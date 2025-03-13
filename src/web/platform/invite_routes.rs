@@ -87,7 +87,7 @@ async fn create_invite(
         org.id,
         create_request.email.clone(),
         role.as_str().to_string(),
-        24, // 24 hour expiry
+        168, // 7 days expiry (24 * 7 = 168 hours)
     );
 
     let invite = data.db.create_invite_code(new_invite).map_err(|e| {
@@ -310,14 +310,17 @@ async fn accept_invite(
         .map_err(|_| ApiError::NotFound)?;
 
     if invite.used {
-        return Err(ApiError::BadRequest);
+        error!("Attempt to accept already used invite code: {}", code);
+        return Err(ApiError::BadRequest.with_message("This invite has already been used"));
     }
 
     if invite.expires_at < chrono::Utc::now() {
-        return Err(ApiError::BadRequest);
+        error!("Attempt to accept expired invite code: {}", code);
+        return Err(ApiError::BadRequest.with_message("This invite has expired"));
     }
 
     if invite.email != platform_user.email {
+        error!("Unauthorized attempt to accept invite code: {}", code);
         return Err(ApiError::Unauthorized);
     }
 
@@ -332,8 +335,12 @@ async fn accept_invite(
         .map_err(|e| {
             error!("Failed to accept invite: {:?}", e);
             match e {
-                DBError::InviteCodeError(InviteCodeError::AlreadyUsed) => ApiError::BadRequest,
-                DBError::InviteCodeError(InviteCodeError::Expired) => ApiError::BadRequest,
+                DBError::InviteCodeError(InviteCodeError::AlreadyUsed) => {
+                    ApiError::BadRequest.with_message("This invite has already been used")
+                }
+                DBError::InviteCodeError(InviteCodeError::Expired) => {
+                    ApiError::BadRequest.with_message("This invite has expired")
+                }
                 _ => ApiError::InternalServerError,
             }
         })?;

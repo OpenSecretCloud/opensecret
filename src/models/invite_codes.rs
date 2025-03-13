@@ -144,9 +144,7 @@ pub struct NewInviteCode {
 }
 
 impl NewInviteCode {
-    pub fn new(org_id: i32, email: String, role: String, expiry_hours: Option<i64>) -> Self {
-        // Default expiration time is 7 days (168 hours)
-        let expiry_hours = expiry_hours.unwrap_or(168);
+    pub fn new(org_id: i32, email: String, role: String, expiry_hours: i64) -> Self {
         NewInviteCode {
             code: Uuid::new_v4(),
             org_id,

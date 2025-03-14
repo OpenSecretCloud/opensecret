@@ -87,7 +87,7 @@ async fn create_invite(
         org.id,
         create_request.email.clone(),
         role.as_str().to_string(),
-        24, // 24 hour expiry
+        168, // 7 days expiry (168 hours)
     );
 
     let invite = data.db.create_invite_code(new_invite).map_err(|e| {

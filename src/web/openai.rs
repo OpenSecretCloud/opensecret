@@ -98,10 +98,15 @@ async fn proxy_openai(
     };
     let openai_api_base = &state.openai_api_base;
 
-    // Create a new hyper client
+    // Create a new hyper client with extended timeouts
     let https = HttpsConnector::new();
     let client = Client::builder()
-        .pool_idle_timeout(Duration::from_secs(15))
+        .pool_idle_timeout(Duration::from_secs(60)) // Increased from 15 to 60 seconds
+        .pool_max_idle_per_host(32) // Increased connection pool size
+        .http2_keep_alive_interval(Some(Duration::from_secs(20))) // Keep connections alive
+        .http2_keep_alive_timeout(Duration::from_secs(10)) // Timeout for keep-alive pings
+        .http1_read_buf_exact_size(65_536) // Increased buffer size
+        .http1_title_case_headers(true) // Improved compatibility
         .build::<_, Body>(https);
 
     // Prepare the request to OpenAI
@@ -137,11 +142,73 @@ async fn proxy_openai(
     })?;
 
     debug!("Sending request to OpenAI");
-    // Send the request to OpenAI
-    let res = client.request(req).await.map_err(|e| {
-        error!("Failed to send request to OpenAI: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    // Send the request to OpenAI with retry logic
+    let mut attempts = 0;
+    let max_attempts = 3;
+    let mut _last_error = None;
+
+    // We need to manually clone the request since hyper::Request doesn't have try_clone
+    // Extract the components we need for retrying
+    let (parts, body) = req.into_parts();
+    let method = parts.method.clone();
+    let uri = parts.uri.clone();
+    let headers = parts.headers.clone();
+    let version = parts.version;
+
+    // Convert body to bytes so we can reuse it
+    let body_bytes = match hyper::body::to_bytes(body).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!("Failed to read request body: {:?}", e);
+            return Err(ApiError::InternalServerError);
+        }
+    };
+
+    let res = loop {
+        attempts += 1;
+
+        // Rebuild the request from the saved components
+        let mut req_builder = hyper::Request::builder()
+            .method(method.clone())
+            .uri(uri.clone())
+            .version(version);
+
+        // Add all headers
+        for (name, value) in headers.iter() {
+            req_builder = req_builder.header(name, value);
+        }
+
+        // Build the request with the body
+        let request = req_builder
+            .body(hyper::Body::from(body_bytes.clone()))
+            .map_err(|e| {
+                error!("Failed to build request: {:?}", e);
+                ApiError::InternalServerError
+            })?;
+
+        match client.request(request).await {
+            Ok(response) => break response,
+            Err(e) => {
+                error!(
+                    "Attempt {}/{}: Failed to send request to OpenAI: {:?}",
+                    attempts, max_attempts, e
+                );
+                _last_error = Some(e);
+
+                // If we've reached max attempts, return the error
+                if attempts >= max_attempts {
+                    error!("Max retry attempts reached. Giving up.");
+                    return Err(ApiError::InternalServerError);
+                }
+
+                // Wait before retrying (exponential backoff with max delay cap of 3 seconds)
+                let backoff_ms = 500 * 2_u64.pow(attempts as u32 - 1);
+                let capped_backoff_ms = std::cmp::min(backoff_ms, 3000); // Cap at 3 seconds
+                let delay = std::time::Duration::from_millis(capped_backoff_ms);
+                tokio::time::sleep(delay).await;
+            }
+        }
+    };
 
     // Check if the response is successful
     if !res.status().is_success() {
@@ -201,12 +268,18 @@ async fn proxy_openai(
                         processed_events
                     }
                     Err(e) => {
+                        // Log the error with more details to help debug
                         error!(
                             "Error reading response body: {:?}. Current buffer: {}",
                             e,
                             buffer.lock().unwrap()
                         );
-                        vec![Ok(Event::default().data("Error reading response"))]
+
+                        // Return a more specific error message that can help with debugging
+                        let error_msg = format!("Error reading response: {:?}", e);
+
+                        // Send an error event to the client
+                        vec![Ok(Event::default().data(error_msg))]
                     }
                 }
             }

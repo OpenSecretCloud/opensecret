@@ -40,3 +40,5 @@ manifests/
 **/pcr_*.b64
 **/pcr_private*
 **/pcr_public*
+tinfoil-proxy/venv/
+__pycache__/

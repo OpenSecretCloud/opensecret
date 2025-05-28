@@ -38,6 +38,9 @@
           pkgs.python3
           (pkgs.python3.withPackages (ps: with ps; [
             cryptography
+            # For tinfoil proxy - we'll use pip in virtualenv
+            pip
+            virtualenv
           ]))
         ];
         linuxOnlyInputs = [

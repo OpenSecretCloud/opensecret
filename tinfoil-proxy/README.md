@@ -14,36 +14,42 @@ An OpenAI-compatible API proxy server for Tinfoil's secure enclave models.
 
 ## Setup
 
+### Development/Testing
+
 1. Enter the Nix development shell:
 ```bash
 nix develop
 ```
 
-2. Run the setup script to create a virtual environment and install dependencies:
+2. Build the binary (if not already built):
 ```bash
-cd tinfoil-proxy
-./setup.sh
+just build-tinfoil-proxy
 ```
 
-3. Activate the virtual environment:
-```bash
-source venv/bin/activate
-```
-
-4. Set your Tinfoil API key:
+3. Set your Tinfoil API key:
 ```bash
 export TINFOIL_API_KEY="your-api-key-here"
 ```
 
-5. Run the server:
+4. Run the server using the alias:
 ```bash
+tinfoil-proxy
+```
+
+Or run from Python directly:
+```bash
+cd tinfoil-proxy
 python tinfoil_proxy.py
 ```
 
 The server will start on `http://localhost:8093` by default. You can override the port with:
 ```bash
-TINFOIL_PROXY_PORT=8000 python tinfoil_proxy.py
+TINFOIL_PROXY_PORT=8000 tinfoil-proxy
 ```
+
+### Production (Docker/EIF)
+
+The binary is automatically included in the Docker image and EIF builds. It runs at `/app/tinfoil-proxy` with all necessary libraries and SSL certificates configured.
 
 ## Usage
 

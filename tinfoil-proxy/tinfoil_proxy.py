@@ -5,6 +5,7 @@ An OpenAI-compatible API server that routes requests to Tinfoil's secure enclave
 """
 
 import os
+import sys
 import json
 import logging
 from typing import Dict, Optional, AsyncIterator
@@ -18,7 +19,7 @@ import uvicorn
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if getattr(sys, 'frozen', False) else logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -84,6 +85,12 @@ class TinfoilProxyServer:
         
         for model_name, config in MODEL_CONFIGS.items():
             try:
+                # Debug info for attestation
+                import traceback
+                logger.debug(f"Initializing {model_name}")
+                logger.debug(f"Python frozen: {getattr(sys, 'frozen', False)}")
+                logger.debug(f"Bundle dir: {getattr(sys, '_MEIPASS', None)}")
+                
                 self.clients[model_name] = TinfoilAI(
                     api_key=self.api_key,
                     enclave=config["enclave"],
@@ -92,6 +99,7 @@ class TinfoilProxyServer:
                 logger.info(f"Successfully initialized Tinfoil client for model: {model_name}")
             except Exception as e:
                 logger.error(f"Failed to initialize model {model_name}: {str(e)}")
+                logger.debug(f"Full error: {traceback.format_exc()}")
                 # Continue with other models instead of failing completely
                 logger.warning(f"Skipping model {model_name} due to initialization error")
 
@@ -293,10 +301,24 @@ async def health_check():
 if __name__ == "__main__":
     # Run the server
     port = int(os.getenv("TINFOIL_PROXY_PORT", "8093"))
-    uvicorn.run(
-        "tinfoil_proxy:app",
-        host="0.0.0.0",
-        port=port,
-        reload=True,
-        log_level="info"
-    )
+    # When running as a binary, we need to use app directly (not module:app string)
+    # and disable reload to avoid multiple processes
+    import sys
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller binary
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=port,
+            reload=False,
+            log_level="info"
+        )
+    else:
+        # Running as Python script
+        uvicorn.run(
+            "tinfoil_proxy:app",
+            host="0.0.0.0",
+            port=port,
+            reload=True,
+            log_level="info"
+        )

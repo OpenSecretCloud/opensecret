@@ -42,3 +42,7 @@ manifests/
 **/pcr_public*
 tinfoil-proxy/venv/
 __pycache__/
+tinfoil-proxy/build/
+tinfoil-proxy/*.spec
+# Keep the binary
+!tinfoil-proxy/dist/tinfoil-proxy

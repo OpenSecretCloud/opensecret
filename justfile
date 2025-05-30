@@ -635,3 +635,18 @@ deploy-preview-nix: build-eif-preview verify-pcr-preview scp-eif-to-aws-preview
 # Clean EIF build artifacts
 clean-eif:
     rm -f result
+
+### Tinfoil Proxy Commands ###
+
+# Build tinfoil-proxy binary using Docker
+build-tinfoil-proxy:
+    {{container}} build --platform linux/arm64 -t tinfoil-proxy-builder -f tinfoil-proxy/Dockerfile.build tinfoil-proxy
+    {{container}} create --name tinfoil-proxy-extract tinfoil-proxy-builder
+    {{container}} cp tinfoil-proxy-extract:/app/dist/tinfoil-proxy tinfoil-proxy/dist/
+    {{container}} rm tinfoil-proxy-extract
+    echo "Binary created at: tinfoil-proxy/dist/tinfoil-proxy"
+    echo "Size: $(du -h tinfoil-proxy/dist/tinfoil-proxy | cut -f1)"
+
+# Clean tinfoil-proxy build artifacts
+clean-tinfoil-proxy:
+    rm -rf tinfoil-proxy/build tinfoil-proxy/dist tinfoil-proxy/*.spec tinfoil-proxy/venv

@@ -1,0 +1,48 @@
+FROM docker.io/python:3.12-slim
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    patchelf \
+    binutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy project files
+COPY pyproject.toml poetry.lock ./
+COPY tinfoil_proxy.py ./
+
+# Install Python dependencies and PyInstaller
+RUN pip install --no-cache-dir poetry pyinstaller && \
+    poetry config virtualenvs.create false && \
+    poetry install --only main --no-interaction --no-ansi
+
+# Build the binary
+RUN pyinstaller \
+    --onefile \
+    --name tinfoil-proxy \
+    --hidden-import=tinfoil \
+    --hidden-import=tinfoil.attestation \
+    --hidden-import=uvicorn.logging \
+    --hidden-import=uvicorn.loops \
+    --hidden-import=uvicorn.loops.auto \
+    --hidden-import=uvicorn.protocols \
+    --hidden-import=uvicorn.protocols.http \
+    --hidden-import=uvicorn.protocols.http.auto \
+    --hidden-import=uvicorn.protocols.websockets \
+    --hidden-import=uvicorn.protocols.websockets.auto \
+    --hidden-import=uvicorn.lifespan \
+    --hidden-import=uvicorn.lifespan.on \
+    --hidden-import=fastapi \
+    --hidden-import=multipart \
+    --collect-submodules=tinfoil \
+    --collect-submodules=sigstore \
+    --collect-submodules=cryptography \
+    --collect-data=tinfoil \
+    --collect-data=sigstore \
+    --strip \
+    --clean \
+    tinfoil_proxy.py
+
+# Binary will be at /app/dist/tinfoil-proxy

@@ -6,17 +6,9 @@ use std::time::Duration;
 use tracing::{debug, error};
 
 #[derive(Debug, Clone)]
-pub enum ProxyProvider {
-    OpenAI,
-    Continuum,
-    Tinfoil,
-}
-
-#[derive(Debug, Clone)]
 pub struct ProxyConfig {
     pub base_url: String,
     pub api_key: Option<String>,
-    pub provider: ProxyProvider,
 }
 
 #[derive(Debug, Clone)]
@@ -43,11 +35,6 @@ impl ProxyRouter {
             } else {
                 None // Continuum proxy doesn't need API key
             },
-            provider: if openai_base.contains("api.openai.com") {
-                ProxyProvider::OpenAI
-            } else {
-                ProxyProvider::Continuum
-            },
         };
 
         // If tinfoil is configured, add its models
@@ -55,7 +42,6 @@ impl ProxyRouter {
             let tinfoil_config = ProxyConfig {
                 base_url: base,
                 api_key: None, // Tinfoil proxy doesn't need API key
-                provider: ProxyProvider::Tinfoil,
             };
 
             // Register tinfoil models
@@ -174,7 +160,8 @@ mod tests {
         );
 
         let proxy = router.get_proxy_for_model("gpt-4");
-        assert!(matches!(proxy.provider, ProxyProvider::OpenAI));
+        assert_eq!(proxy.base_url, "https://api.openai.com");
+        assert!(proxy.api_key.is_some());
     }
 
     #[test]
@@ -186,9 +173,11 @@ mod tests {
         );
 
         let proxy = router.get_proxy_for_model("deepseek-r1-70b");
-        assert!(matches!(proxy.provider, ProxyProvider::Tinfoil));
+        assert_eq!(proxy.base_url, "http://127.0.0.1:8093");
+        assert!(proxy.api_key.is_none());
 
         let proxy = router.get_proxy_for_model("gpt-4");
-        assert!(matches!(proxy.provider, ProxyProvider::Continuum));
+        assert_eq!(proxy.base_url, "http://127.0.0.1:8092");
+        assert!(proxy.api_key.is_none());
     }
 }

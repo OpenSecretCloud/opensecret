@@ -100,7 +100,6 @@ curl http://localhost:8093/v1/models
 ## Environment Variables
 
 - `TINFOIL_API_KEY` (required) - Your Tinfoil API key
-- `TINFOIL_BASE_URL` (optional) - Override the Tinfoil API base URL
 
 ## Integration with OpenSecret
 

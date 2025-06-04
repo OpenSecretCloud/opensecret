@@ -300,7 +300,7 @@ class TinfoilProxyServer:
             
         except Exception as e:
             logger.error(f"Error during non-streaming completion: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
+            raise HTTPException(status_code=500, detail=str(e)) from e
 
 # Initialize proxy server
 proxy_server = None

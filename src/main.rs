@@ -77,11 +77,13 @@ mod migrations;
 mod models;
 mod oauth;
 mod private_key;
+mod proxy_config;
 mod sqs;
 mod web;
 
 use apple_signin::AppleJwtVerifier;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
+use proxy_config::ProxyRouter;
 
 const ENCLAVE_KEY_NAME: &str = "enclave_key";
 const OPENAI_API_KEY_NAME: &str = "openai_api_key";
@@ -373,8 +375,7 @@ pub struct AppState {
     config: Config,
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
     enclave_key: Vec<u8>,
-    openai_api_key: Option<String>,
-    openai_api_base: String,
+    proxy_router: Arc<ProxyRouter>,
     resend_api_key: Option<String>,
     ephemeral_keys: Arc<RwLock<HashMap<String, EphemeralSecret>>>,
     session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, SessionState>>>,
@@ -392,6 +393,7 @@ pub struct AppStateBuilder {
     aws_credential_manager: Option<Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>>,
     openai_api_key: Option<String>,
     openai_api_base: Option<String>,
+    tinfoil_api_base: Option<String>,
     jwt_secret: Option<Vec<u8>>,
     resend_api_key: Option<String>,
     github_client_secret: Option<String>,
@@ -437,6 +439,11 @@ impl AppStateBuilder {
 
     pub fn openai_api_base(mut self, openai_api_base: String) -> Self {
         self.openai_api_base = Some(openai_api_base);
+        self
+    }
+
+    pub fn tinfoil_api_base(mut self, tinfoil_api_base: Option<String>) -> Self {
+        self.tinfoil_api_base = tinfoil_api_base;
         self
     }
 
@@ -590,14 +597,20 @@ impl AppStateBuilder {
         // Initialize the AppleJwtVerifier
         let apple_jwt_verifier = Arc::new(AppleJwtVerifier::new());
 
+        // Initialize the ProxyRouter
+        let proxy_router = Arc::new(ProxyRouter::new(
+            openai_api_base.clone(),
+            self.openai_api_key.clone(),
+            self.tinfoil_api_base.clone(),
+        ));
+
         Ok(AppState {
             app_mode,
             db,
             config,
             aws_credential_manager,
             enclave_key,
-            openai_api_key: self.openai_api_key,
-            openai_api_base,
+            proxy_router,
             resend_api_key: self.resend_api_key,
             ephemeral_keys: Arc::new(RwLock::new(HashMap::new())),
             session_states: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -2261,6 +2274,9 @@ async fn main() -> Result<(), Error> {
         None // No API key needed if not using OpenAI's domain
     };
 
+    // Tinfoil API base is always from environment (like OpenAI API base)
+    let tinfoil_api_base = env::var("TINFOIL_API_BASE").ok();
+
     let jwt_secret = get_or_create_jwt_secret(
         &app_mode,
         aws_credential_manager.clone(),
@@ -2357,6 +2373,7 @@ async fn main() -> Result<(), Error> {
         .aws_credential_manager(aws_credential_manager)
         .openai_api_key(openai_api_key)
         .openai_api_base(openai_api_base)
+        .tinfoil_api_base(tinfoil_api_base)
         .jwt_secret(jwt_secret)
         .resend_api_key(resend_api_key)
         .github_client_secret(github_client_secret.clone())

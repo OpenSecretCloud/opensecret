@@ -146,6 +146,7 @@ For custom environments, you must also set the `ENV_NAME` environment variable. 
 - Form the KMS key alias (`alias/open-secret-{env_name}-enclave`)
 - Form the database URL secret name (`opensecret_{env_name}_database_url`)
 - Form the Continuum proxy API key secret name (`continuum_proxy_{env_name}_api_key`)
+- Form the Tinfoil proxy API key secret name (`tinfoil_proxy_{env_name}_api_key`)
 
 For example, to deploy a custom environment named "staging":
 ```sh
@@ -827,6 +828,159 @@ A restart should not be needed but if you need to:
 sudo systemctl restart vsock-billing-proxy.service
 ```
 
+## Vsock Tinfoil proxies
+Create vsock proxy services so that tinfoil-proxy can talk to Tinfoil services:
+
+First configure the endpoints into their allowlist:
+
+```sh
+sudo vim /etc/nitro_enclaves/vsock-proxy.yaml
+```
+
+Add these lines:
+```
+- {address: api-github-proxy.tinfoil.sh, port: 443}
+- {address: tuf-repo-cdn.sigstore.dev, port: 443}
+- {address: deepseek-r1-70b-p.model.tinfoil.sh, port: 443}
+- {address: kds-proxy.tinfoil.sh, port: 443}
+- {address: github-proxy.tinfoil.sh, port: 443}
+```
+
+Restart the nitro vsock proxy service:
+```
+sudo systemctl restart nitro-enclaves-vsock-proxy.service
+```
+
+#### Tinfoil API GitHub Proxy
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-api-github-proxy.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil API GitHub Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8019 api-github-proxy.tinfoil.sh 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### TUF Repository CDN
+```sh
+sudo vim /etc/systemd/system/vsock-tuf-repo-cdn.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock TUF Repository CDN Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8020 tuf-repo-cdn.sigstore.dev 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil DeepSeek Model
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-deepseek.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil DeepSeek Model Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8021 deepseek-r1-70b-p.model.tinfoil.sh 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil KDS Proxy
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-kds-proxy.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil KDS Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8022 kds-proxy.tinfoil.sh 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil GitHub Proxy
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-github-proxy.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil GitHub Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8023 github-proxy.tinfoil.sh 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Activate all the services:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable vsock-tinfoil-api-github-proxy.service
+sudo systemctl start vsock-tinfoil-api-github-proxy.service
+sudo systemctl status vsock-tinfoil-api-github-proxy.service
+sudo systemctl enable vsock-tuf-repo-cdn.service
+sudo systemctl start vsock-tuf-repo-cdn.service
+sudo systemctl status vsock-tuf-repo-cdn.service
+sudo systemctl enable vsock-tinfoil-deepseek.service
+sudo systemctl start vsock-tinfoil-deepseek.service
+sudo systemctl status vsock-tinfoil-deepseek.service
+sudo systemctl enable vsock-tinfoil-kds-proxy.service
+sudo systemctl start vsock-tinfoil-kds-proxy.service
+sudo systemctl status vsock-tinfoil-kds-proxy.service
+sudo systemctl enable vsock-tinfoil-github-proxy.service
+sudo systemctl start vsock-tinfoil-github-proxy.service
+sudo systemctl status vsock-tinfoil-github-proxy.service
+```
+
+If you need to restart these services:
+```sh
+sudo systemctl restart vsock-tinfoil-api-github-proxy.service
+sudo systemctl restart vsock-tuf-repo-cdn.service
+sudo systemctl restart vsock-tinfoil-deepseek.service
+sudo systemctl restart vsock-tinfoil-kds-proxy.service
+sudo systemctl restart vsock-tinfoil-github-proxy.service
+```
+
 ## KMS Key
 
 You need to create an AWS KMS key that the enclave can encrypt/decrypt things to. Name it according to your environment:
@@ -1151,6 +1305,24 @@ Take that value and insert into SecretsManager with the appropriate name:
 - `continuum_proxy_preview1_api_key` for preview environment
 - `continuum_proxy_prod_api_key` for prod environment
 
+#### Tinfoil Proxy API Key
+Need to store the tinfoil proxy api key encrypted to the enclave.
+
+```sh
+echo -n "TINFOIL_API_KEY" | base64 -w 0
+```
+
+Take that output and encrypt to the KMS key, from a machine that has encrypt access to the key:
+
+```sh
+aws kms encrypt --key-id "KEY_ARN" --plaintext "BASE64_KEY" --query CiphertextBlob --output text
+```
+
+Take that value and insert into SecretsManager with the appropriate name:
+- `tinfoil_proxy_dev_api_key` for dev environment
+- `tinfoil_proxy_preview1_api_key` for preview environment
+- `tinfoil_proxy_prod_api_key` for prod environment
+
 ## Credential Requester
 
 This setup will run the credential requester on port 8003 of the parent instance, making it available for the enclave to request aws credentials.
@@ -1170,7 +1342,10 @@ The ec2 role will need a new inline policy to request secrets from Secrets Manag
 				"arn:aws:secretsmanager:us-east-2:XXX:secret:continuum_proxy_preview1_api_key-XXX",
 				"arn:aws:secretsmanager:us-east-2:XXX:secret:opensecret_preview1_database_url-XXX",
 				"arn:aws:secretsmanager:us-east-2:XXX:secret:continuum_proxy_prod_api_key-XXX",
-				"arn:aws:secretsmanager:us-east-2:XXX:secret:opensecret_prod_database_url-XXX"
+				"arn:aws:secretsmanager:us-east-2:XXX:secret:opensecret_prod_database_url-XXX",
+				"arn:aws:secretsmanager:us-east-2:XXX:secret:tinfoil_proxy_dev_api_key-XXX",
+				"arn:aws:secretsmanager:us-east-2:XXX:secret:tinfoil_proxy_preview1_api_key-XXX",
+				"arn:aws:secretsmanager:us-east-2:XXX:secret:tinfoil_proxy_prod_api_key-XXX"
 			]
 		}
 	]

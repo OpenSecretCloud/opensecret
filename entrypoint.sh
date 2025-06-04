@@ -114,6 +114,32 @@ get_continuum_proxy_api_key_secret() {
     vsock_request $cid $port "$request"
 }
 
+# Function to get tinfoil proxy API key from Secrets Manager
+get_tinfoil_proxy_api_key_secret() {
+    local cid=3
+    local port=8003
+
+    # Determine the correct secret name based on APP_MODE
+    local secret_name
+    if [ "$APP_MODE" = "prod" ]; then
+        secret_name="tinfoil_proxy_prod_api_key"
+    elif [ "$APP_MODE" = "preview" ]; then
+        secret_name="tinfoil_proxy_preview1_api_key"
+    elif [ "$APP_MODE" = "custom" ]; then
+        if [ -z "$ENV_NAME" ]; then
+            log "Error: ENV_NAME must be set when using custom mode"
+            exit 1
+        fi
+        secret_name="tinfoil_proxy_${ENV_NAME}_api_key"
+    else
+        secret_name="tinfoil_proxy_dev_api_key"
+    fi
+
+    local request="{\"request_type\":\"SecretsManager\",\"key_name\":\"$secret_name\"}"
+
+    vsock_request $cid $port "$request"
+}
+
 # Get AWS credentials
 log "Fetching AWS credentials"
 aws_creds=$(get_aws_credentials)
@@ -242,6 +268,14 @@ else
     log "Added development billing domain to /etc/hosts"
 fi
 
+# Add Tinfoil proxy hostnames to /etc/hosts
+echo "127.0.0.16 api-github-proxy.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.17 tuf-repo-cdn.sigstore.dev" >> /etc/hosts
+echo "127.0.0.18 deepseek-r1-70b-p.model.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.19 kds-proxy.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.20 github-proxy.tinfoil.sh" >> /etc/hosts
+log "Added Tinfoil proxy domains to /etc/hosts"
+
 touch /app/libnsm.so
 log "Created /app/libnsm.so"
 
@@ -310,6 +344,22 @@ python3 /app/traffic_forwarder.py 127.0.0.14 443 3 8017 &
 # Start the traffic forwarder for Apple OAuth in the background
 log "Starting Apple OAuth traffic forwarder"
 python3 /app/traffic_forwarder.py 127.0.0.15 443 3 8018 &
+
+# Start the traffic forwarders for Tinfoil proxy in the background
+log "Starting Tinfoil API GitHub proxy traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.16 443 3 8019 &
+
+log "Starting TUF Repository CDN traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.17 443 3 8020 &
+
+log "Starting Tinfoil DeepSeek model traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.18 443 3 8021 &
+
+log "Starting Tinfoil KDS proxy traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.19 443 3 8022 &
+
+log "Starting Tinfoil GitHub proxy traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.20 443 3 8023 &
 
 # Wait for the forwarders to start
 log "Waiting for forwarders to start"
@@ -423,6 +473,42 @@ else
     log "Apple OAuth connection failed"
 fi
 
+# Test the connections to Tinfoil proxy services
+log "Testing connection to Tinfoil API GitHub proxy:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.16/443'; then
+    log "Tinfoil API GitHub proxy connection successful"
+else
+    log "Tinfoil API GitHub proxy connection failed"
+fi
+
+log "Testing connection to TUF Repository CDN:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.17/443'; then
+    log "TUF Repository CDN connection successful"
+else
+    log "TUF Repository CDN connection failed"
+fi
+
+log "Testing connection to Tinfoil DeepSeek model:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.18/443'; then
+    log "Tinfoil DeepSeek model connection successful"
+else
+    log "Tinfoil DeepSeek model connection failed"
+fi
+
+log "Testing connection to Tinfoil KDS proxy:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.19/443'; then
+    log "Tinfoil KDS proxy connection successful"
+else
+    log "Tinfoil KDS proxy connection failed"
+fi
+
+log "Testing connection to Tinfoil GitHub proxy:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.20/443'; then
+    log "Tinfoil GitHub proxy connection successful"
+else
+    log "Tinfoil GitHub proxy connection failed"
+fi
+
 # Start the continuum-proxy if we're in AWS Nitro mode
 if [ "$APP_MODE" != "local" ]; then
     # Get Continuum Proxy API key from Secrets Manager
@@ -481,6 +567,62 @@ if [ "$APP_MODE" != "local" ]; then
 
     # Set OPENAI_API_BASE to point to the local proxy
     export OPENAI_API_BASE="http://127.0.0.1:8092"
+    
+    # Also start tinfoil-proxy
+    # Get Tinfoil Proxy API key from Secrets Manager
+    log "Fetching Tinfoil Proxy API key"
+    tinfoil_proxy_api_key_response=$(get_tinfoil_proxy_api_key_secret)
+    log "Retrieved raw Tinfoil Proxy API key response"
+
+    # Check if the response is an error
+    if echo "$tinfoil_proxy_api_key_response" | jq -e '.response_type == "error"' > /dev/null; then
+        error_message=$(echo "$tinfoil_proxy_api_key_response" | jq -r '.response_value')
+        log "Error: Failed to get Tinfoil Proxy API key. Error message: $error_message"
+        exit 1
+    fi
+
+    # Extract the encrypted API key value from the JSON structure
+    tinfoil_proxy_api_key_encrypted=$(echo "$tinfoil_proxy_api_key_response" | jq -r '.response_value | fromjson | .api_key')
+    if [ -z "$tinfoil_proxy_api_key_encrypted" ]; then
+        log "Error: Failed to extract Tinfoil Proxy API key from the response"
+        log "Secret response: $tinfoil_proxy_api_key_response"
+        exit 1
+    fi
+
+    # Decrypt the API key using kmstool_enclave_cli
+    log "Decrypting Tinfoil Proxy API key"
+    decryption_output=$(kmstool_enclave_cli decrypt \
+        --region "$region" \
+        --proxy-port 8000 \
+        --aws-access-key-id "$access_key_id" \
+        --aws-secret-access-key "$secret_access_key" \
+        --aws-session-token "$session_token" \
+        --ciphertext "$tinfoil_proxy_api_key_encrypted" 2>&1)
+
+    decrypted_api_key=$(echo "$decryption_output" | sed -n 's/PLAINTEXT: //p')
+
+    if [ -z "$decrypted_api_key" ]; then
+        log "Error: Failed to decrypt Tinfoil Proxy API key"
+        log "Decryption output: $decryption_output"
+        exit 1
+    fi
+
+    # Base64 decode the decrypted API key
+    tinfoil_proxy_api_key=$(echo "$decrypted_api_key" | base64 -d)
+
+    if [ -z "$tinfoil_proxy_api_key" ]; then
+        log "Error: Failed to base64 decode Tinfoil Proxy API key"
+        exit 1
+    fi
+
+    log "Tinfoil Proxy API key retrieved, decrypted, and decoded successfully"
+
+    # Set environment variable for tinfoil-proxy and start it
+    log "Starting tinfoil-proxy on port 8093"
+    TINFOIL_API_KEY="$tinfoil_proxy_api_key" TINFOIL_PROXY_PORT=8093 /app/tinfoil-proxy &
+
+    # Wait for the proxy to start
+    sleep 5
 else
     # For local mode, use the default OpenAI API base or the one set in the environment
     export OPENAI_API_BASE=${OPENAI_API_BASE:-"https://api.openai.com"}

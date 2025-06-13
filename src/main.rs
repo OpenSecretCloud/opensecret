@@ -16,7 +16,7 @@ use crate::models::platform_password_reset::NewPlatformPasswordResetRequest;
 use crate::models::platform_users::PlatformUser;
 use crate::sqs::SqsEventPublisher;
 use crate::web::platform_login_routes;
-use crate::web::{health_routes, login_routes, oauth_routes, openai_routes, protected_routes};
+use crate::web::{document_routes, health_routes, login_routes, oauth_routes, openai_routes, protected_routes};
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
 use crate::{
@@ -2413,6 +2413,10 @@ async fn main() -> Result<(), Error> {
         .merge(login_routes(app_state.clone()))
         .merge(
             openai_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            document_routes(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
         )
         .merge(attestation_routes::router(app_state.clone()))

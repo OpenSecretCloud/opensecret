@@ -842,6 +842,7 @@ Add these lines:
 - {address: api-github-proxy.tinfoil.sh, port: 443}
 - {address: tuf-repo-cdn.sigstore.dev, port: 443}
 - {address: deepseek-r1-70b-p.model.tinfoil.sh, port: 443}
+- {address: doc-upload.model.tinfoil.sh, port: 443}
 - {address: kds-proxy.tinfoil.sh, port: 443}
 - {address: gh-attestation-proxy.tinfoil.sh, port: 443}
 ```
@@ -951,6 +952,26 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
+#### Tinfoil Document Upload
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-doc-upload.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Document Upload Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8024 doc-upload.model.tinfoil.sh 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
 Activate all the services:
 
 ```sh
@@ -970,6 +991,9 @@ sudo systemctl status vsock-tinfoil-kds-proxy.service
 sudo systemctl enable vsock-tinfoil-github-proxy.service
 sudo systemctl start vsock-tinfoil-github-proxy.service
 sudo systemctl status vsock-tinfoil-github-proxy.service
+sudo systemctl enable vsock-tinfoil-doc-upload.service
+sudo systemctl start vsock-tinfoil-doc-upload.service
+sudo systemctl status vsock-tinfoil-doc-upload.service
 ```
 
 If you need to restart these services:
@@ -979,6 +1003,7 @@ sudo systemctl restart vsock-tuf-repo-cdn.service
 sudo systemctl restart vsock-tinfoil-deepseek.service
 sudo systemctl restart vsock-tinfoil-kds-proxy.service
 sudo systemctl restart vsock-tinfoil-github-proxy.service
+sudo systemctl restart vsock-tinfoil-doc-upload.service
 ```
 
 ## KMS Key

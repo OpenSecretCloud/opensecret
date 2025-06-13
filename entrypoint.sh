@@ -274,6 +274,7 @@ echo "127.0.0.17 tuf-repo-cdn.sigstore.dev" >> /etc/hosts
 echo "127.0.0.18 deepseek-r1-70b-p.model.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.19 kds-proxy.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.20 gh-attestation-proxy.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.21 doc-upload.model.tinfoil.sh" >> /etc/hosts
 log "Added Tinfoil proxy domains to /etc/hosts"
 
 touch /app/libnsm.so
@@ -360,6 +361,9 @@ python3 /app/traffic_forwarder.py 127.0.0.19 443 3 8022 &
 
 log "Starting Tinfoil GitHub proxy traffic forwarder"
 python3 /app/traffic_forwarder.py 127.0.0.20 443 3 8023 &
+
+log "Starting Tinfoil Document Upload traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.21 443 3 8024 &
 
 # Wait for the forwarders to start
 log "Waiting for forwarders to start"
@@ -507,6 +511,13 @@ if timeout 5 bash -c '</dev/tcp/127.0.0.20/443'; then
     log "Tinfoil GitHub proxy connection successful"
 else
     log "Tinfoil GitHub proxy connection failed"
+fi
+
+log "Testing connection to Tinfoil Document Upload:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.21/443'; then
+    log "Tinfoil Document Upload connection successful"
+else
+    log "Tinfoil Document Upload connection failed"
 fi
 
 # Start the continuum-proxy if we're in AWS Nitro mode

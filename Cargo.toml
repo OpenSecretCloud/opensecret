@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = { version = "0.7.5", features = ["macros"] }
+axum = { version = "0.7.5", features = ["macros", "multipart"] }
 axum-macros = { version = "0.4.1" }
 password-auth = "1.0.0"
 bip39 = { version = "2.0.0" }

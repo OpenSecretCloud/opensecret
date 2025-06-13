@@ -103,6 +103,12 @@ impl ProxyRouter {
         }
     }
 
+    /// Get the Tinfoil proxy base URL if configured
+    pub fn get_tinfoil_base_url(&self) -> Option<String> {
+        // The first additional proxy is the Tinfoil proxy if configured
+        self.additional_proxies.first().map(|p| p.base_url.clone())
+    }
+
     pub async fn get_proxy_for_model(&self, model_name: &str) -> ProxyConfig {
         // Ensure cache is fresh
         self.refresh_cache_if_needed().await;

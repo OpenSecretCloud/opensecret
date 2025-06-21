@@ -24,6 +24,7 @@ use std::convert::Infallible;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::time::sleep;
 use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
@@ -102,10 +103,11 @@ async fn proxy_openai(
     let openai_api_key = proxy_config.api_key.as_deref().unwrap_or("");
     let openai_api_base = &proxy_config.base_url;
 
-    // Create a new hyper client
+    // Create a new hyper client with better timeout configuration
     let https = HttpsConnector::new();
     let client = Client::builder()
-        .pool_idle_timeout(Duration::from_secs(15))
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(10)
         .build::<_, Body>(https);
 
     // Prepare the request to OpenAI
@@ -114,57 +116,88 @@ async fn proxy_openai(
         ApiError::InternalServerError
     })?;
 
-    let mut req = Request::builder()
-        .method("POST")
-        .uri(format!("{}/v1/chat/completions", openai_api_base))
-        .header("Content-Type", "application/json");
+    debug!("Sending request to OpenAI");
 
-    if !openai_api_key.is_empty() {
-        req = req.header("Authorization", format!("Bearer {}", openai_api_key));
-    }
+    // Retry logic: 3 attempts with exponential backoff
+    let mut res = None;
+    let max_attempts = 3;
 
-    // Forward relevant headers from the original request
-    for (key, value) in headers.iter() {
-        if key != header::HOST && key != header::AUTHORIZATION && key != header::CONTENT_LENGTH {
-            if let (Ok(name), Ok(val)) = (
-                HeaderName::from_bytes(key.as_ref()),
-                HeaderValue::from_str(value.to_str().unwrap_or_default()),
-            ) {
-                req = req.header(name, val);
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            let delay = attempt; // 1s after 1st failure, 2s after 2nd failure
+            debug!(
+                "Retrying request (attempt {} of {}) after {}s delay",
+                attempt + 1,
+                max_attempts,
+                delay
+            );
+            sleep(Duration::from_secs(delay)).await;
+        } else {
+            debug!("Making initial request (attempt 1 of {})", max_attempts);
+        }
+
+        // Build new request for each attempt
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("{}/v1/chat/completions", openai_api_base))
+            .header("Content-Type", "application/json");
+
+        if !openai_api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", openai_api_key));
+        }
+
+        // Forward relevant headers from the original request
+        for (key, value) in headers.iter() {
+            if key != header::HOST && key != header::AUTHORIZATION && key != header::CONTENT_LENGTH
+            {
+                if let (Ok(name), Ok(val)) = (
+                    HeaderName::from_bytes(key.as_ref()),
+                    HeaderValue::from_str(value.to_str().unwrap_or_default()),
+                ) {
+                    req = req.header(name, val);
+                }
+            }
+        }
+
+        let req = req.body(Body::from(body_json.clone())).map_err(|e| {
+            error!("Failed to create request body: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+        match client.request(req).await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    res = Some(response);
+                    break;
+                } else if attempt == max_attempts - 1 {
+                    // Only log details on last attempt
+                    error!(
+                        "OpenAI API returned non-success status: {}",
+                        response.status()
+                    );
+                    debug!("Response headers: {:?}", response.headers());
+                    let body_bytes = to_bytes(response.into_body()).await.map_err(|e| {
+                        error!("Failed to read response body: {:?}", e);
+                        ApiError::InternalServerError
+                    })?;
+                    let body_str = String::from_utf8_lossy(&body_bytes);
+                    error!("Response body: {}", body_str);
+                }
+            }
+            Err(e) => {
+                if attempt == max_attempts - 1 {
+                    error!("Failed to send request to OpenAI: {:?}", e);
+                } else {
+                    debug!("Request failed on attempt {}: {:?}", attempt + 1, e);
+                }
             }
         }
     }
 
-    let req = req.body(Body::from(body_json)).map_err(|e| {
-        error!("Failed to create request body: {:?}", e);
+    let res = res.ok_or_else(|| {
+        error!("All retry attempts failed");
         ApiError::InternalServerError
     })?;
-
-    debug!("Sending request to OpenAI");
-    // Send the request to OpenAI
-    let res = client.request(req).await.map_err(|e| {
-        error!("Failed to send request to OpenAI: {:?}", e);
-        ApiError::InternalServerError
-    })?;
-
-    // Check if the response is successful
-    if !res.status().is_success() {
-        error!("OpenAI API returned non-success status: {}", res.status());
-
-        // Log headers
-        debug!("Response headers: {:?}", res.headers());
-
-        // Read and log the response body
-        let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
-            error!("Failed to read response body: {:?}", e);
-            ApiError::InternalServerError
-        })?;
-
-        let body_str = String::from_utf8_lossy(&body_bytes);
-        error!("Response body: {}", body_str);
-
-        return Err(ApiError::InternalServerError);
-    }
 
     debug!("Successfully received response from OpenAI");
 

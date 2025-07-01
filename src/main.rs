@@ -17,7 +17,7 @@ use crate::models::platform_users::PlatformUser;
 use crate::sqs::SqsEventPublisher;
 use crate::web::platform_login_routes;
 use crate::web::{
-    document_routes, health_routes, login_routes, oauth_routes, openai_routes, protected_routes,
+    brave_search_handler, document_routes, health_routes, login_routes, oauth_routes, openai_routes, protected_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
@@ -33,7 +33,7 @@ use crate::{
 };
 use crate::{encrypt::create_new_encryption_key, jwt::validate_jwt};
 use aws_credentials::{AwsCredentialManager, AwsCredentials};
-use axum::{http::StatusCode, middleware::from_fn_with_state, response::IntoResponse, Json};
+use axum::{http::StatusCode, middleware::from_fn_with_state, response::IntoResponse, routing::get, Json};
 use base64::engine::general_purpose;
 use base64::Engine as _;
 use chacha20poly1305::aead::Aead;
@@ -90,6 +90,7 @@ use proxy_config::ProxyRouter;
 const ENCLAVE_KEY_NAME: &str = "enclave_key";
 const OPENAI_API_KEY_NAME: &str = "openai_api_key";
 const JWT_SECRET_KEY_NAME: &str = "jwt_secret";
+const BRAVE_SEARCH_API_KEY_NAME: &str = "brave_search_api_key";
 
 // General secret key names
 const GITHUB_CLIENT_ID_NAME: &str = "github_client_id";
@@ -396,6 +397,7 @@ pub struct AppStateBuilder {
     openai_api_key: Option<String>,
     openai_api_base: Option<String>,
     tinfoil_api_base: Option<String>,
+    brave_search_api_key: Option<String>,
     jwt_secret: Option<Vec<u8>>,
     resend_api_key: Option<String>,
     github_client_secret: Option<String>,
@@ -446,6 +448,11 @@ impl AppStateBuilder {
 
     pub fn tinfoil_api_base(mut self, tinfoil_api_base: Option<String>) -> Self {
         self.tinfoil_api_base = tinfoil_api_base;
+        self
+    }
+
+    pub fn brave_search_api_key(mut self, brave_search_api_key: Option<String>) -> Self {
+        self.brave_search_api_key = brave_search_api_key;
         self
     }
 
@@ -604,6 +611,7 @@ impl AppStateBuilder {
             openai_api_base.clone(),
             self.openai_api_key.clone(),
             self.tinfoil_api_base.clone(),
+            self.brave_search_api_key.clone(),
         ));
 
         Ok(AppState {
@@ -1816,6 +1824,48 @@ async fn retrieve_resend_api_key(
     }
 }
 
+async fn retrieve_brave_search_api_key(
+    aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
+    db: Arc<dyn DBConnection + Send + Sync>,
+) -> Result<Option<String>, Error> {
+    let creds = aws_credential_manager
+        .read()
+        .await
+        .clone()
+        .expect("non-local mode should have creds")
+        .get_credentials()
+        .await
+        .expect("non-local mode should have creds");
+
+    // check if the key already exists in the db
+    let existing_key = db.get_enclave_secret_by_key(BRAVE_SEARCH_API_KEY_NAME)?;
+
+    if let Some(ref encrypted_key) = existing_key {
+        // Convert the stored bytes back to base64
+        let base64_encrypted_key = general_purpose::STANDARD.encode(&encrypted_key.value);
+
+        debug!("trying to decrypt base64 encrypted Brave Search API key");
+
+        // Decrypt the existing key
+        let decrypted_bytes = decrypt_with_kms(
+            &creds.region,
+            &creds.access_key_id,
+            &creds.secret_access_key,
+            &creds.token,
+            &base64_encrypted_key,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        // Convert the decrypted bytes to a UTF-8 string
+        String::from_utf8(decrypted_bytes)
+            .map_err(|e| Error::EncryptionError(format!("Failed to decode UTF-8: {}", e)))
+            .map(Some)
+    } else {
+        tracing::info!("Brave Search API key not found in the database");
+        Ok(None)
+    }
+}
+
 async fn retrieve_github_client_id(
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
     db: Arc<dyn DBConnection + Send + Sync>,
@@ -2279,6 +2329,13 @@ async fn main() -> Result<(), Error> {
     // Tinfoil API base is always from environment (like OpenAI API base)
     let tinfoil_api_base = env::var("TINFOIL_API_BASE").ok();
 
+    // Brave Search API key - from DB in non-local mode, from env in local mode
+    let brave_search_api_key = if app_mode != AppMode::Local {
+        retrieve_brave_search_api_key(aws_credential_manager.clone(), db.clone()).await?
+    } else {
+        env::var("BRAVE_SEARCH_API_KEY").ok()
+    };
+
     let jwt_secret = get_or_create_jwt_secret(
         &app_mode,
         aws_credential_manager.clone(),
@@ -2376,6 +2433,7 @@ async fn main() -> Result<(), Error> {
         .openai_api_key(openai_api_key)
         .openai_api_base(openai_api_base)
         .tinfoil_api_base(tinfoil_api_base)
+        .brave_search_api_key(brave_search_api_key)
         .jwt_secret(jwt_secret)
         .resend_api_key(resend_api_key)
         .github_client_secret(github_client_secret.clone())
@@ -2419,6 +2477,12 @@ async fn main() -> Result<(), Error> {
         )
         .merge(
             document_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .route(
+            "/v1/brave/search",
+            get(brave_search_handler)
+                .with_state(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
         )
         .merge(attestation_routes::router(app_state.clone()))

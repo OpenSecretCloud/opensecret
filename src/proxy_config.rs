@@ -69,6 +69,8 @@ pub struct ProxyRouter {
     additional_proxies: Vec<ProxyConfig>,
     // Tinfoil proxy base URL if configured
     tinfoil_base_url: Option<String>,
+    // Brave Search configuration
+    brave_search_config: Option<ProxyConfig>,
 }
 
 impl ProxyRouter {
@@ -76,6 +78,7 @@ impl ProxyRouter {
         openai_base: String,
         openai_key: Option<String>,
         tinfoil_base: Option<String>,
+        brave_search_api_key: Option<String>,
     ) -> Self {
         let cache = Arc::new(RwLock::new(ModelsCache::new_with_default()));
 
@@ -98,17 +101,29 @@ impl ProxyRouter {
             });
         }
 
+        // Brave Search configuration
+        let brave_search_config = brave_search_api_key.map(|api_key| ProxyConfig {
+            base_url: "https://api.search.brave.com".to_string(),
+            api_key: Some(api_key),
+        });
+
         ProxyRouter {
             cache,
             default_proxy,
             additional_proxies,
             tinfoil_base_url: tinfoil_base,
+            brave_search_config,
         }
     }
 
     /// Get the Tinfoil proxy base URL if configured
     pub fn get_tinfoil_base_url(&self) -> Option<String> {
         self.tinfoil_base_url.clone()
+    }
+
+    /// Get the Brave Search configuration if available
+    pub fn get_brave_search_config(&self) -> Option<ProxyConfig> {
+        self.brave_search_config.clone()
     }
 
     pub async fn get_proxy_for_model(&self, model_name: &str) -> ProxyConfig {
@@ -289,6 +304,7 @@ mod tests {
             "https://api.openai.com".to_string(),
             Some("test-key".to_string()),
             None,
+            None,
         );
 
         let proxy = router.get_proxy_for_model("gpt-4").await;
@@ -302,6 +318,7 @@ mod tests {
             "http://127.0.0.1:8092".to_string(),
             None,
             Some("http://127.0.0.1:8093".to_string()),
+            None,
         );
 
         // Since model discovery is async, we can't test specific model mapping

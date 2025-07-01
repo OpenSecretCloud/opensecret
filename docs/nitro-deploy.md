@@ -828,6 +828,54 @@ A restart should not be needed but if you need to:
 sudo systemctl restart vsock-billing-proxy.service
 ```
 
+## Vsock Brave Search proxy
+Create a vsock proxy service so that enclave program can talk to Brave Search API:
+
+First configure the endpoint into its allowlist:
+
+```sh
+sudo vim /etc/nitro_enclaves/vsock-proxy.yaml
+```
+
+Add this line:
+```
+- {address: api.search.brave.com, port: 443}
+```
+
+Now create a service that spins this up automatically:
+
+```sh
+sudo vim /etc/systemd/system/vsock-brave-search-proxy.service
+```
+
+```
+[Unit]
+Description=Vsock Brave Search Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8025 api.search.brave.com 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Activate the service:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable vsock-brave-search-proxy.service
+sudo systemctl start vsock-brave-search-proxy.service
+sudo systemctl status vsock-brave-search-proxy.service
+```
+
+A restart should not be needed but if you need to:
+```sh
+sudo systemctl restart vsock-brave-search-proxy.service
+```
+
 ## Vsock Tinfoil proxies
 Create vsock proxy services so that tinfoil-proxy can talk to Tinfoil services:
 
@@ -1289,6 +1337,25 @@ Take that encrypted base64 and insert it into the `enclave_secrets` table with k
 ```sql
 INSERT INTO enclave_secrets (key, value)
 VALUES ('billing_server_url', decode('your_base64_string', 'base64'));
+```
+
+#### Brave Search API Key
+
+```sh
+echo -n "BRAVE_SEARCH_API_KEY" | base64 -w 0
+```
+
+Take that output and encrypt to the KMS key, from a machine that has encrypt access to the key:
+
+```sh
+aws kms encrypt --key-id "KEY_ARN" --plaintext "BASE64_KEY" --query CiphertextBlob --output text
+```
+
+Take that encrypted base64 and insert it into the `enclave_secrets` table with key as `brave_search_api_key` and value as the base64.
+
+```sql
+INSERT INTO enclave_secrets (key, value)
+VALUES ('brave_search_api_key', decode('your_base64_string', 'base64'));
 ```
 
 

@@ -1,4 +1,5 @@
 pub mod attestation_routes;
+mod brave_search;
 pub mod documents;
 pub mod encryption_middleware;
 mod health_routes;
@@ -8,6 +9,7 @@ mod openai;
 pub mod platform;
 pub mod protected_routes;
 
+pub use brave_search::brave_search_handler;
 pub use documents::router as document_routes;
 pub use health_routes::router as health_routes;
 pub use login_routes::router as login_routes;

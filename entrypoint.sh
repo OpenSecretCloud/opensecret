@@ -140,6 +140,32 @@ get_tinfoil_proxy_api_key_secret() {
     vsock_request $cid $port "$request"
 }
 
+# Function to get Brave Search API key from Secrets Manager
+get_brave_search_api_key_secret() {
+    local cid=3
+    local port=8003
+
+    # Determine the correct secret name based on APP_MODE
+    local secret_name
+    if [ "$APP_MODE" = "prod" ]; then
+        secret_name="brave_search_prod_api_key"
+    elif [ "$APP_MODE" = "preview" ]; then
+        secret_name="brave_search_preview1_api_key"
+    elif [ "$APP_MODE" = "custom" ]; then
+        if [ -z "$ENV_NAME" ]; then
+            log "Error: ENV_NAME must be set when using custom mode"
+            exit 1
+        fi
+        secret_name="brave_search_${ENV_NAME}_api_key"
+    else
+        secret_name="brave_search_dev_api_key"
+    fi
+
+    local request="{\"request_type\":\"SecretsManager\",\"key_name\":\"$secret_name\"}"
+
+    vsock_request $cid $port "$request"
+}
+
 # Get AWS credentials
 log "Fetching AWS credentials"
 aws_creds=$(get_aws_credentials)
@@ -277,6 +303,10 @@ echo "127.0.0.20 gh-attestation-proxy.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.21 doc-upload.model.tinfoil.sh" >> /etc/hosts
 log "Added Tinfoil proxy domains to /etc/hosts"
 
+# Add Brave Search API hostname to /etc/hosts
+echo "127.0.0.22 api.search.brave.com" >> /etc/hosts
+log "Added Brave Search API domain to /etc/hosts"
+
 touch /app/libnsm.so
 log "Created /app/libnsm.so"
 
@@ -364,6 +394,10 @@ python3 /app/traffic_forwarder.py 127.0.0.20 443 3 8023 &
 
 log "Starting Tinfoil Document Upload traffic forwarder"
 python3 /app/traffic_forwarder.py 127.0.0.21 443 3 8024 &
+
+# Start the traffic forwarder for Brave Search API in the background
+log "Starting Brave Search API traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.22 443 3 8025 &
 
 # Wait for the forwarders to start
 log "Waiting for forwarders to start"
@@ -518,6 +552,14 @@ if timeout 5 bash -c '</dev/tcp/127.0.0.21/443'; then
     log "Tinfoil Document Upload connection successful"
 else
     log "Tinfoil Document Upload connection failed"
+fi
+
+# Test the connection to Brave Search API
+log "Testing connection to Brave Search API:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.22/443'; then
+    log "Brave Search API connection successful"
+else
+    log "Brave Search API connection failed"
 fi
 
 # Start the continuum-proxy if we're in AWS Nitro mode

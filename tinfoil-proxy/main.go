@@ -37,7 +37,7 @@ var modelConfigs = map[string]struct {
 	"llama3-3-70b": {
 		ModelID:     "llama3-3-70b",
 		Description: "Multilingual understanding, dialogue optimization",
-		Active:      false,
+		Active:      true,
 	},
 	"qwen2-5-72b": {
 		ModelID:     "qwen2-5-72b",

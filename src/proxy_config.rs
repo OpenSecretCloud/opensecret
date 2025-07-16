@@ -10,10 +10,36 @@ use tracing::{debug, error, info, warn};
 
 const DEFAULT_CONTINUUM_MODEL: &str = "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4";
 
+/// Known model equivalencies across providers
+/// This maps a canonical model identifier to provider-specific names
+fn get_model_equivalencies() -> HashMap<&'static str, HashMap<&'static str, &'static str>> {
+    let mut equivalencies = HashMap::new();
+    
+    // Llama 3.3 70B
+    let mut llama_33_70b = HashMap::new();
+    llama_33_70b.insert("continuum", DEFAULT_CONTINUUM_MODEL);
+    llama_33_70b.insert("tinfoil", "llama3-3-70b");
+    equivalencies.insert("llama-3.3-70b", llama_33_70b);
+    
+    equivalencies
+}
+
+/// Model routing configuration
+#[derive(Debug, Clone)]
+pub struct ModelRoute {
+    /// Primary provider configuration
+    pub primary: ProxyConfig,
+    /// Optional fallback providers in order of preference
+    pub fallbacks: Vec<ProxyConfig>,
+}
+
+
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
     pub base_url: String,
     pub api_key: Option<String>,
+    /// Provider name for logging
+    pub provider_name: String,
 }
 
 #[derive(Debug)]
@@ -22,6 +48,8 @@ struct ModelsCache {
     models_response: Option<Value>,
     // Map from model name to proxy configuration for internal routing
     model_to_proxy: HashMap<String, ProxyConfig>,
+    // Model routing configurations with fallback support
+    model_routes: HashMap<String, ModelRoute>,
     // When the cache expires
     expires_at: DateTime<Utc>,
 }
@@ -44,6 +72,7 @@ impl ModelsCache {
         Self {
             models_response: Some(models_response),
             model_to_proxy: HashMap::new(),
+            model_routes: HashMap::new(),
             expires_at: Utc::now(),
         }
     }
@@ -52,9 +81,15 @@ impl ModelsCache {
         Utc::now() >= self.expires_at
     }
 
-    fn update(&mut self, models_response: Value, model_to_proxy: HashMap<String, ProxyConfig>) {
+    fn update(
+        &mut self,
+        models_response: Value,
+        model_to_proxy: HashMap<String, ProxyConfig>,
+        model_routes: HashMap<String, ModelRoute>,
+    ) {
         self.models_response = Some(models_response);
         self.model_to_proxy = model_to_proxy;
+        self.model_routes = model_routes;
         self.expires_at = Utc::now() + chrono::Duration::minutes(5);
     }
 }
@@ -67,11 +102,37 @@ pub struct ProxyRouter {
     default_proxy: ProxyConfig,
     // Additional proxy configurations (e.g., tinfoil)
     additional_proxies: Vec<ProxyConfig>,
-    // Tinfoil proxy base URL if configured
-    tinfoil_base_url: Option<String>,
+    // Tinfoil proxy configuration if configured
+    tinfoil_proxy: Option<ProxyConfig>,
 }
 
 impl ProxyRouter {
+    /// Get the provider-specific model name for a given canonical model
+    pub fn get_model_name_for_provider(&self, canonical_model: &str, provider_name: &str) -> String {
+        let equivalencies = get_model_equivalencies();
+        
+        // First check if this is already a provider-specific name
+        for provider_names in equivalencies.values() {
+            if let Some((_, model_name)) = provider_names.iter().find(|(p, m)| **p == provider_name && **m == canonical_model) {
+                return model_name.to_string();
+            }
+        }
+        
+        // Then check if we need to translate
+        for provider_names in equivalencies.values() {
+            // Check if the canonical model matches any known model
+            if provider_names.values().any(|m| *m == canonical_model) {
+                // Found it, now get the name for the requested provider
+                if let Some(name) = provider_names.get(provider_name) {
+                    return name.to_string();
+                }
+            }
+        }
+        
+        // No translation needed
+        canonical_model.to_string()
+    }
+
     pub fn new(
         openai_base: String,
         openai_key: Option<String>,
@@ -87,28 +148,41 @@ impl ProxyRouter {
             } else {
                 None // Continuum proxy doesn't need API key
             },
+            provider_name: if openai_base.contains("api.openai.com") {
+                "openai".to_string()
+            } else {
+                "continuum".to_string()
+            },
         };
+
+        // Tinfoil proxy configuration
+        let tinfoil_proxy = tinfoil_base.map(|base| ProxyConfig {
+            base_url: base.clone(),
+            api_key: None, // Tinfoil proxy doesn't need API key
+            provider_name: "tinfoil".to_string(),
+        });
 
         // Collect additional proxies
         let mut additional_proxies = Vec::new();
-        if let Some(ref base) = tinfoil_base {
-            additional_proxies.push(ProxyConfig {
-                base_url: base.clone(),
-                api_key: None, // Tinfoil proxy doesn't need API key
-            });
+        if let Some(ref tp) = tinfoil_proxy {
+            additional_proxies.push(tp.clone());
         }
 
         ProxyRouter {
             cache,
             default_proxy,
             additional_proxies,
-            tinfoil_base_url: tinfoil_base,
+            tinfoil_proxy,
         }
     }
 
-    /// Get the Tinfoil proxy base URL if configured
-    pub fn get_tinfoil_base_url(&self) -> Option<String> {
-        self.tinfoil_base_url.clone()
+    /// Get the model route configuration for a given model
+    pub async fn get_model_route(&self, model_name: &str) -> Option<ModelRoute> {
+        // Ensure cache is fresh
+        self.refresh_cache_if_needed().await;
+
+        let cache = self.cache.read().await;
+        cache.model_routes.get(model_name).cloned()
     }
 
     pub async fn get_proxy_for_model(&self, model_name: &str) -> ProxyConfig {
@@ -116,6 +190,12 @@ impl ProxyRouter {
         self.refresh_cache_if_needed().await;
 
         let cache = self.cache.read().await;
+
+        // Check if there's a special route for this model
+        if let Some(route) = cache.model_routes.get(model_name) {
+            return route.primary.clone();
+        }
+
         cache
             .model_to_proxy
             .get(model_name)
@@ -150,6 +230,7 @@ impl ProxyRouter {
         let mut all_models = Vec::new();
         let mut model_to_proxy = HashMap::new();
         let mut fetched_proxies = HashMap::new();
+        let mut available_models_by_provider: HashMap<String, Vec<String>> = HashMap::new();
 
         // Always include the default Continuum model
         let default_continuum_model = serde_json::json!({
@@ -166,10 +247,22 @@ impl ProxyRouter {
             .await
         {
             Ok(mut models) => {
+                let mut provider_models = Vec::new();
+
                 // Remove duplicate of default model if it exists
                 models.retain(|m| {
-                    m.get("id").and_then(|v| v.as_str()) != Some(DEFAULT_CONTINUUM_MODEL)
+                    if let Some(model_id) = m.get("id").and_then(|v| v.as_str()) {
+                        provider_models.push(model_id.to_string());
+                        model_id != DEFAULT_CONTINUUM_MODEL
+                    } else {
+                        true
+                    }
                 });
+
+                // Track continuum models
+                available_models_by_provider
+                    .insert(self.default_proxy.provider_name.clone(), provider_models);
+
                 all_models.extend(models);
                 fetched_proxies.insert(self.default_proxy.base_url.clone(), true);
                 // Note: We don't add default proxy models to model_to_proxy map
@@ -177,6 +270,8 @@ impl ProxyRouter {
             }
             Err(e) => {
                 warn!("Failed to fetch models from default proxy: {:?}", e);
+                available_models_by_provider
+                    .insert(self.default_proxy.provider_name.clone(), Vec::new());
             }
         }
 
@@ -185,12 +280,15 @@ impl ProxyRouter {
             if !fetched_proxies.contains_key(&proxy_config.base_url) {
                 match self.fetch_models_from_proxy(&client, proxy_config).await {
                     Ok(models) => {
+                        let mut provider_models = Vec::new();
+
                         all_models.extend(models.clone());
                         fetched_proxies.insert(proxy_config.base_url.clone(), true);
 
                         // Add these models to the routing map
                         for model in &models {
                             if let Some(model_id) = model.get("id").and_then(|v| v.as_str()) {
+                                provider_models.push(model_id.to_string());
                                 debug!(
                                     "Mapped model '{}' to proxy {}",
                                     model_id, proxy_config.base_url
@@ -198,12 +296,17 @@ impl ProxyRouter {
                                 model_to_proxy.insert(model_id.to_string(), proxy_config.clone());
                             }
                         }
+
+                        available_models_by_provider
+                            .insert(proxy_config.provider_name.clone(), provider_models);
                     }
                     Err(e) => {
                         warn!(
                             "Failed to fetch models from proxy {}: {:?}",
                             proxy_config.base_url, e
                         );
+                        available_models_by_provider
+                            .insert(proxy_config.provider_name.clone(), Vec::new());
                     }
                 }
             }
@@ -214,9 +317,88 @@ impl ProxyRouter {
             "data": all_models
         });
 
+        // Build model routes dynamically based on what's available
+        let mut model_routes = HashMap::new();
+        let model_equivalencies = get_model_equivalencies();
+
+        // For each known model equivalency, check which providers have it
+        for (canonical_name, provider_names) in &model_equivalencies {
+            let mut providers_with_model = Vec::new();
+            
+            // Check each provider
+            for (provider, model_name) in provider_names {
+                if let Some(models) = available_models_by_provider.get(*provider) {
+                    if models.contains(&model_name.to_string()) {
+                        providers_with_model.push((*provider, *model_name));
+                    }
+                }
+            }
+            
+            // If multiple providers have this model, set up routing with fallback
+            if providers_with_model.len() > 1 {
+                // For now, prioritize tinfoil over continuum for shared models
+                let primary_provider = if providers_with_model.iter().any(|(p, _)| *p == "tinfoil") {
+                    "tinfoil"
+                } else {
+                    providers_with_model.get(0).map(|(p, _)| *p).unwrap_or("continuum")
+                };
+                
+                let fallback_provider = if primary_provider == "tinfoil" {
+                    "continuum"
+                } else {
+                    "tinfoil"
+                };
+                
+                // Get proxy configs
+                let primary_proxy = if primary_provider == "tinfoil" {
+                    self.tinfoil_proxy.as_ref()
+                } else {
+                    Some(&self.default_proxy)
+                };
+                
+                let fallback_proxy = if fallback_provider == "tinfoil" {
+                    self.tinfoil_proxy.as_ref()
+                } else {
+                    Some(&self.default_proxy)
+                };
+                
+                if let (Some(primary), Some(fallback)) = (primary_proxy, fallback_proxy) {
+                    info!(
+                        "Model {} available from multiple providers - {} (primary) and {} (fallback)",
+                        canonical_name, primary_provider, fallback_provider
+                    );
+                    
+                    // Build list of providers in order (tinfoil first if available)
+                    let mut ordered_providers = Vec::new();
+                    if primary_provider == "tinfoil" {
+                        ordered_providers.push(primary.clone());
+                        ordered_providers.push(fallback.clone());
+                    } else {
+                        ordered_providers.push(fallback.clone());
+                        ordered_providers.push(primary.clone());
+                    }
+                    
+                    let route = ModelRoute {
+                        primary: ordered_providers[0].clone(),
+                        fallbacks: vec![ordered_providers[1].clone()],
+                    };
+                    
+                    // Map all provider-specific names to this route
+                    for (_, model_name) in &providers_with_model {
+                        model_routes.insert(model_name.to_string(), route.clone());
+                    }
+                }
+            } else if providers_with_model.len() == 1 {
+                // Single provider - no special routing needed
+                if let Some((provider, _)) = providers_with_model.get(0) {
+                    info!("Model {} only available from {}", canonical_name, provider);
+                }
+            }
+        }
+
         // Update the cache
         let mut cache = self.cache.write().await;
-        cache.update(models_response, model_to_proxy);
+        cache.update(models_response, model_to_proxy, model_routes);
 
         info!(
             "Models cache refreshed. Total models: {}, Additional proxy models: {}",
@@ -277,6 +459,11 @@ impl ProxyRouter {
             Ok(vec![])
         }
     }
+
+    /// Get the Tinfoil proxy base URL if configured
+    pub fn get_tinfoil_base_url(&self) -> Option<String> {
+        self.tinfoil_proxy.as_ref().map(|p| p.base_url.clone())
+    }
 }
 
 #[cfg(test)]
@@ -310,11 +497,9 @@ mod tests {
         assert_eq!(proxy.base_url, "http://127.0.0.1:8092");
         assert!(proxy.api_key.is_none());
 
-        // Verify additional proxies were configured
-        assert_eq!(router.additional_proxies.len(), 1);
-        assert_eq!(
-            router.additional_proxies[0].base_url,
-            "http://127.0.0.1:8093"
-        );
+        // Verify providers were configured
+        assert_eq!(router.providers.len(), 2);
+        assert!(router.providers.contains_key("continuum"));
+        assert!(router.providers.contains_key("tinfoil"));
     }
 }

@@ -1,5 +1,6 @@
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
+use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
 use crate::{ApiError, AppState};
@@ -92,16 +93,13 @@ async fn proxy_openai(
         .ok_or_else(|| {
             error!("Model not specified in request");
             ApiError::BadRequest
-        })?;
+        })?
+        .to_string();
 
-    // Get the appropriate proxy configuration for this model
-    let proxy_config = state.proxy_router.get_proxy_for_model(model_name).await;
+    // Get the model route configuration
+    let model_route = state.proxy_router.get_model_route(&model_name).await;
 
-    let modified_body = Value::Object(modified_body);
-
-    // Use the proxy configuration for this specific model
-    let openai_api_key = proxy_config.api_key.as_deref().unwrap_or("");
-    let openai_api_base = &proxy_config.base_url;
+    let modified_body_json = Value::Object(modified_body);
 
     // Create a new hyper client with better timeout configuration
     let https = HttpsConnector::new();
@@ -110,97 +108,107 @@ async fn proxy_openai(
         .pool_max_idle_per_host(10)
         .build::<_, Body>(https);
 
-    // Prepare the request to OpenAI
-    let body_json = serde_json::to_string(&modified_body).map_err(|e| {
-        error!("Failed to serialize request body: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    // Prepare the request to proxies
+    debug!("Sending request for model: {}", model_name);
 
-    debug!("Sending request to OpenAI");
-
-    // Retry logic: 3 attempts with exponential backoff
-    let mut res = None;
-    let max_attempts = 3;
-
-    for attempt in 0..max_attempts {
-        if attempt > 0 {
-            let delay = attempt; // 1s after 1st failure, 2s after 2nd failure
-            debug!(
-                "Retrying request (attempt {} of {}) after {}s delay",
-                attempt + 1,
-                max_attempts,
-                delay
-            );
-            sleep(Duration::from_secs(delay)).await;
-        } else {
-            debug!("Making initial request (attempt 1 of {})", max_attempts);
-        }
-
-        // Build new request for each attempt
-        let mut req = Request::builder()
-            .method("POST")
-            .uri(format!("{}/v1/chat/completions", openai_api_base))
-            .header("Content-Type", "application/json");
-
-        if !openai_api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", openai_api_key));
-        }
-
-        // Forward relevant headers from the original request
-        for (key, value) in headers.iter() {
-            if key != header::HOST
-                && key != header::AUTHORIZATION
-                && key != header::CONTENT_LENGTH
-                && key != header::CONTENT_TYPE
-            {
-                if let (Ok(name), Ok(val)) = (
-                    HeaderName::from_bytes(key.as_ref()),
-                    HeaderValue::from_str(value.to_str().unwrap_or_default()),
-                ) {
-                    req = req.header(name, val);
-                }
-            }
-        }
-
-        let req = req.body(Body::from(body_json.clone())).map_err(|e| {
-            error!("Failed to create request body: {:?}", e);
+    // Try primary provider first, then fallbacks if configured
+    let res = if let Some(route) = model_route {
+        // We have a special route with potential fallbacks
+        debug!("Using model route for {}", model_name);
+        
+        let mut last_error: Option<String> = None;
+        
+        // Try primary provider first
+        let primary_model_name = state.proxy_router.get_model_name_for_provider(&model_name, &route.primary.provider_name);
+        let mut primary_body = modified_body_json.as_object().unwrap().clone();
+        primary_body.insert("model".to_string(), json!(primary_model_name));
+        let primary_body_json = serde_json::to_string(&Value::Object(primary_body)).map_err(|e| {
+            error!("Failed to serialize request body: {:?}", e);
             ApiError::InternalServerError
         })?;
-
-        match client.request(req).await {
+        
+        match try_provider_with_retries(
+            &client,
+            &route.primary,
+            &primary_body_json,
+            &headers,
+            3,
+        ).await {
             Ok(response) => {
-                if response.status().is_success() {
-                    res = Some(response);
-                    break;
-                } else if attempt == max_attempts - 1 {
-                    // Only log details on last attempt
-                    error!(
-                        "OpenAI API returned non-success status: {}",
-                        response.status()
-                    );
-                    debug!("Response headers: {:?}", response.headers());
-                    let body_bytes = to_bytes(response.into_body()).await.map_err(|e| {
-                        error!("Failed to read response body: {:?}", e);
+                info!("Successfully got response from primary provider {}", route.primary.provider_name);
+                response
+            }
+            Err(err) => {
+                error!("Primary provider {} failed: {:?}", route.primary.provider_name, err);
+                last_error = Some(err);
+                
+                // Try each fallback in order
+                let mut found_response = None;
+                for fallback_provider in &route.fallbacks {
+                    let fallback_model_name = state.proxy_router.get_model_name_for_provider(&model_name, &fallback_provider.provider_name);
+                    let mut fallback_body = modified_body_json.as_object().unwrap().clone();
+                    fallback_body.insert("model".to_string(), json!(fallback_model_name));
+                    let fallback_body_json = serde_json::to_string(&Value::Object(fallback_body)).map_err(|e| {
+                        error!("Failed to serialize fallback request body: {:?}", e);
                         ApiError::InternalServerError
                     })?;
-                    let body_str = String::from_utf8_lossy(&body_bytes);
-                    error!("Response body: {}", body_str);
+                    
+                    match try_provider_with_retries(
+                        &client,
+                        &fallback_provider,
+                        &fallback_body_json,
+                        &headers,
+                        3,
+                    ).await {
+                        Ok(response) => {
+                            info!("Successfully got response from fallback provider {}", fallback_provider.provider_name);
+                            found_response = Some(response);
+                            break;
+                        }
+                        Err(err) => {
+                            error!("Fallback provider {} failed: {:?}", fallback_provider.provider_name, err);
+                            last_error = Some(err);
+                        }
+                    }
                 }
-            }
-            Err(e) => {
-                if attempt == max_attempts - 1 {
-                    error!("Failed to send request to OpenAI: {:?}", e);
-                } else {
-                    debug!("Request failed on attempt {}: {:?}", attempt + 1, e);
+                
+                match found_response {
+                    Some(response) => response,
+                    None => {
+                        error!("All providers failed. Last error: {:?}", last_error);
+                        return Err(ApiError::InternalServerError);
+                    }
                 }
             }
         }
-    }
-
-    let res = res.ok_or_else(|| {
-        error!("All retry attempts failed");
-        ApiError::InternalServerError
-    })?;
+    } else {
+        // No special routing, use default proxy
+        let proxy_config = state.proxy_router.get_proxy_for_model(&model_name).await;
+        debug!("Using default proxy for model {}: {}", model_name, proxy_config.provider_name);
+        
+        // Get the correct model name for this provider
+        let provider_model_name = state.proxy_router.get_model_name_for_provider(&model_name, &proxy_config.provider_name);
+        let mut request_body = modified_body_json.as_object().unwrap().clone();
+        request_body.insert("model".to_string(), json!(provider_model_name));
+        let request_body_json = serde_json::to_string(&Value::Object(request_body)).map_err(|e| {
+            error!("Failed to serialize request body: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+        
+        match try_provider_with_retries(
+            &client,
+            &proxy_config,
+            &request_body_json,
+            &headers,
+            3,
+        ).await {
+            Ok(response) => response,
+            Err(e) => {
+                error!("Default provider failed: {:?}", e);
+                return Err(ApiError::InternalServerError);
+            }
+        }
+    };
 
     debug!("Successfully received response from OpenAI");
 
@@ -390,4 +398,119 @@ async fn proxy_models(
     debug!("Exiting proxy_models function");
     // Encrypt and return the response
     encrypt_response(&state, &session_id, &models_response).await
+}
+
+/// Helper function to try a provider with retries
+async fn try_provider_with_retries(
+    client: &Client<HttpsConnector<hyper::client::HttpConnector>>,
+    proxy_config: &ProxyConfig,
+    body_json: &str,
+    headers: &HeaderMap,
+    max_attempts: usize,
+) -> Result<hyper::Response<Body>, String> {
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            let delay = attempt as u64; // 1s after 1st failure, 2s after 2nd failure
+            debug!(
+                "Retrying request to {} (attempt {} of {}) after {}s delay",
+                proxy_config.provider_name,
+                attempt + 1,
+                max_attempts,
+                delay
+            );
+            sleep(Duration::from_secs(delay)).await;
+        } else {
+            debug!(
+                "Making initial request to {} (attempt 1 of {})",
+                proxy_config.provider_name, max_attempts
+            );
+        }
+
+        // Build new request for each attempt
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("{}/v1/chat/completions", proxy_config.base_url))
+            .header("Content-Type", "application/json");
+
+        if let Some(api_key) = &proxy_config.api_key {
+            if !api_key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", api_key));
+            }
+        }
+
+        // Forward relevant headers from the original request
+        for (key, value) in headers.iter() {
+            if key != header::HOST
+                && key != header::AUTHORIZATION
+                && key != header::CONTENT_LENGTH
+                && key != header::CONTENT_TYPE
+            {
+                if let (Ok(name), Ok(val)) = (
+                    HeaderName::from_bytes(key.as_ref()),
+                    HeaderValue::from_str(value.to_str().unwrap_or_default()),
+                ) {
+                    req = req.header(name, val);
+                }
+            }
+        }
+
+        let req = req
+            .body(Body::from(body_json.to_string()))
+            .map_err(|e| format!("Failed to create request body: {:?}", e))?;
+
+        match client.request(req).await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    return Ok(response);
+                } else if attempt == max_attempts - 1 {
+                    // Only log details on last attempt
+                    let status = response.status();
+                    error!(
+                        "Provider {} returned non-success status: {}",
+                        proxy_config.provider_name, status
+                    );
+                    debug!("Response headers: {:?}", response.headers());
+
+                    // Try to get error body for logging
+                    if let Ok(body_bytes) = to_bytes(response.into_body()).await {
+                        let body_str = String::from_utf8_lossy(&body_bytes);
+                        error!("Response body: {}", body_str);
+                        return Err(format!(
+                            "Provider {} returned status {}: {}",
+                            proxy_config.provider_name, status, body_str
+                        ));
+                    } else {
+                        return Err(format!(
+                            "Provider {} returned status {}",
+                            proxy_config.provider_name, status
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                if attempt == max_attempts - 1 {
+                    error!(
+                        "Failed to send request to {}: {:?}",
+                        proxy_config.provider_name, e
+                    );
+                    return Err(format!(
+                        "Failed to connect to {}: {}",
+                        proxy_config.provider_name, e
+                    ));
+                } else {
+                    debug!(
+                        "Request to {} failed on attempt {}: {:?}",
+                        proxy_config.provider_name,
+                        attempt + 1,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "All {} attempts failed for provider {}",
+        max_attempts, proxy_config.provider_name
+    ))
 }

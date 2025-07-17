@@ -427,6 +427,132 @@ impl ProxyRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
+
+    #[test]
+    fn test_get_model_equivalencies() {
+        let equivalencies = get_model_equivalencies();
+
+        // Should have at least one canonical model
+        assert!(!equivalencies.is_empty());
+
+        // Check Llama 3.3 70B mapping
+        let llama_mapping = equivalencies.get(CANONICAL_LLAMA_33_70B).unwrap();
+        assert_eq!(
+            llama_mapping.get("continuum"),
+            Some(&CONTINUUM_LLAMA_33_70B)
+        );
+        assert_eq!(llama_mapping.get("tinfoil"), Some(&TINFOIL_LLAMA_33_70B));
+    }
+
+    #[test]
+    fn test_models_cache_new_with_default() {
+        let cache = ModelsCache::new_with_default();
+
+        // Should start with empty models
+        assert!(cache.models_response.is_some());
+        let response = cache.models_response.as_ref().unwrap();
+        assert_eq!(response["object"], "list");
+        assert_eq!(response["data"].as_array().unwrap().len(), 0);
+
+        // Should be immediately expired
+        assert!(cache.is_expired());
+        assert!(cache.model_to_proxy.is_empty());
+        assert!(cache.model_routes.is_empty());
+    }
+
+    #[test]
+    fn test_models_cache_update_and_expiry() {
+        let mut cache = ModelsCache::new_with_default();
+
+        // Update cache
+        let test_models = serde_json::json!({
+            "object": "list",
+            "data": [{"id": "test-model"}]
+        });
+        let mut model_to_proxy = HashMap::new();
+        model_to_proxy.insert(
+            "test-model".to_string(),
+            ProxyConfig {
+                base_url: "http://test".to_string(),
+                api_key: None,
+                provider_name: "test".to_string(),
+            },
+        );
+        let model_routes = HashMap::new();
+
+        cache.update(
+            test_models.clone(),
+            model_to_proxy.clone(),
+            model_routes.clone(),
+        );
+
+        // Should not be expired immediately after update
+        assert!(!cache.is_expired());
+        assert_eq!(cache.models_response, Some(test_models));
+        assert_eq!(cache.model_to_proxy.len(), 1);
+
+        // Test that expiry is set to 5 minutes in the future
+        let expected_expiry = Utc::now() + Duration::minutes(5);
+        let time_diff = cache
+            .expires_at
+            .signed_duration_since(expected_expiry)
+            .num_seconds()
+            .abs();
+        assert!(time_diff <= 1); // Allow 1 second tolerance
+    }
+
+    #[test]
+    fn test_proxy_router_new_configurations() {
+        // Test with OpenAI configuration
+        let router = ProxyRouter::new(
+            "https://api.openai.com".to_string(),
+            Some("test-key".to_string()),
+            None,
+        );
+        assert_eq!(router.default_proxy.provider_name, "openai");
+        assert_eq!(router.default_proxy.api_key, Some("test-key".to_string()));
+        assert!(router.tinfoil_proxy.is_none());
+
+        // Test with Continuum configuration
+        let router = ProxyRouter::new(
+            "http://continuum.example.com".to_string(),
+            Some("test-key".to_string()),
+            None,
+        );
+        assert_eq!(router.default_proxy.provider_name, "continuum");
+        assert_eq!(router.default_proxy.api_key, None); // Continuum doesn't use API key
+
+        // Test with Tinfoil configuration
+        let router = ProxyRouter::new(
+            "http://continuum.example.com".to_string(),
+            None,
+            Some("http://tinfoil.example.com".to_string()),
+        );
+        assert!(router.tinfoil_proxy.is_some());
+        let tinfoil = router.tinfoil_proxy.as_ref().unwrap();
+        assert_eq!(tinfoil.provider_name, "tinfoil");
+        assert_eq!(tinfoil.base_url, "http://tinfoil.example.com");
+        assert_eq!(tinfoil.api_key, None);
+    }
+
+    #[test]
+    fn test_get_tinfoil_base_url() {
+        // Without Tinfoil
+        let router = ProxyRouter::new("http://continuum.example.com".to_string(), None, None);
+        assert_eq!(router.get_tinfoil_base_url(), None);
+
+        // With Tinfoil
+        let router = ProxyRouter::new(
+            "http://continuum.example.com".to_string(),
+            None,
+            Some("http://tinfoil.example.com".to_string()),
+        );
+        assert_eq!(
+            router.get_tinfoil_base_url(),
+            Some("http://tinfoil.example.com".to_string())
+        );
+    }
 
     #[tokio::test]
     async fn test_proxy_router_default() {
@@ -505,5 +631,63 @@ mod tests {
             router.get_model_name_for_provider("gpt-4", "tinfoil"),
             "gpt-4"
         );
+    }
+
+    #[test]
+    fn test_model_route_structure() {
+        // Test that ModelRoute can be created and cloned
+        let primary = ProxyConfig {
+            base_url: "http://primary.com".to_string(),
+            api_key: Some("key".to_string()),
+            provider_name: "primary".to_string(),
+        };
+        let fallback = ProxyConfig {
+            base_url: "http://fallback.com".to_string(),
+            api_key: None,
+            provider_name: "fallback".to_string(),
+        };
+
+        let route = ModelRoute {
+            primary: primary.clone(),
+            fallbacks: vec![fallback.clone()],
+        };
+
+        // Test clone
+        let cloned_route = route.clone();
+        assert_eq!(cloned_route.primary.provider_name, "primary");
+        assert_eq!(cloned_route.fallbacks.len(), 1);
+        assert_eq!(cloned_route.fallbacks[0].provider_name, "fallback");
+    }
+
+    #[test]
+    fn test_proxy_config_debug_trait() {
+        // Test that ProxyConfig implements Debug properly
+        let config = ProxyConfig {
+            base_url: "http://test.com".to_string(),
+            api_key: Some("secret".to_string()),
+            provider_name: "test".to_string(),
+        };
+
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("test.com"));
+        assert!(debug_str.contains("test"));
+        // Should contain api_key but we're not testing the exact format
+        assert!(debug_str.contains("api_key"));
+    }
+
+    #[tokio::test]
+    async fn test_get_proxy_for_model_with_cache() {
+        let router = ProxyRouter::new(
+            "http://continuum.example.com".to_string(),
+            None,
+            Some("http://tinfoil.example.com".to_string()),
+        );
+
+        // Before cache is populated, should return default proxy
+        let proxy = router.get_proxy_for_model("unknown-model").await;
+        assert_eq!(proxy.provider_name, "continuum");
+
+        // Test that cache is checked (this is implementation detail but good to verify)
+        // The actual cache population would happen via refresh_cache which requires HTTP mocking
     }
 }

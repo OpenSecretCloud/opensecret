@@ -219,7 +219,7 @@ async fn proxy_openai(
             Some(response) => response,
             None => {
                 error!(
-                    "All providers failed after {} cycles for model {}. Last error: {:?}",
+                    "OpenAI API returned non-success status: All providers failed after {} cycles for model {}. Last error: {:?}",
                     max_cycles, model_name, last_error
                 );
                 return Err(ApiError::InternalServerError);
@@ -286,7 +286,7 @@ async fn proxy_openai(
         match found_response {
             Some(response) => response,
             None => {
-                error!("Default provider failed after 3 attempts: {:?}", last_error);
+                error!("OpenAI API returned non-success status: Default provider failed after 3 attempts: {:?}", last_error);
                 return Err(ApiError::InternalServerError);
             }
         }

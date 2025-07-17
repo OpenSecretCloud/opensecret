@@ -108,28 +108,27 @@ impl ProxyRouter {
     ) -> String {
         let equivalencies = get_model_equivalencies();
 
-        // First check if this is already a provider-specific name
-        for provider_names in equivalencies.values() {
-            if let Some((_, model_name)) = provider_names
-                .iter()
-                .find(|(p, m)| **p == provider_name && **m == canonical_model)
-            {
-                return model_name.to_string();
+        // Direct lookup: check if input is a canonical name with a mapping
+        if let Some(provider_map) = equivalencies.get(canonical_model) {
+            if let Some(provider_specific_name) = provider_map.get(provider_name) {
+                return provider_specific_name.to_string();
             }
         }
 
-        // Then check if we need to translate
-        for provider_names in equivalencies.values() {
-            // Check if the canonical model matches any known model
-            if provider_names.values().any(|m| *m == canonical_model) {
-                // Found it, now get the name for the requested provider
-                if let Some(name) = provider_names.get(provider_name) {
-                    return name.to_string();
+        // Reverse lookup: check if input is already a provider-specific name
+        for (canonical_name, provider_map) in &equivalencies {
+            // If this model name exists in any provider's mapping
+            if provider_map.values().any(|name| *name == canonical_model) {
+                // Return the name for the requested provider
+                if let Some(provider_specific_name) = provider_map.get(provider_name) {
+                    return provider_specific_name.to_string();
                 }
+                // If the requested provider doesn't have this model, return canonical
+                return canonical_name.to_string();
             }
         }
 
-        // No translation needed
+        // No translation needed - return as-is
         canonical_model.to_string()
     }
 
@@ -305,6 +304,11 @@ impl ProxyRouter {
             }
         }
 
+        // Note: If adding a third provider in the future, consider deduplicating models
+        // by ID to prevent duplicates in the all_models list. Currently not needed as:
+        // 1. We control Tinfoil proxy and ensure no duplicates
+        // 2. Continuum models are filtered for known equivalencies
+        // 3. Only two providers exist currently
         let models_response = serde_json::json!({
             "object": "list",
             "data": all_models
@@ -456,6 +460,50 @@ mod tests {
         assert_eq!(
             router.get_tinfoil_base_url(),
             Some("http://127.0.0.1:8093".to_string())
+        );
+    }
+
+    #[test]
+    fn test_model_name_translation() {
+        let router = ProxyRouter::new(
+            "http://127.0.0.1:8092".to_string(),
+            None,
+            Some("http://127.0.0.1:8093".to_string()),
+        );
+
+        // Test canonical name -> provider specific
+        assert_eq!(
+            router.get_model_name_for_provider("llama-3.3-70b", "tinfoil"),
+            "llama3-3-70b"
+        );
+        assert_eq!(
+            router.get_model_name_for_provider("llama-3.3-70b", "continuum"),
+            "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"
+        );
+
+        // Test provider specific -> same provider (should return as-is)
+        assert_eq!(
+            router.get_model_name_for_provider("llama3-3-70b", "tinfoil"),
+            "llama3-3-70b"
+        );
+
+        // Test provider specific -> different provider (should translate)
+        assert_eq!(
+            router.get_model_name_for_provider("llama3-3-70b", "continuum"),
+            "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"
+        );
+        assert_eq!(
+            router.get_model_name_for_provider(
+                "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4",
+                "tinfoil"
+            ),
+            "llama3-3-70b"
+        );
+
+        // Test unknown model (should return as-is)
+        assert_eq!(
+            router.get_model_name_for_provider("gpt-4", "tinfoil"),
+            "gpt-4"
         );
     }
 }

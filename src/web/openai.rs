@@ -111,12 +111,12 @@ async fn proxy_openai(
     // Prepare the request to proxies
     debug!("Sending request for model: {}", model_name);
 
-    // Try primary provider first, then fallbacks if configured
+    // Try providers with cycling between primary and fallback
     let res = if let Some(route) = model_route {
         // We have a special route with potential fallbacks
         debug!("Using model route for {}", model_name);
 
-        // Try primary provider first
+        // Prepare request bodies for all providers
         let primary_model_name = state
             .proxy_router
             .get_model_name_for_provider(&model_name, &route.primary.provider_name);
@@ -128,73 +128,105 @@ async fn proxy_openai(
                 ApiError::InternalServerError
             })?;
 
-        match try_provider_with_retries(&client, &route.primary, &primary_body_json, &headers, 3)
-            .await
-        {
-            Ok(response) => {
-                info!(
-                    "Successfully got response from primary provider {}",
-                    route.primary.provider_name
-                );
-                response
+        // Prepare fallback request if available
+        let fallback_request = if let Some(fallback) = route.fallbacks.first() {
+            let fallback_model_name = state
+                .proxy_router
+                .get_model_name_for_provider(&model_name, &fallback.provider_name);
+            let mut fallback_body = modified_body_json.as_object().unwrap().clone();
+            fallback_body.insert("model".to_string(), json!(fallback_model_name));
+            let fallback_body_json =
+                serde_json::to_string(&Value::Object(fallback_body)).map_err(|e| {
+                    error!("Failed to serialize fallback request body: {:?}", e);
+                    ApiError::InternalServerError
+                })?;
+            Some((fallback, fallback_body_json))
+        } else {
+            None
+        };
+
+        // Try cycling between primary and fallback up to 3 times each
+        let max_cycles = 3;
+        let mut last_error = None;
+        let mut found_response = None;
+
+        for cycle in 0..max_cycles {
+            if cycle > 0 {
+                // Add delay between cycles (1s after first cycle, 2s after second)
+                let delay = cycle as u64;
+                debug!("Starting cycle {} after {}s delay", cycle + 1, delay);
+                sleep(Duration::from_secs(delay)).await;
             }
-            Err(primary_err) => {
-                error!(
-                    "Primary provider {} failed: {:?}",
-                    route.primary.provider_name, primary_err
-                );
 
-                // Try each fallback in order
-                let mut found_response = None;
-                for fallback_provider in &route.fallbacks {
-                    let fallback_model_name = state
-                        .proxy_router
-                        .get_model_name_for_provider(&model_name, &fallback_provider.provider_name);
-                    let mut fallback_body = modified_body_json.as_object().unwrap().clone();
-                    fallback_body.insert("model".to_string(), json!(fallback_model_name));
-                    let fallback_body_json = serde_json::to_string(&Value::Object(fallback_body))
-                        .map_err(|e| {
-                        error!("Failed to serialize fallback request body: {:?}", e);
-                        ApiError::InternalServerError
-                    })?;
-
-                    match try_provider_with_retries(
-                        &client,
-                        fallback_provider,
-                        &fallback_body_json,
-                        &headers,
-                        3,
-                    )
-                    .await
-                    {
-                        Ok(response) => {
-                            info!(
-                                "Successfully got response from fallback provider {}",
-                                fallback_provider.provider_name
-                            );
-                            found_response = Some(response);
-                            break;
-                        }
-                        Err(err) => {
-                            error!(
-                                "Fallback provider {} failed: {:?}",
-                                fallback_provider.provider_name, err
-                            );
-                        }
-                    }
+            // Try primary
+            debug!(
+                "Cycle {}: Trying primary provider {}",
+                cycle + 1,
+                route.primary.provider_name
+            );
+            match try_provider(&client, &route.primary, &primary_body_json, &headers).await {
+                Ok(response) => {
+                    info!(
+                        "Successfully got response from primary provider {} on cycle {}",
+                        route.primary.provider_name,
+                        cycle + 1
+                    );
+                    found_response = Some(response);
+                    break;
                 }
+                Err(err) => {
+                    error!(
+                        "Cycle {}: Primary provider {} failed: {:?}",
+                        cycle + 1,
+                        route.primary.provider_name,
+                        err
+                    );
+                    last_error = Some(err);
+                }
+            }
 
-                match found_response {
-                    Some(response) => response,
-                    None => {
-                        error!("All providers failed for model {}", model_name);
-                        return Err(ApiError::InternalServerError);
+            // Try fallback if available
+            if let Some((fallback_provider, ref fallback_body_json)) = fallback_request {
+                debug!(
+                    "Cycle {}: Trying fallback provider {}",
+                    cycle + 1,
+                    fallback_provider.provider_name
+                );
+                match try_provider(&client, fallback_provider, fallback_body_json, &headers).await {
+                    Ok(response) => {
+                        info!(
+                            "Successfully got response from fallback provider {} on cycle {}",
+                            fallback_provider.provider_name,
+                            cycle + 1
+                        );
+                        found_response = Some(response);
+                        break;
+                    }
+                    Err(err) => {
+                        error!(
+                            "Cycle {}: Fallback provider {} failed: {:?}",
+                            cycle + 1,
+                            fallback_provider.provider_name,
+                            err
+                        );
+                        last_error = Some(err);
                     }
                 }
             }
         }
+
+        match found_response {
+            Some(response) => response,
+            None => {
+                error!(
+                    "All providers failed after {} cycles for model {}. Last error: {:?}",
+                    max_cycles, model_name, last_error
+                );
+                return Err(ApiError::InternalServerError);
+            }
+        }
     } else {
-        // No special routing, use default proxy
+        // No special routing, use default proxy with retries
         let proxy_config = state.proxy_router.get_proxy_for_model(&model_name).await;
         debug!(
             "Using default proxy for model {}: {}",
@@ -213,12 +245,48 @@ async fn proxy_openai(
                 ApiError::InternalServerError
             })?;
 
-        match try_provider_with_retries(&client, &proxy_config, &request_body_json, &headers, 3)
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                error!("Default provider failed: {:?}", e);
+        // Try up to 3 times with delays
+        let mut last_error = None;
+        let mut found_response = None;
+
+        for attempt in 0..3 {
+            if attempt > 0 {
+                let delay = attempt as u64;
+                debug!(
+                    "Retrying request to {} (attempt {}) after {}s delay",
+                    proxy_config.provider_name,
+                    attempt + 1,
+                    delay
+                );
+                sleep(Duration::from_secs(delay)).await;
+            }
+
+            match try_provider(&client, &proxy_config, &request_body_json, &headers).await {
+                Ok(response) => {
+                    info!(
+                        "Successfully got response from {} on attempt {}",
+                        proxy_config.provider_name,
+                        attempt + 1
+                    );
+                    found_response = Some(response);
+                    break;
+                }
+                Err(err) => {
+                    error!(
+                        "Attempt {}: Provider {} failed: {:?}",
+                        attempt + 1,
+                        proxy_config.provider_name,
+                        err
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        match found_response {
+            Some(response) => response,
+            None => {
+                error!("Default provider failed after 3 attempts: {:?}", last_error);
                 return Err(ApiError::InternalServerError);
             }
         }
@@ -414,117 +482,84 @@ async fn proxy_models(
     encrypt_response(&state, &session_id, &models_response).await
 }
 
-/// Helper function to try a provider with retries
-async fn try_provider_with_retries(
+/// Helper function to try a provider once
+async fn try_provider(
     client: &Client<HttpsConnector<hyper::client::HttpConnector>>,
     proxy_config: &ProxyConfig,
     body_json: &str,
     headers: &HeaderMap,
-    max_attempts: usize,
 ) -> Result<hyper::Response<Body>, String> {
-    for attempt in 0..max_attempts {
-        if attempt > 0 {
-            let delay = attempt as u64; // 1s after 1st failure, 2s after 2nd failure
-            debug!(
-                "Retrying request to {} (attempt {} of {}) after {}s delay",
-                proxy_config.provider_name,
-                attempt + 1,
-                max_attempts,
-                delay
-            );
-            sleep(Duration::from_secs(delay)).await;
-        } else {
-            debug!(
-                "Making initial request to {} (attempt 1 of {})",
-                proxy_config.provider_name, max_attempts
-            );
+    debug!("Making request to {}", proxy_config.provider_name);
+
+    // Build request
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(format!("{}/v1/chat/completions", proxy_config.base_url))
+        .header("Content-Type", "application/json");
+
+    if let Some(api_key) = &proxy_config.api_key {
+        if !api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", api_key));
         }
+    }
 
-        // Build new request for each attempt
-        let mut req = Request::builder()
-            .method("POST")
-            .uri(format!("{}/v1/chat/completions", proxy_config.base_url))
-            .header("Content-Type", "application/json");
-
-        if let Some(api_key) = &proxy_config.api_key {
-            if !api_key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", api_key));
-            }
-        }
-
-        // Forward relevant headers from the original request
-        for (key, value) in headers.iter() {
-            if key != header::HOST
-                && key != header::AUTHORIZATION
-                && key != header::CONTENT_LENGTH
-                && key != header::CONTENT_TYPE
-            {
-                if let (Ok(name), Ok(val)) = (
-                    HeaderName::from_bytes(key.as_ref()),
-                    HeaderValue::from_str(value.to_str().unwrap_or_default()),
-                ) {
-                    req = req.header(name, val);
-                }
-            }
-        }
-
-        let req = req
-            .body(Body::from(body_json.to_string()))
-            .map_err(|e| format!("Failed to create request body: {:?}", e))?;
-
-        match client.request(req).await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    return Ok(response);
-                } else if attempt == max_attempts - 1 {
-                    // Only log details on last attempt
-                    let status = response.status();
-                    error!(
-                        "Provider {} returned non-success status: {}",
-                        proxy_config.provider_name, status
-                    );
-                    debug!("Response headers: {:?}", response.headers());
-
-                    // Try to get error body for logging
-                    if let Ok(body_bytes) = to_bytes(response.into_body()).await {
-                        let body_str = String::from_utf8_lossy(&body_bytes);
-                        error!("Response body: {}", body_str);
-                        return Err(format!(
-                            "Provider {} returned status {}: {}",
-                            proxy_config.provider_name, status, body_str
-                        ));
-                    } else {
-                        return Err(format!(
-                            "Provider {} returned status {}",
-                            proxy_config.provider_name, status
-                        ));
-                    }
-                }
-            }
-            Err(e) => {
-                if attempt == max_attempts - 1 {
-                    error!(
-                        "Failed to send request to {}: {:?}",
-                        proxy_config.provider_name, e
-                    );
-                    return Err(format!(
-                        "Failed to connect to {}: {}",
-                        proxy_config.provider_name, e
-                    ));
-                } else {
-                    debug!(
-                        "Request to {} failed on attempt {}: {:?}",
-                        proxy_config.provider_name,
-                        attempt + 1,
-                        e
-                    );
-                }
+    // Forward relevant headers from the original request
+    for (key, value) in headers.iter() {
+        if key != header::HOST
+            && key != header::AUTHORIZATION
+            && key != header::CONTENT_LENGTH
+            && key != header::CONTENT_TYPE
+        {
+            if let (Ok(name), Ok(val)) = (
+                HeaderName::from_bytes(key.as_ref()),
+                HeaderValue::from_str(value.to_str().unwrap_or_default()),
+            ) {
+                req = req.header(name, val);
             }
         }
     }
 
-    Err(format!(
-        "All {} attempts failed for provider {}",
-        max_attempts, proxy_config.provider_name
-    ))
+    let req = req
+        .body(Body::from(body_json.to_string()))
+        .map_err(|e| format!("Failed to create request body: {:?}", e))?;
+
+    match client.request(req).await {
+        Ok(response) => {
+            if response.status().is_success() {
+                Ok(response)
+            } else {
+                let status = response.status();
+                error!(
+                    "Provider {} returned non-success status: {}",
+                    proxy_config.provider_name, status
+                );
+                debug!("Response headers: {:?}", response.headers());
+
+                // Try to get error body for logging
+                if let Ok(body_bytes) = to_bytes(response.into_body()).await {
+                    let body_str = String::from_utf8_lossy(&body_bytes);
+                    error!("Response body: {}", body_str);
+                    Err(format!(
+                        "Provider {} returned status {}: {}",
+                        proxy_config.provider_name, status, body_str
+                    ))
+                } else {
+                    Err(format!(
+                        "Provider {} returned status {}",
+                        proxy_config.provider_name, status
+                    ))
+                }
+            }
+        }
+        Err(e) => {
+            error!(
+                "Failed to send request to {}: {:?}",
+                proxy_config.provider_name, e
+            );
+            Err(format!(
+                "Failed to connect to {}: {}",
+                proxy_config.provider_name, e
+            ))
+        }
+    }
 }

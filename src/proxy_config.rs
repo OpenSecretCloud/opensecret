@@ -8,19 +8,22 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-const DEFAULT_CONTINUUM_MODEL: &str = "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4";
+// Model name constants
+const CONTINUUM_LLAMA_33_70B: &str = "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4";
+const TINFOIL_LLAMA_33_70B: &str = "llama3-3-70b";
+const CANONICAL_LLAMA_33_70B: &str = "llama-3.3-70b";
 
 /// Known model equivalencies across providers
 /// This maps a canonical model identifier to provider-specific names
 fn get_model_equivalencies() -> HashMap<&'static str, HashMap<&'static str, &'static str>> {
     let mut equivalencies = HashMap::new();
-    
+
     // Llama 3.3 70B
     let mut llama_33_70b = HashMap::new();
-    llama_33_70b.insert("continuum", DEFAULT_CONTINUUM_MODEL);
-    llama_33_70b.insert("tinfoil", "llama3-3-70b");
-    equivalencies.insert("llama-3.3-70b", llama_33_70b);
-    
+    llama_33_70b.insert("continuum", CONTINUUM_LLAMA_33_70B);
+    llama_33_70b.insert("tinfoil", TINFOIL_LLAMA_33_70B);
+    equivalencies.insert(CANONICAL_LLAMA_33_70B, llama_33_70b);
+
     equivalencies
 }
 
@@ -32,7 +35,6 @@ pub struct ModelRoute {
     /// Optional fallback providers in order of preference
     pub fallbacks: Vec<ProxyConfig>,
 }
-
 
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
@@ -56,17 +58,10 @@ struct ModelsCache {
 
 impl ModelsCache {
     fn new_with_default() -> Self {
-        // Default Continuum model that should always be available
-        let default_model = serde_json::json!({
-            "id": DEFAULT_CONTINUUM_MODEL,
-            "object": "model",
-            "created": 1700000000,
-            "owned_by": "continuum"
-        });
-
+        // Start with empty cache
         let models_response = serde_json::json!({
             "object": "list",
-            "data": [default_model]
+            "data": []
         });
 
         Self {
@@ -100,24 +95,29 @@ pub struct ProxyRouter {
     cache: Arc<RwLock<ModelsCache>>,
     // Default proxy if model not found
     default_proxy: ProxyConfig,
-    // Additional proxy configurations (e.g., tinfoil)
-    additional_proxies: Vec<ProxyConfig>,
     // Tinfoil proxy configuration if configured
     tinfoil_proxy: Option<ProxyConfig>,
 }
 
 impl ProxyRouter {
     /// Get the provider-specific model name for a given canonical model
-    pub fn get_model_name_for_provider(&self, canonical_model: &str, provider_name: &str) -> String {
+    pub fn get_model_name_for_provider(
+        &self,
+        canonical_model: &str,
+        provider_name: &str,
+    ) -> String {
         let equivalencies = get_model_equivalencies();
-        
+
         // First check if this is already a provider-specific name
         for provider_names in equivalencies.values() {
-            if let Some((_, model_name)) = provider_names.iter().find(|(p, m)| **p == provider_name && **m == canonical_model) {
+            if let Some((_, model_name)) = provider_names
+                .iter()
+                .find(|(p, m)| **p == provider_name && **m == canonical_model)
+            {
                 return model_name.to_string();
             }
         }
-        
+
         // Then check if we need to translate
         for provider_names in equivalencies.values() {
             // Check if the canonical model matches any known model
@@ -128,7 +128,7 @@ impl ProxyRouter {
                 }
             }
         }
-        
+
         // No translation needed
         canonical_model.to_string()
     }
@@ -162,16 +162,9 @@ impl ProxyRouter {
             provider_name: "tinfoil".to_string(),
         });
 
-        // Collect additional proxies
-        let mut additional_proxies = Vec::new();
-        if let Some(ref tp) = tinfoil_proxy {
-            additional_proxies.push(tp.clone());
-        }
-
         ProxyRouter {
             cache,
             default_proxy,
-            additional_proxies,
             tinfoil_proxy,
         }
     }
@@ -229,86 +222,86 @@ impl ProxyRouter {
 
         let mut all_models = Vec::new();
         let mut model_to_proxy = HashMap::new();
-        let mut fetched_proxies = HashMap::new();
         let mut available_models_by_provider: HashMap<String, Vec<String>> = HashMap::new();
+        let mut tinfoil_models = HashMap::new();
 
-        // Always include the default Continuum model
-        let default_continuum_model = serde_json::json!({
-            "id": DEFAULT_CONTINUUM_MODEL,
-            "object": "model",
-            "created": 1700000000,
-            "owned_by": "continuum"
-        });
-        all_models.push(default_continuum_model);
+        // First, fetch from Tinfoil if configured - these will be primary
+        if let Some(ref tinfoil_proxy) = self.tinfoil_proxy {
+            match self.fetch_models_from_proxy(&client, tinfoil_proxy).await {
+                Ok(models) => {
+                    let mut provider_models = Vec::new();
 
-        // First, fetch from the default proxy
+                    for model in &models {
+                        if let Some(model_id) = model.get("id").and_then(|v| v.as_str()) {
+                            provider_models.push(model_id.to_string());
+                            tinfoil_models.insert(model_id.to_string(), model.clone());
+
+                            debug!("Tinfoil model '{}' will be primary", model_id);
+                            model_to_proxy.insert(model_id.to_string(), tinfoil_proxy.clone());
+                        }
+                    }
+
+                    all_models.extend(models);
+                    available_models_by_provider.insert("tinfoil".to_string(), provider_models);
+                    info!("Fetched {} models from Tinfoil", tinfoil_models.len());
+                }
+                Err(e) => {
+                    warn!("Failed to fetch models from Tinfoil: {:?}", e);
+                    available_models_by_provider.insert("tinfoil".to_string(), Vec::new());
+                }
+            }
+        }
+
+        // Then fetch from Continuum - only primary if not available from Tinfoil
         match self
             .fetch_models_from_proxy(&client, &self.default_proxy)
             .await
         {
-            Ok(mut models) => {
+            Ok(models) => {
                 let mut provider_models = Vec::new();
 
-                // Remove duplicate of default model if it exists
-                models.retain(|m| {
-                    if let Some(model_id) = m.get("id").and_then(|v| v.as_str()) {
+                for model in &models {
+                    if let Some(model_id) = model.get("id").and_then(|v| v.as_str()) {
                         provider_models.push(model_id.to_string());
-                        model_id != DEFAULT_CONTINUUM_MODEL
-                    } else {
-                        true
-                    }
-                });
 
-                // Track continuum models
-                available_models_by_provider
-                    .insert(self.default_proxy.provider_name.clone(), provider_models);
+                        // Check if this is equivalent to any Tinfoil model
+                        let mut is_equivalent_to_tinfoil = false;
+                        let equivalencies = get_model_equivalencies();
 
-                all_models.extend(models);
-                fetched_proxies.insert(self.default_proxy.base_url.clone(), true);
-                // Note: We don't add default proxy models to model_to_proxy map
-                // because they use the default proxy by default
-            }
-            Err(e) => {
-                warn!("Failed to fetch models from default proxy: {:?}", e);
-                available_models_by_provider
-                    .insert(self.default_proxy.provider_name.clone(), Vec::new());
-            }
-        }
-
-        // Then fetch from any unique additional proxies (like tinfoil)
-        for proxy_config in &self.additional_proxies {
-            if !fetched_proxies.contains_key(&proxy_config.base_url) {
-                match self.fetch_models_from_proxy(&client, proxy_config).await {
-                    Ok(models) => {
-                        let mut provider_models = Vec::new();
-
-                        all_models.extend(models.clone());
-                        fetched_proxies.insert(proxy_config.base_url.clone(), true);
-
-                        // Add these models to the routing map
-                        for model in &models {
-                            if let Some(model_id) = model.get("id").and_then(|v| v.as_str()) {
-                                provider_models.push(model_id.to_string());
-                                debug!(
-                                    "Mapped model '{}' to proxy {}",
-                                    model_id, proxy_config.base_url
-                                );
-                                model_to_proxy.insert(model_id.to_string(), proxy_config.clone());
+                        for provider_names in equivalencies.values() {
+                            if let (Some(continuum_name), Some(tinfoil_name)) = (
+                                provider_names.get("continuum"),
+                                provider_names.get("tinfoil"),
+                            ) {
+                                if *continuum_name == model_id
+                                    && tinfoil_models.contains_key(*tinfoil_name)
+                                {
+                                    is_equivalent_to_tinfoil = true;
+                                    debug!("Continuum model '{}' is equivalent to Tinfoil model '{}' - will be fallback", 
+                                           model_id, tinfoil_name);
+                                    break;
+                                }
                             }
                         }
 
-                        available_models_by_provider
-                            .insert(proxy_config.provider_name.clone(), provider_models);
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to fetch models from proxy {}: {:?}",
-                            proxy_config.base_url, e
-                        );
-                        available_models_by_provider
-                            .insert(proxy_config.provider_name.clone(), Vec::new());
+                        // Only add to all_models if not equivalent to a Tinfoil model
+                        if !is_equivalent_to_tinfoil {
+                            all_models.push(model.clone());
+                            debug!(
+                                "Continuum model '{}' will be primary (no Tinfoil equivalent)",
+                                model_id
+                            );
+                        }
                     }
                 }
+
+                let model_count = provider_models.len();
+                available_models_by_provider.insert("continuum".to_string(), provider_models);
+                info!("Fetched {} models from Continuum", model_count);
+            }
+            Err(e) => {
+                warn!("Failed to fetch models from Continuum: {:?}", e);
+                available_models_by_provider.insert("continuum".to_string(), Vec::new());
             }
         }
 
@@ -317,81 +310,42 @@ impl ProxyRouter {
             "data": all_models
         });
 
-        // Build model routes dynamically based on what's available
+        // Build model routes - simpler approach based on our new fetching order
         let mut model_routes = HashMap::new();
         let model_equivalencies = get_model_equivalencies();
 
-        // For each known model equivalency, check which providers have it
-        for (canonical_name, provider_names) in &model_equivalencies {
-            let mut providers_with_model = Vec::new();
-            
-            // Check each provider
-            for (provider, model_name) in provider_names {
-                if let Some(models) = available_models_by_provider.get(*provider) {
-                    if models.contains(&model_name.to_string()) {
-                        providers_with_model.push((*provider, *model_name));
+        // For each known equivalency, check if we have both providers
+        for provider_names in model_equivalencies.values() {
+            let tinfoil_model = provider_names.get("tinfoil");
+            let continuum_model = provider_names.get("continuum");
+
+            if let (Some(tinfoil_name), Some(continuum_name)) = (tinfoil_model, continuum_model) {
+                // Check if both providers have their respective models
+                let tinfoil_has_it = available_models_by_provider
+                    .get("tinfoil")
+                    .map(|models| models.contains(&tinfoil_name.to_string()))
+                    .unwrap_or(false);
+
+                let continuum_has_it = available_models_by_provider
+                    .get("continuum")
+                    .map(|models| models.contains(&continuum_name.to_string()))
+                    .unwrap_or(false);
+
+                if tinfoil_has_it && continuum_has_it {
+                    // Both have it - Tinfoil primary, Continuum fallback
+                    if let Some(ref tinfoil_proxy) = self.tinfoil_proxy {
+                        info!("Model available from both providers - Tinfoil ({}) primary, Continuum ({}) fallback", 
+                              tinfoil_name, continuum_name);
+
+                        let route = ModelRoute {
+                            primary: tinfoil_proxy.clone(),
+                            fallbacks: vec![self.default_proxy.clone()],
+                        };
+
+                        // Map both names to this route
+                        model_routes.insert(tinfoil_name.to_string(), route.clone());
+                        model_routes.insert(continuum_name.to_string(), route);
                     }
-                }
-            }
-            
-            // If multiple providers have this model, set up routing with fallback
-            if providers_with_model.len() > 1 {
-                // For now, prioritize tinfoil over continuum for shared models
-                let primary_provider = if providers_with_model.iter().any(|(p, _)| *p == "tinfoil") {
-                    "tinfoil"
-                } else {
-                    providers_with_model.get(0).map(|(p, _)| *p).unwrap_or("continuum")
-                };
-                
-                let fallback_provider = if primary_provider == "tinfoil" {
-                    "continuum"
-                } else {
-                    "tinfoil"
-                };
-                
-                // Get proxy configs
-                let primary_proxy = if primary_provider == "tinfoil" {
-                    self.tinfoil_proxy.as_ref()
-                } else {
-                    Some(&self.default_proxy)
-                };
-                
-                let fallback_proxy = if fallback_provider == "tinfoil" {
-                    self.tinfoil_proxy.as_ref()
-                } else {
-                    Some(&self.default_proxy)
-                };
-                
-                if let (Some(primary), Some(fallback)) = (primary_proxy, fallback_proxy) {
-                    info!(
-                        "Model {} available from multiple providers - {} (primary) and {} (fallback)",
-                        canonical_name, primary_provider, fallback_provider
-                    );
-                    
-                    // Build list of providers in order (tinfoil first if available)
-                    let mut ordered_providers = Vec::new();
-                    if primary_provider == "tinfoil" {
-                        ordered_providers.push(primary.clone());
-                        ordered_providers.push(fallback.clone());
-                    } else {
-                        ordered_providers.push(fallback.clone());
-                        ordered_providers.push(primary.clone());
-                    }
-                    
-                    let route = ModelRoute {
-                        primary: ordered_providers[0].clone(),
-                        fallbacks: vec![ordered_providers[1].clone()],
-                    };
-                    
-                    // Map all provider-specific names to this route
-                    for (_, model_name) in &providers_with_model {
-                        model_routes.insert(model_name.to_string(), route.clone());
-                    }
-                }
-            } else if providers_with_model.len() == 1 {
-                // Single provider - no special routing needed
-                if let Some((provider, _)) = providers_with_model.get(0) {
-                    info!("Model {} only available from {}", canonical_name, provider);
                 }
             }
         }
@@ -497,9 +451,11 @@ mod tests {
         assert_eq!(proxy.base_url, "http://127.0.0.1:8092");
         assert!(proxy.api_key.is_none());
 
-        // Verify providers were configured
-        assert_eq!(router.providers.len(), 2);
-        assert!(router.providers.contains_key("continuum"));
-        assert!(router.providers.contains_key("tinfoil"));
+        // Verify Tinfoil proxy was configured
+        assert!(router.tinfoil_proxy.is_some());
+        assert_eq!(
+            router.get_tinfoil_base_url(),
+            Some("http://127.0.0.1:8093".to_string())
+        );
     }
 }

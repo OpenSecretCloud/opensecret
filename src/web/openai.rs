@@ -115,67 +115,79 @@ async fn proxy_openai(
     let res = if let Some(route) = model_route {
         // We have a special route with potential fallbacks
         debug!("Using model route for {}", model_name);
-        
-        let mut last_error: Option<String> = None;
-        
+
         // Try primary provider first
-        let primary_model_name = state.proxy_router.get_model_name_for_provider(&model_name, &route.primary.provider_name);
+        let primary_model_name = state
+            .proxy_router
+            .get_model_name_for_provider(&model_name, &route.primary.provider_name);
         let mut primary_body = modified_body_json.as_object().unwrap().clone();
         primary_body.insert("model".to_string(), json!(primary_model_name));
-        let primary_body_json = serde_json::to_string(&Value::Object(primary_body)).map_err(|e| {
-            error!("Failed to serialize request body: {:?}", e);
-            ApiError::InternalServerError
-        })?;
-        
-        match try_provider_with_retries(
-            &client,
-            &route.primary,
-            &primary_body_json,
-            &headers,
-            3,
-        ).await {
+        let primary_body_json =
+            serde_json::to_string(&Value::Object(primary_body)).map_err(|e| {
+                error!("Failed to serialize request body: {:?}", e);
+                ApiError::InternalServerError
+            })?;
+
+        match try_provider_with_retries(&client, &route.primary, &primary_body_json, &headers, 3)
+            .await
+        {
             Ok(response) => {
-                info!("Successfully got response from primary provider {}", route.primary.provider_name);
+                info!(
+                    "Successfully got response from primary provider {}",
+                    route.primary.provider_name
+                );
                 response
             }
-            Err(err) => {
-                error!("Primary provider {} failed: {:?}", route.primary.provider_name, err);
-                last_error = Some(err);
-                
+            Err(primary_err) => {
+                error!(
+                    "Primary provider {} failed: {:?}",
+                    route.primary.provider_name, primary_err
+                );
+
                 // Try each fallback in order
                 let mut found_response = None;
                 for fallback_provider in &route.fallbacks {
-                    let fallback_model_name = state.proxy_router.get_model_name_for_provider(&model_name, &fallback_provider.provider_name);
+                    let fallback_model_name = state
+                        .proxy_router
+                        .get_model_name_for_provider(&model_name, &fallback_provider.provider_name);
                     let mut fallback_body = modified_body_json.as_object().unwrap().clone();
                     fallback_body.insert("model".to_string(), json!(fallback_model_name));
-                    let fallback_body_json = serde_json::to_string(&Value::Object(fallback_body)).map_err(|e| {
+                    let fallback_body_json = serde_json::to_string(&Value::Object(fallback_body))
+                        .map_err(|e| {
                         error!("Failed to serialize fallback request body: {:?}", e);
                         ApiError::InternalServerError
                     })?;
-                    
+
                     match try_provider_with_retries(
                         &client,
-                        &fallback_provider,
+                        fallback_provider,
                         &fallback_body_json,
                         &headers,
                         3,
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(response) => {
-                            info!("Successfully got response from fallback provider {}", fallback_provider.provider_name);
+                            info!(
+                                "Successfully got response from fallback provider {}",
+                                fallback_provider.provider_name
+                            );
                             found_response = Some(response);
                             break;
                         }
                         Err(err) => {
-                            error!("Fallback provider {} failed: {:?}", fallback_provider.provider_name, err);
-                            last_error = Some(err);
+                            error!(
+                                "Fallback provider {} failed: {:?}",
+                                fallback_provider.provider_name, err
+                            );
                         }
                     }
                 }
-                
+
                 match found_response {
                     Some(response) => response,
                     None => {
-                        error!("All providers failed. Last error: {:?}", last_error);
+                        error!("All providers failed for model {}", model_name);
                         return Err(ApiError::InternalServerError);
                     }
                 }
@@ -184,24 +196,26 @@ async fn proxy_openai(
     } else {
         // No special routing, use default proxy
         let proxy_config = state.proxy_router.get_proxy_for_model(&model_name).await;
-        debug!("Using default proxy for model {}: {}", model_name, proxy_config.provider_name);
-        
+        debug!(
+            "Using default proxy for model {}: {}",
+            model_name, proxy_config.provider_name
+        );
+
         // Get the correct model name for this provider
-        let provider_model_name = state.proxy_router.get_model_name_for_provider(&model_name, &proxy_config.provider_name);
+        let provider_model_name = state
+            .proxy_router
+            .get_model_name_for_provider(&model_name, &proxy_config.provider_name);
         let mut request_body = modified_body_json.as_object().unwrap().clone();
         request_body.insert("model".to_string(), json!(provider_model_name));
-        let request_body_json = serde_json::to_string(&Value::Object(request_body)).map_err(|e| {
-            error!("Failed to serialize request body: {:?}", e);
-            ApiError::InternalServerError
-        })?;
-        
-        match try_provider_with_retries(
-            &client,
-            &proxy_config,
-            &request_body_json,
-            &headers,
-            3,
-        ).await {
+        let request_body_json =
+            serde_json::to_string(&Value::Object(request_body)).map_err(|e| {
+                error!("Failed to serialize request body: {:?}", e);
+                ApiError::InternalServerError
+            })?;
+
+        match try_provider_with_retries(&client, &proxy_config, &request_body_json, &headers, 3)
+            .await
+        {
             Ok(response) => response,
             Err(e) => {
                 error!("Default provider failed: {:?}", e);

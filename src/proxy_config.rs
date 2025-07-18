@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use hyper::{Body, Client, Request};
 use hyper_tls::HttpsConnector;
+use lazy_static::lazy_static;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,18 +14,20 @@ const CONTINUUM_LLAMA_33_70B: &str = "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AW
 const TINFOIL_LLAMA_33_70B: &str = "llama3-3-70b";
 const CANONICAL_LLAMA_33_70B: &str = "llama-3.3-70b";
 
-/// Known model equivalencies across providers
-/// This maps a canonical model identifier to provider-specific names
-fn get_model_equivalencies() -> HashMap<&'static str, HashMap<&'static str, &'static str>> {
-    let mut equivalencies = HashMap::new();
+lazy_static! {
+    /// Known model equivalencies across providers
+    /// This maps a canonical model identifier to provider-specific names
+    static ref MODEL_EQUIVALENCIES: HashMap<&'static str, HashMap<&'static str, &'static str>> = {
+        let mut equivalencies = HashMap::new();
 
-    // Llama 3.3 70B
-    let mut llama_33_70b = HashMap::new();
-    llama_33_70b.insert("continuum", CONTINUUM_LLAMA_33_70B);
-    llama_33_70b.insert("tinfoil", TINFOIL_LLAMA_33_70B);
-    equivalencies.insert(CANONICAL_LLAMA_33_70B, llama_33_70b);
+        // Llama 3.3 70B
+        let mut llama_33_70b = HashMap::new();
+        llama_33_70b.insert("continuum", CONTINUUM_LLAMA_33_70B);
+        llama_33_70b.insert("tinfoil", TINFOIL_LLAMA_33_70B);
+        equivalencies.insert(CANONICAL_LLAMA_33_70B, llama_33_70b);
 
-    equivalencies
+        equivalencies
+    };
 }
 
 /// Model routing configuration
@@ -106,17 +109,15 @@ impl ProxyRouter {
         canonical_model: &str,
         provider_name: &str,
     ) -> String {
-        let equivalencies = get_model_equivalencies();
-
         // Direct lookup: check if input is a canonical name with a mapping
-        if let Some(provider_map) = equivalencies.get(canonical_model) {
+        if let Some(provider_map) = MODEL_EQUIVALENCIES.get(canonical_model) {
             if let Some(provider_specific_name) = provider_map.get(provider_name) {
                 return provider_specific_name.to_string();
             }
         }
 
         // Reverse lookup: check if input is already a provider-specific name
-        for (canonical_name, provider_map) in &equivalencies {
+        for (canonical_name, provider_map) in &*MODEL_EQUIVALENCIES {
             // If this model name exists in any provider's mapping
             if provider_map.values().any(|name| *name == canonical_model) {
                 // Return the name for the requested provider
@@ -265,9 +266,8 @@ impl ProxyRouter {
 
                         // Check if this is equivalent to any Tinfoil model
                         let mut is_equivalent_to_tinfoil = false;
-                        let equivalencies = get_model_equivalencies();
 
-                        for provider_names in equivalencies.values() {
+                        for provider_names in MODEL_EQUIVALENCIES.values() {
                             if let (Some(continuum_name), Some(tinfoil_name)) = (
                                 provider_names.get("continuum"),
                                 provider_names.get("tinfoil"),
@@ -316,10 +316,9 @@ impl ProxyRouter {
 
         // Build model routes - simpler approach based on our new fetching order
         let mut model_routes = HashMap::new();
-        let model_equivalencies = get_model_equivalencies();
 
         // For each known equivalency, check if we have both providers
-        for provider_names in model_equivalencies.values() {
+        for provider_names in MODEL_EQUIVALENCIES.values() {
             let tinfoil_model = provider_names.get("tinfoil");
             let continuum_model = provider_names.get("continuum");
 
@@ -431,13 +430,11 @@ mod tests {
 
     #[test]
     fn test_get_model_equivalencies() {
-        let equivalencies = get_model_equivalencies();
-
         // Should have at least one canonical model
-        assert!(!equivalencies.is_empty());
+        assert!(!MODEL_EQUIVALENCIES.is_empty());
 
         // Check Llama 3.3 70B mapping
-        let llama_mapping = equivalencies.get(CANONICAL_LLAMA_33_70B).unwrap();
+        let llama_mapping = MODEL_EQUIVALENCIES.get(CANONICAL_LLAMA_33_70B).unwrap();
         assert_eq!(
             llama_mapping.get("continuum"),
             Some(&CONTINUUM_LLAMA_33_70B)

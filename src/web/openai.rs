@@ -96,8 +96,8 @@ async fn proxy_openai(
         })?
         .to_string();
 
-    // Get the model route configuration
-    let model_route = state.proxy_router.get_model_route(&model_name).await;
+    // Get the model route configuration - ALL models now have routes
+    let route = state.proxy_router.get_model_route(&model_name).await;
 
     let modified_body_json = Value::Object(modified_body);
 
@@ -111,10 +111,14 @@ async fn proxy_openai(
     // Prepare the request to proxies
     debug!("Sending request for model: {}", model_name);
 
-    // Try providers with cycling between primary and fallback
-    let res = if let Some(route) = model_route {
-        // We have a special route with potential fallbacks
-        debug!("Using model route for {}", model_name);
+    // All models now have routes - some with fallbacks, some without
+    let res = {
+        debug!(
+            "Using route for model {}: primary={}, fallbacks={}",
+            model_name,
+            route.primary.provider_name,
+            route.fallbacks.len()
+        );
 
         // Prepare request bodies for all providers
         let primary_model_name = state
@@ -218,75 +222,18 @@ async fn proxy_openai(
         match found_response {
             Some(response) => response,
             None => {
-                error!(
-                    "OpenAI API returned non-success status: All providers failed after {} cycles for model {}. Last error: {:?}",
-                    max_cycles, model_name, last_error
-                );
-                return Err(ApiError::InternalServerError);
-            }
-        }
-    } else {
-        // No special routing, use default proxy with retries
-        let proxy_config = state.proxy_router.get_proxy_for_model(&model_name).await;
-        debug!(
-            "Using default proxy for model {}: {}",
-            model_name, proxy_config.provider_name
-        );
-
-        // Get the correct model name for this provider
-        let provider_model_name = state
-            .proxy_router
-            .get_model_name_for_provider(&model_name, &proxy_config.provider_name);
-        let mut request_body = modified_body_json.as_object().unwrap().clone();
-        request_body.insert("model".to_string(), json!(provider_model_name));
-        let request_body_json =
-            serde_json::to_string(&Value::Object(request_body)).map_err(|e| {
-                error!("Failed to serialize request body: {:?}", e);
-                ApiError::InternalServerError
-            })?;
-
-        // Try up to 3 times with delays
-        let mut last_error = None;
-        let mut found_response = None;
-
-        for attempt in 0..3 {
-            if attempt > 0 {
-                let delay = attempt as u64;
-                debug!(
-                    "Retrying request to {} (attempt {}) after {}s delay",
-                    proxy_config.provider_name,
-                    attempt + 1,
-                    delay
-                );
-                sleep(Duration::from_secs(delay)).await;
-            }
-
-            match try_provider(&client, &proxy_config, &request_body_json, &headers).await {
-                Ok(response) => {
-                    info!(
-                        "Successfully got response from {} on attempt {}",
-                        proxy_config.provider_name,
-                        attempt + 1
-                    );
-                    found_response = Some(response);
-                    break;
-                }
-                Err(err) => {
-                    error!(
-                        "Attempt {}: Provider {} failed: {:?}",
-                        attempt + 1,
-                        proxy_config.provider_name,
-                        err
-                    );
-                    last_error = Some(err);
-                }
-            }
-        }
-
-        match found_response {
-            Some(response) => response,
-            None => {
-                error!("OpenAI API returned non-success status: Default provider failed after 3 attempts: {:?}", last_error);
+                let error_msg = if route.fallbacks.is_empty() {
+                    format!(
+                        "OpenAI API returned non-success status: Provider {} failed after {} attempts for model {}. Last error: {:?}",
+                        route.primary.provider_name, max_cycles, model_name, last_error
+                    )
+                } else {
+                    format!(
+                        "OpenAI API returned non-success status: All providers failed after {} cycles for model {}. Last error: {:?}",
+                        max_cycles, model_name, last_error
+                    )
+                };
+                error!("{}", error_msg);
                 return Err(ApiError::InternalServerError);
             }
         }

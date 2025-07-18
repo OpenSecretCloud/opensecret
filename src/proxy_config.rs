@@ -170,30 +170,29 @@ impl ProxyRouter {
     }
 
     /// Get the model route configuration for a given model
-    pub async fn get_model_route(&self, model_name: &str) -> Option<ModelRoute> {
-        // Ensure cache is fresh
-        self.refresh_cache_if_needed().await;
-
-        let cache = self.cache.read().await;
-        cache.model_routes.get(model_name).cloned()
-    }
-
-    pub async fn get_proxy_for_model(&self, model_name: &str) -> ProxyConfig {
+    /// Always returns a route - all models have routes after initialization
+    pub async fn get_model_route(&self, model_name: &str) -> ModelRoute {
         // Ensure cache is fresh
         self.refresh_cache_if_needed().await;
 
         let cache = self.cache.read().await;
 
-        // Check if there's a special route for this model
-        if let Some(route) = cache.model_routes.get(model_name) {
-            return route.primary.clone();
-        }
-
+        // All models should have routes now
         cache
-            .model_to_proxy
+            .model_routes
             .get(model_name)
             .cloned()
-            .unwrap_or_else(|| self.default_proxy.clone())
+            .unwrap_or_else(|| {
+                // Fallback for unknown models - use default proxy with no fallbacks
+                warn!(
+                    "Unknown model '{}' requested, using default proxy",
+                    model_name
+                );
+                ModelRoute {
+                    primary: self.default_proxy.clone(),
+                    fallbacks: vec![],
+                }
+            })
     }
 
     /// Refresh the cache if it's expired
@@ -314,41 +313,69 @@ impl ProxyRouter {
             "data": all_models
         });
 
-        // Build model routes - simpler approach based on our new fetching order
+        // Build model routes - create a route for EVERY model
         let mut model_routes = HashMap::new();
 
-        // For each known equivalency, check if we have both providers
-        for provider_names in MODEL_EQUIVALENCIES.values() {
-            let tinfoil_model = provider_names.get("tinfoil");
-            let continuum_model = provider_names.get("continuum");
+        // First, create routes for all Tinfoil models
+        if let Some(ref tinfoil_proxy) = self.tinfoil_proxy {
+            if let Some(tinfoil_model_list) = available_models_by_provider.get("tinfoil") {
+                for model_name in tinfoil_model_list {
+                    // Check if this model has an equivalent in Continuum
+                    let mut has_continuum_fallback = false;
 
-            if let (Some(tinfoil_name), Some(continuum_name)) = (tinfoil_model, continuum_model) {
-                // Check if both providers have their respective models
-                let tinfoil_has_it = available_models_by_provider
-                    .get("tinfoil")
-                    .map(|models| models.contains(&tinfoil_name.to_string()))
-                    .unwrap_or(false);
+                    for provider_names in MODEL_EQUIVALENCIES.values() {
+                        if let (Some(tinfoil_equiv), Some(continuum_equiv)) = (
+                            provider_names.get("tinfoil"),
+                            provider_names.get("continuum"),
+                        ) {
+                            if *tinfoil_equiv == model_name {
+                                // Check if Continuum has the equivalent model
+                                if let Some(continuum_models) =
+                                    available_models_by_provider.get("continuum")
+                                {
+                                    if continuum_models.contains(&continuum_equiv.to_string()) {
+                                        // This model has a Continuum fallback
+                                        let route = ModelRoute {
+                                            primary: tinfoil_proxy.clone(),
+                                            fallbacks: vec![self.default_proxy.clone()],
+                                        };
+                                        model_routes.insert(model_name.clone(), route.clone());
+                                        // Also map the Continuum name to the same route
+                                        model_routes.insert(continuum_equiv.to_string(), route);
+                                        has_continuum_fallback = true;
+                                        info!("Model available from both providers - Tinfoil ({}) primary, Continuum ({}) fallback", 
+                                              model_name, continuum_equiv);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
 
-                let continuum_has_it = available_models_by_provider
-                    .get("continuum")
-                    .map(|models| models.contains(&continuum_name.to_string()))
-                    .unwrap_or(false);
-
-                if tinfoil_has_it && continuum_has_it {
-                    // Both have it - Tinfoil primary, Continuum fallback
-                    if let Some(ref tinfoil_proxy) = self.tinfoil_proxy {
-                        info!("Model available from both providers - Tinfoil ({}) primary, Continuum ({}) fallback", 
-                              tinfoil_name, continuum_name);
-
+                    // If no fallback found, create route with just Tinfoil
+                    if !has_continuum_fallback {
                         let route = ModelRoute {
                             primary: tinfoil_proxy.clone(),
-                            fallbacks: vec![self.default_proxy.clone()],
+                            fallbacks: vec![],
                         };
-
-                        // Map both names to this route
-                        model_routes.insert(tinfoil_name.to_string(), route.clone());
-                        model_routes.insert(continuum_name.to_string(), route);
+                        model_routes.insert(model_name.clone(), route);
+                        debug!("Tinfoil-only model '{}' has no fallbacks", model_name);
                     }
+                }
+            }
+        }
+
+        // Then, create routes for Continuum models that aren't already mapped
+        if let Some(continuum_model_list) = available_models_by_provider.get("continuum") {
+            for model_name in continuum_model_list {
+                if !model_routes.contains_key(model_name) {
+                    // This is a Continuum-only model
+                    let route = ModelRoute {
+                        primary: self.default_proxy.clone(),
+                        fallbacks: vec![],
+                    };
+                    model_routes.insert(model_name.clone(), route);
+                    debug!("Continuum-only model '{}' has no fallbacks", model_name);
                 }
             }
         }
@@ -559,9 +586,9 @@ mod tests {
             None,
         );
 
-        let proxy = router.get_proxy_for_model("gpt-4").await;
-        assert_eq!(proxy.base_url, "https://api.openai.com");
-        assert!(proxy.api_key.is_some());
+        let route = router.get_model_route("gpt-4").await;
+        assert_eq!(route.primary.base_url, "https://api.openai.com");
+        assert!(route.primary.api_key.is_some());
     }
 
     #[tokio::test]
@@ -574,9 +601,9 @@ mod tests {
 
         // Since model discovery is async, we can't test specific model mapping
         // without mocking the HTTP client. Test the default proxy behavior instead.
-        let proxy = router.get_proxy_for_model("gpt-4").await;
-        assert_eq!(proxy.base_url, "http://127.0.0.1:8092");
-        assert!(proxy.api_key.is_none());
+        let route = router.get_model_route("gpt-4").await;
+        assert_eq!(route.primary.base_url, "http://127.0.0.1:8092");
+        assert!(route.primary.api_key.is_none());
 
         // Verify Tinfoil proxy was configured
         assert!(router.tinfoil_proxy.is_some());
@@ -673,16 +700,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_proxy_for_model_with_cache() {
+    async fn test_get_model_route_with_cache() {
         let router = ProxyRouter::new(
             "http://continuum.example.com".to_string(),
             None,
             Some("http://tinfoil.example.com".to_string()),
         );
 
-        // Before cache is populated, should return default proxy
-        let proxy = router.get_proxy_for_model("unknown-model").await;
-        assert_eq!(proxy.provider_name, "continuum");
+        // Before cache is populated, should return default proxy route
+        let route = router.get_model_route("unknown-model").await;
+        assert_eq!(route.primary.provider_name, "continuum");
+        assert!(route.fallbacks.is_empty());
 
         // Test that cache is checked (this is implementation detail but good to verify)
         // The actual cache population would happen via refresh_cache which requires HTTP mocking

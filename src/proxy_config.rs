@@ -687,4 +687,58 @@ mod tests {
         // Test that cache is checked (this is implementation detail but good to verify)
         // The actual cache population would happen via refresh_cache which requires HTTP mocking
     }
+
+    #[test]
+    fn test_model_route_with_empty_fallbacks() {
+        // Test edge case where primary provider has no fallbacks
+        let primary = ProxyConfig {
+            base_url: "http://primary.com".to_string(),
+            api_key: None,
+            provider_name: "primary".to_string(),
+        };
+
+        let route = ModelRoute {
+            primary: primary.clone(),
+            fallbacks: vec![], // No fallbacks available
+        };
+
+        // Should still be able to access primary
+        assert_eq!(route.primary.provider_name, "primary");
+        assert!(route.fallbacks.is_empty());
+    }
+
+    #[test]
+    fn test_cache_expiry_edge_case() {
+        let mut cache = ModelsCache::new_with_default();
+
+        // Set expiry to past time to test immediate expiration
+        cache.expires_at = Utc::now() - chrono::Duration::seconds(1);
+        assert!(cache.is_expired());
+
+        // Update and verify not expired
+        cache.update(
+            serde_json::json!({"object": "list", "data": []}),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert!(!cache.is_expired());
+    }
+
+    #[tokio::test]
+    async fn test_get_all_models_with_empty_cache() {
+        let router = ProxyRouter::new(
+            "http://continuum.example.com".to_string(),
+            None,
+            None, // No Tinfoil configured
+        );
+
+        // This will attempt to refresh cache but fail due to no actual HTTP client
+        // In real usage, this would return an error when providers are unavailable
+        let result = router.get_all_models().await;
+
+        // The implementation will return cached empty response on refresh failure
+        assert!(result.is_ok());
+        let models = result.unwrap();
+        assert_eq!(models["object"], "list");
+    }
 }

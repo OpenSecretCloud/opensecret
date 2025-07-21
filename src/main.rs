@@ -18,6 +18,7 @@ use crate::sqs::SqsEventPublisher;
 use crate::web::platform_login_routes;
 use crate::web::{
     document_routes, health_routes, login_routes, oauth_routes, openai_routes, protected_routes,
+    search_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
@@ -97,6 +98,7 @@ const GITHUB_CLIENT_SECRET_NAME: &str = "github_client_secret";
 const GOOGLE_CLIENT_ID_NAME: &str = "google_client_id";
 const GOOGLE_CLIENT_SECRET_NAME: &str = "google_client_secret";
 const RESEND_API_KEY_NAME: &str = "resend_api_key";
+const KAGI_API_KEY_NAME: &str = "kagi_api_key";
 
 const BILLING_API_KEY_NAME: &str = "billing_api_key";
 const BILLING_SERVER_URL_NAME: &str = "billing_server_url";
@@ -379,6 +381,7 @@ pub struct AppState {
     enclave_key: Vec<u8>,
     proxy_router: Arc<ProxyRouter>,
     resend_api_key: Option<String>,
+    kagi_api_key: Option<String>,
     ephemeral_keys: Arc<RwLock<HashMap<String, EphemeralSecret>>>,
     session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, SessionState>>>,
     oauth_manager: Arc<OAuthManager>,
@@ -398,6 +401,7 @@ pub struct AppStateBuilder {
     tinfoil_api_base: Option<String>,
     jwt_secret: Option<Vec<u8>>,
     resend_api_key: Option<String>,
+    kagi_api_key: Option<String>,
     github_client_secret: Option<String>,
     github_client_id: Option<String>,
     google_client_secret: Option<String>,
@@ -456,6 +460,11 @@ impl AppStateBuilder {
 
     pub fn resend_api_key(mut self, resend_api_key: Option<String>) -> Self {
         self.resend_api_key = resend_api_key;
+        self
+    }
+
+    pub fn kagi_api_key(mut self, kagi_api_key: Option<String>) -> Self {
+        self.kagi_api_key = kagi_api_key;
         self
     }
 
@@ -614,6 +623,7 @@ impl AppStateBuilder {
             enclave_key,
             proxy_router,
             resend_api_key: self.resend_api_key,
+            kagi_api_key: self.kagi_api_key,
             ephemeral_keys: Arc::new(RwLock::new(HashMap::new())),
             session_states: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             oauth_manager,
@@ -2106,6 +2116,48 @@ async fn retrieve_billing_server_url(
     }
 }
 
+async fn retrieve_kagi_api_key(
+    aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
+    db: Arc<dyn DBConnection + Send + Sync>,
+) -> Result<Option<String>, Error> {
+    let creds = aws_credential_manager
+        .read()
+        .await
+        .clone()
+        .expect("non-local mode should have creds")
+        .get_credentials()
+        .await
+        .expect("non-local mode should have creds");
+
+    // check if the key already exists in the db
+    let existing_key = db.get_enclave_secret_by_key(KAGI_API_KEY_NAME)?;
+
+    if let Some(ref encrypted_key) = existing_key {
+        // Convert the stored bytes back to base64
+        let base64_encrypted_key = general_purpose::STANDARD.encode(&encrypted_key.value);
+
+        debug!("trying to decrypt base64 encrypted Kagi API key");
+
+        // Decrypt the existing key
+        let decrypted_bytes = decrypt_with_kms(
+            &creds.region,
+            &creds.access_key_id,
+            &creds.secret_access_key,
+            &creds.token,
+            &base64_encrypted_key,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        // Convert the decrypted bytes to a UTF-8 string
+        String::from_utf8(decrypted_bytes)
+            .map_err(|e| Error::EncryptionError(format!("Failed to decode UTF-8: {}", e)))
+            .map(Some)
+    } else {
+        tracing::info!("Kagi API key not found in the database");
+        Ok(None)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     // Add debug logs for entrypoints and exit points
@@ -2368,6 +2420,12 @@ async fn main() -> Result<(), Error> {
         std::env::var("BILLING_SERVER_URL").ok()
     };
 
+    let kagi_api_key = if app_mode != AppMode::Local {
+        retrieve_kagi_api_key(aws_credential_manager.clone(), db.clone()).await?
+    } else {
+        std::env::var("KAGI_API_KEY").ok()
+    };
+
     let app_state = AppStateBuilder::default()
         .app_mode(app_mode.clone())
         .db(db)
@@ -2385,6 +2443,7 @@ async fn main() -> Result<(), Error> {
         .sqs_queue_maple_events_url(sqs_queue_maple_events_url)
         .billing_api_key(billing_api_key)
         .billing_server_url(billing_server_url)
+        .kagi_api_key(kagi_api_key)
         .build()
         .await?;
     tracing::info!("App state created, app_mode: {:?}", app_mode);
@@ -2415,6 +2474,10 @@ async fn main() -> Result<(), Error> {
         .merge(login_routes(app_state.clone()))
         .merge(
             openai_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            search_routes(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
         )
         .merge(

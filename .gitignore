@@ -47,3 +47,5 @@ tinfoil-proxy/*.spec
 tuf-repo-cdn.sigstore.dev.json
 # Keep the binary
 !tinfoil-proxy/dist/tinfoil-proxy
+
+/thirdparty

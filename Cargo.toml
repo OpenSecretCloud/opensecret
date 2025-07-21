@@ -71,3 +71,4 @@ validator = { version = "0.20.0", features = ["derive"] }
 regex = "1.9.0"
 lazy_static = "1.4.0"
 subtle = "2.6.1"
+kagi-api-rust = { git = "https://github.com/kagisearch/kagi-api-rust.git", branch = "main" }

@@ -14,25 +14,24 @@
 10. [Error Handling](#error-handling)
 11. [Database Migrations](#database-migrations)
 12. [Security Considerations](#security-considerations)
-13. [SQS Integration](#sqs-integration)
-14. [Performance Optimizations](#performance-optimizations)
-15. [Testing Strategy](#testing-strategy)
-16. [Implementation Checklist](#implementation-checklist)
+13. [Performance Optimizations](#performance-optimizations)
+14. [Testing Strategy](#testing-strategy)
+15. [Implementation Checklist](#implementation-checklist)
 
 ## Overview
 
-This document outlines the implementation of an OpenAI Responses API-compatible endpoint for OpenSecret. The Responses API is different from the Chat Completions API - it uses a job queue architecture with SSE streaming and a single entry point where the request contains the entire conversation state.
+This document outlines the implementation of an OpenAI Responses API-compatible endpoint for OpenSecret. The Responses API is different from the Chat Completions API - it provides server-side conversation state management with SSE streaming and a single entry point where the request contains the entire conversation state.
 
 **Key Differences from Chat Completions API**:
-- **Chat Completions** (`/v1/chat/completions`): Synchronous, stateless, immediate streaming
-- **Responses** (`/v1/responses`): Asynchronous, job-based, status tracking, server-side tools
+- **Chat Completions** (`/v1/chat/completions`): Stateless, requires full conversation history each request
+- **Responses** (`/v1/responses`): Server-managed conversation state, status tracking, server-side tools
 
 ### Objectives
 
 1. **OpenAI Responses API Compatibility**: Implement `/v1/responses` endpoint that matches OpenAI's Responses API specification
-2. **Job Queue Architecture**: Immediate 202 response with job ID, background processing via SQS
+2. **Dual Streaming Architecture**: Stream responses to client while simultaneously storing to database
 3. **SSE Streaming**: Server-sent events with proper event types (response.created, response.delta, tool.call, response.done, etc.)
-4. **Status Lifecycle**: Track response status through queued → in_progress → requires_action → completed
+4. **Status Lifecycle**: Track response status through in_progress → requires_action → completed
 5. **Tool Calling Support**: Server-side tool execution with proper status tracking
 6. **Integration with Existing Chat API**: Use the existing `/v1/chat/completions` internally for model calls
 7. **Security First**: All user content encrypted at rest using existing patterns
@@ -40,22 +39,22 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 ### Key Features
 
 - Single POST /v1/responses endpoint (no thread/run management)
-- Job queue architecture for non-blocking operation
+- Simultaneous streaming to client and database storage
 - SSE streaming with OpenAI-compatible event format
-- Status lifecycle management (queued → in_progress → completed)
-- Server-side tool execution with worker processes
+- Status lifecycle management (in_progress → completed)
+- Server-side tool execution integrated into response flow
 - Leverages existing /v1/chat/completions for model interaction
-- 70k token context window support
+- Model-specific token context window support
 
 ### Architecture Overview
 
 The Responses API builds on top of the existing infrastructure:
 - Requests authenticated via JWT middleware
-- Immediate 202 response with response ID
-- Job queued to SQS for background processing
-- Worker pulls job, calls internal /v1/chat/completions
-- SSE hub broadcasts events to connected clients
+- Immediate response with SSE streaming if requested
+- Calls internal /v1/chat/completions with streaming
+- Dual stream: responses sent to client while storing to database
 - All data encrypted at rest using existing patterns
+- Thread context automatically managed server-side
 
 ## Database Schema
 
@@ -117,7 +116,7 @@ Stores user inputs and tracks Responses API request lifecycle.
 ```sql
 -- Table: user_messages (user inputs / Responses API requests)
 CREATE TYPE response_status AS ENUM 
-  ('queued', 'in_progress', 'requires_action', 'completed', 'failed', 'canceled');
+  ('in_progress', 'requires_action', 'completed', 'failed', 'canceled');
 
 CREATE TABLE user_messages (
     id UUID PRIMARY KEY, -- This is the response_id in the API. For new threads (previous_response_id=null), this ID also becomes the thread_id
@@ -126,7 +125,7 @@ CREATE TABLE user_messages (
     content BYTEA NOT NULL, -- Encrypted user input (binary ciphertext)
     
     -- Responses API fields
-    status response_status DEFAULT 'queued',
+    status response_status DEFAULT 'in_progress',
     model TEXT NOT NULL,
     previous_message_id UUID REFERENCES user_messages(id) ON DELETE SET NULL,
     temperature REAL,
@@ -238,7 +237,7 @@ CREATE INDEX idx_assistant_messages_thread_created_id
 Creates a new response request. This is the single entry point for the Responses API.
 
 **Note**: This endpoint complements the existing `/v1/chat/completions` endpoint. Use `/v1/chat/completions` for simple stateless requests. Use `/v1/responses` when you need:
-- Job-based async processing with status tracking
+- Server-managed conversation state with status tracking
 - Server-side tool execution
 - Conversation continuity via `previous_response_id`
 - OpenAI Responses API compatibility
@@ -279,13 +278,13 @@ Creates a new response request. This is the single entry point for the Responses
 }
 ```
 
-**Response (Immediate - 202 Accepted):**
+**Response (Immediate):**
 ```json
 {
   "id": "msg_xyz789",
   "object": "response",
   "created": 1677652288,
-  "status": "queued"
+  "status": "in_progress"
 }
 ```
 
@@ -404,7 +403,7 @@ Cancel an in-progress response or delete a completed response.
 ```
 
 **Implementation Notes:**
-- Uses optimistic locking to prevent race conditions with workers
+- Uses optimistic locking to prevent race conditions
 - Updates status to 'canceled' atomically
 - Cascading deletes clean up related tool_calls, tool_outputs, and assistant_messages
 
@@ -511,7 +510,7 @@ if let Some(idempotency_key) = headers.get("idempotency-key") {
         
         // Check if request is still in progress
         match existing.status {
-            ResponseStatus::Queued | ResponseStatus::InProgress | ResponseStatus::RequiresAction => {
+            ResponseStatus::InProgress | ResponseStatus::RequiresAction => {
                 // Request is still being processed
                 return Err(ApiError::RequestInProgress {
                     message: "Request with this idempotency key is already in progress".into(),
@@ -549,7 +548,7 @@ if let Some(idempotency_key) = headers.get("idempotency-key") {
 
 | Status | Behavior |
 |--------|----------|
-| `queued`, `in_progress`, `requires_action` | Return 409 Conflict - request in progress |
+| `in_progress`, `requires_action` | Return 409 Conflict - request in progress |
 | `completed` | Return cached successful response |
 | `failed`, `canceled` | Return cached error response |
 | Key not found | Process new request |
@@ -567,7 +566,7 @@ WHERE idempotency_expires_at < CURRENT_TIMESTAMP;
 
 ## Request Processing Architecture
 
-The Responses API uses a job queue pattern for asynchronous processing.
+The Responses API processes requests synchronously with dual streaming for real-time responses and persistent storage.
 
 ### Request Flow
 
@@ -578,48 +577,63 @@ The Responses API uses a job queue pattern for asynchronous processing.
    - Determine thread handling:
      - If `previous_response_id` is null: Create new thread with `thread.id = message.id`
      - If `previous_response_id` is provided: Look up thread from previous message
-   - Insert user_message record with status='queued'
-   - Queue job to SQS (reusing existing SqsEventPublisher)
-   - Return 202 with message ID
+   - Insert user_message record with status='in_progress'
+   - Build conversation context from thread history
    - If stream=true, upgrade to SSE connection
+   - Call internal chat API and process response
 
-2. **Background Worker**:
+2. **Synchronous Processing**:
    ```rust
-   loop {
-       let job = dequeue_job(&sqs).await;
-       let user_message = fetch_user_message(job.message_id).await?;
+   // Inside the request handler
+   async fn process_response(
+       state: &AppState,
+       user: &User,
+       user_message: &UserMessage,
+       context: Vec<Message>,
+   ) -> Result<()> {
+       // Create dual streams - one for client, one for storage
+       let (client_tx, client_rx) = channel(1024);
+       let (storage_tx, storage_rx) = channel(1024);
        
-       // Build conversation history from all thread messages
-       let messages = build_conversation_context(user_message.thread_id).await?;
-       
-       // Convert to chat completion request
-       let chat_request = ChatCompletionRequest {
-           model: user_message.model,
-           messages,
-           temperature: user_message.temperature,
-           // ... other params
-       };
-       
-       // Call internal /v1/chat/completions with streaming
-       let stream = call_internal_chat_api(chat_request).await?;
-       
-       // Process stream and broadcast SSE events
-       while let Some(chunk) = stream.next().await {
-           match chunk {
-               ChatChunk::Delta(text) => {
-                   broadcast_sse(Event::Delta { content: text }).await;
-                   accumulate_output(&mut output, text);
-               }
-               ChatChunk::ToolCall(call) => {
-                   create_tool_call_record(user_message.thread_id, user_message.id, call).await?;
-                   broadcast_sse(Event::ToolCall { call }).await;
-               }
-               ChatChunk::Done => {
-                   update_user_message_status(user_message.id, "completed").await?;
-                   broadcast_sse(Event::Done { id: user_message.id }).await;
+       // Spawn storage task
+       let storage_task = tokio::spawn(async move {
+           let mut content = String::new();
+           let mut tool_calls = Vec::new();
+           
+           while let Some(chunk) = storage_rx.recv().await {
+               match chunk {
+                   StreamChunk::Content(text) => content.push_str(&text),
+                   StreamChunk::ToolCall(call) => {
+                       store_tool_call(&db, user_message, &call).await?;
+                       tool_calls.push(call);
+                   }
+                   StreamChunk::Done(usage) => {
+                       store_assistant_message(&db, user_message, &content, usage).await?;
+                       update_user_message_status(user_message.id, "completed").await?;
+                       break;
+                   }
                }
            }
+           Ok::<(), Error>(())
+       });
+       
+       // Stream from internal chat API
+       let stream = call_internal_chat_api(&state.llm, context).await?;
+       
+       // Process stream - send to both client and storage
+       while let Some(chunk) = stream.next().await {
+           // Send to client
+           if let Some(sse_event) = format_sse_event(&chunk) {
+               client_tx.send(sse_event).await?;
+           }
+           
+           // Send to storage
+           storage_tx.send(chunk).await?;
        }
+       
+       // Wait for storage to complete
+       storage_task.await??;
+       Ok(())
    }
    ```
 
@@ -983,51 +997,51 @@ user_defined_tool()
 ### Responses API Flow
 
 ```
-Client              API Gateway         Responses API      Job Queue       Worker         Chat API
-  |                     |                    |                |               |              |
-  |--POST /v1/--------->|                    |                |               |              |
-  |  responses          |--JWT Validate----->|                |               |              |
-  |                     |--Decrypt Request-->|                |               |              |
-  |                     |                    |--Insert------->|               |              |
-  |                     |                    |  Response      |               |              |
-  |                     |                    |  (queued)      |               |              |
-  |                     |                    |--Queue Job---->|               |              |
-  |<--202 + ID----------|<--Response ID-----|                |               |              |
-  |                     |                    |                |               |              |
-  |<----SSE Connect-----|<--Upgrade to SSE--|                |               |              |
-  |                     |                    |                |<--Pull Job----|              |
-  |                     |                    |                |               |--Build------>|
-  |                     |                    |                |               |  Context     |
-  |                     |                    |                |               |--POST------->|
-  |                     |                    |                |               | /v1/chat/    |
-  |                     |                    |                |               | completions  |
-  |<--response.delta----|<--Broadcast-------|<--Events-------|<--Stream-----|<--Response--|
-  |<--response.done-----|                    |                |               |              |
+Client              API Gateway         Responses API          Chat API         Database
+  |                     |                    |                    |                |
+  |--POST /v1/--------->|                    |                    |                |
+  |  responses          |--JWT Validate----->|                    |                |
+  |                     |--Decrypt Request-->|                    |                |
+  |                     |                    |--Insert User------->|                |
+  |                     |                    |  Message            |                |
+  |                     |                    |  (in_progress)      |                |
+  |<--Response ID-------|<--Return ID--------|                    |                |
+  |                     |                    |                    |                |
+  |<----SSE Connect-----|<--Upgrade to SSE--|                    |                |
+  |                     |                    |--Build Context----->|                |
+  |                     |                    |--POST /v1/chat/---->|                |
+  |                     |                    |  completions        |                |
+  |<--response.delta----|<--Stream-----------|<--LLM Response-----|                |
+  |                     |                    |--Store Assistant--->|                |
+  |                     |                    |  Message            |                |
+  |<--response.done-----|<--Complete---------|--Update Status----->|                |
+  |                     |                    |  (completed)        |                |
 ```
 
 ### Tool Calling Flow
 
 ```
-Client              Worker           Chat API         Tool Worker      Database
-  |                   |                 |                |               |
-  |<--response.delta--|--Stream LLM---->|                |               |
-  |                   |<--Tool Call-----|                |               |
-  |                   |                 |                |               |
-  |                   |--Update Status->|                |--Store------->|
-  |                   |  requires_action|                | Tool Call     |
-  |                   |                 |                |               |
-  |<--response.-------|-----------------| 
-  | requires_action   |                 |                |               |
-  |                   |                 |                |<--Execute-----|
-  |--POST tool------->|                 |                |  Tool         |
-  |  outputs          |                 |                |               |
-  |                   |--Queue Job----->|                |               |
-  |                   |  (continue)     |                |               |
-  |                   |                 |                |               |
-  |<--response.delta--|--Continue------>|                |               |
-  |                   |  with Tool      |                |               |
-  |                   |  Results        |                |               |
-  |<--response.done---|                 |                |               |
+Client              Responses API      Chat API         Tool Executor    Database
+  |                     |                 |                |               |
+  |<--response.delta----|--Stream LLM---->|                |               |
+  |                     |<--Tool Call-----|                |               |
+  |<--tool.call---------|                 |                |               |
+  |                     |--Store Tool-----|---------------->|               |
+  |                     |  Call           |                |               |
+  |                     |--Update Status--|---------------->|               |
+  |                     |  requires_action|                |               |
+  |<--response.----------|                |                |               |
+  | requires_action     |                |                |               |
+  |                     |                |                |               |
+  |--POST tool--------->|                |                |               |
+  |  outputs            |                |                |               |
+  |                     |--Execute Tool---|--------------->|               |
+  |                     |                |                |               |
+  |                     |--Store Output---|---------------->|               |
+  |                     |--Continue------>|                |               |
+  |                     |  with Results   |                |               |
+  |<--response.delta----|<--Continue------|                |               |
+  |<--response.done-----|--Complete-------|---------------->|               |
 ```
 
 ### Error Recovery Flow
@@ -1119,7 +1133,7 @@ Uses the existing JWT-based authentication:
 2. **Token Usage Limits**:
    - Track cumulative token usage
    - Enforce monthly/daily limits
-   - Queue overflow requests (future)
+   - Handle overflow with rate limiting
 
 ### API Key Management
 
@@ -1357,7 +1371,7 @@ CREATE INDEX idx_chat_threads_updated ON chat_threads(user_id, updated_at DESC);
 
 -- Create response status enum
 CREATE TYPE response_status AS ENUM 
-  ('queued', 'in_progress', 'requires_action', 'completed', 'failed', 'canceled');
+  ('in_progress', 'requires_action', 'completed', 'failed', 'canceled');
 
 -- Create user_messages table
 CREATE TABLE user_messages (
@@ -1365,7 +1379,7 @@ CREATE TABLE user_messages (
     thread_id UUID NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
     content BYTEA NOT NULL,
-    status response_status DEFAULT 'queued',
+    status response_status DEFAULT 'in_progress',
     model TEXT NOT NULL,
     previous_message_id UUID REFERENCES user_messages(id) ON DELETE SET NULL,
     temperature REAL,
@@ -1717,112 +1731,6 @@ pub struct AssistantMessage {
    - GDPR-compliant data handling
    - Right to deletion support
    - Data portability via export
-
-## SQS Integration
-
-### Async Job Processing
-
-The Responses API uses AWS SQS for job queue management, reusing the existing `SqsEventPublisher` infrastructure.
-
-### Use Cases for Async Processing
-
-1. **Long-Running Tool Executions**:
-   - Tools that take >30 seconds
-   - External API calls with retries
-   - Batch processing operations
-
-2. **Background Tasks**:
-   - Thread summarization
-   - Usage analytics aggregation
-   - Export generation
-
-3. **Rate-Limited Operations**:
-   - Queue overflow requests
-   - Scheduled batch processing
-
-### SQS Message Format
-
-```rust
-#[derive(Serialize, Deserialize)]
-pub struct ChatJobMessage {
-    pub job_id: Uuid,
-    pub job_type: JobType,
-    pub user_id: Uuid,
-    pub thread_id: Option<Uuid>,
-    pub payload: serde_json::Value,
-    pub created_at: DateTime<Utc>,
-    pub retry_count: u32,
-}
-
-#[derive(Serialize, Deserialize)]
-pub enum JobType {
-    ToolExecution { tool_call_id: String },
-    ThreadSummarization { thread_id: Uuid },
-    BatchExport { format: ExportFormat },
-}
-```
-
-### Queue Configuration
-
-```rust
-// Reuse existing SqsEventPublisher pattern from src/events/mod.rs
-let sqs_publisher = SqsEventPublisher::new(
-    sqs_client,
-    env::var("RESPONSES_QUEUE_URL")?,
-    project_id,
-);
-
-// Queue a response job
-let job_message = ResponseJob {
-    response_id: response.id,
-    user_id: user.id,
-    request: encrypted_request,
-    timestamp: Utc::now(),
-};
-
-sqs_publisher.publish_event(Event::ResponseJob(job_message)).await?;
-```
-
-### Job Processing Flow
-
-```
-API Request → Check if Async → Queue to SQS → Return Job ID
-                   ↓
-            Process Inline → Stream Response
-
-Worker → Poll SQS → Process Job → Update Database → Notify Client
-           ↓                                              ↓
-     Handle Error → DLQ                          WebSocket/Webhook
-```
-
-### Implementation Considerations
-
-1. **Job Status Tracking**:
-   - Add `job_status` table for async jobs
-   - Track progress and results
-   - Enable status polling endpoint
-
-2. **Client Notification**:
-   - WebSocket for real-time updates
-   - Webhook callbacks for integrations
-   - Email notifications for completion
-
-3. **Error Handling**:
-   - Retry with exponential backoff
-   - Dead letter queue for failures
-   - Alert on repeated failures
-
-4. **Security**:
-   - Encrypt job payloads
-   - Validate job ownership
-   - Audit job execution
-
-### Deferred Implementation
-
-This async architecture is planned but not required for MVP. The synchronous implementation will handle initial load, with async processing added when needed for:
-- Scale beyond single-server capacity
-- Tools requiring >30 second execution
-- Batch operations
 
 ## Performance Optimizations
 
@@ -2449,6 +2357,49 @@ impl LLMProvider for MockLLMProvider {
    - Custom authentication methods
    - Content filtering
    - Usage tracking
+
+### Async Job Queue Architecture
+
+For scaling beyond single-server capacity, implement job queue processing:
+
+1. **Queue Infrastructure**:
+   ```rust
+   // Reuse existing SqsEventPublisher pattern
+   let sqs_publisher = SqsEventPublisher::new(
+       sqs_client,
+       env::var("RESPONSES_QUEUE_URL")?,
+       project_id,
+   );
+   
+   // Queue long-running operations
+   let job = ResponseJob {
+       response_id: response.id,
+       job_type: JobType::ToolExecution { tool_call_id },
+       payload: encrypted_request,
+   };
+   
+   sqs_publisher.publish_event(Event::ResponseJob(job)).await?;
+   ```
+
+2. **Use Cases**:
+   - Tools requiring >30 second execution
+   - Batch processing operations
+   - Rate-limited external API calls
+   - Thread summarization
+   - Export generation
+
+3. **Worker Architecture**:
+   - Poll SQS for jobs
+   - Process in background
+   - Update status via WebSocket/webhooks
+   - Handle retries with exponential backoff
+   - Dead letter queue for failures
+
+4. **Benefits**:
+   - Non-blocking API responses
+   - Horizontal scaling of workers
+   - Fault tolerance and retry handling
+   - Load distribution across servers
 
 These enhancements maintain backward compatibility while enabling powerful new capabilities for future growth.
 

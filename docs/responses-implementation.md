@@ -46,6 +46,175 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 - Leverages existing /v1/chat/completions for model interaction
 - Model-specific token context window support
 
+### Implementation TODO List
+
+**Phase 1: Foundation (Database & Models)**
+- [ ] Create and run database migrations
+  - [ ] Create response_status enum (without 'queued' state)
+  - [ ] Create user_system_prompts table
+  - [ ] Create chat_threads table 
+  - [ ] Create user_messages table with idempotency columns
+  - [ ] Create tool_calls table
+  - [ ] Create tool_outputs table
+  - [ ] Create assistant_messages table
+  - [ ] Add all necessary indexes
+- [ ] Generate schema.rs with diesel print-schema
+- [ ] Create Diesel model structs
+  - [ ] ResponseStatus enum
+  - [ ] UserSystemPrompt model
+  - [ ] ChatThread model
+  - [ ] UserMessage model (with idempotency fields)
+  - [ ] ToolCall model
+  - [ ] ToolOutput model
+  - [ ] AssistantMessage model
+- [ ] Add query methods to DBConnection trait
+  - [ ] get_thread_by_id_and_user()
+  - [ ] create_thread_with_id()
+  - [ ] get_user_message_by_previous_id()
+  - [ ] get_thread_messages_for_context()
+  - [ ] get_user_message_by_idempotency_key()
+
+**Phase 2: Basic Responses Endpoint (No Streaming)**
+- [ ] Create ResponsesCreateRequest struct matching OpenAI spec
+- [ ] Create ResponsesCreateResponse struct
+- [ ] Implement POST /v1/responses handler
+  - [ ] JWT validation (reuse existing middleware)
+  - [ ] Request validation
+  - [ ] Thread creation logic (thread.id = message.id for new threads)
+  - [ ] Thread lookup for previous_response_id
+  - [ ] Store user message with status='in_progress'
+  - [ ] Return immediate response with ID
+- [ ] Add route to web server
+- [ ] Test basic request/response flow
+
+**Phase 3: Context Building & Chat Integration**
+- [ ] Implement conversation context builder
+  - [ ] Query all message types from thread
+  - [ ] Merge and sort by timestamp
+  - [ ] Decrypt message content
+  - [ ] Format into ChatCompletionRequest messages array
+- [ ] Implement token counting
+  - [ ] Integrate tiktoken-rs
+  - [ ] Add per-model token limits
+  - [ ] Implement context truncation strategy
+- [ ] Call internal /v1/chat/completions
+  - [ ] Build request from context
+  - [ ] Handle non-streaming response
+  - [ ] Store assistant message
+  - [ ] Update user message status to 'completed'
+- [ ] Test end-to-end flow
+
+**Phase 4: SSE Streaming**
+- [ ] Update handler to support stream=true
+- [ ] Implement SSE response format
+  - [ ] Add Content-Type: text/event-stream header
+  - [ ] Format events: response.delta, response.done
+  - [ ] Add encryption for SSE chunks
+- [ ] Implement streaming from chat API
+  - [ ] Handle streaming response from internal endpoint
+  - [ ] Forward chunks to client as SSE
+  - [ ] Accumulate content for storage
+- [ ] Add heartbeat support
+  - [ ] Send comment frames every 30s
+  - [ ] Handle client disconnection gracefully
+- [ ] Test streaming functionality
+
+**Phase 5: Dual Streaming (Simultaneous DB Storage)**
+- [ ] Implement dual stream architecture
+  - [ ] Create separate channels for client and storage
+  - [ ] Spawn storage task
+  - [ ] Send chunks to both streams
+- [ ] Implement storage accumulator
+  - [ ] Accumulate content as it streams
+  - [ ] Store complete assistant message on completion
+  - [ ] Handle partial storage on error
+- [ ] Add proper error handling
+  - [ ] Continue streaming even if storage fails
+  - [ ] Log storage errors for retry
+  - [ ] Store partial content on stream error
+- [ ] Test concurrent streaming and storage
+
+**Phase 6: Tool Calling Framework**
+- [ ] Define Tool and FunctionDefinition structs
+- [ ] Create ToolExecutor trait
+- [ ] Implement ToolRegistry
+- [ ] Create example tool: current_time
+  - [ ] Implement CurrentTimeExecutor
+  - [ ] Add timezone support
+  - [ ] Test execution
+- [ ] Integrate tool calling into stream processing
+  - [ ] Detect tool calls in stream
+  - [ ] Store tool_calls records
+  - [ ] Update status to 'requires_action'
+  - [ ] Return tool calls to client
+- [ ] Implement POST /v1/responses/{id}/tool_outputs
+  - [ ] Validate tool outputs
+  - [ ] Execute tools with ToolRegistry
+  - [ ] Store tool outputs
+  - [ ] Continue conversation with results
+- [ ] Test tool calling flow
+
+**Phase 7: Additional Endpoints**
+- [ ] Implement GET /v1/responses/{id}
+  - [ ] Query user message by ID
+  - [ ] Verify user ownership
+  - [ ] Build response with usage data
+  - [ ] Return formatted response
+- [ ] Implement GET /v1/responses (list)
+  - [ ] Add pagination support
+  - [ ] Query user's responses
+  - [ ] Format list response
+- [ ] Implement DELETE /v1/responses/{id}
+  - [ ] Add optimistic locking
+  - [ ] Update status to 'canceled'
+  - [ ] Handle cascade deletes
+- [ ] Test all endpoints
+
+**Phase 8: Idempotency Support**
+- [ ] Add idempotency handling to POST /v1/responses
+  - [ ] Check Idempotency-Key header
+  - [ ] Hash request body for comparison
+  - [ ] Handle in-progress requests (409 Conflict)
+  - [ ] Return cached responses
+  - [ ] Handle different parameters (422 error)
+- [ ] Add cleanup job for expired keys
+- [ ] Test idempotency behavior
+
+**Phase 9: Error Handling & Edge Cases**
+- [ ] Implement comprehensive error types
+- [ ] Add provider error mapping
+- [ ] Handle streaming errors gracefully
+- [ ] Add timeout handling
+- [ ] Implement backpressure for slow clients
+- [ ] Test error scenarios
+
+**Phase 10: Performance & Polish**
+- [ ] Add caching layer
+  - [ ] Cache tiktoken encoders
+  - [ ] Cache user encryption keys (LRU)
+  - [ ] Cache thread metadata
+- [ ] Optimize database queries
+  - [ ] Review query plans
+  - [ ] Add missing indexes
+  - [ ] Batch operations where possible
+- [ ] Add metrics and logging
+  - [ ] Request duration
+  - [ ] Token usage
+  - [ ] Error rates
+- [ ] Load testing
+  - [ ] Test concurrent streams
+  - [ ] Measure latencies
+  - [ ] Identify bottlenecks
+
+**Phase 11: Documentation & Integration**
+- [ ] Update OpenAPI specification
+- [ ] Create integration examples
+  - [ ] Python client example
+  - [ ] TypeScript client example
+  - [ ] Curl examples
+- [ ] Document migration from chat API
+- [ ] Add troubleshooting guide
+
 ### Architecture Overview
 
 The Responses API builds on top of the existing infrastructure:

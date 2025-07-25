@@ -398,6 +398,8 @@ CREATE INDEX idx_assistant_messages_thread_created_id
 
 ## API Endpoints
 
+The following endpoints implement OpenAI Responses API compatibility, with some OpenSecret-specific extensions noted.
+
 ### POST /v1/responses
 
 Creates a new response request. This is the single entry point for the Responses API.
@@ -495,6 +497,8 @@ Get the status and result of a response (for polling if not using SSE).
 ### GET /v1/responses
 
 List responses for the authenticated user with pagination.
+
+**Note**: This is a custom OpenSecret endpoint for convenience, not part of the standard OpenAI Responses API.
 
 **Query Parameters:**
 - `limit` (integer, default: 20, max: 100): Number of responses to return

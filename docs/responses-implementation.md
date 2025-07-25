@@ -31,7 +31,7 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 1. **OpenAI Responses API Compatibility**: Implement `/v1/responses` endpoint that matches OpenAI's Responses API specification
 2. **Dual Streaming Architecture**: Stream responses to client while simultaneously storing to database
 3. **SSE Streaming**: Server-sent events with proper event types (response.created, response.delta, tool.call, response.done, etc.)
-4. **Status Lifecycle**: Track response status through in_progress → requires_action → completed
+4. **Status Lifecycle**: Track response status through in_progress → completed
 5. **Tool Calling Support**: Server-side tool execution with proper status tracking
 6. **Integration with Existing Chat API**: Use the existing `/v1/chat/completions` internally for model calls
 7. **Security First**: All user content encrypted at rest using existing patterns
@@ -127,11 +127,11 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 - [ ] Implement storage accumulator
   - [ ] Accumulate content as it streams
   - [ ] Store complete assistant message on completion
-  - [ ] Handle partial storage on error
+  - [ ] No partial storage on error
 - [ ] Add proper error handling
   - [ ] Continue streaming even if storage fails
   - [ ] Log storage errors for retry
-  - [ ] Store partial content on stream error
+  - [ ] No partial content on stream error
 - [ ] Test concurrent streaming and storage
 
 **Phase 6: Tool Calling Framework**
@@ -139,19 +139,16 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 - [ ] Create ToolExecutor trait
 - [ ] Implement ToolRegistry
 - [ ] Create example tool: current_time
-  - [ ] Implement CurrentTimeExecutor
-  - [ ] Add timezone support
+  - [ ] Implement CurrentTimeExecutor (UTC)
   - [ ] Test execution
 - [ ] Integrate tool calling into stream processing
   - [ ] Detect tool calls in stream
+  - [ ] Execute tools immediately via ToolRegistry
   - [ ] Store tool_calls records
-  - [ ] Update status to 'requires_action'
-  - [ ] Return tool calls to client
-- [ ] Implement POST /v1/responses/{id}/tool_outputs
-  - [ ] Validate tool outputs
-  - [ ] Execute tools with ToolRegistry
   - [ ] Store tool outputs
-  - [ ] Continue conversation with results
+  - [ ] Format tool results as messages
+  - [ ] Send back to LLM to continue
+  - [ ] Stream continued response to client
 - [ ] Test tool calling flow
 
 **Phase 7: Additional Endpoints**
@@ -285,7 +282,7 @@ Stores user inputs and tracks Responses API request lifecycle.
 ```sql
 -- Table: user_messages (user inputs / Responses API requests)
 CREATE TYPE response_status AS ENUM 
-  ('in_progress', 'requires_action', 'completed', 'failed', 'canceled');
+  ('in_progress', 'completed', 'failed', 'canceled');
 
 CREATE TABLE user_messages (
     id UUID PRIMARY KEY, -- This is the response_id in the API. For new threads (previous_response_id=null), this ID also becomes the thread_id
@@ -460,16 +457,19 @@ Creates a new response request. This is the single entry point for the Responses
 **SSE Stream Events (if stream=true):**
 ```
 event: response.delta
-data: {"content": "Quantum computing is"}
-
-event: response.delta  
-data: {"content": " a revolutionary approach"}
+data: {"content": "Let me check the current time for you."}
 
 event: tool.call
 data: {"id": "call_123", "name": "current_time", "arguments": "{}"}
 
+event: tool.result
+data: {"tool_call_id": "call_123", "content": "{\"time\": \"2024-01-15T10:30:00Z\", \"timezone\": \"UTC\"}"}
+
+event: response.delta
+data: {"content": "The current time is 10:30 AM UTC on January 15, 2024."}
+
 event: response.done
-data: {"id": "msg_xyz789", "status": "completed", "usage": {"prompt_tokens": 10, "completion_tokens": 50}}
+data: {"id": "msg_xyz789", "status": "completed", "usage": {"prompt_tokens": 25, "completion_tokens": 45}}
 
 ### GET /v1/responses/{response_id}
 
@@ -523,31 +523,6 @@ List responses for the authenticated user with pagination.
   "has_more": true,
   "first_id": "resp_xyz789",
   "last_id": "resp_abc123"
-}
-```
-
-### POST /v1/responses/{message_id}/tool_outputs
-
-Submit tool outputs for a response in `requires_action` status.
-
-**Request Body:**
-```json
-{
-  "tool_outputs": [
-    {
-      "tool_call_id": "call_123",
-      "output": "{\"time\": \"2024-01-15T10:30:00Z\", \"timezone\": \"UTC\"}"
-    }
-  ]
-}
-```
-
-**Response:**
-```json
-{
-  "id": "msg_xyz789",
-  "object": "response",
-  "status": "in_progress"
 }
 ```
 
@@ -679,7 +654,7 @@ if let Some(idempotency_key) = headers.get("idempotency-key") {
         
         // Check if request is still in progress
         match existing.status {
-            ResponseStatus::InProgress | ResponseStatus::RequiresAction => {
+            ResponseStatus::InProgress => {
                 // Request is still being processed
                 return Err(ApiError::RequestInProgress {
                     message: "Request with this idempotency key is already in progress".into(),
@@ -717,7 +692,7 @@ if let Some(idempotency_key) = headers.get("idempotency-key") {
 
 | Status | Behavior |
 |--------|----------|
-| `in_progress`, `requires_action` | Return 409 Conflict - request in progress |
+| `in_progress` | Return 409 Conflict - request in progress |
 | `completed` | Return cached successful response |
 | `failed`, `canceled` | Return cached error response |
 | Key not found | Process new request |
@@ -1103,7 +1078,7 @@ impl ToolExecutor for CurrentTimeExecutor {
 
 ### Tool Call Flow
 
-1. **Model requests tool call**:
+1. **Model requests tool call** (detected in SSE stream):
    ```json
    {
      "tool_calls": [{
@@ -1117,16 +1092,18 @@ impl ToolExecutor for CurrentTimeExecutor {
    }
    ```
 
-2. **Execute and store**:
+2. **Server executes tool automatically**:
    - Parse tool call from stream
-   - Execute via ToolRegistry
-   - Store in tool_executions table
-   - Add tool message to conversation
+   - Execute via ToolRegistry immediately
+   - Store tool call and output in database
+   - Format tool response as message
+   - Send back to LLM to continue conversation
 
-3. **Continue conversation**:
-   - Include tool response in context
-   - Model processes tool output
-   - May call more tools or respond
+3. **LLM continues with tool result**:
+   - Tool result included in conversation context
+   - Model processes tool output and responds
+   - May call more tools or provide final answer
+   - All happens within same request/response cycle
 
 ### Security Considerations
 
@@ -1195,21 +1172,14 @@ Client              Responses API      Chat API         Tool Executor    Databas
   |<--response.delta----|--Stream LLM---->|                |               |
   |                     |<--Tool Call-----|                |               |
   |<--tool.call---------|                 |                |               |
-  |                     |--Store Tool-----|---------------->|               |
-  |                     |  Call           |                |               |
-  |                     |--Update Status--|---------------->|               |
-  |                     |  requires_action|                |               |
-  |<--response.----------|                |                |               |
-  | requires_action     |                |                |               |
-  |                     |                |                |               |
-  |--POST tool--------->|                |                |               |
-  |  outputs            |                |                |               |
   |                     |--Execute Tool---|--------------->|               |
-  |                     |                |                |               |
-  |                     |--Store Output---|---------------->|               |
-  |                     |--Continue------>|                |               |
-  |                     |  with Results   |                |               |
+  |                     |                |                |--Store Call-->|
+  |                     |<--Tool Result---|                |               |
+  |<--tool.result-------|                |                |--Store Output->|
+  |                     |--Send Result--->|                |               |
+  |                     |  back to LLM    |                |               |
   |<--response.delta----|<--Continue------|                |               |
+  |                     |  with Result    |                |               |
   |<--response.done-----|--Complete-------|---------------->|               |
 ```
 
@@ -1540,7 +1510,7 @@ CREATE INDEX idx_chat_threads_updated ON chat_threads(user_id, updated_at DESC);
 
 -- Create response status enum
 CREATE TYPE response_status AS ENUM 
-  ('in_progress', 'requires_action', 'completed', 'failed', 'canceled');
+  ('in_progress', 'completed', 'failed', 'canceled');
 
 -- Create user_messages table
 CREATE TABLE user_messages (

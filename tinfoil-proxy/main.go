@@ -384,13 +384,7 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 				}
 				if choice.Delta.Content != "" {
 					choiceData.Delta.Content = choice.Delta.Content
-				} else if choice.Delta.Content == "" && choice.FinishReason == "" {
-					// Tinfoil sends empty content with no finish reason - interpret as end
-					log.Printf("Empty content with no finish_reason - setting finish_reason to 'stop'")
-					finishReason := "stop"
-					choiceData.FinishReason = &finishReason
-					hasFinishReason = true
-				}
+				} 
 				
 				if choice.FinishReason != "" {
 					finishReason := string(choice.FinishReason)

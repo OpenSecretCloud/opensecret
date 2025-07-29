@@ -28,6 +28,10 @@ use crate::models::project_settings::OAuthSettings;
 use crate::models::project_settings::{
     EmailSettings, NewProjectSetting, ProjectSetting, ProjectSettingError, SettingCategory,
 };
+use crate::models::responses::{
+    AssistantMessage, ChatThread, NewAssistantMessage, NewChatThread, NewToolCall, NewToolOutput,
+    NewUserMessage, RawThreadMessage, ResponseStatus, ToolCall, ToolOutput, UserMessage,
+};
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
 use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
 use crate::models::users::{NewUser, User, UserError};
@@ -35,6 +39,7 @@ use crate::models::{
     email_verification::{EmailVerification, EmailVerificationError, NewEmailVerification},
     org_memberships::OrgRole,
 };
+use chrono::{DateTime, Utc};
 use diesel::Connection;
 use diesel::{
     pg::PgConnection,
@@ -118,6 +123,8 @@ pub enum DBError {
     ProjectSettingError(#[from] ProjectSettingError),
     #[error("Project setting not found")]
     ProjectSettingNotFound,
+    #[error("Responses API error: {0}")]
+    ResponsesError(#[from] crate::models::responses::ResponsesError),
 }
 
 #[allow(dead_code)]
@@ -445,6 +452,65 @@ pub trait DBConnection {
 
     // Platform invite code methods
     fn validate_platform_invite_code(&self, code: Uuid) -> Result<PlatformInviteCode, DBError>;
+
+    // ---------- Responses API helpers ----------
+
+    // Threads
+    fn create_thread(&self, new_thread: NewChatThread) -> Result<ChatThread, DBError>;
+    fn create_thread_with_first_message(
+        &self,
+        thread_uuid: Uuid,
+        user_id: Uuid,
+        system_prompt_id: Option<i64>,
+        first_message: NewUserMessage,
+    ) -> Result<(ChatThread, UserMessage), DBError>;
+    fn get_thread_by_id_and_user(
+        &self,
+        thread_id: i64,
+        user_id: Uuid,
+    ) -> Result<ChatThread, DBError>;
+    fn update_thread_title(&self, thread_id: i64, title_enc: Vec<u8>) -> Result<(), DBError>;
+
+    // User messages
+    fn create_user_message(&self, new_msg: NewUserMessage) -> Result<UserMessage, DBError>;
+    fn update_user_message_status(
+        &self,
+        id: i64,
+        status: ResponseStatus,
+        error: Option<String>,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<(), DBError>;
+    fn get_user_message(&self, id: i64, user_id: Uuid) -> Result<UserMessage, DBError>;
+    fn get_user_message_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<UserMessage, DBError>;
+    fn get_user_message_by_idempotency_key(
+        &self,
+        user_id: Uuid,
+        key: &str,
+    ) -> Result<Option<UserMessage>, DBError>;
+    fn list_user_messages(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<(DateTime<Utc>, i64)>,
+        before: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<Vec<UserMessage>, DBError>;
+
+    // Assistant messages
+    fn create_assistant_message(
+        &self,
+        new_msg: NewAssistantMessage,
+    ) -> Result<AssistantMessage, DBError>;
+
+    // Tool calls / outputs
+    fn create_tool_call(&self, new_call: NewToolCall) -> Result<ToolCall, DBError>;
+    fn create_tool_output(&self, new_output: NewToolOutput) -> Result<ToolOutput, DBError>;
+
+    // Context reconstruction
+    fn get_thread_context_messages(&self, thread_id: i64)
+        -> Result<Vec<RawThreadMessage>, DBError>;
+
+    // Maintenance
+    fn cleanup_expired_idempotency_keys(&self) -> Result<u64, DBError>;
 }
 
 pub(crate) struct PostgresConnection {
@@ -1760,6 +1826,143 @@ impl DBConnection for PostgresConnection {
 
             Ok(())
         })
+    }
+
+    // ---------- Responses API implementations ----------
+
+    // Threads
+    fn create_thread(&self, new_thread: NewChatThread) -> Result<ChatThread, DBError> {
+        debug!("Creating new chat thread");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_thread.insert(conn).map_err(DBError::from)
+    }
+
+    fn create_thread_with_first_message(
+        &self,
+        thread_uuid: Uuid,
+        user_id: Uuid,
+        system_prompt_id: Option<i64>,
+        first_message: NewUserMessage,
+    ) -> Result<(ChatThread, UserMessage), DBError> {
+        debug!("Creating new chat thread with first message");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        NewChatThread::create_with_first_message(
+            conn,
+            thread_uuid,
+            user_id,
+            system_prompt_id,
+            first_message,
+        )
+        .map_err(DBError::from)
+    }
+
+    fn get_thread_by_id_and_user(
+        &self,
+        thread_id: i64,
+        user_id: Uuid,
+    ) -> Result<ChatThread, DBError> {
+        debug!("Getting thread by ID and user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        ChatThread::get_by_id_and_user(conn, thread_id, user_id).map_err(DBError::from)
+    }
+
+    fn update_thread_title(&self, thread_id: i64, title_enc: Vec<u8>) -> Result<(), DBError> {
+        debug!("Updating thread title");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        ChatThread::update_title(conn, thread_id, title_enc).map_err(DBError::from)
+    }
+
+    // User messages
+    fn create_user_message(&self, new_msg: NewUserMessage) -> Result<UserMessage, DBError> {
+        debug!("Creating new user message");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_msg.insert(conn).map_err(DBError::from)
+    }
+
+    fn update_user_message_status(
+        &self,
+        id: i64,
+        status: ResponseStatus,
+        error: Option<String>,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<(), DBError> {
+        debug!("Updating user message status");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserMessage::update_status(conn, id, status, error, completed_at).map_err(DBError::from)
+    }
+
+    fn get_user_message(&self, id: i64, user_id: Uuid) -> Result<UserMessage, DBError> {
+        debug!("Getting user message by ID and user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserMessage::get_by_id_and_user(conn, id, user_id).map_err(DBError::from)
+    }
+
+    fn get_user_message_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<UserMessage, DBError> {
+        debug!("Getting user message by UUID and user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserMessage::get_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
+    }
+
+    fn get_user_message_by_idempotency_key(
+        &self,
+        user_id: Uuid,
+        key: &str,
+    ) -> Result<Option<UserMessage>, DBError> {
+        debug!("Getting user message by idempotency key");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserMessage::get_by_idempotency_key(conn, user_id, key).map_err(DBError::from)
+    }
+
+    fn list_user_messages(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<(DateTime<Utc>, i64)>,
+        before: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<Vec<UserMessage>, DBError> {
+        debug!("Listing user messages");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserMessage::list_for_user(conn, user_id, limit, after, before).map_err(DBError::from)
+    }
+
+    // Assistant messages
+    fn create_assistant_message(
+        &self,
+        new_msg: NewAssistantMessage,
+    ) -> Result<AssistantMessage, DBError> {
+        debug!("Creating new assistant message");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_msg.insert(conn).map_err(DBError::from)
+    }
+
+    // Tool calls / outputs
+    fn create_tool_call(&self, new_call: NewToolCall) -> Result<ToolCall, DBError> {
+        debug!("Creating new tool call");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_call.insert(conn).map_err(DBError::from)
+    }
+
+    fn create_tool_output(&self, new_output: NewToolOutput) -> Result<ToolOutput, DBError> {
+        debug!("Creating new tool output");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_output.insert(conn).map_err(DBError::from)
+    }
+
+    // Context reconstruction
+    fn get_thread_context_messages(
+        &self,
+        thread_id: i64,
+    ) -> Result<Vec<RawThreadMessage>, DBError> {
+        debug!("Getting thread context messages");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        RawThreadMessage::get_thread_context(conn, thread_id).map_err(DBError::from)
+    }
+
+    // Maintenance
+    fn cleanup_expired_idempotency_keys(&self) -> Result<u64, DBError> {
+        debug!("Cleaning up expired idempotency keys");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserMessage::cleanup_expired_idempotency_keys(conn).map_err(DBError::from)
     }
 }
 

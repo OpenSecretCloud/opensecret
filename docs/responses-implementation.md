@@ -50,30 +50,31 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 ### Implementation TODO List
 
 **Phase 1: Foundation (Database & Models)**
-- [ ] Create and run database migrations
-  - [ ] Create response_status enum (includes 'queued' for future use, but MVP will skip directly to 'in_progress')
-  - [ ] Create user_system_prompts table
-  - [ ] Create chat_threads table 
-  - [ ] Create user_messages table with idempotency columns
-  - [ ] Create tool_calls table
-  - [ ] Create tool_outputs table
-  - [ ] Create assistant_messages table
-  - [ ] Add all necessary indexes
-- [ ] Generate schema.rs with diesel run command (fix any migration errors that come up)
-- [ ] Create Diesel model structs
-  - [ ] ResponseStatus enum
-  - [ ] UserSystemPrompt model
-  - [ ] ChatThread model
-  - [ ] UserMessage model (with idempotency fields)
-  - [ ] ToolCall model
-  - [ ] ToolOutput model
-  - [ ] AssistantMessage model
-- [ ] Add query methods to DBConnection trait
-  - [ ] get_thread_by_id_and_user()
-  - [ ] create_thread_with_id()
-  - [ ] get_user_message_by_previous_id()
-  - [ ] get_thread_messages_for_context()
-  - [ ] get_user_message_by_idempotency_key() - query includes NOW() check for expiry
+- [x] Create and run database migrations
+  - [x] Create response_status enum (includes 'queued' for future use, but MVP will skip directly to 'in_progress')
+  - [x] Create user_system_prompts table
+  - [x] Create chat_threads table 
+  - [x] Create user_messages table with idempotency columns
+  - [x] Create tool_calls table
+  - [x] Create tool_outputs table
+  - [x] Create assistant_messages table
+  - [x] Add all necessary indexes
+- [x] Generate schema.rs with diesel run command (fix any migration errors that come up)
+- [x] Create Diesel model structs
+  - [x] ResponseStatus enum
+  - [x] UserSystemPrompt model
+  - [x] ChatThread model
+  - [x] UserMessage model (with idempotency fields)
+  - [x] ToolCall model
+  - [x] ToolOutput model
+  - [x] AssistantMessage model
+- [x] Add query methods to DBConnection trait
+  - [x] get_thread_by_id_and_user()
+  - [x] create_thread() - renamed from create_thread_with_id()
+  - [x] get_user_message_by_uuid() - added instead of get_user_message_by_previous_id()
+  - [x] get_thread_context_messages() - renamed from get_thread_messages_for_context()
+  - [x] get_user_message_by_idempotency_key() - query includes NOW() check for expiry
+  - [x] Additional methods added: update_thread_title(), create_user_message(), update_user_message_status(), get_user_message(), list_user_messages(), create_assistant_message(), create_tool_call(), create_tool_output(), cleanup_expired_idempotency_keys()
 
 **Phase 2: Basic Responses Endpoint (No Streaming)**
 - [ ] Create ResponsesCreateRequest struct matching OpenAI spec
@@ -251,7 +252,7 @@ CREATE TABLE user_system_prompts (
     name_enc BYTEA NOT NULL, -- Encrypted system prompt name (binary ciphertext)
     prompt_enc BYTEA NOT NULL, -- Encrypted system prompt (binary ciphertext)
     prompt_tokens INTEGER, -- Token count for the system prompt
-    is_default BOOLEAN DEFAULT false,
+    is_default BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -314,8 +315,8 @@ CREATE TABLE user_messages (
     top_p REAL,
     max_output_tokens INTEGER,
     tool_choice TEXT,
-    parallel_tool_calls BOOLEAN DEFAULT false,
-    store BOOLEAN DEFAULT true,
+    parallel_tool_calls BOOLEAN NOT NULL DEFAULT false,
+    store BOOLEAN NOT NULL DEFAULT true,
     metadata JSONB,
     error TEXT,
     

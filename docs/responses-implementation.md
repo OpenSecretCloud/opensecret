@@ -77,16 +77,17 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
   - [x] Additional methods added: update_thread_title(), create_user_message(), update_user_message_status(), get_user_message(), list_user_messages(), create_assistant_message(), create_tool_call(), create_tool_output(), cleanup_expired_idempotency_keys()
 
 **Phase 2: Basic Responses Endpoint (No Streaming)**
-- [ ] Create ResponsesCreateRequest struct matching OpenAI spec
-- [ ] Create ResponsesCreateResponse struct
-- [ ] Implement POST /v1/responses handler
-  - [ ] JWT validation (reuse existing middleware)
-  - [ ] Request validation
-  - [ ] Thread creation logic (thread.id = message.id for new threads)
-  - [ ] Thread lookup for previous_response_id
-  - [ ] Store user message with status='in_progress'
-  - [ ] Return immediate response with ID
-- [ ] Add route to web server
+- [x] Create ResponsesCreateRequest struct matching OpenAI spec
+- [x] Create ResponsesCreateResponse struct
+- [x] Implement POST /v1/responses handler
+  - [x] JWT validation (reuse existing middleware)
+  - [x] Request validation
+  - [x] Thread creation logic (thread.uuid = message.uuid for new threads)
+  - [x] Thread lookup for previous_response_id
+  - [x] Store user message with status='in_progress'
+  - [x] Return immediate response with ID
+- [x] Add route to web server
+- [x] Idempotency support with header checking
 - [ ] Test basic request/response flow
 
 **Phase 3: Context Building & Chat Integration**

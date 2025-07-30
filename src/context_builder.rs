@@ -22,8 +22,6 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
     thread_id: i64,
     user_key: &secp256k1::SecretKey,
     model: &str,
-    new_user_input: &str,
-    _new_user_input_enc: Vec<u8>,
 ) -> Result<(Vec<serde_json::Value>, usize), crate::ApiError> {
     // 1. Pull every stored message (already in chrono order ASC)
     let raw = db
@@ -54,14 +52,9 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
         });
     }
 
-    // 3. Append current user message (not in DB yet)
-    let new_tok = count_tokens(new_user_input);
-    msgs.push(ChatMsg {
-        role: "user",
-        content: new_user_input.to_owned(),
-        tool_call_id: None,
-        tok: new_tok,
-    });
+    // Note: In the Responses API flow, the current user message is already persisted
+    // to the database before this function is called, so it's included in the
+    // get_thread_context_messages result above.
 
     // Delegate to the pure function for testing
     build_prompt_from_chat_messages(msgs, model)
@@ -72,7 +65,6 @@ pub fn build_prompt_from_chat_messages(
     mut msgs: Vec<ChatMsg>,
     model: &str,
 ) -> Result<(Vec<serde_json::Value>, usize), crate::ApiError> {
-
     // 4. Truncation
     let max_ctx = model_max_ctx(model);
     let response_reserve = 4096usize;
@@ -89,13 +81,14 @@ pub fn build_prompt_from_chat_messages(
 
         // Always keep the first messages (system + first user + first assistant if present)
         let mut has_system = false;
-        let mut has_user = false; 
+        let mut has_user = false;
         let mut has_assistant = false;
-        
+
         for m in &msgs {
-            if (m.role == "system" && !has_system) || 
-               (m.role == "user" && !has_user) ||
-               (m.role == "assistant" && !has_assistant) {
+            if (m.role == "system" && !has_system)
+                || (m.role == "user" && !has_user)
+                || (m.role == "assistant" && !has_assistant)
+            {
                 head.push(m.clone());
                 match m.role {
                     "system" => has_system = true,
@@ -108,13 +101,14 @@ pub fn build_prompt_from_chat_messages(
                 break;
             }
         }
-        
+
         let head_tokens: usize = head.iter().map(|m| m.tok).sum();
-        let truncation_msg_tokens = count_tokens("[Previous messages truncated due to context limits]");
-        
+        let truncation_msg_tokens =
+            count_tokens("[Previous messages truncated due to context limits]");
+
         // Calculate how many tokens we have left for the tail
         let available_for_tail = ctx_budget.saturating_sub(head_tokens + truncation_msg_tokens);
-        
+
         // Collect messages from the end until we hit the budget
         for m in msgs.iter().rev() {
             if tail_tokens + m.tok > available_for_tail {
@@ -127,13 +121,17 @@ pub fn build_prompt_from_chat_messages(
 
         // Reconstruct with truncation message
         msgs = head;
-        
+
         // Only add truncation message if we're actually truncating something
         if !tail.is_empty() || msgs.len() < msgs.len() {
             // Check last role to avoid duplicate user messages
             let last_role = msgs.last().map(|m| m.role).unwrap_or("");
-            let truncation_role = if last_role == "user" { "assistant" } else { "user" };
-            
+            let truncation_role = if last_role == "user" {
+                "assistant"
+            } else {
+                "user"
+            };
+
             msgs.push(ChatMsg {
                 role: truncation_role,
                 content: "[Previous messages truncated due to context limits]".to_string(),
@@ -141,13 +139,13 @@ pub fn build_prompt_from_chat_messages(
                 tok: truncation_msg_tokens,
             });
         }
-        
+
         msgs.extend(tail);
     }
 
     // Recalculate total after potential truncation
     total = msgs.iter().map(|m| m.tok).sum();
-    
+
     // Safety check
     debug_assert!(
         total <= ctx_budget,
@@ -166,9 +164,9 @@ pub fn build_prompt_from_chat_messages(
                     m.tool_call_id.is_some(),
                     "tool_call_id must be present for tool output messages"
                 );
-                
+
                 json!({
-                    "role": "tool", 
+                    "role": "tool",
                     "content": m.content,
                     "tool_call_id": m.tool_call_id
                         .map(|u| u.to_string())
@@ -192,7 +190,7 @@ pub fn build_prompt_from_chat_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     // Helper to create a ChatMsg
     fn create_chat_msg(role: &'static str, content: &str, tokens: Option<usize>) -> ChatMsg {
         ChatMsg {
@@ -202,26 +200,24 @@ mod tests {
             tok: tokens.unwrap_or_else(|| count_tokens(content)),
         }
     }
-    
+
     #[test]
     fn test_build_prompt_empty_thread() {
         // Empty thread with just new user input
-        let msgs = vec![
-            create_chat_msg("user", "Hello, assistant!", None),
-        ];
-        
+        let msgs = vec![create_chat_msg("user", "Hello, assistant!", None)];
+
         let result = build_prompt_from_chat_messages(msgs, "test-model");
-        
+
         assert!(result.is_ok());
         let (messages, total_tokens) = result.unwrap();
-        
+
         // Should have just the user message
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"], "Hello, assistant!");
         assert!(total_tokens > 0);
     }
-    
+
     #[test]
     fn test_build_prompt_with_history() {
         let msgs = vec![
@@ -231,11 +227,11 @@ mod tests {
             create_chat_msg("assistant", "I'm doing well, thanks!", Some(6)),
             create_chat_msg("user", "Great!", Some(1)),
         ];
-        
+
         let result = build_prompt_from_chat_messages(msgs, "test-model");
-        
+
         let (messages, _total_tokens) = result.expect("Failed to build prompt");
-        
+
         // Should have all messages
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[0]["role"], "user");
@@ -245,16 +241,20 @@ mod tests {
         assert_eq!(messages[4]["role"], "user");
         assert_eq!(messages[4]["content"], "Great!");
     }
-    
+
     #[test]
     fn test_truncation_preserves_first_and_last() {
         // Create many messages that will exceed token limit
         let mut msgs = vec![];
-        
+
         // First exchange
         msgs.push(create_chat_msg("user", "First user message", Some(5)));
-        msgs.push(create_chat_msg("assistant", "First assistant reply", Some(5)));
-        
+        msgs.push(create_chat_msg(
+            "assistant",
+            "First assistant reply",
+            Some(5),
+        ));
+
         // Many middle messages (each with high token count to trigger truncation)
         // We need to exceed 59,404 token budget
         for i in 0..35 {
@@ -269,43 +269,50 @@ mod tests {
                 Some(1000),
             ));
         }
-        
+
         // Last messages
         msgs.push(create_chat_msg("user", "Recent user message", Some(5)));
-        msgs.push(create_chat_msg("assistant", "Recent assistant reply", Some(5)));
+        msgs.push(create_chat_msg(
+            "assistant",
+            "Recent assistant reply",
+            Some(5),
+        ));
         msgs.push(create_chat_msg("user", "Final message", Some(3)));
-        
+
         let original_count = msgs.len(); // 2 + 70 + 3 = 75
-        
+
         let result = build_prompt_from_chat_messages(
             msgs,
             "deepseek-r1-70b", // 64k context limit
         );
-        
+
         assert!(result.is_ok());
         let (messages, total_tokens) = result.unwrap();
-        
+
         // Should have truncated middle messages
-        assert!(messages.len() < original_count, "Expected truncation to occur");
-        
+        assert!(
+            messages.len() < original_count,
+            "Expected truncation to occur"
+        );
+
         // First messages should be preserved
         assert_eq!(messages[0]["content"], "First user message");
         assert_eq!(messages[1]["content"], "First assistant reply");
-        
+
         // Should have truncation message
-        let has_truncation = messages.iter().any(|m| 
-            m["content"].as_str().unwrap_or("").contains("truncated")
-        );
+        let has_truncation = messages
+            .iter()
+            .any(|m| m["content"].as_str().unwrap_or("").contains("truncated"));
         assert!(has_truncation);
-        
+
         // Last message should be the new input
         assert_eq!(messages.last().unwrap()["content"], "Final message");
-        
+
         // Total tokens should be within budget
         let budget = 64_000 - 4096 - 500; // max - response_reserve - safety
         assert!(total_tokens <= budget);
     }
-    
+
     #[test]
     fn test_role_alternation_with_truncation() {
         // Force truncation by using massive token counts
@@ -315,33 +322,31 @@ mod tests {
             create_chat_msg("assistant", "Reply", Some(20000)),
             create_chat_msg("user", "New message", Some(5)),
         ];
-        
-        let result = build_prompt_from_chat_messages(
-            msgs,
-            "deepseek-r1-70b",
-        );
-        
+
+        let result = build_prompt_from_chat_messages(msgs, "deepseek-r1-70b");
+
         assert!(result.is_ok());
         let (messages, _) = result.unwrap();
-        
+
         // Check that truncation message has appropriate role
-        let truncation_idx = messages.iter().position(|m| 
-            m["content"].as_str().unwrap_or("").contains("truncated")
-        );
-        
+        let truncation_idx = messages
+            .iter()
+            .position(|m| m["content"].as_str().unwrap_or("").contains("truncated"));
+
         if let Some(idx) = truncation_idx {
             // Check the role before truncation message
             if idx > 0 {
                 let prev_role = messages[idx - 1]["role"].as_str().unwrap();
                 let truncation_role = messages[idx]["role"].as_str().unwrap();
-                
+
                 // If previous was user, truncation should be assistant
                 if prev_role == "user" {
-                    assert_eq!(truncation_role, "assistant", 
-                        "Truncation message should alternate roles");
+                    assert_eq!(
+                        truncation_role, "assistant",
+                        "Truncation message should alternate roles"
+                    );
                 }
             }
         }
     }
 }
-

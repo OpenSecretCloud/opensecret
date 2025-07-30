@@ -23,14 +23,12 @@ pub fn model_max_ctx(model: &str) -> usize {
     const LIMITS: &[(&str, usize)] = &[
         // Free Tier
         ("ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4", 70_000), // Llama 3.3 70B
-        
         // Starter Tier
         ("leon-se/gemma-3-27b-it-fp8-dynamic", 70_000), // Gemma 3 27B (vision)
-        
         // Pro Tier
-        ("deepseek-r1-70b", 64_000), // DeepSeek R1 70B
+        ("deepseek-r1-70b", 64_000),        // DeepSeek R1 70B
         ("mistral-small-3-1-24b", 128_000), // Mistral Small 3.1 24B (vision)
-        ("qwen2-5-72b", 128_000), // Qwen 2.5 72B
+        ("qwen2-5-72b", 128_000),           // Qwen 2.5 72B
     ];
 
     LIMITS
@@ -48,10 +46,10 @@ mod tests {
     fn test_count_tokens_basic() {
         // Basic English text
         assert_eq!(count_tokens("Hello, world!"), 4); // "Hello", ",", " world", "!"
-        
+
         // Empty string
         assert_eq!(count_tokens(""), 0);
-        
+
         // Single token
         assert_eq!(count_tokens("Hello"), 1);
     }
@@ -68,7 +66,10 @@ mod tests {
     #[test]
     fn test_model_max_ctx_known_models() {
         // Test known models
-        assert_eq!(model_max_ctx("ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"), 70_000);
+        assert_eq!(
+            model_max_ctx("ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"),
+            70_000
+        );
         assert_eq!(model_max_ctx("leon-se/gemma-3-27b-it-fp8-dynamic"), 70_000);
         assert_eq!(model_max_ctx("deepseek-r1-70b"), 64_000);
         assert_eq!(model_max_ctx("mistral-small-3-1-24b"), 128_000);

@@ -31,7 +31,7 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 
 1. **OpenAI Responses API Compatibility**: Implement `/v1/responses` endpoint that matches OpenAI's Responses API specification (including the `queued` status added in April 2025)
 2. **Dual Streaming Architecture**: Stream responses to client while simultaneously storing to database
-3. **SSE Streaming**: Server-sent events with proper event types (response.created, response.delta, tool.call, response.done, etc.)
+3. **SSE Streaming**: Server-sent events with proper event types (response.created, response.output_text.delta, tool.call, response.completed, etc.)
 4. **Status Lifecycle**: Track response status through queued → in_progress → completed (though queued is not currently used)
 5. **Tool Calling Support**: Server-side tool execution with proper status tracking
 6. **Integration with Existing Chat API**: Use the existing `/v1/chat/completions` internally for model calls
@@ -108,34 +108,41 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 - [x] Test end-to-end flow
 
 **Phase 4: SSE Streaming**
-- [ ] Update handler to support stream=true
-- [ ] Implement SSE response format
-  - [ ] Add Content-Type: text/event-stream header
-  - [ ] Format events: response.delta, response.done
-  - [ ] Add encryption for SSE chunks
-- [ ] Implement streaming from chat API
-  - [ ] Handle streaming response from internal endpoint
-  - [ ] Forward chunks to client as SSE
-  - [ ] Accumulate content for storage
-- [ ] Add heartbeat support
-  - [ ] Send comment frames every 30s
-  - [ ] Handle client disconnection gracefully
-- [ ] Test streaming functionality
+- [x] Update handler to support stream=true
+- [x] Implement SSE response format
+  - [x] Add Content-Type: text/event-stream header
+  - [x] Format events: response.output_text.delta, response.completed
+  - [x] Add encryption for SSE chunks
+  - [x] Implement all 10 OpenAI event types:
+    1. response.created
+    2. response.in_progress
+    3. response.output_item.added
+    4. response.content_part.added
+    5. response.output_text.delta (multiple for chunks)
+    6. response.output_text.done
+    7. response.content_part.done
+    8. response.output_item.done
+    9. response.completed
+- [x] Implement streaming from chat API
+  - [x] Handle streaming response from internal endpoint
+  - [x] Forward chunks to client as SSE
+  - [x] Accumulate content for storage
+- [x] Test streaming functionality
 
 **Phase 5: Dual Streaming (Simultaneous DB Storage)**
-- [ ] Implement dual stream architecture
-  - [ ] Create separate channels for client and storage
-  - [ ] Spawn storage task
-  - [ ] Send chunks to both streams
-- [ ] Implement storage accumulator
-  - [ ] Accumulate content as it streams
-  - [ ] Store complete assistant message on completion
-  - [ ] No partial storage on error
-- [ ] Add proper error handling
-  - [ ] Continue streaming even if storage fails
-  - [ ] Log storage errors for retry
-  - [ ] No partial content on stream error
-- [ ] Test concurrent streaming and storage
+- [x] Implement dual stream architecture
+  - [x] Create separate channels for client and storage
+  - [x] Spawn storage task
+  - [x] Send chunks to both streams
+- [x] Implement storage accumulator
+  - [x] Accumulate content as it streams
+  - [x] Store complete assistant message on completion
+  - [x] No partial storage on error
+- [x] Add proper error handling
+  - [x] Continue streaming even if storage fails
+  - [x] Log storage errors for retry
+  - [x] No partial content on stream error
+- [x] Test concurrent streaming and storage
 
 **Phase 6: Tool Calling Framework**
 - [ ] Define Tool and FunctionDefinition structs
@@ -552,25 +559,58 @@ Creates a new response request. This is the single entry point for the Responses
 ```
 
 **SSE Stream Events (if stream=true):**
+
+Complete example from actual OpenAI API call:
+```bash
+curl https://api.openai.com/v1/responses \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"stream": true, "model": "gpt-4o", "input": "hey whats up"}'
 ```
-event: response.delta
-data: {"content": "Let me check the current time for you."}
 
-event: tool.call
-data: {"id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "name": "current_time", "arguments": "{}"}
+Response stream:
+```
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_xxx","object":"response","created_at":1753910244,"status":"in_progress","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-4o-2024-08-06","output":[],"parallel_tool_calls":true,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"auto","store":true,"temperature":1.0,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}}}
 
-event: tool.result
-data: {"tool_call_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "content": "{\"time\": \"2024-01-15T10:30:00Z\", \"timezone\": \"UTC\"}"}
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_xxx","object":"response","created_at":1753910244,"status":"in_progress","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-4o-2024-08-06","output":[],"parallel_tool_calls":true,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"auto","store":true,"temperature":1.0,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}}}
 
-event: response.delta
-data: {"content": "The current time is 10:30 AM UTC on January 15, 2024."}
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"msg_xxx","type":"message","status":"in_progress","content":[],"role":"assistant"}}
 
-event: response.done
-data: {"id": "550e8400-e29b-41d4-a716-446655440000", "status": "completed", "usage": {"prompt_tokens": 25, "completion_tokens": 45}}
+event: response.content_part.added
+data: {"type":"response.content_part.added","sequence_number":3,"item_id":"msg_xxx","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_xxx","output_index":0,"content_index":0,"delta":"Hey","logprobs":[]}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":5,"item_id":"msg_xxx","output_index":0,"content_index":0,"delta":"!","logprobs":[]}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":6,"item_id":"msg_xxx","output_index":0,"content_index":0,"delta":" Not","logprobs":[]}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":7,"item_id":"msg_xxx","output_index":0,"content_index":0,"delta":" much","logprobs":[]}
+
+// ... more delta events ...
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","sequence_number":20,"item_id":"msg_xxx","output_index":0,"content_index":0,"text":"Hey! Not much, just here to help out. What's up with you?","logprobs":[]}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","sequence_number":21,"item_id":"msg_xxx","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":"Hey! Not much, just here to help out. What's up with you?"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":22,"output_index":0,"item":{"id":"msg_xxx","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"Hey! Not much, just here to help out. What's up with you?"}],"role":"assistant"}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":23,"response":{"id":"resp_xxx","object":"response","created_at":1753910244,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-4o-2024-08-06","output":[{"id":"msg_xxx","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"Hey! Not much, just here to help out. What's up with you?"}],"role":"assistant"}],"parallel_tool_calls":true,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"default","store":true,"temperature":1.0,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":17,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":27},"user":null,"metadata":{}}}
 
 // Example: Cancelled response
-event: response.done
-data: {"id": "550e8400-e29b-41d4-a716-446655440000", "status": "cancelled"}
+event: response.completed
+data: {"type": "response.completed", "response": {"id": "550e8400-e29b-41d4-a716-446655440000", "status": "cancelled", ...}, "sequence_number": 5}
 
 ### GET /v1/responses/{response_id}
 
@@ -662,7 +702,7 @@ Cancel a model response with the given ID. Only responses with status `in_progre
 - Updates status to 'cancelled' if current status allows
 - Returns the updated response object
 - No version/optimistic locking needed - simple status check is sufficient
-- For streaming responses: Send `response.done` event with `"status": "cancelled"` before closing the SSE connection
+- For streaming responses: Send `response.completed` event with `"status": "cancelled"` before closing the SSE connection
 
 ### DELETE /v1/responses/{response_id}
 
@@ -1147,17 +1187,35 @@ These are SSE comment frames that keep the connection alive without affecting th
 #### Data Events
 
 ```
+// Shows abbreviated stream with all 10 event types (matching OpenAI format)
 event: response.created
-data: {"id": "550e8400-e29b-41d4-a716-446655440000", "status": "in_progress"}
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_xxx","object":"response","created_at":1753910244,"status":"in_progress","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-4o-2024-08-06","output":[],"parallel_tool_calls":true,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"store":true,"temperature":1.0,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}}}
 
-event: response.delta
-data: {"content": "Here's what I know about"}
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_xxx","object":"response","created_at":1753910244,"status":"in_progress","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-4o-2024-08-06","output":[],"parallel_tool_calls":true,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"store":true,"temperature":1.0,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}}}
 
-event: tool.call
-data: {"id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8", "type": "function", "function": {"name": "current_time", "arguments": "{}"}}
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"msg_xxx","type":"message","status":"in_progress","content":[],"role":"assistant"}}
 
-event: response.done
-data: {"id": "550e8400-e29b-41d4-a716-446655440000", "status": "completed", "usage": {"prompt_tokens": 25, "completion_tokens": 150}}
+event: response.content_part.added
+data: {"type":"response.content_part.added","sequence_number":3,"item_id":"msg_xxx","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_xxx","output_index":0,"content_index":0,"delta":"Here's what I know about","logprobs":[]}
+
+// ... more delta events ...
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","sequence_number":N,"item_id":"msg_xxx","output_index":0,"content_index":0,"text":"[complete text]","logprobs":[]}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","sequence_number":N+1,"item_id":"msg_xxx","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":"[complete text]"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":N+2,"output_index":0,"item":{"id":"msg_xxx","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"[complete text]"}],"role":"assistant"}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":N+3,"response":{"id":"resp_xxx","object":"response","created_at":1753910244,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-4o-2024-08-06","output":[{"id":"msg_xxx","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"[complete text]"}],"role":"assistant"}],"parallel_tool_calls":true,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"store":true,"temperature":1.0,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":17,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":27},"user":null,"metadata":{}}}
 ```
 
 ### Error Handling During Streaming
@@ -1568,8 +1626,8 @@ For the initial MVP implementation, we will **only support single tool calling**
 
 **Streaming Pattern (Single Tool):**
 ```
-event: response.delta
-data: {"content": "I'll check the weather for you."}
+event: response.output_text.delta
+data: {"type": "response.output_text.delta", "delta": "I'll check the weather for you.", "item_id": "msg_123", "output_index": 0, "content_index": 0, "sequence_number": 1, "logprobs": []}
 
 event: tool.call
 data: {"id": "call_1", "name": "get_weather", "arguments": "{\"city\": \"NYC\"}"}
@@ -1577,8 +1635,8 @@ data: {"id": "call_1", "name": "get_weather", "arguments": "{\"city\": \"NYC\"}"
 event: tool.result
 data: {"tool_call_id": "call_1", "content": "{\"temp\": 72, \"condition\": \"sunny\"}"}
 
-event: response.delta
-data: {"content": "In New York City, it's 72°F and sunny. Now let me check London."}
+event: response.output_text.delta
+data: {"type": "response.output_text.delta", "delta": "In New York City, it's 72°F and sunny. Now let me check London.", "item_id": "msg_123", "output_index": 0, "content_index": 0, "sequence_number": 3, "logprobs": []}
 
 event: tool.call
 data: {"id": "call_2", "name": "get_weather", "arguments": "{\"city\": \"London\"}"}
@@ -1586,11 +1644,11 @@ data: {"id": "call_2", "name": "get_weather", "arguments": "{\"city\": \"London\
 event: tool.result
 data: {"tool_call_id": "call_2", "content": "{\"temp\": 59, \"condition\": \"cloudy\"}"}
 
-event: response.delta
-data: {"content": "In London, it's 59°F and cloudy."}
+event: response.output_text.delta
+data: {"type": "response.output_text.delta", "delta": "In London, it's 59°F and cloudy.", "item_id": "msg_123", "output_index": 0, "content_index": 0, "sequence_number": 5, "logprobs": []}
 
-event: response.done
-data: {"status": "completed", "usage": {...}}
+event: response.completed
+data: {"type": "response.completed", "response": {"status": "completed", "usage": {...}, ...}, "sequence_number": 6}
 ```
 
 #### Future: Parallel Tool Calling Support
@@ -1615,8 +1673,8 @@ When we add parallel tool calling support (parallel_tool_calls = true), the impl
 
 **Streaming Pattern (Parallel Tools):**
 ```
-event: response.delta
-data: {"content": "I'll check the weather in all three cities for you."}
+event: response.output_text.delta
+data: {"type": "response.output_text.delta", "delta": "I'll check the weather in all three cities for you.", "item_id": "msg_123", "output_index": 0, "content_index": 0, "sequence_number": 1, "logprobs": []}
 
 event: tool.call
 data: {"id": "call_1", "name": "get_weather", "arguments": "{\"city\": \"NYC\"}"}
@@ -1637,11 +1695,11 @@ data: {"tool_call_id": "call_1", "content": "{\"temp\": 72, \"condition\": \"sun
 event: tool.result
 data: {"tool_call_id": "call_3", "content": "{\"temp\": 68, \"condition\": \"rainy\"}"}
 
-event: response.delta
-data: {"content": "Here's the weather in all three cities:\n- NYC: 72°F, sunny\n- London: 59°F, cloudy\n- Tokyo: 68°F, rainy"}
+event: response.output_text.delta
+data: {"type": "response.output_text.delta", "delta": "Here's the weather in all three cities:\n- NYC: 72°F, sunny\n- London: 59°F, cloudy\n- Tokyo: 68°F, rainy", "item_id": "msg_123", "output_index": 0, "content_index": 0, "sequence_number": 5, "logprobs": []}
 
-event: response.done
-data: {"status": "completed", "usage": {...}}
+event: response.completed
+data: {"type": "response.completed", "response": {"status": "completed", "usage": {...}, ...}, "sequence_number": 6}
 ```
 
 **Implementation Changes for Parallel Support:**
@@ -1858,10 +1916,10 @@ Client              API Gateway         Responses API          Chat API         
   |                     |                    |--Build Context-----|--------------->|
   |                     |                    |--POST /v1/chat/---->|                |
   |                     |                    |  completions        |                |
-  |<--response.delta----|<--Stream-----------|<--LLM Response-----|                |
+  |<--response.output_text.delta--|<--Stream-----------|<--LLM Response-----|                |
   |                     |                    |--Store Assistant------------------->|
   |                     |                    |  Message            |                |
-  |<--response.done-----|<--Complete---------|--Update Status-------------------->|
+  |<--response.completed--|<--Complete---------|--Update Status-------------------->|
   |                     |                    |  (completed)        |                |
 ```
 
@@ -1870,7 +1928,7 @@ Client              API Gateway         Responses API          Chat API         
 ```
 Client              Responses API      Chat API         Tool Executor    Database
   |                     |                 |                |               |
-  |<--response.delta----|--Stream LLM---->|                |               |
+  |<--response.output_text.delta--|--Stream LLM---->|                |               |
   |                     |<--Tool Call-----|                |               |
   |<--tool.call---------|                 |                |               |
   |                     |--Execute Tool---|--------------->|               |
@@ -1879,9 +1937,9 @@ Client              Responses API      Chat API         Tool Executor    Databas
   |<--tool.result-------|                |                |--Store Output->|
   |                     |--Send Result--->|                |               |
   |                     |  back to LLM    |                |               |
-  |<--response.delta----|<--Continue------|                |               |
+  |<--response.output_text.delta--|<--Continue------|                |               |
   |                     |  with Result    |                |               |
-  |<--response.done-----|--Complete---------|--------------|-------------->|
+  |<--response.completed--|--Complete---------|--------------|-------------->|
 ```
 
 ### Error Recovery Flow
@@ -2191,6 +2249,28 @@ All `_enc` fields are `Vec<u8>` for BYTEA encrypted content. Use existing encryp
 2. **Compression**:
    - Enable gzip for non-streaming responses
    - Consider SSE compression for supported clients
+
+3. **SSE Heartbeat Support**:
+   ```rust
+   // Send comment frames every 30s to keep connection alive
+   let heartbeat_interval = Duration::from_secs(30);
+   let mut heartbeat_timer = interval(heartbeat_interval);
+   
+   loop {
+       tokio::select! {
+           _ = heartbeat_timer.tick() => {
+               // Send SSE comment frame
+               yield Ok(Event::default().comment("heartbeat"));
+           }
+           chunk = body_stream.next() => {
+               // Process normal chunks
+           }
+       }
+   }
+   ```
+   - Prevents proxy/firewall timeouts
+   - Detects client disconnection early
+   - No impact on client processing (comments are ignored)
 
 ### Resource Management
 

@@ -1,14 +1,20 @@
+use crate::context_builder::build_prompt;
 use crate::db::DBError;
 use crate::encrypt::encrypt_with_key;
-use crate::models::responses::{NewUserMessage, ResponseStatus, ResponsesError};
+use crate::models::responses::{
+    NewAssistantMessage, NewUserMessage, ResponseStatus, ResponsesError,
+};
 use crate::models::users::User;
+use crate::tokens::count_tokens;
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
+use crate::web::openai::get_chat_completion_response;
 use crate::{ApiError, AppState};
 use axum::http::HeaderMap;
 use axum::{extract::State, routing::post, Extension, Json, Router};
 use chrono::Utc;
+use hyper::body::to_bytes;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -358,7 +364,7 @@ async fn create_response(
             uuid: Uuid::new_v4(),
             thread_id: thread.id,
             user_id: user.uuid,
-            content_enc,
+            content_enc: content_enc.clone(),
             prompt_tokens: None, // Will be calculated in Phase 3
             status: ResponseStatus::InProgress,
             model: body.model.clone(),
@@ -395,7 +401,7 @@ async fn create_response(
             uuid: thread_uuid, // Message UUID = Thread UUID for first message
             thread_id: 0,      // Will be set by create_with_first_message
             user_id: user.uuid,
-            content_enc,
+            content_enc: content_enc.clone(),
             prompt_tokens: None, // Will be calculated in Phase 3
             status: ResponseStatus::InProgress,
             model: body.model.clone(),
@@ -434,17 +440,150 @@ async fn create_response(
         inserted.uuid, user.uuid, thread.uuid
     );
 
-    // 7. Build immediate API response
+    // Phase 3: Build prompt and call chat completion
+
+    // Calculate tokens for just the user's input message
+    let user_input_tokens = count_tokens(&body.input) as i32;
+
+    // Update user message with its own token count
+    state
+        .db
+        .update_user_message_prompt_tokens(inserted.id, user_input_tokens)
+        .map_err(|e| {
+            error!("Failed to update prompt tokens: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    // Build the conversation context for the chat API
+    let (prompt_messages, total_prompt_tokens) = build_prompt(
+        state.db.as_ref(),
+        thread.id,
+        &user_key,
+        &body.model,
+        &body.input,
+        content_enc,
+    )?;
+
+    // Build chat completion request
+    let chat_request = json!({
+        "model": body.model,
+        "messages": prompt_messages,
+        "temperature": body.temperature.unwrap_or(0.7),
+        "top_p": body.top_p.unwrap_or(1.0),
+        "max_tokens": body.max_output_tokens.unwrap_or(512),
+        "stream": true,  // API only supports streaming
+        "stream_options": { "include_usage": true }
+    });
+
+    // Call the chat completion API (responses.rs doesn't use auth_method)
+    let response = get_chat_completion_response(&state, &user, chat_request, &headers).await?;
+
+    // Process the SSE stream to extract content and usage
+    let body_bytes = to_bytes(response.into_body()).await.map_err(|e| {
+        error!("Failed to read response body: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+    
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    let mut assistant_content = String::new();
+    let mut completion_tokens = 0i32;
+    let mut finish_reason = "stop".to_string();
+    
+    // Parse SSE events
+    for line in body_str.lines() {
+        if let Some(data) = line.strip_prefix("data: ") {
+            if data.trim() == "[DONE]" {
+                break;
+            }
+            
+            if let Ok(event_json) = serde_json::from_str::<Value>(data) {
+                // Extract content from delta
+                if let Some(delta_content) = event_json["choices"][0]["delta"]["content"].as_str() {
+                    assistant_content.push_str(delta_content);
+                }
+                
+                // Extract usage from the final event
+                if let Some(usage) = event_json.get("usage") {
+                    if let Some(tokens) = usage["completion_tokens"].as_i64() {
+                        completion_tokens = tokens as i32;
+                    }
+                }
+                
+                // Extract finish reason if present
+                if let Some(reason) = event_json["choices"][0]["finish_reason"].as_str() {
+                    finish_reason = reason.to_string();
+                }
+            }
+        }
+    }
+    
+    // Fallback to counting tokens if not provided
+    if completion_tokens == 0 {
+        completion_tokens = count_tokens(&assistant_content) as i32;
+    }
+
+    // Encrypt and store assistant message
+    let assistant_enc = encrypt_with_key(&user_key, assistant_content.as_bytes()).await;
+
+    let new_assistant = NewAssistantMessage {
+        uuid: Uuid::new_v4(),
+        thread_id: thread.id,
+        user_message_id: inserted.id,
+        content_enc: assistant_enc,
+        completion_tokens: Some(completion_tokens),
+        finish_reason: Some(finish_reason),
+    };
+
+    let _assistant = state
+        .db
+        .create_assistant_message(new_assistant)
+        .map_err(|e| {
+            error!("Failed to create assistant message: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    // Update user message status to completed
+    state
+        .db
+        .update_user_message_status(
+            inserted.id,
+            ResponseStatus::Completed,
+            None,
+            Some(Utc::now()),
+        )
+        .map_err(|e| {
+            error!("Failed to update user message status: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    // Build final response
     let api_resp = ResponsesCreateResponse {
         id: inserted.uuid,
         object: "response",
         created_at: inserted.created_at.timestamp(),
         model: inserted.model.clone(),
-        status: "in_progress",
-        output: vec![], // Empty for in_progress
+        status: "completed",
+        output: vec![OutputItem {
+            output_type: "message".to_string(),
+            id: Uuid::new_v4().to_string(),
+            status: "completed".to_string(),
+            role: Some("assistant".to_string()),
+            content: Some(vec![json!({
+                "type": "text",
+                "text": assistant_content
+            })]),
+        }],
         error: None,
         incomplete_details: None,
-        usage: None, // Will be populated in Phase 3
+        usage: Some(ResponseUsage {
+            input_tokens: total_prompt_tokens as i32,
+            input_tokens_details: InputTokenDetails { cached_tokens: 0 },
+            output_tokens: completion_tokens,
+            output_tokens_details: OutputTokenDetails {
+                reasoning_tokens: 0,
+            },
+            total_tokens: total_prompt_tokens as i32 + completion_tokens,
+        }),
         metadata: inserted.metadata.clone(),
         parallel_tool_calls: inserted.parallel_tool_calls,
         previous_response_id: inserted.previous_response_id,
@@ -452,7 +591,7 @@ async fn create_response(
         temperature: inserted.temperature,
         top_p: inserted.top_p,
         tool_choice: inserted.tool_choice.clone(),
-        tools: vec![], // No tools in Phase 2
+        tools: vec![], // No tools in Phase 3
     };
 
     encrypt_response(&state, &session_id, &api_resp).await

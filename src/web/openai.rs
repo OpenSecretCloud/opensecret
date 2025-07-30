@@ -169,7 +169,7 @@ pub(crate) async fn get_chat_completion_response(
                 cycle + 1,
                 route.primary.provider_name
             );
-            match try_provider(&client, &route.primary, &primary_body_json, &headers).await {
+            match try_provider(&client, &route.primary, &primary_body_json, headers).await {
                 Ok(response) => {
                     info!(
                         "Successfully got response from primary provider {} on cycle {}",
@@ -197,7 +197,7 @@ pub(crate) async fn get_chat_completion_response(
                     cycle + 1,
                     fallback_provider.provider_name
                 );
-                match try_provider(&client, fallback_provider, fallback_body_json, &headers).await {
+                match try_provider(&client, fallback_provider, fallback_body_json, headers).await {
                     Ok(response) => {
                         info!(
                             "Successfully got response from fallback provider {} on cycle {}",
@@ -251,10 +251,10 @@ async fn proxy_openai(
     axum::Extension(body): axum::Extension<Value>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     debug!("Entering proxy_openai function");
-    
+
     // Get the raw response using the core function
     let res = get_chat_completion_response(&state, &user, body, &headers).await?;
-    
+
     debug!("Successfully received response from OpenAI");
 
     let stream = res.into_body().into_stream();

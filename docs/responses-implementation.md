@@ -91,21 +91,21 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 - [ ] Test basic request/response flow
 
 **Phase 3: Context Building & Chat Integration**
-- [ ] Implement conversation context builder
-  - [ ] Query all message types from thread
-  - [ ] Merge and sort by timestamp
-  - [ ] Decrypt message content
-  - [ ] Format into ChatCompletionRequest messages array
-- [ ] Implement token counting
-  - [ ] Integrate tiktoken-rs
-  - [ ] Add per-model token limits (ask for supported models and their limits)
-  - [ ] Implement context truncation strategy
-- [ ] Call internal /v1/chat/completions
-  - [ ] Build request from context
-  - [ ] Handle non-streaming response
-  - [ ] Store assistant message
-  - [ ] Update user message status to 'completed'
-- [ ] Test end-to-end flow
+- [x] Implement conversation context builder
+  - [x] Query all message types from thread
+  - [x] Merge and sort by timestamp
+  - [x] Decrypt message content
+  - [x] Format into ChatCompletionRequest messages array
+- [x] Implement token counting
+  - [x] Integrate tiktoken-rs
+  - [x] Add per-model token limits
+  - [x] Implement context truncation strategy (middle truncation)
+- [x] Call internal /v1/chat/completions
+  - [x] Build request from context
+  - [x] Handle streaming response (parse SSE events)
+  - [x] Store assistant message
+  - [x] Update user message status to 'completed'
+- [x] Test end-to-end flow
 
 **Phase 4: SSE Streaming**
 - [ ] Update handler to support stream=true

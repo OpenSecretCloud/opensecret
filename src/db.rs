@@ -30,7 +30,7 @@ use crate::models::project_settings::{
 };
 use crate::models::responses::{
     AssistantMessage, ChatThread, NewAssistantMessage, NewChatThread, NewToolCall, NewToolOutput,
-    NewUserMessage, RawThreadMessage, ResponseStatus, ToolCall, ToolOutput, UserMessage,
+    NewUserMessage, RawThreadMessage, ResponseStatus, ResponsesError, ToolCall, ToolOutput, UserMessage,
 };
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
 use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
@@ -480,6 +480,7 @@ pub trait DBConnection {
         error: Option<String>,
         completed_at: Option<DateTime<Utc>>,
     ) -> Result<(), DBError>;
+    fn update_user_message_prompt_tokens(&self, id: i64, prompt_tokens: i32) -> Result<(), DBError>;
     fn get_user_message(&self, id: i64, user_id: Uuid) -> Result<UserMessage, DBError>;
     fn get_user_message_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<UserMessage, DBError>;
     fn get_user_message_by_idempotency_key(
@@ -1889,6 +1890,19 @@ impl DBConnection for PostgresConnection {
         debug!("Updating user message status");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         UserMessage::update_status(conn, id, status, error, completed_at).map_err(DBError::from)
+    }
+
+    fn update_user_message_prompt_tokens(&self, id: i64, prompt_tokens: i32) -> Result<(), DBError> {
+        debug!("Updating user message prompt tokens");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        use crate::models::schema::user_messages;
+        use diesel::prelude::*;
+        
+        diesel::update(user_messages::table.filter(user_messages::id.eq(id)))
+            .set(user_messages::prompt_tokens.eq(prompt_tokens))
+            .execute(conn)
+            .map(|_| ())
+            .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
     }
 
     fn get_user_message(&self, id: i64, user_id: Uuid) -> Result<UserMessage, DBError> {

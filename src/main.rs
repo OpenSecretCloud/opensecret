@@ -71,6 +71,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 mod apple_signin;
 mod aws_credentials;
 mod billing;
+mod context_builder;
 mod db;
 mod email;
 mod encrypt;
@@ -83,6 +84,7 @@ mod oauth;
 mod private_key;
 mod proxy_config;
 mod sqs;
+mod tokens;
 mod web;
 
 use apple_signin::AppleJwtVerifier;
@@ -252,9 +254,6 @@ pub enum ApiError {
     #[error("Resource not found")]
     NotFound,
 
-    #[error("Request conflict")]
-    Conflict,
-
     #[error("Unprocessable entity")]
     UnprocessableEntity,
 }
@@ -278,7 +277,6 @@ impl IntoResponse for ApiError {
             ApiError::EmailAlreadyExists => StatusCode::CONFLICT,
             ApiError::UsageLimitReached => StatusCode::FORBIDDEN,
             ApiError::NotFound => StatusCode::NOT_FOUND,
-            ApiError::Conflict => StatusCode::CONFLICT,
             ApiError::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
         };
         (

@@ -188,12 +188,143 @@ async fn proxy_openai(
         }
     }
 
+    // Check if streaming is requested (default to false if not specified)
+    let is_streaming = body
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
+
+    // Extract the model from the request
+    let model_name = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .ok_or_else(|| {
+            error!("Model not specified in request");
+            ApiError::BadRequest
+        })?
+        .to_string();
+
+    // Get the raw response from the completion endpoint
+    let res = get_chat_completion_response(&state, &user, body, &headers).await?;
+
+    debug!("Successfully received response from OpenAI");
+
+    // Handle non-streaming vs streaming responses differently
+    if !is_streaming {
+        // For non-streaming responses, read the entire body and return as JSON
+        debug!("Handling non-streaming response");
+        let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
+            error!("Failed to read response body: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+        let response_str = String::from_utf8_lossy(&body_bytes);
+        trace!("Non-streaming response body: {}", response_str);
+
+        // Parse the response JSON
+        let response_json: Value = serde_json::from_str(&response_str).map_err(|e| {
+            error!("Failed to parse response JSON: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+        // Handle usage statistics if available
+        handle_usage_tracking(
+            &state,
+            &user,
+            &response_json,
+            auth_method,
+            &model_name,
+            None, // provider_name will be extracted from response if needed
+        )
+        .await;
+
+        // Encrypt and return the response
+        let encrypted_response = encrypt_response(&state, &session_id, &response_json).await?;
+        debug!("Exiting proxy_openai function (non-streaming)");
+        return Ok(encrypted_response.into_response());
+    }
+
+    // For streaming responses, continue with the existing SSE logic
+    debug!("Handling streaming response");
+    let stream = res.into_body().into_stream();
+    let buffer = Arc::new(Mutex::new(String::new()));
+    let stream = stream
+        .map(move |chunk| {
+            let state = state.clone();
+            let session_id = session_id;
+            let user = user.clone();
+            let buffer = buffer.clone();
+            let auth_method = auth_method;
+            let model_name = model_name.clone();
+            async move {
+                match chunk {
+                    Ok(chunk) => {
+                        let chunk_str = String::from_utf8_lossy(&chunk);
+                        let mut events = Vec::new();
+                        {
+                            let mut buffer = buffer.lock().unwrap();
+                            buffer.push_str(&chunk_str);
+                            while let Some(event_end) = buffer.find("\n\n") {
+                                let event = buffer[..event_end].to_string();
+                                *buffer = buffer[event_end + 2..].to_string();
+                                events.push(event);
+                            }
+                            if events.is_empty() {
+                                trace!("No complete events in buffer. Current buffer: {}", buffer);
+                            }
+                        }
+
+                        let mut processed_events: Vec<Result<Event, std::convert::Infallible>> =
+                            Vec::new();
+                        for event in events {
+                            if let Some(processed_event) = encrypt_and_process_event(
+                                &state,
+                                &session_id,
+                                &user,
+                                &event,
+                                auth_method,
+                                &model_name,
+                            )
+                            .await
+                            {
+                                processed_events.push(Ok(processed_event));
+                            }
+                        }
+                        processed_events
+                    }
+                    Err(e) => {
+                        error!(
+                            "Error reading response body: {:?}. Current buffer: {}",
+                            e,
+                            buffer.lock().unwrap()
+                        );
+                        vec![Ok(Event::default().data("Error reading response"))]
+                    }
+                }
+            }
+        })
+        .flat_map(stream::once)
+        .flat_map(stream::iter);
+
+    debug!("Exiting proxy_openai function (streaming)");
+    Ok(Sse::new(stream).into_response())
+}
+
+/// Internal function to get chat completion response without HTTP handling
+/// This can be used by both the proxy_openai endpoint and the responses API
+pub async fn get_chat_completion_response(
+    state: &Arc<AppState>,
+    _user: &User,
+    body: Value,
+    headers: &HeaderMap,
+) -> Result<hyper::Response<Body>, ApiError> {
+    debug!("Entering get_chat_completion_response");
+
     if body.is_null() || body.as_object().map_or(true, |obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
         return Err(ApiError::BadRequest);
     }
 
-    // We already verified it's a valid object above, so this expect should never trigger
     let modified_body = body.as_object().expect("body was just checked").clone();
 
     // Check if streaming is requested (default to false if not specified)
@@ -233,7 +364,6 @@ async fn proxy_openai(
     // Prepare the request to proxies
     debug!("Sending request for model: {}", model_name);
 
-    // All models now have routes - some with fallbacks, some without
     let (res, successful_provider) = {
         debug!(
             "Using route for model {}: primary={}, fallbacks={}",
@@ -250,13 +380,9 @@ async fn proxy_openai(
         primary_body.insert("model".to_string(), json!(primary_model_name));
 
         // Add stream_options based on provider capabilities
-        // Tinfoil supports stream_options for both streaming and non-streaming
-        // Continuum only supports it for streaming requests
         if route.primary.provider_name.to_lowercase() == "tinfoil" {
-            // Tinfoil always gets stream_options with include_usage
             primary_body.insert("stream_options".to_string(), json!({"include_usage": true}));
         } else if is_streaming {
-            // Other providers (like continuum) only get it when streaming
             primary_body.insert("stream_options".to_string(), json!({"include_usage": true}));
         }
 
@@ -274,12 +400,9 @@ async fn proxy_openai(
             let mut fallback_body = modified_body_json.as_object().unwrap().clone();
             fallback_body.insert("model".to_string(), json!(fallback_model_name));
 
-            // Add stream_options based on provider capabilities
             if fallback.provider_name.to_lowercase() == "tinfoil" {
-                // Tinfoil always gets stream_options with include_usage
                 fallback_body.insert("stream_options".to_string(), json!({"include_usage": true}));
             } else if is_streaming {
-                // Other providers (like continuum) only get it when streaming
                 fallback_body.insert("stream_options".to_string(), json!({"include_usage": true}));
             }
 
@@ -301,7 +424,6 @@ async fn proxy_openai(
 
         for cycle in 0..max_cycles {
             if cycle > 0 {
-                // Add delay between cycles (1s after first cycle, 2s after second)
                 let delay = cycle as u64;
                 debug!("Starting cycle {} after {}s delay", cycle + 1, delay);
                 sleep(Duration::from_secs(delay)).await;
@@ -313,7 +435,7 @@ async fn proxy_openai(
                 cycle + 1,
                 route.primary.provider_name
             );
-            match try_provider(&client, &route.primary, &primary_body_json, &headers).await {
+            match try_provider(&client, &route.primary, &primary_body_json, headers).await {
                 Ok(response) => {
                     info!(
                         "Successfully got response from primary provider {} on cycle {}",
@@ -342,7 +464,7 @@ async fn proxy_openai(
                     cycle + 1,
                     fallback_provider.provider_name
                 );
-                match try_provider(&client, fallback_provider, fallback_body_json, &headers).await {
+                match try_provider(&client, fallback_provider, fallback_body_json, headers).await {
                     Ok(response) => {
                         info!(
                             "Successfully got response from fallback provider {} on cycle {}",
@@ -386,166 +508,84 @@ async fn proxy_openai(
         }
     };
 
-    debug!("Successfully received response from OpenAI");
+    debug!(
+        "Successfully received response from provider: {}",
+        successful_provider
+    );
+    Ok(res)
+}
 
-    // Handle non-streaming vs streaming responses differently
-    if !is_streaming {
-        // For non-streaming responses, read the entire body and return as JSON
-        debug!("Handling non-streaming response");
-        let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
-            error!("Failed to read response body: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+/// Helper function to handle usage tracking for both streaming and non-streaming responses
+async fn handle_usage_tracking(
+    state: &Arc<AppState>,
+    user: &User,
+    response_json: &Value,
+    auth_method: AuthMethod,
+    model_name: &str,
+    provider_name: Option<&str>,
+) {
+    if let Some(usage) = response_json.get("usage") {
+        if !usage.is_null() && usage.is_object() {
+            let input_tokens = usage
+                .get("prompt_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32;
+            let output_tokens = usage
+                .get("completion_tokens")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32;
 
-        let response_str = String::from_utf8_lossy(&body_bytes);
-        trace!("Non-streaming response body: {}", response_str);
+            // Calculate estimated cost with correct pricing
+            let input_cost =
+                BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(input_tokens);
+            let output_cost =
+                BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(output_tokens);
+            let total_cost = input_cost + output_cost;
 
-        // Parse the response JSON
-        let response_json: Value = serde_json::from_str(&response_str).map_err(|e| {
-            error!("Failed to parse response JSON: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+            info!(
+                "OpenAI API usage for user {}: prompt_tokens={}, completion_tokens={}, total_tokens={}, estimated_cost={}",
+                user.uuid, input_tokens, output_tokens,
+                input_tokens + output_tokens,
+                total_cost
+            );
 
-        // Handle usage statistics if available
-        if let Some(usage) = response_json.get("usage") {
-            if !usage.is_null() && usage.is_object() {
-                let input_tokens = usage
-                    .get("prompt_tokens")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0) as i32;
-                let output_tokens = usage
-                    .get("completion_tokens")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0) as i32;
+            // Create token usage record and post to SQS in the background
+            let state_clone = state.clone();
+            let user_id = user.uuid;
+            let is_api_request = auth_method == AuthMethod::ApiKey;
+            let provider_name = provider_name.unwrap_or("unknown").to_string();
+            let model_name = model_name.to_string();
+            tokio::spawn(async move {
+                // Create and store token usage record
+                let new_usage =
+                    NewTokenUsage::new(user_id, input_tokens, output_tokens, total_cost.clone());
 
-                // Calculate estimated cost with correct pricing
-                let input_cost =
-                    BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(input_tokens);
-                let output_cost =
-                    BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(output_tokens);
-                let total_cost = input_cost + output_cost;
+                if let Err(e) = state_clone.db.create_token_usage(new_usage) {
+                    error!("Failed to save token usage: {:?}", e);
+                }
 
-                info!(
-                    "OpenAI API usage for user {}: prompt_tokens={}, completion_tokens={}, total_tokens={}, estimated_cost={}",
-                    user.uuid, input_tokens, output_tokens,
-                    input_tokens + output_tokens,
-                    total_cost
-                );
-
-                // Create token usage record and post to SQS in the background
-                let state_clone = state.clone();
-                let user_id = user.uuid;
-                let is_api_request = auth_method == AuthMethod::ApiKey;
-                let provider_name = successful_provider.clone();
-                let model_name_clone = model_name.clone();
-                tokio::spawn(async move {
-                    // Create and store token usage record
-                    let new_usage = NewTokenUsage::new(
+                // Post event to SQS if configured
+                if let Some(publisher) = &state_clone.sqs_publisher {
+                    let event = UsageEvent {
+                        event_id: Uuid::new_v4(), // Generate new UUID for idempotency
                         user_id,
                         input_tokens,
                         output_tokens,
-                        total_cost.clone(),
-                    );
+                        estimated_cost: total_cost,
+                        chat_time: Utc::now(),
+                        is_api_request,
+                        provider_name,
+                        model_name,
+                    };
 
-                    if let Err(e) = state_clone.db.create_token_usage(new_usage) {
-                        error!("Failed to save token usage: {:?}", e);
-                    }
-
-                    // Post event to SQS if configured
-                    if let Some(publisher) = &state_clone.sqs_publisher {
-                        let event = UsageEvent {
-                            event_id: Uuid::new_v4(), // Generate new UUID for idempotency
-                            user_id,
-                            input_tokens,
-                            output_tokens,
-                            estimated_cost: total_cost,
-                            chat_time: Utc::now(),
-                            is_api_request,
-                            provider_name,
-                            model_name: model_name_clone,
-                        };
-
-                        match publisher.publish_event(event).await {
-                            Ok(_) => debug!("published usage event successfully"),
-                            Err(e) => error!("error publishing usage event: {e}"),
-                        }
-                    }
-                });
-            }
-        }
-
-        // Encrypt and return the response
-        let encrypted_response = encrypt_response(&state, &session_id, &response_json).await?;
-        debug!("Exiting proxy_openai function (non-streaming)");
-        return Ok(encrypted_response.into_response());
-    }
-
-    // For streaming responses, continue with the existing SSE logic
-    debug!("Handling streaming response");
-    let stream = res.into_body().into_stream();
-    let buffer = Arc::new(Mutex::new(String::new()));
-    let stream = stream
-        .map(move |chunk| {
-            let state = state.clone();
-            let session_id = session_id;
-            let user = user.clone();
-            let buffer = buffer.clone();
-            let auth_method = auth_method;
-            let successful_provider = successful_provider.clone();
-            let model_name = model_name.clone();
-            async move {
-                match chunk {
-                    Ok(chunk) => {
-                        let chunk_str = String::from_utf8_lossy(&chunk);
-                        let mut events = Vec::new();
-                        {
-                            let mut buffer = buffer.lock().unwrap();
-                            buffer.push_str(&chunk_str);
-                            while let Some(event_end) = buffer.find("\n\n") {
-                                let event = buffer[..event_end].to_string();
-                                *buffer = buffer[event_end + 2..].to_string();
-                                events.push(event);
-                            }
-                            if events.is_empty() {
-                                trace!("No complete events in buffer. Current buffer: {}", buffer);
-                            }
-                        }
-
-                        let mut processed_events: Vec<Result<Event, std::convert::Infallible>> =
-                            Vec::new();
-                        for event in events {
-                            if let Some(processed_event) = encrypt_and_process_event(
-                                &state,
-                                &session_id,
-                                &user,
-                                &event,
-                                auth_method,
-                                &successful_provider,
-                                &model_name,
-                            )
-                            .await
-                            {
-                                processed_events.push(Ok(processed_event));
-                            }
-                        }
-                        processed_events
-                    }
-                    Err(e) => {
-                        error!(
-                            "Error reading response body: {:?}. Current buffer: {}",
-                            e,
-                            buffer.lock().unwrap()
-                        );
-                        vec![Ok(Event::default().data("Error reading response"))]
+                    match publisher.publish_event(event).await {
+                        Ok(_) => debug!("published usage event successfully"),
+                        Err(e) => error!("error publishing usage event: {e}"),
                     }
                 }
-            }
-        })
-        .flat_map(stream::once)
-        .flat_map(stream::iter);
-
-    debug!("Exiting proxy_openai function (streaming)");
-    Ok(Sse::new(stream).into_response())
+            });
+        }
+    }
 }
 
 async fn encrypt_and_process_event(
@@ -554,7 +594,6 @@ async fn encrypt_and_process_event(
     user: &User,
     event: &str,
     auth_method: AuthMethod,
-    provider_name: &str,
     model_name: &str,
 ) -> Option<Event> {
     if event.trim() == "data: [DONE]" {
@@ -564,73 +603,18 @@ async fn encrypt_and_process_event(
     if let Some(data) = event.strip_prefix("data: ") {
         match serde_json::from_str::<Value>(data) {
             Ok(json) => {
-                // Handle usage statistics if available
-                if let Some(usage) = json.get("usage") {
-                    if !usage.is_null() && usage.is_object() {
-                        let input_tokens = usage
-                            .get("prompt_tokens")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0) as i32;
-                        let output_tokens = usage
-                            .get("completion_tokens")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0) as i32;
-
-                        // Calculate estimated cost with correct pricing
-                        let input_cost = BigDecimal::from_str("0.0000053").unwrap()
-                            * BigDecimal::from(input_tokens);
-                        let output_cost = BigDecimal::from_str("0.0000053").unwrap()
-                            * BigDecimal::from(output_tokens);
-                        let total_cost = input_cost + output_cost;
-
-                        info!(
-                            "OpenAI API usage for user {}: prompt_tokens={}, completion_tokens={}, total_tokens={}, estimated_cost={}",
-                            user.uuid, input_tokens, output_tokens,
-                            input_tokens + output_tokens,
-                            total_cost
-                        );
-
-                        // Create token usage record and post to SQS in the background
-                        let state = state.clone();
-                        let user_id = user.uuid;
-                        let is_api_request = auth_method == AuthMethod::ApiKey;
-                        let provider_name = provider_name.to_string();
-                        let model_name = model_name.to_string();
-                        tokio::spawn(async move {
-                            // Create and store token usage record
-                            let new_usage = NewTokenUsage::new(
-                                user_id,
-                                input_tokens,
-                                output_tokens,
-                                total_cost.clone(),
-                            );
-
-                            if let Err(e) = state.db.create_token_usage(new_usage) {
-                                error!("Failed to save token usage: {:?}", e);
-                            }
-
-                            // Post event to SQS if configured
-                            if let Some(publisher) = &state.sqs_publisher {
-                                let event = UsageEvent {
-                                    event_id: Uuid::new_v4(), // Generate new UUID for idempotency
-                                    user_id,
-                                    input_tokens,
-                                    output_tokens,
-                                    estimated_cost: total_cost,
-                                    chat_time: Utc::now(),
-                                    is_api_request,
-                                    provider_name,
-                                    model_name,
-                                };
-
-                                match publisher.publish_event(event).await {
-                                    Ok(_) => debug!("published usage event successfully"),
-                                    Err(e) => error!("error publishing usage event: {e}"),
-                                }
-                            }
-                        });
-                    }
-                }
+                // Handle usage statistics if available (for streaming responses)
+                // Convert state to Arc for the async handle_usage_tracking call
+                let state_arc = Arc::new(state.clone());
+                handle_usage_tracking(
+                    &state_arc,
+                    user,
+                    &json,
+                    auth_method,
+                    model_name,
+                    None, // provider_name will be extracted from response if needed
+                )
+                .await;
 
                 let json_str = json.to_string();
                 match state

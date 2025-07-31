@@ -29,6 +29,8 @@ pub enum ResponsesError {
     AssistantMessageNotFound,
     #[error("Unauthorized access")]
     Unauthorized,
+    #[error("Validation error")]
+    ValidationError,
 }
 
 // Response status enum matching the database enum
@@ -344,6 +346,59 @@ impl UserMessage {
         .map(|count| count as u64)
         .map_err(ResponsesError::DatabaseError)
     }
+
+    pub fn delete_by_id_and_user(
+        conn: &mut PgConnection,
+        id: i64,
+        user_id: Uuid,
+    ) -> Result<(), ResponsesError> {
+        diesel::delete(
+            user_messages::table
+                .filter(user_messages::id.eq(id))
+                .filter(user_messages::user_id.eq(user_id)),
+        )
+        .execute(conn)
+        .map(|rows| {
+            if rows == 0 {
+                Err(ResponsesError::UserMessageNotFound)
+            } else {
+                Ok(())
+            }
+        })?
+    }
+
+    pub fn cancel_by_id_and_user(
+        conn: &mut PgConnection,
+        id: i64,
+        user_id: Uuid,
+    ) -> Result<UserMessage, ResponsesError> {
+        // First check the current status
+        let message = user_messages::table
+            .filter(user_messages::id.eq(id))
+            .filter(user_messages::user_id.eq(user_id))
+            .first::<UserMessage>(conn)
+            .map_err(|e| match e {
+                diesel::result::Error::NotFound => ResponsesError::UserMessageNotFound,
+                _ => ResponsesError::DatabaseError(e),
+            })?;
+
+        // Only allow cancelling if in progress
+        match message.status {
+            ResponseStatus::InProgress | ResponseStatus::Queued => diesel::update(
+                user_messages::table
+                    .filter(user_messages::id.eq(id))
+                    .filter(user_messages::user_id.eq(user_id)),
+            )
+            .set((
+                user_messages::status.eq(ResponseStatus::Cancelled),
+                user_messages::completed_at.eq(diesel::dsl::now),
+                user_messages::updated_at.eq(diesel::dsl::now),
+            ))
+            .get_result(conn)
+            .map_err(ResponsesError::DatabaseError),
+            _ => Err(ResponsesError::ValidationError),
+        }
+    }
 }
 
 impl NewUserMessage {
@@ -465,6 +520,19 @@ pub struct NewAssistantMessage {
     pub content_enc: Vec<u8>,
     pub completion_tokens: Option<i32>,
     pub finish_reason: Option<String>,
+}
+
+impl AssistantMessage {
+    pub fn get_by_user_message_id(
+        conn: &mut PgConnection,
+        user_message_id: i64,
+    ) -> Result<Vec<AssistantMessage>, ResponsesError> {
+        assistant_messages::table
+            .filter(assistant_messages::user_message_id.eq(user_message_id))
+            .order(assistant_messages::created_at.asc())
+            .load::<AssistantMessage>(conn)
+            .map_err(ResponsesError::DatabaseError)
+    }
 }
 
 impl NewAssistantMessage {

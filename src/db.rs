@@ -512,6 +512,14 @@ pub trait DBConnection {
     fn get_thread_context_messages(&self, thread_id: i64)
         -> Result<Vec<RawThreadMessage>, DBError>;
 
+    // Phase 6 additions
+    fn get_assistant_messages_for_user_message(
+        &self,
+        user_message_id: i64,
+    ) -> Result<Vec<AssistantMessage>, DBError>;
+    fn cancel_user_message(&self, id: Uuid, user_id: Uuid) -> Result<UserMessage, DBError>;
+    fn delete_user_message(&self, id: Uuid, user_id: Uuid) -> Result<(), DBError>;
+
     // Maintenance
     fn cleanup_expired_idempotency_keys(&self) -> Result<u64, DBError>;
 }
@@ -1976,6 +1984,32 @@ impl DBConnection for PostgresConnection {
         debug!("Getting thread context messages");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         RawThreadMessage::get_thread_context(conn, thread_id).map_err(DBError::from)
+    }
+
+    // Phase 6 additions
+    fn get_assistant_messages_for_user_message(
+        &self,
+        user_message_id: i64,
+    ) -> Result<Vec<AssistantMessage>, DBError> {
+        debug!("Getting assistant messages for user message");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        AssistantMessage::get_by_user_message_id(conn, user_message_id).map_err(DBError::from)
+    }
+
+    fn cancel_user_message(&self, id: Uuid, user_id: Uuid) -> Result<UserMessage, DBError> {
+        debug!("Cancelling user message");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        // First get the message by UUID to find its ID
+        let msg = UserMessage::get_by_uuid_and_user(conn, id, user_id)?;
+        UserMessage::cancel_by_id_and_user(conn, msg.id, user_id).map_err(DBError::from)
+    }
+
+    fn delete_user_message(&self, id: Uuid, user_id: Uuid) -> Result<(), DBError> {
+        debug!("Deleting user message");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        // First get the message by UUID to find its ID
+        let msg = UserMessage::get_by_uuid_and_user(conn, id, user_id)?;
+        UserMessage::delete_by_id_and_user(conn, msg.id, user_id).map_err(DBError::from)
     }
 
     // Maintenance

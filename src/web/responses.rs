@@ -4,21 +4,25 @@
 use crate::{
     context_builder::build_prompt,
     db::DBError,
-    encrypt::encrypt_with_key,
+    encrypt::{decrypt_with_key, encrypt_with_key},
     models::responses::{NewAssistantMessage, NewUserMessage, ResponseStatus, ResponsesError},
     models::token_usage::NewTokenUsage,
     models::users::User,
     sqs::UsageEvent,
     tokens::count_tokens,
-    web::{encryption_middleware::decrypt_request, openai::get_chat_completion_response},
+    web::{
+        encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+        openai::get_chat_completion_response,
+    },
     ApiError, AppState,
 };
 use axum::{
-    extract::State,
+    extract::{Path, Query, State},
     http::HeaderMap,
+    middleware::from_fn_with_state,
     response::sse::{Event, Sse},
-    routing::post,
-    Extension, Router,
+    routing::{delete, get, post},
+    Extension, Json, Router,
 };
 use base64::Engine;
 use bigdecimal::BigDecimal;
@@ -465,13 +469,81 @@ pub struct OutputTokenDetails {
     pub reasoning_tokens: i32,
 }
 
+/// Response returned by GET /v1/responses/{id}
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesRetrieveResponse {
+    pub id: Uuid,
+    pub object: &'static str,
+    pub created_at: i64,
+    pub status: String,
+    pub model: String,
+    pub usage: Option<ResponseUsage>,
+    pub output: Option<String>,
+}
+
+/// Response item for list endpoint
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesListItem {
+    pub id: Uuid,
+    pub object: &'static str,
+    pub created_at: i64,
+    pub status: String,
+    pub model: String,
+    pub title: Option<String>,
+}
+
+/// Response returned by GET /v1/responses (list)
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesListResponse {
+    pub object: &'static str,
+    pub data: Vec<ResponsesListItem>,
+    pub has_more: bool,
+    pub first_id: Option<Uuid>,
+    pub last_id: Option<Uuid>,
+}
+
+/// Query parameters for GET /v1/responses
+#[derive(Debug, Deserialize)]
+pub struct ListParams {
+    pub limit: Option<i64>,
+    pub after: Option<Uuid>,
+    pub before: Option<Uuid>,
+    pub order: Option<String>,
+}
+
+/// Response returned by DELETE /v1/responses/{id}
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponsesDeleteResponse {
+    pub id: Uuid,
+    pub object: &'static str,
+    pub deleted: bool,
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/v1/responses", post(create_response_stream))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            decrypt_request::<ResponsesCreateRequest>,
-        ))
+        .route(
+            "/v1/responses",
+            post(create_response_stream).layer(from_fn_with_state(
+                state.clone(),
+                decrypt_request::<ResponsesCreateRequest>,
+            )),
+        )
+        .route(
+            "/v1/responses",
+            get(list_responses).layer(from_fn_with_state(state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/v1/responses/:id",
+            get(get_response).layer(from_fn_with_state(state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/v1/responses/:id",
+            delete(delete_response).layer(from_fn_with_state(state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/v1/responses/:id/cancel",
+            post(cancel_response).layer(from_fn_with_state(state.clone(), decrypt_request::<()>)),
+        )
         .with_state(state)
 }
 
@@ -1412,4 +1484,272 @@ async fn persist_initial_message(
                 ApiError::InternalServerError
             })
     }
+}
+
+/// GET /v1/responses/{id} - Retrieve a single response
+async fn get_response(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Extension(user): Extension<User>,
+    Extension(session_id): Extension<Uuid>,
+) -> Result<Json<EncryptedResponse<ResponsesRetrieveResponse>>, ApiError> {
+    debug!("Getting response {} for user {}", id, user.uuid);
+
+    // Get the user message
+    let user_message = state
+        .db
+        .get_user_message_by_uuid(id, user.uuid)
+        .map_err(|e| {
+            debug!("Response {} not found for user {}: {:?}", id, user.uuid, e);
+            match e {
+                DBError::ResponsesError(ResponsesError::UserMessageNotFound) => ApiError::NotFound,
+                DBError::ResponsesError(ResponsesError::Unauthorized) => ApiError::Unauthorized,
+                _ => ApiError::InternalServerError,
+            }
+        })?;
+
+    // Get associated assistant messages
+    let assistant_messages = state
+        .db
+        .get_assistant_messages_for_user_message(user_message.id)
+        .map_err(|e| {
+            error!("Failed to get assistant messages: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    // Get user's encryption key
+    let user_key = state
+        .get_user_key(user.uuid, None, None)
+        .await
+        .map_err(|e| {
+            error!("Failed to get user encryption key: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    // Build output from assistant messages
+    let mut output = String::new();
+    for msg in &assistant_messages {
+        let decrypted = decrypt_with_key(&user_key, &msg.content_enc).unwrap_or_else(|_| vec![]);
+        let text = String::from_utf8_lossy(&decrypted);
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(&text);
+    }
+
+    // Calculate usage if completed
+    let usage = if user_message.status == ResponseStatus::Completed {
+        let total_completion_tokens = assistant_messages
+            .iter()
+            .map(|m| m.completion_tokens.unwrap_or(0))
+            .sum();
+
+        Some(ResponseUsage {
+            input_tokens: user_message.prompt_tokens.unwrap_or(0),
+            input_tokens_details: InputTokenDetails { cached_tokens: 0 },
+            output_tokens: total_completion_tokens,
+            output_tokens_details: OutputTokenDetails {
+                reasoning_tokens: 0,
+            },
+            total_tokens: user_message.prompt_tokens.unwrap_or(0) + total_completion_tokens,
+        })
+    } else {
+        None
+    };
+
+    let response = ResponsesRetrieveResponse {
+        id: user_message.uuid,
+        object: "response",
+        created_at: user_message.created_at.timestamp(),
+        status: serde_json::to_value(user_message.status)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| "unknown".to_string()),
+        model: user_message.model.clone(),
+        usage,
+        output: if output.is_empty() {
+            None
+        } else {
+            Some(output)
+        },
+    };
+
+    encrypt_response(&state, &session_id, &response).await
+}
+
+/// GET /v1/responses - List responses with pagination
+async fn list_responses(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ListParams>,
+    Extension(user): Extension<User>,
+    Extension(session_id): Extension<Uuid>,
+) -> Result<Json<EncryptedResponse<ResponsesListResponse>>, ApiError> {
+    let limit = params.limit.unwrap_or(20).min(100);
+    let order = params.order.as_deref().unwrap_or("desc");
+
+    // Validate order parameter
+    if order != "asc" && order != "desc" {
+        return Err(ApiError::BadRequest);
+    }
+
+    // Convert UUID cursors to (created_at, id) tuples
+    let after_cursor = if let Some(after_uuid) = params.after {
+        state
+            .db
+            .get_user_message_by_uuid(after_uuid, user.uuid)
+            .ok()
+            .map(|msg| (msg.created_at, msg.id))
+    } else {
+        None
+    };
+
+    let before_cursor = if let Some(before_uuid) = params.before {
+        state
+            .db
+            .get_user_message_by_uuid(before_uuid, user.uuid)
+            .ok()
+            .map(|msg| (msg.created_at, msg.id))
+    } else {
+        None
+    };
+
+    // Get messages - note: list_user_messages currently always returns desc order
+    let mut messages = state
+        .db
+        .list_user_messages(user.uuid, limit + 1, after_cursor, before_cursor)
+        .map_err(|e| {
+            error!("Failed to list user messages: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    let has_more = messages.len() > limit as usize;
+    if has_more {
+        messages.truncate(limit as usize);
+    }
+
+    // Get user's encryption key
+    let user_key = state
+        .get_user_key(user.uuid, None, None)
+        .await
+        .map_err(|e| {
+            error!("Failed to get user encryption key: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    // If ascending order requested, reverse the messages
+    if order == "asc" {
+        messages.reverse();
+    }
+
+    // Convert to response format
+    let mut data = Vec::new();
+    for msg in &messages {
+        // Get thread to access title
+        let thread = state
+            .db
+            .get_thread_by_id_and_user(msg.thread_id, user.uuid)
+            .ok();
+
+        // Decrypt title if available
+        let title = if let Some(thread) = thread {
+            if let Some(title_enc) = thread.title_enc {
+                let decrypted = decrypt_with_key(&user_key, &title_enc).unwrap_or_else(|_| vec![]);
+                Some(String::from_utf8_lossy(&decrypted).to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        data.push(ResponsesListItem {
+            id: msg.uuid,
+            object: "response",
+            created_at: msg.created_at.timestamp(),
+            status: serde_json::to_value(msg.status)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| "unknown".to_string()),
+            model: msg.model.clone(),
+            title,
+        });
+    }
+
+    let response = ResponsesListResponse {
+        object: "list",
+        data,
+        has_more,
+        first_id: messages.first().map(|m| m.uuid),
+        last_id: messages.last().map(|m| m.uuid),
+    };
+
+    encrypt_response(&state, &session_id, &response).await
+}
+
+/// POST /v1/responses/{id}/cancel - Cancel an in-progress response
+async fn cancel_response(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Extension(user): Extension<User>,
+    Extension(session_id): Extension<Uuid>,
+) -> Result<Json<EncryptedResponse<ResponsesRetrieveResponse>>, ApiError> {
+    debug!("Cancelling response {} for user {}", id, user.uuid);
+
+    // Cancel the user message
+    let user_message = state.db.cancel_user_message(id, user.uuid).map_err(|e| {
+        debug!(
+            "Response {} not found for user {} during cancel: {:?}",
+            id, user.uuid, e
+        );
+        match e {
+            DBError::ResponsesError(ResponsesError::UserMessageNotFound) => ApiError::NotFound,
+            DBError::ResponsesError(ResponsesError::Unauthorized) => ApiError::Unauthorized,
+            DBError::ResponsesError(ResponsesError::ValidationError) => ApiError::BadRequest,
+            _ => ApiError::InternalServerError,
+        }
+    })?;
+
+    // No usage or output for cancelled responses
+    let response = ResponsesRetrieveResponse {
+        id: user_message.uuid,
+        object: "response",
+        created_at: user_message.created_at.timestamp(),
+        status: "cancelled".to_string(),
+        model: user_message.model.clone(),
+        usage: None,
+        output: None,
+    };
+
+    encrypt_response(&state, &session_id, &response).await
+}
+
+/// DELETE /v1/responses/{id} - Hard delete a response
+async fn delete_response(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+    Extension(user): Extension<User>,
+    Extension(session_id): Extension<Uuid>,
+) -> Result<Json<EncryptedResponse<ResponsesDeleteResponse>>, ApiError> {
+    debug!("Deleting response {} for user {}", id, user.uuid);
+
+    // Delete the user message (cascade will handle related records)
+    state.db.delete_user_message(id, user.uuid).map_err(|e| {
+        debug!(
+            "Response {} not found for user {} during delete: {:?}",
+            id, user.uuid, e
+        );
+        match e {
+            DBError::ResponsesError(ResponsesError::UserMessageNotFound) => ApiError::NotFound,
+            DBError::ResponsesError(ResponsesError::Unauthorized) => ApiError::Unauthorized,
+            _ => ApiError::InternalServerError,
+        }
+    })?;
+
+    let response = ResponsesDeleteResponse {
+        id,
+        object: "response.deleted",
+        deleted: true,
+    };
+
+    encrypt_response(&state, &session_id, &response).await
 }

@@ -23,9 +23,12 @@
         nitro = nitro-util.lib.${system};
 
         # Development environment setup
+        # Get rust-analyzer from rust-overlay to match our rust version
+        rustAnalyzer = pkgs.rust-bin.stable."1.84.1".rust-analyzer;
+        
         commonInputs = [
           rust
-          pkgs.rust-analyzer
+          rustAnalyzer
           pkgs.pkg-config
           pkgs.openssl
           pkgs.zlib
@@ -168,12 +171,33 @@
           pathsToLink = [ "/bin" "/lib" "/app" "/usr/bin" "/usr/sbin" "/sbin" ];
         };
 
+        # Build custom kernel - use kernel 6.12 which has NSM driver (merged in 6.8)
+        customKernel = pkgs.linuxPackages_6_12.kernel.override {
+          structuredExtraConfig = with pkgs.lib.kernel; {
+            VIRTIO_MMIO = yes;
+            VIRTIO_MENU = yes;
+            VIRTIO_MMIO_CMDLINE_DEVICES = yes;
+            NET = yes;
+            VSOCKETS = yes;
+            VIRTIO_VSOCKETS = yes;
+            NSM = yes;  # Enable NSM driver for KMS operations (merged in 6.8+)
+          };
+          ignoreConfigErrors = true;
+        };
+
         # Function to create EIF with specific APP_MODE
         mkEif = appMode: nitro.buildEif {
           name = "opensecret-eif-${appMode}";
-          kernel = nitro.blobs.${arch}.kernel;
+          # The kernel image location varies by architecture
+          kernel = if arch == "aarch64" 
+            then "${customKernel}/Image"  # ARM64 uses Image
+            else "${customKernel}/bzImage"; # x86_64 uses bzImage
+          # Use the blob config since extracting from custom kernel is complex
+          # The important thing is the kernel itself, not the config file
           kernelConfig = nitro.blobs.${arch}.kernelConfig;
-          nsmKo = nitro.blobs.${arch}.nsmKo;
+          # NSM driver is built into kernel 6.8+, so we don't need the old module
+          # Setting to null to skip loading the incompatible old module
+          nsmKo = null;
           copyToRoot = mkRootfs appMode;
           entrypoint = "/bin/entrypoint";
         };
@@ -205,7 +229,7 @@
           };
           nativeBuildInputs = [
             pkgs.pkg-config
-            pkgs.rust-analyzer
+            rustAnalyzer
             pkgs.gcc
             pkgs.clang
           ];

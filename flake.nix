@@ -23,8 +23,10 @@
         nitro = nitro-util.lib.${system};
 
         # Development environment setup
-        # Get rust-analyzer from rust-overlay to match our rust version
-        rustAnalyzer = pkgs.rust-bin.stable."1.84.1".rust-analyzer;
+        # Get rust-analyzer matching the channel in rust-toolchain.toml
+        rustToolchain = builtins.fromTOML (builtins.readFile ./rust-toolchain.toml);
+        rustChannel = rustToolchain.toolchain.channel;
+        rustAnalyzer = pkgs.rust-bin.stable."${rustChannel}".rust-analyzer;
         
         commonInputs = [
           rust
@@ -182,7 +184,8 @@
             VIRTIO_VSOCKETS = yes;
             NSM = yes;  # Enable NSM driver for KMS operations (merged in 6.8+)
           };
-          ignoreConfigErrors = true;
+          # Ensure we catch invalid or renamed config flags at build time
+          ignoreConfigErrors = false;
         };
 
         # Function to create EIF with specific APP_MODE

@@ -14,6 +14,10 @@ const CONTINUUM_LLAMA_33_70B: &str = "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AW
 const TINFOIL_LLAMA_33_70B: &str = "llama3-3-70b";
 const CANONICAL_LLAMA_33_70B: &str = "llama-3.3-70b";
 
+const CONTINUUM_GPT_OSS_120B: &str = "openai/gpt-oss-120b";
+const TINFOIL_GPT_OSS_120B: &str = "gpt-oss-120b";
+const CANONICAL_GPT_OSS_120B: &str = "gpt-oss-120b";
+
 lazy_static! {
     /// Known model equivalencies across providers
     /// This maps a canonical model identifier to provider-specific names
@@ -25,6 +29,12 @@ lazy_static! {
         llama_33_70b.insert("continuum", CONTINUUM_LLAMA_33_70B);
         llama_33_70b.insert("tinfoil", TINFOIL_LLAMA_33_70B);
         equivalencies.insert(CANONICAL_LLAMA_33_70B, llama_33_70b);
+
+        // GPT-OSS 120B
+        let mut gpt_oss_120b = HashMap::new();
+        gpt_oss_120b.insert("continuum", CONTINUUM_GPT_OSS_120B);
+        gpt_oss_120b.insert("tinfoil", TINFOIL_GPT_OSS_120B);
+        equivalencies.insert(CANONICAL_GPT_OSS_120B, gpt_oss_120b);
 
         equivalencies
     };

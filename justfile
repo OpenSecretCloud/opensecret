@@ -183,7 +183,7 @@ diesel-migration-run-preview:
 
 # Update continuum-proxy
 update-continuum-proxy:
-    containerID=$({{container}} create --platform linux/arm64 ghcr.io/edgelesssys/privatemode/privatemode-proxy:v1.21.0@sha256:81b832614df21fe159aeef8e1368e4f26e15d8e05f0aad56f4a0ae7ceaca31e2) && \
+    containerID=$({{container}} create --platform linux/arm64 ghcr.io/edgelesssys/privatemode/privatemode-proxy:v1.23.0@sha256:f128d6389c8afa50cc995adc736486131b224b856320a38777cac027128f4ed4) && \
     {{container}} cp "${containerID}":/bin/privatemode-proxy ./continuum-proxy && \
     {{container}} rm "${containerID}"
 

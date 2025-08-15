@@ -29,6 +29,7 @@ fi
 
 log "Starting entrypoint script"
 log "APP_MODE=$APP_MODE"
+log "Kernel version: $(uname -r)"
 
 # Configure loopback interface
 log "Configuring loopback interface"

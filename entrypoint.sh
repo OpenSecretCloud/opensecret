@@ -12,8 +12,9 @@ log "Starting entrypoint script"
 # Start the logging script
 log "Starting log exports"
 
-# Redirect all output to the logging script via VSOCK
-exec > >(socat - VSOCK-CONNECT:3:8011) 2>&1
+# Redirect all output to the logging script via VSOCK with buffering
+# Use stdbuf to line-buffer output for timely delivery
+exec > >(stdbuf -oL socat -u - VSOCK-CONNECT:3:8011) 2>&1
 
 # Read and set APP_MODE from file
 log "Reading /app/APP_MODE"
@@ -26,6 +27,10 @@ else
     log "ERROR: /app/APP_MODE is missing. Please ensure the file exists and contains a valid mode (dev/preview/prod/custom)"
     exit 1
 fi
+
+# Increase file descriptor limits to prevent socket exhaustion
+ulimit -n 65536
+log "File descriptor limit set to: $(ulimit -n)"
 
 log "Starting entrypoint script"
 log "APP_MODE=$APP_MODE"
@@ -658,6 +663,18 @@ else
     # No tinfoil proxy in local mode
     export TINFOIL_API_BASE=""
 fi
+
+# Start file descriptor monitoring in background
+(
+    while true; do
+        sleep 300  # Check every 5 minutes
+        FD_COUNT=$(ls /proc/*/fd 2>/dev/null | wc -l)
+        log "File descriptors in use: $FD_COUNT"
+        if [ "$FD_COUNT" -gt 50000 ]; then
+            log "WARNING: High file descriptor usage: $FD_COUNT"
+        fi
+    done
+) &
 
 # Start the opensecret
 log "Starting opensecret..."

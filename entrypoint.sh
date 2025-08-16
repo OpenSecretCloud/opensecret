@@ -31,6 +31,10 @@ log "Starting entrypoint script"
 log "APP_MODE=$APP_MODE"
 log "Kernel version: $(uname -r)"
 
+# Increase file descriptor limits to prevent socket exhaustion
+ulimit -n 65536
+log "File descriptor limit set to: $(ulimit -n)"
+
 # Configure loopback interface
 log "Configuring loopback interface"
 ip addr add 127.0.0.1/8 dev lo

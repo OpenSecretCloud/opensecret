@@ -40,14 +40,15 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
         .with_state(app_state)
 }
 
-async fn proxy_openai(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::Extension(session_id): axum::Extension<Uuid>,
-    axum::Extension(user): axum::Extension<User>,
-    axum::Extension(body): axum::Extension<Value>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    debug!("Entering proxy_openai function");
+/// Core chat completion logic that returns the raw response from the provider
+/// This is used by both the public /v1/chat/completions endpoint and internal Responses API
+pub(crate) async fn get_chat_completion_response(
+    state: &Arc<AppState>,
+    user: &User,
+    body: Value,
+    headers: &HeaderMap,
+) -> Result<hyper::Response<Body>, ApiError> {
+    debug!("Entering get_chat_completion_response");
 
     // Prevent guest users from using the OpenAI chat feature
     if user.is_guest() {
@@ -168,7 +169,7 @@ async fn proxy_openai(
                 cycle + 1,
                 route.primary.provider_name
             );
-            match try_provider(&client, &route.primary, &primary_body_json, &headers).await {
+            match try_provider(&client, &route.primary, &primary_body_json, headers).await {
                 Ok(response) => {
                     info!(
                         "Successfully got response from primary provider {} on cycle {}",
@@ -196,7 +197,7 @@ async fn proxy_openai(
                     cycle + 1,
                     fallback_provider.provider_name
                 );
-                match try_provider(&client, fallback_provider, fallback_body_json, &headers).await {
+                match try_provider(&client, fallback_provider, fallback_body_json, headers).await {
                     Ok(response) => {
                         info!(
                             "Successfully got response from fallback provider {} on cycle {}",
@@ -238,6 +239,21 @@ async fn proxy_openai(
             }
         }
     };
+
+    Ok(res)
+}
+
+async fn proxy_openai(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(user): axum::Extension<User>,
+    axum::Extension(body): axum::Extension<Value>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    debug!("Entering proxy_openai function");
+
+    // Get the raw response using the core function
+    let res = get_chat_completion_response(&state, &user, body, &headers).await?;
 
     debug!("Successfully received response from OpenAI");
 

@@ -10,8 +10,7 @@ CREATE TABLE user_api_keys (
     UNIQUE(user_id, name)
 );
 
--- Indexes for efficient lookups
-CREATE INDEX idx_user_api_keys_key_hash ON user_api_keys(key_hash);
+-- Index for efficient user lookups (key_hash already has unique index)
 CREATE INDEX idx_user_api_keys_user_id ON user_api_keys(user_id);
 
 -- Create a trigger to automatically update the updated_at column

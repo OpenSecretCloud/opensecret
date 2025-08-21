@@ -3,8 +3,7 @@
 DROP TRIGGER IF EXISTS trigger_update_user_api_keys_updated_at ON user_api_keys;
 DROP FUNCTION IF EXISTS update_user_api_keys_updated_at();
 
--- Drop indexes
-DROP INDEX IF EXISTS idx_user_api_keys_key_hash;
+-- Drop index
 DROP INDEX IF EXISTS idx_user_api_keys_user_id;
 
 -- Drop table

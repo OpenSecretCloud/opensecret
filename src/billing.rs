@@ -34,21 +34,20 @@ impl BillingClient {
     }
 
     async fn check_usage(&self, user_id: Uuid, is_api: bool) -> Result<bool, BillingError> {
-        let mut url = format!(
-            "{}/v1/admin/check-usage?user_id={}&product=maple",
-            self.base_url, user_id
-        );
+        let mut request = self
+            .client
+            .get(format!("{}/v1/admin/check-usage", self.base_url))
+            .query(&[
+                ("user_id", user_id.to_string()),
+                ("product", "maple".to_string()),
+            ])
+            .header("x-api-key", &self.api_key);
 
         if is_api {
-            url.push_str("&api=true");
+            request = request.query(&[("api", "true".to_string())]);
         }
 
-        let response = self
-            .client
-            .get(&url)
-            .header("x-api-key", &self.api_key)
-            .send()
-            .await?;
+        let response = request.send().await?;
 
         if response.status().is_success() {
             response

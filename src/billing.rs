@@ -33,11 +33,15 @@ impl BillingClient {
         }
     }
 
-    pub async fn can_user_chat(&self, user_id: Uuid) -> Result<bool, BillingError> {
-        let url = format!(
+    async fn check_usage(&self, user_id: Uuid, is_api: bool) -> Result<bool, BillingError> {
+        let mut url = format!(
             "{}/v1/admin/check-usage?user_id={}&product=maple",
             self.base_url, user_id
         );
+
+        if is_api {
+            url.push_str("&api=true");
+        }
 
         let response = self
             .client
@@ -59,5 +63,13 @@ impl BillingClient {
                 .unwrap_or_else(|_| "Unknown error".to_string());
             Err(BillingError::ServiceError(error))
         }
+    }
+
+    pub async fn can_user_chat(&self, user_id: Uuid) -> Result<bool, BillingError> {
+        self.check_usage(user_id, false).await
+    }
+
+    pub async fn can_user_chat_api(&self, user_id: Uuid) -> Result<bool, BillingError> {
+        self.check_usage(user_id, true).await
     }
 }

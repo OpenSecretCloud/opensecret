@@ -15,6 +15,7 @@ use crate::models::password_reset::NewPasswordResetRequest;
 use crate::models::platform_password_reset::NewPlatformPasswordResetRequest;
 use crate::models::platform_users::PlatformUser;
 use crate::sqs::SqsEventPublisher;
+use crate::web::openai_auth::validate_openai_auth;
 use crate::web::platform_login_routes;
 use crate::web::{
     document_routes, health_routes_with_state, login_routes, oauth_routes, openai_routes,
@@ -148,6 +149,9 @@ pub enum Error {
 
     #[error("Authentication error")]
     AuthenticationError,
+
+    #[error("Invalid API key")]
+    InvalidApiKey,
 
     #[error("Failed to parse secret")]
     SecretParsingError,
@@ -2416,7 +2420,7 @@ async fn main() -> Result<(), Error> {
         .merge(login_routes(app_state.clone()))
         .merge(
             openai_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+                .route_layer(from_fn_with_state(app_state.clone(), validate_openai_auth)),
         )
         .merge(
             document_routes(app_state.clone())

@@ -379,6 +379,33 @@ pub struct DecryptDataRequest {
     pub key_options: KeyOptions,
 }
 
+// API Key Management Types
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateApiKeyRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateApiKeyResponse {
+    pub id: i32,
+    pub key: String, // UUID format with dashes
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyInfo {
+    pub id: i32,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListApiKeysResponse {
+    pub keys: Vec<ApiKeyInfo>,
+}
+
 pub fn router(app_state: Arc<AppState>) -> Router<()> {
     Router::new()
         .route(
@@ -478,6 +505,23 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
                 app_state.clone(),
                 decrypt_request::<DecryptDataRequest>,
             )),
+        )
+        // API Key management endpoints
+        .route(
+            "/protected/api-keys",
+            post(create_api_key).layer(from_fn_with_state(
+                app_state.clone(),
+                decrypt_request::<CreateApiKeyRequest>,
+            )),
+        )
+        .route(
+            "/protected/api-keys",
+            get(list_api_keys).layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/protected/api-keys/:id",
+            delete(delete_api_key)
+                .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
         )
         .with_state(app_state.clone())
 }
@@ -1373,6 +1417,100 @@ pub async fn confirm_account_deletion(
             }
         },
     }
+}
+
+// API Key Management Handlers
+
+pub async fn create_api_key(
+    State(data): State<Arc<AppState>>,
+    Extension(user): Extension<User>,
+    Extension(request): Extension<CreateApiKeyRequest>,
+    Extension(session_id): Extension<Uuid>,
+) -> Result<Json<EncryptedResponse<CreateApiKeyResponse>>, ApiError> {
+    debug!("Creating new API key for user: {}", user.uuid);
+
+    // Generate a random UUID for the API key
+    let random_bytes: [u8; 16] =
+        crate::encrypt::generate_random_enclave::<16>(data.aws_credential_manager.clone()).await;
+    let api_key_uuid = Uuid::from_bytes(random_bytes);
+
+    // Hash the UUID string (with dashes) using SHA-256
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(api_key_uuid.to_string().as_bytes());
+    let key_hash = format!("{:x}", hasher.finalize());
+
+    // Create the database record
+    let new_key =
+        crate::models::user_api_keys::NewUserApiKey::new(user.uuid, key_hash, request.name.clone());
+
+    let api_key_record = data.db.create_user_api_key(new_key).map_err(|e| {
+        error!("Failed to create API key: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    let response = CreateApiKeyResponse {
+        id: api_key_record.id,
+        key: api_key_uuid.to_string(), // Return the actual UUID to the user
+        name: api_key_record.name,
+        created_at: api_key_record.created_at,
+    };
+
+    info!("Created API key '{}' for user {}", response.name, user.uuid);
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub async fn list_api_keys(
+    State(data): State<Arc<AppState>>,
+    Extension(user): Extension<User>,
+    Extension(session_id): Extension<Uuid>,
+) -> Result<Json<EncryptedResponse<ListApiKeysResponse>>, ApiError> {
+    debug!("Listing API keys for user: {}", user.uuid);
+
+    let api_keys = data
+        .db
+        .get_all_user_api_keys_for_user(user.uuid)
+        .map_err(|e| {
+            error!("Failed to list API keys: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    let keys: Vec<ApiKeyInfo> = api_keys
+        .into_iter()
+        .map(|key| ApiKeyInfo {
+            id: key.id,
+            name: key.name,
+            created_at: key.created_at,
+        })
+        .collect();
+
+    let response = ListApiKeysResponse { keys };
+
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub async fn delete_api_key(
+    State(data): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Extension(user): Extension<User>,
+    Extension(session_id): Extension<Uuid>,
+) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    debug!("Deleting API key {} for user: {}", id, user.uuid);
+
+    data.db.delete_user_api_key(id, user.uuid).map_err(|e| {
+        error!("Failed to delete API key: {:?}", e);
+        match e {
+            DBError::UserApiKeyError(crate::models::user_api_keys::UserApiKeyError::NotFound) => {
+                ApiError::NotFound
+            }
+            _ => ApiError::InternalServerError,
+        }
+    })?;
+
+    info!("Deleted API key {} for user {}", id, user.uuid);
+
+    let response = json!({ "success": true });
+    encrypt_response(&data, &session_id, &response).await
 }
 
 #[cfg(test)]

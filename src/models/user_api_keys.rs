@@ -86,7 +86,6 @@ impl UserApiKey {
     ) -> Result<Vec<Self>, UserApiKeyError> {
         user_api_keys::table
             .filter(user_api_keys::user_id.eq(user_id))
-            .order(user_api_keys::created_at.desc())
             .load::<Self>(conn)
             .map_err(UserApiKeyError::DatabaseError)
     }
@@ -103,6 +102,26 @@ impl UserApiKey {
             .execute(conn)
             .map(|_| ())
             .map_err(UserApiKeyError::DatabaseError)
+    }
+
+    pub fn delete_by_name_and_user(
+        conn: &mut PgConnection,
+        name: &str,
+        user_id: Uuid,
+    ) -> Result<(), UserApiKeyError> {
+        let rows_affected = diesel::delete(
+            user_api_keys::table
+                .filter(user_api_keys::name.eq(name))
+                .filter(user_api_keys::user_id.eq(user_id)),
+        )
+        .execute(conn)
+        .map_err(UserApiKeyError::DatabaseError)?;
+
+        if rows_affected == 0 {
+            Err(UserApiKeyError::NotFound)
+        } else {
+            Ok(())
+        }
     }
 
     /// Get the user associated with this API key

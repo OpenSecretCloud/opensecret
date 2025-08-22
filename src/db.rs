@@ -441,6 +441,7 @@ pub trait DBConnection {
     fn get_user_by_api_key_hash(&self, key_hash: &str) -> Result<Option<User>, DBError>;
     fn get_all_user_api_keys_for_user(&self, user_id: Uuid) -> Result<Vec<UserApiKey>, DBError>;
     fn delete_user_api_key(&self, id: i32, user_id: Uuid) -> Result<(), DBError>;
+    fn delete_user_api_key_by_name(&self, name: &str, user_id: Uuid) -> Result<(), DBError>;
 
     // Platform invite code methods
     fn validate_platform_invite_code(&self, code: Uuid) -> Result<PlatformInviteCode, DBError>;
@@ -1661,6 +1662,17 @@ impl DBConnection for PostgresConnection {
             }
             _ => Err(DBError::UserApiKeyError(UserApiKeyError::NotFound)),
         }
+    }
+
+    fn delete_user_api_key_by_name(&self, name: &str, user_id: Uuid) -> Result<(), DBError> {
+        debug!("Deleting API key '{}' for user {}", name, user_id);
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        // First find the key by name and user_id, then delete it
+        // Use the same error for both "not found" and "unauthorized" to prevent information disclosure
+        UserApiKey::delete_by_name_and_user(conn, name, user_id).map_err(|e| match e {
+            UserApiKeyError::NotFound => DBError::UserApiKeyError(UserApiKeyError::NotFound),
+            e => DBError::from(e),
+        })
     }
 
     // Account Deletion implementations

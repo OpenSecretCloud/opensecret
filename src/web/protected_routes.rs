@@ -388,15 +388,13 @@ pub struct CreateApiKeyRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateApiKeyResponse {
-    pub id: i32,
-    pub key: String, // UUID format with dashes
+    pub key: String, // UUID format with dashes - only returned on creation
     pub name: String,
     pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyInfo {
-    pub id: i32,
     pub name: String,
     pub created_at: DateTime<Utc>,
 }
@@ -519,7 +517,7 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
             get(list_api_keys).layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
         )
         .route(
-            "/protected/api-keys/:id",
+            "/protected/api-keys/:name",
             delete(delete_api_key)
                 .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
         )
@@ -1450,8 +1448,7 @@ pub async fn create_api_key(
     })?;
 
     let response = CreateApiKeyResponse {
-        id: api_key_record.id,
-        key: api_key_uuid.to_string(), // Return the actual UUID to the user
+        key: api_key_uuid.to_string(), // Return the actual UUID to the user (only time it's shown)
         name: api_key_record.name,
         created_at: api_key_record.created_at,
     };
@@ -1478,7 +1475,6 @@ pub async fn list_api_keys(
     let keys: Vec<ApiKeyInfo> = api_keys
         .into_iter()
         .map(|key| ApiKeyInfo {
-            id: key.id,
             name: key.name,
             created_at: key.created_at,
         })
@@ -1491,23 +1487,25 @@ pub async fn list_api_keys(
 
 pub async fn delete_api_key(
     State(data): State<Arc<AppState>>,
-    Path(id): Path<i32>,
+    Path(name): Path<String>,
     Extension(user): Extension<User>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Deleting API key {} for user: {}", id, user.uuid);
+    debug!("Deleting API key '{}' for user: {}", name, user.uuid);
 
-    data.db.delete_user_api_key(id, user.uuid).map_err(|e| {
-        error!("Failed to delete API key: {:?}", e);
-        match e {
-            DBError::UserApiKeyError(crate::models::user_api_keys::UserApiKeyError::NotFound) => {
-                ApiError::NotFound
+    data.db
+        .delete_user_api_key_by_name(&name, user.uuid)
+        .map_err(|e| {
+            error!("Failed to delete API key: {:?}", e);
+            match e {
+                DBError::UserApiKeyError(
+                    crate::models::user_api_keys::UserApiKeyError::NotFound,
+                ) => ApiError::NotFound,
+                _ => ApiError::InternalServerError,
             }
-            _ => ApiError::InternalServerError,
-        }
-    })?;
+        })?;
 
-    info!("Deleted API key {} for user {}", id, user.uuid);
+    info!("Deleted API key '{}' for user {}", name, user.uuid);
 
     let response = json!({ "success": true });
     encrypt_response(&data, &session_id, &response).await

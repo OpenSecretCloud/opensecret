@@ -32,6 +32,7 @@ use std::sync::Arc;
 use tokio::spawn;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+use validator::Validate;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -381,8 +382,32 @@ pub struct DecryptDataRequest {
 
 // API Key Management Types
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Validation function for API key names
+// More restrictive than project names since they're used in URL paths
+fn validate_api_key_name(name: &str) -> Result<(), validator::ValidationError> {
+    use validator::ValidationError;
+
+    let trimmed = name.trim();
+
+    // Check for valid characters (alphanumeric, space, hyphen, underscore)
+    if !trimmed
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '_')
+    {
+        return Err(ValidationError::new("invalid_characters").with_message(
+            std::borrow::Cow::Borrowed(
+                "Only alphanumeric characters, spaces, hyphens, and underscores are allowed",
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct CreateApiKeyRequest {
+    #[validate(length(min = 1, max = 50))]
+    #[validate(custom(function = "validate_api_key_name"))]
     pub name: String,
 }
 
@@ -1427,6 +1452,15 @@ pub async fn create_api_key(
 ) -> Result<Json<EncryptedResponse<CreateApiKeyResponse>>, ApiError> {
     debug!("Creating new API key for user: {}", user.uuid);
 
+    // Validate the request
+    if let Err(e) = request.validate() {
+        error!("API key request validation failed: {:?}", e);
+        return Err(ApiError::BadRequest);
+    }
+
+    // Trim the name for use (validation already checked it's not empty after trim)
+    let name = request.name.trim().to_string();
+
     // Generate a random UUID for the API key
     let random_bytes: [u8; 16] =
         crate::encrypt::generate_random_enclave::<16>(data.aws_credential_manager.clone()).await;
@@ -1440,11 +1474,21 @@ pub async fn create_api_key(
 
     // Create the database record
     let new_key =
-        crate::models::user_api_keys::NewUserApiKey::new(user.uuid, key_hash, request.name.clone());
+        crate::models::user_api_keys::NewUserApiKey::new(user.uuid, key_hash, name.clone());
 
     let api_key_record = data.db.create_user_api_key(new_key).map_err(|e| {
-        error!("Failed to create API key: {:?}", e);
-        ApiError::InternalServerError
+        match e {
+            DBError::UserApiKeyError(
+                crate::models::user_api_keys::UserApiKeyError::DuplicateName,
+            ) => {
+                error!("API key with name '{}' already exists for user", name);
+                ApiError::Conflict // 409 - name already in use
+            }
+            _ => {
+                error!("Failed to create API key: {:?}", e);
+                ApiError::InternalServerError
+            }
+        }
     })?;
 
     let response = CreateApiKeyResponse {

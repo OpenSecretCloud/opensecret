@@ -219,6 +219,9 @@ pub enum ApiError {
     #[error("Bad Request")]
     BadRequest,
 
+    #[error("Conflict")]
+    Conflict,
+
     #[error("Encryption error")]
     EncryptionError,
 
@@ -261,6 +264,7 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::InternalServerError => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::BadRequest => StatusCode::BAD_REQUEST,
+            ApiError::Conflict => StatusCode::CONFLICT,
             ApiError::InvalidInviteCode => StatusCode::UNAUTHORIZED,
             ApiError::RefreshFailed => StatusCode::UNAUTHORIZED,
             ApiError::UserAlreadyVerified => StatusCode::BAD_REQUEST,

@@ -52,6 +52,11 @@ var modelConfigs = map[string]struct {
 		Description: "Powerful reasoning, configurable reasoning effort levels, full chain-of-thought access, native agentic abilities",
 		Active:      true,
 	},
+	"qwen3-coder-480b": {
+		ModelID:     "qwen3-coder-480b",
+		Description: "Advanced coding model with 480B parameters for complex programming tasks",
+		Active:      true,
+	},
 }
 
 // Request/Response models

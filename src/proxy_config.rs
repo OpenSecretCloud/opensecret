@@ -348,31 +348,17 @@ impl ProxyRouter {
                                     available_models_by_provider.get("continuum")
                                 {
                                     if continuum_models.contains(&continuum_equiv.to_string()) {
-                                        // TEMPORARY: Swap Llama 3 to use Continuum as primary due to Tinfoil issues
-                                        let route = if model_name == "llama3-3-70b" {
-                                            warn!("TEMPORARY: Using Continuum as primary for Llama 3.3 70B due to Tinfoil issues");
-                                            ModelRoute {
-                                                primary: self.default_proxy.clone(),
-                                                fallbacks: vec![tinfoil_proxy.clone()],
-                                            }
-                                        } else {
-                                            ModelRoute {
-                                                primary: tinfoil_proxy.clone(),
-                                                fallbacks: vec![self.default_proxy.clone()],
-                                            }
+                                        // This model has a Continuum fallback
+                                        let route = ModelRoute {
+                                            primary: tinfoil_proxy.clone(),
+                                            fallbacks: vec![self.default_proxy.clone()],
                                         };
                                         model_routes.insert(model_name.clone(), route.clone());
                                         // Also map the Continuum name to the same route
                                         model_routes.insert(continuum_equiv.to_string(), route);
                                         has_continuum_fallback = true;
-
-                                        if model_name == "llama3-3-70b" {
-                                            info!("Model available from both providers - Continuum ({}) primary, Tinfoil ({}) fallback (TEMPORARY)", 
-                                                  continuum_equiv, model_name);
-                                        } else {
-                                            info!("Model available from both providers - Tinfoil ({}) primary, Continuum ({}) fallback", 
-                                                  model_name, continuum_equiv);
-                                        }
+                                        info!("Model available from both providers - Tinfoil ({}) primary, Continuum ({}) fallback", 
+                                              model_name, continuum_equiv);
                                         break;
                                     }
                                 }

@@ -15,24 +15,48 @@ pub enum UserApiKeyError {
     NotFound,
 }
 
-#[derive(Queryable, Serialize, Deserialize, Clone, Debug)]
+#[derive(Queryable, Serialize, Deserialize, Clone)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
 #[diesel(table_name = user_api_keys)]
 pub struct UserApiKey {
     pub id: i32,
     pub user_id: Uuid,
+    #[serde(skip_serializing)]
     pub key_hash: String,
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Insertable, Debug)]
+impl std::fmt::Debug for UserApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserApiKey")
+            .field("id", &self.id)
+            .field("user_id", &self.user_id)
+            .field("key_hash", &"<redacted>")
+            .field("name", &self.name)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+#[derive(Insertable)]
 #[diesel(table_name = user_api_keys)]
 pub struct NewUserApiKey {
     pub user_id: Uuid,
     pub key_hash: String,
     pub name: String,
+}
+
+impl std::fmt::Debug for NewUserApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewUserApiKey")
+            .field("user_id", &self.user_id)
+            .field("key_hash", &"<redacted>")
+            .field("name", &self.name)
+            .finish()
+    }
 }
 
 impl NewUserApiKey {

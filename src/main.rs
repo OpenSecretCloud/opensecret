@@ -150,9 +150,6 @@ pub enum Error {
     #[error("Authentication error")]
     AuthenticationError,
 
-    #[error("Invalid API key")]
-    InvalidApiKey,
-
     #[error("Failed to parse secret")]
     SecretParsingError,
 

@@ -387,16 +387,29 @@ pub struct DecryptDataRequest {
 fn validate_api_key_name(name: &str) -> Result<(), validator::ValidationError> {
     use validator::ValidationError;
 
-    let trimmed = name.trim();
+    // First check for leading/trailing whitespace
+    if name != name.trim() {
+        return Err(
+            ValidationError::new("whitespace").with_message(std::borrow::Cow::Borrowed(
+                "Name cannot have leading or trailing whitespace",
+            )),
+        );
+    }
 
-    // Check for valid characters (alphanumeric, space, hyphen, underscore)
-    if !trimmed
+    // After confirming no leading/trailing space, check length
+    if name.is_empty() || name.len() > 50 {
+        return Err(ValidationError::new("length")
+            .with_message(std::borrow::Cow::Borrowed("Name must be 1-50 characters")));
+    }
+
+    // Check for valid characters (ASCII only for URL safety)
+    if !name
         .chars()
-        .all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '_')
+        .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '_')
     {
         return Err(ValidationError::new("invalid_characters").with_message(
             std::borrow::Cow::Borrowed(
-                "Only alphanumeric characters, spaces, hyphens, and underscores are allowed",
+                "Only ASCII alphanumeric characters, spaces, hyphens, and underscores are allowed",
             ),
         ));
     }
@@ -1458,8 +1471,8 @@ pub async fn create_api_key(
         return Err(ApiError::BadRequest);
     }
 
-    // Trim the name for use (validation already checked it's not empty after trim)
-    let name = request.name.trim().to_string();
+    // Use the name directly (validation ensures no leading/trailing whitespace)
+    let name = request.name.clone();
 
     // Generate a random UUID for the API key
     let random_bytes: [u8; 16] =
@@ -1817,5 +1830,186 @@ mod tests {
             // Print debug info
             println!("Iteration {}: Both decryptions successful", i);
         }
+    }
+}
+
+#[cfg(test)]
+mod api_key_validation_tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_api_key_names() {
+        let max_length_name = "a".repeat(50);
+        let valid_names = vec![
+            "my-api-key",
+            "test_key_123",
+            "Production Key",
+            "key-with_spaces and-dashes",
+            "UPPERCASE",
+            "lowercase",
+            "MixedCase",
+            "123numeric",
+            "a",                      // single character
+            max_length_name.as_str(), // max length
+        ];
+
+        for name in valid_names {
+            assert!(
+                validate_api_key_name(name).is_ok(),
+                "Expected '{}' to be valid",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_invalid_api_key_names_whitespace() {
+        let invalid_names = vec![
+            "   ",            // only spaces
+            "\t",             // tab
+            "\n",             // newline
+            "  leading",      // leading space
+            "trailing  ",     // trailing space
+            " both ",         // both leading and trailing
+            "\tleading_tab",  // leading tab
+            "trailing_tab\t", // trailing tab
+        ];
+
+        for name in invalid_names {
+            let result = validate_api_key_name(name);
+            assert!(
+                result.is_err(),
+                "Expected '{}' to be invalid",
+                name.escape_debug()
+            );
+            if let Err(e) = result {
+                assert_eq!(
+                    e.code,
+                    "whitespace",
+                    "Expected whitespace error for '{}'",
+                    name.escape_debug()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_invalid_api_key_names_length() {
+        let too_long = "a".repeat(51);
+        let way_too_long = "x".repeat(100);
+        let invalid_names = vec![
+            "",                    // empty
+            too_long.as_str(),     // too long (51 chars)
+            way_too_long.as_str(), // way too long
+        ];
+
+        for name in invalid_names {
+            let result = validate_api_key_name(name);
+            assert!(
+                result.is_err(),
+                "Expected '{}' (len={}) to be invalid",
+                if name.len() > 20 { "[truncated]" } else { name },
+                name.len()
+            );
+            if let Err(e) = result {
+                assert_eq!(
+                    e.code,
+                    "length",
+                    "Expected length error for name of length {}",
+                    name.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_invalid_api_key_names_characters() {
+        let invalid_names = vec![
+            "café",             // accented character
+            "测试",             // Chinese characters
+            "тест",             // Cyrillic
+            "key!",             // exclamation mark
+            "key@host",         // at symbol
+            "key#hash",         // hash
+            "key$money",        // dollar sign
+            "key%percent",      // percent
+            "key^caret",        // caret
+            "key&and",          // ampersand
+            "key*star",         // asterisk
+            "key(paren",        // parenthesis
+            "key[bracket",      // bracket
+            "key{brace",        // brace
+            "key|pipe",         // pipe
+            "key\\backslash",   // backslash
+            "key/slash",        // forward slash
+            "key:colon",        // colon
+            "key;semicolon",    // semicolon
+            "key'quote",        // single quote
+            "key\"doublequote", // double quote
+            "key<less",         // less than
+            "key>greater",      // greater than
+            "key?question",     // question mark
+            "key,comma",        // comma
+            "key.period",       // period
+            "😀emoji",          // emoji
+            "key\0null",        // null character
+            "hello\nworld",     // newline in middle
+            "hello\tworld",     // tab in middle
+        ];
+
+        for name in invalid_names {
+            let result = validate_api_key_name(name);
+            assert!(
+                result.is_err(),
+                "Expected '{}' to be invalid due to invalid characters",
+                name.escape_debug()
+            );
+            if let Err(e) = result {
+                assert_eq!(
+                    e.code,
+                    "invalid_characters",
+                    "Expected invalid_characters error for '{}'",
+                    name.escape_debug()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        // Test that internal spaces are allowed
+        assert!(validate_api_key_name("valid name").is_ok());
+        assert!(validate_api_key_name("multiple  spaces  inside").is_ok());
+
+        // Test all allowed characters together
+        assert!(validate_api_key_name("aZ_0-9 mix").is_ok());
+
+        // Test exact boundary lengths
+        let exactly_50 = "x".repeat(50);
+        let exactly_51 = "x".repeat(51);
+        assert!(validate_api_key_name(&exactly_50).is_ok()); // exactly 50
+        assert!(validate_api_key_name(&exactly_51).is_err()); // exactly 51
+    }
+
+    #[test]
+    fn test_security_concerns() {
+        // Path traversal attempts
+        assert!(validate_api_key_name("../etc/passwd").is_err());
+        assert!(validate_api_key_name("..\\windows\\system32").is_err());
+
+        // SQL injection attempts
+        assert!(validate_api_key_name("'; DROP TABLE users--").is_err());
+        assert!(validate_api_key_name("1' OR '1'='1").is_err());
+
+        // XSS attempts
+        assert!(validate_api_key_name("<script>alert(1)</script>").is_err());
+        assert!(validate_api_key_name("javascript:alert(1)").is_err());
+
+        // Command injection attempts
+        assert!(validate_api_key_name("key; rm -rf /").is_err());
+        assert!(validate_api_key_name("key`whoami`").is_err());
+        assert!(validate_api_key_name("key$(whoami)").is_err());
+        assert!(validate_api_key_name("key&&whoami").is_err());
+        assert!(validate_api_key_name("key||whoami").is_err());
     }
 }

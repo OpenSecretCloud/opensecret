@@ -1640,7 +1640,7 @@ impl DBConnection for PostgresConnection {
     fn get_user_by_api_key_hash(&self, key_hash: &str) -> Result<Option<User>, DBError> {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         match UserApiKey::get_by_key_hash(conn, key_hash)? {
-            Some(api_key) => api_key.get_user(conn).map_err(DBError::from),
+            Some(api_key) => User::get_by_uuid(conn, api_key.user_id).map_err(DBError::from),
             None => Ok(None),
         }
     }

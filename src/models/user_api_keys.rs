@@ -147,16 +147,4 @@ impl UserApiKey {
             Ok(())
         }
     }
-
-    /// Get the user associated with this API key
-    pub fn get_user(
-        &self,
-        conn: &mut PgConnection,
-    ) -> Result<Option<crate::models::users::User>, UserApiKeyError> {
-        use crate::models::users::{User, UserError};
-        User::get_by_uuid(conn, self.user_id).map_err(|e| match e {
-            UserError::DatabaseError(db_err) => UserApiKeyError::DatabaseError(db_err),
-            _ => UserApiKeyError::NotFound, // KeyAlreadyExists doesn't apply here
-        })
-    }
 }

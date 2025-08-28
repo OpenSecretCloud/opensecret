@@ -15,5 +15,6 @@ pub mod platform_users;
 pub mod project_settings;
 pub mod schema;
 pub mod token_usage;
+pub mod user_api_keys;
 pub mod user_kv;
 pub mod users;

@@ -32,6 +32,7 @@ use std::sync::Arc;
 use tokio::spawn;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+use validator::Validate;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -379,6 +380,68 @@ pub struct DecryptDataRequest {
     pub key_options: KeyOptions,
 }
 
+// API Key Management Types
+
+// Validation function for API key names
+// More restrictive than project names since they're used in URL paths
+fn validate_api_key_name(name: &str) -> Result<(), validator::ValidationError> {
+    use validator::ValidationError;
+
+    // First check for leading/trailing whitespace
+    if name != name.trim() {
+        return Err(
+            ValidationError::new("whitespace").with_message(std::borrow::Cow::Borrowed(
+                "Name cannot have leading or trailing whitespace",
+            )),
+        );
+    }
+
+    // After confirming no leading/trailing space, check length
+    if name.is_empty() || name.len() > 50 {
+        return Err(ValidationError::new("length")
+            .with_message(std::borrow::Cow::Borrowed("Name must be 1-50 characters")));
+    }
+
+    // Check for valid characters (ASCII only for URL safety)
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '-' || c == '_')
+    {
+        return Err(ValidationError::new("invalid_characters").with_message(
+            std::borrow::Cow::Borrowed(
+                "Only ASCII alphanumeric characters, spaces, hyphens, and underscores are allowed",
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+pub struct CreateApiKeyRequest {
+    #[validate(length(min = 1, max = 50))]
+    #[validate(custom(function = "validate_api_key_name"))]
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateApiKeyResponse {
+    pub key: String, // UUID format with dashes - only returned on creation
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyInfo {
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListApiKeysResponse {
+    pub keys: Vec<ApiKeyInfo>,
+}
+
 pub fn router(app_state: Arc<AppState>) -> Router<()> {
     Router::new()
         .route(
@@ -478,6 +541,23 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
                 app_state.clone(),
                 decrypt_request::<DecryptDataRequest>,
             )),
+        )
+        // API Key management endpoints
+        .route(
+            "/protected/api-keys",
+            post(create_api_key).layer(from_fn_with_state(
+                app_state.clone(),
+                decrypt_request::<CreateApiKeyRequest>,
+            )),
+        )
+        .route(
+            "/protected/api-keys",
+            get(list_api_keys).layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/protected/api-keys/:name",
+            delete(delete_api_key)
+                .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
         )
         .with_state(app_state.clone())
 }
@@ -1375,6 +1455,119 @@ pub async fn confirm_account_deletion(
     }
 }
 
+// API Key Management Handlers
+
+pub async fn create_api_key(
+    State(data): State<Arc<AppState>>,
+    Extension(user): Extension<User>,
+    Extension(request): Extension<CreateApiKeyRequest>,
+    Extension(session_id): Extension<Uuid>,
+) -> Result<Json<EncryptedResponse<CreateApiKeyResponse>>, ApiError> {
+    debug!("Creating new API key for user: {}", user.uuid);
+
+    // Validate the request
+    if let Err(e) = request.validate() {
+        error!("API key request validation failed: {:?}", e);
+        return Err(ApiError::BadRequest);
+    }
+
+    // Use the name directly (validation ensures no leading/trailing whitespace)
+    let name = request.name.clone();
+
+    // Generate a random UUID for the API key
+    let random_bytes: [u8; 16] =
+        crate::encrypt::generate_random_enclave::<16>(data.aws_credential_manager.clone()).await;
+    let api_key_uuid = Uuid::from_bytes(random_bytes);
+
+    // Hash the UUID string (with dashes) using SHA-256
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(api_key_uuid.to_string().as_bytes());
+    let key_hash = format!("{:x}", hasher.finalize());
+
+    // Create the database record
+    let new_key =
+        crate::models::user_api_keys::NewUserApiKey::new(user.uuid, key_hash, name.clone());
+
+    let api_key_record = data.db.create_user_api_key(new_key).map_err(|e| {
+        match e {
+            DBError::UserApiKeyError(
+                crate::models::user_api_keys::UserApiKeyError::DuplicateName,
+            ) => {
+                error!("API key with name '{}' already exists for user", name);
+                ApiError::Conflict // 409 - name already in use
+            }
+            _ => {
+                error!("Failed to create API key: {:?}", e);
+                ApiError::InternalServerError
+            }
+        }
+    })?;
+
+    let response = CreateApiKeyResponse {
+        key: api_key_uuid.to_string(), // Return the actual UUID to the user (only time it's shown)
+        name: api_key_record.name,
+        created_at: api_key_record.created_at,
+    };
+
+    info!("Created API key '{}' for user {}", response.name, user.uuid);
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub async fn list_api_keys(
+    State(data): State<Arc<AppState>>,
+    Extension(user): Extension<User>,
+    Extension(session_id): Extension<Uuid>,
+) -> Result<Json<EncryptedResponse<ListApiKeysResponse>>, ApiError> {
+    debug!("Listing API keys for user: {}", user.uuid);
+
+    let api_keys = data
+        .db
+        .get_all_user_api_keys_for_user(user.uuid)
+        .map_err(|e| {
+            error!("Failed to list API keys: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    let keys: Vec<ApiKeyInfo> = api_keys
+        .into_iter()
+        .map(|key| ApiKeyInfo {
+            name: key.name,
+            created_at: key.created_at,
+        })
+        .collect();
+
+    let response = ListApiKeysResponse { keys };
+
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub async fn delete_api_key(
+    State(data): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Extension(user): Extension<User>,
+    Extension(session_id): Extension<Uuid>,
+) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    debug!("Deleting API key '{}' for user: {}", name, user.uuid);
+
+    data.db
+        .delete_user_api_key_by_name(&name, user.uuid)
+        .map_err(|e| {
+            error!("Failed to delete API key: {:?}", e);
+            match e {
+                DBError::UserApiKeyError(
+                    crate::models::user_api_keys::UserApiKeyError::NotFound,
+                ) => ApiError::NotFound,
+                _ => ApiError::InternalServerError,
+            }
+        })?;
+
+    info!("Deleted API key '{}' for user {}", name, user.uuid);
+
+    let response = json!({ "success": true });
+    encrypt_response(&data, &session_id, &response).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1637,5 +1830,186 @@ mod tests {
             // Print debug info
             println!("Iteration {}: Both decryptions successful", i);
         }
+    }
+}
+
+#[cfg(test)]
+mod api_key_validation_tests {
+    use super::*;
+
+    #[test]
+    fn test_valid_api_key_names() {
+        let max_length_name = "a".repeat(50);
+        let valid_names = vec![
+            "my-api-key",
+            "test_key_123",
+            "Production Key",
+            "key-with_spaces and-dashes",
+            "UPPERCASE",
+            "lowercase",
+            "MixedCase",
+            "123numeric",
+            "a",                      // single character
+            max_length_name.as_str(), // max length
+        ];
+
+        for name in valid_names {
+            assert!(
+                validate_api_key_name(name).is_ok(),
+                "Expected '{}' to be valid",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_invalid_api_key_names_whitespace() {
+        let invalid_names = vec![
+            "   ",            // only spaces
+            "\t",             // tab
+            "\n",             // newline
+            "  leading",      // leading space
+            "trailing  ",     // trailing space
+            " both ",         // both leading and trailing
+            "\tleading_tab",  // leading tab
+            "trailing_tab\t", // trailing tab
+        ];
+
+        for name in invalid_names {
+            let result = validate_api_key_name(name);
+            assert!(
+                result.is_err(),
+                "Expected '{}' to be invalid",
+                name.escape_debug()
+            );
+            if let Err(e) = result {
+                assert_eq!(
+                    e.code,
+                    "whitespace",
+                    "Expected whitespace error for '{}'",
+                    name.escape_debug()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_invalid_api_key_names_length() {
+        let too_long = "a".repeat(51);
+        let way_too_long = "x".repeat(100);
+        let invalid_names = vec![
+            "",                    // empty
+            too_long.as_str(),     // too long (51 chars)
+            way_too_long.as_str(), // way too long
+        ];
+
+        for name in invalid_names {
+            let result = validate_api_key_name(name);
+            assert!(
+                result.is_err(),
+                "Expected '{}' (len={}) to be invalid",
+                if name.len() > 20 { "[truncated]" } else { name },
+                name.len()
+            );
+            if let Err(e) = result {
+                assert_eq!(
+                    e.code,
+                    "length",
+                    "Expected length error for name of length {}",
+                    name.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_invalid_api_key_names_characters() {
+        let invalid_names = vec![
+            "café",             // accented character
+            "测试",             // Chinese characters
+            "тест",             // Cyrillic
+            "key!",             // exclamation mark
+            "key@host",         // at symbol
+            "key#hash",         // hash
+            "key$money",        // dollar sign
+            "key%percent",      // percent
+            "key^caret",        // caret
+            "key&and",          // ampersand
+            "key*star",         // asterisk
+            "key(paren",        // parenthesis
+            "key[bracket",      // bracket
+            "key{brace",        // brace
+            "key|pipe",         // pipe
+            "key\\backslash",   // backslash
+            "key/slash",        // forward slash
+            "key:colon",        // colon
+            "key;semicolon",    // semicolon
+            "key'quote",        // single quote
+            "key\"doublequote", // double quote
+            "key<less",         // less than
+            "key>greater",      // greater than
+            "key?question",     // question mark
+            "key,comma",        // comma
+            "key.period",       // period
+            "😀emoji",          // emoji
+            "key\0null",        // null character
+            "hello\nworld",     // newline in middle
+            "hello\tworld",     // tab in middle
+        ];
+
+        for name in invalid_names {
+            let result = validate_api_key_name(name);
+            assert!(
+                result.is_err(),
+                "Expected '{}' to be invalid due to invalid characters",
+                name.escape_debug()
+            );
+            if let Err(e) = result {
+                assert_eq!(
+                    e.code,
+                    "invalid_characters",
+                    "Expected invalid_characters error for '{}'",
+                    name.escape_debug()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        // Test that internal spaces are allowed
+        assert!(validate_api_key_name("valid name").is_ok());
+        assert!(validate_api_key_name("multiple  spaces  inside").is_ok());
+
+        // Test all allowed characters together
+        assert!(validate_api_key_name("aZ_0-9 mix").is_ok());
+
+        // Test exact boundary lengths
+        let exactly_50 = "x".repeat(50);
+        let exactly_51 = "x".repeat(51);
+        assert!(validate_api_key_name(&exactly_50).is_ok()); // exactly 50
+        assert!(validate_api_key_name(&exactly_51).is_err()); // exactly 51
+    }
+
+    #[test]
+    fn test_security_concerns() {
+        // Path traversal attempts
+        assert!(validate_api_key_name("../etc/passwd").is_err());
+        assert!(validate_api_key_name("..\\windows\\system32").is_err());
+
+        // SQL injection attempts
+        assert!(validate_api_key_name("'; DROP TABLE users--").is_err());
+        assert!(validate_api_key_name("1' OR '1'='1").is_err());
+
+        // XSS attempts
+        assert!(validate_api_key_name("<script>alert(1)</script>").is_err());
+        assert!(validate_api_key_name("javascript:alert(1)").is_err());
+
+        // Command injection attempts
+        assert!(validate_api_key_name("key; rm -rf /").is_err());
+        assert!(validate_api_key_name("key`whoami`").is_err());
+        assert!(validate_api_key_name("key$(whoami)").is_err());
+        assert!(validate_api_key_name("key&&whoami").is_err());
+        assert!(validate_api_key_name("key||whoami").is_err());
     }
 }

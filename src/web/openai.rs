@@ -3,6 +3,7 @@ use crate::models::users::User;
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
+use crate::web::openai_auth::AuthMethod;
 use crate::{ApiError, AppState};
 use axum::http::{header, HeaderMap};
 use axum::{
@@ -45,6 +46,7 @@ async fn proxy_openai(
     headers: HeaderMap,
     axum::Extension(session_id): axum::Extension<Uuid>,
     axum::Extension(user): axum::Extension<User>,
+    axum::Extension(auth_method): axum::Extension<AuthMethod>,
     axum::Extension(body): axum::Extension<Value>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
     debug!("Entering proxy_openai function");
@@ -60,8 +62,17 @@ async fn proxy_openai(
 
     // Check billing if client exists
     if let Some(billing_client) = &state.billing_client {
-        debug!("Checking billing server for user {}", user.uuid);
-        match billing_client.can_user_chat(user.uuid).await {
+        debug!(
+            "Checking billing server for user {} (auth_method: {:?})",
+            user.uuid, auth_method
+        );
+        let can_chat_result = if auth_method == AuthMethod::ApiKey {
+            billing_client.can_user_chat_api(user.uuid).await
+        } else {
+            billing_client.can_user_chat(user.uuid).await
+        };
+
+        match can_chat_result {
             Ok(true) => {
                 // User can chat, proceed with existing logic
                 debug!("Billing service passed for user {}", user.uuid);
@@ -249,6 +260,7 @@ async fn proxy_openai(
             let session_id = session_id;
             let user = user.clone();
             let buffer = buffer.clone();
+            let auth_method = auth_method;
             async move {
                 match chunk {
                     Ok(chunk) => {
@@ -269,8 +281,14 @@ async fn proxy_openai(
 
                         let mut processed_events = Vec::new();
                         for event in events {
-                            if let Some(processed_event) =
-                                encrypt_and_process_event(&state, &session_id, &user, &event).await
+                            if let Some(processed_event) = encrypt_and_process_event(
+                                &state,
+                                &session_id,
+                                &user,
+                                &event,
+                                auth_method,
+                            )
+                            .await
                             {
                                 processed_events.push(Ok(processed_event));
                             }
@@ -300,6 +318,7 @@ async fn encrypt_and_process_event(
     session_id: &Uuid,
     user: &User,
     event: &str,
+    auth_method: AuthMethod,
 ) -> Option<Event> {
     if event.trim() == "data: [DONE]" {
         return Some(Event::default().data("[DONE]"));
@@ -337,6 +356,7 @@ async fn encrypt_and_process_event(
                         // Create token usage record and post to SQS in the background
                         let state = state.clone();
                         let user_id = user.uuid;
+                        let is_api_request = auth_method == AuthMethod::ApiKey;
                         tokio::spawn(async move {
                             // Create and store token usage record
                             let new_usage = NewTokenUsage::new(
@@ -359,6 +379,7 @@ async fn encrypt_and_process_event(
                                     output_tokens,
                                     estimated_cost: total_cost,
                                     chat_time: Utc::now(),
+                                    is_api_request,
                                 };
 
                                 match publisher.publish_event(event).await {
@@ -405,6 +426,7 @@ async fn proxy_models(
     _headers: HeaderMap,
     axum::Extension(session_id): axum::Extension<Uuid>,
     axum::Extension(user): axum::Extension<User>,
+    axum::Extension(_auth_method): axum::Extension<AuthMethod>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
     debug!("Entering proxy_models function");
 

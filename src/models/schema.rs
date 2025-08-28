@@ -189,6 +189,18 @@ diesel::table! {
 }
 
 diesel::table! {
+    user_api_keys (id) {
+        id -> Int4,
+        user_id -> Uuid,
+        #[max_length = 64]
+        key_hash -> Varchar,
+        name -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     user_kv (id) {
         id -> Int8,
         user_id -> Uuid,
@@ -253,6 +265,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     platform_users,
     project_settings,
     token_usage,
+    user_api_keys,
     user_kv,
     user_oauth_connections,
     users,

@@ -33,18 +33,21 @@ impl BillingClient {
         }
     }
 
-    pub async fn can_user_chat(&self, user_id: Uuid) -> Result<bool, BillingError> {
-        let url = format!(
-            "{}/v1/admin/check-usage?user_id={}&product=maple",
-            self.base_url, user_id
-        );
-
-        let response = self
+    async fn check_usage(&self, user_id: Uuid, is_api: bool) -> Result<bool, BillingError> {
+        let mut request = self
             .client
-            .get(&url)
-            .header("x-api-key", &self.api_key)
-            .send()
-            .await?;
+            .get(format!("{}/v1/admin/check-usage", self.base_url))
+            .query(&[
+                ("user_id", user_id.to_string()),
+                ("product", "maple".to_string()),
+            ])
+            .header("x-api-key", &self.api_key);
+
+        if is_api {
+            request = request.query(&[("api", "true".to_string())]);
+        }
+
+        let response = request.send().await?;
 
         if response.status().is_success() {
             response
@@ -59,5 +62,13 @@ impl BillingClient {
                 .unwrap_or_else(|_| "Unknown error".to_string());
             Err(BillingError::ServiceError(error))
         }
+    }
+
+    pub async fn can_user_chat(&self, user_id: Uuid) -> Result<bool, BillingError> {
+        self.check_usage(user_id, false).await
+    }
+
+    pub async fn can_user_chat_api(&self, user_id: Uuid) -> Result<bool, BillingError> {
+        self.check_usage(user_id, true).await
     }
 }

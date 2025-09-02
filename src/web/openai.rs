@@ -123,7 +123,7 @@ async fn proxy_openai(
     debug!("Sending request for model: {}", model_name);
 
     // All models now have routes - some with fallbacks, some without
-    let res = {
+    let (res, successful_provider) = {
         debug!(
             "Using route for model {}: primary={}, fallbacks={}",
             model_name,
@@ -164,6 +164,7 @@ async fn proxy_openai(
         let max_cycles = 3;
         let mut last_error = None;
         let mut found_response = None;
+        let mut successful_provider_name = String::new();
 
         for cycle in 0..max_cycles {
             if cycle > 0 {
@@ -187,6 +188,7 @@ async fn proxy_openai(
                         cycle + 1
                     );
                     found_response = Some(response);
+                    successful_provider_name = route.primary.provider_name.clone();
                     break;
                 }
                 Err(err) => {
@@ -215,6 +217,7 @@ async fn proxy_openai(
                             cycle + 1
                         );
                         found_response = Some(response);
+                        successful_provider_name = fallback_provider.provider_name.clone();
                         break;
                     }
                     Err(err) => {
@@ -231,7 +234,7 @@ async fn proxy_openai(
         }
 
         match found_response {
-            Some(response) => response,
+            Some(response) => (response, successful_provider_name),
             None => {
                 let error_msg = if route.fallbacks.is_empty() {
                     format!(
@@ -261,6 +264,8 @@ async fn proxy_openai(
             let user = user.clone();
             let buffer = buffer.clone();
             let auth_method = auth_method;
+            let successful_provider = successful_provider.clone();
+            let model_name = model_name.clone();
             async move {
                 match chunk {
                     Ok(chunk) => {
@@ -287,6 +292,8 @@ async fn proxy_openai(
                                 &user,
                                 &event,
                                 auth_method,
+                                &successful_provider,
+                                &model_name,
                             )
                             .await
                             {
@@ -319,6 +326,8 @@ async fn encrypt_and_process_event(
     user: &User,
     event: &str,
     auth_method: AuthMethod,
+    provider_name: &str,
+    model_name: &str,
 ) -> Option<Event> {
     if event.trim() == "data: [DONE]" {
         return Some(Event::default().data("[DONE]"));
@@ -357,6 +366,8 @@ async fn encrypt_and_process_event(
                         let state = state.clone();
                         let user_id = user.uuid;
                         let is_api_request = auth_method == AuthMethod::ApiKey;
+                        let provider_name = provider_name.to_string();
+                        let model_name = model_name.to_string();
                         tokio::spawn(async move {
                             // Create and store token usage record
                             let new_usage = NewTokenUsage::new(
@@ -380,6 +391,8 @@ async fn encrypt_and_process_event(
                                     estimated_cost: total_cost,
                                     chat_time: Utc::now(),
                                     is_api_request,
+                                    provider_name,
+                                    model_name,
                                 };
 
                                 match publisher.publish_event(event).await {

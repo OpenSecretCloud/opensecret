@@ -36,6 +36,10 @@ pub struct UsageEvent {
     pub chat_time: DateTime<Utc>,
     #[serde(default)]
     pub is_api_request: bool,
+    #[serde(default)]
+    pub provider_name: String,
+    #[serde(default)]
+    pub model_name: String,
 }
 
 #[derive(Debug, thiserror::Error)]

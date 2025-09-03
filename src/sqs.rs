@@ -34,6 +34,12 @@ pub struct UsageEvent {
     pub output_tokens: i32,
     pub estimated_cost: BigDecimal,
     pub chat_time: DateTime<Utc>,
+    #[serde(default)]
+    pub is_api_request: bool,
+    #[serde(default)]
+    pub provider_name: String,
+    #[serde(default)]
+    pub model_name: String,
 }
 
 #[derive(Debug, thiserror::Error)]

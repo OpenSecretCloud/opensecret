@@ -29,6 +29,7 @@ use crate::models::project_settings::{
     EmailSettings, NewProjectSetting, ProjectSetting, ProjectSettingError, SettingCategory,
 };
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
+use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
 use crate::models::users::{NewUser, User, UserError};
 use crate::models::{
     email_verification::{EmailVerification, EmailVerificationError, NewEmailVerification},
@@ -73,6 +74,8 @@ pub enum DBError {
     OAuthError(#[from] OAuthError),
     #[error("Token usage error: {0}")]
     TokenUsageError(#[from] TokenUsageError),
+    #[error("User API key error: {0}")]
+    UserApiKeyError(#[from] UserApiKeyError),
     #[error("Org error: {0}")]
     OrgError(#[from] OrgError),
     #[error("Org not found")]
@@ -430,6 +433,15 @@ pub trait DBConnection {
         &self,
         request: &PlatformPasswordResetRequest,
     ) -> Result<(), DBError>;
+
+    // User API key methods
+    fn create_user_api_key(&self, new_key: NewUserApiKey) -> Result<UserApiKey, DBError>;
+    fn get_user_api_key_by_id(&self, id: i32) -> Result<Option<UserApiKey>, DBError>;
+    fn get_user_api_key_by_hash(&self, key_hash: &str) -> Result<Option<UserApiKey>, DBError>;
+    fn get_user_by_api_key_hash(&self, key_hash: &str) -> Result<Option<User>, DBError>;
+    fn get_all_user_api_keys_for_user(&self, user_id: Uuid) -> Result<Vec<UserApiKey>, DBError>;
+    fn delete_user_api_key(&self, id: i32, user_id: Uuid) -> Result<(), DBError>;
+    fn delete_user_api_key_by_name(&self, name: &str, user_id: Uuid) -> Result<(), DBError>;
 
     // Platform invite code methods
     fn validate_platform_invite_code(&self, code: Uuid) -> Result<PlatformInviteCode, DBError>;
@@ -1606,6 +1618,69 @@ impl DBConnection for PostgresConnection {
             error!("Failed to validate platform invite code: {:?}", e);
         }
         result
+    }
+
+    // User API key implementations
+    fn create_user_api_key(&self, new_key: NewUserApiKey) -> Result<UserApiKey, DBError> {
+        debug!("Creating new user API key");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_key.insert(conn).map_err(DBError::from)
+    }
+
+    fn get_user_api_key_by_id(&self, id: i32) -> Result<Option<UserApiKey>, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserApiKey::get_by_id(conn, id).map_err(DBError::from)
+    }
+
+    fn get_user_api_key_by_hash(&self, key_hash: &str) -> Result<Option<UserApiKey>, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserApiKey::get_by_key_hash(conn, key_hash).map_err(DBError::from)
+    }
+
+    fn get_user_by_api_key_hash(&self, key_hash: &str) -> Result<Option<User>, DBError> {
+        use crate::models::schema::{user_api_keys, users};
+        use diesel::prelude::*;
+
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        // Single JOIN query to get user directly from API key hash
+        users::table
+            .inner_join(user_api_keys::table.on(users::uuid.eq(user_api_keys::user_id)))
+            .filter(user_api_keys::key_hash.eq(key_hash))
+            .select(users::all_columns)
+            .first::<User>(conn)
+            .optional()
+            .map_err(DBError::from)
+    }
+
+    fn get_all_user_api_keys_for_user(&self, user_id: Uuid) -> Result<Vec<UserApiKey>, DBError> {
+        debug!("Getting all API keys for user: {}", user_id);
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserApiKey::get_all_for_user(conn, user_id).map_err(DBError::from)
+    }
+
+    fn delete_user_api_key(&self, id: i32, user_id: Uuid) -> Result<(), DBError> {
+        debug!("Deleting API key {} for user {}", id, user_id);
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        // First verify the key belongs to the user
+        // Use the same error for both "not found" and "unauthorized" to prevent information disclosure
+        match UserApiKey::get_by_id(conn, id)? {
+            Some(api_key) if api_key.user_id == user_id => {
+                UserApiKey::delete_by_id(conn, id).map_err(DBError::from)
+            }
+            _ => Err(DBError::UserApiKeyError(UserApiKeyError::NotFound)),
+        }
+    }
+
+    fn delete_user_api_key_by_name(&self, name: &str, user_id: Uuid) -> Result<(), DBError> {
+        debug!("Deleting API key '{}' for user {}", name, user_id);
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        // First find the key by name and user_id, then delete it
+        // Use the same error for both "not found" and "unauthorized" to prevent information disclosure
+        UserApiKey::delete_by_name_and_user(conn, name, user_id).map_err(|e| match e {
+            UserApiKeyError::NotFound => DBError::UserApiKeyError(UserApiKeyError::NotFound),
+            e => DBError::from(e),
+        })
     }
 
     // Account Deletion implementations

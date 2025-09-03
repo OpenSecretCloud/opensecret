@@ -9,20 +9,20 @@ use axum::http::{header, HeaderMap};
 use axum::{
     extract::State,
     response::sse::{Event, Sse},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose, Engine as _};
 use bigdecimal::BigDecimal;
 use chrono::Utc;
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{self, StreamExt};
 use futures::TryStreamExt;
 use hyper::body::to_bytes;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Body, Client, Request};
 use hyper_tls::HttpsConnector;
 use serde_json::{json, Value};
-use std::convert::Infallible;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -48,7 +48,7 @@ async fn proxy_openai(
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(auth_method): axum::Extension<AuthMethod>,
     axum::Extension(body): axum::Extension<Value>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Entering proxy_openai function");
 
     // Prevent guest users from using the OpenAI chat feature
@@ -94,8 +94,13 @@ async fn proxy_openai(
     }
 
     // We already verified it's a valid object above, so this expect should never trigger
-    let mut modified_body = body.as_object().expect("body was just checked").clone();
-    modified_body.insert("stream_options".to_string(), json!({"include_usage": true}));
+    let modified_body = body.as_object().expect("body was just checked").clone();
+
+    // Check if streaming is requested (default to false if not specified)
+    let is_streaming = modified_body
+        .get("stream")
+        .and_then(|s| s.as_bool())
+        .unwrap_or(false);
 
     // Extract the model from the request - error if not specified
     let model_name = modified_body
@@ -137,6 +142,18 @@ async fn proxy_openai(
             .get_model_name_for_provider(&model_name, &route.primary.provider_name);
         let mut primary_body = modified_body_json.as_object().unwrap().clone();
         primary_body.insert("model".to_string(), json!(primary_model_name));
+
+        // Add stream_options based on provider capabilities
+        // Tinfoil supports stream_options for both streaming and non-streaming
+        // Continuum only supports it for streaming requests
+        if route.primary.provider_name.to_lowercase() == "tinfoil" {
+            // Tinfoil always gets stream_options with include_usage
+            primary_body.insert("stream_options".to_string(), json!({"include_usage": true}));
+        } else if is_streaming {
+            // Other providers (like continuum) only get it when streaming
+            primary_body.insert("stream_options".to_string(), json!({"include_usage": true}));
+        }
+
         let primary_body_json =
             serde_json::to_string(&Value::Object(primary_body)).map_err(|e| {
                 error!("Failed to serialize request body: {:?}", e);
@@ -150,6 +167,16 @@ async fn proxy_openai(
                 .get_model_name_for_provider(&model_name, &fallback.provider_name);
             let mut fallback_body = modified_body_json.as_object().unwrap().clone();
             fallback_body.insert("model".to_string(), json!(fallback_model_name));
+
+            // Add stream_options based on provider capabilities
+            if fallback.provider_name.to_lowercase() == "tinfoil" {
+                // Tinfoil always gets stream_options with include_usage
+                fallback_body.insert("stream_options".to_string(), json!({"include_usage": true}));
+            } else if is_streaming {
+                // Other providers (like continuum) only get it when streaming
+                fallback_body.insert("stream_options".to_string(), json!({"include_usage": true}));
+            }
+
             let fallback_body_json =
                 serde_json::to_string(&Value::Object(fallback_body)).map_err(|e| {
                     error!("Failed to serialize fallback request body: {:?}", e);
@@ -255,6 +282,100 @@ async fn proxy_openai(
 
     debug!("Successfully received response from OpenAI");
 
+    // Handle non-streaming vs streaming responses differently
+    if !is_streaming {
+        // For non-streaming responses, read the entire body and return as JSON
+        debug!("Handling non-streaming response");
+        let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
+            error!("Failed to read response body: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+        let response_str = String::from_utf8_lossy(&body_bytes);
+        trace!("Non-streaming response body: {}", response_str);
+
+        // Parse the response JSON
+        let response_json: Value = serde_json::from_str(&response_str).map_err(|e| {
+            error!("Failed to parse response JSON: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+        // Handle usage statistics if available
+        if let Some(usage) = response_json.get("usage") {
+            if !usage.is_null() && usage.is_object() {
+                let input_tokens = usage
+                    .get("prompt_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32;
+                let output_tokens = usage
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32;
+
+                // Calculate estimated cost with correct pricing
+                let input_cost =
+                    BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(input_tokens);
+                let output_cost =
+                    BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(output_tokens);
+                let total_cost = input_cost + output_cost;
+
+                info!(
+                    "OpenAI API usage for user {}: prompt_tokens={}, completion_tokens={}, total_tokens={}, estimated_cost={}",
+                    user.uuid, input_tokens, output_tokens,
+                    input_tokens + output_tokens,
+                    total_cost
+                );
+
+                // Create token usage record and post to SQS in the background
+                let state_clone = state.clone();
+                let user_id = user.uuid;
+                let is_api_request = auth_method == AuthMethod::ApiKey;
+                let provider_name = successful_provider.clone();
+                let model_name_clone = model_name.clone();
+                tokio::spawn(async move {
+                    // Create and store token usage record
+                    let new_usage = NewTokenUsage::new(
+                        user_id,
+                        input_tokens,
+                        output_tokens,
+                        total_cost.clone(),
+                    );
+
+                    if let Err(e) = state_clone.db.create_token_usage(new_usage) {
+                        error!("Failed to save token usage: {:?}", e);
+                    }
+
+                    // Post event to SQS if configured
+                    if let Some(publisher) = &state_clone.sqs_publisher {
+                        let event = UsageEvent {
+                            event_id: Uuid::new_v4(), // Generate new UUID for idempotency
+                            user_id,
+                            input_tokens,
+                            output_tokens,
+                            estimated_cost: total_cost,
+                            chat_time: Utc::now(),
+                            is_api_request,
+                            provider_name,
+                            model_name: model_name_clone,
+                        };
+
+                        match publisher.publish_event(event).await {
+                            Ok(_) => debug!("published usage event successfully"),
+                            Err(e) => error!("error publishing usage event: {e}"),
+                        }
+                    }
+                });
+            }
+        }
+
+        // Encrypt and return the response
+        let encrypted_response = encrypt_response(&state, &session_id, &response_json).await?;
+        debug!("Exiting proxy_openai function (non-streaming)");
+        return Ok(encrypted_response.into_response());
+    }
+
+    // For streaming responses, continue with the existing SSE logic
+    debug!("Handling streaming response");
     let stream = res.into_body().into_stream();
     let buffer = Arc::new(Mutex::new(String::new()));
     let stream = stream
@@ -284,7 +405,8 @@ async fn proxy_openai(
                             }
                         }
 
-                        let mut processed_events = Vec::new();
+                        let mut processed_events: Vec<Result<Event, std::convert::Infallible>> =
+                            Vec::new();
                         for event in events {
                             if let Some(processed_event) = encrypt_and_process_event(
                                 &state,
@@ -316,8 +438,8 @@ async fn proxy_openai(
         .flat_map(stream::once)
         .flat_map(stream::iter);
 
-    debug!("Exiting proxy_openai function");
-    Ok(Sse::new(stream))
+    debug!("Exiting proxy_openai function (streaming)");
+    Ok(Sse::new(stream).into_response())
 }
 
 async fn encrypt_and_process_event(

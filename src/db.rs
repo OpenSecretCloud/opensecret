@@ -463,6 +463,7 @@ pub trait DBConnection {
         thread_uuid: Uuid,
         user_id: Uuid,
         system_prompt_id: Option<i64>,
+        title_enc: Option<Vec<u8>>,
         first_message: NewUserMessage,
     ) -> Result<(ChatThread, UserMessage), DBError>;
     fn get_thread_by_id_and_user(
@@ -1865,6 +1866,7 @@ impl DBConnection for PostgresConnection {
         thread_uuid: Uuid,
         user_id: Uuid,
         system_prompt_id: Option<i64>,
+        title_enc: Option<Vec<u8>>,
         first_message: NewUserMessage,
     ) -> Result<(ChatThread, UserMessage), DBError> {
         debug!("Creating new chat thread with first message");
@@ -1874,6 +1876,7 @@ impl DBConnection for PostgresConnection {
             thread_uuid,
             user_id,
             system_prompt_id,
+            title_enc,
             first_message,
         )
         .map_err(DBError::from)

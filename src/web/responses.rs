@@ -16,6 +16,7 @@ use crate::{
     },
     ApiError, AppState,
 };
+use secp256k1::SecretKey;
 use axum::{
     extract::{Path, Query, State},
     http::HeaderMap,
@@ -601,6 +602,7 @@ async fn create_response_stream(
         &body,
         content_enc.clone(),
         user_message_tokens,
+        &user_key,
     )
     .await?;
 
@@ -1375,6 +1377,7 @@ async fn persist_initial_message(
     body: &ResponsesCreateRequest,
     content_enc: Vec<u8>,
     user_message_tokens: i32,
+    user_key: &SecretKey,
 ) -> Result<
     (
         crate::models::responses::ChatThread,
@@ -1446,6 +1449,10 @@ async fn persist_initial_message(
 
         // Create new thread with UUID = message UUID
         let thread_uuid = Uuid::new_v4();
+        
+        // Encrypt default title "New Chat"
+        let default_title = "New Chat";
+        let title_enc = Some(encrypt_with_key(user_key, default_title.as_bytes()).await);
 
         // Prepare the first message
         let first_message = NewUserMessage {
@@ -1476,6 +1483,7 @@ async fn persist_initial_message(
                 thread_uuid,
                 user.uuid,
                 None, // system_prompt_id - will be added in later phases
+                title_enc,
                 first_message,
             )
             .map_err(|e| {

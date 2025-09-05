@@ -487,8 +487,7 @@ pub struct ResponsesListItem {
     pub id: Uuid,
     pub object: &'static str,
     pub created_at: i64,
-    pub status: String,
-    pub model: String,
+    pub updated_at: i64,
     pub title: Option<String>,
 }
 
@@ -1592,13 +1591,13 @@ async fn list_responses(
         return Err(ApiError::BadRequest);
     }
 
-    // Convert UUID cursors to (created_at, id) tuples
+    // Convert UUID cursors to (updated_at, id) tuples for threads
     let after_cursor = if let Some(after_uuid) = params.after {
         state
             .db
-            .get_user_message_by_uuid(after_uuid, user.uuid)
+            .get_thread_by_uuid_and_user(after_uuid, user.uuid)
             .ok()
-            .map(|msg| (msg.created_at, msg.id))
+            .map(|thread| (thread.updated_at, thread.id))
     } else {
         None
     };
@@ -1606,25 +1605,25 @@ async fn list_responses(
     let before_cursor = if let Some(before_uuid) = params.before {
         state
             .db
-            .get_user_message_by_uuid(before_uuid, user.uuid)
+            .get_thread_by_uuid_and_user(before_uuid, user.uuid)
             .ok()
-            .map(|msg| (msg.created_at, msg.id))
+            .map(|thread| (thread.updated_at, thread.id))
     } else {
         None
     };
 
-    // Get messages - note: list_user_messages currently always returns desc order
-    let mut messages = state
+    // Get threads - note: list_threads currently always returns desc order by updated_at
+    let mut threads = state
         .db
-        .list_user_messages(user.uuid, limit + 1, after_cursor, before_cursor)
+        .list_threads(user.uuid, limit + 1, after_cursor, before_cursor)
         .map_err(|e| {
-            error!("Failed to list user messages: {:?}", e);
+            error!("Failed to list threads: {:?}", e);
             ApiError::InternalServerError
         })?;
 
-    let has_more = messages.len() > limit as usize;
+    let has_more = threads.len() > limit as usize;
     if has_more {
-        messages.truncate(limit as usize);
+        threads.truncate(limit as usize);
     }
 
     // Get user's encryption key
@@ -1636,41 +1635,27 @@ async fn list_responses(
             ApiError::InternalServerError
         })?;
 
-    // If ascending order requested, reverse the messages
+    // If ascending order requested, reverse the threads
     if order == "asc" {
-        messages.reverse();
+        threads.reverse();
     }
 
     // Convert to response format
     let mut data = Vec::new();
-    for msg in &messages {
-        // Get thread to access title
-        let thread = state
-            .db
-            .get_thread_by_id_and_user(msg.thread_id, user.uuid)
-            .ok();
-
+    for thread in &threads {
         // Decrypt title if available
-        let title = if let Some(thread) = thread {
-            if let Some(title_enc) = thread.title_enc {
-                let decrypted = decrypt_with_key(&user_key, &title_enc).unwrap_or_else(|_| vec![]);
-                Some(String::from_utf8_lossy(&decrypted).to_string())
-            } else {
-                None
-            }
+        let title = if let Some(title_enc) = &thread.title_enc {
+            let decrypted = decrypt_with_key(&user_key, title_enc).unwrap_or_else(|_| vec![]);
+            Some(String::from_utf8_lossy(&decrypted).to_string())
         } else {
             None
         };
 
         data.push(ResponsesListItem {
-            id: msg.uuid,
-            object: "response",
-            created_at: msg.created_at.timestamp(),
-            status: serde_json::to_value(msg.status)
-                .ok()
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_else(|| "unknown".to_string()),
-            model: msg.model.clone(),
+            id: thread.uuid,
+            object: "thread",
+            created_at: thread.created_at.timestamp(),
+            updated_at: thread.updated_at.timestamp(),
             title,
         });
     }
@@ -1679,8 +1664,8 @@ async fn list_responses(
         object: "list",
         data,
         has_more,
-        first_id: messages.first().map(|m| m.uuid),
-        last_id: messages.last().map(|m| m.uuid),
+        first_id: threads.first().map(|t| t.uuid),
+        last_id: threads.last().map(|t| t.uuid),
     };
 
     encrypt_response(&state, &session_id, &response).await

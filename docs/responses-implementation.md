@@ -637,17 +637,17 @@ Get the status and result of a response (for polling if not using SSE).
 
 ### GET /v1/responses
 
-List responses for the authenticated user with pagination.
+List conversation threads for the authenticated user with pagination.
 
-**Note**: This is a custom OpenSecret endpoint for convenience, not part of the standard OpenAI Responses API. OpenAI only supports GET /v1/responses/{response_id} for retrieving individual responses.
+**Note**: This is a custom OpenSecret endpoint for convenience, not part of the standard OpenAI Responses API. OpenAI only supports GET /v1/responses/{response_id} for retrieving individual responses. This endpoint returns thread metadata, not individual messages.
 
 **Query Parameters:**
-- `limit` (integer, default: 20, max: 100): Number of responses to return
-- `after` (string): Cursor for pagination (response ID to start after)
-- `before` (string): Cursor for pagination (response ID to start before)
-- `order` (string, default: "desc"): Sort order by created_at ("asc" or "desc")
+- `limit` (integer, default: 20, max: 100): Number of threads to return
+- `after` (string): Cursor for pagination (thread UUID to start after)
+- `before` (string): Cursor for pagination (thread UUID to start before)
+- `order` (string, default: "desc"): Sort order by updated_at ("asc" or "desc")
 
-**Pagination Design**: We use `after`/`before` parameters following OpenAI's standard list endpoint patterns (e.g., list assistants, list files), not to be confused with the `starting_after` parameter in GET /v1/responses/{response_id} which is for streaming event sequences.
+**Pagination Design**: We use `after`/`before` parameters following OpenAI's standard list endpoint patterns (e.g., list assistants, list files). Threads are sorted by their `updated_at` timestamp.
 
 **Response:**
 ```json
@@ -656,10 +656,9 @@ List responses for the authenticated user with pagination.
   "data": [
     {
       "id": "550e8400-e29b-41d4-a716-446655440000",
-      "object": "response",
+      "object": "thread",
       "created_at": 1677652288,
-      "status": "completed",
-      "model": "gpt-4",
+      "updated_at": 1677652350,
       "title": "How to cook chicken"
     }
   ],
@@ -668,6 +667,13 @@ List responses for the authenticated user with pagination.
   "last_id": "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
 }
 ```
+
+**Implementation Notes:**
+- Returns chat thread metadata for display in a conversation history sidebar
+- Each thread appears once, regardless of how many messages it contains
+- Threads are ordered by most recently updated (when new messages are added)
+- Thread titles are decrypted for display
+- Status and model information are not included as they belong to individual messages, not threads
 
 ### POST /v1/responses/{response_id}/cancel
 

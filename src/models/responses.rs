@@ -117,6 +117,21 @@ impl ChatThread {
             })
     }
 
+    pub fn get_by_uuid_and_user(
+        conn: &mut PgConnection,
+        thread_uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<ChatThread, ResponsesError> {
+        chat_threads::table
+            .filter(chat_threads::uuid.eq(thread_uuid))
+            .filter(chat_threads::user_id.eq(user_id))
+            .first::<ChatThread>(conn)
+            .map_err(|e| match e {
+                diesel::result::Error::NotFound => ResponsesError::ChatThreadNotFound,
+                _ => ResponsesError::DatabaseError(e),
+            })
+    }
+
     pub fn update_title(
         conn: &mut PgConnection,
         thread_id: i64,
@@ -129,6 +144,44 @@ impl ChatThread {
             ))
             .execute(conn)
             .map(|_| ())
+            .map_err(ResponsesError::DatabaseError)
+    }
+
+    pub fn list_for_user(
+        conn: &mut PgConnection,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<(DateTime<Utc>, i64)>,
+        before: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<Vec<ChatThread>, ResponsesError> {
+        let mut query = chat_threads::table
+            .filter(chat_threads::user_id.eq(user_id))
+            .into_boxed();
+
+        if let Some((updated_at, id)) = after {
+            query = query.filter(
+                chat_threads::updated_at
+                    .lt(updated_at)
+                    .or(chat_threads::updated_at
+                        .eq(updated_at)
+                        .and(chat_threads::id.lt(id))),
+            );
+        }
+
+        if let Some((updated_at, id)) = before {
+            query = query.filter(
+                chat_threads::updated_at
+                    .gt(updated_at)
+                    .or(chat_threads::updated_at
+                        .eq(updated_at)
+                        .and(chat_threads::id.gt(id))),
+            );
+        }
+
+        query
+            .order(chat_threads::updated_at.desc())
+            .limit(limit)
+            .load::<ChatThread>(conn)
             .map_err(ResponsesError::DatabaseError)
     }
 }

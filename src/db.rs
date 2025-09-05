@@ -470,7 +470,19 @@ pub trait DBConnection {
         thread_id: i64,
         user_id: Uuid,
     ) -> Result<ChatThread, DBError>;
+    fn get_thread_by_uuid_and_user(
+        &self,
+        thread_uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<ChatThread, DBError>;
     fn update_thread_title(&self, thread_id: i64, title_enc: Vec<u8>) -> Result<(), DBError>;
+    fn list_threads(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<(DateTime<Utc>, i64)>,
+        before: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<Vec<ChatThread>, DBError>;
 
     // User messages
     fn create_user_message(&self, new_msg: NewUserMessage) -> Result<UserMessage, DBError>;
@@ -1877,10 +1889,32 @@ impl DBConnection for PostgresConnection {
         ChatThread::get_by_id_and_user(conn, thread_id, user_id).map_err(DBError::from)
     }
 
+    fn get_thread_by_uuid_and_user(
+        &self,
+        thread_uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<ChatThread, DBError> {
+        debug!("Getting thread by UUID and user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        ChatThread::get_by_uuid_and_user(conn, thread_uuid, user_id).map_err(DBError::from)
+    }
+
     fn update_thread_title(&self, thread_id: i64, title_enc: Vec<u8>) -> Result<(), DBError> {
         debug!("Updating thread title");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         ChatThread::update_title(conn, thread_id, title_enc).map_err(DBError::from)
+    }
+
+    fn list_threads(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<(DateTime<Utc>, i64)>,
+        before: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<Vec<ChatThread>, DBError> {
+        debug!("Listing threads for user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        ChatThread::list_for_user(conn, user_id, limit, after, before).map_err(DBError::from)
     }
 
     // User messages

@@ -200,6 +200,7 @@ impl NewChatThread {
         thread_uuid: Uuid,
         user_id: Uuid,
         system_prompt_id: Option<i64>,
+        title_enc: Option<Vec<u8>>,
         first_message: NewUserMessage,
     ) -> Result<(ChatThread, UserMessage), ResponsesError> {
         use diesel::Connection;
@@ -210,7 +211,7 @@ impl NewChatThread {
                 uuid: thread_uuid,
                 user_id,
                 system_prompt_id,
-                title_enc: None,
+                title_enc,
             };
             let thread = new_thread.insert(tx)?;
 

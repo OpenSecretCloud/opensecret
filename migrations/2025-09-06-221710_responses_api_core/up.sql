@@ -36,27 +36,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_user_system_prompts_one_default
     ON user_system_prompts(user_id)
     WHERE is_default;
 
--- 3. chat_threads table - Conversation containers
-CREATE TABLE IF NOT EXISTS chat_threads (
+-- 3. conversations table - Conversation containers (OpenAI Conversations API)
+CREATE TABLE IF NOT EXISTS conversations (
     id              BIGSERIAL PRIMARY KEY,
     uuid            UUID    NOT NULL UNIQUE,
     user_id         UUID    NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
     system_prompt_id BIGINT REFERENCES user_system_prompts(id) ON DELETE SET NULL,
     title_enc       BYTEA,
+    metadata        JSONB,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- Indexes for chat_threads
-CREATE INDEX IF NOT EXISTS idx_chat_threads_uuid        ON chat_threads(uuid);
-CREATE INDEX IF NOT EXISTS idx_chat_threads_user_id     ON chat_threads(user_id);
-CREATE INDEX IF NOT EXISTS idx_chat_threads_updated     ON chat_threads(user_id, updated_at DESC);
+-- Indexes for conversations
+CREATE INDEX IF NOT EXISTS idx_conversations_uuid        ON conversations(uuid);
+CREATE INDEX IF NOT EXISTS idx_conversations_user_id     ON conversations(user_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_updated     ON conversations(user_id, updated_at DESC);
 
 -- 4. user_messages table - User inputs / Responses API requests
 CREATE TABLE IF NOT EXISTS user_messages (
     id                    BIGSERIAL PRIMARY KEY,
     uuid                  UUID           NOT NULL UNIQUE,
-    thread_id             BIGINT         NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    conversation_id       BIGINT         NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     user_id               UUID           NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
     content_enc           BYTEA          NOT NULL,
     prompt_tokens         INTEGER,
@@ -93,14 +94,14 @@ CREATE TABLE IF NOT EXISTS user_messages (
 
 -- Indexes for user_messages
 CREATE INDEX IF NOT EXISTS idx_user_messages_uuid             ON user_messages(uuid);
-CREATE INDEX IF NOT EXISTS idx_user_messages_thread_id        ON user_messages(thread_id);
+CREATE INDEX IF NOT EXISTS idx_user_messages_conversation_id  ON user_messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_user_messages_user_id          ON user_messages(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_messages_status           ON user_messages(status);
 CREATE INDEX IF NOT EXISTS idx_user_messages_previous_uuid    ON user_messages(previous_response_id);
-CREATE INDEX IF NOT EXISTS idx_user_messages_thread_created_id 
-    ON user_messages(thread_id, created_at DESC, id);
-CREATE INDEX IF NOT EXISTS idx_user_messages_thread_created
-    ON user_messages(thread_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_user_messages_conversation_created_id 
+    ON user_messages(conversation_id, created_at DESC, id);
+CREATE INDEX IF NOT EXISTS idx_user_messages_conversation_created
+    ON user_messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_user_messages_idempotency
     ON user_messages(user_id, idempotency_key)
     WHERE idempotency_key IS NOT NULL;
@@ -109,7 +110,7 @@ CREATE INDEX IF NOT EXISTS idx_user_messages_idempotency
 CREATE TABLE IF NOT EXISTS tool_calls (
     id             BIGSERIAL PRIMARY KEY,
     uuid           UUID    NOT NULL UNIQUE,
-    thread_id      BIGINT  NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    conversation_id BIGINT  NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     user_message_id BIGINT NOT NULL REFERENCES user_messages(id) ON DELETE CASCADE,
     tool_call_id   UUID    NOT NULL,
     name           TEXT    NOT NULL,
@@ -121,18 +122,18 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 
 -- Indexes for tool_calls
 CREATE INDEX IF NOT EXISTS idx_tool_calls_uuid               ON tool_calls(uuid);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_thread_id          ON tool_calls(thread_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_conversation_id     ON tool_calls(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_user_message_id    ON tool_calls(user_message_id);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_thread_created_id  
-    ON tool_calls(thread_id, created_at DESC, id);
-CREATE INDEX IF NOT EXISTS idx_tool_calls_thread_created
-    ON tool_calls(thread_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_conversation_created_id  
+    ON tool_calls(conversation_id, created_at DESC, id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_conversation_created
+    ON tool_calls(conversation_id, created_at);
 
 -- 6. tool_outputs table - Tool execution results
 CREATE TABLE IF NOT EXISTS tool_outputs (
     id             BIGSERIAL PRIMARY KEY,
     uuid           UUID    NOT NULL UNIQUE,
-    thread_id      BIGINT  NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    conversation_id BIGINT  NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     tool_call_fk   BIGINT  NOT NULL REFERENCES tool_calls(id) ON DELETE CASCADE,
     output_enc     BYTEA   NOT NULL,
     output_tokens  INTEGER,
@@ -144,18 +145,18 @@ CREATE TABLE IF NOT EXISTS tool_outputs (
 
 -- Indexes for tool_outputs
 CREATE INDEX IF NOT EXISTS idx_tool_outputs_uuid              ON tool_outputs(uuid);
-CREATE INDEX IF NOT EXISTS idx_tool_outputs_thread_id         ON tool_outputs(thread_id);
+CREATE INDEX IF NOT EXISTS idx_tool_outputs_conversation_id   ON tool_outputs(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_tool_outputs_tool_call_fk      ON tool_outputs(tool_call_fk);
-CREATE INDEX IF NOT EXISTS idx_tool_outputs_thread_created_id 
-    ON tool_outputs(thread_id, created_at DESC, id);
-CREATE INDEX IF NOT EXISTS idx_tool_outputs_thread_created
-    ON tool_outputs(thread_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_tool_outputs_conversation_created_id 
+    ON tool_outputs(conversation_id, created_at DESC, id);
+CREATE INDEX IF NOT EXISTS idx_tool_outputs_conversation_created
+    ON tool_outputs(conversation_id, created_at);
 
 -- 7. assistant_messages table - LLM responses
 CREATE TABLE IF NOT EXISTS assistant_messages (
     id                BIGSERIAL PRIMARY KEY,
     uuid              UUID    NOT NULL UNIQUE,
-    thread_id         BIGINT  NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    conversation_id   BIGINT  NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     user_message_id   BIGINT  NOT NULL REFERENCES user_messages(id) ON DELETE CASCADE,
     content_enc       BYTEA   NOT NULL,
     completion_tokens INTEGER,
@@ -166,12 +167,12 @@ CREATE TABLE IF NOT EXISTS assistant_messages (
 
 -- Indexes for assistant_messages
 CREATE INDEX IF NOT EXISTS idx_assistant_messages_uuid             ON assistant_messages(uuid);
-CREATE INDEX IF NOT EXISTS idx_assistant_messages_thread_id        ON assistant_messages(thread_id);
+CREATE INDEX IF NOT EXISTS idx_assistant_messages_conversation_id  ON assistant_messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_assistant_messages_user_message_id  ON assistant_messages(user_message_id);
-CREATE INDEX IF NOT EXISTS idx_assistant_messages_thread_created_id
-    ON assistant_messages(thread_id, created_at DESC, id);
-CREATE INDEX IF NOT EXISTS idx_assistant_messages_thread_created
-    ON assistant_messages(thread_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_assistant_messages_conversation_created_id
+    ON assistant_messages(conversation_id, created_at DESC, id);
+CREATE INDEX IF NOT EXISTS idx_assistant_messages_conversation_created
+    ON assistant_messages(conversation_id, created_at);
 
 -- 8. Create triggers for updated_at columns
 -- Note: update_updated_at_column() function already exists from previous migrations
@@ -180,8 +181,8 @@ CREATE TRIGGER update_user_system_prompts_updated_at
 BEFORE UPDATE ON user_system_prompts
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
-CREATE TRIGGER update_chat_threads_updated_at
-BEFORE UPDATE ON chat_threads
+CREATE TRIGGER update_conversations_updated_at
+BEFORE UPDATE ON conversations
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER update_user_messages_updated_at

@@ -1,5 +1,5 @@
 use crate::models::schema::{
-    assistant_messages, chat_threads, tool_calls, tool_outputs, user_messages, user_system_prompts,
+    assistant_messages, conversations, tool_calls, tool_outputs, user_messages, user_system_prompts,
 };
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
@@ -15,8 +15,8 @@ use uuid::Uuid;
 pub enum ResponsesError {
     #[error("Database error: {0}")]
     DatabaseError(#[from] diesel::result::Error),
-    #[error("Chat thread not found")]
-    ChatThreadNotFound,
+    #[error("Conversation not found")]
+    ConversationNotFound,
     #[error("User message not found")]
     UserMessageNotFound,
     #[error("System prompt not found")]
@@ -76,71 +76,73 @@ pub struct NewUserSystemPrompt {
 }
 
 // ============================================================================
-// Chat Threads
+// Conversations (formerly Chat Threads)
 // ============================================================================
 
 #[derive(Queryable, Selectable, Identifiable, Debug, Clone, Serialize, Deserialize)]
-#[diesel(table_name = chat_threads)]
+#[diesel(table_name = conversations)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
-pub struct ChatThread {
+pub struct Conversation {
     pub id: i64,
     pub uuid: Uuid,
     pub user_id: Uuid,
     pub system_prompt_id: Option<i64>,
     pub title_enc: Option<Vec<u8>>,
+    pub metadata: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Insertable, Debug)]
-#[diesel(table_name = chat_threads)]
-pub struct NewChatThread {
+#[diesel(table_name = conversations)]
+pub struct NewConversation {
     pub uuid: Uuid,
     pub user_id: Uuid,
     pub system_prompt_id: Option<i64>,
     pub title_enc: Option<Vec<u8>>,
+    pub metadata: Option<serde_json::Value>,
 }
 
-impl ChatThread {
+impl Conversation {
     pub fn get_by_id_and_user(
         conn: &mut PgConnection,
-        thread_id: i64,
+        conversation_id: i64,
         user_id: Uuid,
-    ) -> Result<ChatThread, ResponsesError> {
-        chat_threads::table
-            .filter(chat_threads::id.eq(thread_id))
-            .filter(chat_threads::user_id.eq(user_id))
-            .first::<ChatThread>(conn)
+    ) -> Result<Conversation, ResponsesError> {
+        conversations::table
+            .filter(conversations::id.eq(conversation_id))
+            .filter(conversations::user_id.eq(user_id))
+            .first::<Conversation>(conn)
             .map_err(|e| match e {
-                diesel::result::Error::NotFound => ResponsesError::ChatThreadNotFound,
+                diesel::result::Error::NotFound => ResponsesError::ConversationNotFound,
                 _ => ResponsesError::DatabaseError(e),
             })
     }
 
     pub fn get_by_uuid_and_user(
         conn: &mut PgConnection,
-        thread_uuid: Uuid,
+        conversation_uuid: Uuid,
         user_id: Uuid,
-    ) -> Result<ChatThread, ResponsesError> {
-        chat_threads::table
-            .filter(chat_threads::uuid.eq(thread_uuid))
-            .filter(chat_threads::user_id.eq(user_id))
-            .first::<ChatThread>(conn)
+    ) -> Result<Conversation, ResponsesError> {
+        conversations::table
+            .filter(conversations::uuid.eq(conversation_uuid))
+            .filter(conversations::user_id.eq(user_id))
+            .first::<Conversation>(conn)
             .map_err(|e| match e {
-                diesel::result::Error::NotFound => ResponsesError::ChatThreadNotFound,
+                diesel::result::Error::NotFound => ResponsesError::ConversationNotFound,
                 _ => ResponsesError::DatabaseError(e),
             })
     }
 
     pub fn update_title(
         conn: &mut PgConnection,
-        thread_id: i64,
+        conversation_id: i64,
         title_enc: Vec<u8>,
     ) -> Result<(), ResponsesError> {
-        diesel::update(chat_threads::table.filter(chat_threads::id.eq(thread_id)))
+        diesel::update(conversations::table.filter(conversations::id.eq(conversation_id)))
             .set((
-                chat_threads::title_enc.eq(title_enc),
-                chat_threads::updated_at.eq(diesel::dsl::now),
+                conversations::title_enc.eq(title_enc),
+                conversations::updated_at.eq(diesel::dsl::now),
             ))
             .execute(conn)
             .map(|_| ())
@@ -153,74 +155,76 @@ impl ChatThread {
         limit: i64,
         after: Option<(DateTime<Utc>, i64)>,
         before: Option<(DateTime<Utc>, i64)>,
-    ) -> Result<Vec<ChatThread>, ResponsesError> {
-        let mut query = chat_threads::table
-            .filter(chat_threads::user_id.eq(user_id))
+    ) -> Result<Vec<Conversation>, ResponsesError> {
+        let mut query = conversations::table
+            .filter(conversations::user_id.eq(user_id))
             .into_boxed();
 
         if let Some((updated_at, id)) = after {
             query = query.filter(
-                chat_threads::updated_at
+                conversations::updated_at
                     .lt(updated_at)
-                    .or(chat_threads::updated_at
+                    .or(conversations::updated_at
                         .eq(updated_at)
-                        .and(chat_threads::id.lt(id))),
+                        .and(conversations::id.lt(id))),
             );
         }
 
         if let Some((updated_at, id)) = before {
             query = query.filter(
-                chat_threads::updated_at
+                conversations::updated_at
                     .gt(updated_at)
-                    .or(chat_threads::updated_at
+                    .or(conversations::updated_at
                         .eq(updated_at)
-                        .and(chat_threads::id.gt(id))),
+                        .and(conversations::id.gt(id))),
             );
         }
 
         query
-            .order(chat_threads::updated_at.desc())
+            .order(conversations::updated_at.desc())
             .limit(limit)
-            .load::<ChatThread>(conn)
+            .load::<Conversation>(conn)
             .map_err(ResponsesError::DatabaseError)
     }
 }
 
-impl NewChatThread {
-    pub fn insert(&self, conn: &mut PgConnection) -> Result<ChatThread, ResponsesError> {
-        diesel::insert_into(chat_threads::table)
+impl NewConversation {
+    pub fn insert(&self, conn: &mut PgConnection) -> Result<Conversation, ResponsesError> {
+        diesel::insert_into(conversations::table)
             .values(self)
             .get_result(conn)
             .map_err(ResponsesError::DatabaseError)
     }
 
-    /// Creates a new thread and its first user message in a transaction
+    /// Creates a new conversation and its first user message in a transaction
     pub fn create_with_first_message(
         conn: &mut PgConnection,
-        thread_uuid: Uuid,
+        conversation_uuid: Uuid,
         user_id: Uuid,
         system_prompt_id: Option<i64>,
         title_enc: Option<Vec<u8>>,
+        metadata: Option<serde_json::Value>,
         first_message: NewUserMessage,
-    ) -> Result<(ChatThread, UserMessage), ResponsesError> {
+    ) -> Result<(Conversation, UserMessage), ResponsesError> {
         use diesel::Connection;
 
         conn.transaction(|tx| {
-            // Create the thread
-            let new_thread = NewChatThread {
-                uuid: thread_uuid,
+            // Create the conversation
+            let new_conversation = NewConversation {
+                uuid: conversation_uuid,
                 user_id,
                 system_prompt_id,
                 title_enc,
+                metadata,
             };
-            let thread = new_thread.insert(tx)?;
+            let conversation = new_conversation.insert(tx)?;
 
-            // Create the first message with the thread's ID
-            let mut message_with_thread = first_message;
-            message_with_thread.thread_id = thread.id;
-            let user_message = message_with_thread.insert(tx)?;
+            // Create the first message with the conversation's ID
+            let mut message_with_conversation = first_message;
+            message_with_conversation.conversation_id = conversation.id;
+            let user_message = message_with_conversation.insert(tx)?;
 
-            Ok((thread, user_message))
+            Ok((conversation, user_message))
         })
     }
 }
@@ -235,7 +239,7 @@ impl NewChatThread {
 pub struct UserMessage {
     pub id: i64,
     pub uuid: Uuid,
-    pub thread_id: i64,
+    pub conversation_id: i64,
     pub user_id: Uuid,
     pub content_enc: Vec<u8>,
     pub prompt_tokens: Option<i32>,
@@ -262,7 +266,7 @@ pub struct UserMessage {
 #[diesel(table_name = user_messages)]
 pub struct NewUserMessage {
     pub uuid: Uuid,
-    pub thread_id: i64,
+    pub conversation_id: i64,
     pub user_id: Uuid,
     pub content_enc: Vec<u8>,
     pub prompt_tokens: Option<i32>,
@@ -474,7 +478,7 @@ impl NewUserMessage {
 pub struct ToolCall {
     pub id: i64,
     pub uuid: Uuid,
-    pub thread_id: i64,
+    pub conversation_id: i64,
     pub user_message_id: i64,
     pub tool_call_id: Uuid,
     pub name: String,
@@ -488,7 +492,7 @@ pub struct ToolCall {
 #[diesel(table_name = tool_calls)]
 pub struct NewToolCall {
     pub uuid: Uuid,
-    pub thread_id: i64,
+    pub conversation_id: i64,
     pub user_message_id: i64,
     pub tool_call_id: Uuid,
     pub name: String,
@@ -515,7 +519,7 @@ impl NewToolCall {
 pub struct ToolOutput {
     pub id: i64,
     pub uuid: Uuid,
-    pub thread_id: i64,
+    pub conversation_id: i64,
     pub tool_call_fk: i64,
     pub output_enc: Vec<u8>,
     pub output_tokens: Option<i32>,
@@ -529,7 +533,7 @@ pub struct ToolOutput {
 #[diesel(table_name = tool_outputs)]
 pub struct NewToolOutput {
     pub uuid: Uuid,
-    pub thread_id: i64,
+    pub conversation_id: i64,
     pub tool_call_fk: i64,
     pub output_enc: Vec<u8>,
     pub output_tokens: Option<i32>,
@@ -556,7 +560,7 @@ impl NewToolOutput {
 pub struct AssistantMessage {
     pub id: i64,
     pub uuid: Uuid,
-    pub thread_id: i64,
+    pub conversation_id: i64,
     pub user_message_id: i64,
     pub content_enc: Vec<u8>,
     pub completion_tokens: Option<i32>,
@@ -569,7 +573,7 @@ pub struct AssistantMessage {
 #[diesel(table_name = assistant_messages)]
 pub struct NewAssistantMessage {
     pub uuid: Uuid,
-    pub thread_id: i64,
+    pub conversation_id: i64,
     pub user_message_id: i64,
     pub content_enc: Vec<u8>,
     pub completion_tokens: Option<i32>,
@@ -626,12 +630,12 @@ pub struct RawThreadMessage {
 }
 
 impl RawThreadMessage {
-    pub fn get_thread_context(
+    pub fn get_conversation_context(
         conn: &mut PgConnection,
-        thread_id: i64,
+        conversation_id: i64,
     ) -> Result<Vec<RawThreadMessage>, ResponsesError> {
         let query = r#"
-            WITH thread_messages AS (
+            WITH conversation_messages AS (
                 -- User messages
                 SELECT 
                     'user' as message_type,
@@ -644,7 +648,7 @@ impl RawThreadMessage {
                     NULL::uuid as tool_call_id,
                     NULL::text as finish_reason
                 FROM user_messages um
-                WHERE um.thread_id = $1
+                WHERE um.conversation_id = $1
                 
                 UNION ALL
                 
@@ -661,7 +665,7 @@ impl RawThreadMessage {
                     am.finish_reason
                 FROM assistant_messages am
                 JOIN user_messages um ON am.user_message_id = um.id
-                WHERE am.thread_id = $1
+                WHERE am.conversation_id = $1
                 
                 UNION ALL
                 
@@ -677,7 +681,7 @@ impl RawThreadMessage {
                     tc.tool_call_id,
                     NULL::text as finish_reason
                 FROM tool_calls tc
-                WHERE tc.thread_id = $1
+                WHERE tc.conversation_id = $1
                 
                 UNION ALL
                 
@@ -694,14 +698,14 @@ impl RawThreadMessage {
                     NULL::text as finish_reason
                 FROM tool_outputs tto
                 JOIN tool_calls tc ON tto.tool_call_fk = tc.id
-                WHERE tto.thread_id = $1
+                WHERE tto.conversation_id = $1
             )
-            SELECT * FROM thread_messages
+            SELECT * FROM conversation_messages
             ORDER BY created_at ASC
         "#;
 
         sql_query(query)
-            .bind::<BigInt, _>(thread_id)
+            .bind::<BigInt, _>(conversation_id)
             .load::<RawThreadMessage>(conn)
             .map_err(ResponsesError::DatabaseError)
     }

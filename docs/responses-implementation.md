@@ -21,39 +21,47 @@
 
 ## Overview
 
-This document outlines the implementation of an OpenAI Responses API-compatible endpoint for OpenSecret. The Responses API is different from the Chat Completions API - it provides server-side conversation state management with SSE streaming and a single entry point where the request contains the entire conversation state.
+This document outlines the implementation of an OpenAI Responses API-compatible endpoint for OpenSecret. The Responses API works in conjunction with the new Conversations API to provide server-side conversation state management with SSE streaming.
+
+**Key API Components**:
+- **Conversations API** (`/v1/conversations`): Manages conversation objects and their items (messages, tool calls, etc.)
+- **Responses API** (`/v1/responses`): Generates model responses that can be automatically added to conversations
+- **Chat Completions API** (`/v1/chat/completions`): Stateless API for simple request/response interactions
 
 **Key Differences from Chat Completions API**:
-- **Chat Completions** (`/v1/chat/completions`): Stateless, requires full conversation history each request
-- **Responses** (`/v1/responses`): Server-managed conversation state, status tracking, server-side tools
+- **Chat Completions**: Stateless, requires full conversation history each request
+- **Responses + Conversations**: Server-managed conversation state, automatic context management, SSE streaming
 
 ### Objectives
 
-1. **OpenAI Responses API Compatibility**: Implement `/v1/responses` endpoint that matches OpenAI's Responses API specification (including the `queued` status added in April 2025)
-2. **Dual Streaming Architecture**: Stream responses to client while simultaneously storing to database
-3. **SSE Streaming**: Server-sent events with proper event types (response.created, response.output_text.delta, tool.call, response.completed, etc.)
-4. **Status Lifecycle**: Track response status through queued → in_progress → completed (though queued is not currently used)
-5. **Tool Calling Support**: Server-side tool execution with proper status tracking
-6. **Integration with Existing Chat API**: Use the existing `/v1/chat/completions` internally for model calls
-7. **Security First**: All user content encrypted at rest using existing patterns
+1. **OpenAI Responses API Compatibility**: Implement `/v1/responses` endpoint that matches OpenAI's latest specification
+2. **Conversations API Integration**: Support the new `conversation` parameter to automatically manage conversation state
+3. **Dual Streaming Architecture**: Stream responses to client while simultaneously storing to database
+4. **SSE Streaming**: Server-sent events with proper event types (response.created, response.output_text.delta, tool.call, response.completed, etc.)
+5. **Status Lifecycle**: Track response status through queued → in_progress → completed
+6. **Tool Calling Support**: Server-side tool execution with proper status tracking
+7. **Integration with Existing Chat API**: Use the existing `/v1/chat/completions` internally for model calls
+8. **Security First**: All user content encrypted at rest using existing patterns
 
 ### Key Features
 
-- Single POST /v1/responses endpoint (no thread/run management)
-- Simultaneous streaming to client and database storage
-- SSE streaming with OpenAI-compatible event format
-- Status lifecycle management (in_progress → completed)
-- Server-side tool execution integrated into response flow
-- Leverages existing /v1/chat/completions for model interaction
-- Model-specific token context window support
+- **Conversations API**: Full CRUD operations on conversation objects and items
+- **Responses API**: Single POST /v1/responses endpoint with conversation integration
+- **Automatic Context Management**: When `conversation` parameter is provided, context is automatically pulled from the conversation
+- **Simultaneous streaming**: Stream to client while storing to database
+- **SSE streaming**: OpenAI-compatible event format
+- **Status lifecycle**: Track response progress (queued → in_progress → completed)
+- **Server-side tools**: Integrated tool execution in response flow
+- **Chat API integration**: Leverages existing /v1/chat/completions for model calls
+- **Token management**: Model-specific context window support
 
 ### Implementation TODO List
 
 **Phase 1: Foundation (Database & Models)**
 - [x] Create and run database migrations
-  - [x] Create response_status enum (includes 'queued' for future use, but MVP will skip directly to 'in_progress')
+  - [x] Create response_status enum (queued, in_progress, completed, failed, cancelled)
   - [x] Create user_system_prompts table
-  - [x] Create chat_threads table 
+  - [x] Create conversations table (renamed from chat_threads, with system_prompt_id, title_enc, model)
   - [x] Create user_messages table with idempotency columns
   - [x] Create tool_calls table
   - [x] Create tool_outputs table
@@ -63,36 +71,47 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 - [x] Create Diesel model structs
   - [x] ResponseStatus enum
   - [x] UserSystemPrompt model
-  - [x] ChatThread model
+  - [x] Conversation model
   - [x] UserMessage model (with idempotency fields)
   - [x] ToolCall model
   - [x] ToolOutput model
   - [x] AssistantMessage model
 - [x] Add query methods to DBConnection trait
-  - [x] get_thread_by_id_and_user()
-  - [x] create_thread() - renamed from create_thread_with_id()
-  - [x] get_user_message_by_uuid() - added instead of get_user_message_by_previous_id()
-  - [x] get_thread_context_messages() - renamed from get_thread_messages_for_context()
+  - [x] get_conversation_by_id_and_user() (renamed from get_thread_by_id_and_user)
+  - [x] create_conversation() (renamed from create_thread)
+  - [x] get_user_message_by_uuid()
+  - [x] get_conversation_context_messages() (renamed from get_thread_context_messages)
   - [x] get_user_message_by_idempotency_key() - query includes NOW() check for expiry
-  - [x] Additional methods added: update_thread_title(), create_user_message(), update_user_message_status(), get_user_message(), list_user_messages(), create_assistant_message(), create_tool_call(), create_tool_output(), cleanup_expired_idempotency_keys()
+  - [x] Additional methods added: update_conversation_title(), create_user_message(), update_user_message_status(), get_user_message(), list_user_messages(), create_assistant_message(), create_tool_call(), create_tool_output(), cleanup_expired_idempotency_keys()
 
-**Phase 2: Basic Responses Endpoint (No Streaming)**
+**Phase 2: Conversations API Implementation**
+- [ ] Implement POST /v1/conversations (create conversation)
+- [ ] Implement GET /v1/conversations/{id} (retrieve conversation)
+- [ ] Implement PATCH /v1/conversations/{id} (update metadata)
+- [ ] Implement DELETE /v1/conversations/{id} (delete conversation)
+- [ ] Implement POST /v1/conversations/{id}/items (add items)
+- [ ] Implement GET /v1/conversations/{id}/items (list items)
+- [ ] Implement GET /v1/conversations (list all - custom extension)
+- [ ] Map internal tables to external "items" format
+- [ ] Test Conversations API endpoints
+
+**Phase 3: Basic Responses Endpoint (No Streaming)**
 - [x] Create ResponsesCreateRequest struct matching OpenAI spec
-- [x] Create ResponsesCreateResponse struct
+- [x] Create ResponsesCreateResponse struct  
 - [x] Implement POST /v1/responses handler
   - [x] JWT validation (reuse existing middleware)
   - [x] Request validation
-  - [x] Thread creation logic (thread.uuid = message.uuid for new threads)
-  - [x] Thread lookup for previous_response_id
+  - [x] Handle conversation parameter (UUID string or {id: "uuid"} object, null for none)
+  - [x] Support backward-compatible previous_response_id
   - [x] Store user message with status='in_progress'
-  - [x] Return immediate response with ID
+  - [x] Return immediate response with conversation_id
 - [x] Add route to web server
 - [x] Idempotency support with header checking
 - [ ] Test basic request/response flow
 
-**Phase 3: Context Building & Chat Integration**
+**Phase 4: Context Building & Chat Integration**
 - [x] Implement conversation context builder
-  - [x] Query all message types from thread
+  - [x] Query all message types from conversation
   - [x] Merge and sort by timestamp
   - [x] Decrypt message content
   - [x] Format into ChatCompletionRequest messages array
@@ -107,7 +126,7 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
   - [x] Update user message status to 'completed'
 - [x] Test end-to-end flow
 
-**Phase 4: SSE Streaming**
+**Phase 5: SSE Streaming**
 - [x] Update handler to support stream=true
 - [x] Implement SSE response format
   - [x] Add Content-Type: text/event-stream header
@@ -129,7 +148,7 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
   - [x] Accumulate content for storage
 - [x] Test streaming functionality
 
-**Phase 5: Dual Streaming (Simultaneous DB Storage)**
+**Phase 6: Dual Streaming (Simultaneous DB Storage)**
 - [x] Implement dual stream architecture
   - [x] Create separate channels for client and storage
   - [x] Spawn storage task
@@ -144,17 +163,12 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
   - [x] No partial content on stream error
 - [x] Test concurrent streaming and storage
 
-**Phase 6: Additional Endpoints**
+**Phase 7: Response Management Endpoints**
 - [x] Implement GET /v1/responses/{id}
   - [x] Query user message by ID
   - [x] Verify user ownership
   - [x] Build response with usage data
   - [x] Return formatted response
-- [x] Implement GET /v1/responses (list) [NOT openai standard but needed in our app)
-  - [x] Add pagination support (limit, after, before, order)
-  - [x] Query user's responses
-  - [x] Format list response
-  - [x] Include decrypted thread title in list response
 - [x] Implement POST /v1/responses/{id}/cancel
   - [x] Check if status is 'in_progress'
   - [x] Update status to 'cancelled'
@@ -166,7 +180,7 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
   - [x] Let cascade deletes handle related records
 - [x] Test all endpoints
 
-**Phase 7: Tool Calling Framework**
+**Phase 8: Tool Calling Framework**
 - [ ] Define Tool and FunctionDefinition structs
 - [ ] Create ToolExecutor trait
 - [ ] Implement ToolRegistry
@@ -183,28 +197,28 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
   - [ ] Stream continued response to client
 - [ ] Test tool calling flow
 
-**Phase 8: Idempotency Support**
+**Phase 9: Idempotency Support**
 - [ ] Add idempotency handling to POST /v1/responses
   - [ ] Check Idempotency-Key header
   - [ ] Hash request body for comparison
-  - [ ] Handle in-progress requests (409 Conflict)
-  - [ ] Return cached responses
-  - [ ] Handle different parameters (422 error)
+  - [x] Handle in-progress requests (409 Conflict)
+  - [x] Return cached responses
+  - [x] Handle different parameters (422 error)
 - [ ] Add cleanup job for expired keys
 - [ ] Test idempotency behavior
 
-**Phase 9: Error Handling & Edge Cases**
+**Phase 10: Error Handling & Edge Cases**
 - [ ] Implement comprehensive error types
 - [ ] Add provider error mapping
 - [ ] Handle streaming errors gracefully
 - [ ] Add timeout handling
 - [ ] Test error scenarios
 
-**Phase 10: Performance & Polish**
+**Phase 11: Performance & Polish**
 - [ ] Add caching layer
   - [ ] Cache tiktoken encoders
   - [ ] Cache user encryption keys (LRU)
-  - [ ] Cache thread metadata
+  - [ ] Cache conversation metadata
 - [ ] Optimize database queries
   - [ ] Review query plans
   - [ ] Add missing indexes
@@ -218,7 +232,7 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
   - [ ] Measure latencies
   - [ ] Identify bottlenecks
 
-**Phase 11: Documentation & Integration**
+**Phase 12: Documentation & Integration**
 - [ ] Update OpenAPI specification
 - [ ] Create integration examples
   - [ ] Python client example
@@ -235,7 +249,7 @@ The Responses API builds on top of the existing infrastructure:
 - Calls internal /v1/chat/completions with streaming
 - Dual stream: responses sent to client while storing to database
 - All data encrypted at rest using existing patterns
-- Thread context automatically managed server-side
+- Conversation context automatically managed server-side
 
 ## Database Schema
 
@@ -254,14 +268,18 @@ The schema splits messages into distinct tables by type, allowing us to:
 Stores optional custom system prompts for users.
 
 ```sql
--- Table: user_system_prompts (optional custom system prompts)
+-- Table: user_system_prompts
+-- Stores optional custom system prompts for users
+-- name_enc: Encrypted system prompt name (binary ciphertext)
+-- prompt_enc: Encrypted system prompt (binary ciphertext)
+-- prompt_tokens: Token count for the system prompt
 CREATE TABLE user_system_prompts (
     id BIGSERIAL PRIMARY KEY,
     uuid UUID NOT NULL UNIQUE,
     user_id UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
-    name_enc BYTEA NOT NULL, -- Encrypted system prompt name (binary ciphertext)
-    prompt_enc BYTEA NOT NULL, -- Encrypted system prompt (binary ciphertext)
-    prompt_tokens INTEGER, -- Token count for the system prompt
+    name_enc BYTEA NOT NULL,
+    prompt_enc BYTEA NOT NULL,
+    prompt_tokens INTEGER,
     is_default BOOLEAN NOT NULL DEFAULT false,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -269,55 +287,58 @@ CREATE TABLE user_system_prompts (
 
 CREATE INDEX idx_user_system_prompts_uuid ON user_system_prompts(uuid);
 CREATE INDEX idx_user_system_prompts_user_id ON user_system_prompts(user_id);
--- Ensure only one default prompt per user
 CREATE UNIQUE INDEX idx_user_system_prompts_one_default 
     ON user_system_prompts(user_id) 
     WHERE is_default = true;
 ```
 
-### chat_threads Table
+### conversations Table
 
-Conversation containers that group related messages. For new conversations (where `previous_response_id` is null), the thread ID matches the first message ID.
+Conversation containers (renamed from chat_threads) that implement OpenAI's Conversations API externally, with additional internal fields. These persist independently and group related messages.
 
 ```sql
--- Table: chat_threads (conversation containers)
-CREATE TABLE chat_threads (
+-- Table: conversations (renamed from chat_threads)
+-- Implements OpenAI Conversations API with additional internal fields
+-- The title_enc field is exposed via metadata.title in the API response
+CREATE TABLE conversations (
     id BIGSERIAL PRIMARY KEY,
-    uuid UUID NOT NULL UNIQUE, -- Set to first user_message uuid for new threads
+    uuid UUID NOT NULL UNIQUE,
     user_id UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
     system_prompt_id BIGINT REFERENCES user_system_prompts(id) ON DELETE SET NULL,
-    title_enc BYTEA, -- Encrypted title (binary ciphertext)
+    title_enc BYTEA,
+    metadata JSONB,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_chat_threads_uuid ON chat_threads(uuid);
-CREATE INDEX idx_chat_threads_user_id ON chat_threads(user_id);
-CREATE INDEX idx_chat_threads_updated ON chat_threads(user_id, updated_at DESC);
+CREATE INDEX idx_conversations_uuid ON conversations(uuid);
+CREATE INDEX idx_conversations_user_id ON conversations(user_id);
+CREATE INDEX idx_conversations_updated ON conversations(user_id, updated_at DESC);
 ```
 
 ### user_messages Table
 
-Stores user inputs and tracks Responses API request lifecycle.
+Stores user inputs and tracks Responses API request lifecycle. These are exposed as "message" items with role="user" in the Conversations API.
 
-**Note on model storage**: The `model` field is only stored in `user_messages` since assistant messages are always generated using the model specified in their parent user message. This avoids redundancy and ensures consistency.
+**Note on model storage**: The `model` field is stored in `user_messages` since the Responses API allows specifying the model per request. Assistant messages are always generated using the model specified in their parent user message.
 
 ```sql
--- Table: user_messages (user inputs / Responses API requests)
--- Note: 'queued' status is included for future compatibility with async processing,
--- but MVP implementation will skip directly to 'in_progress' status
+-- Table: user_messages
+-- User inputs that become "message" items in the Conversations API
+-- Includes response lifecycle tracking for the Responses API
+-- Model is stored per request since Responses API allows changing models
+-- content_enc: Encrypted user input (binary ciphertext)
+-- prompt_tokens: Total tokens in the prompt sent to the model (includes system + all context + user message)
 CREATE TYPE response_status AS ENUM 
   ('queued', 'in_progress', 'completed', 'failed', 'cancelled');
 
 CREATE TABLE user_messages (
     id BIGSERIAL PRIMARY KEY,
-    uuid UUID NOT NULL UNIQUE, -- This is the response_id in the API. For new threads (previous_response_id=null), this UUID also becomes the chat_thread(uuid)
-    thread_id BIGINT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    uuid UUID NOT NULL UNIQUE,
+    conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
-    content_enc BYTEA NOT NULL, -- Encrypted user input (binary ciphertext)
-    prompt_tokens INTEGER, -- Total tokens in the prompt sent to the model (includes system + all context + user message)
-    
-    -- Responses API fields
+    content_enc BYTEA NOT NULL,
+    prompt_tokens INTEGER,
     status response_status NOT NULL DEFAULT 'in_progress',
     model TEXT NOT NULL,
     previous_response_id UUID REFERENCES user_messages(uuid),
@@ -329,12 +350,8 @@ CREATE TABLE user_messages (
     store BOOLEAN NOT NULL DEFAULT true,
     metadata JSONB,
     error TEXT,
-    
-    -- Timestamps
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMP WITH TIME ZONE,
-    
-    -- Idempotency fields
     idempotency_key TEXT,
     request_hash TEXT,
     idempotency_expires_at TIMESTAMP WITH TIME ZONE
@@ -342,19 +359,14 @@ CREATE TABLE user_messages (
 
 -- Indexes
 CREATE INDEX idx_user_messages_uuid ON user_messages(uuid);
-CREATE INDEX idx_user_messages_thread_id ON user_messages(thread_id);
+CREATE INDEX idx_user_messages_conversation_id ON user_messages(conversation_id);
 CREATE INDEX idx_user_messages_user_id ON user_messages(user_id);
 CREATE INDEX idx_user_messages_status ON user_messages(status);
 CREATE INDEX idx_user_messages_previous_uuid ON user_messages(previous_response_id);
--- Composite index for pagination
-CREATE INDEX idx_user_messages_thread_created_id 
-    ON user_messages(thread_id, created_at DESC, id);
-
--- Index for efficient conversation reconstruction
-CREATE INDEX idx_user_messages_thread_created 
-    ON user_messages(thread_id, created_at);
-    
--- Index for efficient idempotency lookups (not a unique constraint)
+CREATE INDEX idx_user_messages_conversation_created_id 
+    ON user_messages(conversation_id, created_at DESC, id);
+CREATE INDEX idx_user_messages_conversation_created 
+    ON user_messages(conversation_id, created_at);
 CREATE INDEX idx_user_messages_idempotency 
     ON user_messages(user_id, idempotency_key) 
     WHERE idempotency_key IS NOT NULL;
@@ -365,29 +377,31 @@ CREATE INDEX idx_user_messages_idempotency
 Tracks tool calls requested by the model.
 
 ```sql
--- Table: tool_calls (tool invocations by the model)
+-- Table: tool_calls
+-- Tool invocations by the model, exposed as "tool_call" items in Conversations API
+-- tool_call_id: Unique identifier for the tool call
+-- arguments_enc: Encrypted arguments (binary ciphertext)
+-- argument_tokens: Token count for the tool arguments
 CREATE TABLE tool_calls (
     id BIGSERIAL PRIMARY KEY,
-    uuid UUID NOT NULL UNIQUE, -- Backend generates before streaming
-    thread_id BIGINT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    uuid UUID NOT NULL UNIQUE,
+    conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     user_message_id BIGINT NOT NULL REFERENCES user_messages(id) ON DELETE CASCADE,
-    tool_call_id UUID NOT NULL, -- Unique identifier for the tool call
+    tool_call_id UUID NOT NULL,
     name TEXT NOT NULL,
-    arguments_enc BYTEA, -- Encrypted arguments (binary ciphertext)
-    argument_tokens INTEGER, -- Token count for the tool arguments
+    arguments_enc BYTEA,
+    argument_tokens INTEGER,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_tool_calls_uuid ON tool_calls(uuid);
-CREATE INDEX idx_tool_calls_thread_id ON tool_calls(thread_id);
+CREATE INDEX idx_tool_calls_conversation_id ON tool_calls(conversation_id);
 CREATE INDEX idx_tool_calls_user_message_id ON tool_calls(user_message_id);
-CREATE INDEX idx_tool_calls_thread_created_id 
-    ON tool_calls(thread_id, created_at DESC, id);
-
--- Index for efficient conversation reconstruction
-CREATE INDEX idx_tool_calls_thread_created 
-    ON tool_calls(thread_id, created_at);
+CREATE INDEX idx_tool_calls_conversation_created_id 
+    ON tool_calls(conversation_id, created_at DESC, id);
+CREATE INDEX idx_tool_calls_conversation_created 
+    ON tool_calls(conversation_id, created_at);
 ```
 
 ### tool_outputs Table  
@@ -395,14 +409,17 @@ CREATE INDEX idx_tool_calls_thread_created
 Stores results from tool executions.
 
 ```sql
--- Table: tool_outputs (tool execution results)
+-- Table: tool_outputs
+-- Tool execution results, exposed as "tool_output" items in Conversations API
+-- output_enc: Encrypted output (binary ciphertext) - use {} for empty responses
+-- output_tokens: Token count for the tool output
 CREATE TABLE tool_outputs (
     id BIGSERIAL PRIMARY KEY,
-    uuid UUID NOT NULL UNIQUE, -- Backend generates before streaming
-    thread_id BIGINT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    uuid UUID NOT NULL UNIQUE,
+    conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     tool_call_fk BIGINT NOT NULL REFERENCES tool_calls(id) ON DELETE CASCADE,
-    output_enc BYTEA NOT NULL, -- Encrypted output (binary ciphertext) - use {} for empty responses
-    output_tokens INTEGER, -- Token count for the tool output
+    output_enc BYTEA NOT NULL,
+    output_tokens INTEGER,
     status TEXT NOT NULL DEFAULT 'succeeded' CHECK (status IN ('succeeded', 'failed')),
     error TEXT,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -410,50 +427,48 @@ CREATE TABLE tool_outputs (
 );
 
 CREATE INDEX idx_tool_outputs_uuid ON tool_outputs(uuid);
-CREATE INDEX idx_tool_outputs_thread_id ON tool_outputs(thread_id);
+CREATE INDEX idx_tool_outputs_conversation_id ON tool_outputs(conversation_id);
 CREATE INDEX idx_tool_outputs_tool_call_fk ON tool_outputs(tool_call_fk);
-CREATE INDEX idx_tool_outputs_thread_created_id 
-    ON tool_outputs(thread_id, created_at DESC, id);
-
--- Index for efficient conversation reconstruction
-CREATE INDEX idx_tool_outputs_thread_created 
-    ON tool_outputs(thread_id, created_at);
+CREATE INDEX idx_tool_outputs_conversation_created_id 
+    ON tool_outputs(conversation_id, created_at DESC, id);
+CREATE INDEX idx_tool_outputs_conversation_created 
+    ON tool_outputs(conversation_id, created_at);
 ```
 
 ### assistant_messages Table
 
-Stores LLM responses (non-tool responses). The model is not stored here since it can be derived from the parent `user_message_id` - this avoids redundancy and potential inconsistencies.
+Stores LLM responses (non-tool responses). The model is not stored here since it can be derived from the parent `user_message_id` - this avoids redundancy and ensures consistency.
 
 ```sql
--- Table: assistant_messages (LLM responses)
+-- Table: assistant_messages
+-- LLM responses, exposed as "message" items with role="assistant" in Conversations API
+-- content_enc: Encrypted assistant response (binary ciphertext)
+-- completion_tokens: Token count for this assistant response
 CREATE TABLE assistant_messages (
     id BIGSERIAL PRIMARY KEY,
-    uuid UUID NOT NULL UNIQUE, -- Backend generates before streaming
-    thread_id BIGINT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+    uuid UUID NOT NULL UNIQUE,
+    conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     user_message_id BIGINT NOT NULL REFERENCES user_messages(id) ON DELETE CASCADE,
-    content_enc BYTEA NOT NULL, -- Encrypted assistant response (binary ciphertext)
-    completion_tokens INTEGER, -- Token count for this assistant response
+    content_enc BYTEA NOT NULL,
+    completion_tokens INTEGER,
     finish_reason TEXT,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_assistant_messages_uuid ON assistant_messages(uuid);
-CREATE INDEX idx_assistant_messages_thread_id ON assistant_messages(thread_id);
+CREATE INDEX idx_assistant_messages_conversation_id ON assistant_messages(conversation_id);
 CREATE INDEX idx_assistant_messages_user_message_id ON assistant_messages(user_message_id);
-CREATE INDEX idx_assistant_messages_thread_created_id 
-    ON assistant_messages(thread_id, created_at DESC, id);
+CREATE INDEX idx_assistant_messages_conversation_created_id 
+    ON assistant_messages(conversation_id, created_at DESC, id);
+CREATE INDEX idx_assistant_messages_conversation_created 
+    ON assistant_messages(conversation_id, created_at);
 
--- Index for efficient conversation reconstruction
-CREATE INDEX idx_assistant_messages_thread_created 
-    ON assistant_messages(thread_id, created_at);
-
--- Apply triggers for updated_at (using existing update_updated_at_column function)
 CREATE TRIGGER update_user_system_prompts_updated_at BEFORE UPDATE
     ON user_system_prompts FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     
-CREATE TRIGGER update_chat_threads_updated_at BEFORE UPDATE
-    ON chat_threads FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_conversations_updated_at BEFORE UPDATE
+    ON conversations FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
     
 CREATE TRIGGER update_user_messages_updated_at BEFORE UPDATE
     ON user_messages FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
@@ -488,13 +503,13 @@ DROP TRIGGER IF EXISTS update_assistant_messages_updated_at ON assistant_message
 DROP TRIGGER IF EXISTS update_tool_outputs_updated_at ON tool_outputs;
 DROP TRIGGER IF EXISTS update_tool_calls_updated_at ON tool_calls;
 DROP TRIGGER IF EXISTS update_user_messages_updated_at ON user_messages;
-DROP TRIGGER IF EXISTS update_chat_threads_updated_at ON chat_threads;
+DROP TRIGGER IF EXISTS update_conversations_updated_at ON conversations;
 DROP TRIGGER IF EXISTS update_user_system_prompts_updated_at ON user_system_prompts;
 DROP TABLE IF EXISTS assistant_messages;
 DROP TABLE IF EXISTS tool_outputs;
 DROP TABLE IF EXISTS tool_calls;
 DROP TABLE IF EXISTS user_messages;
-DROP TABLE IF EXISTS chat_threads;
+DROP TABLE IF EXISTS conversations;
 DROP TABLE IF EXISTS user_system_prompts;
 DROP TYPE IF EXISTS response_status;
 ```
@@ -508,15 +523,22 @@ The following endpoints implement OpenAI Responses API compatibility, with some 
 Creates a new response request. This is the single entry point for the Responses API.
 
 **Note**: This endpoint complements the existing `/v1/chat/completions` endpoint. Use `/v1/chat/completions` for simple stateless requests. Use `/v1/responses` when you need:
-- Server-managed conversation state with status tracking
+- Server-managed conversation state with automatic context handling
+- Integration with the Conversations API
 - Server-side tool execution
-- Conversation continuity via `previous_response_id`
+- SSE streaming with detailed events
 - OpenAI Responses API compatibility
 
-**Thread Management**:
-- When `previous_response_id` is null, a new thread is created with `thread.id = message.id`
-- When `previous_response_id` is provided, the conversation continues in the existing thread
-- Thread titles are auto-generated after the first few messages and stored in `chat_threads.title_enc`
+**Conversation Management**:
+- When `conversation` parameter is provided:
+  - Can be a conversation ID (UUID string)
+  - Can be an object with `{id: "uuid"}`
+  - Defaults to `null` (no conversation association)
+- When `conversation` is a valid ID:
+  - Items from that conversation are prepended to the input for context
+  - The model specified in the request is used (can differ from previous requests)
+- Response output is automatically added to the specified conversation
+- For backward compatibility, `previous_response_id` is still supported but deprecated
 
 **Headers:**
 - `Authorization: Bearer <token>` (required)
@@ -527,6 +549,7 @@ Creates a new response request. This is the single entry point for the Responses
 {
   "model": "gpt-4",
   "input": "Explain quantum computing",
+  "conversation": "550e8400-e29b-41d4-a716-446655440000", // or {"id": "550e8400-e29b-41d4-a716-446655440000"} or null
   "tools": [
     {
       "type": "function", 
@@ -545,19 +568,18 @@ Creates a new response request. This is the single entry point for the Responses
   "store": true,
   "metadata": {},
   "stream": true,
-  "previous_response_id": null // null for new thread, or UUID to continue
-}
+  "previous_response_id": null // Deprecated - use conversation parameter instead
 ```
 
 **Response (Immediate):**
 ```json
 {
-  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "id": "resp_550e8400e29b41d4a716446655440000",
   "object": "response",
   "created_at": 1677652288,
   "model": "gpt-4",
-  "status": "in_progress"
-}
+  "status": "in_progress",
+  "conversation_id": "conv_123"
 ```
 
 **SSE Stream Events (if stream=true):**
@@ -635,19 +657,107 @@ Get the status and result of a response (for polling if not using SSE).
 }
 ```
 
-### GET /v1/responses
+### Conversations API Endpoints
 
-List conversation threads for the authenticated user with pagination.
+OpenAI's Conversations API provides full CRUD operations for managing conversations:
 
-**Note**: This is a custom OpenSecret endpoint for convenience, not part of the standard OpenAI Responses API. OpenAI only supports GET /v1/responses/{response_id} for retrieving individual responses. This endpoint returns thread metadata, not individual messages.
+#### POST /v1/conversations
+
+Create a new conversation with optional initial items.
+
+**Request Body:**
+```json
+{
+  "metadata": {"topic": "quantum physics"},
+  "items": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": "What is quantum entanglement?"
+    }
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "object": "conversation",
+  "created_at": 1677652288,
+  "metadata": {
+    "topic": "quantum physics",
+    "title": "Quantum Entanglement Discussion"  // Auto-generated from title_enc
+  }
+}
+```
+
+**Implementation Notes:**
+- Internally stores model at conversation creation (from first response or explicit setting)
+- title_enc is stored as a first-class field but exposed via metadata.title
+- UUID format used for all IDs (no special prefixes needed)
+
+#### GET /v1/conversations/{conversation_id}
+
+Retrieve a conversation by ID.
+
+#### PATCH /v1/conversations/{conversation_id}
+
+Update conversation metadata.
+
+#### DELETE /v1/conversations/{conversation_id}
+
+Delete a conversation and all its items.
+
+#### POST /v1/conversations/{conversation_id}/items
+
+Add items to an existing conversation.
+
+#### GET /v1/conversations/{conversation_id}/items
+
+List all items in a conversation. This is the standard OpenAI endpoint for retrieving conversation history.
 
 **Query Parameters:**
-- `limit` (integer, default: 20, max: 100): Number of threads to return
-- `after` (string): Cursor for pagination (thread UUID to start after)
-- `before` (string): Cursor for pagination (thread UUID to start before)
-- `order` (string, default: "desc"): Sort order by updated_at ("asc" or "desc")
+- `limit` (integer, default: 20, max: 100): Number of items to return
+- `after` (string): Cursor for pagination (item ID to start after)
+- `before` (string): Cursor for pagination (item ID to start before)
+- `order` (string, default: "asc"): Sort order by created_at
 
-**Pagination Design**: We use `after`/`before` parameters following OpenAI's standard list endpoint patterns (e.g., list assistants, list files). Threads are sorted by their `updated_at` timestamp.
+**Response:**
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "msg_123",
+      "type": "message",
+      "role": "user",
+      "content": [{"type": "text", "text": "Hello"}],
+      "created_at": 1677652288
+    },
+    {
+      "id": "msg_124",
+      "type": "message",
+      "role": "assistant",
+      "content": [{"type": "text", "text": "Hi there!"}],
+      "created_at": 1677652290
+    }
+  ],
+  "has_more": false
+}
+```
+
+### GET /v1/conversations (Custom OpenSecret Extension)
+
+List all conversations for the authenticated user with pagination.
+
+**Note**: This is a custom OpenSecret endpoint, not part of the standard OpenAI Conversations API. However, it follows OpenAI's list response format and returns standard conversation objects.
+
+**Query Parameters:**
+- `limit` (integer, default: 20, max: 100): Number of conversations to return
+- `after` (string): Cursor for pagination (conversation UUID to start after)
+- `before` (string): Cursor for pagination (conversation UUID to start before)
+- `order` (string, default: "desc"): Sort order by updated_at
 
 **Response:**
 ```json
@@ -656,7 +766,36 @@ List conversation threads for the authenticated user with pagination.
   "data": [
     {
       "id": "550e8400-e29b-41d4-a716-446655440000",
-      "object": "thread",
+      "object": "conversation",
+      "created_at": 1677652288,
+      "updated_at": 1677652350,
+      "metadata": {
+        "title": "Quantum Physics Discussion"
+      }
+    }
+  ],
+  "has_more": true,
+  "first_id": "550e8400-e29b-41d4-a716-446655440000",
+  "last_id": "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
+}
+```
+
+**Query Parameters:**
+- `limit` (integer, default: 20, max: 100): Number of conversations to return
+- `after` (string): Cursor for pagination (conversation UUID to start after)
+- `before` (string): Cursor for pagination (conversation UUID to start before)
+- `order` (string, default: "desc"): Sort order by updated_at ("asc" or "desc")
+
+**Pagination Design**: We use `after`/`before` parameters following OpenAI's standard list endpoint patterns (e.g., list assistants, list files). Conversations are sorted by their `updated_at` timestamp.
+
+**Response:**
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "object": "conversation",
       "created_at": 1677652288,
       "updated_at": 1677652350,
       "title": "How to cook chicken"
@@ -669,11 +808,11 @@ List conversation threads for the authenticated user with pagination.
 ```
 
 **Implementation Notes:**
-- Returns chat thread metadata for display in a conversation history sidebar
-- Each thread appears once, regardless of how many messages it contains
-- Threads are ordered by most recently updated (when new messages are added)
-- Thread titles are decrypted for display
-- Status and model information are not included as they belong to individual messages, not threads
+- Returns conversation metadata for display in a conversation history sidebar
+- Each conversation appears once, regardless of how many messages it contains
+- Conversations are ordered by most recently updated (when new messages are added)
+- Conversation titles are decrypted and exposed via metadata.title
+- Status and model information are not included as they belong to individual messages, not conversations
 
 ### POST /v1/responses/{response_id}/cancel
 
@@ -746,7 +885,7 @@ All user content is encrypted at rest using the same patterns as the existing KV
 
 1. **User Master Key**: Derived from `users.seed_enc` using KDF
 2. **Encryption Key**: AES-256 key derived from master key
-3. **No per-thread keys**: All messages for a user use the same encryption key
+3. **No per-conversation keys**: All messages for a user use the same encryption key
 
 ### Encryption Methods
 
@@ -757,10 +896,10 @@ All user content is encrypted at rest using the same patterns as the existing KV
 - More secure than deterministic encryption
 - Use existing standards for user-based encryption in the codebase currently. Like the value in the KV store.
 
-Note: Unlike the KV store (src/kv.rs), the Responses API does NOT use deterministic encryption. Thread and message lookups use unencrypted UUIDs, not encrypted fields.
+Note: Unlike the KV store (src/kv.rs), the Responses API does NOT use deterministic encryption. Conversation and message lookups use unencrypted UUIDs, not encrypted fields.
 
 **Unencrypted Fields**
-- UUIDs (thread_id, message_id, user_id)
+- UUIDs (conversation_id, message_id, user_id)
 - Metadata (timestamps, status, model names)
 - These contain no sensitive user content - just identifiers and operational data
 
@@ -776,7 +915,7 @@ let user_key: &SecretKey = &user.seed_enc;
 
 // All encryption uses AES-256-GCM (non-deterministic) via encrypt_with_key
 let content_enc = encrypt_with_key(user_key, message_content.as_bytes()).await;
-let title_enc = encrypt_with_key(user_key, thread_title.as_bytes()).await;
+let title_enc = encrypt_with_key(user_key, conversation_title.as_bytes()).await;
 let args_enc = encrypt_with_key(user_key, tool_args.as_bytes()).await;
 
 // Decrypting on retrieval
@@ -934,7 +1073,7 @@ Building conversation context is the most performance-critical operation, happen
 
 ```sql
 -- Single query to get all message types with token counts ordered by timestamp
-WITH thread_messages AS (
+WITH conversation_messages AS (
     -- User messages
     SELECT 
         'user' as message_type,
@@ -947,7 +1086,7 @@ WITH thread_messages AS (
         NULL as tool_call_id,
         NULL as finish_reason
     FROM user_messages um
-    WHERE um.thread_id = $1
+    WHERE um.conversation_id = $1
     
     UNION ALL
     
@@ -964,7 +1103,7 @@ WITH thread_messages AS (
         am.finish_reason
     FROM assistant_messages am
     JOIN user_messages um ON am.user_message_id = um.id
-    WHERE am.thread_id = $1
+    WHERE am.conversation_id = $1
     
     UNION ALL
     
@@ -980,7 +1119,7 @@ WITH thread_messages AS (
         tc.tool_call_id,
         NULL as finish_reason
     FROM tool_calls tc
-    WHERE tc.thread_id = $1
+    WHERE tc.conversation_id = $1
     
     UNION ALL
     
@@ -997,9 +1136,9 @@ WITH thread_messages AS (
         NULL as finish_reason
     FROM tool_outputs tto
     JOIN tool_calls tc ON tto.tool_call_fk = tc.id
-    WHERE tto.thread_id = $1
+    WHERE tto.conversation_id = $1
 )
-SELECT * FROM thread_messages
+SELECT * FROM conversation_messages
 ORDER BY created_at ASC;
 ```
 
@@ -1008,26 +1147,26 @@ ORDER BY created_at ASC;
 ```rust
 // MVP implementation - efficient but not overly complex
 impl DBConnection for AsyncPgConnection {
-    async fn get_thread_context(
+    async fn get_conversation_context(
         &mut self,
-        thread_id: i64,
+        conversation_id: i64,
         user_id: Uuid,
     ) -> Result<Vec<ChatCompletionMessage>> {
-        // 1. Verify thread ownership
-        let thread = chat_threads::table
-            .filter(chat_threads::id.eq(thread_id))
-            .filter(chat_threads::user_id.eq(user_id))
-            .first::<ChatThread>(self)
+        // 1. Verify conversation ownership
+        let conversation = conversations::table
+            .filter(conversations::id.eq(conversation_id))
+            .filter(conversations::user_id.eq(user_id))
+            .first::<Conversation>(self)
             .await?;
             
         // 2. Get user encryption key
         let user_key: &SecretKey = &user.seed_enc;
         
         // 3. Run the UNION ALL query to get ALL messages with token counts
-        const THREAD_MESSAGES_QUERY: &str = include_str!("../sql/thread_messages.sql");
-        let raw_messages = diesel::sql_query(THREAD_MESSAGES_QUERY)
-            .bind::<BigInt, _>(thread_id)
-            .load::<RawThreadMessage>(self)
+        const CONVERSATION_MESSAGES_QUERY: &str = include_str!("../sql/conversation_messages.sql");
+        let raw_messages = diesel::sql_query(CONVERSATION_MESSAGES_QUERY)
+            .bind::<BigInt, _>(conversation_id)
+            .load::<RawConversationMessage>(self)
             .await?;
             
         // 4. Convert all messages to chat format (no truncation here)
@@ -1035,7 +1174,7 @@ impl DBConnection for AsyncPgConnection {
         let mut token_counts = Vec::new();
         
         // Add system prompt if exists
-        if let Some(system_prompt) = thread.system_prompt {
+        if let Some(system_prompt) = conversation.system_prompt {
             let decrypted_prompt = decrypt_content(&system_prompt.prompt_enc, &user_key)?;
             messages.push(ChatCompletionMessage {
                 role: "system".to_string(),
@@ -1086,17 +1225,17 @@ impl DBConnection for AsyncPgConnection {
 
 ```sql
 -- Essential indexes for the UNION ALL query
-CREATE INDEX idx_user_messages_thread_created 
-ON user_messages(thread_id, created_at);
+CREATE INDEX idx_user_messages_conversation_created 
+ON user_messages(conversation_id, created_at);
 
-CREATE INDEX idx_assistant_messages_thread_created 
-ON assistant_messages(thread_id, created_at);
+CREATE INDEX idx_assistant_messages_conversation_created 
+ON assistant_messages(conversation_id, created_at);
 
-CREATE INDEX idx_tool_calls_thread_created 
-ON tool_calls(thread_id, created_at);
+CREATE INDEX idx_tool_calls_conversation_created 
+ON tool_calls(conversation_id, created_at);
 
-CREATE INDEX idx_tool_outputs_thread_created 
-ON tool_outputs(thread_id, created_at);
+CREATE INDEX idx_tool_outputs_conversation_created 
+ON tool_outputs(conversation_id, created_at);
 ```
 
 ### Request Flow
@@ -1105,9 +1244,8 @@ ON tool_outputs(thread_id, created_at);
    - Validate JWT and decrypt request
    - Check for idempotency key if provided
    - Generate message ID (or reuse from idempotency check)
-   - Determine thread handling:
-     - If `previous_response_id` is null: Create new thread with `thread.id = message.id`
-     - If `previous_response_id` is provided: Look up thread from previous message
+   - Determine conversation handling:
+     - If `conversation` is null and `previous_response_id` exists: Look up conversation from previous response (backward compatibility)
    - Insert user_message record with status='in_progress' (MVP skips 'queued' status for synchronous processing)
    - Build conversation context from thread history
    - If stream=true, upgrade to SSE connection
@@ -1391,7 +1529,7 @@ pub fn get_model_max_tokens(model: &str) -> usize {
    ```rust
    // Build the final prompt for the LLM with context window management
    async fn build_conversation_prompt(
-       thread_id: i64,
+       conversation_id: i64,
        user_id: Uuid,
        model: &str,
        new_message: &str,
@@ -1410,9 +1548,9 @@ pub fn get_model_max_tokens(model: &str) -> usize {
            .saturating_sub(tool_reserve)
            .saturating_sub(safety_margin);
        
-       // Get ALL messages from the thread efficiently using the UNION ALL query
+       // Get ALL messages from the conversation efficiently using the UNION ALL query
        // This now returns both messages and their token counts
-       let (all_messages, token_counts) = get_thread_context(thread_id, user_id).await?;
+       let (all_messages, token_counts) = get_conversation_context(conversation_id, user_id).await?;
        
        // Calculate total tokens using stored counts
        let mut total_tokens = new_message_tokens as usize;
@@ -1749,7 +1887,7 @@ data: {"type": "response.completed", "response": {"status": "completed", "usage"
 
 ### Tool Definition
 
-Tools are defined in the request or at the thread level:
+Tools are defined in the request or at the conversation level:
 
 ```rust
 #[derive(Debug, Serialize, Deserialize)]
@@ -1975,7 +2113,7 @@ Client              Chat Service         Database            LLM Provider
 1. **Asynchronous Processing**: All database operations are non-blocking
 2. **Dual Stream Handling**: Responses stream to client while storing to DB
 3. **Error Resilience**: Partial responses are saved on error
-4. **Stateful Conversation**: Thread context maintained across requests
+4. **Stateful Conversation**: Conversation context maintained across requests
 5. **Encryption at Every Layer**: Request, storage, and response encryption
 
 ## Authentication & Authorization
@@ -2005,11 +2143,11 @@ Uses the existing JWT-based authentication:
 
 ### Authorization Rules
 
-1. **Thread Access**:
-   - Users can only access their own threads
+1. **Conversation Access**:
+   - Users can only access their own conversations
    - Enforced at database query level:
    ```rust
-   let thread = db.get_thread_by_id_and_user(thread_id, user.id)?;
+   let conversation = db.get_conversation_by_id_and_user(conversation_id, user.id)?;
    ```
 
 ## Error Handling
@@ -2097,7 +2235,7 @@ After running migrations, examine the generated `src/schema.rs` file and create 
 
 - `ResponseStatus` enum (queued, in_progress, completed, failed, cancelled)
 - `UserSystemPrompt` - custom system prompts
-- `ChatThread` - conversation containers
+- `Conversation` - conversation containers
 - `UserMessage` - user inputs with Responses API lifecycle tracking
 - `ToolCall` - model-requested tool invocations
 - `ToolOutput` - tool execution results

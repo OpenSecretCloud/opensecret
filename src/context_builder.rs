@@ -19,13 +19,13 @@ pub struct ChatMsg {
 /// Return (messages, total_prompt_tokens)
 pub fn build_prompt<D: DBConnection + ?Sized>(
     db: &D,
-    thread_id: i64,
+    conversation_id: i64,
     user_key: &secp256k1::SecretKey,
     model: &str,
 ) -> Result<(Vec<serde_json::Value>, usize), crate::ApiError> {
     // 1. Pull every stored message (already in chrono order ASC)
     let raw = db
-        .get_thread_context_messages(thread_id)
+        .get_conversation_context_messages(conversation_id)
         .map_err(|_| crate::ApiError::InternalServerError)?;
 
     // 2. Decrypt + map to ChatMsg
@@ -54,7 +54,7 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
 
     // Note: In the Responses API flow, the current user message is already persisted
     // to the database before this function is called, so it's included in the
-    // get_thread_context_messages result above.
+    // get_conversation_context_messages result above.
 
     // Delegate to the pure function for testing
     build_prompt_from_chat_messages(msgs, model)
@@ -202,8 +202,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_prompt_empty_thread() {
-        // Empty thread with just new user input
+    fn test_build_prompt_empty_conversation() {
+        // Empty conversation with just new user input
         let msgs = vec![create_chat_msg("user", "Hello, assistant!", None)];
 
         let result = build_prompt_from_chat_messages(msgs, "test-model");

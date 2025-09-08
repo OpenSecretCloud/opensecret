@@ -16,9 +16,8 @@ use crate::{
     },
     ApiError, AppState,
 };
-use secp256k1::SecretKey;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::HeaderMap,
     middleware::from_fn_with_state,
     response::sse::{Event, Sse},
@@ -29,6 +28,7 @@ use base64::Engine;
 use bigdecimal::BigDecimal;
 use chrono::Utc;
 use futures::{Stream, StreamExt, TryStreamExt};
+use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -46,6 +46,14 @@ fn default_stream() -> bool {
     true
 }
 
+/// Conversation parameter - can be a string UUID or an object with id field
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ConversationParam {
+    String(Uuid),
+    Object { id: Uuid },
+}
+
 /// Request payload for creating a new response
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponsesCreateRequest {
@@ -53,9 +61,15 @@ pub struct ResponsesCreateRequest {
     pub model: String,
 
     /// User's input message
+    /// TODO: Support structured content array with text/images like OpenAI's format:
+    /// input: [{type: "text", text: "..."}, {type: "image_url", image_url: {...}}]
     pub input: String,
 
-    /// Previous response ID to continue conversation
+    /// Conversation to associate with (UUID string or {id: UUID} object)
+    #[serde(default)]
+    pub conversation: Option<ConversationParam>,
+
+    /// Previous response ID to continue conversation (deprecated, use conversation instead)
     #[serde(default)]
     pub previous_response_id: Option<Uuid>,
 
@@ -482,35 +496,6 @@ pub struct ResponsesRetrieveResponse {
     pub output: Option<String>,
 }
 
-/// Response item for list endpoint
-#[derive(Debug, Clone, Serialize)]
-pub struct ResponsesListItem {
-    pub id: Uuid,
-    pub object: &'static str,
-    pub created_at: i64,
-    pub updated_at: i64,
-    pub title: Option<String>,
-}
-
-/// Response returned by GET /v1/responses (list)
-#[derive(Debug, Clone, Serialize)]
-pub struct ResponsesListResponse {
-    pub object: &'static str,
-    pub data: Vec<ResponsesListItem>,
-    pub has_more: bool,
-    pub first_id: Option<Uuid>,
-    pub last_id: Option<Uuid>,
-}
-
-/// Query parameters for GET /v1/responses
-#[derive(Debug, Deserialize)]
-pub struct ListParams {
-    pub limit: Option<i64>,
-    pub after: Option<Uuid>,
-    pub before: Option<Uuid>,
-    pub order: Option<String>,
-}
-
 /// Response returned by DELETE /v1/responses/{id}
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponsesDeleteResponse {
@@ -527,10 +512,6 @@ pub fn router(state: Arc<AppState>) -> Router {
                 state.clone(),
                 decrypt_request::<ResponsesCreateRequest>,
             )),
-        )
-        .route(
-            "/v1/responses",
-            get(list_responses).layer(from_fn_with_state(state.clone(), decrypt_request::<()>)),
         )
         .route(
             "/v1/responses/:id",
@@ -595,8 +576,8 @@ async fn create_response_stream(
     // Encrypt user input
     let content_enc = encrypt_with_key(&user_key, body.input.as_bytes()).await;
 
-    // Create thread and user message
-    let (thread, user_message) = persist_initial_message(
+    // Create conversation and user message
+    let (conversation, user_message) = persist_initial_message(
         &state,
         &user,
         &body,
@@ -607,13 +588,13 @@ async fn create_response_stream(
     .await?;
 
     info!(
-        "Created response {} for user {} in thread {}",
-        user_message.uuid, user.uuid, thread.uuid
+        "Created response {} for user {} in conversation {}",
+        user_message.uuid, user.uuid, conversation.uuid
     );
 
     // Build the conversation context from all persisted messages
     let (prompt_messages, total_prompt_tokens) =
-        build_prompt(state.db.as_ref(), thread.id, &user_key, &body.model)?;
+        build_prompt(state.db.as_ref(), conversation.id, &user_key, &body.model)?;
 
     trace!(
         "Built prompt with {} total tokens, {} messages",
@@ -655,7 +636,7 @@ async fn create_response_stream(
     let storage_handle = {
         let db = state.db.clone();
         let user_message_id = user_message.id;
-        let thread_id = thread.id;
+        let conversation_id = conversation.id;
         let user_uuid = user.uuid;
         let sqs_publisher = state.sqs_publisher.clone();
 
@@ -664,7 +645,7 @@ async fn create_response_stream(
                 rx_storage,
                 db,
                 user_message_id,
-                thread_id,
+                conversation_id,
                 user_key,
                 user_uuid,
                 sqs_publisher,
@@ -1185,7 +1166,7 @@ async fn storage_task(
     mut rx: mpsc::Receiver<StorageMessage>,
     db: Arc<dyn crate::DBConnection + Send + Sync>,
     user_message_id: i64,
-    thread_id: i64,
+    conversation_id: i64,
     user_key: secp256k1::SecretKey,
     user_uuid: Uuid,
     sqs_publisher: Option<Arc<crate::sqs::SqsEventPublisher>>,
@@ -1268,7 +1249,7 @@ async fn storage_task(
 
     let new_assistant = NewAssistantMessage {
         uuid: message_id,
-        thread_id,
+        conversation_id,
         user_message_id,
         content_enc,
         completion_tokens: Some(completion_tokens),
@@ -1327,7 +1308,7 @@ async fn storage_task(
                     chat_time: Utc::now(),
                     is_api_request: false, // TODO: Responses API is not API key based
                     provider_name: String::new(), // TODO: Track provider name from upstream response
-                    model_name: String::new(), // TODO: Track actual model name used
+                    model_name: String::new(),    // TODO: Track actual model name used
                 };
 
                 match publisher.publish_event(event).await {
@@ -1370,7 +1351,7 @@ async fn encrypt_event(
     Ok(Event::default().event(event_type).data(base64_encrypted))
 }
 
-/// Persist initial user message and possibly create new thread
+/// Persist initial user message and possibly create new conversation
 async fn persist_initial_message(
     state: &Arc<AppState>,
     user: &User,
@@ -1380,16 +1361,67 @@ async fn persist_initial_message(
     user_key: &SecretKey,
 ) -> Result<
     (
-        crate::models::responses::ChatThread,
+        crate::models::responses::Conversation,
         crate::models::responses::UserMessage,
     ),
     ApiError,
 > {
-    // Thread resolution/creation with message
-    if let Some(prev_id) = body.previous_response_id {
+    // Determine which conversation to use
+    // Priority: conversation parameter > previous_response_id > create new
+    let conversation_id = match &body.conversation {
+        Some(ConversationParam::String(id)) | Some(ConversationParam::Object { id }) => Some(*id),
+        None => None,
+    };
+
+    if let Some(conv_uuid) = conversation_id {
+        // Use specified conversation
+        debug!("Using specified conversation: {}", conv_uuid);
+
+        let conversation = state
+            .db
+            .get_conversation_by_uuid_and_user(conv_uuid, user.uuid)
+            .map_err(|e| {
+                error!("Error fetching conversation: {:?}", e);
+                match e {
+                    DBError::ResponsesError(ResponsesError::ConversationNotFound) => {
+                        ApiError::NotFound
+                    }
+                    _ => ApiError::InternalServerError,
+                }
+            })?;
+
+        // Create message for existing conversation
+        let new_msg = NewUserMessage {
+            uuid: Uuid::new_v4(),
+            conversation_id: conversation.id,
+            user_id: user.uuid,
+            content_enc: content_enc.clone(),
+            prompt_tokens: Some(user_message_tokens),
+            status: ResponseStatus::InProgress,
+            model: body.model.clone(),
+            previous_response_id: None, // No longer using this field
+            temperature: body.temperature,
+            top_p: body.top_p,
+            max_output_tokens: body.max_output_tokens,
+            tool_choice: body.tool_choice.clone(),
+            parallel_tool_calls: body.parallel_tool_calls,
+            store: body.store,
+            metadata: body.metadata.clone(),
+            idempotency_key: None,
+            request_hash: None,
+            idempotency_expires_at: None,
+        };
+
+        let inserted = state.db.create_user_message(new_msg).map_err(|e| {
+            error!("Error creating user message: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+        Ok((conversation, inserted))
+    } else if let Some(prev_id) = body.previous_response_id {
         debug!("Looking up previous response: {}", prev_id);
 
-        // Get the previous message to find the thread
+        // Get the previous message to find the conversation
         let prev_msg = state
             .db
             .get_user_message_by_uuid(prev_id, user.uuid)
@@ -1404,19 +1436,19 @@ async fn persist_initial_message(
                 }
             })?;
 
-        // Get the thread
-        let thread = state
+        // Get the conversation
+        let conversation = state
             .db
-            .get_thread_by_id_and_user(prev_msg.thread_id, user.uuid)
+            .get_conversation_by_id_and_user(prev_msg.conversation_id, user.uuid)
             .map_err(|e| {
-                error!("Error fetching thread: {:?}", e);
+                error!("Error fetching conversation: {:?}", e);
                 ApiError::InternalServerError
             })?;
 
-        // Create message for existing thread
+        // Create message for existing conversation
         let new_msg = NewUserMessage {
             uuid: Uuid::new_v4(),
-            thread_id: thread.id,
+            conversation_id: conversation.id,
             user_id: user.uuid,
             content_enc: content_enc.clone(),
             prompt_tokens: Some(user_message_tokens),
@@ -1440,24 +1472,24 @@ async fn persist_initial_message(
             ApiError::InternalServerError
         })?;
 
-        Ok((thread, inserted))
+        Ok((conversation, inserted))
     } else {
         debug!(
-            "Creating new thread with first message for user: {}",
+            "Creating new conversation with first message for user: {}",
             user.uuid
         );
 
-        // Create new thread with UUID = message UUID
-        let thread_uuid = Uuid::new_v4();
-        
+        // Create new conversation with UUID = message UUID
+        let conversation_uuid = Uuid::new_v4();
+
         // Encrypt default title "New Chat"
         let default_title = "New Chat";
         let title_enc = Some(encrypt_with_key(user_key, default_title.as_bytes()).await);
 
         // Prepare the first message
         let first_message = NewUserMessage {
-            uuid: thread_uuid,
-            thread_id: 0, // Will be set by create_thread_with_first_message
+            uuid: conversation_uuid,
+            conversation_id: 0, // Will be set by create_conversation_with_first_message
             user_id: user.uuid,
             content_enc: content_enc.clone(),
             prompt_tokens: Some(user_message_tokens),
@@ -1476,18 +1508,19 @@ async fn persist_initial_message(
             idempotency_expires_at: None,
         };
 
-        // Use transactional method to create both thread and message atomically
+        // Use transactional method to create both conversation and message atomically
         state
             .db
-            .create_thread_with_first_message(
-                thread_uuid,
+            .create_conversation_with_first_message(
+                conversation_uuid,
                 user.uuid,
                 None, // system_prompt_id - will be added in later phases
                 title_enc,
+                None, // metadata - can be added in later phases
                 first_message,
             )
             .map_err(|e| {
-                error!("Error creating thread with first message: {:?}", e);
+                error!("Error creating conversation with first message: {:?}", e);
                 ApiError::InternalServerError
             })
     }
@@ -1579,101 +1612,6 @@ async fn get_response(
         } else {
             Some(output)
         },
-    };
-
-    encrypt_response(&state, &session_id, &response).await
-}
-
-/// GET /v1/responses - List responses with pagination
-async fn list_responses(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<ListParams>,
-    Extension(user): Extension<User>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<ResponsesListResponse>>, ApiError> {
-    let limit = params.limit.unwrap_or(20).min(100);
-    let order = params.order.as_deref().unwrap_or("desc");
-
-    // Validate order parameter
-    if order != "asc" && order != "desc" {
-        return Err(ApiError::BadRequest);
-    }
-
-    // Convert UUID cursors to (updated_at, id) tuples for threads
-    let after_cursor = if let Some(after_uuid) = params.after {
-        state
-            .db
-            .get_thread_by_uuid_and_user(after_uuid, user.uuid)
-            .ok()
-            .map(|thread| (thread.updated_at, thread.id))
-    } else {
-        None
-    };
-
-    let before_cursor = if let Some(before_uuid) = params.before {
-        state
-            .db
-            .get_thread_by_uuid_and_user(before_uuid, user.uuid)
-            .ok()
-            .map(|thread| (thread.updated_at, thread.id))
-    } else {
-        None
-    };
-
-    // Get threads - note: list_threads currently always returns desc order by updated_at
-    let mut threads = state
-        .db
-        .list_threads(user.uuid, limit + 1, after_cursor, before_cursor)
-        .map_err(|e| {
-            error!("Failed to list threads: {:?}", e);
-            ApiError::InternalServerError
-        })?;
-
-    let has_more = threads.len() > limit as usize;
-    if has_more {
-        threads.truncate(limit as usize);
-    }
-
-    // Get user's encryption key
-    let user_key = state
-        .get_user_key(user.uuid, None, None)
-        .await
-        .map_err(|e| {
-            error!("Failed to get user encryption key: {:?}", e);
-            ApiError::InternalServerError
-        })?;
-
-    // If ascending order requested, reverse the threads
-    if order == "asc" {
-        threads.reverse();
-    }
-
-    // Convert to response format
-    let mut data = Vec::new();
-    for thread in &threads {
-        // Decrypt title if available
-        let title = if let Some(title_enc) = &thread.title_enc {
-            let decrypted = decrypt_with_key(&user_key, title_enc).unwrap_or_else(|_| vec![]);
-            Some(String::from_utf8_lossy(&decrypted).to_string())
-        } else {
-            None
-        };
-
-        data.push(ResponsesListItem {
-            id: thread.uuid,
-            object: "thread",
-            created_at: thread.created_at.timestamp(),
-            updated_at: thread.updated_at.timestamp(),
-            title,
-        });
-    }
-
-    let response = ResponsesListResponse {
-        object: "list",
-        data,
-        has_more,
-        first_id: threads.first().map(|t| t.uuid),
-        last_id: threads.last().map(|t| t.uuid),
     };
 
     encrypt_response(&state, &session_id, &response).await

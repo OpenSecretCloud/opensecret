@@ -29,9 +29,9 @@ use crate::models::project_settings::{
     EmailSettings, NewProjectSetting, ProjectSetting, ProjectSettingError, SettingCategory,
 };
 use crate::models::responses::{
-    AssistantMessage, ChatThread, NewAssistantMessage, NewChatThread, NewToolCall, NewToolOutput,
-    NewUserMessage, RawThreadMessage, ResponseStatus, ResponsesError, ToolCall, ToolOutput,
-    UserMessage,
+    AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewToolCall,
+    NewToolOutput, NewUserMessage, RawThreadMessage, ResponseStatus, ResponsesError, ToolCall,
+    ToolOutput, UserMessage,
 };
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
 use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
@@ -456,34 +456,48 @@ pub trait DBConnection {
 
     // ---------- Responses API helpers ----------
 
-    // Threads
-    fn create_thread(&self, new_thread: NewChatThread) -> Result<ChatThread, DBError>;
-    fn create_thread_with_first_message(
+    // Conversations
+    fn create_conversation(
         &self,
-        thread_uuid: Uuid,
+        new_conversation: NewConversation,
+    ) -> Result<Conversation, DBError>;
+    fn create_conversation_with_first_message(
+        &self,
+        conversation_uuid: Uuid,
         user_id: Uuid,
         system_prompt_id: Option<i64>,
         title_enc: Option<Vec<u8>>,
+        metadata: Option<serde_json::Value>,
         first_message: NewUserMessage,
-    ) -> Result<(ChatThread, UserMessage), DBError>;
-    fn get_thread_by_id_and_user(
+    ) -> Result<(Conversation, UserMessage), DBError>;
+    fn get_conversation_by_id_and_user(
         &self,
-        thread_id: i64,
+        conversation_id: i64,
         user_id: Uuid,
-    ) -> Result<ChatThread, DBError>;
-    fn get_thread_by_uuid_and_user(
+    ) -> Result<Conversation, DBError>;
+    fn get_conversation_by_uuid_and_user(
         &self,
-        thread_uuid: Uuid,
+        conversation_uuid: Uuid,
         user_id: Uuid,
-    ) -> Result<ChatThread, DBError>;
-    fn update_thread_title(&self, thread_id: i64, title_enc: Vec<u8>) -> Result<(), DBError>;
-    fn list_threads(
+    ) -> Result<Conversation, DBError>;
+    fn update_conversation_title(
+        &self,
+        conversation_id: i64,
+        title_enc: Vec<u8>,
+    ) -> Result<(), DBError>;
+    fn update_conversation_metadata(
+        &self,
+        conversation_id: i64,
+        user_id: Uuid,
+        metadata: serde_json::Value,
+    ) -> Result<(), DBError>;
+    fn list_conversations(
         &self,
         user_id: Uuid,
         limit: i64,
         after: Option<(DateTime<Utc>, i64)>,
         before: Option<(DateTime<Utc>, i64)>,
-    ) -> Result<Vec<ChatThread>, DBError>;
+    ) -> Result<Vec<Conversation>, DBError>;
 
     // User messages
     fn create_user_message(&self, new_msg: NewUserMessage) -> Result<UserMessage, DBError>;
@@ -522,8 +536,10 @@ pub trait DBConnection {
     fn create_tool_output(&self, new_output: NewToolOutput) -> Result<ToolOutput, DBError>;
 
     // Context reconstruction
-    fn get_thread_context_messages(&self, thread_id: i64)
-        -> Result<Vec<RawThreadMessage>, DBError>;
+    fn get_conversation_context_messages(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Vec<RawThreadMessage>, DBError>;
 
     // Phase 6 additions
     fn get_assistant_messages_for_user_message(
@@ -1854,70 +1870,112 @@ impl DBConnection for PostgresConnection {
 
     // ---------- Responses API implementations ----------
 
-    // Threads
-    fn create_thread(&self, new_thread: NewChatThread) -> Result<ChatThread, DBError> {
-        debug!("Creating new chat thread");
+    // Conversations
+    fn create_conversation(
+        &self,
+        new_conversation: NewConversation,
+    ) -> Result<Conversation, DBError> {
+        debug!("Creating new conversation");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        new_thread.insert(conn).map_err(DBError::from)
+        new_conversation.insert(conn).map_err(DBError::from)
     }
 
-    fn create_thread_with_first_message(
+    fn create_conversation_with_first_message(
         &self,
-        thread_uuid: Uuid,
+        conversation_uuid: Uuid,
         user_id: Uuid,
         system_prompt_id: Option<i64>,
         title_enc: Option<Vec<u8>>,
+        metadata: Option<serde_json::Value>,
         first_message: NewUserMessage,
-    ) -> Result<(ChatThread, UserMessage), DBError> {
-        debug!("Creating new chat thread with first message");
+    ) -> Result<(Conversation, UserMessage), DBError> {
+        debug!("Creating new conversation with first message");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        NewChatThread::create_with_first_message(
+        NewConversation::create_with_first_message(
             conn,
-            thread_uuid,
+            conversation_uuid,
             user_id,
             system_prompt_id,
             title_enc,
+            metadata,
             first_message,
         )
         .map_err(DBError::from)
     }
 
-    fn get_thread_by_id_and_user(
+    fn get_conversation_by_id_and_user(
         &self,
-        thread_id: i64,
+        conversation_id: i64,
         user_id: Uuid,
-    ) -> Result<ChatThread, DBError> {
-        debug!("Getting thread by ID and user");
+    ) -> Result<Conversation, DBError> {
+        debug!("Getting conversation by ID and user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        ChatThread::get_by_id_and_user(conn, thread_id, user_id).map_err(DBError::from)
+        Conversation::get_by_id_and_user(conn, conversation_id, user_id).map_err(DBError::from)
     }
 
-    fn get_thread_by_uuid_and_user(
+    fn get_conversation_by_uuid_and_user(
         &self,
-        thread_uuid: Uuid,
+        conversation_uuid: Uuid,
         user_id: Uuid,
-    ) -> Result<ChatThread, DBError> {
-        debug!("Getting thread by UUID and user");
+    ) -> Result<Conversation, DBError> {
+        debug!("Getting conversation by UUID and user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        ChatThread::get_by_uuid_and_user(conn, thread_uuid, user_id).map_err(DBError::from)
+        Conversation::get_by_uuid_and_user(conn, conversation_uuid, user_id).map_err(DBError::from)
     }
 
-    fn update_thread_title(&self, thread_id: i64, title_enc: Vec<u8>) -> Result<(), DBError> {
-        debug!("Updating thread title");
+    fn update_conversation_title(
+        &self,
+        conversation_id: i64,
+        title_enc: Vec<u8>,
+    ) -> Result<(), DBError> {
+        debug!("Updating conversation title");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        ChatThread::update_title(conn, thread_id, title_enc).map_err(DBError::from)
+        Conversation::update_title(conn, conversation_id, title_enc).map_err(DBError::from)
     }
 
-    fn list_threads(
+    fn update_conversation_metadata(
+        &self,
+        conversation_id: i64,
+        user_id: Uuid,
+        metadata: serde_json::Value,
+    ) -> Result<(), DBError> {
+        debug!("Updating conversation metadata");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::conversations;
+        use diesel::prelude::*;
+
+        // Verify the conversation belongs to the user and update metadata
+        let updated = diesel::update(
+            conversations::table
+                .filter(conversations::id.eq(conversation_id))
+                .filter(conversations::user_id.eq(user_id)),
+        )
+        .set((
+            conversations::metadata.eq(metadata),
+            conversations::updated_at.eq(diesel::dsl::now),
+        ))
+        .execute(conn)?;
+
+        if updated == 0 {
+            return Err(DBError::ResponsesError(
+                ResponsesError::ConversationNotFound,
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn list_conversations(
         &self,
         user_id: Uuid,
         limit: i64,
         after: Option<(DateTime<Utc>, i64)>,
         before: Option<(DateTime<Utc>, i64)>,
-    ) -> Result<Vec<ChatThread>, DBError> {
-        debug!("Listing threads for user");
+    ) -> Result<Vec<Conversation>, DBError> {
+        debug!("Listing conversations for user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        ChatThread::list_for_user(conn, user_id, limit, after, before).map_err(DBError::from)
+        Conversation::list_for_user(conn, user_id, limit, after, before).map_err(DBError::from)
     }
 
     // User messages
@@ -2014,13 +2072,13 @@ impl DBConnection for PostgresConnection {
     }
 
     // Context reconstruction
-    fn get_thread_context_messages(
+    fn get_conversation_context_messages(
         &self,
-        thread_id: i64,
+        conversation_id: i64,
     ) -> Result<Vec<RawThreadMessage>, DBError> {
-        debug!("Getting thread context messages");
+        debug!("Getting conversation context messages");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        RawThreadMessage::get_thread_context(conn, thread_id).map_err(DBError::from)
+        RawThreadMessage::get_conversation_context(conn, conversation_id).map_err(DBError::from)
     }
 
     // Phase 6 additions

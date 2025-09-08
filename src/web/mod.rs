@@ -1,4 +1,5 @@
 pub mod attestation_routes;
+mod conversations;
 pub mod documents;
 pub mod encryption_middleware;
 mod health_routes;
@@ -10,6 +11,7 @@ pub mod platform;
 pub mod protected_routes;
 mod responses;
 
+pub use conversations::router as conversations_routes;
 pub use documents::router as document_routes;
 pub use health_routes::router_with_state as health_routes_with_state;
 pub use login_routes::router as login_routes;

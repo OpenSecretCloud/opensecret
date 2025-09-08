@@ -25,7 +25,7 @@ diesel::table! {
     assistant_messages (id) {
         id -> Int8,
         uuid -> Uuid,
-        thread_id -> Int8,
+        conversation_id -> Int8,
         user_message_id -> Int8,
         content_enc -> Bytea,
         completion_tokens -> Nullable<Int4>,
@@ -36,12 +36,13 @@ diesel::table! {
 }
 
 diesel::table! {
-    chat_threads (id) {
+    conversations (id) {
         id -> Int8,
         uuid -> Uuid,
         user_id -> Uuid,
         system_prompt_id -> Nullable<Int8>,
         title_enc -> Nullable<Bytea>,
+        metadata -> Nullable<Jsonb>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
@@ -224,7 +225,7 @@ diesel::table! {
     tool_calls (id) {
         id -> Int8,
         uuid -> Uuid,
-        thread_id -> Int8,
+        conversation_id -> Int8,
         user_message_id -> Int8,
         tool_call_id -> Uuid,
         name -> Text,
@@ -239,7 +240,7 @@ diesel::table! {
     tool_outputs (id) {
         id -> Int8,
         uuid -> Uuid,
-        thread_id -> Int8,
+        conversation_id -> Int8,
         tool_call_fk -> Int8,
         output_enc -> Bytea,
         output_tokens -> Nullable<Int4>,
@@ -280,7 +281,7 @@ diesel::table! {
     user_messages (id) {
         id -> Int8,
         uuid -> Uuid,
-        thread_id -> Int8,
+        conversation_id -> Int8,
         user_id -> Uuid,
         content_enc -> Bytea,
         prompt_tokens -> Nullable<Int4>,
@@ -347,26 +348,26 @@ diesel::table! {
     }
 }
 
-diesel::joinable!(assistant_messages -> chat_threads (thread_id));
+diesel::joinable!(assistant_messages -> conversations (conversation_id));
 diesel::joinable!(assistant_messages -> user_messages (user_message_id));
-diesel::joinable!(chat_threads -> user_system_prompts (system_prompt_id));
+diesel::joinable!(conversations -> user_system_prompts (system_prompt_id));
 diesel::joinable!(invite_codes -> orgs (org_id));
 diesel::joinable!(org_memberships -> orgs (org_id));
 diesel::joinable!(org_project_secrets -> org_projects (project_id));
 diesel::joinable!(org_projects -> orgs (org_id));
 diesel::joinable!(project_settings -> org_projects (project_id));
-diesel::joinable!(tool_calls -> chat_threads (thread_id));
+diesel::joinable!(tool_calls -> conversations (conversation_id));
 diesel::joinable!(tool_calls -> user_messages (user_message_id));
-diesel::joinable!(tool_outputs -> chat_threads (thread_id));
+diesel::joinable!(tool_outputs -> conversations (conversation_id));
 diesel::joinable!(tool_outputs -> tool_calls (tool_call_fk));
-diesel::joinable!(user_messages -> chat_threads (thread_id));
+diesel::joinable!(user_messages -> conversations (conversation_id));
 diesel::joinable!(user_oauth_connections -> oauth_providers (provider_id));
 diesel::joinable!(users -> org_projects (project_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     account_deletion_requests,
     assistant_messages,
-    chat_threads,
+    conversations,
     email_verifications,
     enclave_secrets,
     invite_codes,

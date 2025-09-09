@@ -498,6 +498,11 @@ pub trait DBConnection {
         after: Option<(DateTime<Utc>, i64)>,
         before: Option<(DateTime<Utc>, i64)>,
     ) -> Result<Vec<Conversation>, DBError>;
+    fn delete_conversation(
+        &self,
+        conversation_id: i64,
+        user_id: Uuid,
+    ) -> Result<(), DBError>;
 
     // User messages
     fn create_user_message(&self, new_msg: NewUserMessage) -> Result<UserMessage, DBError>;
@@ -1976,6 +1981,34 @@ impl DBConnection for PostgresConnection {
         debug!("Listing conversations for user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Conversation::list_for_user(conn, user_id, limit, after, before).map_err(DBError::from)
+    }
+
+    fn delete_conversation(
+        &self,
+        conversation_id: i64,
+        user_id: Uuid,
+    ) -> Result<(), DBError> {
+        debug!("Deleting conversation");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        
+        use crate::models::schema::conversations;
+        use diesel::prelude::*;
+
+        // Delete the conversation - cascades will handle related records
+        let deleted = diesel::delete(
+            conversations::table
+                .filter(conversations::id.eq(conversation_id))
+                .filter(conversations::user_id.eq(user_id)),
+        )
+        .execute(conn)?;
+
+        if deleted == 0 {
+            return Err(DBError::ResponsesError(
+                ResponsesError::ConversationNotFound,
+            ));
+        }
+
+        Ok(())
     }
 
     // User messages

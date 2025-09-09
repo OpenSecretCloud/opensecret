@@ -18,7 +18,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 use uuid::Uuid;
 
 // ============================================================================
@@ -61,15 +61,13 @@ impl MessageContent {
     pub fn to_text(&self) -> String {
         match self {
             MessageContent::Text(text) => text.clone(),
-            MessageContent::Parts(parts) => {
-                parts
-                    .iter()
-                    .filter_map(|part| match part {
-                        MessageContentPart::Text { text } => Some(text.clone()),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            }
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    MessageContentPart::Text { text } => Some(text.clone()),
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
         }
     }
 }
@@ -274,7 +272,8 @@ async fn create_conversation(
                     if role == "user" {
                         // Create user message
                         let content_text = content.to_text();
-                        let content_enc = encrypt_with_key(&user_key, content_text.as_bytes()).await;
+                        let content_enc =
+                            encrypt_with_key(&user_key, content_text.as_bytes()).await;
                         let new_msg = NewUserMessage {
                             uuid: Uuid::new_v4(),
                             conversation_id: conversation.id,
@@ -303,6 +302,7 @@ async fn create_conversation(
                     } else if role == "assistant" {
                         // Note: We don't support creating assistant messages in initial items
                         // Just log and skip for now
+                        // TODO fix this logic
                         debug!("Skipping assistant message in initial items (not yet supported)");
                     }
                 }
@@ -424,9 +424,14 @@ async fn delete_conversation(
             }
         })?;
 
-    // TODO: Add delete_conversation method to DBConnection trait
-    // For now, we'll return success but warn that it's not implemented
-    warn!("Conversation deletion not yet implemented in database layer");
+    // Delete the conversation (cascades will delete all associated responses)
+    state
+        .db
+        .delete_conversation(conversation.id, user.uuid)
+        .map_err(|e| {
+            error!("Failed to delete conversation: {:?}", e);
+            ApiError::InternalServerError
+        })?;
 
     let response = DeletedConversationResponse {
         id: conversation.uuid,
@@ -470,6 +475,8 @@ async fn create_conversation_items(
 
     let mut created_items = Vec::new();
 
+    // TODO this is wrong. we should be appending the items to the conversation and then persisting
+
     // Process each item
     for item in &body.items {
         match item {
@@ -488,7 +495,7 @@ async fn create_conversation_items(
                         content_enc,
                         prompt_tokens: None,
                         status: ResponseStatus::Completed,
-                        model: "gpt-4".to_string(), // Default model
+                        model: "gpt-4".to_string(), // TODO this is wrong
                         previous_response_id: None,
                         temperature: None,
                         top_p: None,

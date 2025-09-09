@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS user_messages (
     -- Responses API fields
     status                response_status NOT NULL DEFAULT 'in_progress',
     model                 TEXT            NOT NULL,
-    previous_response_id  UUID            REFERENCES user_messages(uuid),
+    previous_response_id  UUID            REFERENCES user_messages(uuid) ON DELETE CASCADE,
     temperature           REAL,
     top_p                 REAL,
     max_output_tokens     INTEGER,

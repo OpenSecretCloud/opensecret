@@ -1401,9 +1401,6 @@ async fn persist_initial_message(
             parallel_tool_calls: body.parallel_tool_calls,
             store: body.store,
             metadata: body.metadata.clone(),
-            idempotency_key: None,
-            request_hash: None,
-            idempotency_expires_at: None,
         };
         let response = state.db.create_response(new_response).map_err(|e| {
             error!("Error creating response: {:?}", e);
@@ -1453,9 +1450,6 @@ async fn persist_initial_message(
             parallel_tool_calls: body.parallel_tool_calls,
             store: body.store,
             metadata: body.metadata.clone(),
-            idempotency_key: None,
-            request_hash: None,
-            idempotency_expires_at: None,
         };
 
         // Use transactional method to create conversation, response, and message atomically

@@ -6,18 +6,17 @@
 2. [Database Schema](#database-schema)
 3. [API Endpoints](#api-endpoints)
 4. [Message Encryption Strategy](#message-encryption-strategy)
-5. [Idempotency](#idempotency)
-6. [Request Processing Architecture](#request-processing-architecture)
-7. [Usage Tracking & Analytics](#usage-tracking--analytics)
-8. [Token Management Strategy](#token-management-strategy)
-9. [Tool Calling Framework](#tool-calling-framework)
-10. [Authentication & Authorization](#authentication--authorization)
-11. [Error Handling](#error-handling)
-12. [Database Migrations](#database-migrations)
-13. [Security Considerations](#security-considerations)
-14. [Performance Optimizations](#performance-optimizations)
-15. [Testing Strategy](#testing-strategy)
-16. [Implementation Checklist](#implementation-checklist)
+5. [Request Processing Architecture](#request-processing-architecture)
+6. [Usage Tracking & Analytics](#usage-tracking--analytics)
+7. [Token Management Strategy](#token-management-strategy)
+8. [Tool Calling Framework](#tool-calling-framework)
+9. [Authentication & Authorization](#authentication--authorization)
+10. [Error Handling](#error-handling)
+11. [Database Migrations](#database-migrations)
+12. [Security Considerations](#security-considerations)
+13. [Performance Optimizations](#performance-optimizations)
+14. [Testing Strategy](#testing-strategy)
+15. [Implementation Checklist](#implementation-checklist)
 
 ## Overview
 
@@ -84,8 +83,7 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
   - [x] create_conversation() (renamed from create_thread)
   - [x] get_user_message_by_uuid()
   - [x] get_conversation_context_messages() (renamed from get_thread_context_messages)
-  - [x] get_response_by_idempotency_key() - query includes NOW() check for expiry
-  - [x] Additional methods added: update_conversation_title(), create_response(), update_response_status(), get_response(), list_responses(), create_user_message(), create_assistant_message(), create_tool_call(), create_tool_output(), cleanup_expired_idempotency_keys()
+  - [x] Additional methods added: update_conversation_title(), create_response(), update_response_status(), get_response(), list_responses(), create_user_message(), create_assistant_message(), create_tool_call(), create_tool_output()
 
 **Phase 2: Conversations API Implementation**
 - [ ] Implement POST /v1/conversations (create conversation)
@@ -110,7 +108,6 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
   - [x] Store user message linked to response
   - [x] Return immediate response with conversation_id
 - [x] Add route to web server
-- [x] Idempotency support with header checking
 - [ ] Test basic request/response flow
 
 **Phase 4: Context Building & Chat Integration**
@@ -201,17 +198,7 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
   - [ ] Stream continued response to client
 - [ ] Test tool calling flow
 
-**Phase 9: Idempotency Support**
-- [x] Add idempotency handling to POST /v1/responses
-  - [x] Check Idempotency-Key header
-  - [x] Hash request body for comparison
-  - [x] Handle in-progress requests (409 Conflict)
-  - [x] Return cached responses
-  - [x] Handle different parameters (422 error)
-- [x] Add cleanup job for expired keys
-- [x] Test idempotency behavior
-
-**Phase 10: Error Handling & Edge Cases**
+**Phase 9: Error Handling & Edge Cases**
 - [ ] Implement comprehensive error types
 - [ ] Add provider error mapping
 - [ ] Handle streaming errors gracefully
@@ -310,17 +297,7 @@ CREATE TABLE responses (
     
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TIMESTAMPTZ,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    
-    -- Idempotency fields
-    idempotency_key TEXT,
-    request_hash TEXT,
-    idempotency_expires_at TIMESTAMPTZ,
-    
-    CONSTRAINT idempotency_fields_check CHECK (
-        (idempotency_key IS NULL AND request_hash IS NULL AND idempotency_expires_at IS NULL) OR
-        (idempotency_key IS NOT NULL AND request_hash IS NOT NULL AND idempotency_expires_at IS NOT NULL)
-    )
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
@@ -489,9 +466,6 @@ CREATE INDEX idx_tool_outputs_conversation_created_id
 
 -- Response-specific indexes for job tracking
 CREATE INDEX idx_responses_status ON responses(status);
-CREATE INDEX idx_responses_idempotency 
-    ON responses(user_id, idempotency_key) 
-    WHERE idempotency_key IS NOT NULL;
 ```
 
 ### Query Patterns
@@ -577,7 +551,6 @@ Creates a new response request. This is the single entry point for the Responses
 
 **Headers:**
 - `Authorization: Bearer <token>` (required)
-- `Idempotency-Key: <unique-key>` (optional, recommended for retries)
 
 **Request Body:**
 ```json
@@ -981,122 +954,6 @@ let content_str = String::from_utf8(content)?;
 - Keys derived on-demand from user seed
 - Follows existing `encryption_middleware` patterns
 
-## Idempotency
-
-The Responses API supports idempotent requests to ensure safe retries.
-
-### Implementation
-
-Idempotency is handled at the application level with the help of columns in the `responses` table:
-
-**Application-Level Approach**:
-- Check for existing idempotency key before inserting
-- Include expiry time in the query to ignore expired keys
-- No complex database constraints needed
-- Simple and predictable behavior
-
-```sql
--- Idempotency columns are in the responses table:
--- idempotency_key TEXT
--- request_hash TEXT  
--- idempotency_expires_at TIMESTAMP WITH TIME ZONE
-
--- Index for efficient idempotency lookups
-CREATE INDEX idx_responses_idempotency 
-    ON responses(user_id, idempotency_key) 
-    WHERE idempotency_key IS NOT NULL;
-```
-
-**Query Pattern**:
-```sql
--- Check for existing non-expired idempotency key
-SELECT * FROM responses 
-WHERE user_id = $1 
-  AND idempotency_key = $2 
-  AND idempotency_expires_at > NOW()  -- Evaluated at query time
-LIMIT 1;
-```
-
-### Request Handling
-
-```rust
-// Idempotency key handling - simple application-level check
-if let Some(idempotency_key) = headers.get("idempotency-key") {
-    // Canonicalize and hash the request body
-    let request_json = serde_json::to_string(&request)?;
-    let request_hash = sha256::digest(request_json);
-    
-    // Check if we've seen this key before for this user within the expiry window
-    if let Some(existing) = db.get_response_by_idempotency_key(
-        &idempotency_key, 
-        user.id
-    ).await? {
-        // Verify the request hasn't changed
-        if existing.request_hash != Some(request_hash.clone()) {
-            return Err(ApiError::IdempotencyKeyReused {
-                message: "Different request body with same idempotency key".into(),
-                status: StatusCode::UNPROCESSABLE_ENTITY, // 422
-            });
-        }
-        
-        // Check if request is still in progress
-        match existing.status {
-            ResponseStatus::InProgress => {
-                // Request is still being processed
-                return Err(ApiError::RequestInProgress {
-                    message: "Request with this idempotency key is already in progress".into(),
-                    status: StatusCode::CONFLICT, // 409
-                    retry_after: Some(5), // seconds
-                });
-            }
-            _ => {
-                // Return cached response (completed, failed, or cancelled)
-                return Ok(Json(build_response_from_response(existing).await?).into_response());
-            }
-        }
-    }
-    
-    // Include idempotency info when creating the response
-    let response = create_response(
-        request,
-        Some(idempotency_key),
-        Some(request_hash),
-        Some(Utc::now() + Duration::hours(24))
-    ).await?;
-}
-```
-
-### Key Properties
-
-- **One execution per key**: Each idempotency key triggers exactly one LLM call
-- **Conflict on concurrent**: Returns 409 if request is still processing
-- **Parameter validation**: Different parameters with same key returns 422 error
-- **24-hour expiration**: Keys automatically expire and can be reused after 24 hours
-- **User-scoped**: Keys are unique per user, not globally
-
-### Response Behavior by Status
-
-| Status | Behavior |
-|--------|----------|
-| `in_progress` | Return 409 Conflict - request in progress |
-| `completed` | Return cached successful response |
-| `failed`, `cancelled` | Return cached error response |
-| Key not found | Process new request |
-| Different parameters | Return 422 Unprocessable Entity |
-
-### Cleanup
-
-```sql
--- Optional periodic cleanup to remove old idempotency data and save storage
-UPDATE responses 
-SET idempotency_key = NULL, request_hash = NULL, idempotency_expires_at = NULL
-WHERE idempotency_expires_at < CURRENT_TIMESTAMP
-  AND idempotency_key IS NOT NULL;
-```
-
-**Note**: Since we handle expiry checks in the application code when querying, this cleanup
-is optional and only serves to reduce storage usage.
-
 ## Request Processing Architecture
 
 The Responses API processes requests synchronously with dual streaming for real-time responses and persistent storage.
@@ -1280,8 +1137,7 @@ ON tool_outputs(conversation_id, created_at);
 
 1. **Initial Request**:
    - Validate JWT and decrypt request
-   - Check for idempotency key if provided
-   - Generate message ID (or reuse from idempotency check)
+   - Generate message ID
    - Determine conversation handling:
      - If `conversation` provided: validate ownership and get internal id
      - If `conversation` is null: auto-create new conversation
@@ -2219,11 +2075,6 @@ pub enum ChatError {
     RequestInProgress {
         message: String,
         retry_after: Option<u64>,
-    },
-    
-    #[error("Idempotency key reused with different parameters")]
-    IdempotencyKeyReused {
-        message: String,
     },
     
     #[error("Invalid request: {0}")]

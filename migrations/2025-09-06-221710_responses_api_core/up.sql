@@ -66,16 +66,7 @@ CREATE TABLE responses (
     
     created_at            TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at          TIMESTAMPTZ,
-    updated_at            TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    
-    idempotency_key       TEXT,
-    request_hash          TEXT,
-    idempotency_expires_at TIMESTAMPTZ,
-    
-    CONSTRAINT idempotency_fields_check CHECK (
-        (idempotency_key IS NULL AND request_hash IS NULL AND idempotency_expires_at IS NULL) OR
-        (idempotency_key IS NOT NULL AND request_hash IS NOT NULL AND idempotency_expires_at IS NOT NULL)
-    )
+    updated_at            TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Indexes for responses
@@ -83,9 +74,6 @@ CREATE INDEX idx_responses_uuid             ON responses(uuid);
 CREATE INDEX idx_responses_user_id          ON responses(user_id);
 CREATE INDEX idx_responses_conversation_id  ON responses(conversation_id);
 CREATE INDEX idx_responses_status           ON responses(status);
-CREATE INDEX idx_responses_idempotency
-    ON responses(user_id, idempotency_key)
-    WHERE idempotency_key IS NOT NULL;
 
 -- 5. user_messages table - User inputs (can be created via Conversations or Responses API)
 -- response_id: NULL if created via Conversations API, populated if created via Responses API

@@ -71,9 +71,6 @@ pub struct Response {
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
-    pub idempotency_key: Option<String>,
-    pub request_hash: Option<String>,
-    pub idempotency_expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Insertable, Debug)]
@@ -91,9 +88,6 @@ pub struct NewResponse {
     pub parallel_tool_calls: bool,
     pub store: bool,
     pub metadata: Option<serde_json::Value>,
-    pub idempotency_key: Option<String>,
-    pub request_hash: Option<String>,
-    pub idempotency_expires_at: Option<DateTime<Utc>>,
 }
 
 impl Response {
@@ -110,20 +104,6 @@ impl Response {
                 diesel::result::Error::NotFound => ResponsesError::ResponseNotFound,
                 _ => ResponsesError::DatabaseError(e),
             })
-    }
-
-    pub fn get_by_idempotency_key(
-        conn: &mut PgConnection,
-        user_id: Uuid,
-        key: &str,
-    ) -> Result<Option<Response>, ResponsesError> {
-        responses::table
-            .filter(responses::user_id.eq(user_id))
-            .filter(responses::idempotency_key.eq(key))
-            .filter(responses::idempotency_expires_at.gt(diesel::dsl::now))
-            .first::<Response>(conn)
-            .optional()
-            .map_err(ResponsesError::DatabaseError)
     }
 
     pub fn update_status(
@@ -183,24 +163,6 @@ impl Response {
                 Ok(())
             }
         })?
-    }
-
-    pub fn cleanup_expired_idempotency_keys(
-        conn: &mut PgConnection,
-    ) -> Result<u64, ResponsesError> {
-        diesel::update(
-            responses::table
-                .filter(responses::idempotency_expires_at.lt(diesel::dsl::now))
-                .filter(responses::idempotency_key.is_not_null()),
-        )
-        .set((
-            responses::idempotency_key.eq(None::<String>),
-            responses::request_hash.eq(None::<String>),
-            responses::idempotency_expires_at.eq(None::<DateTime<Utc>>),
-        ))
-        .execute(conn)
-        .map(|count| count as u64)
-        .map_err(ResponsesError::DatabaseError)
     }
 }
 
@@ -474,8 +436,6 @@ impl UserMessage {
             })
     }
 
-    // Note: idempotency is now handled at the Response level
-
     // Note: status is now tracked on Response, not UserMessage
 
     pub fn list_for_user(
@@ -515,8 +475,6 @@ impl UserMessage {
             .load::<UserMessage>(conn)
             .map_err(ResponsesError::DatabaseError)
     }
-
-    // Note: cleanup_expired_idempotency_keys is now on Response
 
     pub fn delete_by_id_and_user(
         conn: &mut PgConnection,

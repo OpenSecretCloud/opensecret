@@ -232,9 +232,6 @@ diesel::table! {
         created_at -> Timestamptz,
         completed_at -> Nullable<Timestamptz>,
         updated_at -> Timestamptz,
-        idempotency_key -> Nullable<Text>,
-        request_hash -> Nullable<Text>,
-        idempotency_expires_at -> Nullable<Timestamptz>,
     }
 }
 

@@ -502,11 +502,6 @@ pub trait DBConnection {
         uuid: Uuid,
         user_id: Uuid,
     ) -> Result<Response, DBError>;
-    fn get_response_by_idempotency_key(
-        &self,
-        user_id: Uuid,
-        key: &str,
-    ) -> Result<Option<Response>, DBError>;
     fn update_response_status(
         &self,
         id: i64,
@@ -515,7 +510,6 @@ pub trait DBConnection {
     ) -> Result<(), DBError>;
     fn cancel_response(&self, uuid: Uuid, user_id: Uuid) -> Result<Response, DBError>;
     fn delete_response(&self, uuid: Uuid, user_id: Uuid) -> Result<(), DBError>;
-    fn cleanup_expired_response_idempotency_keys(&self) -> Result<u64, DBError>;
     fn create_conversation_with_response_and_message(
         &self,
         conversation_uuid: Uuid,
@@ -2013,16 +2007,6 @@ impl DBConnection for PostgresConnection {
         Response::get_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
     }
     
-    fn get_response_by_idempotency_key(
-        &self,
-        user_id: Uuid,
-        key: &str,
-    ) -> Result<Option<Response>, DBError> {
-        debug!("Getting response by idempotency key");
-        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        Response::get_by_idempotency_key(conn, user_id, key).map_err(DBError::from)
-    }
-    
     fn update_response_status(
         &self,
         id: i64,
@@ -2044,12 +2028,6 @@ impl DBConnection for PostgresConnection {
         debug!("Deleting response");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Response::delete_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
-    }
-    
-    fn cleanup_expired_response_idempotency_keys(&self) -> Result<u64, DBError> {
-        debug!("Cleaning up expired response idempotency keys");
-        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        Response::cleanup_expired_idempotency_keys(conn).map_err(DBError::from)
     }
     
     fn create_conversation_with_response_and_message(

@@ -35,7 +35,7 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 ### Objectives
 
 1. **OpenAI Responses API Compatibility**: Implement `/v1/responses` endpoint that matches OpenAI's latest specification
-2. **Conversations API Integration**: Support the new `conversation` parameter to automatically manage conversation state
+2. **Conversations-First Design**: Every response requires a conversation (auto-created if not provided) - no support for `previous_response_id` chains
 3. **Dual Streaming Architecture**: Stream responses to client while simultaneously storing to database
 4. **SSE Streaming**: Server-sent events with proper event types (response.created, response.output_text.delta, tool.call, response.completed, etc.)
 5. **Status Lifecycle**: Track response status through queued → in_progress → completed
@@ -46,43 +46,46 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 ### Key Features
 
 - **Conversations API**: Full CRUD operations on conversation objects and items
-- **Responses API**: Single POST /v1/responses endpoint with conversation integration
-- **Automatic Context Management**: When `conversation` parameter is provided, context is automatically pulled from the conversation
+- **Responses API**: Single POST /v1/responses endpoint with required conversation integration
+- **Automatic Context Management**: Context is automatically pulled from the conversation
+- **Clean Data Model**: Responses track jobs, messages store content - no conflation
 - **Simultaneous streaming**: Stream to client while storing to database
 - **SSE streaming**: OpenAI-compatible event format
 - **Status lifecycle**: Track response progress (queued → in_progress → completed)
 - **Server-side tools**: Integrated tool execution in response flow
 - **Chat API integration**: Leverages existing /v1/chat/completions for model calls
-- **Token management**: Model-specific context window support
+- **Token management**: Required token counts on all messages for efficient context management
 
 ### Implementation TODO List
 
 **Phase 1: Foundation (Database & Models)**
 - [x] Create and run database migrations
   - [x] Create response_status enum (queued, in_progress, completed, failed, cancelled)
+  - [x] Create responses table (pure job tracker - no content)
   - [x] Create user_system_prompts table
-  - [x] Create conversations table (renamed from chat_threads, with system_prompt_id, title_enc, model)
-  - [x] Create user_messages table with idempotency columns
-  - [x] Create tool_calls table
-  - [x] Create tool_outputs table
-  - [x] Create assistant_messages table
+  - [x] Create conversations table (renamed from chat_threads)
+  - [x] Create user_messages table (with response_id FK)
+  - [x] Create assistant_messages table (with response_id FK)
+  - [x] Create tool_calls table (with response_id FK)
+  - [x] Create tool_outputs table (with response_id FK)
   - [x] Add all necessary indexes
 - [x] Generate schema.rs with diesel run command (fix any migration errors that come up)
 - [x] Create Diesel model structs
   - [x] ResponseStatus enum
+  - [x] Response model (job tracker)
   - [x] UserSystemPrompt model
   - [x] Conversation model
-  - [x] UserMessage model (with idempotency fields)
-  - [x] ToolCall model
-  - [x] ToolOutput model
-  - [x] AssistantMessage model
+  - [x] UserMessage model (with response_id)
+  - [x] AssistantMessage model (with response_id)
+  - [x] ToolCall model (with response_id)
+  - [x] ToolOutput model (with response_id)
 - [x] Add query methods to DBConnection trait
   - [x] get_conversation_by_id_and_user() (renamed from get_thread_by_id_and_user)
   - [x] create_conversation() (renamed from create_thread)
   - [x] get_user_message_by_uuid()
   - [x] get_conversation_context_messages() (renamed from get_thread_context_messages)
-  - [x] get_user_message_by_idempotency_key() - query includes NOW() check for expiry
-  - [x] Additional methods added: update_conversation_title(), create_user_message(), update_user_message_status(), get_user_message(), list_user_messages(), create_assistant_message(), create_tool_call(), create_tool_output(), cleanup_expired_idempotency_keys()
+  - [x] get_response_by_idempotency_key() - query includes NOW() check for expiry
+  - [x] Additional methods added: update_conversation_title(), create_response(), update_response_status(), get_response(), list_responses(), create_user_message(), create_assistant_message(), create_tool_call(), create_tool_output(), cleanup_expired_idempotency_keys()
 
 **Phase 2: Conversations API Implementation**
 - [ ] Implement POST /v1/conversations (create conversation)
@@ -101,9 +104,10 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 - [x] Implement POST /v1/responses handler
   - [x] JWT validation (reuse existing middleware)
   - [x] Request validation
-  - [x] Handle conversation parameter (UUID string or {id: "uuid"} object, null for none)
-  - [x] Support backward-compatible previous_response_id
-  - [x] Store user message with status='in_progress'
+  - [x] Handle conversation parameter (UUID string or {id: "uuid"} object)
+  - [x] Auto-create conversation if not provided
+  - [x] Store response record with status='in_progress'
+  - [x] Store user message linked to response
   - [x] Return immediate response with conversation_id
 - [x] Add route to web server
 - [x] Idempotency support with header checking
@@ -198,14 +202,14 @@ This document outlines the implementation of an OpenAI Responses API-compatible 
 - [ ] Test tool calling flow
 
 **Phase 9: Idempotency Support**
-- [ ] Add idempotency handling to POST /v1/responses
-  - [ ] Check Idempotency-Key header
-  - [ ] Hash request body for comparison
+- [x] Add idempotency handling to POST /v1/responses
+  - [x] Check Idempotency-Key header
+  - [x] Hash request body for comparison
   - [x] Handle in-progress requests (409 Conflict)
   - [x] Return cached responses
   - [x] Handle different parameters (422 error)
-- [ ] Add cleanup job for expired keys
-- [ ] Test idempotency behavior
+- [x] Add cleanup job for expired keys
+- [x] Test idempotency behavior
 
 **Phase 10: Error Handling & Edge Cases**
 - [ ] Implement comprehensive error types
@@ -253,15 +257,72 @@ The Responses API builds on top of the existing infrastructure:
 
 ## Database Schema
 
-The database schema is designed to support the Responses API while maintaining clean separation between different message types. All tables work together to reconstruct conversation history when needed.
+The database schema is designed with a clean separation between job tracking (responses) and content storage (messages). This design enables efficient queries while maintaining conceptual clarity.
 
-### Core Schema Design
+### Core Schema Design Principles
 
-The schema splits messages into distinct tables by type, allowing us to:
-1. Track each message type with appropriate metadata
-2. Reconstruct conversations by ordering all records by timestamp
-3. Support the Responses API's status tracking on user messages
-4. Maintain clean separation of concerns
+1. **Separation of Concerns**: `responses` table tracks jobs/tasks, message tables store content
+2. **Dual Citizenship**: All messages belong to a conversation (required) and optionally to a response
+3. **Performance First**: BIGINT foreign keys for fast JOINs, UUID for external API
+4. **No Response Chains**: We don't support `previous_response_id` - conversations are the only way to maintain state
+5. **Required Conversations**: Every response must have a conversation (auto-created if not provided)
+
+### Key Architecture Decisions
+
+1. **UUID vs BIGINT Pattern**: 
+   - External API uses UUIDs (secure, unguessable)
+   - Internal foreign keys use BIGINTs (fast JOINs)
+   - UUID→BIGINT lookup serves as authorization checkpoint
+
+2. **Token Tracking**:
+   - All token fields are NOT NULL (no defaults)
+   - Each message stores its OWN token count
+   - Total context = SUM of all message tokens
+
+3. **Response vs Message Separation**:
+   - `responses` = Job metadata (status, model, parameters)
+   - `*_messages` = Actual content
+   - Clean separation prevents conflation
+
+### responses Table
+
+Pure job/task tracker for the Responses API - contains no content.
+
+```sql
+-- Table: responses
+-- Pure job/task tracker for the Responses API
+-- Note: We intentionally don't support previous_response_id - use conversations instead
+CREATE TABLE responses (
+    id BIGSERIAL PRIMARY KEY,
+    uuid UUID NOT NULL UNIQUE,
+    user_id UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
+    conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    
+    status response_status NOT NULL DEFAULT 'in_progress',
+    model TEXT NOT NULL,
+    temperature REAL,
+    top_p REAL,
+    max_output_tokens INTEGER,
+    tool_choice TEXT,
+    parallel_tool_calls BOOLEAN NOT NULL DEFAULT FALSE,
+    store BOOLEAN NOT NULL DEFAULT TRUE,
+    metadata JSONB,
+    
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    
+    -- Idempotency fields
+    idempotency_key TEXT,
+    request_hash TEXT,
+    idempotency_expires_at TIMESTAMPTZ,
+    
+    CONSTRAINT idempotency_fields_check CHECK (
+        (idempotency_key IS NULL AND request_hash IS NULL AND idempotency_expires_at IS NULL) OR
+        (idempotency_key IS NOT NULL AND request_hash IS NOT NULL AND idempotency_expires_at IS NOT NULL)
+    )
+);
+```
 
 ### user_system_prompts Table
 
@@ -270,19 +331,16 @@ Stores optional custom system prompts for users.
 ```sql
 -- Table: user_system_prompts
 -- Stores optional custom system prompts for users
--- name_enc: Encrypted system prompt name (binary ciphertext)
--- prompt_enc: Encrypted system prompt (binary ciphertext)
--- prompt_tokens: Token count for the system prompt
 CREATE TABLE user_system_prompts (
     id BIGSERIAL PRIMARY KEY,
     uuid UUID NOT NULL UNIQUE,
     user_id UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
     name_enc BYTEA NOT NULL,
     prompt_enc BYTEA NOT NULL,
-    prompt_tokens INTEGER,
-    is_default BOOLEAN NOT NULL DEFAULT false,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    prompt_tokens INTEGER NOT NULL,  -- Required: must count tokens
+    is_default BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_user_system_prompts_uuid ON user_system_prompts(uuid);
@@ -294,12 +352,12 @@ CREATE UNIQUE INDEX idx_user_system_prompts_one_default
 
 ### conversations Table
 
-Conversation containers (renamed from chat_threads) that implement OpenAI's Conversations API externally, with additional internal fields. These persist independently and group related messages.
+Conversation containers that implement OpenAI's Conversations API. Every response requires a conversation.
 
 ```sql
--- Table: conversations (renamed from chat_threads)
--- Implements OpenAI Conversations API with additional internal fields
--- The title_enc field is exposed via metadata.title in the API response
+-- Table: conversations
+-- Implements OpenAI Conversations API
+-- Every response MUST have a conversation (auto-created if not provided)
 CREATE TABLE conversations (
     id BIGSERIAL PRIMARY KEY,
     uuid UUID NOT NULL UNIQUE,
@@ -307,8 +365,8 @@ CREATE TABLE conversations (
     system_prompt_id BIGINT REFERENCES user_system_prompts(id) ON DELETE SET NULL,
     title_enc BYTEA,
     metadata JSONB,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE INDEX idx_conversations_uuid ON conversations(uuid);
@@ -318,169 +376,145 @@ CREATE INDEX idx_conversations_updated ON conversations(user_id, updated_at DESC
 
 ### user_messages Table
 
-Stores user inputs and tracks Responses API request lifecycle. These are exposed as "message" items with role="user" in the Conversations API.
-
-**Note on model storage**: The `model` field is stored in `user_messages` since the Responses API allows specifying the model per request. Assistant messages are always generated using the model specified in their parent user message.
+Stores user inputs. Can be created via Conversations API or Responses API.
 
 ```sql
 -- Table: user_messages
--- User inputs that become "message" items in the Conversations API
--- Includes response lifecycle tracking for the Responses API
--- Model is stored per request since Responses API allows changing models
--- content_enc: Encrypted user input (binary ciphertext)
--- prompt_tokens: Total tokens in the prompt sent to the model (includes system + all context + user message)
-CREATE TYPE response_status AS ENUM 
-  ('queued', 'in_progress', 'completed', 'failed', 'cancelled');
-
+-- User inputs that become "message" items with role="user" in the Conversations API
+-- response_id: NULL if created via Conversations API, populated if created via Responses API
+-- prompt_tokens: Token count for just this user message (not including context)
 CREATE TABLE user_messages (
     id BIGSERIAL PRIMARY KEY,
     uuid UUID NOT NULL UNIQUE,
     conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    response_id BIGINT REFERENCES responses(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
     content_enc BYTEA NOT NULL,
-    prompt_tokens INTEGER,
-    status response_status NOT NULL DEFAULT 'in_progress',
-    model TEXT NOT NULL,
-    previous_response_id UUID REFERENCES user_messages(uuid),
-    temperature REAL,
-    top_p REAL,
-    max_output_tokens INTEGER,
-    tool_choice TEXT,
-    parallel_tool_calls BOOLEAN NOT NULL DEFAULT false,
-    store BOOLEAN NOT NULL DEFAULT true,
-    metadata JSONB,
-    error TEXT,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    completed_at TIMESTAMP WITH TIME ZONE,
-    idempotency_key TEXT,
-    request_hash TEXT,
-    idempotency_expires_at TIMESTAMP WITH TIME ZONE
+    prompt_tokens INTEGER NOT NULL,  -- Just this message's tokens
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- Indexes
-CREATE INDEX idx_user_messages_uuid ON user_messages(uuid);
-CREATE INDEX idx_user_messages_conversation_id ON user_messages(conversation_id);
-CREATE INDEX idx_user_messages_user_id ON user_messages(user_id);
-CREATE INDEX idx_user_messages_status ON user_messages(status);
-CREATE INDEX idx_user_messages_previous_uuid ON user_messages(previous_response_id);
-CREATE INDEX idx_user_messages_conversation_created_id 
-    ON user_messages(conversation_id, created_at DESC, id);
-CREATE INDEX idx_user_messages_conversation_created 
-    ON user_messages(conversation_id, created_at);
-CREATE INDEX idx_user_messages_idempotency 
-    ON user_messages(user_id, idempotency_key) 
-    WHERE idempotency_key IS NOT NULL;
+```
+
+### assistant_messages Table
+
+Stores LLM responses. Can be created via Conversations API or Responses API.
+
+```sql
+-- Table: assistant_messages
+-- LLM responses, exposed as "message" items with role="assistant" in Conversations API
+-- response_id: NULL if created via Conversations API, populated if created via Responses API
+CREATE TABLE assistant_messages (
+    id BIGSERIAL PRIMARY KEY,
+    uuid UUID NOT NULL UNIQUE,
+    conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    response_id BIGINT REFERENCES responses(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
+    content_enc BYTEA NOT NULL,
+    completion_tokens INTEGER NOT NULL,  -- Tokens in this response
+    finish_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 ```
 
 ### tool_calls Table
 
-Tracks tool calls requested by the model.
+Tracks tool calls requested by the model. All tool calls are "function_call" type in OpenAI's model.
 
 ```sql
 -- Table: tool_calls
--- Tool invocations by the model, exposed as "tool_call" items in Conversations API
--- tool_call_id: Unique identifier for the tool call
--- arguments_enc: Encrypted arguments (binary ciphertext)
--- argument_tokens: Token count for the tool arguments
+-- Tool invocations by the model (all are function_call type)
+-- response_id: NULL if created via Conversations API, populated if created via Responses API
+-- tool_call_id: The call_id from OpenAI
+-- status: in_progress, completed, incomplete
 CREATE TABLE tool_calls (
     id BIGSERIAL PRIMARY KEY,
     uuid UUID NOT NULL UNIQUE,
     conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    user_message_id BIGINT NOT NULL REFERENCES user_messages(id) ON DELETE CASCADE,
+    response_id BIGINT REFERENCES responses(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
     tool_call_id UUID NOT NULL,
     name TEXT NOT NULL,
     arguments_enc BYTEA,
-    argument_tokens INTEGER,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    argument_tokens INTEGER NOT NULL,
+    status TEXT DEFAULT 'completed',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_tool_calls_uuid ON tool_calls(uuid);
-CREATE INDEX idx_tool_calls_conversation_id ON tool_calls(conversation_id);
-CREATE INDEX idx_tool_calls_user_message_id ON tool_calls(user_message_id);
-CREATE INDEX idx_tool_calls_conversation_created_id 
-    ON tool_calls(conversation_id, created_at DESC, id);
-CREATE INDEX idx_tool_calls_conversation_created 
-    ON tool_calls(conversation_id, created_at);
 ```
 
-### tool_outputs Table  
+### tool_outputs Table
 
 Stores results from tool executions.
 
 ```sql
 -- Table: tool_outputs
--- Tool execution results, exposed as "tool_output" items in Conversations API
--- output_enc: Encrypted output (binary ciphertext) - use {} for empty responses
--- output_tokens: Token count for the tool output
+-- Tool execution results (function_call_output type)
+-- response_id: NULL if created via Conversations API, populated if created via Responses API
+-- status: in_progress, completed, incomplete
 CREATE TABLE tool_outputs (
     id BIGSERIAL PRIMARY KEY,
     uuid UUID NOT NULL UNIQUE,
     conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    response_id BIGINT REFERENCES responses(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
     tool_call_fk BIGINT NOT NULL REFERENCES tool_calls(id) ON DELETE CASCADE,
     output_enc BYTEA NOT NULL,
-    output_tokens INTEGER,
-    status TEXT NOT NULL DEFAULT 'succeeded' CHECK (status IN ('succeeded', 'failed')),
+    output_tokens INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'completed' CHECK (status IN ('in_progress','completed','incomplete')),
     error TEXT,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
-
-CREATE INDEX idx_tool_outputs_uuid ON tool_outputs(uuid);
-CREATE INDEX idx_tool_outputs_conversation_id ON tool_outputs(conversation_id);
-CREATE INDEX idx_tool_outputs_tool_call_fk ON tool_outputs(tool_call_fk);
-CREATE INDEX idx_tool_outputs_conversation_created_id 
-    ON tool_outputs(conversation_id, created_at DESC, id);
-CREATE INDEX idx_tool_outputs_conversation_created 
-    ON tool_outputs(conversation_id, created_at);
 ```
 
-### assistant_messages Table
+### Index Strategy
 
-Stores LLM responses (non-tool responses). The model is not stored here since it can be derived from the parent `user_message_id` - this avoids redundancy and ensures consistency.
+Indexes are optimized for the hot path query pattern:
 
 ```sql
--- Table: assistant_messages
--- LLM responses, exposed as "message" items with role="assistant" in Conversations API
--- content_enc: Encrypted assistant response (binary ciphertext)
--- completion_tokens: Token count for this assistant response
-CREATE TABLE assistant_messages (
-    id BIGSERIAL PRIMARY KEY,
-    uuid UUID NOT NULL UNIQUE,
-    conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    user_message_id BIGINT NOT NULL REFERENCES user_messages(id) ON DELETE CASCADE,
-    content_enc BYTEA NOT NULL,
-    completion_tokens INTEGER,
-    finish_reason TEXT,
-    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_assistant_messages_uuid ON assistant_messages(uuid);
-CREATE INDEX idx_assistant_messages_conversation_id ON assistant_messages(conversation_id);
-CREATE INDEX idx_assistant_messages_user_message_id ON assistant_messages(user_message_id);
+-- Hot path indexes for conversation context queries
+-- Composite indexes on (conversation_id, created_at) for fast sorting
+CREATE INDEX idx_user_messages_conversation_created_id 
+    ON user_messages(conversation_id, created_at DESC, id);
 CREATE INDEX idx_assistant_messages_conversation_created_id 
     ON assistant_messages(conversation_id, created_at DESC, id);
-CREATE INDEX idx_assistant_messages_conversation_created 
-    ON assistant_messages(conversation_id, created_at);
+CREATE INDEX idx_tool_calls_conversation_created_id 
+    ON tool_calls(conversation_id, created_at DESC, id);
+CREATE INDEX idx_tool_outputs_conversation_created_id 
+    ON tool_outputs(conversation_id, created_at DESC, id);
 
-CREATE TRIGGER update_user_system_prompts_updated_at BEFORE UPDATE
-    ON user_system_prompts FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    
-CREATE TRIGGER update_conversations_updated_at BEFORE UPDATE
-    ON conversations FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    
-CREATE TRIGGER update_user_messages_updated_at BEFORE UPDATE
-    ON user_messages FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    
-CREATE TRIGGER update_tool_calls_updated_at BEFORE UPDATE
-    ON tool_calls FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    
-CREATE TRIGGER update_tool_outputs_updated_at BEFORE UPDATE
-    ON tool_outputs FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
-    
-CREATE TRIGGER update_assistant_messages_updated_at BEFORE UPDATE
-    ON assistant_messages FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+-- Response-specific indexes for job tracking
+CREATE INDEX idx_responses_status ON responses(status);
+CREATE INDEX idx_responses_idempotency 
+    ON responses(user_id, idempotency_key) 
+    WHERE idempotency_key IS NOT NULL;
+```
+
+### Query Patterns
+
+**Hot Path: Rebuild Conversation Context**
+```sql
+-- Super fast with BIGINT conversation_id and proper indexes
+SELECT * FROM user_messages WHERE conversation_id = ?
+UNION ALL
+SELECT * FROM assistant_messages WHERE conversation_id = ?
+UNION ALL
+SELECT * FROM tool_calls WHERE conversation_id = ?
+UNION ALL
+SELECT * FROM tool_outputs WHERE conversation_id = ?
+ORDER BY created_at;
+```
+
+**Authorization + ID Lookup**
+```sql
+-- UUID lookup doubles as security check
+SELECT id, * FROM conversations 
+WHERE uuid = ? AND user_id = ?;
+-- Returns internal BIGINT id for subsequent queries
 ```
 
 ### Migration Management
@@ -503,12 +537,14 @@ DROP TRIGGER IF EXISTS update_assistant_messages_updated_at ON assistant_message
 DROP TRIGGER IF EXISTS update_tool_outputs_updated_at ON tool_outputs;
 DROP TRIGGER IF EXISTS update_tool_calls_updated_at ON tool_calls;
 DROP TRIGGER IF EXISTS update_user_messages_updated_at ON user_messages;
+DROP TRIGGER IF EXISTS update_responses_updated_at ON responses;
 DROP TRIGGER IF EXISTS update_conversations_updated_at ON conversations;
 DROP TRIGGER IF EXISTS update_user_system_prompts_updated_at ON user_system_prompts;
 DROP TABLE IF EXISTS assistant_messages;
 DROP TABLE IF EXISTS tool_outputs;
 DROP TABLE IF EXISTS tool_calls;
 DROP TABLE IF EXISTS user_messages;
+DROP TABLE IF EXISTS responses;
 DROP TABLE IF EXISTS conversations;
 DROP TABLE IF EXISTS user_system_prompts;
 DROP TYPE IF EXISTS response_status;
@@ -530,15 +566,14 @@ Creates a new response request. This is the single entry point for the Responses
 - OpenAI Responses API compatibility
 
 **Conversation Management**:
+- **Required**: Every response MUST have a conversation
 - When `conversation` parameter is provided:
   - Can be a conversation ID (UUID string)
   - Can be an object with `{id: "uuid"}`
-  - Defaults to `null` (no conversation association)
-- When `conversation` is a valid ID:
-  - Items from that conversation are prepended to the input for context
-  - The model specified in the request is used (can differ from previous requests)
-- Response output is automatically added to the specified conversation
-- For backward compatibility, `previous_response_id` is still supported but deprecated
+- When `conversation` is null or not provided:
+  - Auto-create a new conversation
+  - Can mark as ephemeral in metadata if desired
+- **No Response Chains**: `previous_response_id` is NOT supported
 
 **Headers:**
 - `Authorization: Bearer <token>` (required)
@@ -567,8 +602,7 @@ Creates a new response request. This is the single entry point for the Responses
   "parallel_tool_calls": true,
   "store": true,
   "metadata": {},
-  "stream": true,
-  "previous_response_id": null // Deprecated - use conversation parameter instead
+  "stream": true
 ```
 
 **Response (Immediate):**
@@ -595,46 +629,77 @@ curl https://api.openai.com/v1/responses \
 Response stream:
 ```
 event: response.created
-data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_xxx","object":"response","created_at":1753910244,"status":"in_progress","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-4o-2024-08-06","output":[],"parallel_tool_calls":true,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"auto","store":true,"temperature":1.0,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}}}
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_68c0ad6493cc8190a0e8c76c5184504b0c149fc0da51351e","object":"response","created_at":1757457764,"status":"in_progress","background":false,"conversation":{"id":"conv_68c0ad641778819082b690ac664ca0bd0c149fc0da51351e"},"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-4o-2024-08-06","output":[],"parallel_tool_calls":true,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"auto","store":true,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[{"type":"web_search","filters":null,"search_context_size":"medium","user_location":{"type":"approximate","city":null,"country":"US","region":null,"timezone":null}}],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}}}
 
 event: response.in_progress
-data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_xxx","object":"response","created_at":1753910244,"status":"in_progress","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-4o-2024-08-06","output":[],"parallel_tool_calls":true,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"auto","store":true,"temperature":1.0,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}}}
+data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_68c0ad6493cc8190a0e8c76c5184504b0c149fc0da51351e","object":"response","created_at":1757457764,"status":"in_progress","background":false,"conversation":{"id":"conv_68c0ad641778819082b690ac664ca0bd0c149fc0da51351e"},"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-4o-2024-08-06","output":[],"parallel_tool_calls":true,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"auto","store":true,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[{"type":"web_search","filters":null,"search_context_size":"medium","user_location":{"type":"approximate","city":null,"country":"US","region":null,"timezone":null}}],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":null,"user":null,"metadata":{}}}
 
 event: response.output_item.added
-data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"msg_xxx","type":"message","status":"in_progress","content":[],"role":"assistant"}}
+data: {"type":"response.output_item.added","sequence_number":2,"output_index":0,"item":{"id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","type":"message","status":"in_progress","content":[],"role":"assistant"}}
 
 event: response.content_part.added
-data: {"type":"response.content_part.added","sequence_number":3,"item_id":"msg_xxx","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}
+data: {"type":"response.content_part.added","sequence_number":3,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":""}}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_xxx","output_index":0,"content_index":0,"delta":"Hey","logprobs":[]}
+data: {"type":"response.output_text.delta","sequence_number":4,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":"Hey","logprobs":[],"obfuscation":"iondQpvxRRt1M"}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","sequence_number":5,"item_id":"msg_xxx","output_index":0,"content_index":0,"delta":"!","logprobs":[]}
+data: {"type":"response.output_text.delta","sequence_number":5,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":"!","logprobs":[],"obfuscation":"vLuPXTN61txnPro"}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","sequence_number":6,"item_id":"msg_xxx","output_index":0,"content_index":0,"delta":" Not","logprobs":[]}
+data: {"type":"response.output_text.delta","sequence_number":6,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":" Not","logprobs":[],"obfuscation":"A6WS04kv7Eih"}
 
 event: response.output_text.delta
-data: {"type":"response.output_text.delta","sequence_number":7,"item_id":"msg_xxx","output_index":0,"content_index":0,"delta":" much","logprobs":[]}
+data: {"type":"response.output_text.delta","sequence_number":7,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":" much","logprobs":[],"obfuscation":"ZWgQcu5x74V"}
 
-// ... more delta events ...
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":8,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":",","logprobs":[],"obfuscation":"bSbx4RUktmy18JN"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":9,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":" just","logprobs":[],"obfuscation":"ZhlwqT8FrBG"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":10,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":" here","logprobs":[],"obfuscation":"D4IPwVeFvnD"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":11,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":" to","logprobs":[],"obfuscation":"nfIpDYQZmxWwA"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":12,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":" help","logprobs":[],"obfuscation":"KtZScSpQpY9"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":13,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":".","logprobs":[],"obfuscation":"tlVbJqUwEtf5Hym"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":14,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":" What","logprobs":[],"obfuscation":"XZh7BfRlBxV"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":15,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":" about","logprobs":[],"obfuscation":"Hf2jJxbEPs"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":16,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":" you","logprobs":[],"obfuscation":"jxwy8DxPc9wn"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":17,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"delta":"?","logprobs":[],"obfuscation":"qcBzsVaalSMTw3d"}
 
 event: response.output_text.done
-data: {"type":"response.output_text.done","sequence_number":20,"item_id":"msg_xxx","output_index":0,"content_index":0,"text":"Hey! Not much, just here to help out. What's up with you?","logprobs":[]}
+data: {"type":"response.output_text.done","sequence_number":18,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"text":"Hey! Not much, just here to help. What about you?","logprobs":[]}
 
 event: response.content_part.done
-data: {"type":"response.content_part.done","sequence_number":21,"item_id":"msg_xxx","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":"Hey! Not much, just here to help out. What's up with you?"}}
+data: {"type":"response.content_part.done","sequence_number":19,"item_id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","output_index":0,"content_index":0,"part":{"type":"output_text","annotations":[],"logprobs":[],"text":"Hey! Not much, just here to help. What about you?"}}
 
 event: response.output_item.done
-data: {"type":"response.output_item.done","sequence_number":22,"output_index":0,"item":{"id":"msg_xxx","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"Hey! Not much, just here to help out. What's up with you?"}],"role":"assistant"}}
+data: {"type":"response.output_item.done","sequence_number":20,"output_index":0,"item":{"id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"Hey! Not much, just here to help. What about you?"}],"role":"assistant"}}
 
 event: response.completed
-data: {"type":"response.completed","sequence_number":23,"response":{"id":"resp_xxx","object":"response","created_at":1753910244,"status":"completed","background":false,"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-4o-2024-08-06","output":[{"id":"msg_xxx","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"Hey! Not much, just here to help out. What's up with you?"}],"role":"assistant"}],"parallel_tool_calls":true,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"default","store":true,"temperature":1.0,"text":{"format":{"type":"text"}},"tool_choice":"auto","tools":[],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":17,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":27},"user":null,"metadata":{}}}
+data: {"type":"response.completed","sequence_number":21,"response":{"id":"resp_68c0ad6493cc8190a0e8c76c5184504b0c149fc0da51351e","object":"response","created_at":1757457764,"status":"completed","background":false,"conversation":{"id":"conv_68c0ad641778819082b690ac664ca0bd0c149fc0da51351e"},"error":null,"incomplete_details":null,"instructions":null,"max_output_tokens":null,"max_tool_calls":null,"model":"gpt-4o-2024-08-06","output":[{"id":"msg_68c0ad65b9348190bd8d3152d7bfb8470c149fc0da51351e","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"logprobs":[],"text":"Hey! Not much, just here to help. What about you?"}],"role":"assistant"}],"parallel_tool_calls":true,"previous_response_id":null,"prompt_cache_key":null,"reasoning":{"effort":null,"summary":null},"safety_identifier":null,"service_tier":"default","store":true,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"medium"},"tool_choice":"auto","tools":[{"type":"web_search","filters":null,"search_context_size":"medium","user_location":{"type":"approximate","city":null,"country":"US","region":null,"timezone":null}}],"top_logprobs":0,"top_p":1.0,"truncation":"disabled","usage":{"input_tokens":305,"input_tokens_details":{"cached_tokens":0},"output_tokens":16,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":321},"user":null,"metadata":{}}}
+
 
 // Example: Cancelled response
 event: response.completed
 data: {"type": "response.completed", "response": {"id": "550e8400-e29b-41d4-a716-446655440000", "status": "cancelled", ...}, "sequence_number": 5}
+
+```
 
 ### GET /v1/responses/{response_id}
 
@@ -772,33 +837,6 @@ List all conversations for the authenticated user with pagination.
       "metadata": {
         "title": "Quantum Physics Discussion"
       }
-    }
-  ],
-  "has_more": true,
-  "first_id": "550e8400-e29b-41d4-a716-446655440000",
-  "last_id": "6ba7b814-9dad-11d1-80b4-00c04fd430c8"
-}
-```
-
-**Query Parameters:**
-- `limit` (integer, default: 20, max: 100): Number of conversations to return
-- `after` (string): Cursor for pagination (conversation UUID to start after)
-- `before` (string): Cursor for pagination (conversation UUID to start before)
-- `order` (string, default: "desc"): Sort order by updated_at ("asc" or "desc")
-
-**Pagination Design**: We use `after`/`before` parameters following OpenAI's standard list endpoint patterns (e.g., list assistants, list files). Conversations are sorted by their `updated_at` timestamp.
-
-**Response:**
-```json
-{
-  "object": "list",
-  "data": [
-    {
-      "id": "550e8400-e29b-41d4-a716-446655440000",
-      "object": "conversation",
-      "created_at": 1677652288,
-      "updated_at": 1677652350,
-      "title": "How to cook chicken"
     }
   ],
   "has_more": true,
@@ -949,7 +987,7 @@ The Responses API supports idempotent requests to ensure safe retries.
 
 ### Implementation
 
-Idempotency is handled at the application level with the help of columns in the `user_messages` table:
+Idempotency is handled at the application level with the help of columns in the `responses` table:
 
 **Application-Level Approach**:
 - Check for existing idempotency key before inserting
@@ -958,21 +996,21 @@ Idempotency is handled at the application level with the help of columns in the 
 - Simple and predictable behavior
 
 ```sql
--- Idempotency columns are already included in the user_messages table:
+-- Idempotency columns are in the responses table:
 -- idempotency_key TEXT
 -- request_hash TEXT  
 -- idempotency_expires_at TIMESTAMP WITH TIME ZONE
 
 -- Index for efficient idempotency lookups
-CREATE INDEX idx_user_messages_idempotency 
-    ON user_messages(user_id, idempotency_key) 
+CREATE INDEX idx_responses_idempotency 
+    ON responses(user_id, idempotency_key) 
     WHERE idempotency_key IS NOT NULL;
 ```
 
 **Query Pattern**:
 ```sql
 -- Check for existing non-expired idempotency key
-SELECT * FROM user_messages 
+SELECT * FROM responses 
 WHERE user_id = $1 
   AND idempotency_key = $2 
   AND idempotency_expires_at > NOW()  -- Evaluated at query time
@@ -989,7 +1027,7 @@ if let Some(idempotency_key) = headers.get("idempotency-key") {
     let request_hash = sha256::digest(request_json);
     
     // Check if we've seen this key before for this user within the expiry window
-    if let Some(existing) = db.get_user_message_by_idempotency_key(
+    if let Some(existing) = db.get_response_by_idempotency_key(
         &idempotency_key, 
         user.id
     ).await? {
@@ -1013,13 +1051,13 @@ if let Some(idempotency_key) = headers.get("idempotency-key") {
             }
             _ => {
                 // Return cached response (completed, failed, or cancelled)
-                return Ok(Json(build_response_from_message(existing).await?).into_response());
+                return Ok(Json(build_response_from_response(existing).await?).into_response());
             }
         }
     }
     
-    // Include idempotency info when creating the user message
-    let message = create_user_message(
+    // Include idempotency info when creating the response
+    let response = create_response(
         request,
         Some(idempotency_key),
         Some(request_hash),
@@ -1050,7 +1088,7 @@ if let Some(idempotency_key) = headers.get("idempotency-key") {
 
 ```sql
 -- Optional periodic cleanup to remove old idempotency data and save storage
-UPDATE user_messages 
+UPDATE responses 
 SET idempotency_key = NULL, request_hash = NULL, idempotency_expires_at = NULL
 WHERE idempotency_expires_at < CURRENT_TIMESTAMP
   AND idempotency_key IS NOT NULL;
@@ -1081,7 +1119,7 @@ WITH conversation_messages AS (
         um.uuid,
         um.content_enc,
         um.created_at,
-        um.model,
+        NULL as model,  -- Model is in responses table now
         um.prompt_tokens as token_count,
         NULL as tool_call_id,
         NULL as finish_reason
@@ -1097,12 +1135,12 @@ WITH conversation_messages AS (
         am.uuid,
         am.content_enc,
         am.created_at,
-        um.model, -- Get model from parent user message
+        r.model, -- Get model from response
         am.completion_tokens as token_count,
         NULL as tool_call_id,
         am.finish_reason
     FROM assistant_messages am
-    JOIN user_messages um ON am.user_message_id = um.id
+    LEFT JOIN responses r ON am.response_id = r.id
     WHERE am.conversation_id = $1
     
     UNION ALL
@@ -1245,8 +1283,10 @@ ON tool_outputs(conversation_id, created_at);
    - Check for idempotency key if provided
    - Generate message ID (or reuse from idempotency check)
    - Determine conversation handling:
-     - If `conversation` is null and `previous_response_id` exists: Look up conversation from previous response (backward compatibility)
-   - Insert user_message record with status='in_progress' (MVP skips 'queued' status for synchronous processing)
+     - If `conversation` provided: validate ownership and get internal id
+     - If `conversation` is null: auto-create new conversation
+   - Insert response record with status='in_progress'
+   - Insert user_message record linked to response
    - Build conversation context from thread history
    - If stream=true, upgrade to SSE connection
    - Call internal chat API and process response
@@ -1257,7 +1297,8 @@ ON tool_outputs(conversation_id, created_at);
    async fn process_response(
        state: &AppState,
        user: &User,
-       user_message: &UserMessage,
+       response: &Response,
+       conversation: &Conversation,
        context: Vec<Message>,
    ) -> Result<()> {
        // Create dual streams - one for client, one for storage
@@ -1273,12 +1314,12 @@ ON tool_outputs(conversation_id, created_at);
                match chunk {
                    StreamChunk::Content(text) => content.push_str(&text),
                    StreamChunk::ToolCall(call) => {
-                       store_tool_call(&db, user_message, &call).await?;
+                       store_tool_call(&db, response.id, conversation.id, user.id, &call).await?;
                        tool_calls.push(call);
                    }
                    StreamChunk::Done(usage) => {
-                       store_assistant_message(&db, user_message, &content, usage).await?;
-                       update_user_message_status(user_message.id, "completed").await?;
+                       store_assistant_message(&db, response.id, conversation.id, user.id, &content, usage).await?;
+                       update_response_status(response.id, "completed").await?;
                        break;
                    }
                }
@@ -1307,10 +1348,11 @@ ON tool_outputs(conversation_id, created_at);
    ```
 
 3. **Message Storage**:
-   - User message: Stored immediately on request
+   - Response: Created immediately with status='in_progress'
+   - User message: Stored immediately after response creation
    - Assistant message: Stored after streaming completes
    - Tool calls: Stored as they arrive
-   - Metadata: Updated when stream ends
+   - Response status: Updated to 'completed' when stream ends
 
 ### SSE Event Format
 
@@ -1449,7 +1491,7 @@ pub fn get_model_max_tokens(model: &str) -> usize {
 
 2. **Storage Strategy**:
    - Store token counts in each message table as they're created
-   - `user_messages.prompt_tokens`: Total tokens in the prompt (system + context + user message)
+   - `user_messages.prompt_tokens`: Token count for just this user message (not including context)
    - `assistant_messages.completion_tokens`: Tokens in the assistant response
    - `tool_calls.argument_tokens`: Tokens in the tool arguments
    - `tool_outputs.output_tokens`: Tokens in the tool output
@@ -1474,15 +1516,17 @@ pub fn get_model_max_tokens(model: &str) -> usize {
        conn: &mut AsyncPgConnection,
        user_id: Uuid,
        content: &str,
-       prompt_tokens: i32, // Already calculated from full prompt
+       prompt_tokens: i32, // Token count for just this message
    ) -> Result<UserMessage> {
        let encrypted_content = encrypt_with_key(&user_key, content.as_bytes()).await;
        
        let new_message = NewUserMessage {
            uuid: Uuid::new_v4(),
+           conversation_id,
+           response_id: Some(response_id),  // Link to response
            user_id,
            content_enc: encrypted_content,
-           prompt_tokens: Some(prompt_tokens),
+           prompt_tokens,  // Required, not optional
            // ... other fields
        };
        
@@ -1495,7 +1539,9 @@ pub fn get_model_max_tokens(model: &str) -> usize {
    // When storing assistant messages from streaming
    async fn store_assistant_message(
        conn: &mut AsyncPgConnection,
-       user_message_id: i64,
+       response_id: i64,
+       conversation_id: i64,
+       user_id: Uuid,
        content: &str,
        completion_tokens: Option<i32>, // From stream or calculated
    ) -> Result<AssistantMessage> {
@@ -1505,9 +1551,12 @@ pub fn get_model_max_tokens(model: &str) -> usize {
        
        let new_message = NewAssistantMessage {
            uuid: Uuid::new_v4(),
-           user_message_id,
+           conversation_id,
+           response_id: Some(response_id),  // Link to response
+           user_id,
            content_enc: encrypted_content,
-           completion_tokens: Some(tokens),
+           completion_tokens: tokens,  // Required, not optional
+           finish_reason: Some("stop".to_string()),
            // ... other fields
        };
        
@@ -2090,8 +2139,8 @@ Client              Responses API      Chat API         Tool Executor    Databas
 Client              Chat Service         Database            LLM Provider
   |                     |                   |                     |
   |--Request----------->|                   |                     |
-  |                     |--Store User------>|                     |
-  |                     |   Message         |                     |
+  |                     |--Store Response-->|                     |
+  |                     |  & User Message   |                     |
   |                     |<------------------|                     |
   |                     |--Stream Request------------------------->|
   |                     |                   |                     |
@@ -2104,8 +2153,8 @@ Client              Chat Service         Database            LLM Provider
   |                     |<------------------|                     |
   |<---Error Event------|                   |                     |
   |                     |                   |                     |
-  |                     |--Mark Error------->|                     |
-  |                     |   Status          |                     |
+  |                     |--Update Response->|                     |
+  |                     |   Status (failed) |                     |
 ```
 
 ### Key Flow Characteristics
@@ -2234,12 +2283,13 @@ diesel run
 After running migrations, examine the generated `src/schema.rs` file and create matching Diesel models in `src/models/responses.rs`. You'll need these structs:
 
 - `ResponseStatus` enum (queued, in_progress, completed, failed, cancelled)
+- `Response` - job/task tracker for the Responses API
 - `UserSystemPrompt` - custom system prompts
 - `Conversation` - conversation containers
-- `UserMessage` - user inputs with Responses API lifecycle tracking
-- `ToolCall` - model-requested tool invocations
-- `ToolOutput` - tool execution results
-- `AssistantMessage` - LLM responses
+- `UserMessage` - user inputs (with response_id FK)
+- `AssistantMessage` - LLM responses (with response_id FK)
+- `ToolCall` - model-requested tool invocations (with response_id FK)
+- `ToolOutput` - tool execution results (with response_id FK)
 
 All `_enc` fields are `Vec<u8>` for BYTEA encrypted content. Use existing encryption patterns from the codebase.
 

@@ -576,8 +576,8 @@ async fn create_response_stream(
     // Encrypt user input
     let content_enc = encrypt_with_key(&user_key, body.input.as_bytes()).await;
 
-    // Create conversation and user message
-    let (conversation, user_message) = persist_initial_message(
+    // Create conversation, response, and user message
+    let (conversation, response, _user_message) = persist_initial_message(
         &state,
         &user,
         &body,
@@ -589,7 +589,7 @@ async fn create_response_stream(
 
     info!(
         "Created response {} for user {} in conversation {}",
-        user_message.uuid, user.uuid, conversation.uuid
+        response.uuid, user.uuid, conversation.uuid
     );
 
     // Build the conversation context from all persisted messages
@@ -612,8 +612,9 @@ async fn create_response_stream(
         "messages": prompt_messages,
         "temperature": body.temperature.unwrap_or(0.7),
         "top_p": body.top_p.unwrap_or(1.0),
-        "max_tokens": body.max_output_tokens.unwrap_or(512),
+        "max_tokens": body.max_output_tokens.unwrap_or(10_000),
         "stream": true,
+        // TODO should either happen in the completions response method
         "stream_options": { "include_usage": true }
     });
 
@@ -635,7 +636,7 @@ async fn create_response_stream(
     // Spawn storage task
     let storage_handle = {
         let db = state.db.clone();
-        let user_message_id = user_message.id;
+        let response_id = response.id;
         let conversation_id = conversation.id;
         let user_uuid = user.uuid;
         let sqs_publisher = state.sqs_publisher.clone();
@@ -644,7 +645,7 @@ async fn create_response_stream(
             storage_task(
                 rx_storage,
                 db,
-                user_message_id,
+                response_id,
                 conversation_id,
                 user_key,
                 user_uuid,
@@ -665,34 +666,34 @@ async fn create_response_stream(
         // Send initial response.created event
         trace!("Building response.created event");
         let created_response = ResponsesCreateResponse {
-            id: user_message.uuid,
+            id: response.uuid,
             object: "response",
-            created_at: user_message.created_at.timestamp(),
+            created_at: response.created_at.timestamp(),
             status: "in_progress",
             background: false,
             error: None,
             incomplete_details: None,
             instructions: None,
-            max_output_tokens: user_message.max_output_tokens,
+            max_output_tokens: response.max_output_tokens,
             max_tool_calls: None,
-            model: user_message.model.clone(),
+            model: response.model.clone(),
             output: vec![],
-            parallel_tool_calls: user_message.parallel_tool_calls,
-            previous_response_id: user_message.previous_response_id,
+            parallel_tool_calls: response.parallel_tool_calls,
+            previous_response_id: None, // We no longer track previous_response_id
             prompt_cache_key: None,
             reasoning: ReasoningInfo { effort: None, summary: None },
             safety_identifier: None,
-            store: user_message.store,
-            temperature: user_message.temperature.unwrap_or(1.0),
+            store: response.store,
+            temperature: response.temperature.unwrap_or(1.0),
             text: TextFormat { format: TextFormatSpec { format_type: "text".to_string() } },
-            tool_choice: user_message.tool_choice.clone().unwrap_or_else(|| "auto".to_string()),
+            tool_choice: response.tool_choice.clone().unwrap_or_else(|| "auto".to_string()),
             tools: vec![],
             top_logprobs: 0,
-            top_p: user_message.top_p.unwrap_or(1.0),
+            top_p: response.top_p.unwrap_or(1.0),
             truncation: "disabled",
             usage: None,
             user: None,
-            metadata: user_message.metadata.clone(),
+            metadata: response.metadata.clone(),
         };
 
         let created_event = ResponseCreatedEvent {
@@ -967,17 +968,17 @@ async fn create_response_stream(
 
                                 // Event 10: response.completed
                                 let done_response = ResponsesCreateResponse {
-                                    id: user_message.uuid,
+                                    id: response.uuid,
                                     object: "response",
-                                    created_at: user_message.created_at.timestamp(),
+                                    created_at: response.created_at.timestamp(),
                                     status: "completed",
                                     background: false,
                                     error: None,
                                     incomplete_details: None,
                                     instructions: None,
-                                    max_output_tokens: user_message.max_output_tokens,
+                                    max_output_tokens: response.max_output_tokens,
                                     max_tool_calls: None,
-                                    model: user_message.model.clone(),
+                                    model: response.model.clone(),
                                     output: vec![OutputItem {
                                         id: message_id.to_string(),
                                         output_type: "message".to_string(),
@@ -990,18 +991,18 @@ async fn create_response_stream(
                                             text: assistant_content.clone(),
                                         }]),
                                     }],
-                                    parallel_tool_calls: user_message.parallel_tool_calls,
-                                    previous_response_id: user_message.previous_response_id,
+                                    parallel_tool_calls: response.parallel_tool_calls,
+                                    previous_response_id: None, // We no longer track previous_response_id
                                     prompt_cache_key: None,
                                     reasoning: ReasoningInfo { effort: None, summary: None },
                                     safety_identifier: None,
-                                    store: user_message.store,
-                                    temperature: user_message.temperature.unwrap_or(1.0),
+                                    store: response.store,
+                                    temperature: response.temperature.unwrap_or(1.0),
                                     text: TextFormat { format: TextFormatSpec { format_type: "text".to_string() } },
-                                    tool_choice: user_message.tool_choice.clone().unwrap_or_else(|| "auto".to_string()),
+                                    tool_choice: response.tool_choice.clone().unwrap_or_else(|| "auto".to_string()),
                                     tools: vec![],
                                     top_logprobs: 0,
-                                    top_p: user_message.top_p.unwrap_or(1.0),
+                                    top_p: response.top_p.unwrap_or(1.0),
                                     truncation: "disabled",
                                     usage: Some(ResponseUsage {
                                         input_tokens: total_prompt_tokens as i32,
@@ -1011,7 +1012,7 @@ async fn create_response_stream(
                                         total_tokens: total_prompt_tokens as i32 + total_completion_tokens,
                                     }),
                                     user: None,
-                                    metadata: user_message.metadata.clone(),
+                                    metadata: response.metadata.clone(),
                                 };
 
                                 let completed_event = ResponseCompletedEvent {
@@ -1165,7 +1166,7 @@ async fn create_response_stream(
 async fn storage_task(
     mut rx: mpsc::Receiver<StorageMessage>,
     db: Arc<dyn crate::DBConnection + Send + Sync>,
-    user_message_id: i64,
+    response_id: i64,
     conversation_id: i64,
     user_key: secp256k1::SecretKey,
     user_uuid: Uuid,
@@ -1223,14 +1224,11 @@ async fn storage_task(
     }
 
     // Handle error case
-    if let Some(error) = error_msg {
-        if let Err(e) = db.update_user_message_status(
-            user_message_id,
-            ResponseStatus::Failed,
-            Some(error),
-            Some(Utc::now()),
-        ) {
-            error!("Failed to update user message status to failed: {:?}", e);
+    if let Some(_error) = error_msg {
+        if let Err(e) =
+            db.update_response_status(response_id, ResponseStatus::Failed, Some(Utc::now()))
+        {
+            error!("Failed to update response status to failed: {:?}", e);
         }
         return;
     }
@@ -1250,9 +1248,10 @@ async fn storage_task(
     let new_assistant = NewAssistantMessage {
         uuid: message_id,
         conversation_id,
-        user_message_id,
+        response_id: Some(response_id),
+        user_id: user_uuid,
         content_enc,
-        completion_tokens: Some(completion_tokens),
+        completion_tokens,
         finish_reason: Some(finish_reason),
     };
 
@@ -1319,14 +1318,11 @@ async fn storage_task(
         });
     }
 
-    // Update user message status to completed
-    if let Err(e) = db.update_user_message_status(
-        user_message_id,
-        ResponseStatus::Completed,
-        None,
-        Some(Utc::now()),
-    ) {
-        error!("Failed to update user message status to completed: {:?}", e);
+    // Update response status to completed
+    if let Err(e) =
+        db.update_response_status(response_id, ResponseStatus::Completed, Some(Utc::now()))
+    {
+        error!("Failed to update response status to completed: {:?}", e);
     }
 }
 
@@ -1351,7 +1347,7 @@ async fn encrypt_event(
     Ok(Event::default().event(event_type).data(base64_encrypted))
 }
 
-/// Persist initial user message and possibly create new conversation
+/// Persist initial response and user message
 async fn persist_initial_message(
     state: &Arc<AppState>,
     user: &User,
@@ -1362,12 +1358,14 @@ async fn persist_initial_message(
 ) -> Result<
     (
         crate::models::responses::Conversation,
+        crate::models::responses::Response,
         crate::models::responses::UserMessage,
     ),
     ApiError,
 > {
+    use crate::models::responses::{NewResponse, ResponseStatus};
+
     // Determine which conversation to use
-    // Priority: conversation parameter > previous_response_id > create new
     let conversation_id = match &body.conversation {
         Some(ConversationParam::String(id)) | Some(ConversationParam::Object { id }) => Some(*id),
         None => None,
@@ -1376,7 +1374,6 @@ async fn persist_initial_message(
     if let Some(conv_uuid) = conversation_id {
         // Use specified conversation
         debug!("Using specified conversation: {}", conv_uuid);
-
         let conversation = state
             .db
             .get_conversation_by_uuid_and_user(conv_uuid, user.uuid)
@@ -1390,16 +1387,13 @@ async fn persist_initial_message(
                 }
             })?;
 
-        // Create message for existing conversation
-        let new_msg = NewUserMessage {
+        // Create the Response (job tracker)
+        let new_response = NewResponse {
             uuid: Uuid::new_v4(),
-            conversation_id: conversation.id,
             user_id: user.uuid,
-            content_enc: content_enc.clone(),
-            prompt_tokens: Some(user_message_tokens),
+            conversation_id: conversation.id,
             status: ResponseStatus::InProgress,
             model: body.model.clone(),
-            previous_response_id: None, // No longer using this field
             temperature: body.temperature,
             top_p: body.top_p,
             max_output_tokens: body.max_output_tokens,
@@ -1411,91 +1405,47 @@ async fn persist_initial_message(
             request_hash: None,
             idempotency_expires_at: None,
         };
-
-        let inserted = state.db.create_user_message(new_msg).map_err(|e| {
-            error!("Error creating user message: {:?}", e);
+        let response = state.db.create_response(new_response).map_err(|e| {
+            error!("Error creating response: {:?}", e);
             ApiError::InternalServerError
         })?;
 
-        Ok((conversation, inserted))
-    } else if let Some(prev_id) = body.previous_response_id {
-        debug!("Looking up previous response: {}", prev_id);
-
-        // Get the previous message to find the conversation
-        let prev_msg = state
-            .db
-            .get_user_message_by_uuid(prev_id, user.uuid)
-            .map_err(|e| {
-                error!("Error fetching previous response: {:?}", e);
-                match e {
-                    DBError::ResponsesError(ResponsesError::UserMessageNotFound) => {
-                        ApiError::NotFound
-                    }
-                    DBError::ResponsesError(ResponsesError::Unauthorized) => ApiError::Unauthorized,
-                    _ => ApiError::InternalServerError,
-                }
-            })?;
-
-        // Get the conversation
-        let conversation = state
-            .db
-            .get_conversation_by_id_and_user(prev_msg.conversation_id, user.uuid)
-            .map_err(|e| {
-                error!("Error fetching conversation: {:?}", e);
-                ApiError::InternalServerError
-            })?;
-
-        // Create message for existing conversation
+        // Create the simplified user message
         let new_msg = NewUserMessage {
             uuid: Uuid::new_v4(),
             conversation_id: conversation.id,
+            response_id: Some(response.id),
             user_id: user.uuid,
             content_enc: content_enc.clone(),
-            prompt_tokens: Some(user_message_tokens),
-            status: ResponseStatus::InProgress,
-            model: body.model.clone(),
-            previous_response_id: body.previous_response_id,
-            temperature: body.temperature,
-            top_p: body.top_p,
-            max_output_tokens: body.max_output_tokens,
-            tool_choice: body.tool_choice.clone(),
-            parallel_tool_calls: body.parallel_tool_calls,
-            store: body.store,
-            metadata: body.metadata.clone(),
-            idempotency_key: None,
-            request_hash: None,
-            idempotency_expires_at: None,
+            prompt_tokens: user_message_tokens,
         };
-
-        let inserted = state.db.create_user_message(new_msg).map_err(|e| {
+        let user_message = state.db.create_user_message(new_msg).map_err(|e| {
             error!("Error creating user message: {:?}", e);
             ApiError::InternalServerError
         })?;
 
-        Ok((conversation, inserted))
+        Ok((conversation, response, user_message))
     } else {
+        // Create new conversation
         debug!(
-            "Creating new conversation with first message for user: {}",
+            "Creating new conversation with response and message for user: {}",
             user.uuid
         );
 
-        // Create new conversation with UUID = message UUID
         let conversation_uuid = Uuid::new_v4();
+        let response_uuid = Uuid::new_v4();
 
         // Encrypt default title "New Chat"
         let default_title = "New Chat";
         let title_enc = Some(encrypt_with_key(user_key, default_title.as_bytes()).await);
 
-        // Prepare the first message
-        let first_message = NewUserMessage {
-            uuid: conversation_uuid,
-            conversation_id: 0, // Will be set by create_conversation_with_first_message
+        // Prepare the Response
+        let new_response = NewResponse {
+            uuid: response_uuid,
             user_id: user.uuid,
-            content_enc: content_enc.clone(),
-            prompt_tokens: Some(user_message_tokens),
+            conversation_id: 0, // Will be set by create_conversation_with_response_and_message
             status: ResponseStatus::InProgress,
             model: body.model.clone(),
-            previous_response_id: None,
             temperature: body.temperature,
             top_p: body.top_p,
             max_output_tokens: body.max_output_tokens,
@@ -1508,21 +1458,27 @@ async fn persist_initial_message(
             idempotency_expires_at: None,
         };
 
-        // Use transactional method to create both conversation and message atomically
+        // Use transactional method to create conversation, response, and message atomically
         state
             .db
-            .create_conversation_with_first_message(
+            .create_conversation_with_response_and_message(
                 conversation_uuid,
                 user.uuid,
-                None, // system_prompt_id - will be added in later phases
+                None, // system_prompt_id
                 title_enc,
-                None, // metadata - can be added in later phases
-                first_message,
+                None, // metadata
+                Some(new_response),
+                content_enc,
+                user_message_tokens,
             )
             .map_err(|e| {
-                error!("Error creating conversation with first message: {:?}", e);
+                error!(
+                    "Error creating conversation with response and message: {:?}",
+                    e
+                );
                 ApiError::InternalServerError
             })
+            .map(|(conv, resp, msg)| (conv, resp.unwrap(), msg))
     }
 }
 
@@ -1535,14 +1491,14 @@ async fn get_response(
 ) -> Result<Json<EncryptedResponse<ResponsesRetrieveResponse>>, ApiError> {
     debug!("Getting response {} for user {}", id, user.uuid);
 
-    // Get the user message
-    let user_message = state
+    // Get the response
+    let response = state
         .db
-        .get_user_message_by_uuid(id, user.uuid)
+        .get_response_by_uuid_and_user(id, user.uuid)
         .map_err(|e| {
             debug!("Response {} not found for user {}: {:?}", id, user.uuid, e);
             match e {
-                DBError::ResponsesError(ResponsesError::UserMessageNotFound) => ApiError::NotFound,
+                DBError::ResponsesError(ResponsesError::ResponseNotFound) => ApiError::NotFound,
                 DBError::ResponsesError(ResponsesError::Unauthorized) => ApiError::Unauthorized,
                 _ => ApiError::InternalServerError,
             }
@@ -1551,7 +1507,7 @@ async fn get_response(
     // Get associated assistant messages
     let assistant_messages = state
         .db
-        .get_assistant_messages_for_user_message(user_message.id)
+        .get_assistant_messages_for_response(response.id)
         .map_err(|e| {
             error!("Failed to get assistant messages: {:?}", e);
             ApiError::InternalServerError
@@ -1578,34 +1534,34 @@ async fn get_response(
     }
 
     // Calculate usage if completed
-    let usage = if user_message.status == ResponseStatus::Completed {
-        let total_completion_tokens = assistant_messages
-            .iter()
-            .map(|m| m.completion_tokens.unwrap_or(0))
-            .sum();
+    // TODO: We need to get the actual input tokens from all user messages in the conversation
+    // For now, we'll use a placeholder
+    let usage = if response.status == ResponseStatus::Completed {
+        let total_completion_tokens: i32 =
+            assistant_messages.iter().map(|m| m.completion_tokens).sum();
 
         Some(ResponseUsage {
-            input_tokens: user_message.prompt_tokens.unwrap_or(0),
+            input_tokens: 0, // TODO: Calculate from user messages
             input_tokens_details: InputTokenDetails { cached_tokens: 0 },
             output_tokens: total_completion_tokens,
             output_tokens_details: OutputTokenDetails {
                 reasoning_tokens: 0,
             },
-            total_tokens: user_message.prompt_tokens.unwrap_or(0) + total_completion_tokens,
+            total_tokens: total_completion_tokens,
         })
     } else {
         None
     };
 
-    let response = ResponsesRetrieveResponse {
-        id: user_message.uuid,
+    let retrieve_response = ResponsesRetrieveResponse {
+        id: response.uuid,
         object: "response",
-        created_at: user_message.created_at.timestamp(),
-        status: serde_json::to_value(user_message.status)
+        created_at: response.created_at.timestamp(),
+        status: serde_json::to_value(response.status)
             .ok()
             .and_then(|v| v.as_str().map(String::from))
             .unwrap_or_else(|| "unknown".to_string()),
-        model: user_message.model.clone(),
+        model: response.model.clone(),
         usage,
         output: if output.is_empty() {
             None
@@ -1614,7 +1570,7 @@ async fn get_response(
         },
     };
 
-    encrypt_response(&state, &session_id, &response).await
+    encrypt_response(&state, &session_id, &retrieve_response).await
 }
 
 /// POST /v1/responses/{id}/cancel - Cancel an in-progress response
@@ -1626,14 +1582,17 @@ async fn cancel_response(
 ) -> Result<Json<EncryptedResponse<ResponsesRetrieveResponse>>, ApiError> {
     debug!("Cancelling response {} for user {}", id, user.uuid);
 
-    // Cancel the user message
-    let user_message = state.db.cancel_user_message(id, user.uuid).map_err(|e| {
+    // TODO we actually need to try canceling the stream and also make sure the user and assistant
+    // message from it is not persisted.
+
+    // Cancel the response
+    let response = state.db.cancel_response(id, user.uuid).map_err(|e| {
         debug!(
             "Response {} not found for user {} during cancel: {:?}",
             id, user.uuid, e
         );
         match e {
-            DBError::ResponsesError(ResponsesError::UserMessageNotFound) => ApiError::NotFound,
+            DBError::ResponsesError(ResponsesError::ResponseNotFound) => ApiError::NotFound,
             DBError::ResponsesError(ResponsesError::Unauthorized) => ApiError::Unauthorized,
             DBError::ResponsesError(ResponsesError::ValidationError) => ApiError::BadRequest,
             _ => ApiError::InternalServerError,
@@ -1641,17 +1600,17 @@ async fn cancel_response(
     })?;
 
     // No usage or output for cancelled responses
-    let response = ResponsesRetrieveResponse {
-        id: user_message.uuid,
+    let retrieve_response = ResponsesRetrieveResponse {
+        id: response.uuid,
         object: "response",
-        created_at: user_message.created_at.timestamp(),
+        created_at: response.created_at.timestamp(),
         status: "cancelled".to_string(),
-        model: user_message.model.clone(),
+        model: response.model.clone(),
         usage: None,
         output: None,
     };
 
-    encrypt_response(&state, &session_id, &response).await
+    encrypt_response(&state, &session_id, &retrieve_response).await
 }
 
 /// DELETE /v1/responses/{id} - Hard delete a response
@@ -1663,14 +1622,14 @@ async fn delete_response(
 ) -> Result<Json<EncryptedResponse<ResponsesDeleteResponse>>, ApiError> {
     debug!("Deleting response {} for user {}", id, user.uuid);
 
-    // Delete the user message (cascade will handle related records)
-    state.db.delete_user_message(id, user.uuid).map_err(|e| {
+    // Delete the response (cascade will handle related records)
+    state.db.delete_response(id, user.uuid).map_err(|e| {
         debug!(
             "Response {} not found for user {} during delete: {:?}",
             id, user.uuid, e
         );
         match e {
-            DBError::ResponsesError(ResponsesError::UserMessageNotFound) => ApiError::NotFound,
+            DBError::ResponsesError(ResponsesError::ResponseNotFound) => ApiError::NotFound,
             DBError::ResponsesError(ResponsesError::Unauthorized) => ApiError::Unauthorized,
             _ => ApiError::InternalServerError,
         }

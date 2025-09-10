@@ -29,8 +29,8 @@ use crate::models::project_settings::{
     EmailSettings, NewProjectSetting, ProjectSetting, ProjectSettingError, SettingCategory,
 };
 use crate::models::responses::{
-    AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewToolCall,
-    NewToolOutput, NewUserMessage, RawThreadMessage, ResponseStatus, ResponsesError, ToolCall,
+    AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewResponse, NewToolCall,
+    NewToolOutput, NewUserMessage, RawThreadMessage, Response, ResponseStatus, ResponsesError, ToolCall,
     ToolOutput, UserMessage,
 };
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
@@ -461,15 +461,6 @@ pub trait DBConnection {
         &self,
         new_conversation: NewConversation,
     ) -> Result<Conversation, DBError>;
-    fn create_conversation_with_first_message(
-        &self,
-        conversation_uuid: Uuid,
-        user_id: Uuid,
-        system_prompt_id: Option<i64>,
-        title_enc: Option<Vec<u8>>,
-        metadata: Option<serde_json::Value>,
-        first_message: NewUserMessage,
-    ) -> Result<(Conversation, UserMessage), DBError>;
     fn get_conversation_by_id_and_user(
         &self,
         conversation_id: i64,
@@ -504,24 +495,45 @@ pub trait DBConnection {
         user_id: Uuid,
     ) -> Result<(), DBError>;
 
-    // User messages
-    fn create_user_message(&self, new_msg: NewUserMessage) -> Result<UserMessage, DBError>;
-    fn update_user_message_status(
+    // Responses (job tracker)
+    fn create_response(&self, new_response: NewResponse) -> Result<Response, DBError>;
+    fn get_response_by_uuid_and_user(
+        &self,
+        uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<Response, DBError>;
+    fn get_response_by_idempotency_key(
+        &self,
+        user_id: Uuid,
+        key: &str,
+    ) -> Result<Option<Response>, DBError>;
+    fn update_response_status(
         &self,
         id: i64,
         status: ResponseStatus,
-        error: Option<String>,
         completed_at: Option<DateTime<Utc>>,
     ) -> Result<(), DBError>;
+    fn cancel_response(&self, uuid: Uuid, user_id: Uuid) -> Result<Response, DBError>;
+    fn delete_response(&self, uuid: Uuid, user_id: Uuid) -> Result<(), DBError>;
+    fn cleanup_expired_response_idempotency_keys(&self) -> Result<u64, DBError>;
+    fn create_conversation_with_response_and_message(
+        &self,
+        conversation_uuid: Uuid,
+        user_id: Uuid,
+        system_prompt_id: Option<i64>,
+        title_enc: Option<Vec<u8>>,
+        metadata: Option<serde_json::Value>,
+        response: Option<NewResponse>,
+        first_message_content: Vec<u8>,
+        first_message_tokens: i32,
+    ) -> Result<(Conversation, Option<Response>, UserMessage), DBError>;
+
+    // User messages
+    fn create_user_message(&self, new_msg: NewUserMessage) -> Result<UserMessage, DBError>;
     fn update_user_message_prompt_tokens(&self, id: i64, prompt_tokens: i32)
         -> Result<(), DBError>;
     fn get_user_message(&self, id: i64, user_id: Uuid) -> Result<UserMessage, DBError>;
     fn get_user_message_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<UserMessage, DBError>;
-    fn get_user_message_by_idempotency_key(
-        &self,
-        user_id: Uuid,
-        key: &str,
-    ) -> Result<Option<UserMessage>, DBError>;
     fn list_user_messages(
         &self,
         user_id: Uuid,
@@ -535,6 +547,10 @@ pub trait DBConnection {
         &self,
         new_msg: NewAssistantMessage,
     ) -> Result<AssistantMessage, DBError>;
+    fn get_assistant_messages_for_response(
+        &self,
+        response_id: i64,
+    ) -> Result<Vec<AssistantMessage>, DBError>;
 
     // Tool calls / outputs
     fn create_tool_call(&self, new_call: NewToolCall) -> Result<ToolCall, DBError>;
@@ -546,16 +562,8 @@ pub trait DBConnection {
         conversation_id: i64,
     ) -> Result<Vec<RawThreadMessage>, DBError>;
 
-    // Phase 6 additions
-    fn get_assistant_messages_for_user_message(
-        &self,
-        user_message_id: i64,
-    ) -> Result<Vec<AssistantMessage>, DBError>;
-    fn cancel_user_message(&self, id: Uuid, user_id: Uuid) -> Result<UserMessage, DBError>;
+    // Delete operation for user messages
     fn delete_user_message(&self, id: Uuid, user_id: Uuid) -> Result<(), DBError>;
-
-    // Maintenance
-    fn cleanup_expired_idempotency_keys(&self) -> Result<u64, DBError>;
 }
 
 pub(crate) struct PostgresConnection {
@@ -1885,29 +1893,6 @@ impl DBConnection for PostgresConnection {
         new_conversation.insert(conn).map_err(DBError::from)
     }
 
-    fn create_conversation_with_first_message(
-        &self,
-        conversation_uuid: Uuid,
-        user_id: Uuid,
-        system_prompt_id: Option<i64>,
-        title_enc: Option<Vec<u8>>,
-        metadata: Option<serde_json::Value>,
-        first_message: NewUserMessage,
-    ) -> Result<(Conversation, UserMessage), DBError> {
-        debug!("Creating new conversation with first message");
-        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        NewConversation::create_with_first_message(
-            conn,
-            conversation_uuid,
-            user_id,
-            system_prompt_id,
-            title_enc,
-            metadata,
-            first_message,
-        )
-        .map_err(DBError::from)
-    }
-
     fn get_conversation_by_id_and_user(
         &self,
         conversation_id: i64,
@@ -2011,6 +1996,89 @@ impl DBConnection for PostgresConnection {
         Ok(())
     }
 
+    // Responses (job tracker) implementations
+    fn create_response(&self, new_response: NewResponse) -> Result<Response, DBError> {
+        debug!("Creating new response");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_response.insert(conn).map_err(DBError::from)
+    }
+    
+    fn get_response_by_uuid_and_user(
+        &self,
+        uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<Response, DBError> {
+        debug!("Getting response by UUID and user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Response::get_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
+    }
+    
+    fn get_response_by_idempotency_key(
+        &self,
+        user_id: Uuid,
+        key: &str,
+    ) -> Result<Option<Response>, DBError> {
+        debug!("Getting response by idempotency key");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Response::get_by_idempotency_key(conn, user_id, key).map_err(DBError::from)
+    }
+    
+    fn update_response_status(
+        &self,
+        id: i64,
+        status: ResponseStatus,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<(), DBError> {
+        debug!("Updating response status");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Response::update_status(conn, id, status, completed_at).map_err(DBError::from)
+    }
+    
+    fn cancel_response(&self, uuid: Uuid, user_id: Uuid) -> Result<Response, DBError> {
+        debug!("Cancelling response");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Response::cancel_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
+    }
+    
+    fn delete_response(&self, uuid: Uuid, user_id: Uuid) -> Result<(), DBError> {
+        debug!("Deleting response");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Response::delete_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
+    }
+    
+    fn cleanup_expired_response_idempotency_keys(&self) -> Result<u64, DBError> {
+        debug!("Cleaning up expired response idempotency keys");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Response::cleanup_expired_idempotency_keys(conn).map_err(DBError::from)
+    }
+    
+    fn create_conversation_with_response_and_message(
+        &self,
+        conversation_uuid: Uuid,
+        user_id: Uuid,
+        system_prompt_id: Option<i64>,
+        title_enc: Option<Vec<u8>>,
+        metadata: Option<serde_json::Value>,
+        response: Option<NewResponse>,
+        first_message_content: Vec<u8>,
+        first_message_tokens: i32,
+    ) -> Result<(Conversation, Option<Response>, UserMessage), DBError> {
+        debug!("Creating conversation with response and message");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        NewConversation::create_with_response_and_message(
+            conn,
+            conversation_uuid,
+            user_id,
+            system_prompt_id,
+            title_enc,
+            metadata,
+            response,
+            first_message_content,
+            first_message_tokens,
+        )
+        .map_err(DBError::from)
+    }
+
     // User messages
     fn create_user_message(&self, new_msg: NewUserMessage) -> Result<UserMessage, DBError> {
         debug!("Creating new user message");
@@ -2018,17 +2086,6 @@ impl DBConnection for PostgresConnection {
         new_msg.insert(conn).map_err(DBError::from)
     }
 
-    fn update_user_message_status(
-        &self,
-        id: i64,
-        status: ResponseStatus,
-        error: Option<String>,
-        completed_at: Option<DateTime<Utc>>,
-    ) -> Result<(), DBError> {
-        debug!("Updating user message status");
-        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        UserMessage::update_status(conn, id, status, error, completed_at).map_err(DBError::from)
-    }
 
     fn update_user_message_prompt_tokens(
         &self,
@@ -2059,15 +2116,6 @@ impl DBConnection for PostgresConnection {
         UserMessage::get_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
     }
 
-    fn get_user_message_by_idempotency_key(
-        &self,
-        user_id: Uuid,
-        key: &str,
-    ) -> Result<Option<UserMessage>, DBError> {
-        debug!("Getting user message by idempotency key");
-        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        UserMessage::get_by_idempotency_key(conn, user_id, key).map_err(DBError::from)
-    }
 
     fn list_user_messages(
         &self,
@@ -2089,6 +2137,15 @@ impl DBConnection for PostgresConnection {
         debug!("Creating new assistant message");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_msg.insert(conn).map_err(DBError::from)
+    }
+    
+    fn get_assistant_messages_for_response(
+        &self,
+        response_id: i64,
+    ) -> Result<Vec<AssistantMessage>, DBError> {
+        debug!("Getting assistant messages for response");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        AssistantMessage::get_by_response_id(conn, response_id).map_err(DBError::from)
     }
 
     // Tool calls / outputs
@@ -2114,23 +2171,6 @@ impl DBConnection for PostgresConnection {
         RawThreadMessage::get_conversation_context(conn, conversation_id).map_err(DBError::from)
     }
 
-    // Phase 6 additions
-    fn get_assistant_messages_for_user_message(
-        &self,
-        user_message_id: i64,
-    ) -> Result<Vec<AssistantMessage>, DBError> {
-        debug!("Getting assistant messages for user message");
-        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        AssistantMessage::get_by_user_message_id(conn, user_message_id).map_err(DBError::from)
-    }
-
-    fn cancel_user_message(&self, id: Uuid, user_id: Uuid) -> Result<UserMessage, DBError> {
-        debug!("Cancelling user message");
-        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        // First get the message by UUID to find its ID
-        let msg = UserMessage::get_by_uuid_and_user(conn, id, user_id)?;
-        UserMessage::cancel_by_id_and_user(conn, msg.id, user_id).map_err(DBError::from)
-    }
 
     fn delete_user_message(&self, id: Uuid, user_id: Uuid) -> Result<(), DBError> {
         debug!("Deleting user message");
@@ -2141,11 +2181,6 @@ impl DBConnection for PostgresConnection {
     }
 
     // Maintenance
-    fn cleanup_expired_idempotency_keys(&self) -> Result<u64, DBError> {
-        debug!("Cleaning up expired idempotency keys");
-        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        UserMessage::cleanup_expired_idempotency_keys(conn).map_err(DBError::from)
-    }
 }
 
 pub(crate) fn setup_db(url: String) -> Arc<dyn DBConnection + Send + Sync> {

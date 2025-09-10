@@ -1,5 +1,100 @@
 ## Future Enhancements
 
+### Idempotency Support
+
+The Responses API could support idempotent requests to ensure safe retries. This was removed from the initial implementation to simplify the API and make it more OpenAI-compatible, but could be added in the future.
+
+#### Implementation Approach
+
+Idempotency could be handled at the application level with the help of columns in the `responses` table:
+
+**Database Schema**:
+```sql
+-- Idempotency fields in responses table
+idempotency_key TEXT,
+request_hash TEXT,
+idempotency_expires_at TIMESTAMPTZ,
+
+CONSTRAINT idempotency_fields_check CHECK (
+    (idempotency_key IS NULL AND request_hash IS NULL AND idempotency_expires_at IS NULL) OR
+    (idempotency_key IS NOT NULL AND request_hash IS NOT NULL AND idempotency_expires_at IS NOT NULL)
+)
+
+-- Index for efficient idempotency lookups
+CREATE INDEX idx_responses_idempotency 
+    ON responses(user_id, idempotency_key) 
+    WHERE idempotency_key IS NOT NULL;
+```
+
+**Request Handling**:
+```rust
+// Idempotency key handling - simple application-level check
+if let Some(idempotency_key) = headers.get("idempotency-key") {
+    // Hash the request body for comparison
+    let request_hash = sha256(request_body);
+    
+    // Check for existing response with this key
+    if let Some(existing) = db.get_response_by_idempotency_key(
+        &idempotency_key, 
+        user_id
+    ).await? {
+        // Compare request hashes
+        if existing.request_hash != request_hash {
+            return Err(ApiError::IdempotencyKeyReused {
+                message: "Different request body with same idempotency key".into(),
+            });
+        }
+        
+        // Return existing response based on status
+        match existing.status {
+            ResponseStatus::InProgress | ResponseStatus::Queued => {
+                // Return 409 for in-progress requests
+                return Err(ApiError::Conflict {
+                    message: "Request with this idempotency key is already in progress".into(),
+                });
+            }
+            _ => {
+                // Return the completed response
+                return Ok(existing);
+            }
+        }
+    }
+    
+    // Include idempotency info when creating the response
+    new_response.idempotency_key = Some(idempotency_key);
+    new_response.request_hash = Some(request_hash);
+    new_response.idempotency_expires_at = Some(now + 24.hours());
+}
+```
+
+**Key Features**:
+- **One execution per key**: Each idempotency key triggers exactly one LLM call
+- **Request validation**: Same key with different request body is rejected
+- **Automatic expiry**: Keys expire after 24 hours by default
+- **In-progress protection**: Returns 409 if the same key is used while processing
+- **Status-aware**: Returns completed responses immediately
+
+**Cleanup Strategy**:
+```sql
+-- Optional periodic cleanup to remove old idempotency data and save storage
+UPDATE responses 
+SET idempotency_key = NULL, request_hash = NULL, idempotency_expires_at = NULL
+WHERE idempotency_expires_at < CURRENT_TIMESTAMP
+  AND idempotency_key IS NOT NULL;
+```
+
+**Benefits**:
+1. **Safe retries**: Clients can safely retry failed requests without duplicating work
+2. **Cost savings**: Prevents duplicate LLM calls for the same request
+3. **Network resilience**: Handles network interruptions gracefully
+4. **Client simplicity**: Clients don't need complex retry logic
+
+**Considerations**:
+1. **Storage overhead**: Additional columns and index for idempotency data
+2. **Complexity**: More logic in request handling
+3. **OpenAI compatibility**: OpenAI doesn't use idempotency keys in their Responses API
+4. **Cache management**: Need to decide on expiry strategy and cleanup frequency
+
 ### Caching Strategy
 
 1. **Token Count Cache**:

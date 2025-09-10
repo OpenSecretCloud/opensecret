@@ -68,6 +68,8 @@ pub struct Response {
     pub parallel_tool_calls: bool,
     pub store: bool,
     pub metadata: Option<serde_json::Value>,
+    pub input_tokens: Option<i32>,
+    pub output_tokens: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
@@ -111,11 +113,15 @@ impl Response {
         id: i64,
         status: ResponseStatus,
         completed_at: Option<DateTime<Utc>>,
+        input_tokens: Option<i32>,
+        output_tokens: Option<i32>,
     ) -> Result<(), ResponsesError> {
         diesel::update(responses::table.filter(responses::id.eq(id)))
             .set((
                 responses::status.eq(status),
                 responses::completed_at.eq(completed_at),
+                responses::input_tokens.eq(input_tokens),
+                responses::output_tokens.eq(output_tokens),
                 responses::updated_at.eq(diesel::dsl::now),
             ))
             .execute(conn)

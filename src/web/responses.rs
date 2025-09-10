@@ -1225,9 +1225,13 @@ async fn storage_task(
 
     // Handle error case
     if let Some(_error) = error_msg {
-        if let Err(e) =
-            db.update_response_status(response_id, ResponseStatus::Failed, Some(Utc::now()))
-        {
+        if let Err(e) = db.update_response_status(
+            response_id,
+            ResponseStatus::Failed,
+            Some(Utc::now()),
+            None,
+            None,
+        ) {
             error!("Failed to update response status to failed: {:?}", e);
         }
         return;
@@ -1318,10 +1322,14 @@ async fn storage_task(
         });
     }
 
-    // Update response status to completed
-    if let Err(e) =
-        db.update_response_status(response_id, ResponseStatus::Completed, Some(Utc::now()))
-    {
+    // Update response status to completed with token counts
+    if let Err(e) = db.update_response_status(
+        response_id,
+        ResponseStatus::Completed,
+        Some(Utc::now()),
+        Some(prompt_tokens),
+        Some(completion_tokens),
+    ) {
         error!("Failed to update response status to completed: {:?}", e);
     }
 }
@@ -1527,21 +1535,19 @@ async fn get_response(
         output.push_str(&text);
     }
 
-    // Calculate usage if completed
-    // TODO: We need to get the actual input tokens from all user messages in the conversation
-    // For now, we'll use a placeholder
+    // Use the stored token counts from the response
     let usage = if response.status == ResponseStatus::Completed {
-        let total_completion_tokens: i32 =
-            assistant_messages.iter().map(|m| m.completion_tokens).sum();
+        let input_tokens = response.input_tokens.unwrap_or(0);
+        let output_tokens = response.output_tokens.unwrap_or(0);
 
         Some(ResponseUsage {
-            input_tokens: 0, // TODO: Calculate from user messages
+            input_tokens,
             input_tokens_details: InputTokenDetails { cached_tokens: 0 },
-            output_tokens: total_completion_tokens,
+            output_tokens,
             output_tokens_details: OutputTokenDetails {
                 reasoning_tokens: 0,
             },
-            total_tokens: total_completion_tokens,
+            total_tokens: input_tokens + output_tokens,
         })
     } else {
         None

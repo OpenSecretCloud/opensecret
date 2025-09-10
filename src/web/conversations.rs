@@ -4,7 +4,7 @@
 use crate::{
     db::DBError,
     encrypt::{decrypt_with_key, encrypt_with_key},
-    models::responses::{NewConversation, NewUserMessage, ResponseStatus, ResponsesError},
+    models::responses::{NewConversation, NewUserMessage, ResponsesError},
     models::users::User,
     web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
     ApiError, AppState,
@@ -274,25 +274,18 @@ async fn create_conversation(
                         let content_text = content.to_text();
                         let content_enc =
                             encrypt_with_key(&user_key, content_text.as_bytes()).await;
+                        
+                        // Count tokens for the user message
+                        // TODO: Use proper tokenizer for actual token count
+                        let prompt_tokens = content_text.len() as i32 / 4; // rough estimate
+                        
                         let new_msg = NewUserMessage {
                             uuid: Uuid::new_v4(),
                             conversation_id: conversation.id,
+                            response_id: None, // No response when creating via Conversations API
                             user_id: user.uuid,
                             content_enc,
-                            prompt_tokens: None,
-                            status: ResponseStatus::Completed,
-                            model: "gpt-4".to_string(), // Default model
-                            previous_response_id: None,
-                            temperature: None,
-                            top_p: None,
-                            max_output_tokens: None,
-                            tool_choice: None,
-                            parallel_tool_calls: false,
-                            store: true,
-                            metadata: None,
-                            idempotency_key: None,
-                            request_hash: None,
-                            idempotency_expires_at: None,
+                            prompt_tokens,
                         };
 
                         state.db.create_user_message(new_msg).map_err(|e| {
@@ -488,25 +481,17 @@ async fn create_conversation_items(
                     let content_enc = encrypt_with_key(&user_key, content_text.as_bytes()).await;
                     let msg_uuid = Uuid::new_v4();
 
+                    // Count tokens for the user message
+                    // TODO: Use proper tokenizer for actual token count
+                    let prompt_tokens = content_text.len() as i32 / 4; // rough estimate
+                    
                     let new_msg = NewUserMessage {
                         uuid: msg_uuid,
                         conversation_id: conversation.id,
+                        response_id: None, // No response when creating via Conversations API
                         user_id: user.uuid,
                         content_enc,
-                        prompt_tokens: None,
-                        status: ResponseStatus::Completed,
-                        model: "gpt-4".to_string(), // TODO this is wrong
-                        previous_response_id: None,
-                        temperature: None,
-                        top_p: None,
-                        max_output_tokens: None,
-                        tool_choice: None,
-                        parallel_tool_calls: false,
-                        store: true,
-                        metadata: None,
-                        idempotency_key: None,
-                        request_hash: None,
-                        idempotency_expires_at: None,
+                        prompt_tokens,
                     };
 
                     let created = state.db.create_user_message(new_msg).map_err(|e| {

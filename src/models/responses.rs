@@ -1,5 +1,5 @@
 use crate::models::schema::{
-    assistant_messages, conversations, tool_calls, tool_outputs, user_messages, user_system_prompts,
+    assistant_messages, conversations, responses, tool_calls, tool_outputs, user_messages, user_system_prompts,
 };
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
@@ -17,6 +17,8 @@ pub enum ResponsesError {
     DatabaseError(#[from] diesel::result::Error),
     #[error("Conversation not found")]
     ConversationNotFound,
+    #[error("Response not found")]
+    ResponseNotFound,
     #[error("User message not found")]
     UserMessageNotFound,
     #[error("System prompt not found")]
@@ -46,6 +48,172 @@ pub enum ResponseStatus {
 }
 
 // ============================================================================
+// Responses (Job Tracker)
+// ============================================================================
+
+#[derive(Queryable, Selectable, Identifiable, Debug, Clone, Serialize, Deserialize)]
+#[diesel(table_name = responses)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct Response {
+    pub id: i64,
+    pub uuid: Uuid,
+    pub user_id: Uuid,
+    pub conversation_id: i64,
+    pub status: ResponseStatus,
+    pub model: String,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub max_output_tokens: Option<i32>,
+    pub tool_choice: Option<String>,
+    pub parallel_tool_calls: bool,
+    pub store: bool,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+    pub idempotency_key: Option<String>,
+    pub request_hash: Option<String>,
+    pub idempotency_expires_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Insertable, Debug)]
+#[diesel(table_name = responses)]
+pub struct NewResponse {
+    pub uuid: Uuid,
+    pub user_id: Uuid,
+    pub conversation_id: i64,
+    pub status: ResponseStatus,
+    pub model: String,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub max_output_tokens: Option<i32>,
+    pub tool_choice: Option<String>,
+    pub parallel_tool_calls: bool,
+    pub store: bool,
+    pub metadata: Option<serde_json::Value>,
+    pub idempotency_key: Option<String>,
+    pub request_hash: Option<String>,
+    pub idempotency_expires_at: Option<DateTime<Utc>>,
+}
+
+impl Response {
+    pub fn get_by_uuid_and_user(
+        conn: &mut PgConnection,
+        uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<Response, ResponsesError> {
+        responses::table
+            .filter(responses::uuid.eq(uuid))
+            .filter(responses::user_id.eq(user_id))
+            .first::<Response>(conn)
+            .map_err(|e| match e {
+                diesel::result::Error::NotFound => ResponsesError::ResponseNotFound,
+                _ => ResponsesError::DatabaseError(e),
+            })
+    }
+
+    pub fn get_by_idempotency_key(
+        conn: &mut PgConnection,
+        user_id: Uuid,
+        key: &str,
+    ) -> Result<Option<Response>, ResponsesError> {
+        responses::table
+            .filter(responses::user_id.eq(user_id))
+            .filter(responses::idempotency_key.eq(key))
+            .filter(responses::idempotency_expires_at.gt(diesel::dsl::now))
+            .first::<Response>(conn)
+            .optional()
+            .map_err(ResponsesError::DatabaseError)
+    }
+
+    pub fn update_status(
+        conn: &mut PgConnection,
+        id: i64,
+        status: ResponseStatus,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<(), ResponsesError> {
+        diesel::update(responses::table.filter(responses::id.eq(id)))
+            .set((
+                responses::status.eq(status),
+                responses::completed_at.eq(completed_at),
+                responses::updated_at.eq(diesel::dsl::now),
+            ))
+            .execute(conn)
+            .map(|_| ())
+            .map_err(ResponsesError::DatabaseError)
+    }
+
+    pub fn cancel_by_uuid_and_user(
+        conn: &mut PgConnection,
+        uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<Response, ResponsesError> {
+        let response = Self::get_by_uuid_and_user(conn, uuid, user_id)?;
+        
+        match response.status {
+            ResponseStatus::InProgress | ResponseStatus::Queued => {
+                diesel::update(responses::table.filter(responses::id.eq(response.id)))
+                    .set((
+                        responses::status.eq(ResponseStatus::Cancelled),
+                        responses::completed_at.eq(diesel::dsl::now),
+                        responses::updated_at.eq(diesel::dsl::now),
+                    ))
+                    .get_result(conn)
+                    .map_err(ResponsesError::DatabaseError)
+            },
+            _ => Err(ResponsesError::ValidationError),
+        }
+    }
+
+    pub fn delete_by_uuid_and_user(
+        conn: &mut PgConnection,
+        uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<(), ResponsesError> {
+        diesel::delete(
+            responses::table
+                .filter(responses::uuid.eq(uuid))
+                .filter(responses::user_id.eq(user_id)),
+        )
+        .execute(conn)
+        .map(|rows| {
+            if rows == 0 {
+                Err(ResponsesError::ResponseNotFound)
+            } else {
+                Ok(())
+            }
+        })?
+    }
+
+    pub fn cleanup_expired_idempotency_keys(
+        conn: &mut PgConnection,
+    ) -> Result<u64, ResponsesError> {
+        diesel::update(
+            responses::table
+                .filter(responses::idempotency_expires_at.lt(diesel::dsl::now))
+                .filter(responses::idempotency_key.is_not_null()),
+        )
+        .set((
+            responses::idempotency_key.eq(None::<String>),
+            responses::request_hash.eq(None::<String>),
+            responses::idempotency_expires_at.eq(None::<DateTime<Utc>>),
+        ))
+        .execute(conn)
+        .map(|count| count as u64)
+        .map_err(ResponsesError::DatabaseError)
+    }
+}
+
+impl NewResponse {
+    pub fn insert(&self, conn: &mut PgConnection) -> Result<Response, ResponsesError> {
+        diesel::insert_into(responses::table)
+            .values(self)
+            .get_result(conn)
+            .map_err(ResponsesError::DatabaseError)
+    }
+}
+
+// ============================================================================
 // User System Prompts
 // ============================================================================
 
@@ -58,7 +226,7 @@ pub struct UserSystemPrompt {
     pub user_id: Uuid,
     pub name_enc: Vec<u8>,
     pub prompt_enc: Vec<u8>,
-    pub prompt_tokens: Option<i32>,
+    pub prompt_tokens: i32,
     pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -71,7 +239,7 @@ pub struct NewUserSystemPrompt {
     pub user_id: Uuid,
     pub name_enc: Vec<u8>,
     pub prompt_enc: Vec<u8>,
-    pub prompt_tokens: Option<i32>,
+    pub prompt_tokens: i32,
     pub is_default: bool,
 }
 
@@ -196,16 +364,18 @@ impl NewConversation {
             .map_err(ResponsesError::DatabaseError)
     }
 
-    /// Creates a new conversation and its first user message in a transaction
-    pub fn create_with_first_message(
+    /// Creates a new conversation with optional response and first message in a transaction
+    pub fn create_with_response_and_message(
         conn: &mut PgConnection,
         conversation_uuid: Uuid,
         user_id: Uuid,
         system_prompt_id: Option<i64>,
         title_enc: Option<Vec<u8>>,
         metadata: Option<serde_json::Value>,
-        first_message: NewUserMessage,
-    ) -> Result<(Conversation, UserMessage), ResponsesError> {
+        response: Option<NewResponse>,
+        first_message_content: Vec<u8>,
+        first_message_tokens: i32,
+    ) -> Result<(Conversation, Option<Response>, UserMessage), ResponsesError> {
         use diesel::Connection;
 
         conn.transaction(|tx| {
@@ -219,12 +389,26 @@ impl NewConversation {
             };
             let conversation = new_conversation.insert(tx)?;
 
-            // Create the first message with the conversation's ID
-            let mut message_with_conversation = first_message;
-            message_with_conversation.conversation_id = conversation.id;
-            let user_message = message_with_conversation.insert(tx)?;
+            // Create the response if provided
+            let response_result = if let Some(mut new_response) = response {
+                new_response.conversation_id = conversation.id;
+                Some(new_response.insert(tx)?)
+            } else {
+                None
+            };
 
-            Ok((conversation, user_message))
+            // Create the first message
+            let new_message = NewUserMessage {
+                uuid: Uuid::new_v4(),
+                conversation_id: conversation.id,
+                response_id: response_result.as_ref().map(|r| r.id),
+                user_id,
+                content_enc: first_message_content,
+                prompt_tokens: first_message_tokens,
+            };
+            let user_message = new_message.insert(tx)?;
+
+            Ok((conversation, response_result, user_message))
         })
     }
 }
@@ -240,26 +424,12 @@ pub struct UserMessage {
     pub id: i64,
     pub uuid: Uuid,
     pub conversation_id: i64,
+    pub response_id: Option<i64>,
     pub user_id: Uuid,
     pub content_enc: Vec<u8>,
-    pub prompt_tokens: Option<i32>,
-    pub status: ResponseStatus,
-    pub model: String,
-    pub previous_response_id: Option<Uuid>,
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub max_output_tokens: Option<i32>,
-    pub tool_choice: Option<String>,
-    pub parallel_tool_calls: bool,
-    pub store: bool,
-    pub metadata: Option<serde_json::Value>,
-    pub error: Option<String>,
+    pub prompt_tokens: i32,
     pub created_at: DateTime<Utc>,
-    pub completed_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
-    pub idempotency_key: Option<String>,
-    pub request_hash: Option<String>,
-    pub idempotency_expires_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Insertable, Debug)]
@@ -267,22 +437,10 @@ pub struct UserMessage {
 pub struct NewUserMessage {
     pub uuid: Uuid,
     pub conversation_id: i64,
+    pub response_id: Option<i64>,
     pub user_id: Uuid,
     pub content_enc: Vec<u8>,
-    pub prompt_tokens: Option<i32>,
-    pub status: ResponseStatus,
-    pub model: String,
-    pub previous_response_id: Option<Uuid>,
-    pub temperature: Option<f32>,
-    pub top_p: Option<f32>,
-    pub max_output_tokens: Option<i32>,
-    pub tool_choice: Option<String>,
-    pub parallel_tool_calls: bool,
-    pub store: bool,
-    pub metadata: Option<serde_json::Value>,
-    pub idempotency_key: Option<String>,
-    pub request_hash: Option<String>,
-    pub idempotency_expires_at: Option<DateTime<Utc>>,
+    pub prompt_tokens: i32,
 }
 
 impl UserMessage {
@@ -316,38 +474,9 @@ impl UserMessage {
             })
     }
 
-    pub fn get_by_idempotency_key(
-        conn: &mut PgConnection,
-        user_id: Uuid,
-        key: &str,
-    ) -> Result<Option<UserMessage>, ResponsesError> {
-        user_messages::table
-            .filter(user_messages::user_id.eq(user_id))
-            .filter(user_messages::idempotency_key.eq(key))
-            .filter(user_messages::idempotency_expires_at.gt(diesel::dsl::now))
-            .first::<UserMessage>(conn)
-            .optional()
-            .map_err(ResponsesError::DatabaseError)
-    }
+    // Note: idempotency is now handled at the Response level
 
-    pub fn update_status(
-        conn: &mut PgConnection,
-        id: i64,
-        status: ResponseStatus,
-        error: Option<String>,
-        completed_at: Option<DateTime<Utc>>,
-    ) -> Result<(), ResponsesError> {
-        diesel::update(user_messages::table.filter(user_messages::id.eq(id)))
-            .set((
-                user_messages::status.eq(status),
-                user_messages::error.eq(error),
-                user_messages::completed_at.eq(completed_at),
-                user_messages::updated_at.eq(diesel::dsl::now),
-            ))
-            .execute(conn)
-            .map(|_| ())
-            .map_err(ResponsesError::DatabaseError)
-    }
+    // Note: status is now tracked on Response, not UserMessage
 
     pub fn list_for_user(
         conn: &mut PgConnection,
@@ -387,23 +516,7 @@ impl UserMessage {
             .map_err(ResponsesError::DatabaseError)
     }
 
-    pub fn cleanup_expired_idempotency_keys(
-        conn: &mut PgConnection,
-    ) -> Result<u64, ResponsesError> {
-        diesel::update(
-            user_messages::table
-                .filter(user_messages::idempotency_expires_at.lt(diesel::dsl::now))
-                .filter(user_messages::idempotency_key.is_not_null()),
-        )
-        .set((
-            user_messages::idempotency_key.eq(None::<String>),
-            user_messages::request_hash.eq(None::<String>),
-            user_messages::idempotency_expires_at.eq(None::<DateTime<Utc>>),
-        ))
-        .execute(conn)
-        .map(|count| count as u64)
-        .map_err(ResponsesError::DatabaseError)
-    }
+    // Note: cleanup_expired_idempotency_keys is now on Response
 
     pub fn delete_by_id_and_user(
         conn: &mut PgConnection,
@@ -425,38 +538,7 @@ impl UserMessage {
         })?
     }
 
-    pub fn cancel_by_id_and_user(
-        conn: &mut PgConnection,
-        id: i64,
-        user_id: Uuid,
-    ) -> Result<UserMessage, ResponsesError> {
-        // First check the current status
-        let message = user_messages::table
-            .filter(user_messages::id.eq(id))
-            .filter(user_messages::user_id.eq(user_id))
-            .first::<UserMessage>(conn)
-            .map_err(|e| match e {
-                diesel::result::Error::NotFound => ResponsesError::UserMessageNotFound,
-                _ => ResponsesError::DatabaseError(e),
-            })?;
-
-        // Only allow cancelling if in progress
-        match message.status {
-            ResponseStatus::InProgress | ResponseStatus::Queued => diesel::update(
-                user_messages::table
-                    .filter(user_messages::id.eq(id))
-                    .filter(user_messages::user_id.eq(user_id)),
-            )
-            .set((
-                user_messages::status.eq(ResponseStatus::Cancelled),
-                user_messages::completed_at.eq(diesel::dsl::now),
-                user_messages::updated_at.eq(diesel::dsl::now),
-            ))
-            .get_result(conn)
-            .map_err(ResponsesError::DatabaseError),
-            _ => Err(ResponsesError::ValidationError),
-        }
-    }
+    // Note: cancellation is now handled at the Response level
 }
 
 impl NewUserMessage {
@@ -479,11 +561,13 @@ pub struct ToolCall {
     pub id: i64,
     pub uuid: Uuid,
     pub conversation_id: i64,
-    pub user_message_id: i64,
+    pub response_id: Option<i64>,
+    pub user_id: Uuid,
     pub tool_call_id: Uuid,
     pub name: String,
     pub arguments_enc: Option<Vec<u8>>,
-    pub argument_tokens: Option<i32>,
+    pub argument_tokens: i32,
+    pub status: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -493,11 +577,13 @@ pub struct ToolCall {
 pub struct NewToolCall {
     pub uuid: Uuid,
     pub conversation_id: i64,
-    pub user_message_id: i64,
+    pub response_id: Option<i64>,
+    pub user_id: Uuid,
     pub tool_call_id: Uuid,
     pub name: String,
     pub arguments_enc: Option<Vec<u8>>,
-    pub argument_tokens: Option<i32>,
+    pub argument_tokens: i32,
+    pub status: Option<String>,
 }
 
 impl NewToolCall {
@@ -520,9 +606,11 @@ pub struct ToolOutput {
     pub id: i64,
     pub uuid: Uuid,
     pub conversation_id: i64,
+    pub response_id: Option<i64>,
+    pub user_id: Uuid,
     pub tool_call_fk: i64,
     pub output_enc: Vec<u8>,
-    pub output_tokens: Option<i32>,
+    pub output_tokens: i32,
     pub status: String,
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -534,9 +622,11 @@ pub struct ToolOutput {
 pub struct NewToolOutput {
     pub uuid: Uuid,
     pub conversation_id: i64,
+    pub response_id: Option<i64>,
+    pub user_id: Uuid,
     pub tool_call_fk: i64,
     pub output_enc: Vec<u8>,
-    pub output_tokens: Option<i32>,
+    pub output_tokens: i32,
     pub status: String,
     pub error: Option<String>,
 }
@@ -561,9 +651,10 @@ pub struct AssistantMessage {
     pub id: i64,
     pub uuid: Uuid,
     pub conversation_id: i64,
-    pub user_message_id: i64,
+    pub response_id: Option<i64>,
+    pub user_id: Uuid,
     pub content_enc: Vec<u8>,
-    pub completion_tokens: Option<i32>,
+    pub completion_tokens: i32,
     pub finish_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -574,19 +665,20 @@ pub struct AssistantMessage {
 pub struct NewAssistantMessage {
     pub uuid: Uuid,
     pub conversation_id: i64,
-    pub user_message_id: i64,
+    pub response_id: Option<i64>,
+    pub user_id: Uuid,
     pub content_enc: Vec<u8>,
-    pub completion_tokens: Option<i32>,
+    pub completion_tokens: i32,
     pub finish_reason: Option<String>,
 }
 
 impl AssistantMessage {
-    pub fn get_by_user_message_id(
+    pub fn get_by_response_id(
         conn: &mut PgConnection,
-        user_message_id: i64,
+        response_id: i64,
     ) -> Result<Vec<AssistantMessage>, ResponsesError> {
         assistant_messages::table
-            .filter(assistant_messages::user_message_id.eq(user_message_id))
+            .filter(assistant_messages::response_id.eq(response_id))
             .order(assistant_messages::created_at.asc())
             .load::<AssistantMessage>(conn)
             .map_err(ResponsesError::DatabaseError)
@@ -643,11 +735,12 @@ impl RawThreadMessage {
                     um.uuid,
                     um.content_enc,
                     um.created_at,
-                    um.model,
+                    r.model,
                     um.prompt_tokens as token_count,
                     NULL::uuid as tool_call_id,
                     NULL::text as finish_reason
                 FROM user_messages um
+                LEFT JOIN responses r ON um.response_id = r.id
                 WHERE um.conversation_id = $1
                 
                 UNION ALL
@@ -659,12 +752,12 @@ impl RawThreadMessage {
                     am.uuid,
                     am.content_enc,
                     am.created_at,
-                    um.model,
+                    r.model,
                     am.completion_tokens as token_count,
                     NULL::uuid as tool_call_id,
                     am.finish_reason
                 FROM assistant_messages am
-                JOIN user_messages um ON am.user_message_id = um.id
+                LEFT JOIN responses r ON am.response_id = r.id
                 WHERE am.conversation_id = $1
                 
                 UNION ALL

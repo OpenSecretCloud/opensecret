@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -111,6 +112,15 @@ type ChatCompletionResponse struct {
 	Model   string   `json:"model"`
 	Choices []Choice `json:"choices"`
 	Usage   *Usage   `json:"usage,omitempty"`
+}
+
+type TTSRequest struct {
+	Model          string  `json:"model"`
+	Input          string  `json:"input"`
+	Voice          string  `json:"voice"`
+	ResponseFormat string  `json:"response_format,omitempty"`
+	Speed          float32 `json:"speed,omitempty"`
+	StreamFormat   string  `json:"stream_format,omitempty"`
 }
 
 type TinfoilProxyServer struct {
@@ -593,6 +603,124 @@ func (s *TinfoilProxyServer) nonStreamingChatCompletion(c *gin.Context, req Chat
 	c.JSON(http.StatusOK, response)
 }
 
+func (s *TinfoilProxyServer) handleTTS(c *gin.Context) {
+	var req TTSRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	log.Printf("TTS request for model: %s, voice: %s", req.Model, req.Voice)
+
+	client, err := s.getClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Use voice directly without mapping
+	voice := req.Voice
+	if voice == "" {
+		voice = "af_sky" // Default Kokoro voice
+	}
+
+	// Default values
+	if req.ResponseFormat == "" {
+		req.ResponseFormat = "mp3"
+	}
+	if req.Speed == 0 {
+		req.Speed = 1.0
+	}
+
+	// Map response format to OpenAI SDK format enum
+	var responseFormat openai.AudioSpeechNewParamsResponseFormat
+	switch req.ResponseFormat {
+	case "mp3":
+		responseFormat = openai.AudioSpeechNewParamsResponseFormatMP3
+	case "opus":
+		responseFormat = openai.AudioSpeechNewParamsResponseFormatOpus
+	case "aac":
+		responseFormat = openai.AudioSpeechNewParamsResponseFormatAAC
+	case "flac":
+		responseFormat = openai.AudioSpeechNewParamsResponseFormatFLAC
+	case "wav":
+		responseFormat = openai.AudioSpeechNewParamsResponseFormatWAV
+	case "pcm":
+		// PCM might not be a standard OpenAI format, default to WAV
+		responseFormat = openai.AudioSpeechNewParamsResponseFormatWAV
+	default:
+		responseFormat = openai.AudioSpeechNewParamsResponseFormatMP3
+	}
+
+	// Build TTS params using Kokoro model
+	params := openai.AudioSpeechNewParams{
+		Model:          "kokoro", // Always use Kokoro for TTS
+		Voice:          openai.AudioSpeechNewParamsVoice(voice), // Cast string to voice type
+		Input:          req.Input,
+		ResponseFormat: responseFormat,
+		Speed:          openai.Float(float64(req.Speed)),
+	}
+
+	// Create speech
+	ctx := c.Request.Context()
+	response, err := client.Audio.Speech.New(ctx, params)
+	if err != nil {
+		log.Printf("TTS error: %v", err)
+		
+		// Check if this is a certificate error and reinitialize if needed
+		if isCertificateError(err) {
+			go func() {
+				if reinitErr := s.reinitializeClient(); reinitErr != nil {
+					log.Printf("Failed to reinitialize client: %v", reinitErr)
+				}
+			}()
+		}
+		
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer response.Body.Close()
+
+	// Set appropriate content type based on format
+	contentType := "audio/mpeg" // default to mp3
+	switch req.ResponseFormat {
+	case "opus":
+		contentType = "audio/opus"
+	case "aac":
+		contentType = "audio/aac"
+	case "flac":
+		contentType = "audio/flac"
+	case "wav":
+		contentType = "audio/wav"
+	case "pcm":
+		contentType = "audio/pcm"
+	}
+
+	// Stream the audio response back to client
+	c.Header("Content-Type", contentType)
+	c.Status(http.StatusOK)
+	
+	// Copy the response body to the client
+	buffer := make([]byte, 4096)
+	for {
+		n, err := response.Body.Read(buffer)
+		if n > 0 {
+			if _, writeErr := c.Writer.Write(buffer[:n]); writeErr != nil {
+				log.Printf("Error writing TTS response: %v", writeErr)
+				return
+			}
+			c.Writer.Flush()
+		}
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Error reading TTS response: %v", err)
+			}
+			break
+		}
+	}
+}
+
+
 func main() {
 	// Initialize proxy server
 	server, err := NewTinfoilProxyServer()
@@ -649,6 +777,11 @@ func main() {
 		} else {
 			server.nonStreamingChatCompletion(c, req)
 		}
+	})
+
+	// TTS endpoint
+	r.POST("/v1/audio/speech", func(c *gin.Context) {
+		server.handleTTS(c)
 	})
 
 	// Start server

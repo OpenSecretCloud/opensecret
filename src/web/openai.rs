@@ -20,7 +20,7 @@ use futures::stream::{self, StreamExt};
 use futures::TryStreamExt;
 use hyper::body::to_bytes;
 use hyper::header::{HeaderName, HeaderValue};
-use hyper::{Body, Client, Request};
+use hyper::{Client, Request, Body as HyperBody};
 use hyper_tls::HttpsConnector;
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -34,6 +34,7 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
     Router::new()
         .route("/v1/chat/completions", post(proxy_openai))
         .route("/v1/models", get(proxy_models))
+        .route("/v1/audio/speech", post(proxy_tts))
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             decrypt_request::<Value>,
@@ -128,7 +129,7 @@ async fn proxy_openai(
     let client = Client::builder()
         .pool_idle_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(10)
-        .build::<_, Body>(https);
+        .build::<_, HyperBody>(https);
 
     // Prepare the request to proxies
     debug!("Sending request for model: {}", model_name);
@@ -592,13 +593,152 @@ async fn proxy_models(
     encrypt_response(&state, &session_id, &models_response).await
 }
 
+async fn proxy_tts(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::Extension(_session_id): axum::Extension<Uuid>,
+    axum::Extension(user): axum::Extension<User>,
+    axum::Extension(_auth_method): axum::Extension<AuthMethod>,
+    axum::Extension(body): axum::Extension<Value>,
+) -> Result<Response, ApiError> {
+    debug!("Entering proxy_tts function");
+
+    // Prevent guest users from using the TTS feature
+    if user.is_guest() {
+        error!(
+            "Guest user attempted to use TTS feature: {}",
+            user.uuid
+        );
+        return Err(ApiError::Unauthorized);
+    }
+
+    if body.is_null() || body.as_object().map_or(true, |obj| obj.is_empty()) {
+        error!("Request body is empty or invalid");
+        return Err(ApiError::BadRequest);
+    }
+
+    let body_obj = body.as_object().expect("body was just checked");
+    
+    // Extract required parameters
+    let input = body_obj
+        .get("input")
+        .and_then(|i| i.as_str())
+        .ok_or_else(|| {
+            error!("Input text not specified in request");
+            ApiError::BadRequest
+        })?;
+
+    let model = body_obj
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("tts-1");
+
+    let voice = body_obj
+        .get("voice")
+        .and_then(|v| v.as_str())
+        .unwrap_or("af_sky");  // Default to a Kokoro voice if not specified
+
+    let response_format = body_obj
+        .get("response_format")
+        .and_then(|f| f.as_str())
+        .unwrap_or("mp3");
+
+    let speed = body_obj
+        .get("speed")
+        .and_then(|s| s.as_f64())
+        .unwrap_or(1.0) as f32;
+
+    // Build request for Tinfoil Kokoro - pass voice directly without mapping
+    let tts_request = json!({
+        "model": "kokoro",
+        "voice": voice,
+        "input": input,
+        "response_format": response_format,
+        "speed": speed,
+    });
+
+    // Use the tinfoil proxy configuration
+    // For now, we'll hardcode to use tinfoil proxy - in future could route based on model
+    let base_url = state.proxy_router.get_tinfoil_base_url()
+        .ok_or_else(|| {
+            error!("Tinfoil proxy not configured for TTS");
+            ApiError::InternalServerError
+        })?;
+    
+    let proxy_config = ProxyConfig {
+        base_url,
+        api_key: None, // Tinfoil proxy handles auth internally
+        provider_name: "tinfoil".to_string(),
+    };
+
+    // Create a new hyper client
+    let https = HttpsConnector::new();
+    let client = Client::builder()
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(10)
+        .build::<_, HyperBody>(https);
+
+    // Build request
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("{}/v1/audio/speech", proxy_config.base_url))
+        .header("Content-Type", "application/json")
+        .body(HyperBody::from(serde_json::to_string(&tts_request).map_err(|e| {
+            error!("Failed to serialize TTS request: {:?}", e);
+            ApiError::InternalServerError
+        })?))
+        .map_err(|e| {
+            error!("Failed to create request: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    // Send request
+    let res = client.request(req).await.map_err(|e| {
+        error!("Failed to send TTS request: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    if !res.status().is_success() {
+        error!("TTS proxy returned non-success status: {}", res.status());
+        return Err(ApiError::InternalServerError);
+    }
+
+    // Get response body as bytes
+    let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
+        error!("Failed to read TTS response body: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    // Build response with appropriate content type
+    let content_type = match response_format {
+        "mp3" => "audio/mpeg",
+        "opus" => "audio/opus",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "wav" => "audio/wav",
+        "pcm" => "audio/pcm",
+        _ => "audio/mpeg", // Default to MP3
+    };
+
+    debug!("Exiting proxy_tts function");
+    
+    Ok(Response::builder()
+        .status(200)
+        .header("Content-Type", content_type)
+        .body(axum::body::Body::from(body_bytes))
+        .map_err(|e| {
+            error!("Failed to build response: {:?}", e);
+            ApiError::InternalServerError
+        })?)
+}
+
 /// Helper function to try a provider once
 async fn try_provider(
-    client: &Client<HttpsConnector<hyper::client::HttpConnector>>,
+    client: &Client<HttpsConnector<hyper::client::HttpConnector>, HyperBody>,
     proxy_config: &ProxyConfig,
     body_json: &str,
     headers: &HeaderMap,
-) -> Result<hyper::Response<Body>, String> {
+) -> Result<hyper::Response<HyperBody>, String> {
     debug!("Making request to {}", proxy_config.provider_name);
 
     // Build request
@@ -630,7 +770,7 @@ async fn try_provider(
     }
 
     let req = req
-        .body(Body::from(body_json.to_string()))
+        .body(HyperBody::from(body_json.to_string()))
         .map_err(|e| format!("Failed to create request body: {:?}", e))?;
 
     match client.request(req).await {

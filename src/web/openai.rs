@@ -20,7 +20,7 @@ use futures::stream::{self, StreamExt};
 use futures::TryStreamExt;
 use hyper::body::to_bytes;
 use hyper::header::{HeaderName, HeaderValue};
-use hyper::{Client, Request, Body as HyperBody};
+use hyper::{Body as HyperBody, Client, Request};
 use hyper_tls::HttpsConnector;
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -595,20 +595,17 @@ async fn proxy_models(
 
 async fn proxy_tts(
     State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    axum::Extension(_session_id): axum::Extension<Uuid>,
+    _headers: HeaderMap,
+    axum::Extension(session_id): axum::Extension<Uuid>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(body): axum::Extension<Value>,
-) -> Result<Response, ApiError> {
+) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
     debug!("Entering proxy_tts function");
 
     // Prevent guest users from using the TTS feature
     if user.is_guest() {
-        error!(
-            "Guest user attempted to use TTS feature: {}",
-            user.uuid
-        );
+        error!("Guest user attempted to use TTS feature: {}", user.uuid);
         return Err(ApiError::Unauthorized);
     }
 
@@ -618,7 +615,7 @@ async fn proxy_tts(
     }
 
     let body_obj = body.as_object().expect("body was just checked");
-    
+
     // Extract required parameters
     let input = body_obj
         .get("input")
@@ -631,12 +628,21 @@ async fn proxy_tts(
     let model = body_obj
         .get("model")
         .and_then(|m| m.as_str())
-        .unwrap_or("tts-1");
+        .unwrap_or("kokoro");
+
+    // Only kokoro is supported for TTS
+    if model != "kokoro" {
+        error!(
+            "Unsupported TTS model: {}. Only 'kokoro' is supported",
+            model
+        );
+        return Err(ApiError::BadRequest);
+    }
 
     let voice = body_obj
         .get("voice")
         .and_then(|v| v.as_str())
-        .unwrap_or("af_sky");  // Default to a Kokoro voice if not specified
+        .unwrap_or("af_sky"); // Default to a Kokoro voice if not specified
 
     let response_format = body_obj
         .get("response_format")
@@ -659,12 +665,11 @@ async fn proxy_tts(
 
     // Use the tinfoil proxy configuration
     // For now, we'll hardcode to use tinfoil proxy - in future could route based on model
-    let base_url = state.proxy_router.get_tinfoil_base_url()
-        .ok_or_else(|| {
-            error!("Tinfoil proxy not configured for TTS");
-            ApiError::InternalServerError
-        })?;
-    
+    let base_url = state.proxy_router.get_tinfoil_base_url().ok_or_else(|| {
+        error!("Tinfoil proxy not configured for TTS");
+        ApiError::InternalServerError
+    })?;
+
     let proxy_config = ProxyConfig {
         base_url,
         api_key: None, // Tinfoil proxy handles auth internally
@@ -683,10 +688,12 @@ async fn proxy_tts(
         .method("POST")
         .uri(format!("{}/v1/audio/speech", proxy_config.base_url))
         .header("Content-Type", "application/json")
-        .body(HyperBody::from(serde_json::to_string(&tts_request).map_err(|e| {
-            error!("Failed to serialize TTS request: {:?}", e);
-            ApiError::InternalServerError
-        })?))
+        .body(HyperBody::from(
+            serde_json::to_string(&tts_request).map_err(|e| {
+                error!("Failed to serialize TTS request: {:?}", e);
+                ApiError::InternalServerError
+            })?,
+        ))
         .map_err(|e| {
             error!("Failed to create request: {:?}", e);
             ApiError::InternalServerError
@@ -709,27 +716,24 @@ async fn proxy_tts(
         ApiError::InternalServerError
     })?;
 
-    // Build response with appropriate content type
-    let content_type = match response_format {
-        "mp3" => "audio/mpeg",
-        "opus" => "audio/opus",
-        "aac" => "audio/aac",
-        "flac" => "audio/flac",
-        "wav" => "audio/wav",
-        "pcm" => "audio/pcm",
-        _ => "audio/mpeg", // Default to MP3
-    };
+    // Create a response object with the audio data and metadata
+    let audio_response = json!({
+        "content_base64": general_purpose::STANDARD.encode(&body_bytes),
+        "content_type": match response_format {
+            "mp3" => "audio/mpeg",
+            "opus" => "audio/opus",
+            "aac" => "audio/aac",
+            "flac" => "audio/flac",
+            "wav" => "audio/wav",
+            "pcm" => "audio/pcm",
+            _ => "audio/mpeg", // Default to MP3
+        },
+    });
 
     debug!("Exiting proxy_tts function");
-    
-    Ok(Response::builder()
-        .status(200)
-        .header("Content-Type", content_type)
-        .body(axum::body::Body::from(body_bytes))
-        .map_err(|e| {
-            error!("Failed to build response: {:?}", e);
-            ApiError::InternalServerError
-        })?)
+
+    // Encrypt and return the response
+    encrypt_response(&state, &session_id, &audio_response).await
 }
 
 /// Helper function to try a provider once

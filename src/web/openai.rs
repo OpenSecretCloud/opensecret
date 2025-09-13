@@ -2,6 +2,7 @@ use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
+use crate::web::audio_utils::{AudioSplitter, merge_transcriptions};
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
 use crate::web::openai_auth::AuthMethod;
 use crate::{ApiError, AppState};
@@ -29,6 +30,17 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace};
 use uuid::Uuid;
+
+/// Parameters for transcription requests
+struct TranscriptionParams<'a> {
+    audio_data: &'a [u8],
+    filename: &'a str,
+    content_type: &'a str,
+    language: Option<&'a str>,
+    prompt: Option<&'a str>,
+    response_format: &'a str,
+    temperature: Option<f64>,
+}
 
 pub fn router(app_state: Arc<AppState>) -> Router<()> {
     Router::new()
@@ -594,6 +606,109 @@ async fn proxy_models(
     encrypt_response(&state, &session_id, &models_response).await
 }
 
+/// Helper function to send transcription request with retries to primary and fallback providers
+async fn send_transcription_with_retries(
+    client: &Client<HttpsConnector<hyper::client::HttpConnector>, HyperBody>,
+    route: &crate::proxy_config::ModelRoute,
+    state: &Arc<AppState>,
+    model_name: &str,
+    params: &TranscriptionParams<'_>,
+) -> Result<Value, String> {
+    let max_cycles = 3;
+    let mut last_error = None;
+    
+    for cycle in 0..max_cycles {
+        if cycle > 0 {
+            let delay = cycle as u64;
+            debug!("Starting cycle {} after {}s delay", cycle + 1, delay);
+            sleep(Duration::from_secs(delay)).await;
+        }
+        
+        // Try primary
+        debug!(
+            "Cycle {}: Trying primary provider {} for transcription",
+            cycle + 1,
+            route.primary.provider_name
+        );
+        
+        let primary_model = state
+            .proxy_router
+            .get_model_name_for_provider(model_name, &route.primary.provider_name);
+        
+        match send_transcription_request(
+            client,
+            &route.primary,
+            &primary_model,
+            params,
+        )
+        .await
+        {
+            Ok(response) => {
+                info!(
+                    "Successfully got transcription from primary provider {} on cycle {}",
+                    route.primary.provider_name,
+                    cycle + 1
+                );
+                return Ok(response);
+            }
+            Err(err) => {
+                error!(
+                    "Cycle {}: Primary provider {} failed: {}",
+                    cycle + 1,
+                    route.primary.provider_name,
+                    err
+                );
+                last_error = Some(err);
+            }
+        }
+        
+        // Try fallback if available
+        if let Some(fallback) = route.fallbacks.first() {
+            debug!(
+                "Cycle {}: Trying fallback provider {} for transcription",
+                cycle + 1,
+                fallback.provider_name
+            );
+            
+            let fallback_model = state
+                .proxy_router
+                .get_model_name_for_provider(model_name, &fallback.provider_name);
+            
+            match send_transcription_request(
+                client,
+                fallback,
+                &fallback_model,
+                params,
+            )
+            .await
+            {
+                Ok(response) => {
+                    info!(
+                        "Successfully got transcription from fallback provider {} on cycle {}",
+                        fallback.provider_name,
+                        cycle + 1
+                    );
+                    return Ok(response);
+                }
+                Err(err) => {
+                    error!(
+                        "Cycle {}: Fallback provider {} failed: {}",
+                        cycle + 1,
+                        fallback.provider_name,
+                        err
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+    }
+    
+    Err(format!(
+        "All providers failed after {} cycles. Last error: {:?}",
+        max_cycles, last_error
+    ))
+}
+
 async fn proxy_transcription(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
@@ -645,6 +760,11 @@ async fn proxy_transcription(
         ApiError::BadRequest
     })?;
 
+    // Check if we need to split the audio
+    let splitter = AudioSplitter::new();
+    let file_size = file_bytes.len();
+    info!("Audio file size: {} bytes", file_size);
+
     // Extract the model from the request
     let model_name = body_obj
         .get("model")
@@ -677,119 +797,114 @@ async fn proxy_transcription(
         .pool_max_idle_per_host(10)
         .build::<_, HyperBody>(https);
 
-    // Try primary provider first, then fallback if available
-    let max_cycles = 3;
-    let mut last_error = None;
-    let mut successful_response = None;
-
-    for cycle in 0..max_cycles {
-        if cycle > 0 {
-            // Add delay between cycles (1s after first cycle, 2s after second)
-            let delay = cycle as u64;
-            debug!("Starting cycle {} after {}s delay", cycle + 1, delay);
-            sleep(Duration::from_secs(delay)).await;
-        }
-
-        // Try primary
-        debug!(
-            "Cycle {}: Trying primary provider {} for transcription",
-            cycle + 1,
-            route.primary.provider_name
-        );
-
-        let primary_model = state
-            .proxy_router
-            .get_model_name_for_provider(&model_name, &route.primary.provider_name);
-
-        match send_transcription_request(
-            &client,
-            &route.primary,
-            &primary_model,
-            &file_bytes,
-            filename,
-            content_type,
-            language,
-            prompt,
-            response_format,
-            temperature,
-        )
-        .await
-        {
-            Ok(response) => {
-                info!(
-                    "Successfully got transcription from primary provider {} on cycle {}",
-                    route.primary.provider_name,
-                    cycle + 1
-                );
-                successful_response = Some(response);
-                break;
-            }
-            Err(err) => {
-                error!(
-                    "Cycle {}: Primary provider {} failed: {}",
-                    cycle + 1,
-                    route.primary.provider_name,
-                    err
-                );
-                last_error = Some(err);
-            }
-        }
-
-        // Try fallback if available
-        if let Some(fallback) = route.fallbacks.first() {
-            debug!(
-                "Cycle {}: Trying fallback provider {} for transcription",
-                cycle + 1,
-                fallback.provider_name
-            );
-
-            let fallback_model = state
-                .proxy_router
-                .get_model_name_for_provider(&model_name, &fallback.provider_name);
-
-            match send_transcription_request(
-                &client,
-                fallback,
-                &fallback_model,
-                &file_bytes,
-                filename,
-                content_type,
-                language,
-                prompt,
-                response_format,
+    // Always split the audio (returns single chunk if no splitting needed)
+    let chunks = splitter
+        .split_audio(&file_bytes, content_type)
+        .map_err(|e| {
+            error!("Failed to split audio: {}", e);
+            ApiError::InternalServerError
+        })?;
+    
+    info!("Processing {} chunk(s)", chunks.len());
+    
+    // Process chunks in parallel (even if it's just one)
+    let mut futures = Vec::new();
+    
+    for chunk in chunks {
+        let client = client.clone();
+        let route = route.clone();
+        let state = state.clone();
+        let model_name = model_name.clone();
+        let filename = filename.to_string();
+        let content_type = content_type.to_string();
+        let language = language.map(|s| s.to_string());
+        let prompt = prompt.map(|s| s.to_string());
+        let response_format = response_format.to_string();
+        
+        let future = async move {
+            info!("Processing chunk {}", chunk.index);
+            
+            let params = TranscriptionParams {
+                audio_data: &chunk.data,
+                filename: &filename,
+                content_type: &content_type,
+                language: language.as_deref(),
+                prompt: prompt.as_deref(),
+                response_format: &response_format,
                 temperature,
+            };
+            
+            match send_transcription_with_retries(
+                &client,
+                &route,
+                &state,
+                &model_name,
+                &params,
             )
             .await
             {
                 Ok(response) => {
-                    info!(
-                        "Successfully got transcription from fallback provider {} on cycle {}",
-                        fallback.provider_name,
-                        cycle + 1
-                    );
-                    successful_response = Some(response);
-                    break;
+                    info!("Chunk {} transcribed successfully", chunk.index);
+                    Ok((chunk.index, response))
                 }
                 Err(err) => {
-                    error!(
-                        "Cycle {}: Fallback provider {} failed: {}",
-                        cycle + 1,
-                        fallback.provider_name,
-                        err
-                    );
-                    last_error = Some(err);
+                    error!("Chunk {} failed: {}", chunk.index, err);
+                    Err(format!("Chunk {} failed: {}", chunk.index, err))
                 }
+            }
+        };
+        
+        futures.push(future);
+    }
+    
+    // Execute all futures in parallel
+    let results: Vec<Result<(usize, Value), String>> = 
+        futures::future::join_all(futures).await;
+    
+    // Check if all chunks succeeded
+    let mut successful_results = Vec::new();
+    for result in results {
+        match result {
+            Ok(r) => successful_results.push(r),
+            Err(e) => {
+                error!("Chunk processing failed: {}", e);
+                return Err(ApiError::InternalServerError);
             }
         }
     }
-
-    let response = successful_response.ok_or_else(|| {
-        error!(
-            "All transcription providers failed. Last error: {:?}",
-            last_error
-        );
-        ApiError::InternalServerError
-    })?;
+    
+    // Get the response (merge if multiple chunks, return as-is if single)
+    let response = if successful_results.is_empty() {
+        error!("No successful transcription results");
+        return Err(ApiError::InternalServerError);
+    } else if successful_results.len() == 1 {
+        // Single chunk - return the response directly
+        successful_results.into_iter().next().map(|(_, r)| r).ok_or_else(|| {
+            error!("Failed to get single result");
+            ApiError::InternalServerError
+        })?
+    } else {
+        // Multiple chunks - merge the results
+        let merged = merge_transcriptions(successful_results).map_err(|e| {
+            error!("Failed to merge transcriptions: {}", e);
+            ApiError::InternalServerError
+        })?;
+        
+        // Convert merged result to standard response format
+        let mut response = json!({
+            "text": merged.text,
+        });
+        
+        if let Some(lang) = merged.language {
+            response["language"] = json!(lang);
+        }
+        
+        if let Some(segments) = merged.segments {
+            response["segments"] = json!(segments);
+        }
+        
+        response
+    };
 
     debug!("Exiting proxy_transcription function");
 
@@ -800,18 +915,11 @@ async fn proxy_transcription(
     encrypt_response(&state, &session_id, &response).await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn send_transcription_request(
     client: &Client<HttpsConnector<hyper::client::HttpConnector>, HyperBody>,
     provider: &ProxyConfig,
     model: &str,
-    file_bytes: &[u8],
-    filename: &str,
-    content_type: &str,
-    language: Option<&str>,
-    prompt: Option<&str>,
-    response_format: &str,
-    temperature: Option<f64>,
+    params: &TranscriptionParams<'_>,
 ) -> Result<Value, String> {
     // Build multipart form data
     let boundary = format!("----FormBoundary{}", Uuid::new_v4().simple());
@@ -828,22 +936,22 @@ async fn send_transcription_request(
     form_data.extend_from_slice(
         format!(
             "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
-            filename
+            params.filename
         )
         .as_bytes(),
     );
-    form_data.extend_from_slice(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes());
-    form_data.extend_from_slice(file_bytes);
+    form_data.extend_from_slice(format!("Content-Type: {}\r\n\r\n", params.content_type).as_bytes());
+    form_data.extend_from_slice(params.audio_data);
     form_data.extend_from_slice(b"\r\n");
 
     // Add optional fields
-    if let Some(lang) = language {
+    if let Some(lang) = params.language {
         form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
         form_data.extend_from_slice(b"Content-Disposition: form-data; name=\"language\"\r\n\r\n");
         form_data.extend_from_slice(lang.as_bytes());
         form_data.extend_from_slice(b"\r\n");
     }
-    if let Some(p) = prompt {
+    if let Some(p) = params.prompt {
         form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
         form_data.extend_from_slice(b"Content-Disposition: form-data; name=\"prompt\"\r\n\r\n");
         form_data.extend_from_slice(p.as_bytes());
@@ -852,9 +960,9 @@ async fn send_transcription_request(
     form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
     form_data
         .extend_from_slice(b"Content-Disposition: form-data; name=\"response_format\"\r\n\r\n");
-    form_data.extend_from_slice(response_format.as_bytes());
+    form_data.extend_from_slice(params.response_format.as_bytes());
     form_data.extend_from_slice(b"\r\n");
-    if let Some(temp) = temperature {
+    if let Some(temp) = params.temperature {
         form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
         form_data
             .extend_from_slice(b"Content-Disposition: form-data; name=\"temperature\"\r\n\r\n");

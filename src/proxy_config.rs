@@ -18,6 +18,11 @@ const CONTINUUM_GPT_OSS_120B: &str = "openai/gpt-oss-120b";
 const TINFOIL_GPT_OSS_120B: &str = "gpt-oss-120b";
 const CANONICAL_GPT_OSS_120B: &str = "gpt-oss-120b";
 
+// Whisper model constants
+const CONTINUUM_WHISPER_LARGE_V3: &str = "openai/whisper-large-v3";
+const TINFOIL_WHISPER_LARGE_V3_TURBO: &str = "whisper-large-v3-turbo";
+const CANONICAL_WHISPER_LARGE_V3: &str = "whisper-large-v3";
+
 lazy_static! {
     /// Known model equivalencies across providers
     /// This maps a canonical model identifier to provider-specific names
@@ -35,6 +40,12 @@ lazy_static! {
         gpt_oss_120b.insert("continuum", CONTINUUM_GPT_OSS_120B);
         gpt_oss_120b.insert("tinfoil", TINFOIL_GPT_OSS_120B);
         equivalencies.insert(CANONICAL_GPT_OSS_120B, gpt_oss_120b);
+
+        // Whisper Large V3
+        let mut whisper_large_v3 = HashMap::new();
+        whisper_large_v3.insert("continuum", CONTINUUM_WHISPER_LARGE_V3);
+        whisper_large_v3.insert("tinfoil", TINFOIL_WHISPER_LARGE_V3_TURBO);
+        equivalencies.insert(CANONICAL_WHISPER_LARGE_V3, whisper_large_v3);
 
         equivalencies
     };
@@ -362,7 +373,7 @@ impl ProxyRouter {
                     // Check if this model has an equivalent in Continuum
                     let mut has_continuum_fallback = false;
 
-                    for provider_names in MODEL_EQUIVALENCIES.values() {
+                    for (_canonical_name, provider_names) in &*MODEL_EQUIVALENCIES {
                         if let (Some(tinfoil_equiv), Some(continuum_equiv)) = (
                             provider_names.get("tinfoil"),
                             provider_names.get("continuum"),

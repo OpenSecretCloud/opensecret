@@ -35,6 +35,7 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
         .route("/v1/chat/completions", post(proxy_openai))
         .route("/v1/models", get(proxy_models))
         .route("/v1/audio/speech", post(proxy_tts))
+        .route("/v1/audio/transcriptions", post(proxy_transcription))
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             decrypt_request::<Value>,
@@ -591,6 +592,326 @@ async fn proxy_models(
     debug!("Exiting proxy_models function");
     // Encrypt and return the response
     encrypt_response(&state, &session_id, &models_response).await
+}
+
+async fn proxy_transcription(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(user): axum::Extension<User>,
+    axum::Extension(_auth_method): axum::Extension<AuthMethod>,
+    axum::Extension(body): axum::Extension<Value>,
+) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+    debug!("Entering proxy_transcription function");
+
+    // Prevent guest users from using the transcription feature
+    if user.is_guest() {
+        error!(
+            "Guest user attempted to use transcription feature: {}",
+            user.uuid
+        );
+        return Err(ApiError::Unauthorized);
+    }
+
+    if body.is_null() || body.as_object().map_or(true, |obj| obj.is_empty()) {
+        error!("Request body is empty or invalid");
+        return Err(ApiError::BadRequest);
+    }
+
+    let body_obj = body.as_object().expect("body was just checked");
+
+    // Extract required fields from encrypted JSON
+    let file_base64 = body_obj
+        .get("file")
+        .and_then(|f| f.as_str())
+        .ok_or_else(|| {
+            error!("Audio file (base64) not provided in request");
+            ApiError::BadRequest
+        })?;
+
+    let filename = body_obj
+        .get("filename")
+        .and_then(|f| f.as_str())
+        .unwrap_or("audio.mp3");
+
+    let content_type = body_obj
+        .get("content_type")
+        .and_then(|c| c.as_str())
+        .unwrap_or("audio/mpeg");
+
+    // Decode base64 audio file
+    let file_bytes = general_purpose::STANDARD.decode(file_base64).map_err(|e| {
+        error!("Failed to decode base64 audio file: {:?}", e);
+        ApiError::BadRequest
+    })?;
+
+    // Extract the model from the request
+    let model_name = body_obj
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("whisper-large-v3")
+        .to_string();
+
+    // Get the model route configuration
+    let route = match state.proxy_router.get_model_route(&model_name).await {
+        Some(r) => r,
+        None => {
+            error!("Model '{}' not found in routing table", model_name);
+            return Err(ApiError::BadRequest);
+        }
+    };
+
+    // Extract optional parameters
+    let language = body_obj.get("language").and_then(|l| l.as_str());
+    let prompt = body_obj.get("prompt").and_then(|p| p.as_str());
+    let response_format = body_obj
+        .get("response_format")
+        .and_then(|r| r.as_str())
+        .unwrap_or("json");
+    let temperature = body_obj.get("temperature").and_then(|t| t.as_f64());
+
+    // Create a new hyper client
+    let https = HttpsConnector::new();
+    let client = Client::builder()
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(10)
+        .build::<_, HyperBody>(https);
+
+    // Try primary provider first, then fallback if available
+    let max_cycles = 3;
+    let mut last_error = None;
+    let mut successful_response = None;
+
+    for cycle in 0..max_cycles {
+        if cycle > 0 {
+            // Add delay between cycles (1s after first cycle, 2s after second)
+            let delay = cycle as u64;
+            debug!("Starting cycle {} after {}s delay", cycle + 1, delay);
+            sleep(Duration::from_secs(delay)).await;
+        }
+
+        // Try primary
+        debug!(
+            "Cycle {}: Trying primary provider {} for transcription",
+            cycle + 1,
+            route.primary.provider_name
+        );
+
+        let primary_model = state
+            .proxy_router
+            .get_model_name_for_provider(&model_name, &route.primary.provider_name);
+
+        match send_transcription_request(
+            &client,
+            &route.primary,
+            &primary_model,
+            &file_bytes,
+            filename,
+            content_type,
+            language,
+            prompt,
+            response_format,
+            temperature,
+        )
+        .await
+        {
+            Ok(response) => {
+                info!(
+                    "Successfully got transcription from primary provider {} on cycle {}",
+                    route.primary.provider_name,
+                    cycle + 1
+                );
+                successful_response = Some(response);
+                break;
+            }
+            Err(err) => {
+                error!(
+                    "Cycle {}: Primary provider {} failed: {}",
+                    cycle + 1,
+                    route.primary.provider_name,
+                    err
+                );
+                last_error = Some(err);
+            }
+        }
+
+        // Try fallback if available
+        if let Some(fallback) = route.fallbacks.first() {
+            debug!(
+                "Cycle {}: Trying fallback provider {} for transcription",
+                cycle + 1,
+                fallback.provider_name
+            );
+
+            let fallback_model = state
+                .proxy_router
+                .get_model_name_for_provider(&model_name, &fallback.provider_name);
+
+            match send_transcription_request(
+                &client,
+                fallback,
+                &fallback_model,
+                &file_bytes,
+                filename,
+                content_type,
+                language,
+                prompt,
+                response_format,
+                temperature,
+            )
+            .await
+            {
+                Ok(response) => {
+                    info!(
+                        "Successfully got transcription from fallback provider {} on cycle {}",
+                        fallback.provider_name,
+                        cycle + 1
+                    );
+                    successful_response = Some(response);
+                    break;
+                }
+                Err(err) => {
+                    error!(
+                        "Cycle {}: Fallback provider {} failed: {}",
+                        cycle + 1,
+                        fallback.provider_name,
+                        err
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+    }
+
+    let response = successful_response.ok_or_else(|| {
+        error!(
+            "All transcription providers failed. Last error: {:?}",
+            last_error
+        );
+        ApiError::InternalServerError
+    })?;
+
+    debug!("Exiting proxy_transcription function");
+
+    // TODO: Add SQS-based billing events for transcription usage
+    // Should track: audio duration/size, model used, user ID, timestamp, provider
+
+    // Encrypt and return the response
+    encrypt_response(&state, &session_id, &response).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_transcription_request(
+    client: &Client<HttpsConnector<hyper::client::HttpConnector>, HyperBody>,
+    provider: &ProxyConfig,
+    model: &str,
+    file_bytes: &[u8],
+    filename: &str,
+    content_type: &str,
+    language: Option<&str>,
+    prompt: Option<&str>,
+    response_format: &str,
+    temperature: Option<f64>,
+) -> Result<Value, String> {
+    // Build multipart form data
+    let boundary = format!("----FormBoundary{}", Uuid::new_v4().simple());
+    let mut form_data = Vec::new();
+
+    // Add model field
+    form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    form_data.extend_from_slice(b"Content-Disposition: form-data; name=\"model\"\r\n\r\n");
+    form_data.extend_from_slice(model.as_bytes());
+    form_data.extend_from_slice(b"\r\n");
+
+    // Add file field
+    form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    form_data.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
+            filename
+        )
+        .as_bytes(),
+    );
+    form_data.extend_from_slice(format!("Content-Type: {}\r\n\r\n", content_type).as_bytes());
+    form_data.extend_from_slice(file_bytes);
+    form_data.extend_from_slice(b"\r\n");
+
+    // Add optional fields
+    if let Some(lang) = language {
+        form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        form_data.extend_from_slice(b"Content-Disposition: form-data; name=\"language\"\r\n\r\n");
+        form_data.extend_from_slice(lang.as_bytes());
+        form_data.extend_from_slice(b"\r\n");
+    }
+    if let Some(p) = prompt {
+        form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        form_data.extend_from_slice(b"Content-Disposition: form-data; name=\"prompt\"\r\n\r\n");
+        form_data.extend_from_slice(p.as_bytes());
+        form_data.extend_from_slice(b"\r\n");
+    }
+    form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    form_data
+        .extend_from_slice(b"Content-Disposition: form-data; name=\"response_format\"\r\n\r\n");
+    form_data.extend_from_slice(response_format.as_bytes());
+    form_data.extend_from_slice(b"\r\n");
+    if let Some(temp) = temperature {
+        form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        form_data
+            .extend_from_slice(b"Content-Disposition: form-data; name=\"temperature\"\r\n\r\n");
+        form_data.extend_from_slice(temp.to_string().as_bytes());
+        form_data.extend_from_slice(b"\r\n");
+    }
+
+    // End boundary
+    form_data.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+    // Build request
+    let endpoint = format!("{}/v1/audio/transcriptions", provider.base_url);
+    let mut req = Request::builder().method("POST").uri(&endpoint).header(
+        "Content-Type",
+        format!("multipart/form-data; boundary={}", boundary),
+    );
+
+    if let Some(api_key) = &provider.api_key {
+        if !api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", api_key));
+        }
+    }
+
+    let req = req
+        .body(HyperBody::from(form_data))
+        .map_err(|e| format!("Failed to create request: {:?}", e))?;
+
+    // Send request
+    match client.request(req).await {
+        Ok(res) => {
+            if res.status().is_success() {
+                let body_bytes = to_bytes(res.into_body())
+                    .await
+                    .map_err(|e| format!("Failed to read response body: {:?}", e))?;
+
+                let response_json: Value = serde_json::from_slice(&body_bytes)
+                    .map_err(|e| format!("Failed to parse response: {:?}", e))?;
+
+                Ok(response_json)
+            } else {
+                let status = res.status();
+                let body_bytes = to_bytes(res.into_body()).await.ok();
+                let error_msg = body_bytes
+                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                    .unwrap_or_else(|| status.to_string());
+
+                Err(format!(
+                    "Provider {} returned error: {} - {}",
+                    provider.provider_name, status, error_msg
+                ))
+            }
+        }
+        Err(e) => Err(format!(
+            "Failed to send request to {}: {:?}",
+            provider.provider_name, e
+        )),
+    }
 }
 
 async fn proxy_tts(

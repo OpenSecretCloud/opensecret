@@ -2,7 +2,7 @@ use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
-use crate::web::audio_utils::{AudioSplitter, merge_transcriptions};
+use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
 use crate::web::openai_auth::AuthMethod;
 use crate::{ApiError, AppState};
@@ -616,33 +616,26 @@ async fn send_transcription_with_retries(
 ) -> Result<Value, String> {
     let max_cycles = 3;
     let mut last_error = None;
-    
+
     for cycle in 0..max_cycles {
         if cycle > 0 {
             let delay = cycle as u64;
             debug!("Starting cycle {} after {}s delay", cycle + 1, delay);
             sleep(Duration::from_secs(delay)).await;
         }
-        
+
         // Try primary
         debug!(
             "Cycle {}: Trying primary provider {} for transcription",
             cycle + 1,
             route.primary.provider_name
         );
-        
+
         let primary_model = state
             .proxy_router
             .get_model_name_for_provider(model_name, &route.primary.provider_name);
-        
-        match send_transcription_request(
-            client,
-            &route.primary,
-            &primary_model,
-            params,
-        )
-        .await
-        {
+
+        match send_transcription_request(client, &route.primary, &primary_model, params).await {
             Ok(response) => {
                 info!(
                     "Successfully got transcription from primary provider {} on cycle {}",
@@ -661,7 +654,7 @@ async fn send_transcription_with_retries(
                 last_error = Some(err);
             }
         }
-        
+
         // Try fallback if available
         if let Some(fallback) = route.fallbacks.first() {
             debug!(
@@ -669,19 +662,12 @@ async fn send_transcription_with_retries(
                 cycle + 1,
                 fallback.provider_name
             );
-            
+
             let fallback_model = state
                 .proxy_router
                 .get_model_name_for_provider(model_name, &fallback.provider_name);
-            
-            match send_transcription_request(
-                client,
-                fallback,
-                &fallback_model,
-                params,
-            )
-            .await
-            {
+
+            match send_transcription_request(client, fallback, &fallback_model, params).await {
                 Ok(response) => {
                     info!(
                         "Successfully got transcription from fallback provider {} on cycle {}",
@@ -702,7 +688,7 @@ async fn send_transcription_with_retries(
             }
         }
     }
-    
+
     Err(format!(
         "All providers failed after {} cycles. Last error: {:?}",
         max_cycles, last_error
@@ -804,15 +790,15 @@ async fn proxy_transcription(
             error!("Failed to split audio: {}", e);
             ApiError::InternalServerError
         })?;
-    
+
     info!("Processing {} chunk(s)", chunks.len());
-    
+
     // Process chunks in parallel (even if it's just one)
     let mut futures = Vec::new();
-    
+
     for chunk in chunks {
         let client = client.clone();
-        let route = route.clone();
+        let mut route = route.clone();
         let state = state.clone();
         let model_name = model_name.clone();
         let filename = filename.to_string();
@@ -820,10 +806,36 @@ async fn proxy_transcription(
         let language = language.map(|s| s.to_string());
         let prompt = prompt.map(|s| s.to_string());
         let response_format = response_format.to_string();
-        
+
         let future = async move {
-            info!("Processing chunk {}", chunk.index);
-            
+            let chunk_size = chunk.data.len();
+            info!(
+                "Processing chunk {} (size: {} bytes)",
+                chunk.index, chunk_size
+            );
+
+            // If chunk is over 0.5MB and primary is Tinfoil, skip Tinfoil and use fallback only
+            if chunk_size > TINFOIL_MAX_SIZE
+                && route.primary.provider_name.to_lowercase() == "tinfoil"
+            {
+                info!(
+                    "Chunk {} size {} bytes exceeds Tinfoil's 0.5MB limit, using fallback only",
+                    chunk.index, chunk_size
+                );
+
+                // If we have a fallback (should be Continuum), use it as primary
+                if let Some(fallback) = route.fallbacks.first() {
+                    route.primary = fallback.clone();
+                    route.fallbacks.clear();
+                } else {
+                    // No fallback available, this will fail
+                    return Err(format!(
+                        "Chunk {} size {} bytes exceeds Tinfoil's limit and no fallback available",
+                        chunk.index, chunk_size
+                    ));
+                }
+            }
+
             let params = TranscriptionParams {
                 audio_data: &chunk.data,
                 filename: &filename,
@@ -833,15 +845,9 @@ async fn proxy_transcription(
                 response_format: &response_format,
                 temperature,
             };
-            
-            match send_transcription_with_retries(
-                &client,
-                &route,
-                &state,
-                &model_name,
-                &params,
-            )
-            .await
+
+            match send_transcription_with_retries(&client, &route, &state, &model_name, &params)
+                .await
             {
                 Ok(response) => {
                     info!("Chunk {} transcribed successfully", chunk.index);
@@ -853,14 +859,13 @@ async fn proxy_transcription(
                 }
             }
         };
-        
+
         futures.push(future);
     }
-    
+
     // Execute all futures in parallel
-    let results: Vec<Result<(usize, Value), String>> = 
-        futures::future::join_all(futures).await;
-    
+    let results: Vec<Result<(usize, Value), String>> = futures::future::join_all(futures).await;
+
     // Check if all chunks succeeded
     let mut successful_results = Vec::new();
     for result in results {
@@ -872,37 +877,41 @@ async fn proxy_transcription(
             }
         }
     }
-    
+
     // Get the response (merge if multiple chunks, return as-is if single)
     let response = if successful_results.is_empty() {
         error!("No successful transcription results");
         return Err(ApiError::InternalServerError);
     } else if successful_results.len() == 1 {
         // Single chunk - return the response directly
-        successful_results.into_iter().next().map(|(_, r)| r).ok_or_else(|| {
-            error!("Failed to get single result");
-            ApiError::InternalServerError
-        })?
+        successful_results
+            .into_iter()
+            .next()
+            .map(|(_, r)| r)
+            .ok_or_else(|| {
+                error!("Failed to get single result");
+                ApiError::InternalServerError
+            })?
     } else {
         // Multiple chunks - merge the results
         let merged = merge_transcriptions(successful_results).map_err(|e| {
             error!("Failed to merge transcriptions: {}", e);
             ApiError::InternalServerError
         })?;
-        
+
         // Convert merged result to standard response format
         let mut response = json!({
             "text": merged.text,
         });
-        
+
         if let Some(lang) = merged.language {
             response["language"] = json!(lang);
         }
-        
+
         if let Some(segments) = merged.segments {
             response["segments"] = json!(segments);
         }
-        
+
         response
     };
 
@@ -940,7 +949,8 @@ async fn send_transcription_request(
         )
         .as_bytes(),
     );
-    form_data.extend_from_slice(format!("Content-Type: {}\r\n\r\n", params.content_type).as_bytes());
+    form_data
+        .extend_from_slice(format!("Content-Type: {}\r\n\r\n", params.content_type).as_bytes());
     form_data.extend_from_slice(params.audio_data);
     form_data.extend_from_slice(b"\r\n");
 

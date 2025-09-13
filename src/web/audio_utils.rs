@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-const MAX_CHUNK_SIZE: usize = 512 * 1024; // 0.5MB for testing (normally 20MB)
+const MAX_CHUNK_SIZE: usize = 20 * 1024 * 1024; // 20MB max chunk size
 const CHUNK_OVERLAP_SECONDS: f64 = 1.0; // 1 second overlap between chunks
 const MIN_WAV_HEADER_SIZE: usize = 44; // Minimum size for a valid WAV file header
+pub const TINFOIL_MAX_SIZE: usize = 512 * 1024; // 0.5MB max size for Tinfoil provider
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioChunk {
@@ -89,7 +90,7 @@ impl AudioSplitter {
                 Ok(vec![AudioChunk {
                     data: audio_data.to_vec(),
                     start_time: 0.0,
-                    end_time: 0.0,
+                    end_time: 0.0, // Unknown duration
                     index: 0,
                 }])
             }
@@ -103,7 +104,10 @@ impl AudioSplitter {
         // - data chunk header (8 bytes) + actual audio data
 
         if audio_data.len() < MIN_WAV_HEADER_SIZE {
-            return Err(format!("Invalid WAV file: too small (minimum {} bytes required)", MIN_WAV_HEADER_SIZE));
+            return Err(format!(
+                "Invalid WAV file: too small (minimum {} bytes required)",
+                MIN_WAV_HEADER_SIZE
+            ));
         }
 
         // Verify it's a WAV file
@@ -307,7 +311,6 @@ pub fn merge_transcriptions(
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,11 +339,11 @@ mod tests {
     #[test]
     fn test_split_audio_small_file() {
         let splitter = AudioSplitter::new();
-        
+
         // Test with small file that doesn't need splitting
         let small_audio = vec![0u8; 1024];
         let result = splitter.split_audio(&small_audio, "audio/mp3").unwrap();
-        
+
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].index, 0);
         assert_eq!(result[0].data.len(), 1024);
@@ -349,11 +352,11 @@ mod tests {
     #[test]
     fn test_split_audio_non_wav_format() {
         let splitter = AudioSplitter::new();
-        
+
         // Test with large MP3 file - should return as single chunk
         let large_mp3 = vec![0u8; MAX_CHUNK_SIZE * 2];
         let result = splitter.split_audio(&large_mp3, "audio/mp3").unwrap();
-        
+
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].data.len(), MAX_CHUNK_SIZE * 2);
     }
@@ -361,20 +364,19 @@ mod tests {
     #[test]
     fn test_split_wav_invalid_file() {
         let splitter = AudioSplitter::new();
-        
+
         // Test with file too small to be valid WAV
         let tiny_file = vec![0u8; 10];
         let result = splitter.split_wav(&tiny_file);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("too small"));
-        
+
         // Test with file that's large enough but not a WAV
         let not_wav = vec![0u8; 100];
         let result = splitter.split_wav(&not_wav);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Not a valid WAV"));
     }
-
 
     #[test]
     fn test_merge_transcriptions() {
@@ -407,5 +409,4 @@ mod tests {
         );
         assert_eq!(merged.language, Some("en".to_string()));
     }
-
 }

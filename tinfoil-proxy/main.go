@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +60,11 @@ var modelConfigs = map[string]struct {
 		Description: "Advanced coding model with 480B parameters for complex programming tasks",
 		Active:      true,
 	},
+	"whisper-large-v3-turbo": {
+		ModelID:     "whisper-large-v3-turbo",
+		Description: "Fast and accurate speech-to-text transcription model",
+		Active:      true,
+	},
 }
 
 // Request/Response models
@@ -67,17 +74,17 @@ type ChatMessage struct {
 }
 
 type ChatCompletionRequest struct {
-	Model             string           `json:"model"`
-	Messages          []ChatMessage    `json:"messages"`
-	Stream            *bool            `json:"stream,omitempty"`
-	Temperature       *float32         `json:"temperature,omitempty"`
-	MaxTokens         *int             `json:"max_tokens,omitempty"`
-	TopP              *float32         `json:"top_p,omitempty"`
-	FrequencyPenalty  *float32         `json:"frequency_penalty,omitempty"`
-	PresencePenalty   *float32         `json:"presence_penalty,omitempty"`
-	N                 *int             `json:"n,omitempty"`
-	Stop              []string         `json:"stop,omitempty"`
-	StreamOptions     *map[string]any  `json:"stream_options,omitempty"`
+	Model            string          `json:"model"`
+	Messages         []ChatMessage   `json:"messages"`
+	Stream           *bool           `json:"stream,omitempty"`
+	Temperature      *float32        `json:"temperature,omitempty"`
+	MaxTokens        *int            `json:"max_tokens,omitempty"`
+	TopP             *float32        `json:"top_p,omitempty"`
+	FrequencyPenalty *float32        `json:"frequency_penalty,omitempty"`
+	PresencePenalty  *float32        `json:"presence_penalty,omitempty"`
+	N                *int            `json:"n,omitempty"`
+	Stop             []string        `json:"stop,omitempty"`
+	StreamOptions    *map[string]any `json:"stream_options,omitempty"`
 }
 
 type ModelInfo struct {
@@ -93,10 +100,10 @@ type ModelsResponse struct {
 }
 
 type Choice struct {
-	Index        int         `json:"index"`
+	Index        int          `json:"index"`
 	Message      *ChatMessage `json:"message,omitempty"`
 	Delta        *ChatMessage `json:"delta,omitempty"`
-	FinishReason *string     `json:"finish_reason"`
+	FinishReason *string      `json:"finish_reason"`
 }
 
 type Usage struct {
@@ -123,11 +130,15 @@ type TTSRequest struct {
 	StreamFormat   string  `json:"stream_format,omitempty"`
 }
 
+type TranscriptionResponse struct {
+	Text string `json:"text"`
+}
+
 type TinfoilProxyServer struct {
-	client        *tinfoil.Client
-	clientMutex   sync.RWMutex
-	apiKey        string
-	lastRotation  time.Time
+	client       *tinfoil.Client
+	clientMutex  sync.RWMutex
+	apiKey       string
+	lastRotation time.Time
 }
 
 func NewTinfoilProxyServer() (*TinfoilProxyServer, error) {
@@ -142,17 +153,17 @@ func NewTinfoilProxyServer() (*TinfoilProxyServer, error) {
 
 	// Initialize Tinfoil client with new simplified API
 	log.Printf("Initializing Tinfoil client with new API")
-	
+
 	// Create a single client that will handle all models through the inference endpoint
 	client, err := tinfoil.NewClient(option.WithAPIKey(apiKey))
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize Tinfoil client: %v", err)
 	}
-	
+
 	server.client = client
 	server.lastRotation = time.Now()
 	log.Printf("Successfully initialized Tinfoil client")
-	
+
 	// Start automatic client rotation every 10 minutes
 	go server.startAutoRotation()
 
@@ -162,7 +173,7 @@ func NewTinfoilProxyServer() (*TinfoilProxyServer, error) {
 func (s *TinfoilProxyServer) getClient() (*tinfoil.Client, error) {
 	s.clientMutex.RLock()
 	defer s.clientMutex.RUnlock()
-	
+
 	if s.client == nil {
 		return nil, fmt.Errorf("client not initialized")
 	}
@@ -173,7 +184,7 @@ func (s *TinfoilProxyServer) getClient() (*tinfoil.Client, error) {
 func (s *TinfoilProxyServer) startAutoRotation() {
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
-	
+
 	for range ticker.C {
 		log.Printf("Performing scheduled client rotation")
 		if err := s.reinitializeClient(); err != nil {
@@ -188,24 +199,24 @@ func (s *TinfoilProxyServer) reinitializeClient() error {
 	s.clientMutex.RLock()
 	timeSinceLastRotation := time.Since(s.lastRotation)
 	s.clientMutex.RUnlock()
-	
+
 	if timeSinceLastRotation < 30*time.Second {
 		log.Printf("Skipping reinitialization - client was rotated %.0f seconds ago", timeSinceLastRotation.Seconds())
 		return nil
 	}
-	
+
 	log.Printf("Reinitializing Tinfoil client (last rotation: %.0f seconds ago)", timeSinceLastRotation.Seconds())
-	
+
 	client, err := tinfoil.NewClient(option.WithAPIKey(s.apiKey))
 	if err != nil {
 		return fmt.Errorf("failed to reinitialize Tinfoil client: %v", err)
 	}
-	
+
 	s.clientMutex.Lock()
 	s.client = client
 	s.lastRotation = time.Now()
 	s.clientMutex.Unlock()
-	
+
 	log.Printf("Successfully reinitialized Tinfoil client")
 	return nil
 }
@@ -216,10 +227,10 @@ func isCertificateError(err error) bool {
 		return false
 	}
 	errStr := err.Error()
-	return strings.Contains(errStr, "certificate") || 
-	       strings.Contains(errStr, "fingerprint") ||
-	       strings.Contains(errStr, "x509") ||
-	       strings.Contains(errStr, "tls")
+	return strings.Contains(errStr, "certificate") ||
+		strings.Contains(errStr, "fingerprint") ||
+		strings.Contains(errStr, "x509") ||
+		strings.Contains(errStr, "tls")
 }
 
 // convertToOpenAIMessage handles both string content and multimodal content arrays
@@ -241,7 +252,7 @@ func convertToOpenAIMessage(msg ChatMessage, role string) openai.ChatCompletionM
 	// If content is an array, it's multimodal content
 	if contentArray, ok := msg.Content.([]interface{}); ok {
 		var parts []openai.ChatCompletionContentPartUnionParam
-		
+
 		for _, part := range contentArray {
 			if partMap, ok := part.(map[string]interface{}); ok {
 				if partType, exists := partMap["type"].(string); exists {
@@ -264,13 +275,13 @@ func convertToOpenAIMessage(msg ChatMessage, role string) openai.ChatCompletionM
 				}
 			}
 		}
-		
+
 		// Only user messages support multimodal content in the OpenAI SDK
 		if role == "user" && len(parts) > 0 {
 			return openai.UserMessage(parts)
 		}
 	}
-	
+
 	// Fallback: stringify the content
 	contentJSON, _ := json.Marshal(msg.Content)
 	switch role {
@@ -347,12 +358,12 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 	// Start streaming - but first check if we can create the stream without errors
 	stream := client.Chat.Completions.NewStreaming(ctx, params)
 	defer stream.Close()
-	
+
 	// Try to get the first chunk to detect early errors before sending SSE headers
 	if !stream.Next() {
 		if err := stream.Err(); err != nil {
 			log.Printf("Stream creation error: %v", err)
-			
+
 			// Check if this is a certificate error and reinitialize if needed
 			if isCertificateError(err) {
 				go func() {
@@ -361,7 +372,7 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 					}
 				}()
 			}
-			
+
 			// Return proper HTTP error before SSE headers are sent
 			c.JSON(http.StatusServiceUnavailable, gin.H{
 				"error": map[string]interface{}{
@@ -382,14 +393,14 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 		})
 		return
 	}
-	
+
 	// We have at least one chunk, so we can proceed with SSE
 	// Set up SSE headers
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
-	
+
 	// Stream responses
 	w := c.Writer
 	flusher, ok := w.(http.Flusher)
@@ -400,7 +411,7 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 
 	// Track if we've already sent usage data for this stream
 	usageSent := false
-	
+
 	// Process the first chunk we already read
 	firstChunk := true
 
@@ -409,7 +420,7 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 			firstChunk = false
 		}
 		chunk := stream.Current()
-		
+
 		// Convert to OpenAI-compatible format
 		chunkData := ChatCompletionResponse{
 			ID:      chunk.ID,
@@ -421,15 +432,15 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 
 		// Track if this chunk has a finish_reason
 		hasFinishReason := false
-		
+
 		// Handle empty choices array - this appears to be Tinfoil's way of signaling end
 		if len(chunk.Choices) == 0 {
 			// Inject a proper final chunk with finish_reason
 			log.Printf("Empty choices array detected - injecting finish_reason: 'stop'")
 			finishReason := "stop"
 			choiceData := Choice{
-				Index: 0,
-				Delta: &ChatMessage{},
+				Index:        0,
+				Delta:        &ChatMessage{},
 				FinishReason: &finishReason,
 			}
 			chunkData.Choices = append(chunkData.Choices, choiceData)
@@ -440,14 +451,14 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 					Index: int(choice.Index),
 					Delta: &ChatMessage{},
 				}
-				
+
 				if choice.Delta.Role != "" {
 					choiceData.Delta.Role = string(choice.Delta.Role)
 				}
 				if choice.Delta.Content != "" {
 					choiceData.Delta.Content = choice.Delta.Content
-				} 
-				
+				}
+
 				if choice.FinishReason != "" {
 					finishReason := string(choice.FinishReason)
 					choiceData.FinishReason = &finishReason
@@ -484,7 +495,7 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 
 	if err := stream.Err(); err != nil {
 		log.Printf("Stream error: %v", err)
-		
+
 		// Check if this is a certificate error and reinitialize if needed
 		if isCertificateError(err) {
 			go func() {
@@ -493,7 +504,7 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 				}
 			}()
 		}
-		
+
 		// Send error to client in OpenAI-compatible format
 		errorResponse := map[string]interface{}{
 			"error": map[string]interface{}{
@@ -603,6 +614,99 @@ func (s *TinfoilProxyServer) nonStreamingChatCompletion(c *gin.Context, req Chat
 	c.JSON(http.StatusOK, response)
 }
 
+func (s *TinfoilProxyServer) handleTranscription(c *gin.Context) {
+	// Parse multipart form data
+	file, fileHeader, err := c.Request.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Audio file is required"})
+		return
+	}
+	defer file.Close()
+
+	log.Printf("Transcription request - file: %s, size: %d bytes", fileHeader.Filename, fileHeader.Size)
+
+	// Get other form parameters
+	model := c.PostForm("model")
+	if model == "" {
+		model = "whisper-large-v3-turbo" // Default to Whisper Large V3 Turbo
+	}
+
+	language := c.PostForm("language")
+	prompt := c.PostForm("prompt")
+	responseFormat := c.PostForm("response_format")
+	if responseFormat == "" {
+		responseFormat = "json"
+	}
+	temperature := c.PostForm("temperature")
+
+	client, err := s.getClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Read file content
+	fileBytes, err := io.ReadAll(file)
+	if err != nil {
+		log.Printf("Failed to read audio file: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read audio file"})
+		return
+	}
+
+	// Build transcription params
+	params := openai.AudioTranscriptionNewParams{
+		Model: "whisper-large-v3-turbo", // Always use Whisper Large V3 Turbo for Tinfoil
+		File:  openai.File(bytes.NewReader(fileBytes), fileHeader.Filename, fileHeader.Header.Get("Content-Type")),
+	}
+
+	// Add optional parameters
+	if language != "" {
+		params.Language = openai.String(language)
+	}
+	if prompt != "" {
+		params.Prompt = openai.String(prompt)
+	}
+	// Note: ResponseFormat handling might need adjustment based on SDK version
+	// For now, we'll skip the response format parameter as it may not be available
+	// in the current SDK version. The default JSON format should work.
+
+	if temperature != "" {
+		if temp, err := strconv.ParseFloat(temperature, 64); err == nil {
+			params.Temperature = openai.Float(temp)
+		}
+	}
+
+	// Create transcription
+	ctx := c.Request.Context()
+	transcription, err := client.Audio.Transcriptions.New(ctx, params)
+	if err != nil {
+		log.Printf("Transcription error: %v", err)
+
+		// Check if this is a certificate error and reinitialize if needed
+		if isCertificateError(err) {
+			go func() {
+				if reinitErr := s.reinitializeClient(); reinitErr != nil {
+					log.Printf("Failed to reinitialize client: %v", reinitErr)
+				}
+			}()
+		}
+
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// TODO: Add SQS-based billing events for transcription usage tracking
+	// Should track: audio duration, model used, user ID, timestamp
+
+	// Return OpenAI-compatible response
+	// The transcription object already has the text field
+	response := TranscriptionResponse{
+		Text: transcription.Text,
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
 func (s *TinfoilProxyServer) handleTTS(c *gin.Context) {
 	var req TTSRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -646,15 +750,16 @@ func (s *TinfoilProxyServer) handleTTS(c *gin.Context) {
 	case "wav":
 		responseFormat = openai.AudioSpeechNewParamsResponseFormatWAV
 	case "pcm":
-		// PCM might not be a standard OpenAI format, default to WAV
-		responseFormat = openai.AudioSpeechNewParamsResponseFormatWAV
+		// PCM is not supported by OpenAI's TTS API
+		c.JSON(http.StatusBadRequest, gin.H{"error": "PCM format is not supported. Please use mp3, wav, opus, aac, or flac."})
+		return
 	default:
 		responseFormat = openai.AudioSpeechNewParamsResponseFormatMP3
 	}
 
 	// Build TTS params using Kokoro model
 	params := openai.AudioSpeechNewParams{
-		Model:          "kokoro", // Always use Kokoro for TTS
+		Model:          "kokoro",                                // Always use Kokoro for TTS
 		Voice:          openai.AudioSpeechNewParamsVoice(voice), // Cast string to voice type
 		Input:          req.Input,
 		ResponseFormat: responseFormat,
@@ -666,7 +771,7 @@ func (s *TinfoilProxyServer) handleTTS(c *gin.Context) {
 	response, err := client.Audio.Speech.New(ctx, params)
 	if err != nil {
 		log.Printf("TTS error: %v", err)
-		
+
 		// Check if this is a certificate error and reinitialize if needed
 		if isCertificateError(err) {
 			go func() {
@@ -675,7 +780,7 @@ func (s *TinfoilProxyServer) handleTTS(c *gin.Context) {
 				}
 			}()
 		}
-		
+
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -692,14 +797,12 @@ func (s *TinfoilProxyServer) handleTTS(c *gin.Context) {
 		contentType = "audio/flac"
 	case "wav":
 		contentType = "audio/wav"
-	case "pcm":
-		contentType = "audio/pcm"
 	}
 
 	// Stream the audio response back to client
 	c.Header("Content-Type", contentType)
 	c.Status(http.StatusOK)
-	
+
 	// Copy the response body to the client
 	buffer := make([]byte, 4096)
 	for {
@@ -720,7 +823,6 @@ func (s *TinfoilProxyServer) handleTTS(c *gin.Context) {
 	}
 }
 
-
 func main() {
 	// Initialize proxy server
 	server, err := NewTinfoilProxyServer()
@@ -735,7 +837,7 @@ func main() {
 	// Health check endpoint
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
-			"status": "healthy",
+			"status":  "healthy",
 			"service": "tinfoil-proxy",
 		})
 	})
@@ -782,6 +884,11 @@ func main() {
 	// TTS endpoint
 	r.POST("/v1/audio/speech", func(c *gin.Context) {
 		server.handleTTS(c)
+	})
+
+	// Transcription endpoint
+	r.POST("/v1/audio/transcriptions", func(c *gin.Context) {
+		server.handleTranscription(c)
 	})
 
 	// Start server

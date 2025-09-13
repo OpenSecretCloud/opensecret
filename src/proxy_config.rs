@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use hyper::{Body, Client, Request};
 use hyper_tls::HttpsConnector;
 use lazy_static::lazy_static;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -251,10 +251,27 @@ impl ProxyRouter {
 
                             debug!("Tinfoil model '{}' will be primary", model_id);
                             model_to_proxy.insert(model_id.to_string(), tinfoil_proxy.clone());
+
+                            // Check if this model has a canonical name
+                            let mut canonical_model = model.clone();
+
+                            for (canonical_name, provider_names) in &*MODEL_EQUIVALENCIES {
+                                if let Some(tinfoil_name) = provider_names.get("tinfoil") {
+                                    if *tinfoil_name == model_id {
+                                        // Replace the model ID with the canonical name
+                                        if let Some(obj) = canonical_model.as_object_mut() {
+                                            obj.insert("id".to_string(), json!(canonical_name));
+                                            debug!("Replacing Tinfoil model '{}' with canonical name '{}'", model_id, canonical_name);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Add the model (with canonical name if applicable)
+                            all_models.push(canonical_model);
                         }
                     }
-
-                    all_models.extend(models);
                     available_models_by_provider.insert("tinfoil".to_string(), provider_models);
                     info!("Fetched {} models from Tinfoil", tinfoil_models.len());
                 }
@@ -298,7 +315,23 @@ impl ProxyRouter {
 
                         // Only add to all_models if not equivalent to a Tinfoil model
                         if !is_equivalent_to_tinfoil {
-                            all_models.push(model.clone());
+                            // Check if this model has a canonical name
+                            let mut canonical_model = model.clone();
+
+                            for (canonical_name, provider_names) in &*MODEL_EQUIVALENCIES {
+                                if let Some(continuum_name) = provider_names.get("continuum") {
+                                    if *continuum_name == model_id {
+                                        // Replace the model ID with the canonical name
+                                        if let Some(obj) = canonical_model.as_object_mut() {
+                                            obj.insert("id".to_string(), json!(canonical_name));
+                                            debug!("Replacing Continuum model '{}' with canonical name '{}'", model_id, canonical_name);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            all_models.push(canonical_model);
                             debug!(
                                 "Continuum model '{}' will be primary (no Tinfoil equivalent)",
                                 model_id

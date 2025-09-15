@@ -184,29 +184,21 @@ impl ProxyRouter {
     }
 
     /// Get the model route configuration for a given model
-    /// Always returns a route - all models have routes after initialization
-    pub async fn get_model_route(&self, model_name: &str) -> ModelRoute {
+    /// Returns None if the model is not found
+    pub async fn get_model_route(&self, model_name: &str) -> Option<ModelRoute> {
         // Ensure cache is fresh
         self.refresh_cache_if_needed().await;
 
         let cache = self.cache.read().await;
 
-        // All models should have routes now
-        cache
-            .model_routes
-            .get(model_name)
-            .cloned()
-            .unwrap_or_else(|| {
-                // Fallback for unknown models - use default proxy with no fallbacks
-                warn!(
-                    "Unknown model '{}' requested, using default proxy",
-                    model_name
-                );
-                ModelRoute {
-                    primary: self.default_proxy.clone(),
-                    fallbacks: vec![],
-                }
-            })
+        // Return the route if found, None otherwise
+        let route = cache.model_routes.get(model_name).cloned();
+
+        if route.is_none() {
+            warn!("Unknown model '{}' requested - no route found", model_name);
+        }
+
+        route
     }
 
     /// Refresh the cache if it's expired
@@ -682,8 +674,9 @@ mod tests {
         );
 
         let route = router.get_model_route("gpt-4").await;
-        assert_eq!(route.primary.base_url, "https://api.openai.com");
-        assert!(route.primary.api_key.is_some());
+        // Should return None for unknown model after cache initialization
+        // In real usage, the cache would be populated with actual models
+        assert!(route.is_none());
     }
 
     #[tokio::test]
@@ -697,8 +690,8 @@ mod tests {
         // Since model discovery is async, we can't test specific model mapping
         // without mocking the HTTP client. Test the default proxy behavior instead.
         let route = router.get_model_route("gpt-4").await;
-        assert_eq!(route.primary.base_url, "http://127.0.0.1:8092");
-        assert!(route.primary.api_key.is_none());
+        // Should return None for unknown model after cache initialization
+        assert!(route.is_none());
 
         // Verify Tinfoil proxy was configured
         assert!(router.tinfoil_proxy.is_some());
@@ -802,10 +795,9 @@ mod tests {
             Some("http://tinfoil.example.com".to_string()),
         );
 
-        // Before cache is populated, should return default proxy route
+        // Before cache is populated, should return None for unknown model
         let route = router.get_model_route("unknown-model").await;
-        assert_eq!(route.primary.provider_name, "continuum");
-        assert!(route.fallbacks.is_empty());
+        assert!(route.is_none());
 
         // Test that cache is checked (this is implementation detail but good to verify)
         // The actual cache population would happen via refresh_cache which requires HTTP mocking

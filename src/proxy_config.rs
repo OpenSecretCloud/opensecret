@@ -388,9 +388,27 @@ impl ProxyRouter {
                                         };
                                         model_routes.insert(model_name.clone(), route.clone());
                                         // Also map the Continuum name to the same route
-                                        model_routes.insert(continuum_equiv.to_string(), route);
+                                        model_routes
+                                            .insert(continuum_equiv.to_string(), route.clone());
+
+                                        // Also map the canonical name to the same route
+                                        for (canonical_name, provider_map) in &*MODEL_EQUIVALENCIES
+                                        {
+                                            if provider_map.get("tinfoil") == Some(tinfoil_equiv) {
+                                                model_routes.insert(
+                                                    canonical_name.to_string(),
+                                                    route.clone(),
+                                                );
+                                                debug!(
+                                                    "Also mapping canonical name '{}' to route",
+                                                    canonical_name
+                                                );
+                                                break;
+                                            }
+                                        }
+
                                         has_continuum_fallback = true;
-                                        info!("Model available from both providers - Tinfoil ({}) primary, Continuum ({}) fallback", 
+                                        info!("Model available from both providers - Tinfoil ({}) primary, Continuum ({}) fallback",
                                               model_name, continuum_equiv);
                                         break;
                                     }
@@ -405,7 +423,22 @@ impl ProxyRouter {
                             primary: tinfoil_proxy.clone(),
                             fallbacks: vec![],
                         };
-                        model_routes.insert(model_name.clone(), route);
+                        model_routes.insert(model_name.clone(), route.clone());
+
+                        // Also map canonical name if this is a provider-specific name
+                        for (canonical_name, provider_names) in &*MODEL_EQUIVALENCIES {
+                            if let Some(tinfoil_name) = provider_names.get("tinfoil") {
+                                if *tinfoil_name == model_name {
+                                    model_routes.insert(canonical_name.to_string(), route.clone());
+                                    debug!(
+                                        "Also mapping canonical name '{}' to Tinfoil route",
+                                        canonical_name
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+
                         debug!("Tinfoil-only model '{}' has no fallbacks", model_name);
                     }
                 }
@@ -421,7 +454,22 @@ impl ProxyRouter {
                         primary: self.default_proxy.clone(),
                         fallbacks: vec![],
                     };
-                    model_routes.insert(model_name.clone(), route);
+                    model_routes.insert(model_name.clone(), route.clone());
+
+                    // Also map canonical name if this is a provider-specific name
+                    for (canonical_name, provider_names) in &*MODEL_EQUIVALENCIES {
+                        if let Some(continuum_name) = provider_names.get("continuum") {
+                            if *continuum_name == model_name {
+                                model_routes.insert(canonical_name.to_string(), route.clone());
+                                debug!(
+                                    "Also mapping canonical name '{}' to Continuum route",
+                                    canonical_name
+                                );
+                                break;
+                            }
+                        }
+                    }
+
                     debug!("Continuum-only model '{}' has no fallbacks", model_name);
                 }
             }

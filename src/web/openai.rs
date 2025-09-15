@@ -112,8 +112,14 @@ async fn proxy_openai(
         })?
         .to_string();
 
-    // Get the model route configuration - ALL models now have routes
-    let route = state.proxy_router.get_model_route(&model_name).await;
+    // Get the model route configuration
+    let route = match state.proxy_router.get_model_route(&model_name).await {
+        Some(r) => r,
+        None => {
+            error!("Model '{}' not found in routing table", model_name);
+            return Err(ApiError::BadRequest);
+        }
+    };
 
     let modified_body_json = Value::Object(modified_body);
 

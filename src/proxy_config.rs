@@ -373,7 +373,7 @@ impl ProxyRouter {
                     // Check if this model has an equivalent in Continuum
                     let mut has_continuum_fallback = false;
 
-                    for (_canonical_name, provider_names) in &*MODEL_EQUIVALENCIES {
+                    for provider_names in MODEL_EQUIVALENCIES.values() {
                         if let (Some(tinfoil_equiv), Some(continuum_equiv)) = (
                             provider_names.get("tinfoil"),
                             provider_names.get("continuum"),

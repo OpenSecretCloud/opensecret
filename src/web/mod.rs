@@ -1,4 +1,5 @@
 pub mod attestation_routes;
+pub mod audio_utils;
 pub mod documents;
 pub mod encryption_middleware;
 mod health_routes;

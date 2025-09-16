@@ -1,5 +1,11 @@
 // @generated automatically by Diesel CLI.
 
+pub mod sql_types {
+    #[derive(diesel::sql_types::SqlType)]
+    #[diesel(postgres_type(name = "response_status"))]
+    pub struct ResponseStatus;
+}
+
 diesel::table! {
     account_deletion_requests (id) {
         id -> Int4,
@@ -12,6 +18,34 @@ diesel::table! {
         created_at -> Timestamptz,
         completed_at -> Nullable<Timestamptz>,
         is_deleted -> Bool,
+    }
+}
+
+diesel::table! {
+    assistant_messages (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        conversation_id -> Int8,
+        response_id -> Nullable<Int8>,
+        user_id -> Uuid,
+        content_enc -> Bytea,
+        completion_tokens -> Int4,
+        finish_reason -> Nullable<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    conversations (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        system_prompt_id -> Nullable<Int8>,
+        title_enc -> Nullable<Bytea>,
+        metadata -> Nullable<Jsonb>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
     }
 }
 
@@ -178,6 +212,32 @@ diesel::table! {
 }
 
 diesel::table! {
+    use diesel::sql_types::*;
+    use super::sql_types::ResponseStatus;
+
+    responses (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        conversation_id -> Int8,
+        status -> ResponseStatus,
+        model -> Text,
+        temperature -> Nullable<Float4>,
+        top_p -> Nullable<Float4>,
+        max_output_tokens -> Nullable<Int4>,
+        tool_choice -> Nullable<Text>,
+        parallel_tool_calls -> Bool,
+        store -> Bool,
+        metadata -> Nullable<Jsonb>,
+        input_tokens -> Nullable<Int4>,
+        output_tokens -> Nullable<Int4>,
+        created_at -> Timestamptz,
+        completed_at -> Nullable<Timestamptz>,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     token_usage (id) {
         id -> Int8,
         user_id -> Uuid,
@@ -185,6 +245,40 @@ diesel::table! {
         output_tokens -> Int4,
         estimated_cost -> Numeric,
         created_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    tool_calls (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        conversation_id -> Int8,
+        response_id -> Nullable<Int8>,
+        user_id -> Uuid,
+        tool_call_id -> Uuid,
+        name -> Text,
+        arguments_enc -> Nullable<Bytea>,
+        argument_tokens -> Int4,
+        status -> Nullable<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    tool_outputs (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        conversation_id -> Int8,
+        response_id -> Nullable<Int8>,
+        user_id -> Uuid,
+        tool_call_fk -> Int8,
+        output_enc -> Bytea,
+        output_tokens -> Int4,
+        status -> Text,
+        error -> Nullable<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
     }
 }
 
@@ -212,6 +306,20 @@ diesel::table! {
 }
 
 diesel::table! {
+    user_messages (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        conversation_id -> Int8,
+        response_id -> Nullable<Int8>,
+        user_id -> Uuid,
+        content_enc -> Bytea,
+        prompt_tokens -> Int4,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     user_oauth_connections (id) {
         id -> Int4,
         user_id -> Uuid,
@@ -221,6 +329,20 @@ diesel::table! {
         access_token_enc -> Bytea,
         refresh_token_enc -> Nullable<Bytea>,
         expires_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    user_system_prompts (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        name_enc -> Bytea,
+        prompt_enc -> Bytea,
+        prompt_tokens -> Int4,
+        is_default -> Bool,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
@@ -240,16 +362,29 @@ diesel::table! {
     }
 }
 
+diesel::joinable!(assistant_messages -> conversations (conversation_id));
+diesel::joinable!(assistant_messages -> responses (response_id));
+diesel::joinable!(conversations -> user_system_prompts (system_prompt_id));
 diesel::joinable!(invite_codes -> orgs (org_id));
 diesel::joinable!(org_memberships -> orgs (org_id));
 diesel::joinable!(org_project_secrets -> org_projects (project_id));
 diesel::joinable!(org_projects -> orgs (org_id));
 diesel::joinable!(project_settings -> org_projects (project_id));
+diesel::joinable!(responses -> conversations (conversation_id));
+diesel::joinable!(tool_calls -> conversations (conversation_id));
+diesel::joinable!(tool_calls -> responses (response_id));
+diesel::joinable!(tool_outputs -> conversations (conversation_id));
+diesel::joinable!(tool_outputs -> responses (response_id));
+diesel::joinable!(tool_outputs -> tool_calls (tool_call_fk));
+diesel::joinable!(user_messages -> conversations (conversation_id));
+diesel::joinable!(user_messages -> responses (response_id));
 diesel::joinable!(user_oauth_connections -> oauth_providers (provider_id));
 diesel::joinable!(users -> org_projects (project_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     account_deletion_requests,
+    assistant_messages,
+    conversations,
     email_verifications,
     enclave_secrets,
     invite_codes,
@@ -264,9 +399,14 @@ diesel::allow_tables_to_appear_in_same_query!(
     platform_password_reset_requests,
     platform_users,
     project_settings,
+    responses,
     token_usage,
+    tool_calls,
+    tool_outputs,
     user_api_keys,
     user_kv,
+    user_messages,
     user_oauth_connections,
+    user_system_prompts,
     users,
 );

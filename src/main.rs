@@ -18,8 +18,8 @@ use crate::sqs::SqsEventPublisher;
 use crate::web::openai_auth::validate_openai_auth;
 use crate::web::platform_login_routes;
 use crate::web::{
-    document_routes, health_routes_with_state, login_routes, oauth_routes, openai_routes,
-    protected_routes,
+    conversations_routes, document_routes, health_routes_with_state, login_routes, oauth_routes,
+    openai_routes, protected_routes, responses_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
@@ -71,6 +71,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 mod apple_signin;
 mod aws_credentials;
 mod billing;
+mod context_builder;
 mod db;
 mod email;
 mod encrypt;
@@ -83,6 +84,7 @@ mod oauth;
 mod private_key;
 mod proxy_config;
 mod sqs;
+mod tokens;
 mod web;
 
 use apple_signin::AppleJwtVerifier;
@@ -251,6 +253,9 @@ pub enum ApiError {
 
     #[error("Resource not found")]
     NotFound,
+
+    #[error("Unprocessable entity")]
+    UnprocessableEntity,
 }
 
 impl IntoResponse for ApiError {
@@ -272,6 +277,7 @@ impl IntoResponse for ApiError {
             ApiError::EmailAlreadyExists => StatusCode::CONFLICT,
             ApiError::UsageLimitReached => StatusCode::FORBIDDEN,
             ApiError::NotFound => StatusCode::NOT_FOUND,
+            ApiError::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
         };
         (
             status,
@@ -2422,6 +2428,14 @@ async fn main() -> Result<(), Error> {
         .merge(
             openai_routes(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_openai_auth)),
+        )
+        .merge(
+            responses_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            conversations_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
         )
         .merge(
             document_routes(app_state.clone())

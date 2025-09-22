@@ -30,8 +30,8 @@ use crate::models::project_settings::{
 };
 use crate::models::responses::{
     AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewResponse, NewToolCall,
-    NewToolOutput, NewUserMessage, RawThreadMessage, Response, ResponseStatus, ResponsesError, ToolCall,
-    ToolOutput, UserMessage,
+    NewToolOutput, NewUserMessage, RawThreadMessage, Response, ResponseStatus, ResponsesError,
+    ToolCall, ToolOutput, UserMessage,
 };
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
 use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
@@ -489,19 +489,12 @@ pub trait DBConnection {
         after: Option<(DateTime<Utc>, i64)>,
         before: Option<(DateTime<Utc>, i64)>,
     ) -> Result<Vec<Conversation>, DBError>;
-    fn delete_conversation(
-        &self,
-        conversation_id: i64,
-        user_id: Uuid,
-    ) -> Result<(), DBError>;
+    fn delete_conversation(&self, conversation_id: i64, user_id: Uuid) -> Result<(), DBError>;
 
     // Responses (job tracker)
     fn create_response(&self, new_response: NewResponse) -> Result<Response, DBError>;
-    fn get_response_by_uuid_and_user(
-        &self,
-        uuid: Uuid,
-        user_id: Uuid,
-    ) -> Result<Response, DBError>;
+    fn get_response_by_uuid_and_user(&self, uuid: Uuid, user_id: Uuid)
+        -> Result<Response, DBError>;
     fn update_response_status(
         &self,
         id: i64,
@@ -1964,14 +1957,10 @@ impl DBConnection for PostgresConnection {
         Conversation::list_for_user(conn, user_id, limit, after, before).map_err(DBError::from)
     }
 
-    fn delete_conversation(
-        &self,
-        conversation_id: i64,
-        user_id: Uuid,
-    ) -> Result<(), DBError> {
+    fn delete_conversation(&self, conversation_id: i64, user_id: Uuid) -> Result<(), DBError> {
         debug!("Deleting conversation");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        
+
         use crate::models::schema::conversations;
         use diesel::prelude::*;
 
@@ -1998,7 +1987,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_response.insert(conn).map_err(DBError::from)
     }
-    
+
     fn get_response_by_uuid_and_user(
         &self,
         uuid: Uuid,
@@ -2008,7 +1997,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Response::get_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
     }
-    
+
     fn update_response_status(
         &self,
         id: i64,
@@ -2022,19 +2011,19 @@ impl DBConnection for PostgresConnection {
         Response::update_status(conn, id, status, completed_at, input_tokens, output_tokens)
             .map_err(DBError::from)
     }
-    
+
     fn cancel_response(&self, uuid: Uuid, user_id: Uuid) -> Result<Response, DBError> {
         debug!("Cancelling response");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Response::cancel_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
     }
-    
+
     fn delete_response(&self, uuid: Uuid, user_id: Uuid) -> Result<(), DBError> {
         debug!("Deleting response");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Response::delete_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
     }
-    
+
     fn create_conversation_with_response_and_message(
         &self,
         conversation_uuid: Uuid,
@@ -2069,7 +2058,6 @@ impl DBConnection for PostgresConnection {
         new_msg.insert(conn).map_err(DBError::from)
     }
 
-
     fn update_user_message_prompt_tokens(
         &self,
         id: i64,
@@ -2099,7 +2087,6 @@ impl DBConnection for PostgresConnection {
         UserMessage::get_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
     }
 
-
     fn list_user_messages(
         &self,
         user_id: Uuid,
@@ -2121,7 +2108,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_msg.insert(conn).map_err(DBError::from)
     }
-    
+
     fn get_assistant_messages_for_response(
         &self,
         response_id: i64,
@@ -2153,7 +2140,6 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         RawThreadMessage::get_conversation_context(conn, conversation_id).map_err(DBError::from)
     }
-
 
     fn delete_user_message(&self, id: Uuid, user_id: Uuid) -> Result<(), DBError> {
         debug!("Deleting user message");

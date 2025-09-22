@@ -1,5 +1,6 @@
 use crate::models::schema::{
-    assistant_messages, conversations, responses, tool_calls, tool_outputs, user_messages, user_system_prompts,
+    assistant_messages, conversations, responses, tool_calls, tool_outputs, user_messages,
+    user_system_prompts,
 };
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
@@ -135,7 +136,7 @@ impl Response {
         user_id: Uuid,
     ) -> Result<Response, ResponsesError> {
         let response = Self::get_by_uuid_and_user(conn, uuid, user_id)?;
-        
+
         match response.status {
             ResponseStatus::InProgress | ResponseStatus::Queued => {
                 diesel::update(responses::table.filter(responses::id.eq(response.id)))
@@ -146,7 +147,7 @@ impl Response {
                     ))
                     .get_result(conn)
                     .map_err(ResponsesError::DatabaseError)
-            },
+            }
             _ => Err(ResponsesError::ValidationError),
         }
     }

@@ -41,11 +41,16 @@ pub struct CreateConversationRequest {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum MessageContentPart {
+    // Legacy: Support "text" for backwards compatibility with chat completions
     #[serde(rename = "text")]
     Text { text: String },
-    // TODO: Add support for other content types:
-    // - image_url: { url: String, detail?: "low" | "high" | "auto" }
-    // - audio: { data: String, format: String }
+    // OpenAI Conversations API standard: "input_text"
+    #[serde(rename = "input_text")]
+    InputText { text: String },
+    // TODO: Add support for other content types per OpenAI Conversations API:
+    // - input_image: { image_url?: String, file_id?: String, detail?: "low" | "high" | "auto" }
+    // - input_audio: { input_audio: {...} }
+    // - input_file: { file_id?: String, file_url?: String, file_data?: String, filename?: String }
 }
 
 /// Content that can be either a string or array of content parts
@@ -65,6 +70,7 @@ impl MessageContent {
                 .iter()
                 .filter_map(|part| match part {
                     MessageContentPart::Text { text } => Some(text.clone()),
+                    MessageContentPart::InputText { text } => Some(text.clone()),
                 })
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -274,11 +280,11 @@ async fn create_conversation(
                         let content_text = content.to_text();
                         let content_enc =
                             encrypt_with_key(&user_key, content_text.as_bytes()).await;
-                        
+
                         // Count tokens for the user message
                         // TODO: Use proper tokenizer for actual token count
                         let prompt_tokens = content_text.len() as i32 / 4; // rough estimate
-                        
+
                         let new_msg = NewUserMessage {
                             uuid: Uuid::new_v4(),
                             conversation_id: conversation.id,
@@ -484,7 +490,7 @@ async fn create_conversation_items(
                     // Count tokens for the user message
                     // TODO: Use proper tokenizer for actual token count
                     let prompt_tokens = content_text.len() as i32 / 4; // rough estimate
-                    
+
                     let new_msg = NewUserMessage {
                         uuid: msg_uuid,
                         conversation_id: conversation.id,

@@ -259,7 +259,7 @@ async fn proxy_openai(
             async move {
                 match chunk {
                     Ok(chunk) => {
-                        let chunk_str = String::from_utf8_lossy(&chunk);
+                        let chunk_str = String::from_utf8_lossy(chunk.as_ref());
                         let mut events = Vec::new();
                         {
                             let mut buffer = buffer.lock().unwrap();
@@ -317,7 +317,7 @@ pub async fn get_chat_completion_response(
     _user: &User,
     body: Value,
     headers: &HeaderMap,
-) -> Result<hyper::Response<Body>, ApiError> {
+) -> Result<hyper::Response<HyperBody>, ApiError> {
     debug!("Entering get_chat_completion_response");
 
     if body.is_null() || body.as_object().map_or(true, |obj| obj.is_empty()) {

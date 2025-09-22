@@ -831,7 +831,7 @@ async fn create_response_stream(
             trace!("Received chunk from upstream");
             match chunk_result {
                 Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(&bytes));
+                    buffer.push_str(&String::from_utf8_lossy(bytes.as_ref()));
 
                     // Process complete SSE frames
                     while let Some(double_newline_pos) = buffer.find("\n\n") {

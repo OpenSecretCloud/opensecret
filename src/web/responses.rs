@@ -54,16 +54,46 @@ pub enum ConversationParam {
     Object { id: Uuid },
 }
 
+/// Input message - can be a simple string or an array of message objects
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum InputMessage {
+    String(String),
+    Messages(Vec<MessageInput>),
+}
+
+impl InputMessage {
+    /// Get the text content as a string
+    /// For Messages variant, concatenates all message contents
+    pub fn to_string(&self) -> String {
+        match self {
+            InputMessage::String(s) => s.clone(),
+            InputMessage::Messages(messages) => {
+                messages
+                    .iter()
+                    .map(|m| m.content.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MessageInput {
+    pub role: String,
+    pub content: String,
+}
+
 /// Request payload for creating a new response
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponsesCreateRequest {
     /// Model to use for the response
     pub model: String,
 
-    /// User's input message
-    /// TODO: Support structured content array with text/images like OpenAI's format:
-    /// input: [{type: "text", text: "..."}, {type: "image_url", image_url: {...}}]
-    pub input: String,
+    /// User's input - can be a string or array of messages
+    /// Supports both: "hello" or [{"role": "user", "content": "hello"}]
+    pub input: InputMessage,
 
     /// Conversation to associate with (UUID string or {id: UUID} object)
     #[serde(default)]
@@ -571,10 +601,11 @@ async fn create_response_stream(
         })?;
 
     // Count tokens for the user's input message
-    let user_message_tokens = count_tokens(&body.input) as i32;
+    let input_text = body.input.to_string();
+    let user_message_tokens = count_tokens(&input_text) as i32;
 
     // Encrypt user input
-    let content_enc = encrypt_with_key(&user_key, body.input.as_bytes()).await;
+    let content_enc = encrypt_with_key(&user_key, input_text.as_bytes()).await;
 
     // Create conversation, response, and user message
     let (conversation, response, _user_message) = persist_initial_message(

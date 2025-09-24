@@ -1203,12 +1203,41 @@ ON tool_outputs(conversation_id, created_at);
    }
    ```
 
-3. **Message Storage**:
-   - Response: Created immediately with status='in_progress'
-   - User message: Stored immediately after response creation
-   - Assistant message: Stored after streaming completes
-   - Tool calls: Stored as they arrive
-   - Response status: Updated to 'completed' when stream ends
+3. **Message Storage Strategy - Deferred Persistence** ⚠️ **[NOT YET IMPLEMENTED]**:
+
+   **Important Design Decision**: Unlike the original implementation that persisted user messages immediately, we will adopt a **deferred persistence** approach similar to OpenAI's actual behavior. This ensures atomic user + assistant message storage.
+
+   **Current Status**: The code currently persists user messages immediately. This section documents the target architecture.
+
+   **Storage Timeline**:
+   - Response: Created immediately with status='in_progress' (tracks the job)
+   - User message: **NOT persisted immediately** - kept in memory/request
+   - Assistant message: Accumulated during streaming
+   - **On Success**: Both user + assistant messages persisted atomically
+   - **On Failure**: Only Response exists with status='failed', no messages stored
+   - Tool calls: Stored as they arrive (if we get that far)
+
+   **Benefits of Deferred Persistence**:
+   - **Atomic conversations**: User messages only exist with corresponding assistant responses
+   - **No duplicate messages**: Failed attempts don't create orphaned user messages
+   - **Clean retry semantics**: Retrying a failed request won't duplicate the user message
+   - **Simpler context building**: No need to filter out messages from failed responses
+
+   **Implementation Notes**:
+   - User message content passed through the streaming pipeline in memory
+   - `storage_task` handles atomic persistence of both messages on completion
+   - Failed responses have no associated messages in the database
+   - This matches OpenAI's Responses API behavior where messages only appear after successful completion
+
+   **Implementation Roadmap**:
+   1. Modify `persist_initial_message()` to only create Response (not UserMessage)
+   2. Pass user message content through the streaming channels (add to `StorageMessage` enum)
+   3. Update `storage_task()` to:
+      - Accept user message data
+      - Store both user and assistant messages atomically on success
+      - Use a database transaction for atomicity
+   4. Update context building to handle conversations where Response exists but no messages
+   5. Test retry behavior to ensure no duplicate messages
 
 ### SSE Event Format
 
@@ -1954,9 +1983,9 @@ Client              API Gateway         Responses API          Chat API         
   |--POST /v1/--------->|                    |                    |                |
   |  responses          |--JWT Validate----->|                    |                |
   |                     |--Decrypt Request-->|                    |                |
-  |                     |                    |--Insert User----------------------->|
-  |                     |                    |  Message            |                |
+  |                     |                    |--Insert Response------------------->|
   |                     |                    |  (in_progress)      |                |
+  |                     |                    |  [No User Message]  |                |
   |<--Response ID-------|<--Return ID--------|<-------------------|                |
   |                     |                    |                    |                |
   |<----SSE Connect-----|<--Upgrade to SSE--|                    |                |
@@ -1964,8 +1993,8 @@ Client              API Gateway         Responses API          Chat API         
   |                     |                    |--POST /v1/chat/---->|                |
   |                     |                    |  completions        |                |
   |<--response.output_text.delta--|<--Stream-----------|<--LLM Response-----|                |
-  |                     |                    |--Store Assistant------------------->|
-  |                     |                    |  Message            |                |
+  |                     |                    |--Store User +---------------------->|
+  |                     |                    |  Assistant Messages |                |
   |<--response.completed--|<--Complete---------|--Update Status-------------------->|
   |                     |                    |  (completed)        |                |
 ```
@@ -1989,14 +2018,14 @@ Client              Responses API      Chat API         Tool Executor    Databas
   |<--response.completed--|--Complete---------|--------------|-------------->|
 ```
 
-### Error Recovery Flow
+### Error Recovery Flow (With Deferred Persistence)
 
 ```
 Client              Chat Service         Database            LLM Provider
   |                     |                   |                     |
   |--Request----------->|                   |                     |
   |                     |--Store Response-->|                     |
-  |                     |  & User Message   |                     |
+  |                     |  (NO User Message)|                     |
   |                     |<------------------|                     |
   |                     |--Stream Request------------------------->|
   |                     |                   |                     |
@@ -2004,14 +2033,17 @@ Client              Chat Service         Database            LLM Provider
   |                     |                   |                     |
   |                     |                   |      X Error X     |
   |                     |                   |                     |
-  |                     |--Store Partial--->|                     |
-  |                     |   Response        |                     |
-  |                     |<------------------|                     |
+  |                     |   [NO Messages    |                     |
+  |                     |    Persisted]     |                     |
+  |                     |                   |                     |
   |<---Error Event------|                   |                     |
   |                     |                   |                     |
   |                     |--Update Response->|                     |
   |                     |   Status (failed) |                     |
+  |                     |   [No Messages]   |                     |
 ```
+
+**Key Difference**: On error, only the Response record exists with `status: failed`. No user or assistant messages are persisted, making retries clean and preventing duplicate messages.
 
 ### Key Flow Characteristics
 

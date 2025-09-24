@@ -65,16 +65,14 @@ pub enum InputMessage {
 impl InputMessage {
     /// Get the text content as a string
     /// For Messages variant, concatenates all message contents
-    pub fn to_string(&self) -> String {
+    pub fn as_text(&self) -> String {
         match self {
             InputMessage::String(s) => s.clone(),
-            InputMessage::Messages(messages) => {
-                messages
-                    .iter()
-                    .map(|m| m.content.clone())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
+            InputMessage::Messages(messages) => messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
         }
     }
 }
@@ -601,7 +599,7 @@ async fn create_response_stream(
         })?;
 
     // Count tokens for the user's input message
-    let input_text = body.input.to_string();
+    let input_text = body.input.as_text();
     let user_message_tokens = count_tokens(&input_text) as i32;
 
     // Encrypt user input
@@ -661,11 +659,12 @@ async fn create_response_stream(
     let upstream_response =
         get_chat_completion_response(&state, &user, chat_request, &headers).await?;
 
-    // Create channel for storage task
+    // Create channels for storage task and client stream
     let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(1024);
+    let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(1024);
 
     // Spawn storage task
-    let storage_handle = {
+    let _storage_handle = {
         let db = state.db.clone();
         let response_id = response.id;
         let conversation_id = conversation.id;
@@ -686,11 +685,150 @@ async fn create_response_stream(
         })
     };
 
-    // Create the SSE stream
-    let mut body_stream = upstream_response.into_body().into_stream();
-    let tx_storage_clone = tx_storage.clone();
+    // Spawn upstream processor task that runs independently of client connection
+    // This ensures storage completes even if client disconnects
+    let _upstream_handle = {
+        let mut body_stream = upstream_response.into_body().into_stream();
+        let tx_storage_clone = tx_storage.clone();
+        let tx_client_clone = tx_client.clone();
+        let message_id = Uuid::new_v4();
 
-    trace!("Creating SSE event stream");
+        tokio::spawn(async move {
+            let mut buffer = String::new();
+            let mut stream_finish_reason: Option<String> = None;
+
+            trace!("Starting upstream processor task");
+            while let Some(chunk_result) = body_stream.next().await {
+                match chunk_result {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(bytes.as_ref()));
+
+                        // Process complete SSE frames
+                        while let Some(double_newline_pos) = buffer.find("\n\n") {
+                            let frame = buffer[..double_newline_pos].to_string();
+                            buffer = buffer[double_newline_pos + 2..].to_string();
+
+                            // Skip empty frames
+                            if frame.trim().is_empty() {
+                                continue;
+                            }
+
+                            // Extract data from SSE frame
+                            if let Some(data) = frame.strip_prefix("data: ") {
+                                let data = data.trim();
+
+                                if data == "[DONE]" {
+                                    trace!(
+                                        "Upstream processor: received [DONE], sending completion"
+                                    );
+
+                                    // Send to storage
+                                    let _ = tx_storage_clone
+                                        .send(StorageMessage::Done {
+                                            finish_reason: stream_finish_reason
+                                                .clone()
+                                                .unwrap_or_else(|| "stop".to_string()),
+                                            message_id,
+                                        })
+                                        .await;
+
+                                    // Send to client (if still connected)
+                                    let _ = tx_client_clone
+                                        .send(StorageMessage::Done {
+                                            finish_reason: stream_finish_reason
+                                                .clone()
+                                                .unwrap_or_else(|| "stop".to_string()),
+                                            message_id,
+                                        })
+                                        .await;
+
+                                    break;
+                                }
+
+                                // Parse JSON data
+                                if let Ok(json_data) = serde_json::from_str::<Value>(data) {
+                                    // Extract content delta
+                                    if let Some(content) =
+                                        json_data["choices"][0]["delta"]["content"].as_str()
+                                    {
+                                        trace!(
+                                            "Upstream processor: found content delta: {}",
+                                            content
+                                        );
+
+                                        // Send to storage
+                                        let _ = tx_storage_clone
+                                            .send(StorageMessage::ContentDelta(content.to_string()))
+                                            .await;
+
+                                        // Send to client (if still connected)
+                                        let _ = tx_client_clone
+                                            .send(StorageMessage::ContentDelta(content.to_string()))
+                                            .await;
+                                    }
+
+                                    // Extract usage
+                                    if let Some(usage) = json_data.get("usage") {
+                                        let provider_prompt_tokens =
+                                            usage["prompt_tokens"].as_i64().unwrap_or(0) as i32;
+                                        let provider_completion_tokens =
+                                            usage["completion_tokens"].as_i64().unwrap_or(0) as i32;
+
+                                        debug!("Upstream processor: found usage - prompt_tokens={}, completion_tokens={}",
+                                               provider_prompt_tokens, provider_completion_tokens);
+
+                                        // Send to storage
+                                        let _ = tx_storage_clone
+                                            .send(StorageMessage::Usage {
+                                                prompt_tokens: provider_prompt_tokens,
+                                                completion_tokens: provider_completion_tokens,
+                                            })
+                                            .await;
+
+                                        // Send to client (if still connected)
+                                        let _ = tx_client_clone
+                                            .send(StorageMessage::Usage {
+                                                prompt_tokens: provider_prompt_tokens,
+                                                completion_tokens: provider_completion_tokens,
+                                            })
+                                            .await;
+                                    }
+
+                                    // Check for finish reason
+                                    if let Some(finish_reason) =
+                                        json_data["choices"][0]["finish_reason"].as_str()
+                                    {
+                                        trace!(
+                                            "Upstream processor: found finish_reason: {}",
+                                            finish_reason
+                                        );
+                                        stream_finish_reason = Some(finish_reason.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Upstream processor: error reading response: {:?}", e);
+                        let _ = tx_storage_clone
+                            .send(StorageMessage::Error(e.to_string()))
+                            .await;
+                        let _ = tx_client_clone
+                            .send(StorageMessage::Error(e.to_string()))
+                            .await;
+                        break;
+                    }
+                }
+            }
+
+            // Clean up
+            drop(tx_storage_clone);
+            drop(tx_client_clone);
+            debug!("Upstream processor task completed");
+        })
+    };
+
+    trace!("Creating SSE event stream for client");
     let event_stream = async_stream::stream! {
         trace!("=== STARTING SSE STREAM ===");
         let mut sequence_number = 0i32;
@@ -781,12 +919,10 @@ async fn create_response_stream(
             }
         }
 
-        // Process upstream chunks
-        let mut buffer = String::new();
+        // Process messages from upstream processor
         let mut assistant_content = String::new();
         let mut total_completion_tokens = 0i32;
-        let message_id = Uuid::new_v4();
-        let mut stream_finish_reason: Option<String> = None; // Track finish_reason from stream
+        let mut message_id = Uuid::new_v4(); // Will be set by upstream processor
 
         // Event 3: response.output_item.added
         let output_item_added_event = ResponseOutputItemAddedEvent {
@@ -857,38 +993,13 @@ async fn create_response_stream(
             }
         }
 
-        trace!("Starting to process upstream chunks");
-        while let Some(chunk_result) = body_stream.next().await {
-            trace!("Received chunk from upstream");
-            match chunk_result {
-                Ok(bytes) => {
-                    buffer.push_str(&String::from_utf8_lossy(bytes.as_ref()));
-
-                    // Process complete SSE frames
-                    while let Some(double_newline_pos) = buffer.find("\n\n") {
-                        let frame = buffer[..double_newline_pos].to_string();
-                        buffer = buffer[double_newline_pos + 2..].to_string();
-
-                        // Skip empty frames
-                        if frame.trim().is_empty() {
-                            continue;
-                        }
-
-                        // Extract data from SSE frame
-                        if let Some(data) = frame.strip_prefix("data: ") {
-                            let data = data.trim();
-
-                            if data == "[DONE]" {
-                                trace!("Received [DONE] from upstream, sending completion events");
-
-                                // Signal completion to storage
-                                let _ = tx_storage_clone.send(StorageMessage::Done {
-                                    finish_reason: stream_finish_reason.clone().unwrap_or_else(|| {
-                                        error!("No finish_reason received from stream, this should not happen!");
-                                        "error".to_string()
-                                    }),
-                                    message_id,
-                                }).await;
+        trace!("Starting to process messages from upstream processor");
+        while let Some(msg) = rx_client.recv().await {
+            trace!("Client stream received message from upstream processor");
+            match msg {
+                StorageMessage::Done { finish_reason, message_id: msg_id } => {
+                    trace!("Client stream received Done signal with finish_reason={}", finish_reason);
+                    message_id = msg_id;
 
                                 // Event 7: response.output_text.done
                                 let output_text_done_event = ResponseOutputTextDoneEvent {
@@ -1067,100 +1178,57 @@ async fn create_response_stream(
                                         yield Ok(Event::default().event("error").data("serialization_failed"));
                                     }
                                 }
-                                break;
+                    break;
+                }
+                StorageMessage::ContentDelta(content) => {
+                    trace!("Client stream received content delta: {}", content);
+                    assistant_content.push_str(&content);
+
+                    // Send to client
+                    let delta_event = ResponseOutputTextDeltaEvent {
+                        event_type: "response.output_text.delta",
+                        delta: content.clone(),
+                        item_id: message_id.to_string(),
+                        output_index: 0,
+                        content_index: 0,
+                        sequence_number,
+                        logprobs: vec![],
+                    };
+                    sequence_number += 1;
+
+                    trace!("Sending response.output_text.delta event");
+                    match serde_json::to_value(&delta_event) {
+                        Ok(delta_json) => {
+                            match encrypt_event(&state, &session_id, "response.output_text.delta", &delta_json).await {
+                                Ok(event) => {
+                                    trace!("Yielding response.output_text.delta event");
+                                    yield Ok(event)
+                                },
+                                Err(e) => {
+                                    error!("Failed to encrypt response.output_text.delta event: {:?}", e);
+                                    yield Ok(Event::default().event("error").data("encryption_failed"));
+                                }
                             }
-
-                            // Parse JSON data
-                            if let Ok(json_data) = serde_json::from_str::<Value>(data) {
-                                trace!("Parsed JSON chunk: has content={}, has usage={}, has finish_reason={}",
-                                       json_data["choices"][0]["delta"]["content"].is_string(),
-                                       json_data.get("usage").is_some(),
-                                       json_data["choices"][0]["finish_reason"].is_string());
-
-                                // Extract content delta
-                                if let Some(content) = json_data["choices"][0]["delta"]["content"].as_str() {
-                                    trace!("Found content delta: {}", content);
-                                    assistant_content.push_str(content);
-
-                                    // Send to storage
-                                    let _ = tx_storage_clone.send(StorageMessage::ContentDelta(content.to_string())).await;
-
-                                    // Send to client
-                                    let delta_event = ResponseOutputTextDeltaEvent {
-                                        event_type: "response.output_text.delta",
-                                        delta: content.to_string(),
-                                        item_id: message_id.to_string(),
-                                        output_index: 0,
-                                        content_index: 0,
-                                        sequence_number,
-                                        logprobs: vec![],
-                                    };
-                                    sequence_number += 1;
-
-                                    trace!("Sending response.output_text.delta event with content: {}", content);
-                                    match serde_json::to_value(&delta_event) {
-                                        Ok(delta_json) => {
-                                            match encrypt_event(&state, &session_id, "response.output_text.delta", &delta_json).await {
-                                                Ok(event) => {
-                                                    trace!("Yielding response.output_text.delta event");
-                                                    yield Ok(event)
-                                                },
-                                                Err(e) => {
-                                                    error!("Failed to encrypt response.output_text.delta event: {:?}", e);
-                                                    yield Ok(Event::default().event("error").data("encryption_failed"));
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to serialize response.output_text.delta: {:?}", e);
-                                            yield Ok(Event::default().event("error").data("serialization_failed"));
-                                        }
-                                    }
-                                }
-
-                                // Extract usage (usually in final chunk)
-                                if let Some(usage) = json_data.get("usage") {
-                                    debug!("Found usage data in chunk: {:?}", usage);
-
-                                    // Get the actual token counts from the provider
-                                    let provider_prompt_tokens = usage["prompt_tokens"].as_i64().unwrap_or(0) as i32;
-                                    let provider_completion_tokens = usage["completion_tokens"].as_i64().unwrap_or(0) as i32;
-
-                                    total_completion_tokens = provider_completion_tokens;
-                                    debug!("Provider reported usage: prompt_tokens={}, completion_tokens={}",
-                                           provider_prompt_tokens, provider_completion_tokens);
-
-                                    // IMMEDIATELY send the provider's actual token counts to storage
-                                    debug!("Immediately sending provider usage to storage: prompt_tokens={}, completion_tokens={}",
-                                           provider_prompt_tokens, provider_completion_tokens);
-                                    let _ = tx_storage_clone.send(StorageMessage::Usage {
-                                        prompt_tokens: provider_prompt_tokens,
-                                        completion_tokens: provider_completion_tokens,
-                                    }).await;
-                                }
-
-                                // Check for finish reason but don't send Done yet
-                                // The Done message will be sent when we see [DONE]
-                                if let Some(finish_reason) = json_data["choices"][0]["finish_reason"].as_str() {
-                                    trace!("Found finish_reason: {}, but waiting for [DONE] to send Done message", finish_reason);
-                                    stream_finish_reason = Some(finish_reason.to_string());
-                                }
-                            } else {
-                                trace!("Failed to parse JSON from upstream: {}", data);
-                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to serialize response.output_text.delta: {:?}", e);
+                            yield Ok(Event::default().event("error").data("serialization_failed"));
                         }
                     }
                 }
-                Err(e) => {
-                    error!("Error reading upstream response: {:?}", e);
-                    let _ = tx_storage_clone.send(StorageMessage::Error(e.to_string())).await;
 
+                StorageMessage::Usage { prompt_tokens: _, completion_tokens } => {
+                    trace!("Client stream received usage data");
+                    total_completion_tokens = completion_tokens;
+                }
+                StorageMessage::Error(error_msg) => {
+                    error!("Client stream received error: {}", error_msg);
                     // Send error event to client
                     let error_event = ResponseErrorEvent {
                         event_type: "response.error",
                         error: ResponseError {
                             error_type: "stream_error".to_string(),
-                            message: "Upstream connection error".to_string(),
+                            message: error_msg,
                         },
                     };
 
@@ -1184,9 +1252,8 @@ async fn create_response_stream(
             }
         }
 
-        // Ensure storage task completes
-        drop(tx_storage_clone);
-        let _ = storage_handle.await;
+        // Client stream is done, but storage and upstream tasks continue independently
+        trace!("Client SSE stream ending");
     };
 
     trace!("Returning SSE stream");
@@ -1250,8 +1317,19 @@ async fn storage_task(
 
     // If we exit the loop without Done or Error, it means all senders were dropped
     if error_msg.is_none() && finish_reason.is_empty() {
-        warn!("Storage: channel closed before receiving Done signal, saving partial content");
-        finish_reason = "error".to_string(); // No finish reason means something went wrong
+        warn!("Storage: channel closed before receiving Done signal, NOT persisting incomplete content");
+        // Don't save partial content - the upstream processor should complete normally
+        // If it doesn't, something went wrong and we shouldn't persist bad data
+        if let Err(e) = db.update_response_status(
+            response_id,
+            ResponseStatus::Failed,
+            Some(Utc::now()),
+            None,
+            None,
+        ) {
+            error!("Failed to update response status to failed: {:?}", e);
+        }
+        return;
     }
 
     // Handle error case

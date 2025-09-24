@@ -16,9 +16,9 @@ use axum::{
     Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 use uuid::Uuid;
 
 // ============================================================================
@@ -68,9 +68,9 @@ impl MessageContent {
             MessageContent::Text(text) => text.clone(),
             MessageContent::Parts(parts) => parts
                 .iter()
-                .filter_map(|part| match part {
-                    MessageContentPart::Text { text } => Some(text.clone()),
-                    MessageContentPart::InputText { text } => Some(text.clone()),
+                .map(|part| match part {
+                    MessageContentPart::Text { text } => text.clone(),
+                    MessageContentPart::InputText { text } => text.clone(),
                 })
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -262,6 +262,8 @@ async fn create_conversation(
         metadata: body.metadata.clone(),
     };
 
+    trace!("Creating conversation with: {:?}", new_conversation);
+
     let conversation = state
         .db
         .create_conversation(new_conversation)
@@ -269,6 +271,8 @@ async fn create_conversation(
             error!("Failed to create conversation: {:?}", e);
             ApiError::InternalServerError
         })?;
+
+    trace!("Created conversation: {:?}", conversation);
 
     // Process initial items if provided
     if let Some(items) = &body.items {
@@ -342,10 +346,33 @@ async fn get_conversation(
             }
         })?;
 
+    // Get user's encryption key for decrypting title
+    let user_key = state
+        .get_user_key(user.uuid, None, None)
+        .await
+        .map_err(|_| ApiError::InternalServerError)?;
+
+    // Start with existing metadata or create empty object
+    let mut metadata = conversation.metadata.clone().unwrap_or_else(|| json!({}));
+
+    // Decrypt and add title if present
+    if let Some(title_enc) = &conversation.title_enc {
+        match decrypt_with_key(&user_key, title_enc) {
+            Ok(title_bytes) => {
+                if let Ok(title) = String::from_utf8(title_bytes) {
+                    metadata["title"] = json!(title);
+                }
+            }
+            Err(e) => {
+                error!("Failed to decrypt conversation title: {:?}", e);
+            }
+        }
+    }
+
     let response = ConversationResponse {
         id: conversation.uuid,
         object: "conversation",
-        metadata: conversation.metadata,
+        metadata: Some(metadata),
         created_at: conversation.created_at.timestamp(),
     };
 
@@ -377,6 +404,31 @@ async fn update_conversation(
             }
         })?;
 
+    // Get user's encryption key
+    let user_key = state
+        .get_user_key(user.uuid, None, None)
+        .await
+        .map_err(|_| ApiError::InternalServerError)?;
+
+    // Check if the update includes a title change
+    let updated_metadata = body.metadata.clone();
+    let mut new_title_enc = conversation.title_enc.clone();
+
+    if let Some(new_title) = body.metadata.get("title").and_then(|v| v.as_str()) {
+        // User is updating the title - encrypt and store it
+        let encrypted_title = encrypt_with_key(&user_key, new_title.as_bytes()).await;
+        new_title_enc = Some(encrypted_title.clone());
+
+        // Update title_enc in database
+        state
+            .db
+            .update_conversation_title(conversation.id, encrypted_title)
+            .map_err(|e| {
+                error!("Failed to update conversation title: {:?}", e);
+                ApiError::InternalServerError
+            })?;
+    }
+
     // Update metadata (always provided per spec)
     state
         .db
@@ -386,13 +438,33 @@ async fn update_conversation(
             ApiError::InternalServerError
         })?;
 
-    // Update the in-memory object to reflect the change
-    conversation.metadata = Some(body.metadata.clone());
+    // Update the in-memory object to reflect the changes
+    conversation.metadata = Some(updated_metadata.clone());
+    conversation.title_enc = new_title_enc.clone();
+
+    // For the response, ensure title is in metadata (either the new one or decrypt the existing one)
+    let mut response_metadata = updated_metadata.clone();
+
+    // Only decrypt and add title if it wasn't already in the update
+    if response_metadata.get("title").is_none() {
+        if let Some(title_enc) = &new_title_enc {
+            match decrypt_with_key(&user_key, title_enc) {
+                Ok(title_bytes) => {
+                    if let Ok(title) = String::from_utf8(title_bytes) {
+                        response_metadata["title"] = json!(title);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to decrypt conversation title: {:?}", e);
+                }
+            }
+        }
+    }
 
     let response = ConversationResponse {
         id: conversation.uuid,
         object: "conversation",
-        metadata: conversation.metadata,
+        metadata: Some(response_metadata),
         created_at: conversation.created_at.timestamp(),
     };
 
@@ -811,14 +883,44 @@ async fn list_conversations(
         conversations.reverse();
     }
 
+    // Get user's encryption key for decrypting titles
+    let user_key = state
+        .get_user_key(user.uuid, None, None)
+        .await
+        .map_err(|_| ApiError::InternalServerError)?;
+
     // Convert to response format
     let data: Vec<ConversationResponse> = conversations
         .iter()
-        .map(|conv| ConversationResponse {
-            id: conv.uuid,
-            object: "conversation",
-            metadata: conv.metadata.clone(),
-            created_at: conv.created_at.timestamp(),
+        .map(|conv| {
+            trace!("Raw conversation object: {:?}", conv);
+            trace!("Conv metadata: {:?}", conv.metadata);
+            trace!("Conv title_enc present: {}", conv.title_enc.is_some());
+
+            // Start with existing metadata or create empty object
+            let mut metadata = conv.metadata.clone().unwrap_or_else(|| json!({}));
+
+            // Decrypt and add title if present
+            if let Some(title_enc) = &conv.title_enc {
+                match decrypt_with_key(&user_key, title_enc) {
+                    Ok(title_bytes) => {
+                        if let Ok(title) = String::from_utf8(title_bytes) {
+                            metadata["title"] = json!(title);
+                            trace!("Decrypted title: {}", title);
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to decrypt conversation title: {:?}", e);
+                    }
+                }
+            }
+
+            ConversationResponse {
+                id: conv.uuid,
+                object: "conversation",
+                metadata: Some(metadata),
+                created_at: conv.created_at.timestamp(),
+            }
         })
         .collect();
 
@@ -829,6 +931,8 @@ async fn list_conversations(
         first_id: conversations.first().map(|c| c.uuid),
         last_id: conversations.last().map(|c| c.uuid),
     };
+
+    trace!("Final ConversationListResponse: {:?}", response);
 
     encrypt_response(&state, &session_id, &response).await
 }

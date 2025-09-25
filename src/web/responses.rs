@@ -1524,6 +1524,25 @@ async fn persist_initial_message(
 > {
     use crate::models::responses::{NewResponse, ResponseStatus};
 
+    // Extract internal_message_id from metadata if present
+    let message_uuid = if let Some(metadata) = &body.metadata {
+        if let Some(internal_id) = metadata.get("internal_message_id") {
+            if let Some(id_str) = internal_id.as_str() {
+                // Try to parse as UUID, use new UUID if parsing fails
+                Uuid::parse_str(id_str).unwrap_or_else(|_| {
+                    warn!("Invalid internal_message_id UUID: {}, generating new one", id_str);
+                    Uuid::new_v4()
+                })
+            } else {
+                Uuid::new_v4()
+            }
+        } else {
+            Uuid::new_v4()
+        }
+    } else {
+        Uuid::new_v4()
+    };
+
     // Determine which conversation to use
     let conversation_id = match &body.conversation {
         Some(ConversationParam::String(id)) | Some(ConversationParam::Object { id }) => Some(*id),
@@ -1577,9 +1596,9 @@ async fn persist_initial_message(
             ApiError::InternalServerError
         })?;
 
-        // Create the simplified user message
+        // Create the simplified user message with extracted UUID
         let new_msg = NewUserMessage {
-            uuid: Uuid::new_v4(),
+            uuid: message_uuid,
             conversation_id: conversation.id,
             response_id: Some(response.id),
             user_id: user.uuid,
@@ -1654,6 +1673,7 @@ async fn persist_initial_message(
                 Some(new_response),
                 content_enc,
                 user_message_tokens,
+                message_uuid,
             )
             .map_err(|e| {
                 error!(

@@ -341,6 +341,7 @@ impl NewConversation {
         response: Option<NewResponse>,
         first_message_content: Vec<u8>,
         first_message_tokens: i32,
+        message_uuid: Uuid,
     ) -> Result<(Conversation, Option<Response>, UserMessage), ResponsesError> {
         use diesel::Connection;
 
@@ -362,9 +363,9 @@ impl NewConversation {
                 None
             };
 
-            // Create the first message
+            // Create the first message with specified UUID
             let new_message = NewUserMessage {
-                uuid: Uuid::new_v4(),
+                uuid: message_uuid,
                 conversation_id: conversation.id,
                 response_id: response_result.as_ref().map(|r| r.id),
                 user_id,

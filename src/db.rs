@@ -509,6 +509,7 @@ pub trait DBConnection {
         response: Option<NewResponse>,
         first_message_content: Vec<u8>,
         first_message_tokens: i32,
+        message_uuid: Uuid,
     ) -> Result<(Conversation, Option<Response>, UserMessage), DBError>;
 
     // User messages
@@ -2017,6 +2018,7 @@ impl DBConnection for PostgresConnection {
         response: Option<NewResponse>,
         first_message_content: Vec<u8>,
         first_message_tokens: i32,
+        message_uuid: Uuid,
     ) -> Result<(Conversation, Option<Response>, UserMessage), DBError> {
         debug!("Creating conversation with response and message");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
@@ -2029,6 +2031,7 @@ impl DBConnection for PostgresConnection {
             response,
             first_message_content,
             first_message_tokens,
+            message_uuid,
         )
         .map_err(DBError::from)
     }

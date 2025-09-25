@@ -1,6 +1,6 @@
 pub mod attestation_routes;
 pub mod audio_utils;
-mod conversations;
+pub mod conversations;
 pub mod documents;
 pub mod encryption_middleware;
 mod health_routes;

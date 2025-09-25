@@ -11,6 +11,7 @@ use crate::{
     sqs::UsageEvent,
     tokens::count_tokens,
     web::{
+        conversations::{MessageContent, MessageContentPart},
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
     },
@@ -63,16 +64,32 @@ pub enum InputMessage {
 }
 
 impl InputMessage {
-    /// Get the text content as a string
-    /// For Messages variant, concatenates all message contents
-    pub fn as_text(&self) -> String {
+    /// Normalize any input format to our standard format: always MessageContent::Parts
+    pub fn normalize(self) -> Vec<MessageInput> {
         match self {
-            InputMessage::String(s) => s.clone(),
-            InputMessage::Messages(messages) => messages
-                .iter()
-                .map(|m| m.content.clone())
-                .collect::<Vec<_>>()
-                .join("\n"),
+            InputMessage::String(s) => {
+                // Simple string -> user message with input_text content parts
+                vec![MessageInput {
+                    role: "user".to_string(),
+                    content: MessageContent::Parts(vec![MessageContentPart::InputText { text: s }]),
+                }]
+            }
+            InputMessage::Messages(mut messages) => {
+                // Ensure all message content is normalized to Parts format
+                for msg in &mut messages {
+                    msg.content = match msg.content.clone() {
+                        MessageContent::Text(text) => {
+                            // Convert plain text to input_text part
+                            MessageContent::Parts(vec![MessageContentPart::InputText { text }])
+                        }
+                        MessageContent::Parts(parts) => {
+                            // Already in parts format, pass through
+                            MessageContent::Parts(parts)
+                        }
+                    };
+                }
+                messages
+            }
         }
     }
 }
@@ -80,7 +97,7 @@ impl InputMessage {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MessageInput {
     pub role: String,
-    pub content: String,
+    pub content: MessageContent,
 }
 
 /// Request payload for creating a new response
@@ -598,12 +615,24 @@ async fn create_response_stream(
             ApiError::InternalServerError
         })?;
 
-    // Count tokens for the user's input message
-    let input_text = body.input.as_text();
-    let user_message_tokens = count_tokens(&input_text) as i32;
+    // Normalize input to our standard format
+    let normalized_messages = body.input.clone().normalize();
 
-    // Encrypt user input
-    let content_enc = encrypt_with_key(&user_key, input_text.as_bytes()).await;
+    // Get the first message's content (for user messages there should only be one)
+    let message_content = &normalized_messages[0].content;
+
+    // Count tokens for the user's input message (text only for token counting)
+    let input_text_for_tokens = message_content.as_text_for_input_token_count_only();
+    let user_message_tokens = count_tokens(&input_text_for_tokens) as i32;
+
+    // Serialize the MessageContent for storage
+    let content_for_storage = serde_json::to_string(message_content).map_err(|e| {
+        error!("Failed to serialize message content: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    // Encrypt the serialized MessageContent
+    let content_enc = encrypt_with_key(&user_key, content_for_storage.as_bytes()).await;
 
     // Create conversation, response, and user message
     let (conversation, response, _user_message) = persist_initial_message(
@@ -1355,7 +1384,7 @@ async fn storage_task(
         );
     }
 
-    // Encrypt and store assistant message
+    // Encrypt and store assistant message as plain text
     let content_enc = encrypt_with_key(&user_key, content.as_bytes()).await;
 
     let new_assistant = NewAssistantMessage {

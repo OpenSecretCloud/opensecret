@@ -155,34 +155,47 @@ pub fn build_prompt_from_chat_messages(
     );
 
     // 5. Convert to JSON array required by chat API
-    let final_msgs: Vec<serde_json::Value> = msgs
-        .into_iter()
-        .map(|m| {
-            if m.role == "tool" {
-                // tool_call_id should always be present for tool messages
-                debug_assert!(
-                    m.tool_call_id.is_some(),
-                    "tool_call_id must be present for tool output messages"
-                );
+    let mut final_msgs = Vec::new();
+    for m in msgs {
+        let msg = if m.role == "tool" {
+            // tool_call_id should always be present for tool messages
+            debug_assert!(
+                m.tool_call_id.is_some(),
+                "tool_call_id must be present for tool output messages"
+            );
 
-                json!({
-                    "role": "tool",
-                    "content": m.content,
-                    "tool_call_id": m.tool_call_id
-                        .map(|u| u.to_string())
-                        .unwrap_or_else(|| {
-                            error!("tool_call_id missing for tool output message");
-                            "error-missing-tool-call-id".to_string()
-                        })
-                })
+            json!({
+                "role": "tool",
+                "content": m.content,
+                "tool_call_id": m.tool_call_id
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|| {
+                        error!("tool_call_id missing for tool output message");
+                        "error-missing-tool-call-id".to_string()
+                    })
+            })
+        } else {
+            // Deserialize stored MessageContent and convert to OpenAI format
+            let content = if m.role == "user" {
+                // User messages are stored as MessageContent - convert to OpenAI format
+                use crate::web::conversations::MessageContent;
+                let mc: MessageContent = serde_json::from_str(&m.content).map_err(|e| {
+                    error!("Failed to deserialize user message content: {:?}", e);
+                    crate::ApiError::InternalServerError
+                })?;
+                mc.to_openai_format()
             } else {
-                json!({
-                    "role": m.role,
-                    "content": m.content
-                })
-            }
-        })
-        .collect();
+                // Assistant messages are plain strings
+                serde_json::Value::String(m.content.clone())
+            };
+
+            json!({
+                "role": m.role,
+                "content": content
+            })
+        };
+        final_msgs.push(msg);
+    }
 
     Ok((final_msgs, total))
 }

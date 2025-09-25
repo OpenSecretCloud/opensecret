@@ -47,8 +47,17 @@ pub enum MessageContentPart {
     // OpenAI Conversations API standard: "input_text"
     #[serde(rename = "input_text")]
     InputText { text: String },
+    // OpenAI Conversations API standard: "input_image"
+    #[serde(rename = "input_image")]
+    InputImage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        image_url: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        file_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>, // "low" | "high" | "auto"
+    },
     // TODO: Add support for other content types per OpenAI Conversations API:
-    // - input_image: { image_url?: String, file_id?: String, detail?: "low" | "high" | "auto" }
     // - input_audio: { input_audio: {...} }
     // - input_file: { file_id?: String, file_url?: String, file_data?: String, filename?: String }
 }
@@ -62,18 +71,64 @@ pub enum MessageContent {
 }
 
 impl MessageContent {
-    /// Extract text content, concatenating multiple parts if necessary
-    pub fn to_text(&self) -> String {
+    /// Extract text content for token counting purposes only
+    /// For Parts variant, concatenates all text content (ignores images)
+    pub fn as_text_for_input_token_count_only(&self) -> String {
         match self {
             MessageContent::Text(text) => text.clone(),
             MessageContent::Parts(parts) => parts
                 .iter()
-                .map(|part| match part {
-                    MessageContentPart::Text { text } => text.clone(),
-                    MessageContentPart::InputText { text } => text.clone(),
+                .filter_map(|part| match part {
+                    MessageContentPart::Text { text } => Some(text.clone()),
+                    MessageContentPart::InputText { text } => Some(text.clone()),
+                    MessageContentPart::InputImage { .. } => None, // Ignore images for token counting
                 })
                 .collect::<Vec<_>>()
                 .join(" "),
+        }
+    }
+
+    /// Convert to OpenAI API format for chat completions
+    pub fn to_openai_format(&self) -> serde_json::Value {
+        match self {
+            MessageContent::Text(text) => serde_json::json!(text),
+            MessageContent::Parts(parts) => {
+                let openai_parts: Vec<serde_json::Value> = parts
+                    .iter()
+                    .map(|part| match part {
+                        MessageContentPart::Text { text } => {
+                            serde_json::json!({
+                                "type": "text",
+                                "text": text
+                            })
+                        }
+                        MessageContentPart::InputText { text } => {
+                            serde_json::json!({
+                                "type": "text",
+                                "text": text
+                            })
+                        }
+                        MessageContentPart::InputImage {
+                            image_url, detail, ..
+                        } => {
+                            let mut image_obj = serde_json::json!({
+                                "url": image_url.as_ref().unwrap_or(&"".to_string())
+                            });
+
+                            // Only include detail if it's explicitly set
+                            if let Some(d) = detail {
+                                image_obj["detail"] = serde_json::json!(d);
+                            }
+
+                            serde_json::json!({
+                                "type": "image_url",
+                                "image_url": image_obj
+                            })
+                        }
+                    })
+                    .collect();
+                serde_json::json!(openai_parts)
+            }
         }
     }
 }
@@ -159,21 +214,44 @@ pub enum ConversationItem {
     },
 }
 
-/// Content within a message
-/// TODO: Extend to support images and other content types:
-/// - image_url: { url: String, detail?: "low" | "high" | "auto" }
-/// - audio: { data: String, format: String }
-///   This will require updates to the Responses API and database storage
+/// Content within a message for API responses
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
-#[allow(dead_code)]
 pub enum ConversationContent {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "input_text")]
     InputText { text: String },
-    // TODO: Add ImageUrl { image_url: ImageUrlContent }
-    // TODO: Add Audio { audio: AudioContent }
+    #[serde(rename = "output_text")]
+    OutputText { text: String },
+    #[serde(rename = "input_image")]
+    InputImage { image_url: String },
+}
+
+impl From<MessageContent> for Vec<ConversationContent> {
+    fn from(content: MessageContent) -> Self {
+        match content {
+            MessageContent::Text(text) => vec![ConversationContent::InputText { text }],
+            MessageContent::Parts(parts) => parts
+                .into_iter()
+                .map(|part| match part {
+                    MessageContentPart::Text { text } | MessageContentPart::InputText { text } => {
+                        ConversationContent::InputText { text }
+                    }
+                    MessageContentPart::InputImage { image_url, .. } => {
+                        ConversationContent::InputImage {
+                            image_url: image_url.unwrap_or_else(|| "[No URL]".to_string()),
+                        }
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+// Helper function to convert assistant message (plain text) to ConversationContent
+fn assistant_text_to_content(text: String) -> Vec<ConversationContent> {
+    vec![ConversationContent::OutputText { text }]
 }
 
 /// Response for listing conversation items
@@ -281,13 +359,18 @@ async fn create_conversation(
                 ConversationInputItem::Message { role, content } => {
                     if role == "user" {
                         // Create user message
-                        let content_text = content.to_text();
+                        // Serialize the full content structure for storage
+                        let content_json = serde_json::to_string(&content).map_err(|e| {
+                            error!("Failed to serialize message content: {:?}", e);
+                            ApiError::InternalServerError
+                        })?;
                         let content_enc =
-                            encrypt_with_key(&user_key, content_text.as_bytes()).await;
+                            encrypt_with_key(&user_key, content_json.as_bytes()).await;
 
-                        // Count tokens for the user message
+                        // Count tokens for the user message (text only for token counting)
                         // TODO: Use proper tokenizer for actual token count
-                        let prompt_tokens = content_text.len() as i32 / 4; // rough estimate
+                        let content_text_for_tokens = content.as_text_for_input_token_count_only();
+                        let prompt_tokens = content_text_for_tokens.len() as i32 / 4; // rough estimate
 
                         let new_msg = NewUserMessage {
                             uuid: Uuid::new_v4(),
@@ -513,106 +596,6 @@ async fn delete_conversation(
     encrypt_response(&state, &session_id, &response).await
 }
 
-/// POST /v1/conversations/{id}/items - Add items to a conversation
-async fn create_conversation_items(
-    State(state): State<Arc<AppState>>,
-    Path(conversation_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
-    Extension(user): Extension<User>,
-    Extension(body): Extension<CreateConversationItemsRequest>,
-) -> Result<Json<EncryptedResponse<ConversationItemListResponse>>, ApiError> {
-    debug!(
-        "Adding items to conversation {} for user {}",
-        conversation_id, user.uuid
-    );
-
-    // Verify conversation exists and user owns it
-    let conversation = state
-        .db
-        .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
-        .map_err(|e| match e {
-            DBError::ResponsesError(ResponsesError::ConversationNotFound) => ApiError::NotFound,
-            _ => {
-                error!("Failed to get conversation: {:?}", e);
-                ApiError::InternalServerError
-            }
-        })?;
-
-    // Get user's encryption key
-    let user_key = state
-        .get_user_key(user.uuid, None, None)
-        .await
-        .map_err(|_| ApiError::InternalServerError)?;
-
-    let mut created_items = Vec::new();
-
-    // TODO this is wrong. we should be appending the items to the conversation and then persisting
-
-    // Process each item
-    for item in &body.items {
-        match item {
-            ConversationInputItem::Message { role, content } => {
-                if role == "user" {
-                    // Create user message
-                    // Extract text from content (handles both string and array formats)
-                    let content_text = content.to_text();
-                    let content_enc = encrypt_with_key(&user_key, content_text.as_bytes()).await;
-                    let msg_uuid = Uuid::new_v4();
-
-                    // Count tokens for the user message
-                    // TODO: Use proper tokenizer for actual token count
-                    let prompt_tokens = content_text.len() as i32 / 4; // rough estimate
-
-                    let new_msg = NewUserMessage {
-                        uuid: msg_uuid,
-                        conversation_id: conversation.id,
-                        response_id: None, // No response when creating via Conversations API
-                        user_id: user.uuid,
-                        content_enc,
-                        prompt_tokens,
-                    };
-
-                    let created = state.db.create_user_message(new_msg).map_err(|e| {
-                        error!("Failed to create user message: {:?}", e);
-                        ApiError::InternalServerError
-                    })?;
-
-                    created_items.push(ConversationItem::Message {
-                        id: created.uuid,
-                        status: Some("completed".to_string()),
-                        role: "user".to_string(),
-                        content: vec![ConversationContent::Text {
-                            text: content_text.clone(),
-                        }],
-                        created_at: Some(created.created_at.timestamp()),
-                    });
-                } else if role == "assistant" {
-                    // Note: We don't support creating assistant messages directly
-                    debug!("Skipping assistant message (not yet supported)");
-                }
-            }
-        }
-    }
-
-    let response = ConversationItemListResponse {
-        object: "list",
-        data: created_items.clone(),
-        has_more: false,
-        first_id: created_items.first().map(|item| match item {
-            ConversationItem::Message { id, .. } => *id,
-            ConversationItem::FunctionToolCall { id, .. } => *id,
-            ConversationItem::FunctionToolCallOutput { id, .. } => *id,
-        }),
-        last_id: created_items.last().map(|item| match item {
-            ConversationItem::Message { id, .. } => *id,
-            ConversationItem::FunctionToolCall { id, .. } => *id,
-            ConversationItem::FunctionToolCallOutput { id, .. } => *id,
-        }),
-    };
-
-    encrypt_response(&state, &session_id, &response).await
-}
-
 /// GET /v1/conversations/{id}/items - List conversation items
 async fn list_conversation_items(
     State(state): State<Arc<AppState>>,
@@ -653,6 +636,20 @@ async fn list_conversation_items(
             ApiError::InternalServerError
         })?;
 
+    trace!(
+        "Retrieved {} raw messages for conversation {}",
+        raw_messages.len(),
+        conversation_id
+    );
+    for (i, msg) in raw_messages.iter().enumerate() {
+        trace!(
+            "Message {}: uuid={}, type={}",
+            i,
+            msg.uuid,
+            msg.message_type
+        );
+    }
+
     // Convert to conversation items
     let mut items = Vec::new();
 
@@ -667,28 +664,58 @@ async fn list_conversation_items(
         0
     };
 
+    trace!(
+        "Starting from index {} (after cursor: {:?})",
+        start_index,
+        params.after
+    );
+
     for msg in raw_messages.iter().skip(start_index) {
+        trace!(
+            "Processing message: uuid={}, type={}",
+            msg.uuid,
+            msg.message_type
+        );
+
         // Decrypt content
         let content = decrypt_with_key(&user_key, &msg.content_enc)
             .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
             .unwrap_or_else(|_| "[Decryption failed]".to_string());
 
+        trace!(
+            "Decrypted content for {}: {}",
+            msg.message_type,
+            if content.len() > 100 {
+                format!("{}...", &content[..100])
+            } else {
+                content.clone()
+            }
+        );
+
         match msg.message_type.as_str() {
             "user" => {
+                // User messages MUST be stored as MessageContent
+                let message_content: MessageContent = serde_json::from_str(&content)
+                    .map_err(|e| {
+                        error!("Failed to deserialize user message content as MessageContent: {:?}, content: {}", e, content);
+                        ApiError::InternalServerError
+                    })?;
+
                 items.push(ConversationItem::Message {
                     id: msg.uuid,
                     status: Some("completed".to_string()),
                     role: "user".to_string(),
-                    content: vec![ConversationContent::Text { text: content }],
+                    content: Vec::<ConversationContent>::from(message_content),
                     created_at: Some(msg.created_at.timestamp()),
                 });
             }
             "assistant" => {
+                // Assistant messages are plain text strings
                 items.push(ConversationItem::Message {
                     id: msg.uuid,
                     status: Some("completed".to_string()),
                     role: "assistant".to_string(),
-                    content: vec![ConversationContent::Text { text: content }],
+                    content: assistant_text_to_content(content),
                     created_at: Some(msg.created_at.timestamp()),
                 });
             }
@@ -713,6 +740,13 @@ async fn list_conversation_items(
         }
     }
 
+    trace!("Built {} conversation items before pagination", items.len());
+    for (i, item) in items.iter().enumerate() {
+        if let ConversationItem::Message { role, content, .. } = item {
+            trace!("Item {}: role={}, content_len={}", i, role, content.len());
+        }
+    }
+
     // Apply pagination
     let limit = params.limit.min(100) as usize;
     let has_more = items.len() > limit;
@@ -724,6 +758,8 @@ async fn list_conversation_items(
     if params.order == "asc" {
         items.reverse();
     }
+
+    trace!("Final items count: {}, has_more: {}", items.len(), has_more);
 
     let response = ConversationItemListResponse {
         object: "list",
@@ -792,18 +828,27 @@ async fn get_conversation_item(
                 .unwrap_or_else(|_| "[Decryption failed]".to_string());
 
             let item = match msg.message_type.as_str() {
-                "user" => ConversationItem::Message {
-                    id: msg.uuid,
-                    status: Some("completed".to_string()),
-                    role: "user".to_string(),
-                    content: vec![ConversationContent::Text { text: content }],
-                    created_at: Some(msg.created_at.timestamp()),
-                },
+                "user" => {
+                    // User messages MUST be stored as MessageContent
+                    let message_content: MessageContent = serde_json::from_str(&content)
+                        .map_err(|e| {
+                            error!("Failed to deserialize user message content as MessageContent: {:?}, content: {}", e, content);
+                            ApiError::InternalServerError
+                        })?;
+
+                    ConversationItem::Message {
+                        id: msg.uuid,
+                        status: Some("completed".to_string()),
+                        role: "user".to_string(),
+                        content: Vec::<ConversationContent>::from(message_content),
+                        created_at: Some(msg.created_at.timestamp()),
+                    }
+                }
                 "assistant" => ConversationItem::Message {
                     id: msg.uuid,
                     status: Some("completed".to_string()),
                     role: "assistant".to_string(),
-                    content: vec![ConversationContent::Text { text: content }],
+                    content: assistant_text_to_content(content),
                     created_at: Some(msg.created_at.timestamp()),
                 },
                 "tool_call" => ConversationItem::FunctionToolCall {
@@ -970,6 +1015,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             delete(delete_conversation)
                 .layer(from_fn_with_state(state.clone(), decrypt_request::<()>)),
         )
+        /* TODO IGNORE FOR NOW - TOO CONFUSING AND NOT NEEDED
         .route(
             "/v1/conversations/:id/items",
             post(create_conversation_items).layer(from_fn_with_state(
@@ -977,6 +1023,7 @@ pub fn router(state: Arc<AppState>) -> Router {
                 decrypt_request::<CreateConversationItemsRequest>,
             )),
         )
+        */
         .route(
             "/v1/conversations/:id/items",
             get(list_conversation_items)

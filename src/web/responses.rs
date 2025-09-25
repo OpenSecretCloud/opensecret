@@ -701,6 +701,10 @@ async fn create_response_stream(
     let upstream_response =
         get_chat_completion_response(&state, &user, chat_request, &headers).await?;
 
+    // Generate the assistant message UUID once, to be used everywhere
+    let assistant_message_id = Uuid::new_v4();
+    debug!("Generated assistant message UUID: {}", assistant_message_id);
+
     // Create channels for storage task and client stream
     let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(1024);
     let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(1024);
@@ -733,7 +737,7 @@ async fn create_response_stream(
         let mut body_stream = upstream_response.into_body().into_stream();
         let tx_storage_clone = tx_storage.clone();
         let tx_client_clone = tx_client.clone();
-        let message_id = Uuid::new_v4();
+        let message_id = assistant_message_id;  // Use the pre-generated UUID
 
         tokio::spawn(async move {
             let mut buffer = String::new();
@@ -964,7 +968,7 @@ async fn create_response_stream(
         // Process messages from upstream processor
         let mut assistant_content = String::new();
         let mut total_completion_tokens = 0i32;
-        let mut message_id = Uuid::new_v4(); // Will be set by upstream processor
+        let message_id = assistant_message_id; // Use the pre-generated UUID
 
         // Event 3: response.output_item.added
         let output_item_added_event = ResponseOutputItemAddedEvent {
@@ -1040,8 +1044,8 @@ async fn create_response_stream(
             trace!("Client stream received message from upstream processor");
             match msg {
                 StorageMessage::Done { finish_reason, message_id: msg_id } => {
-                    trace!("Client stream received Done signal with finish_reason={}", finish_reason);
-                    message_id = msg_id;
+                    trace!("Client stream received Done signal with finish_reason={}, message_id={}", finish_reason, msg_id);
+                    // Note: msg_id should match our pre-generated assistant_message_id
 
                                 // Event 7: response.output_text.done
                                 let output_text_done_event = ResponseOutputTextDoneEvent {

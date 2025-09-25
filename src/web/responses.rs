@@ -650,6 +650,19 @@ async fn create_response_stream(
         response.uuid, user.uuid, conversation.uuid
     );
 
+    // Decrypt metadata for response
+    let decrypted_metadata = if let Some(metadata_enc) = &response.metadata_enc {
+        match decrypt_with_key(&user_key, metadata_enc) {
+            Ok(metadata_bytes) => serde_json::from_slice(&metadata_bytes).ok(),
+            Err(e) => {
+                error!("Failed to decrypt response metadata: {:?}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Build the conversation context from all persisted messages
     let (prompt_messages, total_prompt_tokens) =
         build_prompt(state.db.as_ref(), conversation.id, &user_key, &body.model)?;
@@ -891,7 +904,7 @@ async fn create_response_stream(
             truncation: "disabled",
             usage: None,
             user: None,
-            metadata: response.metadata.clone(),
+            metadata: decrypted_metadata.clone(),
         };
 
         let created_event = ResponseCreatedEvent {
@@ -1183,7 +1196,7 @@ async fn create_response_stream(
                                         total_tokens: total_prompt_tokens as i32 + total_completion_tokens,
                                     }),
                                     user: None,
-                                    metadata: response.metadata.clone(),
+                                    metadata: decrypted_metadata.clone(),
                                 };
 
                                 let completed_event = ResponseCompletedEvent {
@@ -1533,6 +1546,17 @@ async fn persist_initial_message(
                 }
             })?;
 
+        // Encrypt metadata if provided
+        let metadata_enc = if let Some(metadata) = &body.metadata {
+            let metadata_json = serde_json::to_string(metadata).map_err(|e| {
+                error!("Failed to serialize metadata: {:?}", e);
+                ApiError::InternalServerError
+            })?;
+            Some(encrypt_with_key(user_key, metadata_json.as_bytes()).await)
+        } else {
+            None
+        };
+
         // Create the Response (job tracker)
         let new_response = NewResponse {
             uuid: Uuid::new_v4(),
@@ -1546,7 +1570,7 @@ async fn persist_initial_message(
             tool_choice: body.tool_choice.clone(),
             parallel_tool_calls: body.parallel_tool_calls,
             store: body.store,
-            metadata: body.metadata.clone(),
+            metadata_enc,
         };
         let response = state.db.create_response(new_response).map_err(|e| {
             error!("Error creating response: {:?}", e);
@@ -1578,9 +1602,30 @@ async fn persist_initial_message(
         let conversation_uuid = Uuid::new_v4();
         let response_uuid = Uuid::new_v4();
 
-        // Encrypt default title "New Chat"
-        let default_title = "New Chat";
-        let title_enc = Some(encrypt_with_key(user_key, default_title.as_bytes()).await);
+        // Create metadata with default title
+        let mut metadata = body.metadata.clone().unwrap_or_else(|| json!({}));
+        if metadata.get("title").is_none() {
+            metadata["title"] = json!("New Chat");
+        }
+
+        // Encrypt the metadata
+        let metadata_json = serde_json::to_string(&metadata).map_err(|e| {
+            error!("Failed to serialize metadata: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+        let conversation_metadata_enc =
+            Some(encrypt_with_key(user_key, metadata_json.as_bytes()).await);
+
+        // Encrypt response metadata if provided
+        let response_metadata_enc = if let Some(resp_metadata) = &body.metadata {
+            let resp_metadata_json = serde_json::to_string(resp_metadata).map_err(|e| {
+                error!("Failed to serialize response metadata: {:?}", e);
+                ApiError::InternalServerError
+            })?;
+            Some(encrypt_with_key(user_key, resp_metadata_json.as_bytes()).await)
+        } else {
+            None
+        };
 
         // Prepare the Response
         let new_response = NewResponse {
@@ -1595,7 +1640,7 @@ async fn persist_initial_message(
             tool_choice: body.tool_choice.clone(),
             parallel_tool_calls: body.parallel_tool_calls,
             store: body.store,
-            metadata: body.metadata.clone(),
+            metadata_enc: response_metadata_enc,
         };
 
         // Use transactional method to create conversation, response, and message atomically
@@ -1605,8 +1650,7 @@ async fn persist_initial_message(
                 conversation_uuid,
                 user.uuid,
                 None, // system_prompt_id
-                title_enc,
-                None, // metadata
+                conversation_metadata_enc,
                 Some(new_response),
                 content_enc,
                 user_message_tokens,

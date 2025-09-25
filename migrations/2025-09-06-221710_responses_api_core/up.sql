@@ -35,8 +35,7 @@ CREATE TABLE conversations (
     uuid            UUID    NOT NULL UNIQUE,
     user_id         UUID    NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
     system_prompt_id BIGINT REFERENCES user_system_prompts(id) ON DELETE SET NULL,
-    title_enc       BYTEA,
-    metadata        JSONB,
+    metadata_enc    BYTEA,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -62,7 +61,7 @@ CREATE TABLE responses (
     tool_choice           TEXT,
     parallel_tool_calls   BOOLEAN NOT NULL DEFAULT FALSE,
     store                 BOOLEAN NOT NULL DEFAULT TRUE,
-    metadata              JSONB,
+    metadata_enc          BYTEA,
     
     -- Token counts from the actual LLM call (nullable while in_progress)
     input_tokens          INTEGER,  -- Total context tokens sent to LLM (including system prompt)

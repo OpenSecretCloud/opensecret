@@ -42,8 +42,7 @@ diesel::table! {
         uuid -> Uuid,
         user_id -> Uuid,
         system_prompt_id -> Nullable<Int8>,
-        title_enc -> Nullable<Bytea>,
-        metadata -> Nullable<Jsonb>,
+        metadata_enc -> Nullable<Bytea>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
@@ -228,7 +227,7 @@ diesel::table! {
         tool_choice -> Nullable<Text>,
         parallel_tool_calls -> Bool,
         store -> Bool,
-        metadata -> Nullable<Jsonb>,
+        metadata_enc -> Nullable<Bytea>,
         input_tokens -> Nullable<Int4>,
         output_tokens -> Nullable<Int4>,
         created_at -> Timestamptz,

@@ -471,16 +471,11 @@ pub trait DBConnection {
         conversation_uuid: Uuid,
         user_id: Uuid,
     ) -> Result<Conversation, DBError>;
-    fn update_conversation_title(
-        &self,
-        conversation_id: i64,
-        title_enc: Vec<u8>,
-    ) -> Result<(), DBError>;
     fn update_conversation_metadata(
         &self,
         conversation_id: i64,
         user_id: Uuid,
-        metadata: serde_json::Value,
+        metadata_enc: Vec<u8>,
     ) -> Result<(), DBError>;
     fn list_conversations(
         &self,
@@ -510,8 +505,7 @@ pub trait DBConnection {
         conversation_uuid: Uuid,
         user_id: Uuid,
         system_prompt_id: Option<i64>,
-        title_enc: Option<Vec<u8>>,
-        metadata: Option<serde_json::Value>,
+        metadata_enc: Option<Vec<u8>>,
         response: Option<NewResponse>,
         first_message_content: Vec<u8>,
         first_message_tokens: i32,
@@ -1902,21 +1896,11 @@ impl DBConnection for PostgresConnection {
         Conversation::get_by_uuid_and_user(conn, conversation_uuid, user_id).map_err(DBError::from)
     }
 
-    fn update_conversation_title(
-        &self,
-        conversation_id: i64,
-        title_enc: Vec<u8>,
-    ) -> Result<(), DBError> {
-        debug!("Updating conversation title");
-        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        Conversation::update_title(conn, conversation_id, title_enc).map_err(DBError::from)
-    }
-
     fn update_conversation_metadata(
         &self,
         conversation_id: i64,
         user_id: Uuid,
-        metadata: serde_json::Value,
+        metadata_enc: Vec<u8>,
     ) -> Result<(), DBError> {
         debug!("Updating conversation metadata");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
@@ -1931,7 +1915,7 @@ impl DBConnection for PostgresConnection {
                 .filter(conversations::user_id.eq(user_id)),
         )
         .set((
-            conversations::metadata.eq(metadata),
+            conversations::metadata_enc.eq(metadata_enc),
             conversations::updated_at.eq(diesel::dsl::now),
         ))
         .execute(conn)?;
@@ -2029,8 +2013,7 @@ impl DBConnection for PostgresConnection {
         conversation_uuid: Uuid,
         user_id: Uuid,
         system_prompt_id: Option<i64>,
-        title_enc: Option<Vec<u8>>,
-        metadata: Option<serde_json::Value>,
+        metadata_enc: Option<Vec<u8>>,
         response: Option<NewResponse>,
         first_message_content: Vec<u8>,
         first_message_tokens: i32,
@@ -2042,8 +2025,7 @@ impl DBConnection for PostgresConnection {
             conversation_uuid,
             user_id,
             system_prompt_id,
-            title_enc,
-            metadata,
+            metadata_enc,
             response,
             first_message_content,
             first_message_tokens,

@@ -68,7 +68,7 @@ pub struct Response {
     pub tool_choice: Option<String>,
     pub parallel_tool_calls: bool,
     pub store: bool,
-    pub metadata: Option<serde_json::Value>,
+    pub metadata_enc: Option<Vec<u8>>,
     pub input_tokens: Option<i32>,
     pub output_tokens: Option<i32>,
     pub created_at: DateTime<Utc>,
@@ -90,7 +90,7 @@ pub struct NewResponse {
     pub tool_choice: Option<String>,
     pub parallel_tool_calls: bool,
     pub store: bool,
-    pub metadata: Option<serde_json::Value>,
+    pub metadata_enc: Option<Vec<u8>>,
 }
 
 impl Response {
@@ -224,8 +224,7 @@ pub struct Conversation {
     pub uuid: Uuid,
     pub user_id: Uuid,
     pub system_prompt_id: Option<i64>,
-    pub title_enc: Option<Vec<u8>>,
-    pub metadata: Option<serde_json::Value>,
+    pub metadata_enc: Option<Vec<u8>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -236,8 +235,7 @@ pub struct NewConversation {
     pub uuid: Uuid,
     pub user_id: Uuid,
     pub system_prompt_id: Option<i64>,
-    pub title_enc: Option<Vec<u8>>,
-    pub metadata: Option<serde_json::Value>,
+    pub metadata_enc: Option<Vec<u8>>,
 }
 
 impl Conversation {
@@ -271,14 +269,14 @@ impl Conversation {
             })
     }
 
-    pub fn update_title(
+    pub fn update_metadata(
         conn: &mut PgConnection,
         conversation_id: i64,
-        title_enc: Vec<u8>,
+        metadata_enc: Vec<u8>,
     ) -> Result<(), ResponsesError> {
         diesel::update(conversations::table.filter(conversations::id.eq(conversation_id)))
             .set((
-                conversations::title_enc.eq(title_enc),
+                conversations::metadata_enc.eq(metadata_enc),
                 conversations::updated_at.eq(diesel::dsl::now),
             ))
             .execute(conn)
@@ -339,8 +337,7 @@ impl NewConversation {
         conversation_uuid: Uuid,
         user_id: Uuid,
         system_prompt_id: Option<i64>,
-        title_enc: Option<Vec<u8>>,
-        metadata: Option<serde_json::Value>,
+        metadata_enc: Option<Vec<u8>>,
         response: Option<NewResponse>,
         first_message_content: Vec<u8>,
         first_message_tokens: i32,
@@ -353,8 +350,7 @@ impl NewConversation {
                 uuid: conversation_uuid,
                 user_id,
                 system_prompt_id,
-                title_enc,
-                metadata,
+                metadata_enc,
             };
             let conversation = new_conversation.insert(tx)?;
 

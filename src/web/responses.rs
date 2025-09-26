@@ -618,6 +618,21 @@ async fn create_response_stream(
     // Normalize input to our standard format
     let normalized_messages = body.input.clone().normalize();
 
+    // Check if any message contains file uploads (currently unsupported)
+    for msg in &normalized_messages {
+        if let MessageContent::Parts(parts) = &msg.content {
+            for part in parts {
+                if matches!(part, MessageContentPart::InputFile { .. }) {
+                    error!(
+                        "User {} attempted to use unsupported file upload feature",
+                        user.uuid
+                    );
+                    return Err(ApiError::BadRequest);
+                }
+            }
+        }
+    }
+
     // Get the first message's content (for user messages there should only be one)
     let message_content = &normalized_messages[0].content;
 
@@ -737,7 +752,7 @@ async fn create_response_stream(
         let mut body_stream = upstream_response.into_body().into_stream();
         let tx_storage_clone = tx_storage.clone();
         let tx_client_clone = tx_client.clone();
-        let message_id = assistant_message_id;  // Use the pre-generated UUID
+        let message_id = assistant_message_id; // Use the pre-generated UUID
 
         tokio::spawn(async move {
             let mut buffer = String::new();
@@ -1534,7 +1549,10 @@ async fn persist_initial_message(
             if let Some(id_str) = internal_id.as_str() {
                 // Try to parse as UUID, use new UUID if parsing fails
                 Uuid::parse_str(id_str).unwrap_or_else(|_| {
-                    warn!("Invalid internal_message_id UUID: {}, generating new one", id_str);
+                    warn!(
+                        "Invalid internal_message_id UUID: {}, generating new one",
+                        id_str
+                    );
                     Uuid::new_v4()
                 })
             } else {

@@ -57,9 +57,14 @@ pub enum MessageContentPart {
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<String>, // "low" | "high" | "auto"
     },
+    // OpenAI Conversations API standard: "input_file" for PDFs and documents
+    #[serde(rename = "input_file")]
+    InputFile {
+        filename: String,
+        file_data: String, // data:application/pdf;base64,... or other MIME types
+    },
     // TODO: Add support for other content types per OpenAI Conversations API:
     // - input_audio: { input_audio: {...} }
-    // - input_file: { file_id?: String, file_url?: String, file_data?: String, filename?: String }
 }
 
 /// Content that can be either a string or array of content parts
@@ -82,6 +87,7 @@ impl MessageContent {
                     MessageContentPart::Text { text } => Some(text.clone()),
                     MessageContentPart::InputText { text } => Some(text.clone()),
                     MessageContentPart::InputImage { .. } => None, // Ignore images for token counting
+                    MessageContentPart::InputFile { .. } => None, // Ignore files for token counting
                 })
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -123,6 +129,19 @@ impl MessageContent {
                             serde_json::json!({
                                 "type": "image_url",
                                 "image_url": image_obj
+                            })
+                        }
+                        MessageContentPart::InputFile {
+                            filename,
+                            file_data,
+                        } => {
+                            // Convert to Chat Completions API format for files
+                            serde_json::json!({
+                                "type": "file",
+                                "file": {
+                                    "filename": filename,
+                                    "file_data": file_data
+                                }
                             })
                         }
                     })
@@ -226,6 +245,8 @@ pub enum ConversationContent {
     OutputText { text: String },
     #[serde(rename = "input_image")]
     InputImage { image_url: String },
+    #[serde(rename = "input_file")]
+    InputFile { filename: String },
 }
 
 impl From<MessageContent> for Vec<ConversationContent> {
@@ -241,6 +262,11 @@ impl From<MessageContent> for Vec<ConversationContent> {
                     MessageContentPart::InputImage { image_url, .. } => {
                         ConversationContent::InputImage {
                             image_url: image_url.unwrap_or_else(|| "[No URL]".to_string()),
+                        }
+                    }
+                    MessageContentPart::InputFile { filename, .. } => {
+                        ConversationContent::InputFile {
+                            filename: filename.clone(),
                         }
                     }
                 })

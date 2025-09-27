@@ -105,14 +105,17 @@ CREATE INDEX idx_user_messages_conversation_created
 
 -- 6. assistant_messages table - LLM responses (can be created via Conversations or Responses API)
 -- response_id: NULL if created via Conversations API, populated if created via Responses API
+-- content_enc: NULL while streaming, populated when completed
+-- status: in_progress (streaming), completed (done), incomplete (partial - e.g. length limit)
 CREATE TABLE assistant_messages (
     id                BIGSERIAL PRIMARY KEY,
     uuid              UUID    NOT NULL UNIQUE,
     conversation_id   BIGINT  NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     response_id       BIGINT  REFERENCES responses(id) ON DELETE CASCADE,
     user_id           UUID    NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
-    content_enc       BYTEA   NOT NULL,
-    completion_tokens INTEGER NOT NULL,
+    content_enc       BYTEA,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    status            TEXT    NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress','completed','incomplete')),
     finish_reason     TEXT,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP

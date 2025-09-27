@@ -331,7 +331,8 @@ impl NewConversation {
             .map_err(ResponsesError::DatabaseError)
     }
 
-    /// Creates a new conversation with optional response and first message in a transaction
+    /// Creates a new conversation with optional response, first message, and placeholder assistant message in a transaction
+    #[allow(clippy::too_many_arguments)]
     pub fn create_with_response_and_message(
         conn: &mut PgConnection,
         conversation_uuid: Uuid,
@@ -342,6 +343,7 @@ impl NewConversation {
         first_message_content: Vec<u8>,
         first_message_tokens: i32,
         message_uuid: Uuid,
+        assistant_message_uuid: Option<Uuid>,
     ) -> Result<(Conversation, Option<Response>, UserMessage), ResponsesError> {
         use diesel::Connection;
 
@@ -373,6 +375,21 @@ impl NewConversation {
                 prompt_tokens: first_message_tokens,
             };
             let user_message = new_message.insert(tx)?;
+
+            // Create placeholder assistant message if UUID provided (for Responses API streaming)
+            if let Some(assistant_uuid) = assistant_message_uuid {
+                let placeholder_assistant = NewAssistantMessage {
+                    uuid: assistant_uuid,
+                    conversation_id: conversation.id,
+                    response_id: response_result.as_ref().map(|r| r.id),
+                    user_id,
+                    content_enc: None,
+                    completion_tokens: 0,
+                    status: "in_progress".to_string(),
+                    finish_reason: None,
+                };
+                placeholder_assistant.insert(tx)?;
+            }
 
             Ok((conversation, response_result, user_message))
         })
@@ -615,8 +632,9 @@ pub struct AssistantMessage {
     pub conversation_id: i64,
     pub response_id: Option<i64>,
     pub user_id: Uuid,
-    pub content_enc: Vec<u8>,
+    pub content_enc: Option<Vec<u8>>,
     pub completion_tokens: i32,
+    pub status: String,
     pub finish_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -629,8 +647,9 @@ pub struct NewAssistantMessage {
     pub conversation_id: i64,
     pub response_id: Option<i64>,
     pub user_id: Uuid,
-    pub content_enc: Vec<u8>,
+    pub content_enc: Option<Vec<u8>>,
     pub completion_tokens: i32,
+    pub status: String,
     pub finish_reason: Option<String>,
 }
 
@@ -643,6 +662,26 @@ impl AssistantMessage {
             .filter(assistant_messages::response_id.eq(response_id))
             .order(assistant_messages::created_at.asc())
             .load::<AssistantMessage>(conn)
+            .map_err(ResponsesError::DatabaseError)
+    }
+
+    pub fn update(
+        conn: &mut PgConnection,
+        message_uuid: Uuid,
+        content_enc: Option<Vec<u8>>,
+        completion_tokens: i32,
+        status: String,
+        finish_reason: Option<String>,
+    ) -> Result<AssistantMessage, ResponsesError> {
+        diesel::update(assistant_messages::table.filter(assistant_messages::uuid.eq(message_uuid)))
+            .set((
+                assistant_messages::content_enc.eq(content_enc),
+                assistant_messages::completion_tokens.eq(completion_tokens),
+                assistant_messages::status.eq(status),
+                assistant_messages::finish_reason.eq(finish_reason),
+                assistant_messages::updated_at.eq(diesel::dsl::now),
+            ))
+            .get_result(conn)
             .map_err(ResponsesError::DatabaseError)
     }
 }
@@ -669,8 +708,10 @@ pub struct RawThreadMessage {
     pub id: i64,
     #[diesel(sql_type = diesel::sql_types::Uuid)]
     pub uuid: Uuid,
-    #[diesel(sql_type = diesel::sql_types::Bytea)]
-    pub content_enc: Vec<u8>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Bytea>)]
+    pub content_enc: Option<Vec<u8>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub status: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
     pub created_at: DateTime<Utc>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
@@ -691,11 +732,12 @@ impl RawThreadMessage {
         let query = r#"
             WITH conversation_messages AS (
                 -- User messages
-                SELECT 
+                SELECT
                     'user' as message_type,
                     um.id,
                     um.uuid,
                     um.content_enc,
+                    'completed'::text as status,
                     um.created_at,
                     r.model,
                     um.prompt_tokens as token_count,
@@ -704,15 +746,16 @@ impl RawThreadMessage {
                 FROM user_messages um
                 LEFT JOIN responses r ON um.response_id = r.id
                 WHERE um.conversation_id = $1
-                
+
                 UNION ALL
-                
+
                 -- Assistant messages
-                SELECT 
+                SELECT
                     'assistant' as message_type,
                     am.id,
                     am.uuid,
                     am.content_enc,
+                    am.status,
                     am.created_at,
                     r.model,
                     am.completion_tokens as token_count,
@@ -721,15 +764,16 @@ impl RawThreadMessage {
                 FROM assistant_messages am
                 LEFT JOIN responses r ON am.response_id = r.id
                 WHERE am.conversation_id = $1
-                
+
                 UNION ALL
-                
+
                 -- Tool calls
-                SELECT 
+                SELECT
                     'tool_call' as message_type,
                     tc.id,
                     tc.uuid,
                     tc.arguments_enc as content_enc,
+                    'completed'::text as status,
                     tc.created_at,
                     NULL::text as model,
                     tc.argument_tokens as token_count,
@@ -737,15 +781,16 @@ impl RawThreadMessage {
                     NULL::text as finish_reason
                 FROM tool_calls tc
                 WHERE tc.conversation_id = $1
-                
+
                 UNION ALL
-                
+
                 -- Tool outputs
-                SELECT 
+                SELECT
                     'tool_output' as message_type,
                     tto.id,
                     tto.uuid,
                     tto.output_enc as content_enc,
+                    'completed'::text as status,
                     tto.created_at,
                     NULL::text as model,
                     tto.output_tokens as token_count,

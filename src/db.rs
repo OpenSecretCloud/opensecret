@@ -500,6 +500,8 @@ pub trait DBConnection {
     ) -> Result<(), DBError>;
     fn cancel_response(&self, uuid: Uuid, user_id: Uuid) -> Result<Response, DBError>;
     fn delete_response(&self, uuid: Uuid, user_id: Uuid) -> Result<(), DBError>;
+
+    #[allow(clippy::too_many_arguments)]
     fn create_conversation_with_response_and_message(
         &self,
         conversation_uuid: Uuid,
@@ -510,6 +512,7 @@ pub trait DBConnection {
         first_message_content: Vec<u8>,
         first_message_tokens: i32,
         message_uuid: Uuid,
+        assistant_message_uuid: Option<Uuid>,
     ) -> Result<(Conversation, Option<Response>, UserMessage), DBError>;
 
     // User messages
@@ -530,6 +533,14 @@ pub trait DBConnection {
     fn create_assistant_message(
         &self,
         new_msg: NewAssistantMessage,
+    ) -> Result<AssistantMessage, DBError>;
+    fn update_assistant_message(
+        &self,
+        message_uuid: Uuid,
+        content_enc: Option<Vec<u8>>,
+        completion_tokens: i32,
+        status: String,
+        finish_reason: Option<String>,
     ) -> Result<AssistantMessage, DBError>;
     fn get_assistant_messages_for_response(
         &self,
@@ -2019,6 +2030,7 @@ impl DBConnection for PostgresConnection {
         first_message_content: Vec<u8>,
         first_message_tokens: i32,
         message_uuid: Uuid,
+        assistant_message_uuid: Option<Uuid>,
     ) -> Result<(Conversation, Option<Response>, UserMessage), DBError> {
         debug!("Creating conversation with response and message");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
@@ -2032,6 +2044,7 @@ impl DBConnection for PostgresConnection {
             first_message_content,
             first_message_tokens,
             message_uuid,
+            assistant_message_uuid,
         )
         .map_err(DBError::from)
     }
@@ -2092,6 +2105,27 @@ impl DBConnection for PostgresConnection {
         debug!("Creating new assistant message");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_msg.insert(conn).map_err(DBError::from)
+    }
+
+    fn update_assistant_message(
+        &self,
+        message_uuid: Uuid,
+        content_enc: Option<Vec<u8>>,
+        completion_tokens: i32,
+        status: String,
+        finish_reason: Option<String>,
+    ) -> Result<AssistantMessage, DBError> {
+        debug!("Updating assistant message {}", message_uuid);
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        AssistantMessage::update(
+            conn,
+            message_uuid,
+            content_enc,
+            completion_tokens,
+            status,
+            finish_reason,
+        )
+        .map_err(DBError::from)
     }
 
     fn get_assistant_messages_for_response(

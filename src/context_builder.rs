@@ -31,7 +31,13 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
     // 2. Decrypt + map to ChatMsg
     let mut msgs: Vec<ChatMsg> = Vec::with_capacity(raw.len() + 1);
     for r in raw {
-        let plain = decrypt_with_key(user_key, &r.content_enc)
+        // Skip messages with no content (in_progress assistant messages)
+        let content_enc = match &r.content_enc {
+            Some(enc) => enc,
+            None => continue,
+        };
+
+        let plain = decrypt_with_key(user_key, content_enc)
             .map_err(|_| crate::ApiError::InternalServerError)?;
         let content = String::from_utf8_lossy(&plain).into_owned();
         let role = match r.message_type.as_str() {

@@ -692,14 +692,18 @@ async fn list_conversation_items(
             msg.message_type
         );
 
-        // Decrypt content
-        let content = decrypt_with_key(&user_key, &msg.content_enc)
-            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-            .unwrap_or_else(|_| "[Decryption failed]".to_string());
+        // Decrypt content (handle nullable content_enc)
+        let content = match &msg.content_enc {
+            Some(content_enc) => decrypt_with_key(&user_key, content_enc)
+                .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                .unwrap_or_else(|_| "[Decryption failed]".to_string()),
+            None => String::new(),
+        };
 
         trace!(
-            "Decrypted content for {}: {}",
+            "Decrypted content for {} (status={:?}): {}",
             msg.message_type,
+            msg.status,
             if content.len() > 100 {
                 format!("{}...", &content[..100])
             } else {
@@ -718,7 +722,7 @@ async fn list_conversation_items(
 
                 items.push(ConversationItem::Message {
                     id: msg.uuid,
-                    status: Some("completed".to_string()),
+                    status: msg.status.clone(),
                     role: "user".to_string(),
                     content: Vec::<ConversationContent>::from(message_content),
                     created_at: Some(msg.created_at.timestamp()),
@@ -726,11 +730,18 @@ async fn list_conversation_items(
             }
             "assistant" => {
                 // Assistant messages are plain text strings
+                // If content is empty (in_progress), return empty content array
+                let content_parts = if content.is_empty() {
+                    vec![]
+                } else {
+                    assistant_text_to_content(content)
+                };
+
                 items.push(ConversationItem::Message {
                     id: msg.uuid,
-                    status: Some("completed".to_string()),
+                    status: msg.status.clone(),
                     role: "assistant".to_string(),
-                    content: assistant_text_to_content(content),
+                    content: content_parts,
                     created_at: Some(msg.created_at.timestamp()),
                 });
             }
@@ -837,10 +848,13 @@ async fn get_conversation_item(
     // Find the specific item
     for msg in raw_messages {
         if msg.uuid == item_id {
-            // Decrypt content
-            let content = decrypt_with_key(&user_key, &msg.content_enc)
-                .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-                .unwrap_or_else(|_| "[Decryption failed]".to_string());
+            // Decrypt content (handle nullable content_enc)
+            let content = match &msg.content_enc {
+                Some(content_enc) => decrypt_with_key(&user_key, content_enc)
+                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                    .unwrap_or_else(|_| "[Decryption failed]".to_string()),
+                None => String::new(),
+            };
 
             let item = match msg.message_type.as_str() {
                 "user" => {
@@ -853,19 +867,28 @@ async fn get_conversation_item(
 
                     ConversationItem::Message {
                         id: msg.uuid,
-                        status: Some("completed".to_string()),
+                        status: msg.status.clone(),
                         role: "user".to_string(),
                         content: Vec::<ConversationContent>::from(message_content),
                         created_at: Some(msg.created_at.timestamp()),
                     }
                 }
-                "assistant" => ConversationItem::Message {
-                    id: msg.uuid,
-                    status: Some("completed".to_string()),
-                    role: "assistant".to_string(),
-                    content: assistant_text_to_content(content),
-                    created_at: Some(msg.created_at.timestamp()),
-                },
+                "assistant" => {
+                    // If content is empty (in_progress), return empty content array
+                    let content_parts = if content.is_empty() {
+                        vec![]
+                    } else {
+                        assistant_text_to_content(content)
+                    };
+
+                    ConversationItem::Message {
+                        id: msg.uuid,
+                        status: msg.status.clone(),
+                        role: "assistant".to_string(),
+                        content: content_parts,
+                        created_at: Some(msg.created_at.timestamp()),
+                    }
+                }
                 "tool_call" => ConversationItem::FunctionToolCall {
                     id: msg.uuid,
                     name: "function".to_string(),

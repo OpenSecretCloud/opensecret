@@ -378,18 +378,23 @@ CREATE TABLE user_messages (
 
 Stores LLM responses. Can be created via Conversations API or Responses API.
 
+**Streaming Status**: When a response is streaming via the Responses API, a placeholder assistant message is created immediately with `status='in_progress'` and `content_enc=NULL`. This allows clients to poll `/v1/conversations/{id}/items` and see the in-progress status in real-time. Once streaming completes, the message is updated with the actual content and `status='completed'` (or `'incomplete'` if the stream was interrupted).
+
 ```sql
 -- Table: assistant_messages
 -- LLM responses, exposed as "message" items with role="assistant" in Conversations API
 -- response_id: NULL if created via Conversations API, populated if created via Responses API
+-- content_enc: NULL while streaming (status='in_progress'), populated when completed
+-- status: in_progress (streaming), completed (done), incomplete (partial - e.g. length limit)
 CREATE TABLE assistant_messages (
     id BIGSERIAL PRIMARY KEY,
     uuid UUID NOT NULL UNIQUE,
     conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     response_id BIGINT REFERENCES responses(id) ON DELETE CASCADE,
     user_id UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
-    content_enc BYTEA NOT NULL,
-    completion_tokens INTEGER NOT NULL,  -- Tokens in this response
+    content_enc BYTEA,  -- NULLABLE: NULL while streaming
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress','completed','incomplete')),
     finish_reason TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP

@@ -649,7 +649,11 @@ async fn create_response_stream(
     // Encrypt the serialized MessageContent
     let content_enc = encrypt_with_key(&user_key, content_for_storage.as_bytes()).await;
 
-    // Create conversation, response, and user message
+    // Generate the assistant message UUID once, to be used everywhere
+    let assistant_message_id = Uuid::new_v4();
+    debug!("Generated assistant message UUID: {}", assistant_message_id);
+
+    // Create conversation, response, user message, and placeholder assistant message
     let (conversation, response, _user_message) = persist_initial_message(
         &state,
         &user,
@@ -657,6 +661,7 @@ async fn create_response_stream(
         content_enc.clone(),
         user_message_tokens,
         &user_key,
+        assistant_message_id,
     )
     .await?;
 
@@ -716,10 +721,6 @@ async fn create_response_stream(
     let upstream_response =
         get_chat_completion_response(&state, &user, chat_request, &headers).await?;
 
-    // Generate the assistant message UUID once, to be used everywhere
-    let assistant_message_id = Uuid::new_v4();
-    debug!("Generated assistant message UUID: {}", assistant_message_id);
-
     // Create channels for storage task and client stream
     let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(1024);
     let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(1024);
@@ -731,6 +732,7 @@ async fn create_response_stream(
         let conversation_id = conversation.id;
         let user_uuid = user.uuid;
         let sqs_publisher = state.sqs_publisher.clone();
+        let message_id = assistant_message_id;
 
         tokio::spawn(async move {
             storage_task(
@@ -741,6 +743,7 @@ async fn create_response_stream(
                 user_key,
                 user_uuid,
                 sqs_publisher,
+                message_id,
             )
             .await;
         })
@@ -1322,20 +1325,21 @@ async fn create_response_stream(
 }
 
 /// Storage task that accumulates content and writes to database
+#[allow(clippy::too_many_arguments)]
 async fn storage_task(
     mut rx: mpsc::Receiver<StorageMessage>,
     db: Arc<dyn crate::DBConnection + Send + Sync>,
     response_id: i64,
-    conversation_id: i64,
+    _conversation_id: i64,
     user_key: secp256k1::SecretKey,
     user_uuid: Uuid,
     sqs_publisher: Option<Arc<crate::sqs::SqsEventPublisher>>,
+    message_id: Uuid,
 ) {
     let mut content = String::new();
     let mut completion_tokens = 0i32;
     let mut prompt_tokens = 0i32;
     let mut finish_reason = String::new();
-    let mut message_id = Uuid::new_v4(); // Default, will be overridden
     let mut error_msg: Option<String> = None;
 
     // Accumulate content from stream
@@ -1364,8 +1368,14 @@ async fn storage_task(
                     "Storage: received Done signal with finish_reason={}, message_id={}",
                     reason, msg_id
                 );
+                // Verify the message_id matches what we expect
+                if msg_id != message_id {
+                    warn!(
+                        "Storage: received message_id {} doesn't match expected {}",
+                        msg_id, message_id
+                    );
+                }
                 finish_reason = reason;
-                message_id = msg_id;
                 break;
             }
             StorageMessage::Error(e) => {
@@ -1378,9 +1388,9 @@ async fn storage_task(
 
     // If we exit the loop without Done or Error, it means all senders were dropped
     if error_msg.is_none() && finish_reason.is_empty() {
-        warn!("Storage: channel closed before receiving Done signal, NOT persisting incomplete content");
-        // Don't save partial content - the upstream processor should complete normally
-        // If it doesn't, something went wrong and we shouldn't persist bad data
+        warn!("Storage: channel closed before receiving Done signal, saving incomplete content");
+
+        // Update response status to failed
         if let Err(e) = db.update_response_status(
             response_id,
             ResponseStatus::Failed,
@@ -1390,11 +1400,29 @@ async fn storage_task(
         ) {
             error!("Failed to update response status to failed: {:?}", e);
         }
+
+        // Update assistant message to incomplete status with whatever content we have
+        let content_enc = if !content.is_empty() {
+            Some(encrypt_with_key(&user_key, content.as_bytes()).await)
+        } else {
+            None
+        };
+
+        if let Err(e) = db.update_assistant_message(
+            message_id,
+            content_enc,
+            completion_tokens,
+            "incomplete".to_string(),
+            None,
+        ) {
+            error!("Failed to update assistant message to incomplete: {:?}", e);
+        }
         return;
     }
 
     // Handle error case
     if let Some(_error) = error_msg {
+        // Update response status to failed
         if let Err(e) = db.update_response_status(
             response_id,
             ResponseStatus::Failed,
@@ -1403,6 +1431,23 @@ async fn storage_task(
             None,
         ) {
             error!("Failed to update response status to failed: {:?}", e);
+        }
+
+        // Update assistant message to incomplete status with partial content
+        let content_enc = if !content.is_empty() {
+            Some(encrypt_with_key(&user_key, content.as_bytes()).await)
+        } else {
+            None
+        };
+
+        if let Err(e) = db.update_assistant_message(
+            message_id,
+            content_enc,
+            completion_tokens,
+            "incomplete".to_string(),
+            None,
+        ) {
+            error!("Failed to update assistant message to incomplete: {:?}", e);
         }
         return;
     }
@@ -1416,25 +1461,21 @@ async fn storage_task(
         );
     }
 
-    // Encrypt and store assistant message as plain text
+    // Encrypt and update assistant message (placeholder was created earlier)
     let content_enc = encrypt_with_key(&user_key, content.as_bytes()).await;
 
-    let new_assistant = NewAssistantMessage {
-        uuid: message_id,
-        conversation_id,
-        response_id: Some(response_id),
-        user_id: user_uuid,
-        content_enc,
+    match db.update_assistant_message(
+        message_id,
+        Some(content_enc),
         completion_tokens,
-        finish_reason: Some(finish_reason),
-    };
-
-    match db.create_assistant_message(new_assistant) {
+        "completed".to_string(),
+        Some(finish_reason),
+    ) {
         Ok(_) => {
-            debug!("Successfully stored assistant message");
+            debug!("Successfully updated assistant message");
         }
         Err(e) => {
-            error!("Failed to create assistant message: {:?}", e);
+            error!("Failed to update assistant message: {:?}", e);
         }
     }
 
@@ -1525,7 +1566,7 @@ async fn encrypt_event(
     Ok(Event::default().event(event_type).data(base64_encrypted))
 }
 
-/// Persist initial response and user message
+/// Persist initial response, user message, and placeholder assistant message
 async fn persist_initial_message(
     state: &Arc<AppState>,
     user: &User,
@@ -1533,6 +1574,7 @@ async fn persist_initial_message(
     content_enc: Vec<u8>,
     user_message_tokens: i32,
     user_key: &SecretKey,
+    assistant_message_id: Uuid,
 ) -> Result<
     (
         crate::models::responses::Conversation,
@@ -1632,6 +1674,25 @@ async fn persist_initial_message(
             ApiError::InternalServerError
         })?;
 
+        // Create placeholder assistant message with status='in_progress' and NULL content
+        let placeholder_assistant = NewAssistantMessage {
+            uuid: assistant_message_id,
+            conversation_id: conversation.id,
+            response_id: Some(response.id),
+            user_id: user.uuid,
+            content_enc: None,
+            completion_tokens: 0,
+            status: "in_progress".to_string(),
+            finish_reason: None,
+        };
+        state
+            .db
+            .create_assistant_message(placeholder_assistant)
+            .map_err(|e| {
+                error!("Error creating placeholder assistant message: {:?}", e);
+                ApiError::InternalServerError
+            })?;
+
         Ok((conversation, response, user_message))
     } else {
         // Create new conversation
@@ -1684,7 +1745,7 @@ async fn persist_initial_message(
             metadata_enc: response_metadata_enc,
         };
 
-        // Use transactional method to create conversation, response, and message atomically
+        // Use transactional method to create conversation, response, message, and placeholder assistant atomically
         state
             .db
             .create_conversation_with_response_and_message(
@@ -1696,6 +1757,7 @@ async fn persist_initial_message(
                 content_enc,
                 user_message_tokens,
                 message_uuid,
+                Some(assistant_message_id),
             )
             .map_err(|e| {
                 error!(
@@ -1751,12 +1813,14 @@ async fn get_response(
     // Build output from assistant messages
     let mut output = String::new();
     for msg in &assistant_messages {
-        let decrypted = decrypt_with_key(&user_key, &msg.content_enc).unwrap_or_else(|_| vec![]);
-        let text = String::from_utf8_lossy(&decrypted);
-        if !output.is_empty() {
-            output.push('\n');
+        if let Some(content_enc) = &msg.content_enc {
+            let decrypted = decrypt_with_key(&user_key, content_enc).unwrap_or_else(|_| vec![]);
+            let text = String::from_utf8_lossy(&decrypted);
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&text);
         }
-        output.push_str(&text);
     }
 
     // Use the stored token counts from the response
@@ -1777,6 +1841,9 @@ async fn get_response(
         None
     };
 
+    // TODO i'm not sure if this api response is correct
+    // where is user message? is it just assistent outputs?
+    // does ordering matter?
     let retrieve_response = ResponsesRetrieveResponse {
         id: response.uuid,
         object: "response",

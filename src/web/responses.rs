@@ -363,6 +363,30 @@ pub struct ResponseErrorEvent {
     pub error: ResponseError,
 }
 
+/// SSE Event wrapper for response.cancelled
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseCancelledEvent {
+    /// Event ID
+    pub id: String,
+
+    /// Event type (always "response.cancelled")
+    #[serde(rename = "type")]
+    pub event_type: &'static str,
+
+    /// Unix timestamp when cancelled
+    pub created_at: i64,
+
+    /// Event data payload
+    pub data: ResponseCancelledData,
+}
+
+/// Data payload for response.cancelled event
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseCancelledData {
+    /// The unique ID of the response
+    pub id: Uuid,
+}
+
 /// SSE Event wrapper for response.in_progress
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseInProgressEvent {
@@ -586,6 +610,7 @@ enum StorageMessage {
         message_id: Uuid,
     },
     Error(String),
+    Cancelled,
 }
 
 async fn create_response_stream(
@@ -756,13 +781,31 @@ async fn create_response_stream(
         let tx_storage_clone = tx_storage.clone();
         let tx_client_clone = tx_client.clone();
         let message_id = assistant_message_id; // Use the pre-generated UUID
+        let response_uuid = response.uuid;
+        let mut cancel_rx = state.cancellation_broadcast.subscribe();
 
         tokio::spawn(async move {
             let mut buffer = String::new();
             let mut stream_finish_reason: Option<String> = None;
 
             trace!("Starting upstream processor task");
-            while let Some(chunk_result) = body_stream.next().await {
+            loop {
+                tokio::select! {
+                    // Check for cancellation
+                    Ok(cancelled_id) = cancel_rx.recv() => {
+                        if cancelled_id == response_uuid {
+                            debug!("Upstream processor received cancellation for response {}", response_uuid);
+                            let _ = tx_storage_clone.send(StorageMessage::Cancelled).await;
+                            let _ = tx_client_clone.send(StorageMessage::Cancelled).await;
+                            break;
+                        }
+                    }
+
+                    // Process stream chunks
+                    chunk_result = body_stream.next() => {
+                        let Some(chunk_result) = chunk_result else {
+                            break;
+                        };
                 match chunk_result {
                     Ok(bytes) => {
                         buffer.push_str(&String::from_utf8_lossy(bytes.as_ref()));
@@ -881,6 +924,8 @@ async fn create_response_stream(
                             .send(StorageMessage::Error(e.to_string()))
                             .await;
                         break;
+                    }
+                }
                     }
                 }
             }
@@ -1285,6 +1330,35 @@ async fn create_response_stream(
                     trace!("Client stream received usage data");
                     total_completion_tokens = completion_tokens;
                 }
+                StorageMessage::Cancelled => {
+                    debug!("Client stream received cancellation signal");
+                    // Send response.cancelled event
+                    let cancelled_event = ResponseCancelledEvent {
+                        id: Uuid::new_v4().to_string(),
+                        event_type: "response.cancelled",
+                        created_at: Utc::now().timestamp(),
+                        data: ResponseCancelledData {
+                            id: response.uuid,
+                        },
+                    };
+
+                    match serde_json::to_value(&cancelled_event) {
+                        Ok(cancelled_json) => {
+                            match encrypt_event(&state, &session_id, "response.cancelled", &cancelled_json).await {
+                                Ok(event) => yield Ok(event),
+                                Err(e) => {
+                                    error!("Failed to encrypt response.cancelled event: {:?}", e);
+                                    yield Ok(Event::default().event("error").data("encryption_failed"));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to serialize response.cancelled: {:?}", e);
+                            yield Ok(Event::default().event("error").data("serialization_failed"));
+                        }
+                    }
+                    break;
+                }
                 StorageMessage::Error(error_msg) => {
                     error!("Client stream received error: {}", error_msg);
                     // Send error event to client
@@ -1322,6 +1396,52 @@ async fn create_response_stream(
 
     trace!("Returning SSE stream");
     Ok(Sse::new(event_stream))
+}
+
+/// Helper function to persist cancelled response with partial content
+async fn persist_cancelled_response(
+    db: &Arc<dyn crate::DBConnection + Send + Sync>,
+    response_id: i64,
+    message_id: Uuid,
+    content: &str,
+    completion_tokens: i32,
+    user_key: &secp256k1::SecretKey,
+) {
+    // Update response status to cancelled
+    if let Err(e) = db.update_response_status(
+        response_id,
+        ResponseStatus::Cancelled,
+        Some(Utc::now()),
+        None,
+        Some(completion_tokens),
+    ) {
+        error!("Failed to update response status to cancelled: {:?}", e);
+    }
+
+    // Update assistant message to incomplete status with partial content
+    let content_enc = if !content.is_empty() {
+        Some(encrypt_with_key(user_key, content.as_bytes()).await)
+    } else {
+        None
+    };
+
+    if let Err(e) = db.update_assistant_message(
+        message_id,
+        content_enc,
+        completion_tokens,
+        "incomplete".to_string(),
+        Some("cancelled".to_string()),
+    ) {
+        error!(
+            "Failed to update assistant message after cancellation: {:?}",
+            e
+        );
+    }
+
+    debug!(
+        "Persisted cancelled response {} with {} tokens",
+        response_id, completion_tokens
+    );
 }
 
 /// Storage task that accumulates content and writes to database
@@ -1382,6 +1502,20 @@ async fn storage_task(
                 error!("Storage: received error: {}", e);
                 error_msg = Some(e);
                 break;
+            }
+            StorageMessage::Cancelled => {
+                debug!("Storage: received cancellation signal");
+                // Persist partial content with cancelled status
+                persist_cancelled_response(
+                    &db,
+                    response_id,
+                    message_id,
+                    &content,
+                    completion_tokens,
+                    &user_key,
+                )
+                .await;
+                return;
             }
         }
     }
@@ -1873,10 +2007,33 @@ async fn cancel_response(
 ) -> Result<Json<EncryptedResponse<ResponsesRetrieveResponse>>, ApiError> {
     debug!("Cancelling response {} for user {}", id, user.uuid);
 
-    // TODO we actually need to try canceling the stream and also make sure the user and assistant
-    // message from it is not persisted.
+    // Verify the response exists and belongs to the user, and is in_progress
+    let response = state
+        .db
+        .get_response_by_uuid_and_user(id, user.uuid)
+        .map_err(|e| {
+            debug!("Response {} not found for user {}: {:?}", id, user.uuid, e);
+            match e {
+                DBError::ResponsesError(ResponsesError::ResponseNotFound) => ApiError::NotFound,
+                DBError::ResponsesError(ResponsesError::Unauthorized) => ApiError::Unauthorized,
+                _ => ApiError::InternalServerError,
+            }
+        })?;
 
-    // Cancel the response
+    // Only allow cancelling in_progress responses
+    if response.status != ResponseStatus::InProgress {
+        debug!(
+            "Cannot cancel response {} with status {:?}",
+            id, response.status
+        );
+        return Err(ApiError::BadRequest);
+    }
+
+    // Broadcast cancellation signal to all listeners
+    debug!("Broadcasting cancellation signal for response {}", id);
+    let _ = state.cancellation_broadcast.send(id);
+
+    // Update the response status in the database
     let response = state.db.cancel_response(id, user.uuid).map_err(|e| {
         debug!(
             "Response {} not found for user {} during cancel: {:?}",

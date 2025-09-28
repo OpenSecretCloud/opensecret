@@ -397,6 +397,7 @@ pub struct AppState {
     sqs_publisher: Option<Arc<SqsEventPublisher>>,
     billing_client: Option<BillingClient>,
     apple_jwt_verifier: Arc<AppleJwtVerifier>,
+    cancellation_broadcast: tokio::sync::broadcast::Sender<Uuid>,
 }
 
 #[derive(Default)]
@@ -618,6 +619,8 @@ impl AppStateBuilder {
             self.tinfoil_api_base.clone(),
         ));
 
+        let (cancellation_tx, _) = tokio::sync::broadcast::channel(1024);
+
         Ok(AppState {
             app_mode,
             db,
@@ -632,6 +635,7 @@ impl AppStateBuilder {
             sqs_publisher,
             billing_client,
             apple_jwt_verifier,
+            cancellation_broadcast: cancellation_tx,
         })
     }
 }

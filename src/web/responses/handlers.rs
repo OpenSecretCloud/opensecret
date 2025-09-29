@@ -15,6 +15,7 @@ use crate::{
         conversations::{MessageContent, MessageContentPart},
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
+        responses::constants::*,
     },
     ApiError, AppState,
 };
@@ -870,7 +871,7 @@ async fn create_response_stream(
                                         .send(StorageMessage::Done {
                                             finish_reason: stream_finish_reason
                                                 .clone()
-                                                .unwrap_or_else(|| "stop".to_string()),
+                                                .unwrap_or_else(|| FINISH_REASON_STOP.to_string()),
                                             message_id,
                                         })
                                         .await;
@@ -880,7 +881,7 @@ async fn create_response_stream(
                                         .send(StorageMessage::Done {
                                             finish_reason: stream_finish_reason
                                                 .clone()
-                                                .unwrap_or_else(|| "stop".to_string()),
+                                                .unwrap_or_else(|| FINISH_REASON_STOP.to_string()),
                                             message_id,
                                         })
                                         .await;
@@ -981,9 +982,9 @@ async fn create_response_stream(
         trace!("Building response.created event");
         let created_response = ResponsesCreateResponse {
             id: response.uuid,
-            object: "response",
+            object: OBJECT_TYPE_RESPONSE,
             created_at: response.created_at.timestamp(),
-            status: "in_progress",
+            status: STATUS_IN_PROGRESS,
             background: false,
             error: None,
             incomplete_details: None,
@@ -1076,9 +1077,9 @@ async fn create_response_stream(
             output_index: 0,
             item: OutputItem {
                 id: message_id.to_string(),
-                output_type: "message".to_string(),
-                status: "in_progress".to_string(),
-                role: Some("assistant".to_string()),
+                output_type: OUTPUT_TYPE_MESSAGE.to_string(),
+                status: STATUS_IN_PROGRESS.to_string(),
+                role: Some(ROLE_ASSISTANT.to_string()),
                 content: Some(vec![]),
             },
         };
@@ -1111,7 +1112,7 @@ async fn create_response_stream(
             output_index: 0,
             content_index: 0,
             part: ContentPart {
-                part_type: "output_text".to_string(),
+                part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
                 annotations: vec![],
                 logprobs: vec![],
                 text: String::new(),
@@ -1185,7 +1186,7 @@ async fn create_response_stream(
                                     output_index: 0,
                                     content_index: 0,
                                     part: ContentPart {
-                                        part_type: "output_text".to_string(),
+                                        part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
                                         annotations: vec![],
                                         logprobs: vec![],
                                         text: assistant_content.clone(),
@@ -1226,9 +1227,9 @@ async fn create_response_stream(
                                     output_index: 0,
                                     item: OutputItem {
                                         id: message_id.to_string(),
-                                        output_type: "message".to_string(),
-                                        status: "completed".to_string(),
-                                        role: Some("assistant".to_string()),
+                                        output_type: OUTPUT_TYPE_MESSAGE.to_string(),
+                                        status: STATUS_COMPLETED.to_string(),
+                                        role: Some(ROLE_ASSISTANT.to_string()),
                                         content: Some(vec![content_part]),
                                     },
                                 };
@@ -1256,9 +1257,9 @@ async fn create_response_stream(
                                 // Event 10: response.completed
                                 let done_response = ResponsesCreateResponse {
                                     id: response.uuid,
-                                    object: "response",
+                                    object: OBJECT_TYPE_RESPONSE,
                                     created_at: response.created_at.timestamp(),
-                                    status: "completed",
+                                    status: STATUS_COMPLETED,
                                     background: false,
                                     error: None,
                                     incomplete_details: None,
@@ -1268,11 +1269,11 @@ async fn create_response_stream(
                                     model: response.model.clone(),
                                     output: vec![OutputItem {
                                         id: message_id.to_string(),
-                                        output_type: "message".to_string(),
-                                        status: "completed".to_string(),
-                                        role: Some("assistant".to_string()),
+                                        output_type: OUTPUT_TYPE_MESSAGE.to_string(),
+                                        status: STATUS_COMPLETED.to_string(),
+                                        role: Some(ROLE_ASSISTANT.to_string()),
                                         content: Some(vec![ContentPart {
-                                            part_type: "output_text".to_string(),
+                                            part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
                                             annotations: vec![],
                                             logprobs: vec![],
                                             text: assistant_content.clone(),
@@ -1465,8 +1466,8 @@ async fn persist_cancelled_response(
         message_id,
         content_enc,
         completion_tokens,
-        "incomplete".to_string(),
-        Some("cancelled".to_string()),
+        STATUS_INCOMPLETE.to_string(),
+        Some(FINISH_REASON_CANCELLED.to_string()),
     ) {
         error!(
             "Failed to update assistant message after cancellation: {:?}",
@@ -1582,7 +1583,7 @@ async fn storage_task(
             message_id,
             content_enc,
             completion_tokens,
-            "incomplete".to_string(),
+            STATUS_INCOMPLETE.to_string(),
             None,
         ) {
             error!("Failed to update assistant message to incomplete: {:?}", e);
@@ -1614,7 +1615,7 @@ async fn storage_task(
             message_id,
             content_enc,
             completion_tokens,
-            "incomplete".to_string(),
+            STATUS_INCOMPLETE.to_string(),
             None,
         ) {
             error!("Failed to update assistant message to incomplete: {:?}", e);
@@ -1638,7 +1639,7 @@ async fn storage_task(
         message_id,
         Some(content_enc),
         completion_tokens,
-        "completed".to_string(),
+        STATUS_COMPLETED.to_string(),
         Some(finish_reason),
     ) {
         Ok(_) => {
@@ -1848,7 +1849,7 @@ async fn persist_initial_message(
         user_id: user.uuid,
         content_enc: None,
         completion_tokens: 0,
-        status: "in_progress".to_string(),
+        status: STATUS_IN_PROGRESS.to_string(),
         finish_reason: None,
     };
     state
@@ -1938,7 +1939,7 @@ async fn get_response(
     // does ordering matter?
     let retrieve_response = ResponsesRetrieveResponse {
         id: response.uuid,
-        object: "response",
+        object: OBJECT_TYPE_RESPONSE,
         created_at: response.created_at.timestamp(),
         status: serde_json::to_value(response.status)
             .ok()
@@ -2008,9 +2009,9 @@ async fn cancel_response(
     // No usage or output for cancelled responses
     let retrieve_response = ResponsesRetrieveResponse {
         id: response.uuid,
-        object: "response",
+        object: OBJECT_TYPE_RESPONSE,
         created_at: response.created_at.timestamp(),
-        status: "cancelled".to_string(),
+        status: STATUS_CANCELLED.to_string(),
         model: response.model.clone(),
         usage: None,
         output: None,

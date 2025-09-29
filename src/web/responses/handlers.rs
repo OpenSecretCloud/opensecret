@@ -15,7 +15,7 @@ use crate::{
         conversations::{MessageContent, MessageContentPart},
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
-        responses::{constants::*, error_mapping, MessageContentConverter},
+        responses::{constants::*, error_mapping, MessageContentConverter, SseEventEmitter},
     },
     ApiError, AppState,
 };
@@ -964,7 +964,10 @@ async fn create_response_stream(
     trace!("Creating SSE event stream for client");
     let event_stream = async_stream::stream! {
         trace!("=== STARTING SSE STREAM ===");
-        let mut sequence_number = 0i32;
+
+        // Initialize the SSE event emitter
+        let mut emitter = SseEventEmitter::new(&state, session_id, 0);
+
         // Send initial response.created event
         trace!("Building response.created event");
         let created_response = ResponsesCreateResponse {
@@ -1001,56 +1004,19 @@ async fn create_response_stream(
         let created_event = ResponseCreatedEvent {
             event_type: "response.created",
             response: created_response.clone(),
-            sequence_number,
+            sequence_number: emitter.sequence_number(),
         };
-        sequence_number += 1;
 
-        match serde_json::to_value(&created_event) {
-            Ok(created_json) => {
-                trace!("Serialized response.created event");
-                match encrypt_event(&state, &session_id, "response.created", &created_json).await {
-                    Ok(event) => {
-                        trace!("Yielding response.created event");
-                        yield Ok(event)
-                    },
-                    Err(e) => {
-                        error!("Failed to encrypt response.created event: {:?}", e);
-                        yield Ok(Event::default().event("error").data("encryption_failed"));
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to serialize response.created: {:?}", e);
-                yield Ok(Event::default().event("error").data("serialization_failed"));
-            }
-        }
+        yield Ok(emitter.emit("response.created", &created_event).await);
 
         // Event 2: response.in_progress
         let in_progress_event = ResponseInProgressEvent {
             event_type: "response.in_progress",
             response: created_response,
-            sequence_number,
+            sequence_number: emitter.sequence_number(),
         };
-        sequence_number += 1;
 
-        match serde_json::to_value(&in_progress_event) {
-            Ok(in_progress_json) => {
-                match encrypt_event(&state, &session_id, "response.in_progress", &in_progress_json).await {
-                    Ok(event) => {
-                        trace!("Yielding response.in_progress event");
-                        yield Ok(event)
-                    },
-                    Err(e) => {
-                        error!("Failed to encrypt response.in_progress event: {:?}", e);
-                        yield Ok(Event::default().event("error").data("encryption_failed"));
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to serialize response.in_progress: {:?}", e);
-                yield Ok(Event::default().event("error").data("serialization_failed"));
-            }
-        }
+        yield Ok(emitter.emit("response.in_progress", &in_progress_event).await);
 
         // Process messages from upstream processor
         let mut assistant_content = String::new();
@@ -1060,7 +1026,7 @@ async fn create_response_stream(
         // Event 3: response.output_item.added
         let output_item_added_event = ResponseOutputItemAddedEvent {
             event_type: "response.output_item.added",
-            sequence_number,
+            sequence_number: emitter.sequence_number(),
             output_index: 0,
             item: OutputItem {
                 id: message_id.to_string(),
@@ -1070,31 +1036,13 @@ async fn create_response_stream(
                 content: Some(vec![]),
             },
         };
-        sequence_number += 1;
 
-        match serde_json::to_value(&output_item_added_event) {
-            Ok(output_item_json) => {
-                match encrypt_event(&state, &session_id, "response.output_item.added", &output_item_json).await {
-                    Ok(event) => {
-                        trace!("Yielding response.output_item.added event");
-                        yield Ok(event)
-                    },
-                    Err(e) => {
-                        error!("Failed to encrypt response.output_item.added event: {:?}", e);
-                        yield Ok(Event::default().event("error").data("encryption_failed"));
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to serialize response.output_item.added: {:?}", e);
-                yield Ok(Event::default().event("error").data("serialization_failed"));
-            }
-        }
+        yield Ok(emitter.emit("response.output_item.added", &output_item_added_event).await);
 
         // Event 4: response.content_part.added
         let content_part_added_event = ResponseContentPartAddedEvent {
             event_type: "response.content_part.added",
-            sequence_number,
+            sequence_number: emitter.sequence_number(),
             item_id: message_id.to_string(),
             output_index: 0,
             content_index: 0,
@@ -1105,26 +1053,8 @@ async fn create_response_stream(
                 text: String::new(),
             },
         };
-        sequence_number += 1;
 
-        match serde_json::to_value(&content_part_added_event) {
-            Ok(content_part_json) => {
-                match encrypt_event(&state, &session_id, "response.content_part.added", &content_part_json).await {
-                    Ok(event) => {
-                        trace!("Yielding response.content_part.added event");
-                        yield Ok(event)
-                    },
-                    Err(e) => {
-                        error!("Failed to encrypt response.content_part.added event: {:?}", e);
-                        yield Ok(Event::default().event("error").data("encryption_failed"));
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to serialize response.content_part.added: {:?}", e);
-                yield Ok(Event::default().event("error").data("serialization_failed"));
-            }
-        }
+        yield Ok(emitter.emit("response.content_part.added", &content_part_added_event).await);
 
         trace!("Starting to process messages from upstream processor");
         while let Some(msg) = rx_client.recv().await {
@@ -1137,38 +1067,20 @@ async fn create_response_stream(
                                 // Event 7: response.output_text.done
                                 let output_text_done_event = ResponseOutputTextDoneEvent {
                                     event_type: "response.output_text.done",
-                                    sequence_number,
+                                    sequence_number: emitter.sequence_number(),
                                     item_id: message_id.to_string(),
                                     output_index: 0,
                                     content_index: 0,
                                     text: assistant_content.clone(),
                                     logprobs: vec![],
                                 };
-                                sequence_number += 1;
 
-                                match serde_json::to_value(&output_text_done_event) {
-                                    Ok(output_text_done_json) => {
-                                        match encrypt_event(&state, &session_id, "response.output_text.done", &output_text_done_json).await {
-                                            Ok(event) => {
-                                                trace!("Yielding response.output_text.done event");
-                                                yield Ok(event)
-                                            },
-                                            Err(e) => {
-                                                error!("Failed to encrypt response.output_text.done event: {:?}", e);
-                                                yield Ok(Event::default().event("error").data("encryption_failed"));
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to serialize response.output_text.done: {:?}", e);
-                                        yield Ok(Event::default().event("error").data("serialization_failed"));
-                                    }
-                                }
+                                yield Ok(emitter.emit("response.output_text.done", &output_text_done_event).await);
 
                                 // Event 8: response.content_part.done
                                 let content_part_done_event = ResponseContentPartDoneEvent {
                                     event_type: "response.content_part.done",
-                                    sequence_number,
+                                    sequence_number: emitter.sequence_number(),
                                     item_id: message_id.to_string(),
                                     output_index: 0,
                                     content_index: 0,
@@ -1179,26 +1091,8 @@ async fn create_response_stream(
                                         text: assistant_content.clone(),
                                     },
                                 };
-                                sequence_number += 1;
 
-                                match serde_json::to_value(&content_part_done_event) {
-                                    Ok(content_part_done_json) => {
-                                        match encrypt_event(&state, &session_id, "response.content_part.done", &content_part_done_json).await {
-                                            Ok(event) => {
-                                                trace!("Yielding response.content_part.done event");
-                                                yield Ok(event)
-                                            },
-                                            Err(e) => {
-                                                error!("Failed to encrypt response.content_part.done event: {:?}", e);
-                                                yield Ok(Event::default().event("error").data("encryption_failed"));
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to serialize response.content_part.done: {:?}", e);
-                                        yield Ok(Event::default().event("error").data("serialization_failed"));
-                                    }
-                                }
+                                yield Ok(emitter.emit("response.content_part.done", &content_part_done_event).await);
 
                                 // Event 9: response.output_item.done
                                 let content_part = ContentPart {
@@ -1210,7 +1104,7 @@ async fn create_response_stream(
 
                                 let output_item_done_event = ResponseOutputItemDoneEvent {
                                     event_type: "response.output_item.done",
-                                    sequence_number,
+                                    sequence_number: emitter.sequence_number(),
                                     output_index: 0,
                                     item: OutputItem {
                                         id: message_id.to_string(),
@@ -1220,26 +1114,8 @@ async fn create_response_stream(
                                         content: Some(vec![content_part]),
                                     },
                                 };
-                                sequence_number += 1;
 
-                                match serde_json::to_value(&output_item_done_event) {
-                                    Ok(output_item_done_json) => {
-                                        match encrypt_event(&state, &session_id, "response.output_item.done", &output_item_done_json).await {
-                                            Ok(event) => {
-                                                trace!("Yielding response.output_item.done event");
-                                                yield Ok(event)
-                                            },
-                                            Err(e) => {
-                                                error!("Failed to encrypt response.output_item.done event: {:?}", e);
-                                                yield Ok(Event::default().event("error").data("encryption_failed"));
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to serialize response.output_item.done: {:?}", e);
-                                        yield Ok(Event::default().event("error").data("serialization_failed"));
-                                    }
-                                }
+                                yield Ok(emitter.emit("response.output_item.done", &output_item_done_event).await);
 
                                 // Event 10: response.completed
                                 let done_response = ResponsesCreateResponse {
@@ -1293,24 +1169,10 @@ async fn create_response_stream(
                                 let completed_event = ResponseCompletedEvent {
                                     event_type: "response.completed",
                                     response: done_response,
-                                    sequence_number,
+                                    sequence_number: emitter.sequence_number(),
                                 };
 
-                                match serde_json::to_value(&completed_event) {
-                                    Ok(completed_json) => {
-                                        match encrypt_event(&state, &session_id, "response.completed", &completed_json).await {
-                                            Ok(event) => yield Ok(event),
-                                            Err(e) => {
-                                                error!("Failed to encrypt response.completed event: {:?}", e);
-                                                yield Ok(Event::default().event("error").data("encryption_failed"));
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to serialize response.completed: {:?}", e);
-                                        yield Ok(Event::default().event("error").data("serialization_failed"));
-                                    }
-                                }
+                                yield Ok(emitter.emit("response.completed", &completed_event).await);
                     break;
                 }
                 StorageMessage::ContentDelta(content) => {
@@ -1324,30 +1186,11 @@ async fn create_response_stream(
                         item_id: message_id.to_string(),
                         output_index: 0,
                         content_index: 0,
-                        sequence_number,
+                        sequence_number: emitter.sequence_number(),
                         logprobs: vec![],
                     };
-                    sequence_number += 1;
 
-                    trace!("Sending response.output_text.delta event");
-                    match serde_json::to_value(&delta_event) {
-                        Ok(delta_json) => {
-                            match encrypt_event(&state, &session_id, "response.output_text.delta", &delta_json).await {
-                                Ok(event) => {
-                                    trace!("Yielding response.output_text.delta event");
-                                    yield Ok(event)
-                                },
-                                Err(e) => {
-                                    error!("Failed to encrypt response.output_text.delta event: {:?}", e);
-                                    yield Ok(Event::default().event("error").data("encryption_failed"));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to serialize response.output_text.delta: {:?}", e);
-                            yield Ok(Event::default().event("error").data("serialization_failed"));
-                        }
-                    }
+                    yield Ok(emitter.emit("response.output_text.delta", &delta_event).await);
                 }
 
                 StorageMessage::Usage { prompt_tokens: _, completion_tokens } => {
@@ -1366,21 +1209,7 @@ async fn create_response_stream(
                         },
                     };
 
-                    match serde_json::to_value(&cancelled_event) {
-                        Ok(cancelled_json) => {
-                            match encrypt_event(&state, &session_id, "response.cancelled", &cancelled_json).await {
-                                Ok(event) => yield Ok(event),
-                                Err(e) => {
-                                    error!("Failed to encrypt response.cancelled event: {:?}", e);
-                                    yield Ok(Event::default().event("error").data("encryption_failed"));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to serialize response.cancelled: {:?}", e);
-                            yield Ok(Event::default().event("error").data("serialization_failed"));
-                        }
-                    }
+                    yield Ok(emitter.emit_without_sequence("response.cancelled", &cancelled_event).await);
                     break;
                 }
                 StorageMessage::Error(error_msg) => {
@@ -1394,21 +1223,7 @@ async fn create_response_stream(
                         },
                     };
 
-                    match serde_json::to_value(&error_event) {
-                        Ok(error_json) => {
-                            match encrypt_event(&state, &session_id, "response.error", &error_json).await {
-                                Ok(event) => yield Ok(event),
-                                Err(e) => {
-                                    error!("Failed to encrypt error event: {:?}", e);
-                                    yield Ok(Event::default().event("error").data("encryption_failed"));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to serialize response.error: {:?}", e);
-                            yield Ok(Event::default().event("error").data("serialization_failed"));
-                        }
-                    }
+                    yield Ok(emitter.emit_without_sequence("response.error", &error_event).await);
                     break;
                 }
             }

@@ -261,19 +261,32 @@ yield Ok(emitter.emit("event.type", &event_data).await);
 - ✅ Removed `persist_cancelled_response()` helper (now in `ResponsePersister`)
 - ✅ Handlers.rs reduced from 1833 lines to 1438 lines (**395 lines removed**)
 
+#### ✅ Step 8: Response Builder Pattern
+- ✅ Created proper builder types with fluent API
+- ✅ Replaced 2 manual ResponsesCreateResponse constructions
+- ✅ Handlers.rs reduced from 1438 lines to 1378 lines (**60 lines removed**)
+
 **Total Impact:**
-- **Lines of code:** 1833 → 1438 (-395 lines in handlers.rs, -21% reduction)
-- **New modules:** 2 (stream_processor.rs, storage.rs)
+- **Lines of code:** 2018 → 1378 (-640 lines in handlers.rs, -31.7% reduction)
+- **New modules:** 3 (stream_processor.rs, storage.rs, builders.rs)
 - **Testability:** Major improvement - all components now testable in isolation
 - **Maintainability:** Each concern now has a clear home
 - **Build status:** ✅ Compiles successfully with no errors
 
-### Phase 3: Polish (Week 4)
+### Phase 3: Polish ✅ IN PROGRESS
 
-#### Step 8: Additional Utilities
-- Create `src/web/responses/models.rs` for response building
+#### ✅ Step 8: Response Builder Pattern
+- ✅ Created `src/web/responses/builders.rs` with proper builder types
+- ✅ Implemented `ResponseBuilder` with fluent API
+- ✅ Added `OutputItemBuilder` and `ContentPartBuilder` helpers
+- ✅ Created `build_usage()` helper function
+- ✅ Replaced 2 manual construction sites in handlers.rs
+- ✅ **Impact**: 60 lines removed (1438 → 1378 lines, -4.2%)
+- ✅ Comprehensive unit tests added
+
+#### Step 9: Additional Utilities
 - Create `src/web/responses/decryption.rs` for decryption helpers
-- Add builder patterns for complex structs
+- Add authorization middleware patterns
 
 #### Step 9: Documentation
 - Add module-level documentation
@@ -377,13 +390,13 @@ status: STATUS_IN_PROGRESS
 
 ## Benefits Achieved So Far
 
-1. ✅ **Clear Module Structure**: Organized by concern across 6 modules
-2. ✅ **Major Code Reduction**: handlers.rs reduced from 2018 → 1438 lines (-580 lines, -29%)
+1. ✅ **Clear Module Structure**: Organized by concern across 7 modules
+2. ✅ **Major Code Reduction**: handlers.rs reduced from 2018 → 1378 lines (-640 lines, -31.7%)
 3. ✅ **No Breaking Changes**: Original API still works
 4. ✅ **Testable Components**: All major components isolated and testable
 5. ✅ **Documentation**: All public APIs documented
-6. ✅ **Type Safety**: Strong typing throughout
-7. ✅ **Separation of Concerns**: Stream processing, storage, events, errors all isolated
+6. ✅ **Type Safety**: Strong typing throughout (builder pattern enforces correctness)
+7. ✅ **Separation of Concerns**: Stream processing, storage, events, errors, builders all isolated
 
 ---
 

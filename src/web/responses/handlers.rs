@@ -14,7 +14,8 @@ use crate::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
         responses::{
-            constants::*, error_mapping, storage_task, MessageContentConverter, SseEventEmitter,
+            build_usage, constants::*, error_mapping, storage_task, ContentPartBuilder,
+            MessageContentConverter, OutputItemBuilder, ResponseBuilder, SseEventEmitter,
             UpstreamStreamProcessor,
         },
     },
@@ -855,36 +856,10 @@ async fn create_response_stream(
 
         // Send initial response.created event
         trace!("Building response.created event");
-        let created_response = ResponsesCreateResponse {
-            id: response.uuid,
-            object: OBJECT_TYPE_RESPONSE,
-            created_at: response.created_at.timestamp(),
-            status: STATUS_IN_PROGRESS,
-            background: false,
-            error: None,
-            incomplete_details: None,
-            instructions: None,
-            max_output_tokens: response.max_output_tokens,
-            max_tool_calls: None,
-            model: response.model.clone(),
-            output: vec![],
-            parallel_tool_calls: response.parallel_tool_calls,
-            previous_response_id: None, // We no longer track previous_response_id
-            prompt_cache_key: None,
-            reasoning: ReasoningInfo { effort: None, summary: None },
-            safety_identifier: None,
-            store: response.store,
-            temperature: response.temperature.unwrap_or(1.0),
-            text: TextFormat { format: TextFormatSpec { format_type: "text".to_string() } },
-            tool_choice: response.tool_choice.clone().unwrap_or_else(|| "auto".to_string()),
-            tools: vec![],
-            top_logprobs: 0,
-            top_p: response.top_p.unwrap_or(1.0),
-            truncation: "disabled",
-            usage: None,
-            user: None,
-            metadata: decrypted_metadata.clone(),
-        };
+        let created_response = ResponseBuilder::from_response(&response)
+            .status(STATUS_IN_PROGRESS)
+            .metadata(decrypted_metadata.clone())
+            .build();
 
         let created_event = ResponseCreatedEvent {
             event_type: "response.created",
@@ -1003,53 +978,19 @@ async fn create_response_stream(
                                 yield Ok(emitter.emit("response.output_item.done", &output_item_done_event).await);
 
                                 // Event 10: response.completed
-                                let done_response = ResponsesCreateResponse {
-                                    id: response.uuid,
-                                    object: OBJECT_TYPE_RESPONSE,
-                                    created_at: response.created_at.timestamp(),
-                                    status: STATUS_COMPLETED,
-                                    background: false,
-                                    error: None,
-                                    incomplete_details: None,
-                                    instructions: None,
-                                    max_output_tokens: response.max_output_tokens,
-                                    max_tool_calls: None,
-                                    model: response.model.clone(),
-                                    output: vec![OutputItem {
-                                        id: message_id.to_string(),
-                                        output_type: OUTPUT_TYPE_MESSAGE.to_string(),
-                                        status: STATUS_COMPLETED.to_string(),
-                                        role: Some(ROLE_ASSISTANT.to_string()),
-                                        content: Some(vec![ContentPart {
-                                            part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
-                                            annotations: vec![],
-                                            logprobs: vec![],
-                                            text: assistant_content.clone(),
-                                        }]),
-                                    }],
-                                    parallel_tool_calls: response.parallel_tool_calls,
-                                    previous_response_id: None, // We no longer track previous_response_id
-                                    prompt_cache_key: None,
-                                    reasoning: ReasoningInfo { effort: None, summary: None },
-                                    safety_identifier: None,
-                                    store: response.store,
-                                    temperature: response.temperature.unwrap_or(1.0),
-                                    text: TextFormat { format: TextFormatSpec { format_type: "text".to_string() } },
-                                    tool_choice: response.tool_choice.clone().unwrap_or_else(|| "auto".to_string()),
-                                    tools: vec![],
-                                    top_logprobs: 0,
-                                    top_p: response.top_p.unwrap_or(1.0),
-                                    truncation: "disabled",
-                                    usage: Some(ResponseUsage {
-                                        input_tokens: total_prompt_tokens as i32,
-                                        input_tokens_details: InputTokenDetails { cached_tokens: 0 },
-                                        output_tokens: total_completion_tokens,
-                                        output_tokens_details: OutputTokenDetails { reasoning_tokens: 0 },
-                                        total_tokens: total_prompt_tokens as i32 + total_completion_tokens,
-                                    }),
-                                    user: None,
-                                    metadata: decrypted_metadata.clone(),
-                                };
+                                let content_part = ContentPartBuilder::new_output_text(assistant_content.clone()).build();
+                                let output_item = OutputItemBuilder::new_message(message_id)
+                                    .status(STATUS_COMPLETED)
+                                    .content(vec![content_part])
+                                    .build();
+                                let usage = build_usage(total_prompt_tokens as i32, total_completion_tokens);
+
+                                let done_response = ResponseBuilder::from_response(&response)
+                                    .status(STATUS_COMPLETED)
+                                    .output(vec![output_item])
+                                    .usage(usage)
+                                    .metadata(decrypted_metadata.clone())
+                                    .build();
 
                                 let completed_event = ResponseCompletedEvent {
                                     event_type: "response.completed",

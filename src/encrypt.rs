@@ -9,6 +9,7 @@ use generic_array::GenericArray;
 use rand_core::RngCore;
 use secp256k1::rand::rngs::OsRng;
 use secp256k1::SecretKey;
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha512};
 use std::{process::Command, sync::Arc};
 use tokio::sync::Mutex;
@@ -24,6 +25,10 @@ pub enum EncryptError {
     BadData,
     #[error("KMS encryption failed: {0}")]
     KmsError(String),
+    #[error("No content to decrypt")]
+    NoContent,
+    #[error("Deserialization failed: {0}")]
+    DeserializationFailed(String),
 }
 
 pub async fn encrypt_with_key(encryption_key: &SecretKey, bytes: &[u8]) -> Vec<u8> {
@@ -78,6 +83,101 @@ pub fn decrypt_with_key(encryption_key: &SecretKey, bytes: &[u8]) -> Result<Vec<
 
     tracing::debug!("Exiting decrypt_with_key");
     Ok(result)
+}
+
+// ============================================================================
+// High-Level Decryption Helpers
+//
+// The functions above (encrypt_with_key, decrypt_with_key) are LOW-LEVEL
+// primitives that work with raw bytes.
+//
+// The functions below are HIGH-LEVEL helpers that add:
+// - Automatic JSON deserialization
+// - Type safety with generics
+// - Proper error handling (never silent failures!)
+//
+// Use these helpers when decrypting structured data (JSON) from the database.
+// Use the low-level functions when working with raw bytes or custom formats.
+// ============================================================================
+
+/// Decrypt and deserialize encrypted content with type safety
+///
+/// This is a high-level helper that decrypts content and automatically
+/// deserializes it into the target type T using serde_json.
+///
+/// **Important**: If `encrypted` is `None`, this returns `Ok(None)` (not an error).
+/// However, if decryption or deserialization FAILS, this returns `Err` (never silently fails!).
+///
+/// # Arguments
+/// * `key` - The encryption key to use for decryption
+/// * `encrypted` - Optional encrypted content bytes
+///
+/// # Returns
+/// - `Ok(Some(T))` if data exists and decryption succeeds
+/// - `Ok(None)` if `encrypted` is `None` (no data present)
+/// - `Err(EncryptError)` if decryption or deserialization fails
+///
+/// # Example
+/// ```ignore
+/// let content: Option<MessageContent> = decrypt_content(&user_key, msg.content_enc.as_ref())
+///     .map_err(|e| {
+///         error!("Failed to decrypt message: {:?}", e);
+///         ApiError::InternalServerError
+///     })?;
+/// ```
+pub fn decrypt_content<T>(
+    key: &SecretKey,
+    encrypted: Option<&Vec<u8>>,
+) -> Result<Option<T>, EncryptError>
+where
+    T: DeserializeOwned,
+{
+    let Some(encrypted) = encrypted else {
+        return Ok(None);
+    };
+
+    let decrypted_bytes = decrypt_with_key(key, encrypted)?;
+
+    let value = serde_json::from_slice(&decrypted_bytes)
+        .map_err(|e| EncryptError::DeserializationFailed(e.to_string()))?;
+
+    Ok(Some(value))
+}
+
+/// Decrypt encrypted content as a plain UTF-8 string
+///
+/// This is a high-level helper for decrypting plain text content (not JSON).
+///
+/// **Important**: If `encrypted` is `None`, this returns `Ok(None)` (not an error).
+/// However, if decryption FAILS, this returns `Err` (never silently fails!).
+///
+/// # Arguments
+/// * `key` - The encryption key to use for decryption
+/// * `encrypted` - Optional encrypted content bytes
+///
+/// # Returns
+/// - `Ok(Some(String))` if data exists and decryption succeeds
+/// - `Ok(None)` if `encrypted` is `None` (no data present)
+/// - `Err(EncryptError)` if decryption fails
+///
+/// # Example
+/// ```ignore
+/// let text: Option<String> = decrypt_string(&user_key, msg.content_enc.as_ref())
+///     .map_err(|e| {
+///         error!("Failed to decrypt message: {:?}", e);
+///         ApiError::InternalServerError
+///     })?;
+/// ```
+pub fn decrypt_string(
+    key: &SecretKey,
+    encrypted: Option<&Vec<u8>>,
+) -> Result<Option<String>, EncryptError> {
+    let Some(encrypted) = encrypted else {
+        return Ok(None);
+    };
+
+    let bytes = decrypt_with_key(key, encrypted)?;
+    Ok(Some(String::from_utf8_lossy(&bytes).to_string()))
 }
 
 pub fn encrypt_key_deterministic(encryption_key: &SecretKey, key: &[u8]) -> Vec<u8> {

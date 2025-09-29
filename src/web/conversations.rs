@@ -3,7 +3,7 @@
 
 use crate::{
     db::DBError,
-    encrypt::{decrypt_with_key, encrypt_with_key},
+    encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
     models::responses::{NewConversation, ResponsesError},
     models::users::User,
     web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
@@ -398,17 +398,10 @@ async fn create_conversation(
     }
 
     // Decrypt metadata for response
-    let metadata = if let Some(metadata_enc) = &conversation.metadata_enc {
-        match decrypt_with_key(&user_key, metadata_enc) {
-            Ok(metadata_bytes) => serde_json::from_slice(&metadata_bytes).ok(),
-            Err(e) => {
-                error!("Failed to decrypt conversation metadata: {:?}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let metadata = decrypt_content(&user_key, conversation.metadata_enc.as_ref()).map_err(|e| {
+        error!("Failed to decrypt conversation metadata: {:?}", e);
+        ApiError::InternalServerError
+    })?;
 
     let response = ConversationResponse {
         id: conversation.uuid,
@@ -450,17 +443,10 @@ async fn get_conversation(
         .map_err(|_| ApiError::InternalServerError)?;
 
     // Decrypt metadata
-    let metadata = if let Some(metadata_enc) = &conversation.metadata_enc {
-        match decrypt_with_key(&user_key, metadata_enc) {
-            Ok(metadata_bytes) => serde_json::from_slice(&metadata_bytes).ok(),
-            Err(e) => {
-                error!("Failed to decrypt conversation metadata: {:?}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let metadata = decrypt_content(&user_key, conversation.metadata_enc.as_ref()).map_err(|e| {
+        error!("Failed to decrypt conversation metadata: {:?}", e);
+        ApiError::InternalServerError
+    })?;
 
     let response = ConversationResponse {
         id: conversation.uuid,
@@ -659,12 +645,12 @@ async fn list_conversation_items(
         );
 
         // Decrypt content (handle nullable content_enc)
-        let content = match &msg.content_enc {
-            Some(content_enc) => decrypt_with_key(&user_key, content_enc)
-                .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-                .unwrap_or_else(|_| "[Decryption failed]".to_string()),
-            None => String::new(),
-        };
+        let content = decrypt_string(&user_key, msg.content_enc.as_ref())
+            .map_err(|e| {
+                error!("Failed to decrypt message content: {:?}", e);
+                ApiError::InternalServerError
+            })?
+            .unwrap_or_default();
 
         trace!(
             "Decrypted content for {} (status={:?}): {}",
@@ -815,12 +801,12 @@ async fn get_conversation_item(
     for msg in raw_messages {
         if msg.uuid == item_id {
             // Decrypt content (handle nullable content_enc)
-            let content = match &msg.content_enc {
-                Some(content_enc) => decrypt_with_key(&user_key, content_enc)
-                    .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-                    .unwrap_or_else(|_| "[Decryption failed]".to_string()),
-                None => String::new(),
-            };
+            let content = decrypt_string(&user_key, msg.content_enc.as_ref())
+                .map_err(|e| {
+                    error!("Failed to decrypt message content: {:?}", e);
+                    ApiError::InternalServerError
+                })?
+                .unwrap_or_default();
 
             let item = match msg.message_type.as_str() {
                 "user" => {
@@ -941,40 +927,24 @@ async fn list_conversations(
     // Convert to response format
     let data: Vec<ConversationResponse> = conversations
         .iter()
-        .map(|conv| {
+        .map(|conv| -> Result<ConversationResponse, ApiError> {
             trace!("Raw conversation object: {:?}", conv);
             trace!("Conv metadata_enc present: {}", conv.metadata_enc.is_some());
 
             // Decrypt metadata
-            let metadata = if let Some(metadata_enc) = &conv.metadata_enc {
-                match decrypt_with_key(&user_key, metadata_enc) {
-                    Ok(metadata_bytes) => match serde_json::from_slice(&metadata_bytes) {
-                        Ok(metadata) => {
-                            trace!("Decrypted metadata: {:?}", metadata);
-                            Some(metadata)
-                        }
-                        Err(e) => {
-                            error!("Failed to deserialize conversation metadata: {:?}", e);
-                            None
-                        }
-                    },
-                    Err(e) => {
-                        error!("Failed to decrypt conversation metadata: {:?}", e);
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+            let metadata = decrypt_content(&user_key, conv.metadata_enc.as_ref()).map_err(|e| {
+                error!("Failed to decrypt conversation metadata: {:?}", e);
+                ApiError::InternalServerError
+            })?;
 
-            ConversationResponse {
+            Ok(ConversationResponse {
                 id: conv.uuid,
                 object: "conversation",
                 metadata,
                 created_at: conv.created_at.timestamp(),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let response = ConversationListResponse {
         object: "list",

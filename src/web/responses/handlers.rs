@@ -5,7 +5,7 @@ use crate::{
     billing::BillingError,
     context_builder::build_prompt,
     db::DBError,
-    encrypt::{decrypt_with_key, encrypt_with_key},
+    encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
     models::responses::{NewAssistantMessage, NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
     tokens::count_tokens,
@@ -680,17 +680,11 @@ async fn create_response_stream(
     );
 
     // Decrypt metadata for response
-    let decrypted_metadata = if let Some(metadata_enc) = &response.metadata_enc {
-        match decrypt_with_key(&user_key, metadata_enc) {
-            Ok(metadata_bytes) => serde_json::from_slice(&metadata_bytes).ok(),
-            Err(e) => {
-                error!("Failed to decrypt response metadata: {:?}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let decrypted_metadata: Option<Value> =
+        decrypt_content(&user_key, response.metadata_enc.as_ref()).map_err(|e| {
+            error!("Failed to decrypt response metadata: {:?}", e);
+            ApiError::InternalServerError
+        })?;
 
     // Build the conversation context from all persisted messages
     let (prompt_messages, total_prompt_tokens) =
@@ -1232,9 +1226,10 @@ async fn get_response(
     // Build output from assistant messages
     let mut output = String::new();
     for msg in &assistant_messages {
-        if let Some(content_enc) = &msg.content_enc {
-            let decrypted = decrypt_with_key(&user_key, content_enc).unwrap_or_else(|_| vec![]);
-            let text = String::from_utf8_lossy(&decrypted);
+        if let Some(text) = decrypt_string(&user_key, msg.content_enc.as_ref()).map_err(|e| {
+            error!("Failed to decrypt assistant message content: {:?}", e);
+            error_mapping::map_decryption_error("assistant message content")
+        })? {
             if !output.is_empty() {
                 output.push('\n');
             }

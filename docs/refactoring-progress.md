@@ -5,12 +5,18 @@
 ### Directory Structure Created
 ```
 src/web/responses/
-├── mod.rs          - Module definitions and re-exports
-├── handlers.rs     - Legacy responses.rs (renamed, to be refactored)
-├── constants.rs    - Centralized constants
-├── events.rs       - SSE event emitter utility
-├── errors.rs       - Error mapping utilities
-└── conversions.rs  - Message content conversion utilities
+├── mod.rs              - Module definitions and re-exports
+├── handlers.rs         - Legacy responses.rs (refactored from 2018 → 1368 lines)
+├── builders.rs         - Response builder pattern
+├── constants.rs        - Centralized constants
+├── conversions.rs      - Message content conversion utilities
+├── errors.rs           - Error mapping utilities
+├── events.rs           - SSE event emitter utility
+├── storage.rs          - Storage task components
+└── stream_processor.rs - Upstream stream processor
+
+src/encrypt.rs
+└── (high-level helpers) - decrypt_content<T>(), decrypt_string()
 ```
 
 ### Modules Implemented
@@ -284,8 +290,24 @@ yield Ok(emitter.emit("event.type", &event_data).await);
 - ✅ **Impact**: 60 lines removed (1438 → 1378 lines, -4.2%)
 - ✅ Comprehensive unit tests added
 
-#### Step 9: Additional Utilities
-- Create `src/web/responses/decryption.rs` for decryption helpers
+#### ✅ Step 9a: Decryption Helpers - MOVED TO src/encrypt.rs
+- ✅ Added high-level decryption helpers to `src/encrypt.rs` (generic location, not response-specific)
+- ✅ Implemented `decrypt_content<T>()` for JSON deserialization → `Result<Option<T>, EncryptError>`
+- ✅ Implemented `decrypt_string()` for plain text → `Result<Option<String>, EncryptError>`
+- ✅ **Critical**: Errors are ALWAYS returned, never silently failed
+  - `None` input → `Ok(None)` (not an error, just no data)
+  - Decryption/deserialization fails → `Err(...)` (hard error)
+- ✅ Added error variants to `EncryptError`: `NoContent`, `DeserializationFailed`
+- ✅ Updated `src/web/responses/handlers.rs` to use new helpers:
+  - Response metadata decryption: 11 lines → 4 lines
+  - Assistant message content: manual handling → 1-line helper call
+- ✅ Updated `src/web/conversations.rs` to use new helpers:
+  - 5 decryption patterns replaced with proper error handling
+  - Metadata decryption: 11 lines → 4 lines each (3 locations)
+  - Message content: manual handling → 1-line helper call (2 locations)
+- ✅ **Impact**: Type-safe decryption across entire codebase, consistent error handling, eliminated silent failures
+
+#### Step 9b: Additional Utilities (Future)
 - Add authorization middleware patterns
 
 #### Step 9: Documentation
@@ -386,17 +408,57 @@ use crate::web::responses::constants::*;
 status: STATUS_IN_PROGRESS
 ```
 
+### Using Decryption Helpers
+
+```rust
+// Before: Manual decryption with verbose error handling (11 lines)
+let decrypted_metadata = if let Some(metadata_enc) = &response.metadata_enc {
+    match decrypt_with_key(&user_key, metadata_enc) {
+        Ok(metadata_bytes) => serde_json::from_slice(&metadata_bytes).ok(),
+        Err(e) => {
+            error!("Failed to decrypt response metadata: {:?}", e);
+            None
+        }
+    }
+} else {
+    None
+};
+
+// After: Type-safe helper with proper error handling (4 lines)
+use crate::encrypt::{decrypt_content, decrypt_string};
+
+let decrypted_metadata: Option<Value> = decrypt_content(&user_key, response.metadata_enc.as_ref())
+    .map_err(|e| {
+        error!("Failed to decrypt response metadata: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+// Plain text decryption (also returns Result, never silently fails):
+let text: Option<String> = decrypt_string(&user_key, msg.content_enc.as_ref())
+    .map_err(|e| {
+        error!("Failed to decrypt message: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+// Both helpers return Result<Option<T>, EncryptError>:
+// - Ok(None) if encrypted is None (not an error, just no data)
+// - Err(...) if decryption/deserialization fails (hard error, never silent!)
+```
+
 ---
 
 ## Benefits Achieved So Far
 
-1. ✅ **Clear Module Structure**: Organized by concern across 7 modules
-2. ✅ **Major Code Reduction**: handlers.rs reduced from 2018 → 1378 lines (-640 lines, -31.7%)
-3. ✅ **No Breaking Changes**: Original API still works
-4. ✅ **Testable Components**: All major components isolated and testable
-5. ✅ **Documentation**: All public APIs documented
-6. ✅ **Type Safety**: Strong typing throughout (builder pattern enforces correctness)
-7. ✅ **Separation of Concerns**: Stream processing, storage, events, errors, builders all isolated
+1. ✅ **Clear Module Structure**: Organized by concern
+   - responses/: builders.rs, constants.rs, conversions.rs, errors.rs, events.rs, handlers.rs, storage.rs, stream_processor.rs
+   - encrypt.rs: Enhanced with high-level helpers (decrypt_content, decrypt_string)
+2. ✅ **Major Code Reduction**: handlers.rs reduced from 2018 → 1368 lines (-650 lines, -32.2%)
+3. ✅ **Improved Error Handling**: Decryption errors are always returned, never silently failed
+4. ✅ **No Breaking Changes**: Original API still works
+5. ✅ **Testable Components**: All major components isolated and testable
+6. ✅ **Documentation**: All public APIs documented
+7. ✅ **Type Safety**: Strong typing throughout (builder pattern, decryption helpers enforce correctness)
+8. ✅ **Separation of Concerns**: Stream processing, storage, events, errors, builders, encryption all isolated
 
 ---
 

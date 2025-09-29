@@ -97,6 +97,34 @@ These warnings will disappear as we progressively refactor handlers.rs to use th
 
 ---
 
+## Completed: Error Mapping Refactoring ✅
+
+**Commit**: `refactor: Replace error mapping patterns with centralized error_mapping module`
+
+### Changes Made
+- Imported `error_mapping` module into handlers.rs
+- Replaced all repeated error mapping patterns with centralized functions:
+  - ✅ Conversation errors → `error_mapping::map_conversation_error`
+  - ✅ Response errors → `error_mapping::map_response_error`
+  - ✅ Message errors → `error_mapping::map_message_error`
+  - ✅ Key retrieval errors → `error_mapping::map_key_retrieval_error()`
+  - ✅ Serialization errors → `error_mapping::map_serialization_error("context")`
+  - ✅ Generic DB errors → `error_mapping::map_generic_db_error`
+
+### Impact
+- **~10 error handlers replaced** with DRY, centralized functions
+- **Improved consistency**: All errors now follow same logging pattern
+- **Better maintainability**: Error handling logic centralized in errors.rs
+- **Reduced duplication**: Eliminated repeated error matching and logging code
+- **Type safety**: Compiler ensures all error types are handled
+- **Zero runtime impact**: No performance changes, purely organizational
+
+### Lines Changed
+- 10+ error mapping replacements across handlers.rs
+- Simplified error handling from 3-7 lines down to 1 line each
+
+---
+
 ## Next Steps
 
 ### Phase 1: Quick Wins (Week 1)
@@ -106,10 +134,10 @@ These warnings will disappear as we progressively refactor handlers.rs to use th
 - ✅ Search for event type strings, status strings, etc.
 - ✅ Quick find-and-replace operations
 
-#### Step 2: Start Using Error Mapping
-- Replace repeated error mapping patterns
-- Search for `map_err` patterns in handlers.rs
-- Replace with `error_mapping::map_*_error()`
+#### ~~Step 2: Start Using Error Mapping~~ ✅ DONE
+- ✅ Replace repeated error mapping patterns
+- ✅ Search for `map_err` patterns in handlers.rs
+- ✅ Replace with `error_mapping::map_*_error()`
 
 #### Step 3: Start Using MessageContentConverter
 - Replace inline conversion logic

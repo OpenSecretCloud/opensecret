@@ -15,7 +15,7 @@ use crate::{
         conversations::{MessageContent, MessageContentPart},
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
-        responses::constants::*,
+        responses::{constants::*, error_mapping},
     },
     ApiError, AppState,
 };
@@ -632,10 +632,7 @@ async fn create_response_stream(
     let user_key = state
         .get_user_key(user.uuid, None, None)
         .await
-        .map_err(|e| {
-            error!("Failed to get user encryption key: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
     // Normalize input to our standard format
     let normalized_messages = body.input.clone().normalize();
@@ -663,10 +660,8 @@ async fn create_response_stream(
     let user_message_tokens = count_tokens(&input_text_for_tokens) as i32;
 
     // Serialize the MessageContent for storage
-    let content_for_storage = serde_json::to_string(message_content).map_err(|e| {
-        error!("Failed to serialize message content: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    let content_for_storage = serde_json::to_string(message_content)
+        .map_err(|_| error_mapping::map_serialization_error("message content"))?;
 
     // Encrypt the serialized MessageContent
     let content_enc = encrypt_with_key(&user_key, content_for_storage.as_bytes()).await;
@@ -1788,20 +1783,12 @@ async fn persist_initial_message(
     let conversation = state
         .db
         .get_conversation_by_uuid_and_user(conv_uuid, user.uuid)
-        .map_err(|e| {
-            error!("Error fetching conversation: {:?}", e);
-            match e {
-                DBError::ResponsesError(ResponsesError::ConversationNotFound) => ApiError::NotFound,
-                _ => ApiError::InternalServerError,
-            }
-        })?;
+        .map_err(error_mapping::map_conversation_error)?;
 
     // Encrypt metadata if provided
     let metadata_enc = if let Some(metadata) = &body.metadata {
-        let metadata_json = serde_json::to_string(metadata).map_err(|e| {
-            error!("Failed to serialize metadata: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        let metadata_json = serde_json::to_string(metadata)
+            .map_err(|_| error_mapping::map_serialization_error("metadata"))?;
         Some(encrypt_with_key(user_key, metadata_json.as_bytes()).await)
     } else {
         None
@@ -1822,10 +1809,10 @@ async fn persist_initial_message(
         store: body.store,
         metadata_enc,
     };
-    let response = state.db.create_response(new_response).map_err(|e| {
-        error!("Error creating response: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    let response = state
+        .db
+        .create_response(new_response)
+        .map_err(error_mapping::map_generic_db_error)?;
 
     // Create the simplified user message with extracted UUID
     let new_msg = NewUserMessage {
@@ -1836,10 +1823,10 @@ async fn persist_initial_message(
         content_enc: content_enc.clone(),
         prompt_tokens: user_message_tokens,
     };
-    let user_message = state.db.create_user_message(new_msg).map_err(|e| {
-        error!("Error creating user message: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    let user_message = state
+        .db
+        .create_user_message(new_msg)
+        .map_err(error_mapping::map_generic_db_error)?;
 
     // Create placeholder assistant message with status='in_progress' and NULL content
     let placeholder_assistant = NewAssistantMessage {
@@ -1876,32 +1863,19 @@ async fn get_response(
     let response = state
         .db
         .get_response_by_uuid_and_user(id, user.uuid)
-        .map_err(|e| {
-            debug!("Response {} not found for user {}: {:?}", id, user.uuid, e);
-            match e {
-                DBError::ResponsesError(ResponsesError::ResponseNotFound) => ApiError::NotFound,
-                DBError::ResponsesError(ResponsesError::Unauthorized) => ApiError::Unauthorized,
-                _ => ApiError::InternalServerError,
-            }
-        })?;
+        .map_err(error_mapping::map_response_error)?;
 
     // Get associated assistant messages
     let assistant_messages = state
         .db
         .get_assistant_messages_for_response(response.id)
-        .map_err(|e| {
-            error!("Failed to get assistant messages: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        .map_err(error_mapping::map_message_error)?;
 
     // Get user's encryption key
     let user_key = state
         .get_user_key(user.uuid, None, None)
         .await
-        .map_err(|e| {
-            error!("Failed to get user encryption key: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
     // Build output from assistant messages
     let mut output = String::new();

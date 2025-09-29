@@ -7,15 +7,16 @@ use crate::{
     db::DBError,
     encrypt::{decrypt_with_key, encrypt_with_key},
     models::responses::{NewAssistantMessage, NewUserMessage, ResponseStatus, ResponsesError},
-    models::token_usage::NewTokenUsage,
     models::users::User,
-    sqs::UsageEvent,
     tokens::count_tokens,
     web::{
         conversations::{MessageContent, MessageContentPart},
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
-        responses::{constants::*, error_mapping, MessageContentConverter, SseEventEmitter},
+        responses::{
+            constants::*, error_mapping, storage_task, MessageContentConverter, SseEventEmitter,
+            UpstreamStreamProcessor,
+        },
     },
     ApiError, AppState,
 };
@@ -28,13 +29,11 @@ use axum::{
     Extension, Json, Router,
 };
 use base64::Engine;
-use bigdecimal::BigDecimal;
 use chrono::Utc;
 use futures::{Stream, StreamExt, TryStreamExt};
 use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
@@ -586,8 +585,8 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 /// Message types for the storage task
-#[derive(Debug)]
-enum StorageMessage {
+#[derive(Debug, Clone)]
+pub enum StorageMessage {
     ContentDelta(String),
     Usage {
         prompt_tokens: i32,
@@ -778,7 +777,6 @@ async fn create_response_stream(
     let _storage_handle = {
         let db = state.db.clone();
         let response_id = response.id;
-        let conversation_id = conversation.id;
         let user_uuid = user.uuid;
         let sqs_publisher = state.sqs_publisher.clone();
         let message_id = assistant_message_id;
@@ -788,7 +786,6 @@ async fn create_response_stream(
                 rx_storage,
                 db,
                 response_id,
-                conversation_id,
                 user_key,
                 user_uuid,
                 sqs_publisher,
@@ -802,15 +799,13 @@ async fn create_response_stream(
     // This ensures storage completes even if client disconnects
     let _upstream_handle = {
         let mut body_stream = upstream_response.into_body().into_stream();
-        let tx_storage_clone = tx_storage.clone();
-        let tx_client_clone = tx_client.clone();
-        let message_id = assistant_message_id; // Use the pre-generated UUID
+        let message_id = assistant_message_id;
         let response_uuid = response.uuid;
         let mut cancel_rx = state.cancellation_broadcast.subscribe();
 
         tokio::spawn(async move {
-            let mut buffer = String::new();
-            let mut stream_finish_reason: Option<String> = None;
+            let mut processor =
+                UpstreamStreamProcessor::new(message_id, response_uuid, tx_storage, tx_client);
 
             trace!("Starting upstream processor task");
             loop {
@@ -818,9 +813,7 @@ async fn create_response_stream(
                     // Check for cancellation
                     Ok(cancelled_id) = cancel_rx.recv() => {
                         if cancelled_id == response_uuid {
-                            debug!("Upstream processor received cancellation for response {}", response_uuid);
-                            let _ = tx_storage_clone.send(StorageMessage::Cancelled).await;
-                            let _ = tx_client_clone.send(StorageMessage::Cancelled).await;
+                            let _ = processor.send_cancellation().await;
                             break;
                         }
                     }
@@ -830,133 +823,25 @@ async fn create_response_stream(
                         let Some(chunk_result) = chunk_result else {
                             break;
                         };
-                match chunk_result {
-                    Ok(bytes) => {
-                        buffer.push_str(&String::from_utf8_lossy(bytes.as_ref()));
 
-                        // Process complete SSE frames
-                        while let Some(double_newline_pos) = buffer.find("\n\n") {
-                            let frame = buffer[..double_newline_pos].to_string();
-                            buffer = buffer[double_newline_pos + 2..].to_string();
-
-                            // Skip empty frames
-                            if frame.trim().is_empty() {
-                                continue;
-                            }
-
-                            // Extract data from SSE frame
-                            if let Some(data) = frame.strip_prefix("data: ") {
-                                let data = data.trim();
-
-                                if data == "[DONE]" {
-                                    trace!(
-                                        "Upstream processor: received [DONE], sending completion"
-                                    );
-
-                                    // Send to storage
-                                    let _ = tx_storage_clone
-                                        .send(StorageMessage::Done {
-                                            finish_reason: stream_finish_reason
-                                                .clone()
-                                                .unwrap_or_else(|| FINISH_REASON_STOP.to_string()),
-                                            message_id,
-                                        })
-                                        .await;
-
-                                    // Send to client (if still connected)
-                                    let _ = tx_client_clone
-                                        .send(StorageMessage::Done {
-                                            finish_reason: stream_finish_reason
-                                                .clone()
-                                                .unwrap_or_else(|| FINISH_REASON_STOP.to_string()),
-                                            message_id,
-                                        })
-                                        .await;
-
+                        match chunk_result {
+                            Ok(bytes) => {
+                                if let Err(e) = processor.process_chunk(bytes.as_ref()).await {
+                                    error!("Upstream processor error: {:?}", e);
+                                    let _ = processor.send_error(e.to_string()).await;
                                     break;
                                 }
-
-                                // Parse JSON data
-                                if let Ok(json_data) = serde_json::from_str::<Value>(data) {
-                                    // Extract content delta
-                                    if let Some(content) =
-                                        json_data["choices"][0]["delta"]["content"].as_str()
-                                    {
-                                        trace!(
-                                            "Upstream processor: found content delta: {}",
-                                            content
-                                        );
-
-                                        // Send to storage
-                                        let _ = tx_storage_clone
-                                            .send(StorageMessage::ContentDelta(content.to_string()))
-                                            .await;
-
-                                        // Send to client (if still connected)
-                                        let _ = tx_client_clone
-                                            .send(StorageMessage::ContentDelta(content.to_string()))
-                                            .await;
-                                    }
-
-                                    // Extract usage
-                                    if let Some(usage) = json_data.get("usage") {
-                                        let provider_prompt_tokens =
-                                            usage["prompt_tokens"].as_i64().unwrap_or(0) as i32;
-                                        let provider_completion_tokens =
-                                            usage["completion_tokens"].as_i64().unwrap_or(0) as i32;
-
-                                        debug!("Upstream processor: found usage - prompt_tokens={}, completion_tokens={}",
-                                               provider_prompt_tokens, provider_completion_tokens);
-
-                                        // Send to storage
-                                        let _ = tx_storage_clone
-                                            .send(StorageMessage::Usage {
-                                                prompt_tokens: provider_prompt_tokens,
-                                                completion_tokens: provider_completion_tokens,
-                                            })
-                                            .await;
-
-                                        // Send to client (if still connected)
-                                        let _ = tx_client_clone
-                                            .send(StorageMessage::Usage {
-                                                prompt_tokens: provider_prompt_tokens,
-                                                completion_tokens: provider_completion_tokens,
-                                            })
-                                            .await;
-                                    }
-
-                                    // Check for finish reason
-                                    if let Some(finish_reason) =
-                                        json_data["choices"][0]["finish_reason"].as_str()
-                                    {
-                                        trace!(
-                                            "Upstream processor: found finish_reason: {}",
-                                            finish_reason
-                                        );
-                                        stream_finish_reason = Some(finish_reason.to_string());
-                                    }
-                                }
+                            }
+                            Err(e) => {
+                                error!("Upstream processor: error reading response: {:?}", e);
+                                let _ = processor.send_error(e.to_string()).await;
+                                break;
                             }
                         }
-                    }
-                    Err(e) => {
-                        error!("Upstream processor: error reading response: {:?}", e);
-                        let _ = tx_storage_clone
-                            .send(StorageMessage::Error(e.to_string()))
-                            .await;
-                        let _ = tx_client_clone
-                            .send(StorageMessage::Error(e.to_string()))
-                            .await;
-                        break;
-                    }
-                }
                     }
                 }
             }
 
-            // Clean up
-            drop(tx_storage_clone);
-            drop(tx_client_clone);
             debug!("Upstream processor task completed");
         })
     };
@@ -1235,287 +1120,6 @@ async fn create_response_stream(
 
     trace!("Returning SSE stream");
     Ok(Sse::new(event_stream))
-}
-
-/// Helper function to persist cancelled response with partial content
-async fn persist_cancelled_response(
-    db: &Arc<dyn crate::DBConnection + Send + Sync>,
-    response_id: i64,
-    message_id: Uuid,
-    content: &str,
-    completion_tokens: i32,
-    user_key: &secp256k1::SecretKey,
-) {
-    // Update response status to cancelled
-    if let Err(e) = db.update_response_status(
-        response_id,
-        ResponseStatus::Cancelled,
-        Some(Utc::now()),
-        None,
-        Some(completion_tokens),
-    ) {
-        error!("Failed to update response status to cancelled: {:?}", e);
-    }
-
-    // Update assistant message to incomplete status with partial content
-    let content_enc = if !content.is_empty() {
-        Some(encrypt_with_key(user_key, content.as_bytes()).await)
-    } else {
-        None
-    };
-
-    if let Err(e) = db.update_assistant_message(
-        message_id,
-        content_enc,
-        completion_tokens,
-        STATUS_INCOMPLETE.to_string(),
-        Some(FINISH_REASON_CANCELLED.to_string()),
-    ) {
-        error!(
-            "Failed to update assistant message after cancellation: {:?}",
-            e
-        );
-    }
-
-    debug!(
-        "Persisted cancelled response {} with {} tokens",
-        response_id, completion_tokens
-    );
-}
-
-/// Storage task that accumulates content and writes to database
-#[allow(clippy::too_many_arguments)]
-async fn storage_task(
-    mut rx: mpsc::Receiver<StorageMessage>,
-    db: Arc<dyn crate::DBConnection + Send + Sync>,
-    response_id: i64,
-    _conversation_id: i64,
-    user_key: secp256k1::SecretKey,
-    user_uuid: Uuid,
-    sqs_publisher: Option<Arc<crate::sqs::SqsEventPublisher>>,
-    message_id: Uuid,
-) {
-    let mut content = String::new();
-    let mut completion_tokens = 0i32;
-    let mut prompt_tokens = 0i32;
-    let mut finish_reason = String::new();
-    let mut error_msg: Option<String> = None;
-
-    // Accumulate content from stream
-    while let Some(msg) = rx.recv().await {
-        match msg {
-            StorageMessage::ContentDelta(delta) => {
-                trace!("Storage: received content delta: {} chars", delta.len());
-                content.push_str(&delta);
-            }
-            StorageMessage::Usage {
-                prompt_tokens: p_tokens,
-                completion_tokens: c_tokens,
-            } => {
-                debug!(
-                    "Storage: received usage - prompt_tokens={}, completion_tokens={}",
-                    p_tokens, c_tokens
-                );
-                prompt_tokens = p_tokens;
-                completion_tokens = c_tokens;
-            }
-            StorageMessage::Done {
-                finish_reason: reason,
-                message_id: msg_id,
-            } => {
-                debug!(
-                    "Storage: received Done signal with finish_reason={}, message_id={}",
-                    reason, msg_id
-                );
-                // Verify the message_id matches what we expect
-                if msg_id != message_id {
-                    warn!(
-                        "Storage: received message_id {} doesn't match expected {}",
-                        msg_id, message_id
-                    );
-                }
-                finish_reason = reason;
-                break;
-            }
-            StorageMessage::Error(e) => {
-                error!("Storage: received error: {}", e);
-                error_msg = Some(e);
-                break;
-            }
-            StorageMessage::Cancelled => {
-                debug!("Storage: received cancellation signal");
-                // Persist partial content with cancelled status
-                persist_cancelled_response(
-                    &db,
-                    response_id,
-                    message_id,
-                    &content,
-                    completion_tokens,
-                    &user_key,
-                )
-                .await;
-                return;
-            }
-        }
-    }
-
-    // If we exit the loop without Done or Error, it means all senders were dropped
-    if error_msg.is_none() && finish_reason.is_empty() {
-        warn!("Storage: channel closed before receiving Done signal, saving incomplete content");
-
-        // Update response status to failed
-        if let Err(e) = db.update_response_status(
-            response_id,
-            ResponseStatus::Failed,
-            Some(Utc::now()),
-            None,
-            None,
-        ) {
-            error!("Failed to update response status to failed: {:?}", e);
-        }
-
-        // Update assistant message to incomplete status with whatever content we have
-        let content_enc = if !content.is_empty() {
-            Some(encrypt_with_key(&user_key, content.as_bytes()).await)
-        } else {
-            None
-        };
-
-        if let Err(e) = db.update_assistant_message(
-            message_id,
-            content_enc,
-            completion_tokens,
-            STATUS_INCOMPLETE.to_string(),
-            None,
-        ) {
-            error!("Failed to update assistant message to incomplete: {:?}", e);
-        }
-        return;
-    }
-
-    // Handle error case
-    if let Some(_error) = error_msg {
-        // Update response status to failed
-        if let Err(e) = db.update_response_status(
-            response_id,
-            ResponseStatus::Failed,
-            Some(Utc::now()),
-            None,
-            None,
-        ) {
-            error!("Failed to update response status to failed: {:?}", e);
-        }
-
-        // Update assistant message to incomplete status with partial content
-        let content_enc = if !content.is_empty() {
-            Some(encrypt_with_key(&user_key, content.as_bytes()).await)
-        } else {
-            None
-        };
-
-        if let Err(e) = db.update_assistant_message(
-            message_id,
-            content_enc,
-            completion_tokens,
-            STATUS_INCOMPLETE.to_string(),
-            None,
-        ) {
-            error!("Failed to update assistant message to incomplete: {:?}", e);
-        }
-        return;
-    }
-
-    // Fallback token counting if not provided
-    if completion_tokens == 0 && !content.is_empty() {
-        completion_tokens = count_tokens(&content) as i32;
-        debug!(
-            "No completion tokens from upstream, counted {} tokens from content",
-            completion_tokens
-        );
-    }
-
-    // Encrypt and update assistant message (placeholder was created earlier)
-    let content_enc = encrypt_with_key(&user_key, content.as_bytes()).await;
-
-    match db.update_assistant_message(
-        message_id,
-        Some(content_enc),
-        completion_tokens,
-        STATUS_COMPLETED.to_string(),
-        Some(finish_reason),
-    ) {
-        Ok(_) => {
-            debug!("Successfully updated assistant message");
-        }
-        Err(e) => {
-            error!("Failed to update assistant message: {:?}", e);
-        }
-    }
-
-    // Handle billing in background thread
-    if prompt_tokens > 0 || completion_tokens > 0 {
-        let db_clone = db.clone();
-        let sqs_pub = sqs_publisher.clone();
-
-        tokio::spawn(async move {
-            // Calculate estimated cost with correct pricing
-            let input_cost =
-                BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(prompt_tokens);
-            let output_cost =
-                BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(completion_tokens);
-            let total_cost = input_cost + output_cost;
-
-            info!(
-                "Responses API usage for user {}: prompt_tokens={}, completion_tokens={}, total_tokens={}, estimated_cost={}",
-                user_uuid, prompt_tokens, completion_tokens,
-                prompt_tokens + completion_tokens,
-                total_cost
-            );
-
-            // Create and store token usage record
-            let new_usage = NewTokenUsage::new(
-                user_uuid,
-                prompt_tokens,
-                completion_tokens,
-                total_cost.clone(),
-            );
-
-            if let Err(e) = db_clone.create_token_usage(new_usage) {
-                error!("Failed to save token usage: {:?}", e);
-            }
-
-            // Post event to SQS if configured
-            if let Some(publisher) = sqs_pub {
-                let event = UsageEvent {
-                    event_id: Uuid::new_v4(),
-                    user_id: user_uuid,
-                    input_tokens: prompt_tokens,
-                    output_tokens: completion_tokens,
-                    estimated_cost: total_cost,
-                    chat_time: Utc::now(),
-                    is_api_request: false, // TODO: Responses API is not API key based
-                    provider_name: String::new(), // TODO: Track provider name from upstream response
-                    model_name: String::new(),    // TODO: Track actual model name used
-                };
-
-                match publisher.publish_event(event).await {
-                    Ok(_) => debug!("published usage event successfully"),
-                    Err(e) => error!("error publishing usage event: {e}"),
-                }
-            }
-        });
-    }
-
-    // Update response status to completed with token counts
-    if let Err(e) = db.update_response_status(
-        response_id,
-        ResponseStatus::Completed,
-        Some(Utc::now()),
-        Some(prompt_tokens),
-        Some(completion_tokens),
-    ) {
-        error!("Failed to update response status to completed: {:?}", e);
-    }
 }
 
 /// Helper to create encrypted SSE event

@@ -232,23 +232,41 @@ yield Ok(emitter.emit("event.type", &event_data).await);
 - ✅ After: `emitter.emit("event.type", &data).await` (1 line each)
 - ✅ **Actual reduction**: 185 lines removed
 
-### Phase 2: Major Refactorings (Weeks 2-3)
+### Phase 2: Major Refactorings ✅ COMPLETED
 
-#### Step 5: Extract Upstream Stream Processor
-- Create `src/web/responses/stream_processor.rs`
-- Move SSE parsing logic from handlers.rs
-- Encapsulate buffer management and channel broadcasting
+#### ✅ Step 5: Extract Upstream Stream Processor
+- ✅ Created `src/web/responses/stream_processor.rs`
+- ✅ Moved SSE parsing logic from handlers.rs
+- ✅ Encapsulated buffer management and channel broadcasting
+- ✅ Created `UpstreamStreamProcessor` struct with:
+  - `process_chunk()` - handles byte chunks
+  - `extract_sse_frame()` - parses SSE frames
+  - `handle_sse_frame()` - processes individual frames
+  - `send_content_delta()`, `send_usage()`, `send_completion()`, `send_error()`, `send_cancellation()`
+- ✅ **Critical fix**: Storage channel sends are critical (return errors), client channel sends ignore failures
+  - Preserves dual-stream independence: client disconnects don't stop storage
+  - Storage always completes even if user refreshes/navigates away
 
-#### Step 6: Extract Storage Task Components
-- Create `src/web/responses/storage.rs`
-- Extract `ContentAccumulator`, `ResponsePersister`, `BillingEventPublisher`
-- Break up 230-line storage_task function
+#### ✅ Step 6: Extract Storage Task Components
+- ✅ Created `src/web/responses/storage.rs`
+- ✅ Extracted `ContentAccumulator`, `ResponsePersister`, `BillingEventPublisher`
+- ✅ Broke up 230-line storage_task function
+- ✅ Created clean state machine for accumulation: `AccumulatorState` enum
+- ✅ Separated persistence logic by outcome: `persist_completed()`, `persist_cancelled()`, `persist_failed()`
+- ✅ Isolated billing logic in `BillingEventPublisher`
 
-#### Step 7: Break Up create_response_stream
-- Extract `RequestContext` preparation
-- Extract streaming infrastructure setup
-- Extract SSE stream creation
-- Make main handler ~100 lines
+#### ✅ Step 7: Simplified create_response_stream
+- ✅ Replaced 158-line inline upstream processor with `UpstreamStreamProcessor` (35 lines)
+- ✅ Replaced inline storage task with imported `storage_task()`
+- ✅ Removed `persist_cancelled_response()` helper (now in `ResponsePersister`)
+- ✅ Handlers.rs reduced from 1833 lines to 1438 lines (**395 lines removed**)
+
+**Total Impact:**
+- **Lines of code:** 1833 → 1438 (-395 lines in handlers.rs, -21% reduction)
+- **New modules:** 2 (stream_processor.rs, storage.rs)
+- **Testability:** Major improvement - all components now testable in isolation
+- **Maintainability:** Each concern now has a clear home
+- **Build status:** ✅ Compiles successfully with no errors
 
 ### Phase 3: Polish (Week 4)
 
@@ -359,12 +377,13 @@ status: STATUS_IN_PROGRESS
 
 ## Benefits Achieved So Far
 
-1. ✅ **Clear Module Structure**: Organized by concern
-2. ✅ **Ready for Progressive Refactoring**: Can refactor incrementally
+1. ✅ **Clear Module Structure**: Organized by concern across 6 modules
+2. ✅ **Major Code Reduction**: handlers.rs reduced from 2018 → 1438 lines (-580 lines, -29%)
 3. ✅ **No Breaking Changes**: Original API still works
-4. ✅ **Testable Components**: Each module has unit tests
+4. ✅ **Testable Components**: All major components isolated and testable
 5. ✅ **Documentation**: All public APIs documented
 6. ✅ **Type Safety**: Strong typing throughout
+7. ✅ **Separation of Concerns**: Stream processing, storage, events, errors all isolated
 
 ---
 

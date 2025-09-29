@@ -10,7 +10,7 @@ mod openai;
 pub mod openai_auth;
 pub mod platform;
 pub mod protected_routes;
-mod responses;
+pub mod responses;
 
 pub use conversations::router as conversations_routes;
 pub use documents::router as document_routes;

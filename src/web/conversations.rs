@@ -390,7 +390,10 @@ async fn create_conversation(
     // Reject initial items - not supported in our simplified flow
     // Users must use POST /v1/responses to add messages to conversations
     if body.items.is_some() && !body.items.as_ref().unwrap().is_empty() {
-        error!("Initial items not supported in conversation creation for user: {}", user.uuid);
+        error!(
+            "Initial items not supported in conversation creation for user: {}",
+            user.uuid
+        );
         return Err(ApiError::BadRequest);
     }
 

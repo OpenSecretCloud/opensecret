@@ -1,0 +1,270 @@
+# Refactoring Progress
+
+## Completed: Foundation Setup ✅
+
+### Directory Structure Created
+```
+src/web/responses/
+├── mod.rs          - Module definitions and re-exports
+├── handlers.rs     - Legacy responses.rs (renamed, to be refactored)
+├── constants.rs    - Centralized constants
+├── events.rs       - SSE event emitter utility
+├── errors.rs       - Error mapping utilities
+└── conversions.rs  - Message content conversion utilities
+```
+
+### Modules Implemented
+
+#### 1. **constants.rs** - Centralized Constants
+- Channel buffer sizes
+- SSE buffer capacity
+- Default values (temperature, top_p, max_tokens)
+- Event type strings
+- Status strings
+- All magic strings and numbers centralized
+
+#### 2. **events.rs** - SSE Event Emitter
+- `SseEventEmitter` struct that handles:
+  - Automatic serialization
+  - Automatic encryption
+  - Automatic error handling
+  - Sequence number management
+- **Impact**: Will eliminate ~300 lines of duplication when fully adopted
+- **Status**: Ready to use, needs integration into handlers.rs
+
+#### 3. **errors.rs** - Error Mapping Utilities
+- Centralized error mapping functions:
+  - `map_conversation_error()`
+  - `map_response_error()`
+  - `map_message_error()`
+  - `map_generic_db_error()`
+  - `map_decryption_error()`
+  - `map_encryption_error()`
+  - `map_serialization_error()`
+  - `map_key_retrieval_error()`
+- **Impact**: DRY improvement, consistent error handling
+- **Status**: Ready to use with unit tests
+
+#### 4. **conversions.rs** - Message Content Converter
+- `MessageContentConverter` with methods:
+  - `normalize_content()` - Normalize to Parts format
+  - `to_openai_format()` - Convert to OpenAI API format
+  - `to_conversation_content()` - Convert to Conversation API format
+  - `assistant_text_to_content()` - Helper for assistant messages
+  - `extract_text_for_token_counting()` - Extract text for tokens
+- **Impact**: Single source of truth for content conversions
+- **Status**: Ready to use with comprehensive unit tests
+
+### Compilation Status
+✅ **All code compiles successfully**
+
+Current warnings (expected):
+- Unused imports in mod.rs (will be used as we refactor)
+- Unused constants (will be used as we refactor)
+- Unused functions in error_mapping (will be used as we refactor)
+
+These warnings will disappear as we progressively refactor handlers.rs to use the new modules.
+
+---
+
+## Next Steps
+
+### Phase 1: Quick Wins (Week 1)
+
+#### Step 1: Start Using Constants
+- Replace magic strings in handlers.rs with constants
+- Search for event type strings, status strings, etc.
+- Quick find-and-replace operations
+
+#### Step 2: Start Using Error Mapping
+- Replace repeated error mapping patterns
+- Search for `map_err` patterns in handlers.rs
+- Replace with `error_mapping::map_*_error()`
+
+#### Step 3: Start Using MessageContentConverter
+- Replace inline conversion logic
+- Look for `MessageContent` conversions
+- Use centralized converter methods
+
+### Phase 2: Major Refactorings (Weeks 2-3)
+
+#### Step 4: Integrate SseEventEmitter
+- Replace repeated event emission code
+- Before: ~10 blocks of identical serialize + encrypt + error handling
+- After: `emitter.emit("event.type", &data).await`
+- **Expected reduction**: ~300 lines
+
+#### Step 5: Extract Upstream Stream Processor
+- Create `src/web/responses/stream_processor.rs`
+- Move SSE parsing logic from handlers.rs
+- Encapsulate buffer management and channel broadcasting
+
+#### Step 6: Extract Storage Task Components
+- Create `src/web/responses/storage.rs`
+- Extract `ContentAccumulator`, `ResponsePersister`, `BillingEventPublisher`
+- Break up 230-line storage_task function
+
+#### Step 7: Break Up create_response_stream
+- Extract `RequestContext` preparation
+- Extract streaming infrastructure setup
+- Extract SSE stream creation
+- Make main handler ~100 lines
+
+### Phase 3: Polish (Week 4)
+
+#### Step 8: Additional Utilities
+- Create `src/web/responses/models.rs` for response building
+- Create `src/web/responses/decryption.rs` for decryption helpers
+- Add builder patterns for complex structs
+
+#### Step 9: Documentation
+- Add module-level documentation
+- Document public APIs
+- Add usage examples
+
+#### Step 10: Testing
+- Integration tests for refactored components
+- Performance benchmarks
+- Manual testing with frontend
+
+---
+
+## Usage Examples
+
+### Using SseEventEmitter
+
+```rust
+// Before (repeated 10+ times):
+match serde_json::to_value(&event) {
+    Ok(json) => {
+        match encrypt_event(&state, &session_id, "response.created", &json).await {
+            Ok(event) => yield Ok(event),
+            Err(e) => {
+                error!("Failed to encrypt: {:?}", e);
+                yield Ok(Event::default().event("error").data("encryption_failed"));
+            }
+        }
+    }
+    Err(e) => {
+        error!("Failed to serialize: {:?}", e);
+        yield Ok(Event::default().event("error").data("serialization_failed"));
+    }
+}
+
+// After:
+let mut emitter = SseEventEmitter::new(&state, session_id, 0);
+yield Ok(emitter.emit("response.created", &event).await);
+```
+
+### Using Error Mapping
+
+```rust
+// Before:
+let conversation = state
+    .db
+    .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
+    .map_err(|e| match e {
+        DBError::ResponsesError(ResponsesError::ConversationNotFound) => ApiError::NotFound,
+        _ => {
+            error!("Failed to get conversation: {:?}", e);
+            ApiError::InternalServerError
+        }
+    })?;
+
+// After:
+use crate::web::responses::error_mapping;
+
+let conversation = state
+    .db
+    .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
+    .map_err(error_mapping::map_conversation_error)?;
+```
+
+### Using MessageContentConverter
+
+```rust
+// Before:
+let text = match content {
+    MessageContent::Text(text) => text.clone(),
+    MessageContent::Parts(parts) => {
+        parts.iter()
+            .filter_map(|part| match part {
+                MessageContentPart::InputText { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+};
+
+// After:
+use crate::web::responses::MessageContentConverter;
+
+let text = MessageContentConverter::extract_text_for_token_counting(&content);
+```
+
+### Using Constants
+
+```rust
+// Before:
+status: "in_progress"
+
+// After:
+use crate::web::responses::constants::*;
+
+status: STATUS_IN_PROGRESS
+```
+
+---
+
+## Benefits Achieved So Far
+
+1. ✅ **Clear Module Structure**: Organized by concern
+2. ✅ **Ready for Progressive Refactoring**: Can refactor incrementally
+3. ✅ **No Breaking Changes**: Original API still works
+4. ✅ **Testable Components**: Each module has unit tests
+5. ✅ **Documentation**: All public APIs documented
+6. ✅ **Type Safety**: Strong typing throughout
+
+---
+
+## Metrics to Track
+
+As we refactor, track these metrics:
+
+- **Lines of Code Reduced**: Target -500 lines
+- **Function Length**: Target <200 lines per function
+- **Cyclomatic Complexity**: Target <10 per function
+- **Test Coverage**: Target >80%
+- **Compilation Time**: Should remain stable or improve
+- **Runtime Performance**: Should remain stable or improve
+
+---
+
+## Safety Guidelines
+
+1. **One Refactoring at a Time**: Don't mix multiple refactorings
+2. **Test After Each Change**: Run `cargo test` and manual tests
+3. **Keep Old Code Commented**: Until confident in new code
+4. **Commit Frequently**: Small, atomic commits
+5. **Performance Test**: Benchmark before and after major changes
+
+---
+
+## Communication
+
+When a refactoring is complete:
+1. Update this document
+2. Add entry to CHANGELOG
+3. Document any API changes
+4. Update any affected documentation
+
+---
+
+## Questions or Issues?
+
+If you encounter any issues during refactoring:
+1. Check the [Refactoring Opportunities](./refactoring-opportunities.md) doc
+2. Review the test cases for examples
+3. Keep the old code as reference
+4. Don't hesitate to revert if something breaks

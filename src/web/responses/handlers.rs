@@ -1716,7 +1716,7 @@ async fn storage_task(
 }
 
 /// Helper to create encrypted SSE event
-async fn encrypt_event(
+pub async fn encrypt_event(
     state: &AppState,
     session_id: &Uuid,
     event_type: &str,
@@ -1790,9 +1790,7 @@ async fn persist_initial_message(
         .map_err(|e| {
             error!("Error fetching conversation: {:?}", e);
             match e {
-                DBError::ResponsesError(ResponsesError::ConversationNotFound) => {
-                    ApiError::NotFound
-                }
+                DBError::ResponsesError(ResponsesError::ConversationNotFound) => ApiError::NotFound,
                 _ => ApiError::InternalServerError,
             }
         })?;

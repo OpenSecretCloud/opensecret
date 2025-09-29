@@ -15,7 +15,7 @@ use crate::{
         conversations::{MessageContent, MessageContentPart},
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
-        responses::{constants::*, error_mapping},
+        responses::{constants::*, error_mapping, MessageContentConverter},
     },
     ApiError, AppState,
 };
@@ -79,16 +79,7 @@ impl InputMessage {
             InputMessage::Messages(mut messages) => {
                 // Ensure all message content is normalized to Parts format
                 for msg in &mut messages {
-                    msg.content = match msg.content.clone() {
-                        MessageContent::Text(text) => {
-                            // Convert plain text to input_text part
-                            MessageContent::Parts(vec![MessageContentPart::InputText { text }])
-                        }
-                        MessageContent::Parts(parts) => {
-                            // Already in parts format, pass through
-                            MessageContent::Parts(parts)
-                        }
-                    };
+                    msg.content = MessageContentConverter::normalize_content(msg.content.clone());
                 }
                 messages
             }
@@ -656,7 +647,8 @@ async fn create_response_stream(
     let message_content = &normalized_messages[0].content;
 
     // Count tokens for the user's input message (text only for token counting)
-    let input_text_for_tokens = message_content.as_text_for_input_token_count_only();
+    let input_text_for_tokens =
+        MessageContentConverter::extract_text_for_token_counting(message_content);
     let user_message_tokens = count_tokens(&input_text_for_tokens) as i32;
 
     // Serialize the MessageContent for storage

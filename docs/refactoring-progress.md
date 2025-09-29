@@ -125,6 +125,30 @@ These warnings will disappear as we progressively refactor handlers.rs to use th
 
 ---
 
+## Completed: MessageContentConverter Integration ✅
+
+**Commit**: `refactor: Replace inline content conversions with MessageContentConverter`
+
+### Changes Made
+- Imported `MessageContentConverter` into handlers.rs
+- Replaced inline content conversion logic with centralized converter methods:
+  - ✅ Content normalization → `MessageContentConverter::normalize_content()`
+  - ✅ Token counting text extraction → `MessageContentConverter::extract_text_for_token_counting()`
+
+### Impact
+- **2 conversion patterns replaced** with centralized methods
+- **Improved maintainability**: Content conversion logic now in single location
+- **Better testability**: Conversion logic has comprehensive unit tests
+- **Consistent behavior**: All conversions follow same rules
+- **Simplified code**: Reduced 9 lines of match logic to 1 line
+- **Zero runtime impact**: Same behavior, cleaner organization
+
+### Lines Changed
+- Token counting extraction (line 659): `as_text_for_input_token_count_only()` → `MessageContentConverter::extract_text_for_token_counting()`
+- Content normalization (lines 82-91): Replaced 9-line match statement with single `MessageContentConverter::normalize_content()` call
+
+---
+
 ## Next Steps
 
 ### Phase 1: Quick Wins (Week 1)
@@ -139,10 +163,10 @@ These warnings will disappear as we progressively refactor handlers.rs to use th
 - ✅ Search for `map_err` patterns in handlers.rs
 - ✅ Replace with `error_mapping::map_*_error()`
 
-#### Step 3: Start Using MessageContentConverter
-- Replace inline conversion logic
-- Look for `MessageContent` conversions
-- Use centralized converter methods
+#### ~~Step 3: Start Using MessageContentConverter~~ ✅ DONE
+- ✅ Replace inline conversion logic
+- ✅ Look for `MessageContent` conversions
+- ✅ Use centralized converter methods
 
 ### Phase 2: Major Refactorings (Weeks 2-3)
 

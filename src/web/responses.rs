@@ -111,13 +111,8 @@ pub struct ResponsesCreateRequest {
     /// Supports both: "hello" or [{"role": "user", "content": "hello"}]
     pub input: InputMessage,
 
-    /// Conversation to associate with (UUID string or {id: UUID} object)
-    #[serde(default)]
-    pub conversation: Option<ConversationParam>,
-
-    /// Previous response ID to continue conversation (deprecated, use conversation instead)
-    #[serde(default)]
-    pub previous_response_id: Option<Uuid>,
+    /// Conversation to associate with (UUID string or {id: UUID} object) - REQUIRED
+    pub conversation: ConversationParam,
 
     /// Temperature for randomness (0-2)
     pub temperature: Option<f32>,
@@ -1782,167 +1777,91 @@ async fn persist_initial_message(
         Uuid::new_v4()
     };
 
-    // Determine which conversation to use
-    let conversation_id = match &body.conversation {
-        Some(ConversationParam::String(id)) | Some(ConversationParam::Object { id }) => Some(*id),
-        None => None,
+    // Extract conversation ID from the required conversation parameter
+    let conv_uuid = match &body.conversation {
+        ConversationParam::String(id) | ConversationParam::Object { id } => *id,
     };
 
-    if let Some(conv_uuid) = conversation_id {
-        // Use specified conversation
-        debug!("Using specified conversation: {}", conv_uuid);
-        let conversation = state
-            .db
-            .get_conversation_by_uuid_and_user(conv_uuid, user.uuid)
-            .map_err(|e| {
-                error!("Error fetching conversation: {:?}", e);
-                match e {
-                    DBError::ResponsesError(ResponsesError::ConversationNotFound) => {
-                        ApiError::NotFound
-                    }
-                    _ => ApiError::InternalServerError,
+    // Use specified conversation
+    debug!("Using specified conversation: {}", conv_uuid);
+    let conversation = state
+        .db
+        .get_conversation_by_uuid_and_user(conv_uuid, user.uuid)
+        .map_err(|e| {
+            error!("Error fetching conversation: {:?}", e);
+            match e {
+                DBError::ResponsesError(ResponsesError::ConversationNotFound) => {
+                    ApiError::NotFound
                 }
-            })?;
-
-        // Encrypt metadata if provided
-        let metadata_enc = if let Some(metadata) = &body.metadata {
-            let metadata_json = serde_json::to_string(metadata).map_err(|e| {
-                error!("Failed to serialize metadata: {:?}", e);
-                ApiError::InternalServerError
-            })?;
-            Some(encrypt_with_key(user_key, metadata_json.as_bytes()).await)
-        } else {
-            None
-        };
-
-        // Create the Response (job tracker)
-        let new_response = NewResponse {
-            uuid: Uuid::new_v4(),
-            user_id: user.uuid,
-            conversation_id: conversation.id,
-            status: ResponseStatus::InProgress,
-            model: body.model.clone(),
-            temperature: body.temperature,
-            top_p: body.top_p,
-            max_output_tokens: body.max_output_tokens,
-            tool_choice: body.tool_choice.clone(),
-            parallel_tool_calls: body.parallel_tool_calls,
-            store: body.store,
-            metadata_enc,
-        };
-        let response = state.db.create_response(new_response).map_err(|e| {
-            error!("Error creating response: {:?}", e);
-            ApiError::InternalServerError
+                _ => ApiError::InternalServerError,
+            }
         })?;
 
-        // Create the simplified user message with extracted UUID
-        let new_msg = NewUserMessage {
-            uuid: message_uuid,
-            conversation_id: conversation.id,
-            response_id: Some(response.id),
-            user_id: user.uuid,
-            content_enc: content_enc.clone(),
-            prompt_tokens: user_message_tokens,
-        };
-        let user_message = state.db.create_user_message(new_msg).map_err(|e| {
-            error!("Error creating user message: {:?}", e);
-            ApiError::InternalServerError
-        })?;
-
-        // Create placeholder assistant message with status='in_progress' and NULL content
-        let placeholder_assistant = NewAssistantMessage {
-            uuid: assistant_message_id,
-            conversation_id: conversation.id,
-            response_id: Some(response.id),
-            user_id: user.uuid,
-            content_enc: None,
-            completion_tokens: 0,
-            status: "in_progress".to_string(),
-            finish_reason: None,
-        };
-        state
-            .db
-            .create_assistant_message(placeholder_assistant)
-            .map_err(|e| {
-                error!("Error creating placeholder assistant message: {:?}", e);
-                ApiError::InternalServerError
-            })?;
-
-        Ok((conversation, response, user_message))
-    } else {
-        // Create new conversation
-        debug!(
-            "Creating new conversation with response and message for user: {}",
-            user.uuid
-        );
-
-        let conversation_uuid = Uuid::new_v4();
-        let response_uuid = Uuid::new_v4();
-
-        // Create metadata with default title
-        let mut metadata = body.metadata.clone().unwrap_or_else(|| json!({}));
-        if metadata.get("title").is_none() {
-            metadata["title"] = json!("New Chat");
-        }
-
-        // Encrypt the metadata
-        let metadata_json = serde_json::to_string(&metadata).map_err(|e| {
+    // Encrypt metadata if provided
+    let metadata_enc = if let Some(metadata) = &body.metadata {
+        let metadata_json = serde_json::to_string(metadata).map_err(|e| {
             error!("Failed to serialize metadata: {:?}", e);
             ApiError::InternalServerError
         })?;
-        let conversation_metadata_enc =
-            Some(encrypt_with_key(user_key, metadata_json.as_bytes()).await);
+        Some(encrypt_with_key(user_key, metadata_json.as_bytes()).await)
+    } else {
+        None
+    };
 
-        // Encrypt response metadata if provided
-        let response_metadata_enc = if let Some(resp_metadata) = &body.metadata {
-            let resp_metadata_json = serde_json::to_string(resp_metadata).map_err(|e| {
-                error!("Failed to serialize response metadata: {:?}", e);
-                ApiError::InternalServerError
-            })?;
-            Some(encrypt_with_key(user_key, resp_metadata_json.as_bytes()).await)
-        } else {
-            None
-        };
+    // Create the Response (job tracker)
+    let new_response = NewResponse {
+        uuid: Uuid::new_v4(),
+        user_id: user.uuid,
+        conversation_id: conversation.id,
+        status: ResponseStatus::InProgress,
+        model: body.model.clone(),
+        temperature: body.temperature,
+        top_p: body.top_p,
+        max_output_tokens: body.max_output_tokens,
+        tool_choice: body.tool_choice.clone(),
+        parallel_tool_calls: body.parallel_tool_calls,
+        store: body.store,
+        metadata_enc,
+    };
+    let response = state.db.create_response(new_response).map_err(|e| {
+        error!("Error creating response: {:?}", e);
+        ApiError::InternalServerError
+    })?;
 
-        // Prepare the Response
-        let new_response = NewResponse {
-            uuid: response_uuid,
-            user_id: user.uuid,
-            conversation_id: 0, // Will be set by create_conversation_with_response_and_message
-            status: ResponseStatus::InProgress,
-            model: body.model.clone(),
-            temperature: body.temperature,
-            top_p: body.top_p,
-            max_output_tokens: body.max_output_tokens,
-            tool_choice: body.tool_choice.clone(),
-            parallel_tool_calls: body.parallel_tool_calls,
-            store: body.store,
-            metadata_enc: response_metadata_enc,
-        };
+    // Create the simplified user message with extracted UUID
+    let new_msg = NewUserMessage {
+        uuid: message_uuid,
+        conversation_id: conversation.id,
+        response_id: Some(response.id),
+        user_id: user.uuid,
+        content_enc: content_enc.clone(),
+        prompt_tokens: user_message_tokens,
+    };
+    let user_message = state.db.create_user_message(new_msg).map_err(|e| {
+        error!("Error creating user message: {:?}", e);
+        ApiError::InternalServerError
+    })?;
 
-        // Use transactional method to create conversation, response, message, and placeholder assistant atomically
-        state
-            .db
-            .create_conversation_with_response_and_message(
-                conversation_uuid,
-                user.uuid,
-                None, // system_prompt_id
-                conversation_metadata_enc,
-                Some(new_response),
-                content_enc,
-                user_message_tokens,
-                message_uuid,
-                Some(assistant_message_id),
-            )
-            .map_err(|e| {
-                error!(
-                    "Error creating conversation with response and message: {:?}",
-                    e
-                );
-                ApiError::InternalServerError
-            })
-            .map(|(conv, resp, msg)| (conv, resp.unwrap(), msg))
-    }
+    // Create placeholder assistant message with status='in_progress' and NULL content
+    let placeholder_assistant = NewAssistantMessage {
+        uuid: assistant_message_id,
+        conversation_id: conversation.id,
+        response_id: Some(response.id),
+        user_id: user.uuid,
+        content_enc: None,
+        completion_tokens: 0,
+        status: "in_progress".to_string(),
+        finish_reason: None,
+    };
+    state
+        .db
+        .create_assistant_message(placeholder_assistant)
+        .map_err(|e| {
+            error!("Error creating placeholder assistant message: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    Ok((conversation, response, user_message))
 }
 
 /// GET /v1/responses/{id} - Retrieve a single response

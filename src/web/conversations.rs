@@ -4,7 +4,7 @@
 use crate::{
     db::DBError,
     encrypt::{decrypt_with_key, encrypt_with_key},
-    models::responses::{NewConversation, NewUserMessage, ResponsesError},
+    models::responses::{NewConversation, ResponsesError},
     models::users::User,
     web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
     ApiError, AppState,
@@ -387,48 +387,11 @@ async fn create_conversation(
 
     trace!("Created conversation: {:?}", conversation);
 
-    // Process initial items if provided
-    if let Some(items) = &body.items {
-        for item in items {
-            match item {
-                ConversationInputItem::Message { role, content } => {
-                    if role == "user" {
-                        // Create user message
-                        // Serialize the full content structure for storage
-                        let content_json = serde_json::to_string(&content).map_err(|e| {
-                            error!("Failed to serialize message content: {:?}", e);
-                            ApiError::InternalServerError
-                        })?;
-                        let content_enc =
-                            encrypt_with_key(&user_key, content_json.as_bytes()).await;
-
-                        // Count tokens for the user message (text only for token counting)
-                        // TODO: Use proper tokenizer for actual token count
-                        let content_text_for_tokens = content.as_text_for_input_token_count_only();
-                        let prompt_tokens = content_text_for_tokens.len() as i32 / 4; // rough estimate
-
-                        let new_msg = NewUserMessage {
-                            uuid: Uuid::new_v4(),
-                            conversation_id: conversation.id,
-                            response_id: None, // No response when creating via Conversations API
-                            user_id: user.uuid,
-                            content_enc,
-                            prompt_tokens,
-                        };
-
-                        state.db.create_user_message(new_msg).map_err(|e| {
-                            error!("Failed to create initial user message: {:?}", e);
-                            ApiError::InternalServerError
-                        })?;
-                    } else if role == "assistant" {
-                        // Note: We don't support creating assistant messages in initial items
-                        // Just log and skip for now
-                        // TODO fix this logic
-                        debug!("Skipping assistant message in initial items (not yet supported)");
-                    }
-                }
-            }
-        }
+    // Reject initial items - not supported in our simplified flow
+    // Users must use POST /v1/responses to add messages to conversations
+    if body.items.is_some() && !body.items.as_ref().unwrap().is_empty() {
+        error!("Initial items not supported in conversation creation for user: {}", user.uuid);
+        return Err(ApiError::BadRequest);
     }
 
     // Decrypt metadata for response

@@ -2,6 +2,7 @@
 //! Phases 4 & 5: Always streams to client while concurrently storing to database.
 
 use crate::{
+    billing::BillingError,
     context_builder::build_prompt,
     db::DBError,
     encrypt::{decrypt_with_key, encrypt_with_key},
@@ -721,6 +722,46 @@ async fn create_response_stream(
     // Note: We already stored the user message's own token count during persist_initial_message.
     // The total_prompt_tokens here includes system prompt + conversation history + user message,
     // which is used for the actual API call but not stored on the individual message.
+
+    // Check billing with token validation
+    // TODO: This billing check happens AFTER we've already persisted the user message and
+    // created a placeholder assistant message. If billing fails here, those messages remain
+    // in the database showing as "pending". Consider:
+    // 1. Moving this check earlier (before persist_initial_message), but that requires
+    //    calculating tokens before we have the conversation context
+    // 2. Cleaning up persisted messages on billing failure
+    // 3. Marking failed messages with a specific status instead of leaving them pending
+    if let Some(billing_client) = &state.billing_client {
+        debug!(
+            "Checking billing for user {} with {} input tokens",
+            user.uuid, total_prompt_tokens
+        );
+
+        // Responses API always uses JWT auth (not API key), so is_api = false
+        if let Err(e) = billing_client
+            .check_user_chat_with_tokens(user.uuid, false, total_prompt_tokens as i32)
+            .await
+        {
+            match e {
+                BillingError::UsageLimitExceeded => {
+                    error!("Usage limit exceeded for user: {}", user.uuid);
+                    return Err(ApiError::UsageLimitReached);
+                }
+                BillingError::FreeTokenLimitExceeded => {
+                    error!(
+                        "Free tier token limit exceeded for user {} with {} tokens",
+                        user.uuid, total_prompt_tokens
+                    );
+                    return Err(ApiError::FreeTokenLimitExceeded);
+                }
+                _ => {
+                    // Log the error but allow the request for other billing service errors
+                    error!("Billing service error, allowing request: {}", e);
+                }
+            }
+        }
+        debug!("Billing check passed for user {}", user.uuid);
+    }
 
     // Build chat completion request
     let chat_request = json!({

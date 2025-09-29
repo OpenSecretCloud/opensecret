@@ -251,6 +251,9 @@ pub enum ApiError {
     #[error("Usage limit reached")]
     UsageLimitReached,
 
+    #[error("Free tier token limit exceeded")]
+    FreeTokenLimitExceeded,
+
     #[error("Resource not found")]
     NotFound,
 
@@ -276,6 +279,7 @@ impl IntoResponse for ApiError {
             ApiError::UserNotFound => StatusCode::NOT_FOUND,
             ApiError::EmailAlreadyExists => StatusCode::CONFLICT,
             ApiError::UsageLimitReached => StatusCode::FORBIDDEN,
+            ApiError::FreeTokenLimitExceeded => StatusCode::FORBIDDEN,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
         };

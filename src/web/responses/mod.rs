@@ -11,6 +11,7 @@ pub mod conversions;
 pub mod errors;
 pub mod events;
 pub mod handlers;
+pub mod instructions;
 pub mod pagination;
 pub mod storage;
 pub mod stream_processor;
@@ -32,3 +33,4 @@ pub use types::{DeletedObjectResponse, MessageContent, MessageContentPart};
 // Re-export routers
 pub use conversations::router as conversations_router;
 pub use handlers::router as responses_router;
+pub use instructions::router as instructions_router;

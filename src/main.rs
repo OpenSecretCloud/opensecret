@@ -18,8 +18,8 @@ use crate::sqs::SqsEventPublisher;
 use crate::web::openai_auth::validate_openai_auth;
 use crate::web::platform_login_routes;
 use crate::web::{
-    conversations_routes, document_routes, health_routes_with_state, login_routes, oauth_routes,
-    openai_routes, protected_routes, responses_routes,
+    conversations_routes, document_routes, health_routes_with_state, instructions_routes,
+    login_routes, oauth_routes, openai_routes, protected_routes, responses_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
@@ -2442,6 +2442,10 @@ async fn main() -> Result<(), Error> {
         )
         .merge(
             conversations_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            instructions_routes(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
         )
         .merge(

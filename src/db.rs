@@ -517,9 +517,36 @@ pub trait DBConnection {
         &self,
         user_id: Uuid,
     ) -> Result<Option<UserInstruction>, DBError>;
+    fn get_user_instruction_by_uuid_and_user(
+        &self,
+        uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<UserInstruction, DBError>;
     fn create_user_instruction(
         &self,
         new_instruction: NewUserInstruction,
+    ) -> Result<UserInstruction, DBError>;
+    fn update_user_instruction(
+        &self,
+        id: i64,
+        user_id: Uuid,
+        name_enc: Vec<u8>,
+        prompt_enc: Vec<u8>,
+        prompt_tokens: i32,
+        is_default: bool,
+    ) -> Result<UserInstruction, DBError>;
+    fn delete_user_instruction(&self, id: i64, user_id: Uuid) -> Result<(), DBError>;
+    fn list_user_instructions(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<(DateTime<Utc>, i64)>,
+        before: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<Vec<UserInstruction>, DBError>;
+    fn set_default_user_instruction(
+        &self,
+        id: i64,
+        user_id: Uuid,
     ) -> Result<UserInstruction, DBError>;
 
     // User messages
@@ -2074,6 +2101,29 @@ impl DBConnection for PostgresConnection {
             .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
     }
 
+    fn get_user_instruction_by_uuid_and_user(
+        &self,
+        uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<UserInstruction, DBError> {
+        debug!("Getting user instruction by UUID for user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        user_instructions::table
+            .filter(user_instructions::uuid.eq(uuid))
+            .filter(user_instructions::user_id.eq(user_id))
+            .first::<UserInstruction>(conn)
+            .map_err(|e| match e {
+                diesel::result::Error::NotFound => {
+                    DBError::ResponsesError(ResponsesError::SystemPromptNotFound)
+                }
+                _ => DBError::ResponsesError(ResponsesError::DatabaseError(e)),
+            })
+    }
+
     fn create_user_instruction(
         &self,
         new_instruction: NewUserInstruction,
@@ -2084,10 +2134,172 @@ impl DBConnection for PostgresConnection {
         use crate::models::schema::user_instructions;
         use diesel::prelude::*;
 
-        diesel::insert_into(user_instructions::table)
-            .values(&new_instruction)
-            .get_result(conn)
+        conn.transaction(|tx| {
+            // If this instruction should be default, clear other defaults first
+            if new_instruction.is_default {
+                diesel::update(
+                    user_instructions::table
+                        .filter(user_instructions::user_id.eq(new_instruction.user_id))
+                        .filter(user_instructions::is_default.eq(true)),
+                )
+                .set(user_instructions::is_default.eq(false))
+                .execute(tx)?;
+            }
+
+            diesel::insert_into(user_instructions::table)
+                .values(&new_instruction)
+                .get_result(tx)
+        })
+        .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
+    }
+
+    fn update_user_instruction(
+        &self,
+        id: i64,
+        user_id: Uuid,
+        name_enc: Vec<u8>,
+        prompt_enc: Vec<u8>,
+        prompt_tokens: i32,
+        is_default: bool,
+    ) -> Result<UserInstruction, DBError> {
+        debug!("Updating user instruction");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        conn.transaction(|tx| {
+            // If setting this as default, clear other defaults first
+            if is_default {
+                diesel::update(
+                    user_instructions::table
+                        .filter(user_instructions::user_id.eq(user_id))
+                        .filter(user_instructions::is_default.eq(true))
+                        .filter(user_instructions::id.ne(id)),
+                )
+                .set(user_instructions::is_default.eq(false))
+                .execute(tx)?;
+            }
+
+            diesel::update(
+                user_instructions::table
+                    .filter(user_instructions::id.eq(id))
+                    .filter(user_instructions::user_id.eq(user_id)),
+            )
+            .set((
+                user_instructions::name_enc.eq(name_enc),
+                user_instructions::prompt_enc.eq(prompt_enc),
+                user_instructions::prompt_tokens.eq(prompt_tokens),
+                user_instructions::is_default.eq(is_default),
+                user_instructions::updated_at.eq(diesel::dsl::now),
+            ))
+            .get_result(tx)
+        })
+        .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
+    }
+
+    fn delete_user_instruction(&self, id: i64, user_id: Uuid) -> Result<(), DBError> {
+        debug!("Deleting user instruction");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        diesel::delete(
+            user_instructions::table
+                .filter(user_instructions::id.eq(id))
+                .filter(user_instructions::user_id.eq(user_id)),
+        )
+        .execute(conn)
+        .map(|rows| {
+            if rows == 0 {
+                Err(DBError::ResponsesError(
+                    ResponsesError::SystemPromptNotFound,
+                ))
+            } else {
+                Ok(())
+            }
+        })?
+    }
+
+    fn list_user_instructions(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<(DateTime<Utc>, i64)>,
+        before: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<Vec<UserInstruction>, DBError> {
+        debug!("Listing user instructions");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        let mut query = user_instructions::table
+            .filter(user_instructions::user_id.eq(user_id))
+            .into_boxed();
+
+        if let Some((updated_at, id)) = after {
+            query = query.filter(
+                user_instructions::updated_at
+                    .lt(updated_at)
+                    .or(user_instructions::updated_at
+                        .eq(updated_at)
+                        .and(user_instructions::id.lt(id))),
+            );
+        }
+
+        if let Some((updated_at, id)) = before {
+            query = query.filter(
+                user_instructions::updated_at
+                    .gt(updated_at)
+                    .or(user_instructions::updated_at
+                        .eq(updated_at)
+                        .and(user_instructions::id.gt(id))),
+            );
+        }
+
+        query
+            .order(user_instructions::updated_at.desc())
+            .limit(limit)
+            .load::<UserInstruction>(conn)
             .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
+    }
+
+    fn set_default_user_instruction(
+        &self,
+        id: i64,
+        user_id: Uuid,
+    ) -> Result<UserInstruction, DBError> {
+        debug!("Setting default user instruction");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        conn.transaction(|tx| {
+            // Clear all defaults for this user
+            diesel::update(
+                user_instructions::table
+                    .filter(user_instructions::user_id.eq(user_id))
+                    .filter(user_instructions::is_default.eq(true)),
+            )
+            .set(user_instructions::is_default.eq(false))
+            .execute(tx)?;
+
+            // Set this one as default
+            diesel::update(
+                user_instructions::table
+                    .filter(user_instructions::id.eq(id))
+                    .filter(user_instructions::user_id.eq(user_id)),
+            )
+            .set((
+                user_instructions::is_default.eq(true),
+                user_instructions::updated_at.eq(diesel::dsl::now),
+            ))
+            .get_result(tx)
+        })
+        .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
     }
 
     // User messages

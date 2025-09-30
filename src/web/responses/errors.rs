@@ -31,6 +31,26 @@ pub mod error_mapping {
         }
     }
 
+    /// Map instruction-related database errors to API errors
+    ///
+    /// # Arguments
+    /// * `e` - The database error to map
+    ///
+    /// # Returns
+    /// Appropriate ApiError with logging
+    pub fn map_instruction_error(e: DBError) -> ApiError {
+        match e {
+            DBError::ResponsesError(ResponsesError::SystemPromptNotFound) => {
+                // Don't log NotFound as error - it's expected for invalid IDs
+                ApiError::NotFound
+            }
+            _ => {
+                error!("Instruction database error: {:?}", e);
+                ApiError::InternalServerError
+            }
+        }
+    }
+
     /// Map response-related database errors to API errors
     ///
     /// # Arguments

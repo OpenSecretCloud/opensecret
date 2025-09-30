@@ -105,6 +105,10 @@ pub struct ResponsesCreateRequest {
     /// Conversation to associate with (UUID string or {id: UUID} object) - REQUIRED
     pub conversation: ConversationParam,
 
+    /// System instructions for this response (overrides default user instructions)
+    #[serde(default)]
+    pub instructions: Option<String>,
+
     /// Temperature for randomness (0-2)
     pub temperature: Option<f32>,
 
@@ -750,8 +754,15 @@ async fn build_context_and_check_billing(
         .map_err(error_mapping::map_conversation_error)?;
 
     // Build the conversation context from all persisted messages
-    let (mut prompt_messages, mut total_prompt_tokens) =
-        build_prompt(state.db.as_ref(), conversation.id, user_key, &body.model)?;
+    // Pass instructions from request (if provided) to override default user instructions
+    let (mut prompt_messages, mut total_prompt_tokens) = build_prompt(
+        state.db.as_ref(),
+        conversation.id,
+        user.uuid,
+        user_key,
+        &body.model,
+        body.instructions.as_deref(),
+    )?;
 
     // Add the NEW user message to the context (not yet persisted)
     // This is needed for: 1) billing check, 2) sending to LLM

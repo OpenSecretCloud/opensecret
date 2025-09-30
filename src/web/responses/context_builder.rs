@@ -21,16 +21,43 @@ pub struct ChatMsg {
 pub fn build_prompt<D: DBConnection + ?Sized>(
     db: &D,
     conversation_id: i64,
+    user_id: uuid::Uuid,
     user_key: &secp256k1::SecretKey,
     model: &str,
+    override_instructions: Option<&str>,
 ) -> Result<(Vec<serde_json::Value>, usize), crate::ApiError> {
-    // 1. Pull every stored message (already in chrono order ASC)
+    // 1. Get default user instructions if they exist (unless override provided)
+    let mut msgs: Vec<ChatMsg> = Vec::new();
+
+    if let Some(instruction_text) = override_instructions {
+        // Use override instructions if provided
+        let tok = count_tokens(instruction_text);
+        msgs.push(ChatMsg {
+            role: ROLE_SYSTEM,
+            content: instruction_text.to_string(),
+            tool_call_id: None,
+            tok,
+        });
+    } else if let Ok(Some(default_instruction)) = db.get_default_user_instruction(user_id) {
+        // Otherwise use default user instructions
+        let plain = decrypt_with_key(user_key, &default_instruction.prompt_enc)
+            .map_err(|_| crate::ApiError::InternalServerError)?;
+        let content = String::from_utf8_lossy(&plain).into_owned();
+        let tok = default_instruction.prompt_tokens as usize;
+        msgs.push(ChatMsg {
+            role: ROLE_SYSTEM,
+            content,
+            tool_call_id: None,
+            tok,
+        });
+    }
+
+    // 2. Pull every stored message (already in chrono order ASC)
     let raw = db
         .get_conversation_context_messages(conversation_id)
         .map_err(|_| crate::ApiError::InternalServerError)?;
 
-    // 2. Decrypt + map to ChatMsg
-    let mut msgs: Vec<ChatMsg> = Vec::with_capacity(raw.len() + 1);
+    // 3. Decrypt + map to ChatMsg
     for r in raw {
         // Skip messages with no content (in_progress assistant messages)
         let content_enc = match &r.content_enc {
@@ -63,7 +90,7 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
     // to the database before this function is called, so it's included in the
     // get_conversation_context_messages result above.
 
-    // Delegate to the pure function for testing
+    // 4. Delegate to the pure function for truncation and formatting
     build_prompt_from_chat_messages(msgs, model)
 }
 
@@ -81,30 +108,40 @@ pub fn build_prompt_from_chat_messages(
     let mut total: usize = msgs.iter().map(|m| m.tok).sum();
 
     if total > ctx_budget {
-        // Middle truncation: keep first 3 + truncate middle
+        // Middle truncation: keep first messages + truncate middle
         let mut head: Vec<ChatMsg> = Vec::new();
         let mut tail: Vec<ChatMsg> = Vec::new();
         let mut tail_tokens = 0usize;
 
-        // Always keep the first messages (system + first user + first assistant if present)
+        // Always preserve the first system message (user instructions) if present
+        // Then keep first user + first assistant if present
         let mut has_system = false;
         let mut has_user = false;
         let mut has_assistant = false;
 
         for m in &msgs {
-            if (m.role == ROLE_SYSTEM && !has_system)
-                || (m.role == ROLE_USER && !has_user)
-                || (m.role == ROLE_ASSISTANT && !has_assistant)
-            {
+            // Always keep the first system message (this is the user's default instructions)
+            if m.role == ROLE_SYSTEM && !has_system {
                 head.push(m.clone());
-                match m.role {
-                    ROLE_SYSTEM => has_system = true,
-                    ROLE_USER => has_user = true,
-                    ROLE_ASSISTANT => has_assistant = true,
-                    _ => {}
-                }
+                has_system = true;
+                continue;
             }
-            if has_system && has_user && has_assistant {
+            // Keep first user message
+            if m.role == ROLE_USER && !has_user {
+                head.push(m.clone());
+                has_user = true;
+                continue;
+            }
+            // Keep first assistant response
+            if m.role == ROLE_ASSISTANT && !has_assistant {
+                head.push(m.clone());
+                has_assistant = true;
+            }
+            // Stop once we have system (if any) + user + assistant
+            if (has_system || !msgs.iter().any(|m| m.role == ROLE_SYSTEM))
+                && has_user
+                && has_assistant
+            {
                 break;
             }
         }

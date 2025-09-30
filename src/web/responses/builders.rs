@@ -295,8 +295,6 @@ mod tests {
             created_at: Utc::now(),
             completed_at: None,
             updated_at: Utc::now(),
-            input_tokens: None,
-            output_tokens: None,
         }
     }
 

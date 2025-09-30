@@ -42,7 +42,6 @@ diesel::table! {
         id -> Int8,
         uuid -> Uuid,
         user_id -> Uuid,
-        system_prompt_id -> Nullable<Int8>,
         metadata_enc -> Nullable<Bytea>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
@@ -293,6 +292,20 @@ diesel::table! {
 }
 
 diesel::table! {
+    user_instructions (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        name_enc -> Bytea,
+        prompt_enc -> Bytea,
+        prompt_tokens -> Int4,
+        is_default -> Bool,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     user_kv (id) {
         id -> Int8,
         user_id -> Uuid,
@@ -333,20 +346,6 @@ diesel::table! {
 }
 
 diesel::table! {
-    user_system_prompts (id) {
-        id -> Int8,
-        uuid -> Uuid,
-        user_id -> Uuid,
-        name_enc -> Bytea,
-        prompt_enc -> Bytea,
-        prompt_tokens -> Int4,
-        is_default -> Bool,
-        created_at -> Timestamptz,
-        updated_at -> Timestamptz,
-    }
-}
-
-diesel::table! {
     users (id) {
         id -> Int4,
         uuid -> Uuid,
@@ -362,7 +361,6 @@ diesel::table! {
 
 diesel::joinable!(assistant_messages -> conversations (conversation_id));
 diesel::joinable!(assistant_messages -> responses (response_id));
-diesel::joinable!(conversations -> user_system_prompts (system_prompt_id));
 diesel::joinable!(invite_codes -> orgs (org_id));
 diesel::joinable!(org_memberships -> orgs (org_id));
 diesel::joinable!(org_project_secrets -> org_projects (project_id));
@@ -402,9 +400,9 @@ diesel::allow_tables_to_appear_in_same_query!(
     tool_calls,
     tool_outputs,
     user_api_keys,
+    user_instructions,
     user_kv,
     user_messages,
     user_oauth_connections,
-    user_system_prompts,
     users,
 );

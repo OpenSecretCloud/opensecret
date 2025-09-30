@@ -9,8 +9,8 @@
 CREATE TYPE response_status AS ENUM
     ('queued','in_progress','completed','failed','cancelled');
 
--- 2. user_system_prompts table - Stores optional custom system prompts
-CREATE TABLE user_system_prompts (
+-- 2. user_instructions table - Stores optional custom instructions (system prompts)
+CREATE TABLE user_instructions (
     id            BIGSERIAL PRIMARY KEY,
     uuid          UUID    NOT NULL UNIQUE,
     user_id       UUID    NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
@@ -22,11 +22,11 @@ CREATE TABLE user_system_prompts (
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- Indexes for user_system_prompts
-CREATE INDEX idx_user_system_prompts_uuid      ON user_system_prompts(uuid);
-CREATE INDEX idx_user_system_prompts_user_id   ON user_system_prompts(user_id);
-CREATE UNIQUE INDEX idx_user_system_prompts_one_default
-    ON user_system_prompts(user_id)
+-- Indexes for user_instructions
+CREATE INDEX idx_user_instructions_uuid      ON user_instructions(uuid);
+CREATE INDEX idx_user_instructions_user_id   ON user_instructions(user_id);
+CREATE UNIQUE INDEX idx_user_instructions_one_default
+    ON user_instructions(user_id)
     WHERE is_default;
 
 -- 3. conversations table - Conversation containers (OpenAI Conversations API)
@@ -34,7 +34,6 @@ CREATE TABLE conversations (
     id              BIGSERIAL PRIMARY KEY,
     uuid            UUID    NOT NULL UNIQUE,
     user_id         UUID    NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
-    system_prompt_id BIGINT REFERENCES user_system_prompts(id) ON DELETE SET NULL,
     metadata_enc    BYTEA,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -188,8 +187,8 @@ CREATE INDEX idx_tool_outputs_conversation_created
 -- 9. Create triggers for updated_at columns
 -- Note: update_updated_at_column() function already exists from previous migrations
 
-CREATE TRIGGER update_user_system_prompts_updated_at
-BEFORE UPDATE ON user_system_prompts
+CREATE TRIGGER update_user_instructions_updated_at
+BEFORE UPDATE ON user_instructions
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER update_conversations_updated_at

@@ -1,6 +1,6 @@
 use crate::models::schema::{
-    assistant_messages, conversations, responses, tool_calls, tool_outputs, user_messages,
-    user_system_prompts,
+    assistant_messages, conversations, responses, tool_calls, tool_outputs, user_instructions,
+    user_messages,
 };
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
@@ -177,13 +177,13 @@ impl NewResponse {
 }
 
 // ============================================================================
-// User System Prompts
+// User Instructions (System Prompts)
 // ============================================================================
 
 #[derive(Queryable, Selectable, Identifiable, Debug, Clone, Serialize, Deserialize)]
-#[diesel(table_name = user_system_prompts)]
+#[diesel(table_name = user_instructions)]
 #[diesel(check_for_backend(diesel::pg::Pg))]
-pub struct UserSystemPrompt {
+pub struct UserInstruction {
     pub id: i64,
     pub uuid: Uuid,
     pub user_id: Uuid,
@@ -196,8 +196,8 @@ pub struct UserSystemPrompt {
 }
 
 #[derive(Insertable, Debug)]
-#[diesel(table_name = user_system_prompts)]
-pub struct NewUserSystemPrompt {
+#[diesel(table_name = user_instructions)]
+pub struct NewUserInstruction {
     pub uuid: Uuid,
     pub user_id: Uuid,
     pub name_enc: Vec<u8>,
@@ -217,7 +217,6 @@ pub struct Conversation {
     pub id: i64,
     pub uuid: Uuid,
     pub user_id: Uuid,
-    pub system_prompt_id: Option<i64>,
     pub metadata_enc: Option<Vec<u8>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -228,7 +227,6 @@ pub struct Conversation {
 pub struct NewConversation {
     pub uuid: Uuid,
     pub user_id: Uuid,
-    pub system_prompt_id: Option<i64>,
     pub metadata_enc: Option<Vec<u8>>,
 }
 
@@ -331,7 +329,6 @@ impl NewConversation {
         conn: &mut PgConnection,
         conversation_uuid: Uuid,
         user_id: Uuid,
-        system_prompt_id: Option<i64>,
         metadata_enc: Option<Vec<u8>>,
         response: Option<NewResponse>,
         first_message_content: Vec<u8>,
@@ -346,7 +343,6 @@ impl NewConversation {
             let new_conversation = NewConversation {
                 uuid: conversation_uuid,
                 user_id,
-                system_prompt_id,
                 metadata_enc,
             };
             let conversation = new_conversation.insert(tx)?;

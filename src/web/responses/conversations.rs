@@ -240,7 +240,6 @@ async fn create_conversation(
     let new_conversation = NewConversation {
         uuid: conversation_uuid,
         user_id: user.uuid,
-        system_prompt_id: None,
         metadata_enc,
     };
 

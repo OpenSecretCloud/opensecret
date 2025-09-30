@@ -30,8 +30,8 @@ use crate::models::project_settings::{
 };
 use crate::models::responses::{
     AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewResponse, NewToolCall,
-    NewToolOutput, NewUserMessage, RawThreadMessage, Response, ResponseStatus, ResponsesError,
-    ToolCall, ToolOutput, UserMessage,
+    NewToolOutput, NewUserInstruction, NewUserMessage, RawThreadMessage, Response, ResponseStatus,
+    ResponsesError, ToolCall, ToolOutput, UserInstruction, UserMessage,
 };
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
 use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
@@ -504,7 +504,6 @@ pub trait DBConnection {
         &self,
         conversation_uuid: Uuid,
         user_id: Uuid,
-        system_prompt_id: Option<i64>,
         metadata_enc: Option<Vec<u8>>,
         response: Option<NewResponse>,
         first_message_content: Vec<u8>,
@@ -512,6 +511,16 @@ pub trait DBConnection {
         message_uuid: Uuid,
         assistant_message_uuid: Option<Uuid>,
     ) -> Result<(Conversation, Option<Response>, UserMessage), DBError>;
+
+    // User instructions methods
+    fn get_default_user_instruction(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<UserInstruction>, DBError>;
+    fn create_user_instruction(
+        &self,
+        new_instruction: NewUserInstruction,
+    ) -> Result<UserInstruction, DBError>;
 
     // User messages
     fn create_user_message(&self, new_msg: NewUserMessage) -> Result<UserMessage, DBError>;
@@ -2023,7 +2032,6 @@ impl DBConnection for PostgresConnection {
         &self,
         conversation_uuid: Uuid,
         user_id: Uuid,
-        system_prompt_id: Option<i64>,
         metadata_enc: Option<Vec<u8>>,
         response: Option<NewResponse>,
         first_message_content: Vec<u8>,
@@ -2037,7 +2045,6 @@ impl DBConnection for PostgresConnection {
             conn,
             conversation_uuid,
             user_id,
-            system_prompt_id,
             metadata_enc,
             response,
             first_message_content,
@@ -2046,6 +2053,41 @@ impl DBConnection for PostgresConnection {
             assistant_message_uuid,
         )
         .map_err(DBError::from)
+    }
+
+    // User instructions implementations
+    fn get_default_user_instruction(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<UserInstruction>, DBError> {
+        debug!("Getting default user instruction for user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        user_instructions::table
+            .filter(user_instructions::user_id.eq(user_id))
+            .filter(user_instructions::is_default.eq(true))
+            .first::<UserInstruction>(conn)
+            .optional()
+            .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
+    }
+
+    fn create_user_instruction(
+        &self,
+        new_instruction: NewUserInstruction,
+    ) -> Result<UserInstruction, DBError> {
+        debug!("Creating new user instruction");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        diesel::insert_into(user_instructions::table)
+            .values(&new_instruction)
+            .get_result(conn)
+            .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
     }
 
     // User messages

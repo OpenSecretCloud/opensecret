@@ -821,8 +821,72 @@ src/web/responses/
 
 ---
 
-#### Step 7-8: Additional Refactoring (Future)
-- Pagination utilities
+#### ✅ Step 7: Pagination Utilities
+**Commit**: `refactor: Extract pagination utilities to eliminate duplicated pagination logic`
+**Status**: Completed
+
+##### Changes Made
+- **Created `src/web/responses/pagination.rs`** (new file, ~135 lines with tests)
+  - `Paginator::paginate()` - Apply limit and check for more results
+  - `Paginator::apply_order()` - Reverse items if ascending order requested
+  - `Paginator::get_cursor_ids()` - Extract first and last IDs from items
+  - Comprehensive unit tests for all utility functions
+
+- **Exported from mod.rs**:
+  - Added `pub mod pagination;`
+  - Re-exported `Paginator` for public use
+
+- **Updated `src/web/responses/conversations.rs`** to use pagination utilities (2 handlers):
+  1. ✅ `list_conversation_items` (lines 436-447): Replaced manual pagination logic
+  2. ✅ `list_conversations` (lines 531-533, 558-559): Replaced manual pagination logic
+
+##### Impact
+- ✅ **Eliminated ~30 lines of duplicated code** across 2 handlers
+- ✅ **Added 135 lines** for Paginator module (well-documented, reusable, tested)
+- ✅ **Consistent pagination behavior** across all list endpoints
+- ✅ **Easy to modify** - pagination logic now in single location
+- ✅ **Type-safe and generic** - works with any collection type
+- ✅ **Comprehensive tests** - 8 unit tests covering all edge cases
+
+##### Code Pattern Changed
+**Before (repeated 2 times):**
+```rust
+// Apply pagination
+let limit = params.limit.min(MAX_PAGINATION_LIMIT) as usize;
+let has_more = items.len() > limit;
+if has_more {
+    items.truncate(limit);
+}
+
+// Reverse if ascending order requested
+if params.order == "asc" {
+    items.reverse();
+}
+
+// Extract cursor IDs
+first_id: items.first().map(|item| match item { ... }),
+last_id: items.last().map(|item| match item { ... }),
+```
+
+**After:**
+```rust
+// Apply pagination using centralized utilities
+let (items, has_more) = Paginator::paginate(items, params.limit);
+let items = Paginator::apply_order(items, &params.order);
+
+// Extract cursor IDs using centralized utility
+let (first_id, last_id) = Paginator::get_cursor_ids(&items, |item| match item { ... });
+```
+
+##### Build Status
+- ✅ `cargo build` - Compiles successfully
+- ✅ `cargo fmt` - Clean
+- ✅ `cargo clippy` - Zero warnings or errors
+- ✅ Zero breaking changes to external APIs
+
+---
+
+#### Step 8: Unified Delete Response (Future)
 - Unified delete response types
 
 #### Step 12: Additional Utilities (Future)

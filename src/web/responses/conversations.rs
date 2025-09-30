@@ -13,7 +13,7 @@ use crate::{
                 OBJECT_TYPE_CONVERSATION_DELETED, OBJECT_TYPE_LIST,
             },
             error_mapping, ConversationBuilder, ConversationItem, ConversationItemConverter,
-            MessageContent,
+            MessageContent, Paginator,
         },
     },
     ApiError, AppState,
@@ -424,7 +424,7 @@ async fn list_conversation_items(
 
     // Convert messages to items using the centralized converter
     // Note: We don't apply limit here yet, we need to check has_more first
-    let mut items = ConversationItemConverter::messages_to_items(
+    let items = ConversationItemConverter::messages_to_items(
         &raw_messages,
         &ctx.user_key,
         start_index,
@@ -433,34 +433,25 @@ async fn list_conversation_items(
 
     trace!("Built {} conversation items before pagination", items.len());
 
-    // Apply pagination
-    let limit = params.limit.min(MAX_PAGINATION_LIMIT) as usize;
-    let has_more = items.len() > limit;
-    if has_more {
-        items.truncate(limit);
-    }
-
-    // Reverse if ascending order requested
-    if params.order == "asc" {
-        items.reverse();
-    }
+    // Apply pagination using centralized utilities
+    let (items, has_more) = Paginator::paginate(items, params.limit);
+    let items = Paginator::apply_order(items, &params.order);
 
     trace!("Final items count: {}, has_more: {}", items.len(), has_more);
+
+    // Extract cursor IDs using centralized utility
+    let (first_id, last_id) = Paginator::get_cursor_ids(&items, |item| match item {
+        ConversationItem::Message { id, .. } => *id,
+        ConversationItem::FunctionToolCall { id, .. } => *id,
+        ConversationItem::FunctionToolCallOutput { id, .. } => *id,
+    });
 
     let response = ConversationItemListResponse {
         object: OBJECT_TYPE_LIST,
         data: items.clone(),
         has_more,
-        first_id: items.first().map(|item| match item {
-            ConversationItem::Message { id, .. } => *id,
-            ConversationItem::FunctionToolCall { id, .. } => *id,
-            ConversationItem::FunctionToolCallOutput { id, .. } => *id,
-        }),
-        last_id: items.last().map(|item| match item {
-            ConversationItem::Message { id, .. } => *id,
-            ConversationItem::FunctionToolCall { id, .. } => *id,
-            ConversationItem::FunctionToolCallOutput { id, .. } => *id,
-        }),
+        first_id,
+        last_id,
     };
 
     encrypt_response(&state, &session_id, &response).await
@@ -532,20 +523,14 @@ async fn list_conversations(
     };
 
     // Get conversations
-    let mut conversations = state
+    let conversations = state
         .db
         .list_conversations(user.uuid, limit + 1, after_cursor, before_cursor)
         .map_err(error_mapping::map_generic_db_error)?;
 
-    let has_more = conversations.len() > limit as usize;
-    if has_more {
-        conversations.truncate(limit as usize);
-    }
-
-    // If ascending order requested, reverse
-    if order == "asc" {
-        conversations.reverse();
-    }
+    // Apply pagination using centralized utilities
+    let (conversations, has_more) = Paginator::paginate(conversations, limit);
+    let conversations = Paginator::apply_order(conversations, order);
 
     // Get user's encryption key for decrypting titles
     let user_key = state
@@ -570,12 +555,15 @@ async fn list_conversations(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    // Extract cursor IDs using centralized utility
+    let (first_id, last_id) = Paginator::get_cursor_ids(&conversations, |c| c.uuid);
+
     let response = ConversationListResponse {
         object: OBJECT_TYPE_LIST,
         data: data.clone(),
         has_more,
-        first_id: conversations.first().map(|c| c.uuid),
-        last_id: conversations.last().map(|c| c.uuid),
+        first_id,
+        last_id,
     };
 
     trace!("Final ConversationListResponse: {:?}", response);

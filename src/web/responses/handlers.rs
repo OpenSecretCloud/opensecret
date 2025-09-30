@@ -9,13 +9,13 @@ use crate::{
     models::users::User,
     tokens::count_tokens,
     web::{
-        conversations::{MessageContent, MessageContentPart},
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
         responses::{
             build_prompt, build_usage, constants::*, error_mapping, storage_task,
-            ContentPartBuilder, MessageContentConverter, OutputItemBuilder, ResponseBuilder,
-            ResponseEvent, SseEventEmitter, UpstreamStreamProcessor,
+            ContentPartBuilder, MessageContent, MessageContentConverter, MessageContentPart,
+            OutputItemBuilder, ResponseBuilder, ResponseEvent, SseEventEmitter,
+            UpstreamStreamProcessor,
         },
     },
     ApiError, AppState,

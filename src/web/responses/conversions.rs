@@ -1,6 +1,6 @@
 //! Message content conversion utilities
 
-use crate::web::conversations::{ConversationContent, MessageContent, MessageContentPart};
+use crate::web::responses::types::{ConversationContent, MessageContent, MessageContentPart};
 use serde_json::{json, Value};
 
 /// Centralized message content conversion utilities

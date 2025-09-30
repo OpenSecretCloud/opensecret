@@ -9,7 +9,7 @@ use crate::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         responses::{
             constants::{OBJECT_TYPE_CONVERSATION, OBJECT_TYPE_LIST, ROLE_ASSISTANT, ROLE_USER},
-            error_mapping, MessageContentConverter,
+            error_mapping, ConversationContent, MessageContent, MessageContentConverter,
         },
     },
     ApiError, AppState,
@@ -40,121 +40,6 @@ pub struct CreateConversationRequest {
     /// Initial items to include in the conversation
     #[serde(default)]
     pub items: Option<Vec<ConversationInputItem>>,
-}
-
-/// Content part for input messages
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type")]
-pub enum MessageContentPart {
-    // Legacy: Support "text" for backwards compatibility with chat completions
-    #[serde(rename = "text")]
-    Text { text: String },
-    // OpenAI Conversations API standard: "input_text"
-    #[serde(rename = "input_text")]
-    InputText { text: String },
-    // OpenAI Conversations API standard: "input_image"
-    #[serde(rename = "input_image")]
-    InputImage {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        image_url: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        file_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<String>, // "low" | "high" | "auto"
-    },
-    // OpenAI Conversations API standard: "input_file" for PDFs and documents
-    #[serde(rename = "input_file")]
-    InputFile {
-        filename: String,
-        file_data: String, // data:application/pdf;base64,... or other MIME types
-    },
-    // TODO: Add support for other content types per OpenAI Conversations API:
-    // - input_audio: { input_audio: {...} }
-}
-
-/// Content that can be either a string or array of content parts
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum MessageContent {
-    Text(String),
-    Parts(Vec<MessageContentPart>),
-}
-
-impl MessageContent {
-    /// Extract text content for token counting purposes only
-    /// For Parts variant, concatenates all text content (ignores images)
-    pub fn as_text_for_input_token_count_only(&self) -> String {
-        match self {
-            MessageContent::Text(text) => text.clone(),
-            MessageContent::Parts(parts) => parts
-                .iter()
-                .filter_map(|part| match part {
-                    MessageContentPart::Text { text } => Some(text.clone()),
-                    MessageContentPart::InputText { text } => Some(text.clone()),
-                    MessageContentPart::InputImage { .. } => None, // Ignore images for token counting
-                    MessageContentPart::InputFile { .. } => None, // Ignore files for token counting
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-        }
-    }
-
-    /// Convert to OpenAI API format for chat completions
-    pub fn to_openai_format(&self) -> serde_json::Value {
-        match self {
-            MessageContent::Text(text) => serde_json::json!(text),
-            MessageContent::Parts(parts) => {
-                let openai_parts: Vec<serde_json::Value> = parts
-                    .iter()
-                    .map(|part| match part {
-                        MessageContentPart::Text { text } => {
-                            serde_json::json!({
-                                "type": "text",
-                                "text": text
-                            })
-                        }
-                        MessageContentPart::InputText { text } => {
-                            serde_json::json!({
-                                "type": "text",
-                                "text": text
-                            })
-                        }
-                        MessageContentPart::InputImage {
-                            image_url, detail, ..
-                        } => {
-                            let mut image_obj = serde_json::json!({
-                                "url": image_url.as_ref().unwrap_or(&"".to_string())
-                            });
-
-                            // Only include detail if it's explicitly set
-                            if let Some(d) = detail {
-                                image_obj["detail"] = serde_json::json!(d);
-                            }
-
-                            serde_json::json!({
-                                "type": "image_url",
-                                "image_url": image_obj
-                            })
-                        }
-                        MessageContentPart::InputFile {
-                            filename,
-                            file_data,
-                        } => {
-                            // Convert to Chat Completions API format for files
-                            serde_json::json!({
-                                "type": "file",
-                                "file": {
-                                    "filename": filename,
-                                    "file_data": file_data
-                                }
-                            })
-                        }
-                    })
-                    .collect();
-                serde_json::json!(openai_parts)
-            }
-        }
-    }
 }
 
 /// Input item when creating conversation items
@@ -236,48 +121,6 @@ pub enum ConversationItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         created_at: Option<i64>,
     },
-}
-
-/// Content within a message for API responses
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type")]
-pub enum ConversationContent {
-    #[serde(rename = "text")]
-    Text { text: String },
-    #[serde(rename = "input_text")]
-    InputText { text: String },
-    #[serde(rename = "output_text")]
-    OutputText { text: String },
-    #[serde(rename = "input_image")]
-    InputImage { image_url: String },
-    #[serde(rename = "input_file")]
-    InputFile { filename: String },
-}
-
-impl From<MessageContent> for Vec<ConversationContent> {
-    fn from(content: MessageContent) -> Self {
-        match content {
-            MessageContent::Text(text) => vec![ConversationContent::InputText { text }],
-            MessageContent::Parts(parts) => parts
-                .into_iter()
-                .map(|part| match part {
-                    MessageContentPart::Text { text } | MessageContentPart::InputText { text } => {
-                        ConversationContent::InputText { text }
-                    }
-                    MessageContentPart::InputImage { image_url, .. } => {
-                        ConversationContent::InputImage {
-                            image_url: image_url.unwrap_or_else(|| "[No URL]".to_string()),
-                        }
-                    }
-                    MessageContentPart::InputFile { filename, .. } => {
-                        ConversationContent::InputFile {
-                            filename: filename.clone(),
-                        }
-                    }
-                })
-                .collect(),
-        }
-    }
 }
 
 /// Response for listing conversation items

@@ -5,7 +5,9 @@ use crate::{
     models::{responses::ResponseStatus, token_usage::NewTokenUsage},
     sqs::UsageEvent,
     tokens::count_tokens,
-    web::responses::constants::{COST_PER_TOKEN, FINISH_REASON_CANCELLED, STATUS_COMPLETED, STATUS_INCOMPLETE},
+    web::responses::constants::{
+        COST_PER_TOKEN, FINISH_REASON_CANCELLED, STATUS_COMPLETED, STATUS_INCOMPLETE,
+    },
     DBConnection,
 };
 use bigdecimal::BigDecimal;

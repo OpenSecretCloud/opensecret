@@ -185,12 +185,12 @@ pub fn build_prompt_from_chat_messages(
             // Deserialize stored MessageContent and convert to OpenAI format
             let content = if m.role == ROLE_USER {
                 // User messages are stored as MessageContent - convert to OpenAI format
-                use crate::web::conversations::MessageContent;
+                use crate::web::responses::{MessageContent, MessageContentConverter};
                 let mc: MessageContent = serde_json::from_str(&m.content).map_err(|e| {
                     error!("Failed to deserialize user message content: {:?}", e);
                     crate::ApiError::InternalServerError
                 })?;
-                mc.to_openai_format()
+                MessageContentConverter::to_openai_format(&mc)
             } else {
                 // Assistant messages are plain strings
                 serde_json::Value::String(m.content.clone())

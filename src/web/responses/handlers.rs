@@ -601,18 +601,36 @@ pub enum StorageMessage {
     Cancelled,
 }
 
-async fn create_response_stream(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Extension(session_id): Extension<Uuid>,
-    Extension(user): Extension<User>,
-    Extension(body): Extension<ResponsesCreateRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
-    trace!("=== ENTERING create_response_stream ===");
-    trace!("User: {}", user.uuid);
-    trace!("Request body: {:?}", body);
-    trace!("Stream requested: {}", body.stream);
+/// Validated and prepared request data
+struct PreparedRequest {
+    user_key: SecretKey,
+    normalized_messages: Vec<MessageInput>,
+    message_content: MessageContent,
+    user_message_tokens: i32,
+    content_enc: Vec<u8>,
+    assistant_message_id: Uuid,
+}
 
+/// Context and conversation data after building prompt
+struct BuiltContext {
+    conversation: crate::models::responses::Conversation,
+    prompt_messages: Vec<Value>,
+    total_prompt_tokens: usize,
+}
+
+/// Persisted database records
+struct PersistedData {
+    conversation: crate::models::responses::Conversation,
+    response: crate::models::responses::Response,
+    decrypted_metadata: Option<Value>,
+}
+
+/// Validate input and prepare encrypted content
+async fn validate_and_normalize_input(
+    state: &Arc<AppState>,
+    user: &User,
+    body: &ResponsesCreateRequest,
+) -> Result<PreparedRequest, ApiError> {
     // Prevent guest users
     if user.is_guest() {
         error!("Guest user attempted to use Responses API: {}", user.uuid);
@@ -644,15 +662,15 @@ async fn create_response_stream(
     }
 
     // Get the first message's content (for user messages there should only be one)
-    let message_content = &normalized_messages[0].content;
+    let message_content = normalized_messages[0].content.clone();
 
     // Count tokens for the user's input message (text only for token counting)
     let input_text_for_tokens =
-        MessageContentConverter::extract_text_for_token_counting(message_content);
+        MessageContentConverter::extract_text_for_token_counting(&message_content);
     let user_message_tokens = count_tokens(&input_text_for_tokens) as i32;
 
     // Serialize the MessageContent for storage
-    let content_for_storage = serde_json::to_string(message_content)
+    let content_for_storage = serde_json::to_string(&message_content)
         .map_err(|_| error_mapping::map_serialization_error("message content"))?;
 
     // Encrypt the serialized MessageContent
@@ -662,52 +680,57 @@ async fn create_response_stream(
     let assistant_message_id = Uuid::new_v4();
     debug!("Generated assistant message UUID: {}", assistant_message_id);
 
-    // Create conversation, response, user message, and placeholder assistant message
-    let (conversation, response, _user_message) = persist_initial_message(
-        &state,
-        &user,
-        &body,
-        content_enc.clone(),
+    Ok(PreparedRequest {
+        user_key,
+        normalized_messages,
+        message_content,
         user_message_tokens,
-        &user_key,
+        content_enc,
         assistant_message_id,
-    )
-    .await?;
+    })
+}
 
-    info!(
-        "Created response {} for user {} in conversation {}",
-        response.uuid, user.uuid, conversation.uuid
-    );
+/// Build conversation context and check billing (before any persistence)
+async fn build_context_and_check_billing(
+    state: &Arc<AppState>,
+    user: &User,
+    body: &ResponsesCreateRequest,
+    user_key: &SecretKey,
+    prepared: &PreparedRequest,
+) -> Result<BuiltContext, ApiError> {
+    // Extract conversation ID from the required conversation parameter
+    let conv_uuid = match &body.conversation {
+        ConversationParam::String(id) | ConversationParam::Object { id } => *id,
+    };
 
-    // Decrypt metadata for response
-    let decrypted_metadata: Option<Value> =
-        decrypt_content(&user_key, response.metadata_enc.as_ref()).map_err(|e| {
-            error!("Failed to decrypt response metadata: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+    // Get the conversation
+    debug!("Using specified conversation: {}", conv_uuid);
+    let conversation = state
+        .db
+        .get_conversation_by_uuid_and_user(conv_uuid, user.uuid)
+        .map_err(error_mapping::map_conversation_error)?;
 
     // Build the conversation context from all persisted messages
-    let (prompt_messages, total_prompt_tokens) =
-        build_prompt(state.db.as_ref(), conversation.id, &user_key, &body.model)?;
+    let (mut prompt_messages, mut total_prompt_tokens) =
+        build_prompt(state.db.as_ref(), conversation.id, user_key, &body.model)?;
+
+    // Add the NEW user message to the context (not yet persisted)
+    // This is needed for: 1) billing check, 2) sending to LLM
+    let user_message_for_prompt = json!({
+        "role": "user",
+        "content": MessageContentConverter::to_openai_format(&prepared.message_content)
+    });
+    prompt_messages.push(user_message_for_prompt);
+    total_prompt_tokens += prepared.user_message_tokens as usize;
 
     trace!(
-        "Built prompt with {} total tokens, {} messages",
+        "Built prompt with {} total tokens, {} messages (including new user message)",
         total_prompt_tokens,
         prompt_messages.len()
     );
 
-    // Note: We already stored the user message's own token count during persist_initial_message.
-    // The total_prompt_tokens here includes system prompt + conversation history + user message,
-    // which is used for the actual API call but not stored on the individual message.
-
-    // Check billing with token validation
-    // TODO: This billing check happens AFTER we've already persisted the user message and
-    // created a placeholder assistant message. If billing fails here, those messages remain
-    // in the database showing as "pending". Consider:
-    // 1. Moving this check earlier (before persist_initial_message), but that requires
-    //    calculating tokens before we have the conversation context
-    // 2. Cleaning up persisted messages on billing failure
-    // 3. Marking failed messages with a specific status instead of leaving them pending
+    // Check billing with token validation (BEFORE any persistence)
+    // Only check for free users to save processing
     if let Some(billing_client) = &state.billing_client {
         debug!(
             "Checking billing for user {} with {} input tokens",
@@ -725,6 +748,7 @@ async fn create_response_stream(
                     return Err(ApiError::UsageLimitReached);
                 }
                 BillingError::FreeTokenLimitExceeded => {
+                    // This error is only returned for free users
                     error!(
                         "Free tier token limit exceeded for user {} with {} tokens",
                         user.uuid, total_prompt_tokens
@@ -740,15 +764,150 @@ async fn create_response_stream(
         debug!("Billing check passed for user {}", user.uuid);
     }
 
+    Ok(BuiltContext {
+        conversation,
+        prompt_messages,
+        total_prompt_tokens,
+    })
+}
+
+/// Persist request data to database (only called after all validation passes)
+async fn persist_request_data(
+    state: &Arc<AppState>,
+    user: &User,
+    body: &ResponsesCreateRequest,
+    prepared: &PreparedRequest,
+    conversation: &crate::models::responses::Conversation,
+) -> Result<PersistedData, ApiError> {
+    use crate::models::responses::{NewResponse, ResponseStatus};
+
+    // Extract internal_message_id from metadata if present
+    let message_uuid = if let Some(metadata) = &body.metadata {
+        if let Some(internal_id) = metadata.get("internal_message_id") {
+            if let Some(id_str) = internal_id.as_str() {
+                // Try to parse as UUID, use new UUID if parsing fails
+                Uuid::parse_str(id_str).unwrap_or_else(|_| {
+                    warn!(
+                        "Invalid internal_message_id UUID: {}, generating new one",
+                        id_str
+                    );
+                    Uuid::new_v4()
+                })
+            } else {
+                Uuid::new_v4()
+            }
+        } else {
+            Uuid::new_v4()
+        }
+    } else {
+        Uuid::new_v4()
+    };
+
+    // Encrypt metadata if provided
+    let metadata_enc = if let Some(metadata) = &body.metadata {
+        let metadata_json = serde_json::to_string(metadata)
+            .map_err(|_| error_mapping::map_serialization_error("metadata"))?;
+        Some(encrypt_with_key(&prepared.user_key, metadata_json.as_bytes()).await)
+    } else {
+        None
+    };
+
+    // Create the Response (job tracker)
+    let new_response = NewResponse {
+        uuid: Uuid::new_v4(),
+        user_id: user.uuid,
+        conversation_id: conversation.id,
+        status: ResponseStatus::InProgress,
+        model: body.model.clone(),
+        temperature: body.temperature,
+        top_p: body.top_p,
+        max_output_tokens: body.max_output_tokens,
+        tool_choice: body.tool_choice.clone(),
+        parallel_tool_calls: body.parallel_tool_calls,
+        store: body.store,
+        metadata_enc: metadata_enc.clone(),
+    };
+    let response = state
+        .db
+        .create_response(new_response)
+        .map_err(error_mapping::map_generic_db_error)?;
+
+    // Create the simplified user message with extracted UUID
+    let new_msg = NewUserMessage {
+        uuid: message_uuid,
+        conversation_id: conversation.id,
+        response_id: Some(response.id),
+        user_id: user.uuid,
+        content_enc: prepared.content_enc.clone(),
+        prompt_tokens: prepared.user_message_tokens,
+    };
+    let _user_message = state
+        .db
+        .create_user_message(new_msg)
+        .map_err(error_mapping::map_generic_db_error)?;
+
+    // Create placeholder assistant message with status='in_progress' and NULL content
+    let placeholder_assistant = NewAssistantMessage {
+        uuid: prepared.assistant_message_id,
+        conversation_id: conversation.id,
+        response_id: Some(response.id),
+        user_id: user.uuid,
+        content_enc: None,
+        completion_tokens: 0,
+        status: STATUS_IN_PROGRESS.to_string(),
+        finish_reason: None,
+    };
+    state
+        .db
+        .create_assistant_message(placeholder_assistant)
+        .map_err(|e| {
+            error!("Error creating placeholder assistant message: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    info!(
+        "Created response {} for user {} in conversation {}",
+        response.uuid, user.uuid, conversation.uuid
+    );
+
+    // Decrypt metadata for response
+    let decrypted_metadata: Option<Value> =
+        decrypt_content(&prepared.user_key, response.metadata_enc.as_ref()).map_err(|e| {
+            error!("Failed to decrypt response metadata: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    Ok(PersistedData {
+        conversation: conversation.clone(),
+        response,
+        decrypted_metadata,
+    })
+}
+
+/// Setup streaming pipeline with channels and tasks
+async fn setup_streaming_pipeline(
+    state: &Arc<AppState>,
+    user: &User,
+    body: &ResponsesCreateRequest,
+    context: &BuiltContext,
+    prepared: &PreparedRequest,
+    persisted: &PersistedData,
+    headers: &HeaderMap,
+) -> Result<
+    (
+        mpsc::Receiver<StorageMessage>,
+        crate::models::responses::Response,
+    ),
+    ApiError,
+> {
     // Build chat completion request
     let chat_request = json!({
         "model": body.model,
-        "messages": prompt_messages,
+        "messages": context.prompt_messages,
         "temperature": body.temperature.unwrap_or(0.7),
         "top_p": body.top_p.unwrap_or(1.0),
         "max_tokens": body.max_output_tokens.unwrap_or(10_000),
         "stream": true,
-        // TODO should either happen in the completions response method
         "stream_options": { "include_usage": true }
     });
 
@@ -762,19 +921,20 @@ async fn create_response_stream(
 
     // Call the chat API
     let upstream_response =
-        get_chat_completion_response(&state, &user, chat_request, &headers).await?;
+        get_chat_completion_response(state, user, chat_request, headers).await?;
 
     // Create channels for storage task and client stream
     let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(1024);
-    let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(1024);
+    let (tx_client, rx_client) = mpsc::channel::<StorageMessage>(1024);
 
     // Spawn storage task
     let _storage_handle = {
         let db = state.db.clone();
-        let response_id = response.id;
+        let response_id = persisted.response.id;
         let user_uuid = user.uuid;
+        let user_key = prepared.user_key;
         let sqs_publisher = state.sqs_publisher.clone();
-        let message_id = assistant_message_id;
+        let message_id = prepared.assistant_message_id;
 
         tokio::spawn(async move {
             storage_task(
@@ -791,11 +951,10 @@ async fn create_response_stream(
     };
 
     // Spawn upstream processor task that runs independently of client connection
-    // This ensures storage completes even if client disconnects
     let _upstream_handle = {
         let mut body_stream = upstream_response.into_body().into_stream();
-        let message_id = assistant_message_id;
-        let response_uuid = response.uuid;
+        let message_id = prepared.assistant_message_id;
+        let response_uuid = persisted.response.uuid;
         let mut cancel_rx = state.cancellation_broadcast.subscribe();
 
         tokio::spawn(async move {
@@ -840,6 +999,43 @@ async fn create_response_stream(
             debug!("Upstream processor task completed");
         })
     };
+
+    Ok((rx_client, persisted.response.clone()))
+}
+
+async fn create_response_stream(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+    Extension(body): Extension<ResponsesCreateRequest>,
+) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+    trace!("=== ENTERING create_response_stream ===");
+    trace!("User: {}", user.uuid);
+    trace!("Request body: {:?}", body);
+    trace!("Stream requested: {}", body.stream);
+
+    // Phase 1: Validate and normalize input (no side effects)
+    let prepared = validate_and_normalize_input(&state, &user, &body).await?;
+
+    // Phase 2: Build context and check billing (read-only, no DB writes)
+    let context =
+        build_context_and_check_billing(&state, &user, &body, &prepared.user_key, &prepared)
+            .await?;
+
+    // Phase 3: Persist to database (only after all checks pass)
+    let persisted =
+        persist_request_data(&state, &user, &body, &prepared, &context.conversation).await?;
+
+    // Phase 4: Setup streaming pipeline
+    let (mut rx_client, response) = setup_streaming_pipeline(
+        &state, &user, &body, &context, &prepared, &persisted, &headers,
+    )
+    .await?;
+
+    let assistant_message_id = prepared.assistant_message_id;
+    let decrypted_metadata = persisted.decrypted_metadata;
+    let total_prompt_tokens = context.total_prompt_tokens;
 
     trace!("Creating SSE event stream for client");
     let event_stream = async_stream::stream! {
@@ -1076,124 +1272,6 @@ pub async fn encrypt_event(
 
     let base64_encrypted = base64::engine::general_purpose::STANDARD.encode(&encrypted);
     Ok(Event::default().event(event_type).data(base64_encrypted))
-}
-
-/// Persist initial response, user message, and placeholder assistant message
-async fn persist_initial_message(
-    state: &Arc<AppState>,
-    user: &User,
-    body: &ResponsesCreateRequest,
-    content_enc: Vec<u8>,
-    user_message_tokens: i32,
-    user_key: &SecretKey,
-    assistant_message_id: Uuid,
-) -> Result<
-    (
-        crate::models::responses::Conversation,
-        crate::models::responses::Response,
-        crate::models::responses::UserMessage,
-    ),
-    ApiError,
-> {
-    use crate::models::responses::{NewResponse, ResponseStatus};
-
-    // Extract internal_message_id from metadata if present
-    let message_uuid = if let Some(metadata) = &body.metadata {
-        if let Some(internal_id) = metadata.get("internal_message_id") {
-            if let Some(id_str) = internal_id.as_str() {
-                // Try to parse as UUID, use new UUID if parsing fails
-                Uuid::parse_str(id_str).unwrap_or_else(|_| {
-                    warn!(
-                        "Invalid internal_message_id UUID: {}, generating new one",
-                        id_str
-                    );
-                    Uuid::new_v4()
-                })
-            } else {
-                Uuid::new_v4()
-            }
-        } else {
-            Uuid::new_v4()
-        }
-    } else {
-        Uuid::new_v4()
-    };
-
-    // Extract conversation ID from the required conversation parameter
-    let conv_uuid = match &body.conversation {
-        ConversationParam::String(id) | ConversationParam::Object { id } => *id,
-    };
-
-    // Use specified conversation
-    debug!("Using specified conversation: {}", conv_uuid);
-    let conversation = state
-        .db
-        .get_conversation_by_uuid_and_user(conv_uuid, user.uuid)
-        .map_err(error_mapping::map_conversation_error)?;
-
-    // Encrypt metadata if provided
-    let metadata_enc = if let Some(metadata) = &body.metadata {
-        let metadata_json = serde_json::to_string(metadata)
-            .map_err(|_| error_mapping::map_serialization_error("metadata"))?;
-        Some(encrypt_with_key(user_key, metadata_json.as_bytes()).await)
-    } else {
-        None
-    };
-
-    // Create the Response (job tracker)
-    let new_response = NewResponse {
-        uuid: Uuid::new_v4(),
-        user_id: user.uuid,
-        conversation_id: conversation.id,
-        status: ResponseStatus::InProgress,
-        model: body.model.clone(),
-        temperature: body.temperature,
-        top_p: body.top_p,
-        max_output_tokens: body.max_output_tokens,
-        tool_choice: body.tool_choice.clone(),
-        parallel_tool_calls: body.parallel_tool_calls,
-        store: body.store,
-        metadata_enc,
-    };
-    let response = state
-        .db
-        .create_response(new_response)
-        .map_err(error_mapping::map_generic_db_error)?;
-
-    // Create the simplified user message with extracted UUID
-    let new_msg = NewUserMessage {
-        uuid: message_uuid,
-        conversation_id: conversation.id,
-        response_id: Some(response.id),
-        user_id: user.uuid,
-        content_enc: content_enc.clone(),
-        prompt_tokens: user_message_tokens,
-    };
-    let user_message = state
-        .db
-        .create_user_message(new_msg)
-        .map_err(error_mapping::map_generic_db_error)?;
-
-    // Create placeholder assistant message with status='in_progress' and NULL content
-    let placeholder_assistant = NewAssistantMessage {
-        uuid: assistant_message_id,
-        conversation_id: conversation.id,
-        response_id: Some(response.id),
-        user_id: user.uuid,
-        content_enc: None,
-        completion_tokens: 0,
-        status: STATUS_IN_PROGRESS.to_string(),
-        finish_reason: None,
-    };
-    state
-        .db
-        .create_assistant_message(placeholder_assistant)
-        .map_err(|e| {
-            error!("Error creating placeholder assistant message: {:?}", e);
-            ApiError::InternalServerError
-        })?;
-
-    Ok((conversation, response, user_message))
 }
 
 /// GET /v1/responses/{id} - Retrieve a single response

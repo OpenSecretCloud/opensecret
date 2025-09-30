@@ -765,8 +765,63 @@ let item = ConversationItemConverter::message_to_item(&msg, &ctx.user_key)?;
 
 ---
 
-#### Step 6-8: Additional Refactoring (Future)
-- Move conversations to responses directory
+#### ✅ Step 6: Move Conversations to Responses Directory
+**Commit**: `refactor: Move conversations.rs into responses module to reflect logical relationship`
+**Status**: Completed
+
+##### Changes Made
+- **Moved file** using `git mv`:
+  - `src/web/conversations.rs` → `src/web/responses/conversations.rs`
+  - Preserves git history
+
+- **Updated `src/web/responses/mod.rs`**:
+  - Added `pub mod conversations;` to module declarations
+  - Updated exports to include both routers:
+    - `pub use conversations::router as conversations_router;`
+    - `pub use handlers::router as responses_router;` (renamed from `router` for clarity)
+
+- **Updated `src/web/mod.rs`**:
+  - Removed `pub mod conversations;` declaration
+  - Updated import: `pub use responses::conversations_router as conversations_routes;`
+  - Updated responses import: `pub use responses::responses_router as responses_routes;`
+
+- **Fixed import in `src/web/responses/builders.rs`**:
+  - Changed `use crate::web::conversations::ConversationResponse;`
+  - To `use crate::web::responses::conversations::ConversationResponse;`
+
+##### Impact
+- ✅ **Logical organization** - Conversations now part of responses feature module
+- ✅ **Zero breaking changes** - External API routes unchanged
+- ✅ **Preserved git history** - Used `git mv` to maintain file history
+- ✅ **Consistent module structure** - All related code in responses/
+- ✅ **Build status**: Clean compile with zero warnings
+
+##### File Structure After Move
+```
+src/web/responses/
+├── mod.rs                  - Module exports (updated)
+├── handlers.rs             - Responses API handlers
+├── conversations.rs        - Conversations API handlers (MOVED)
+├── types.rs               - Shared message types
+├── builders.rs            - Response & Conversation builders
+├── constants.rs           - All constants
+├── conversions.rs         - Message content converters
+├── errors.rs              - Error mapping
+├── events.rs              - SSE event system
+├── storage.rs             - Storage task
+├── stream_processor.rs    - Upstream processor
+└── context_builder.rs     - Prompt building
+```
+
+##### Build Status
+- ✅ `cargo build` - Compiles successfully
+- ✅ `cargo fmt` - Clean (auto-sorted imports)
+- ✅ `cargo clippy` - Zero warnings
+- ✅ Zero breaking changes to external APIs
+
+---
+
+#### Step 7-8: Additional Refactoring (Future)
 - Pagination utilities
 - Unified delete response types
 

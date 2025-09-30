@@ -2,14 +2,12 @@
 
 use crate::{
     models::responses::{Conversation, Response},
-    web::{
+    web::responses::{
+        constants::*,
         conversations::ConversationResponse,
-        responses::{
-            constants::*,
-            handlers::{
-                ContentPart, InputTokenDetails, OutputItem, OutputTokenDetails, ReasoningInfo,
-                ResponseUsage, ResponsesCreateResponse, TextFormat, TextFormatSpec,
-            },
+        handlers::{
+            ContentPart, InputTokenDetails, OutputItem, OutputTokenDetails, ReasoningInfo,
+            ResponseUsage, ResponsesCreateResponse, TextFormat, TextFormatSpec,
         },
     },
 };

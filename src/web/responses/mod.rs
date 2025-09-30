@@ -6,6 +6,7 @@
 pub mod builders;
 pub mod constants;
 pub mod context_builder;
+pub mod conversations;
 pub mod conversions;
 pub mod errors;
 pub mod events;
@@ -26,5 +27,6 @@ pub use storage::storage_task;
 pub use stream_processor::UpstreamStreamProcessor;
 pub use types::{MessageContent, MessageContentPart};
 
-// Re-export the router from handlers (legacy file)
-pub use handlers::router;
+// Re-export routers
+pub use conversations::router as conversations_router;
+pub use handlers::router as responses_router;

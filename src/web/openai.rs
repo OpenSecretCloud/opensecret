@@ -380,9 +380,7 @@ pub async fn get_chat_completion_response(
         primary_body.insert("model".to_string(), json!(primary_model_name));
 
         // Add stream_options based on provider capabilities
-        if route.primary.provider_name.to_lowercase() == "tinfoil" {
-            primary_body.insert("stream_options".to_string(), json!({"include_usage": true}));
-        } else if is_streaming {
+        if route.primary.provider_name.to_lowercase() == "tinfoil" || is_streaming {
             primary_body.insert("stream_options".to_string(), json!({"include_usage": true}));
         }
 
@@ -400,9 +398,7 @@ pub async fn get_chat_completion_response(
             let mut fallback_body = modified_body_json.as_object().unwrap().clone();
             fallback_body.insert("model".to_string(), json!(fallback_model_name));
 
-            if fallback.provider_name.to_lowercase() == "tinfoil" {
-                fallback_body.insert("stream_options".to_string(), json!({"include_usage": true}));
-            } else if is_streaming {
+            if fallback.provider_name.to_lowercase() == "tinfoil" || is_streaming {
                 fallback_body.insert("stream_options".to_string(), json!({"include_usage": true}));
             }
 

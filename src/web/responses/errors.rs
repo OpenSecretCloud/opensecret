@@ -88,18 +88,6 @@ pub mod error_mapping {
         ApiError::InternalServerError
     }
 
-    /// Map encryption errors to API errors
-    ///
-    /// # Arguments
-    /// * `context` - Description of what was being encrypted (for logging)
-    ///
-    /// # Returns
-    /// ApiError with logging
-    pub fn map_encryption_error(context: &str) -> ApiError {
-        error!("Failed to encrypt {}", context);
-        ApiError::InternalServerError
-    }
-
     /// Map serialization errors to API errors
     ///
     /// # Arguments

@@ -5,7 +5,7 @@ use crate::{
     models::{responses::ResponseStatus, token_usage::NewTokenUsage},
     sqs::UsageEvent,
     tokens::count_tokens,
-    web::responses::constants::{FINISH_REASON_CANCELLED, STATUS_COMPLETED, STATUS_INCOMPLETE},
+    web::responses::constants::{COST_PER_TOKEN, FINISH_REASON_CANCELLED, STATUS_COMPLETED, STATUS_INCOMPLETE},
     DBConnection,
 };
 use bigdecimal::BigDecimal;
@@ -19,11 +19,10 @@ use uuid::Uuid;
 use super::handlers::StorageMessage;
 
 /// Accumulates streaming content and metadata
-pub struct ContentAccumulator {
+pub(crate) struct ContentAccumulator {
     content: String,
     completion_tokens: i32,
     prompt_tokens: i32,
-    finish_reason: Option<String>,
 }
 
 impl ContentAccumulator {
@@ -32,7 +31,6 @@ impl ContentAccumulator {
             content: String::with_capacity(4096),
             completion_tokens: 0,
             prompt_tokens: 0,
-            finish_reason: None,
         }
     }
 
@@ -122,7 +120,7 @@ pub struct FailureData {
 }
 
 /// Handles persistence of responses in various states
-pub struct ResponsePersister {
+pub(crate) struct ResponsePersister {
     db: Arc<dyn DBConnection + Send + Sync>,
     response_id: i64,
     message_id: Uuid,
@@ -263,7 +261,7 @@ impl ResponsePersister {
 }
 
 /// Publishes usage events for billing
-pub struct BillingEventPublisher {
+pub(crate) struct BillingEventPublisher {
     db: Arc<dyn DBConnection + Send + Sync>,
     sqs_publisher: Option<Arc<crate::sqs::SqsEventPublisher>>,
     user_uuid: Uuid,
@@ -295,9 +293,9 @@ impl BillingEventPublisher {
         tokio::spawn(async move {
             // Calculate estimated cost
             let input_cost =
-                BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(prompt_tokens);
+                BigDecimal::from_str(COST_PER_TOKEN).unwrap() * BigDecimal::from(prompt_tokens);
             let output_cost =
-                BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(completion_tokens);
+                BigDecimal::from_str(COST_PER_TOKEN).unwrap() * BigDecimal::from(completion_tokens);
             let total_cost = input_cost + output_cost;
 
             info!(

@@ -3,7 +3,6 @@
 
 use crate::{
     billing::BillingError,
-    context_builder::build_prompt,
     db::DBError,
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
     models::responses::{NewAssistantMessage, NewUserMessage, ResponseStatus, ResponsesError},
@@ -14,9 +13,9 @@ use crate::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
         responses::{
-            build_usage, constants::*, error_mapping, storage_task, ContentPartBuilder,
-            MessageContentConverter, OutputItemBuilder, ResponseBuilder, ResponseEvent,
-            SseEventEmitter, UpstreamStreamProcessor,
+            build_prompt, build_usage, constants::*, error_mapping, storage_task,
+            ContentPartBuilder, MessageContentConverter, OutputItemBuilder, ResponseBuilder,
+            ResponseEvent, SseEventEmitter, UpstreamStreamProcessor,
         },
     },
     ApiError, AppState,
@@ -604,7 +603,6 @@ pub enum StorageMessage {
 /// Validated and prepared request data
 struct PreparedRequest {
     user_key: SecretKey,
-    normalized_messages: Vec<MessageInput>,
     message_content: MessageContent,
     user_message_tokens: i32,
     content_enc: Vec<u8>,
@@ -620,7 +618,6 @@ struct BuiltContext {
 
 /// Persisted database records
 struct PersistedData {
-    conversation: crate::models::responses::Conversation,
     response: crate::models::responses::Response,
     decrypted_metadata: Option<Value>,
 }
@@ -705,7 +702,6 @@ async fn validate_and_normalize_input(
 
     Ok(PreparedRequest {
         user_key,
-        normalized_messages,
         message_content,
         user_message_tokens,
         content_enc,
@@ -959,7 +955,6 @@ async fn persist_request_data(
         })?;
 
     Ok(PersistedData {
-        conversation: conversation.clone(),
         response,
         decrypted_metadata,
     })
@@ -1020,9 +1015,9 @@ async fn setup_streaming_pipeline(
     let chat_request = json!({
         "model": body.model,
         "messages": context.prompt_messages,
-        "temperature": body.temperature.unwrap_or(0.7),
-        "top_p": body.top_p.unwrap_or(1.0),
-        "max_tokens": body.max_output_tokens.unwrap_or(10_000),
+        "temperature": body.temperature.unwrap_or(DEFAULT_TEMPERATURE),
+        "top_p": body.top_p.unwrap_or(DEFAULT_TOP_P),
+        "max_tokens": body.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         "stream": true,
         "stream_options": { "include_usage": true }
     });
@@ -1040,8 +1035,8 @@ async fn setup_streaming_pipeline(
         get_chat_completion_response(state, user, chat_request, headers).await?;
 
     // Create channels for storage task and client stream
-    let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(1024);
-    let (tx_client, rx_client) = mpsc::channel::<StorageMessage>(1024);
+    let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
+    let (tx_client, rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
 
     // Spawn storage task
     let _storage_handle = {

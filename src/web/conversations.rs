@@ -2,11 +2,16 @@
 //! Provides server-side conversation state management compatible with OpenAI's Conversations API
 
 use crate::{
-    db::DBError,
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
-    models::responses::{NewConversation, ResponsesError},
+    models::responses::NewConversation,
     models::users::User,
-    web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+    web::{
+        encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+        responses::{
+            constants::{OBJECT_TYPE_CONVERSATION, OBJECT_TYPE_LIST, ROLE_ASSISTANT, ROLE_USER},
+            error_mapping, MessageContentConverter,
+        },
+    },
     ApiError, AppState,
 };
 use axum::{
@@ -275,11 +280,6 @@ impl From<MessageContent> for Vec<ConversationContent> {
     }
 }
 
-// Helper function to convert assistant message (plain text) to ConversationContent
-fn assistant_text_to_content(text: String) -> Vec<ConversationContent> {
-    vec![ConversationContent::OutputText { text }]
-}
-
 /// Response for listing conversation items
 #[derive(Debug, Clone, Serialize)]
 pub struct ConversationItemListResponse {
@@ -350,7 +350,7 @@ async fn create_conversation(
     let user_key = state
         .get_user_key(user.uuid, None, None)
         .await
-        .map_err(|_| ApiError::InternalServerError)?;
+        .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
     // Create the conversation
     let conversation_uuid = Uuid::new_v4();
@@ -362,10 +362,8 @@ async fn create_conversation(
     }
 
     // Encrypt the entire metadata object
-    let metadata_json = serde_json::to_string(&metadata).map_err(|e| {
-        error!("Failed to serialize metadata: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    let metadata_json = serde_json::to_string(&metadata)
+        .map_err(|_| error_mapping::map_serialization_error("metadata"))?;
     let metadata_enc = Some(encrypt_with_key(&user_key, metadata_json.as_bytes()).await);
 
     let new_conversation = NewConversation {
@@ -380,10 +378,7 @@ async fn create_conversation(
     let conversation = state
         .db
         .create_conversation(new_conversation)
-        .map_err(|e| {
-            error!("Failed to create conversation: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        .map_err(error_mapping::map_generic_db_error)?;
 
     trace!("Created conversation: {:?}", conversation);
 
@@ -398,14 +393,12 @@ async fn create_conversation(
     }
 
     // Decrypt metadata for response
-    let metadata = decrypt_content(&user_key, conversation.metadata_enc.as_ref()).map_err(|e| {
-        error!("Failed to decrypt conversation metadata: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    let metadata = decrypt_content(&user_key, conversation.metadata_enc.as_ref())
+        .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))?;
 
     let response = ConversationResponse {
         id: conversation.uuid,
-        object: "conversation",
+        object: OBJECT_TYPE_CONVERSATION,
         metadata,
         created_at: conversation.created_at.timestamp(),
     };
@@ -428,13 +421,7 @@ async fn get_conversation(
     let conversation = state
         .db
         .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
-        .map_err(|e| match e {
-            DBError::ResponsesError(ResponsesError::ConversationNotFound) => ApiError::NotFound,
-            _ => {
-                error!("Failed to get conversation: {:?}", e);
-                ApiError::InternalServerError
-            }
-        })?;
+        .map_err(error_mapping::map_conversation_error)?;
 
     // Get user's encryption key for decrypting metadata
     let user_key = state
@@ -443,14 +430,12 @@ async fn get_conversation(
         .map_err(|_| ApiError::InternalServerError)?;
 
     // Decrypt metadata
-    let metadata = decrypt_content(&user_key, conversation.metadata_enc.as_ref()).map_err(|e| {
-        error!("Failed to decrypt conversation metadata: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    let metadata = decrypt_content(&user_key, conversation.metadata_enc.as_ref())
+        .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))?;
 
     let response = ConversationResponse {
         id: conversation.uuid,
-        object: "conversation",
+        object: OBJECT_TYPE_CONVERSATION,
         metadata,
         created_at: conversation.created_at.timestamp(),
     };
@@ -475,35 +460,24 @@ async fn update_conversation(
     let mut conversation = state
         .db
         .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
-        .map_err(|e| match e {
-            DBError::ResponsesError(ResponsesError::ConversationNotFound) => ApiError::NotFound,
-            _ => {
-                error!("Failed to get conversation: {:?}", e);
-                ApiError::InternalServerError
-            }
-        })?;
+        .map_err(error_mapping::map_conversation_error)?;
 
     // Get user's encryption key
     let user_key = state
         .get_user_key(user.uuid, None, None)
         .await
-        .map_err(|_| ApiError::InternalServerError)?;
+        .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
     // Encrypt the updated metadata
-    let metadata_json = serde_json::to_string(&body.metadata).map_err(|e| {
-        error!("Failed to serialize metadata: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    let metadata_json = serde_json::to_string(&body.metadata)
+        .map_err(|_| error_mapping::map_serialization_error("metadata"))?;
     let metadata_enc = encrypt_with_key(&user_key, metadata_json.as_bytes()).await;
 
     // Update metadata in database
     state
         .db
         .update_conversation_metadata(conversation.id, user.uuid, metadata_enc.clone())
-        .map_err(|e| {
-            error!("Failed to update conversation metadata: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        .map_err(error_mapping::map_generic_db_error)?;
 
     // Update the in-memory object to reflect the changes
     conversation.metadata_enc = Some(metadata_enc);
@@ -513,7 +487,7 @@ async fn update_conversation(
 
     let response = ConversationResponse {
         id: conversation.uuid,
-        object: "conversation",
+        object: OBJECT_TYPE_CONVERSATION,
         metadata: response_metadata,
         created_at: conversation.created_at.timestamp(),
     };
@@ -537,22 +511,13 @@ async fn delete_conversation(
     let conversation = state
         .db
         .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
-        .map_err(|e| match e {
-            DBError::ResponsesError(ResponsesError::ConversationNotFound) => ApiError::NotFound,
-            _ => {
-                error!("Failed to get conversation: {:?}", e);
-                ApiError::InternalServerError
-            }
-        })?;
+        .map_err(error_mapping::map_conversation_error)?;
 
     // Delete the conversation (cascades will delete all associated responses)
     state
         .db
         .delete_conversation(conversation.id, user.uuid)
-        .map_err(|e| {
-            error!("Failed to delete conversation: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        .map_err(error_mapping::map_generic_db_error)?;
 
     let response = DeletedConversationResponse {
         id: conversation.uuid,
@@ -580,28 +545,19 @@ async fn list_conversation_items(
     let conversation = state
         .db
         .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
-        .map_err(|e| match e {
-            DBError::ResponsesError(ResponsesError::ConversationNotFound) => ApiError::NotFound,
-            _ => {
-                error!("Failed to get conversation: {:?}", e);
-                ApiError::InternalServerError
-            }
-        })?;
+        .map_err(error_mapping::map_conversation_error)?;
 
     // Get user's encryption key
     let user_key = state
         .get_user_key(user.uuid, None, None)
         .await
-        .map_err(|_| ApiError::InternalServerError)?;
+        .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
     // Get all messages from the conversation
     let raw_messages = state
         .db
         .get_conversation_context_messages(conversation.id)
-        .map_err(|e| {
-            error!("Failed to get conversation messages: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        .map_err(error_mapping::map_message_error)?;
 
     trace!(
         "Retrieved {} raw messages for conversation {}",
@@ -646,10 +602,7 @@ async fn list_conversation_items(
 
         // Decrypt content (handle nullable content_enc)
         let content = decrypt_string(&user_key, msg.content_enc.as_ref())
-            .map_err(|e| {
-                error!("Failed to decrypt message content: {:?}", e);
-                ApiError::InternalServerError
-            })?
+            .map_err(|_| error_mapping::map_decryption_error("message content"))?
             .unwrap_or_default();
 
         trace!(
@@ -667,15 +620,12 @@ async fn list_conversation_items(
             "user" => {
                 // User messages MUST be stored as MessageContent
                 let message_content: MessageContent = serde_json::from_str(&content)
-                    .map_err(|e| {
-                        error!("Failed to deserialize user message content as MessageContent: {:?}, content: {}", e, content);
-                        ApiError::InternalServerError
-                    })?;
+                    .map_err(|_| error_mapping::map_serialization_error("user message content"))?;
 
                 items.push(ConversationItem::Message {
                     id: msg.uuid,
                     status: msg.status.clone(),
-                    role: "user".to_string(),
+                    role: ROLE_USER.to_string(),
                     content: Vec::<ConversationContent>::from(message_content),
                     created_at: Some(msg.created_at.timestamp()),
                 });
@@ -686,13 +636,13 @@ async fn list_conversation_items(
                 let content_parts = if content.is_empty() {
                     vec![]
                 } else {
-                    assistant_text_to_content(content)
+                    MessageContentConverter::assistant_text_to_content(content)
                 };
 
                 items.push(ConversationItem::Message {
                     id: msg.uuid,
                     status: msg.status.clone(),
-                    role: "assistant".to_string(),
+                    role: ROLE_ASSISTANT.to_string(),
                     content: content_parts,
                     created_at: Some(msg.created_at.timestamp()),
                 });
@@ -740,7 +690,7 @@ async fn list_conversation_items(
     trace!("Final items count: {}, has_more: {}", items.len(), has_more);
 
     let response = ConversationItemListResponse {
-        object: "list",
+        object: OBJECT_TYPE_LIST,
         data: items.clone(),
         has_more,
         first_id: items.first().map(|item| match item {
@@ -774,28 +724,19 @@ async fn get_conversation_item(
     let conversation = state
         .db
         .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
-        .map_err(|e| match e {
-            DBError::ResponsesError(ResponsesError::ConversationNotFound) => ApiError::NotFound,
-            _ => {
-                error!("Failed to get conversation: {:?}", e);
-                ApiError::InternalServerError
-            }
-        })?;
+        .map_err(error_mapping::map_conversation_error)?;
 
     // Get user's encryption key
     let user_key = state
         .get_user_key(user.uuid, None, None)
         .await
-        .map_err(|_| ApiError::InternalServerError)?;
+        .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
     // Get all messages from the conversation
     let raw_messages = state
         .db
         .get_conversation_context_messages(conversation.id)
-        .map_err(|e| {
-            error!("Failed to get conversation messages: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        .map_err(error_mapping::map_message_error)?;
 
     // Find the specific item
     for msg in raw_messages {
@@ -820,7 +761,7 @@ async fn get_conversation_item(
                     ConversationItem::Message {
                         id: msg.uuid,
                         status: msg.status.clone(),
-                        role: "user".to_string(),
+                        role: ROLE_USER.to_string(),
                         content: Vec::<ConversationContent>::from(message_content),
                         created_at: Some(msg.created_at.timestamp()),
                     }
@@ -830,13 +771,13 @@ async fn get_conversation_item(
                     let content_parts = if content.is_empty() {
                         vec![]
                     } else {
-                        assistant_text_to_content(content)
+                        MessageContentConverter::assistant_text_to_content(content)
                     };
 
                     ConversationItem::Message {
                         id: msg.uuid,
                         status: msg.status.clone(),
-                        role: "assistant".to_string(),
+                        role: ROLE_ASSISTANT.to_string(),
                         content: content_parts,
                         created_at: Some(msg.created_at.timestamp()),
                     }
@@ -903,10 +844,7 @@ async fn list_conversations(
     let mut conversations = state
         .db
         .list_conversations(user.uuid, limit + 1, after_cursor, before_cursor)
-        .map_err(|e| {
-            error!("Failed to list conversations: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        .map_err(error_mapping::map_generic_db_error)?;
 
     let has_more = conversations.len() > limit as usize;
     if has_more {
@@ -932,14 +870,12 @@ async fn list_conversations(
             trace!("Conv metadata_enc present: {}", conv.metadata_enc.is_some());
 
             // Decrypt metadata
-            let metadata = decrypt_content(&user_key, conv.metadata_enc.as_ref()).map_err(|e| {
-                error!("Failed to decrypt conversation metadata: {:?}", e);
-                ApiError::InternalServerError
-            })?;
+            let metadata = decrypt_content(&user_key, conv.metadata_enc.as_ref())
+                .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))?;
 
             Ok(ConversationResponse {
                 id: conv.uuid,
-                object: "conversation",
+                object: OBJECT_TYPE_CONVERSATION,
                 metadata,
                 created_at: conv.created_at.timestamp(),
             })
@@ -947,7 +883,7 @@ async fn list_conversations(
         .collect::<Result<Vec<_>, _>>()?;
 
     let response = ConversationListResponse {
-        object: "list",
+        object: OBJECT_TYPE_LIST,
         data: data.clone(),
         has_more,
         first_id: conversations.first().map(|c| c.uuid),

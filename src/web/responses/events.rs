@@ -118,11 +118,6 @@ impl<'a> SseEventEmitter<'a> {
     pub fn sequence_number(&self) -> i32 {
         self.sequence_number
     }
-
-    /// Set the sequence number (useful for resetting or syncing)
-    pub fn set_sequence_number(&mut self, seq: i32) {
-        self.sequence_number = seq;
-    }
 }
 
 /// Type-safe event wrapper for all Response API events

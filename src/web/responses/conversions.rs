@@ -92,61 +92,6 @@ impl MessageContentConverter {
         }
     }
 
-    /// Convert MessageContent to ConversationContent array for API responses
-    ///
-    /// Transforms content based on the message role (user vs assistant) to
-    /// produce the appropriate ConversationContent variants.
-    ///
-    /// # Arguments
-    /// * `content` - The content to convert
-    /// * `role` - The message role ("user", "assistant", etc.)
-    ///
-    /// # Returns
-    /// Vector of ConversationContent items
-    pub fn to_conversation_content(
-        content: MessageContent,
-        role: &str,
-    ) -> Vec<ConversationContent> {
-        match (content, role) {
-            (MessageContent::Text(text), "user") => {
-                vec![ConversationContent::InputText { text }]
-            }
-            (MessageContent::Text(text), "assistant") => {
-                vec![ConversationContent::OutputText { text }]
-            }
-            (MessageContent::Parts(parts), role) => parts
-                .into_iter()
-                .map(|part| Self::content_part_to_conversation(part, role))
-                .collect(),
-            _ => vec![],
-        }
-    }
-
-    /// Convert a single MessageContentPart to ConversationContent
-    fn content_part_to_conversation(part: MessageContentPart, role: &str) -> ConversationContent {
-        match (part, role) {
-            (
-                MessageContentPart::Text { text } | MessageContentPart::InputText { text },
-                "user",
-            ) => ConversationContent::InputText { text },
-            (
-                MessageContentPart::Text { text } | MessageContentPart::InputText { text },
-                "assistant",
-            ) => ConversationContent::OutputText { text },
-            (MessageContentPart::InputImage { image_url, .. }, _) => {
-                ConversationContent::InputImage {
-                    image_url: image_url.unwrap_or_else(|| "[No URL]".to_string()),
-                }
-            }
-            (MessageContentPart::InputFile { filename, .. }, _) => {
-                ConversationContent::InputFile { filename }
-            }
-            _ => ConversationContent::InputText {
-                text: "".to_string(),
-            },
-        }
-    }
-
     /// Convert assistant text to conversation content
     ///
     /// Helper specifically for assistant messages which are stored as plain text

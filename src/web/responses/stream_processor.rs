@@ -1,6 +1,6 @@
 //! Upstream stream processor for handling SSE responses from chat completion API
 
-use crate::web::responses::constants::FINISH_REASON_STOP;
+use crate::web::responses::constants::{FINISH_REASON_STOP, SSE_BUFFER_CAPACITY};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
@@ -30,7 +30,7 @@ impl UpstreamStreamProcessor {
         tx_client: mpsc::Sender<StorageMessage>,
     ) -> Self {
         Self {
-            buffer: String::with_capacity(8192),
+            buffer: String::with_capacity(SSE_BUFFER_CAPACITY),
             message_id,
             response_uuid,
             tx_storage,

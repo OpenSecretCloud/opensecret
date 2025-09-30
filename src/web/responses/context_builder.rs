@@ -1,5 +1,6 @@
 //! Build the ChatCompletion prompt array respecting token limits.
 
+use super::constants::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_USER};
 use crate::encrypt::decrypt_with_key;
 use crate::tokens::{count_tokens, model_max_ctx};
 use crate::DBConnection;
@@ -41,8 +42,8 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
             .map_err(|_| crate::ApiError::InternalServerError)?;
         let content = String::from_utf8_lossy(&plain).into_owned();
         let role = match r.message_type.as_str() {
-            "user" => "user",
-            "assistant" => "assistant",
+            "user" => ROLE_USER,
+            "assistant" => ROLE_ASSISTANT,
             "tool_output" => "tool",
             _ => continue, // Skip tool_call itself
         };
@@ -91,15 +92,15 @@ pub fn build_prompt_from_chat_messages(
         let mut has_assistant = false;
 
         for m in &msgs {
-            if (m.role == "system" && !has_system)
-                || (m.role == "user" && !has_user)
-                || (m.role == "assistant" && !has_assistant)
+            if (m.role == ROLE_SYSTEM && !has_system)
+                || (m.role == ROLE_USER && !has_user)
+                || (m.role == ROLE_ASSISTANT && !has_assistant)
             {
                 head.push(m.clone());
                 match m.role {
-                    "system" => has_system = true,
-                    "user" => has_user = true,
-                    "assistant" => has_assistant = true,
+                    ROLE_SYSTEM => has_system = true,
+                    ROLE_USER => has_user = true,
+                    ROLE_ASSISTANT => has_assistant = true,
                     _ => {}
                 }
             }
@@ -132,10 +133,10 @@ pub fn build_prompt_from_chat_messages(
         if !tail.is_empty() || msgs.len() < msgs.len() {
             // Check last role to avoid duplicate user messages
             let last_role = msgs.last().map(|m| m.role).unwrap_or("");
-            let truncation_role = if last_role == "user" {
-                "assistant"
+            let truncation_role = if last_role == ROLE_USER {
+                ROLE_ASSISTANT
             } else {
-                "user"
+                ROLE_USER
             };
 
             msgs.push(ChatMsg {
@@ -182,7 +183,7 @@ pub fn build_prompt_from_chat_messages(
             })
         } else {
             // Deserialize stored MessageContent and convert to OpenAI format
-            let content = if m.role == "user" {
+            let content = if m.role == ROLE_USER {
                 // User messages are stored as MessageContent - convert to OpenAI format
                 use crate::web::conversations::MessageContent;
                 let mc: MessageContent = serde_json::from_str(&m.content).map_err(|e| {

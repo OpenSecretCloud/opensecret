@@ -71,7 +71,6 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 mod apple_signin;
 mod aws_credentials;
 mod billing;
-mod context_builder;
 mod db;
 mod email;
 mod encrypt;

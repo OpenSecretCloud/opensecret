@@ -1,7 +1,14 @@
 //! Message content conversion utilities
 
-use crate::web::responses::types::{ConversationContent, MessageContent, MessageContentPart};
+use crate::{
+    encrypt::decrypt_string,
+    models::responses::RawThreadMessage,
+    web::responses::{constants::*, error_mapping, types::*},
+    ApiError,
+};
+use secp256k1::SecretKey;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 /// Centralized message content conversion utilities
 ///
@@ -131,6 +138,180 @@ impl MessageContentConverter {
                 .collect::<Vec<_>>()
                 .join(" "),
         }
+    }
+}
+
+// ============================================================================
+// Conversation Item Converter
+// ============================================================================
+
+/// Conversation item used in the Conversations API
+///
+/// This is defined here to avoid circular dependencies since it's only used
+/// for conversion logic.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type")]
+pub enum ConversationItem {
+    #[serde(rename = "message")]
+    Message {
+        id: Uuid,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        role: String,
+        content: Vec<ConversationContent>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_at: Option<i64>,
+    },
+    #[serde(rename = "function_tool_call")]
+    FunctionToolCall {
+        id: Uuid,
+        name: String,
+        arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_at: Option<i64>,
+    },
+    #[serde(rename = "function_tool_call_output")]
+    FunctionToolCallOutput {
+        id: Uuid,
+        tool_call_id: Uuid,
+        output: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_at: Option<i64>,
+    },
+}
+
+/// Centralized conversation item conversion utilities
+///
+/// Converts database Message models to ConversationItem API types,
+/// handling decryption and format conversion for all message types.
+pub struct ConversationItemConverter;
+
+impl ConversationItemConverter {
+    /// Convert database message to ConversationItem
+    ///
+    /// Handles decryption and format conversion for all message types.
+    ///
+    /// # Arguments
+    /// * `msg` - The database message to convert
+    /// * `user_key` - User's encryption key for decrypting content
+    ///
+    /// # Returns
+    /// ConversationItem ready for API response
+    ///
+    /// # Errors
+    /// Returns ApiError if decryption or deserialization fails
+    pub fn message_to_item(
+        msg: &RawThreadMessage,
+        user_key: &SecretKey,
+    ) -> Result<ConversationItem, ApiError> {
+        // Decrypt content (handle nullable content_enc)
+        let content = decrypt_string(user_key, msg.content_enc.as_ref())
+            .map_err(|_| error_mapping::map_decryption_error("message content"))?
+            .unwrap_or_default();
+
+        match msg.message_type.as_str() {
+            "user" => Self::user_message_to_item(msg, content),
+            "assistant" => Self::assistant_message_to_item(msg, content),
+            "tool_call" => Self::tool_call_to_item(msg, content),
+            "tool_output" => Self::tool_output_to_item(msg, content),
+            _ => Err(ApiError::InternalServerError),
+        }
+    }
+
+    /// Convert user message to item
+    fn user_message_to_item(
+        msg: &RawThreadMessage,
+        content: String,
+    ) -> Result<ConversationItem, ApiError> {
+        // User messages MUST be stored as MessageContent
+        let message_content: MessageContent = serde_json::from_str(&content)
+            .map_err(|_| error_mapping::map_serialization_error("user message content"))?;
+
+        Ok(ConversationItem::Message {
+            id: msg.uuid,
+            status: msg.status.clone(),
+            role: ROLE_USER.to_string(),
+            content: Vec::<ConversationContent>::from(message_content),
+            created_at: Some(msg.created_at.timestamp()),
+        })
+    }
+
+    /// Convert assistant message to item
+    fn assistant_message_to_item(
+        msg: &RawThreadMessage,
+        content: String,
+    ) -> Result<ConversationItem, ApiError> {
+        // Assistant messages are plain text strings
+        // If content is empty (in_progress), return empty content array
+        let content_parts = if content.is_empty() {
+            vec![]
+        } else {
+            MessageContentConverter::assistant_text_to_content(content)
+        };
+
+        Ok(ConversationItem::Message {
+            id: msg.uuid,
+            status: msg.status.clone(),
+            role: ROLE_ASSISTANT.to_string(),
+            content: content_parts,
+            created_at: Some(msg.created_at.timestamp()),
+        })
+    }
+
+    /// Convert tool call to item
+    fn tool_call_to_item(
+        msg: &RawThreadMessage,
+        content: String,
+    ) -> Result<ConversationItem, ApiError> {
+        Ok(ConversationItem::FunctionToolCall {
+            id: msg.uuid,
+            name: DEFAULT_TOOL_FUNCTION_NAME.to_string(),
+            arguments: content,
+            created_at: Some(msg.created_at.timestamp()),
+        })
+    }
+
+    /// Convert tool output to item
+    fn tool_output_to_item(
+        msg: &RawThreadMessage,
+        content: String,
+    ) -> Result<ConversationItem, ApiError> {
+        Ok(ConversationItem::FunctionToolCallOutput {
+            id: msg.uuid,
+            tool_call_id: msg.tool_call_id.unwrap_or(Uuid::nil()),
+            output: content,
+            created_at: Some(msg.created_at.timestamp()),
+        })
+    }
+
+    /// Convert multiple messages to items with pagination
+    ///
+    /// Processes messages starting from an offset and applies limit.
+    ///
+    /// # Arguments
+    /// * `raw_messages` - All messages from the conversation
+    /// * `user_key` - User's encryption key
+    /// * `start_index` - Index to start from (for cursor-based pagination)
+    /// * `limit` - Maximum number of items to return
+    ///
+    /// # Returns
+    /// Vector of ConversationItems
+    ///
+    /// # Errors
+    /// Returns ApiError if any message conversion fails
+    pub fn messages_to_items(
+        raw_messages: &[RawThreadMessage],
+        user_key: &SecretKey,
+        start_index: usize,
+        limit: usize,
+    ) -> Result<Vec<ConversationItem>, ApiError> {
+        let mut items = Vec::new();
+
+        for msg in raw_messages.iter().skip(start_index).take(limit) {
+            items.push(Self::message_to_item(msg, user_key)?);
+        }
+
+        Ok(items)
     }
 }
 

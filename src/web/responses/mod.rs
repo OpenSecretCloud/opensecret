@@ -19,12 +19,12 @@ pub use builders::{
     build_usage, ContentPartBuilder, ConversationBuilder, OutputItemBuilder, ResponseBuilder,
 };
 pub use context_builder::build_prompt;
-pub use conversions::MessageContentConverter;
+pub use conversions::{ConversationItem, ConversationItemConverter, MessageContentConverter};
 pub use errors::error_mapping;
 pub use events::{ResponseEvent, SseEventEmitter};
 pub use storage::storage_task;
 pub use stream_processor::UpstreamStreamProcessor;
-pub use types::{ConversationContent, MessageContent, MessageContentPart};
+pub use types::{MessageContent, MessageContentPart};
 
 // Re-export the router from handlers (legacy file)
 pub use handlers::router;

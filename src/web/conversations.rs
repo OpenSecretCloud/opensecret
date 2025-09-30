@@ -2,19 +2,18 @@
 //! Provides server-side conversation state management compatible with OpenAI's Conversations API
 
 use crate::{
-    encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
+    encrypt::{decrypt_content, encrypt_with_key},
     models::responses::NewConversation,
     models::users::User,
     web::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         responses::{
             constants::{
-                DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, DEFAULT_TOOL_FUNCTION_NAME,
-                MAX_PAGINATION_LIMIT, OBJECT_TYPE_CONVERSATION_DELETED, OBJECT_TYPE_LIST,
-                ROLE_ASSISTANT, ROLE_USER,
+                DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT,
+                OBJECT_TYPE_CONVERSATION_DELETED, OBJECT_TYPE_LIST,
             },
-            error_mapping, ConversationBuilder, ConversationContent, MessageContent,
-            MessageContentConverter,
+            error_mapping, ConversationBuilder, ConversationItem, ConversationItemConverter,
+            MessageContent,
         },
     },
     ApiError, AppState,
@@ -158,38 +157,6 @@ pub struct DeletedConversationResponse {
     pub id: Uuid,
     pub object: &'static str,
     pub deleted: bool,
-}
-
-/// A single conversation item (message, tool call, etc.)
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type")]
-pub enum ConversationItem {
-    #[serde(rename = "message")]
-    Message {
-        id: Uuid,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        status: Option<String>,
-        role: String,
-        content: Vec<ConversationContent>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        created_at: Option<i64>,
-    },
-    #[serde(rename = "function_tool_call")]
-    FunctionToolCall {
-        id: Uuid,
-        name: String,
-        arguments: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        created_at: Option<i64>,
-    },
-    #[serde(rename = "function_tool_call_output")]
-    FunctionToolCallOutput {
-        id: Uuid,
-        tool_call_id: Uuid,
-        output: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        created_at: Option<i64>,
-    },
 }
 
 /// Response for listing conversation items
@@ -418,6 +385,7 @@ async fn list_conversation_items(
     let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
 
     // Get all messages from the conversation
+    // TODO we should apply paging to this method so we don't always fetch everything
     let raw_messages = state
         .db
         .get_conversation_context_messages(ctx.conversation.id)
@@ -437,9 +405,6 @@ async fn list_conversation_items(
         );
     }
 
-    // Convert to conversation items
-    let mut items = Vec::new();
-
     // If we have an after cursor, find where to start
     let start_index = if let Some(after_uuid) = params.after {
         raw_messages
@@ -457,87 +422,16 @@ async fn list_conversation_items(
         params.after
     );
 
-    for msg in raw_messages.iter().skip(start_index) {
-        trace!(
-            "Processing message: uuid={}, type={}",
-            msg.uuid,
-            msg.message_type
-        );
-
-        // Decrypt content (handle nullable content_enc)
-        let content = decrypt_string(&ctx.user_key, msg.content_enc.as_ref())
-            .map_err(|_| error_mapping::map_decryption_error("message content"))?
-            .unwrap_or_default();
-
-        trace!(
-            "Decrypted content for {} (status={:?}): {}",
-            msg.message_type,
-            msg.status,
-            if content.len() > 100 {
-                format!("{}...", &content[..100])
-            } else {
-                content.clone()
-            }
-        );
-
-        match msg.message_type.as_str() {
-            "user" => {
-                // User messages MUST be stored as MessageContent
-                let message_content: MessageContent = serde_json::from_str(&content)
-                    .map_err(|_| error_mapping::map_serialization_error("user message content"))?;
-
-                items.push(ConversationItem::Message {
-                    id: msg.uuid,
-                    status: msg.status.clone(),
-                    role: ROLE_USER.to_string(),
-                    content: Vec::<ConversationContent>::from(message_content),
-                    created_at: Some(msg.created_at.timestamp()),
-                });
-            }
-            "assistant" => {
-                // Assistant messages are plain text strings
-                // If content is empty (in_progress), return empty content array
-                let content_parts = if content.is_empty() {
-                    vec![]
-                } else {
-                    MessageContentConverter::assistant_text_to_content(content)
-                };
-
-                items.push(ConversationItem::Message {
-                    id: msg.uuid,
-                    status: msg.status.clone(),
-                    role: ROLE_ASSISTANT.to_string(),
-                    content: content_parts,
-                    created_at: Some(msg.created_at.timestamp()),
-                });
-            }
-            "tool_call" => {
-                // Parse tool call
-                items.push(ConversationItem::FunctionToolCall {
-                    id: msg.uuid,
-                    name: DEFAULT_TOOL_FUNCTION_NAME.to_string(),
-                    arguments: content,
-                    created_at: Some(msg.created_at.timestamp()),
-                });
-            }
-            "tool_output" => {
-                items.push(ConversationItem::FunctionToolCallOutput {
-                    id: msg.uuid,
-                    tool_call_id: msg.tool_call_id.unwrap_or(Uuid::nil()),
-                    output: content,
-                    created_at: Some(msg.created_at.timestamp()),
-                });
-            }
-            _ => {}
-        }
-    }
+    // Convert messages to items using the centralized converter
+    // Note: We don't apply limit here yet, we need to check has_more first
+    let mut items = ConversationItemConverter::messages_to_items(
+        &raw_messages,
+        &ctx.user_key,
+        start_index,
+        raw_messages.len(), // Process all remaining messages for now
+    )?;
 
     trace!("Built {} conversation items before pagination", items.len());
-    for (i, item) in items.iter().enumerate() {
-        if let ConversationItem::Message { role, content, .. } = item {
-            trace!("Item {}: role={}, content_len={}", i, role, content.len());
-        }
-    }
 
     // Apply pagination
     let limit = params.limit.min(MAX_PAGINATION_LIMIT) as usize;
@@ -592,67 +486,10 @@ async fn get_conversation_item(
         .get_conversation_context_messages(ctx.conversation.id)
         .map_err(error_mapping::map_message_error)?;
 
-    // Find the specific item
+    // Find the specific item and convert using centralized converter
     for msg in raw_messages {
         if msg.uuid == item_id {
-            // Decrypt content (handle nullable content_enc)
-            let content = decrypt_string(&ctx.user_key, msg.content_enc.as_ref())
-                .map_err(|e| {
-                    error!("Failed to decrypt message content: {:?}", e);
-                    ApiError::InternalServerError
-                })?
-                .unwrap_or_default();
-
-            let item = match msg.message_type.as_str() {
-                "user" => {
-                    // User messages MUST be stored as MessageContent
-                    let message_content: MessageContent = serde_json::from_str(&content)
-                        .map_err(|e| {
-                            error!("Failed to deserialize user message content as MessageContent: {:?}, content: {}", e, content);
-                            ApiError::InternalServerError
-                        })?;
-
-                    ConversationItem::Message {
-                        id: msg.uuid,
-                        status: msg.status.clone(),
-                        role: ROLE_USER.to_string(),
-                        content: Vec::<ConversationContent>::from(message_content),
-                        created_at: Some(msg.created_at.timestamp()),
-                    }
-                }
-                "assistant" => {
-                    // If content is empty (in_progress), return empty content array
-                    let content_parts = if content.is_empty() {
-                        vec![]
-                    } else {
-                        MessageContentConverter::assistant_text_to_content(content)
-                    };
-
-                    ConversationItem::Message {
-                        id: msg.uuid,
-                        status: msg.status.clone(),
-                        role: ROLE_ASSISTANT.to_string(),
-                        content: content_parts,
-                        created_at: Some(msg.created_at.timestamp()),
-                    }
-                }
-                "tool_call" => ConversationItem::FunctionToolCall {
-                    id: msg.uuid,
-                    name: DEFAULT_TOOL_FUNCTION_NAME.to_string(),
-                    arguments: content,
-                    created_at: Some(msg.created_at.timestamp()),
-                },
-                "tool_output" => ConversationItem::FunctionToolCallOutput {
-                    id: msg.uuid,
-                    tool_call_id: msg.tool_call_id.unwrap_or(Uuid::nil()),
-                    output: content,
-                    created_at: Some(msg.created_at.timestamp()),
-                },
-                _ => {
-                    return Err(ApiError::InternalServerError);
-                }
-            };
-
+            let item = ConversationItemConverter::message_to_item(&msg, &ctx.user_key)?;
             return encrypt_response(&state, &session_id, &item).await;
         }
     }

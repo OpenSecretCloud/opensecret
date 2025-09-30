@@ -495,8 +495,6 @@ pub trait DBConnection {
         id: i64,
         status: ResponseStatus,
         completed_at: Option<DateTime<Utc>>,
-        input_tokens: Option<i32>,
-        output_tokens: Option<i32>,
     ) -> Result<(), DBError>;
     fn cancel_response(&self, uuid: Uuid, user_id: Uuid) -> Result<Response, DBError>;
     fn delete_response(&self, uuid: Uuid, user_id: Uuid) -> Result<(), DBError>;
@@ -2003,13 +2001,10 @@ impl DBConnection for PostgresConnection {
         id: i64,
         status: ResponseStatus,
         completed_at: Option<DateTime<Utc>>,
-        input_tokens: Option<i32>,
-        output_tokens: Option<i32>,
     ) -> Result<(), DBError> {
         debug!("Updating response status");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        Response::update_status(conn, id, status, completed_at, input_tokens, output_tokens)
-            .map_err(DBError::from)
+        Response::update_status(conn, id, status, completed_at).map_err(DBError::from)
     }
 
     fn cancel_response(&self, uuid: Uuid, user_id: Uuid) -> Result<Response, DBError> {

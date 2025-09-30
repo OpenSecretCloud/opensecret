@@ -62,11 +62,7 @@ CREATE TABLE responses (
     parallel_tool_calls   BOOLEAN NOT NULL DEFAULT FALSE,
     store                 BOOLEAN NOT NULL DEFAULT TRUE,
     metadata_enc          BYTEA,
-    
-    -- Token counts from the actual LLM call (nullable while in_progress)
-    input_tokens          INTEGER,  -- Total context tokens sent to LLM (including system prompt)
-    output_tokens         INTEGER,  -- Total tokens generated in this response
-    
+
     created_at            TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at          TIMESTAMPTZ,
     updated_at            TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP

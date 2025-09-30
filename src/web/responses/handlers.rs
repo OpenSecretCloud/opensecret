@@ -1438,10 +1438,24 @@ async fn get_response(
         }
     }
 
-    // Use the stored token counts from the response
+    // Calculate token counts from individual messages
     let usage = if response.status == ResponseStatus::Completed {
-        let input_tokens = response.input_tokens.unwrap_or(0);
-        let output_tokens = response.output_tokens.unwrap_or(0);
+        // Sum up tokens from all messages
+        let mut input_tokens = 0i32;
+        let mut output_tokens = 0i32;
+
+        for msg in &messages {
+            if let Some(token_count) = msg.token_count {
+                match msg.message_type.as_str() {
+                    "user" => input_tokens += token_count,
+                    "assistant" => output_tokens += token_count,
+                    // tool_call and tool_output tokens are also considered in context
+                    "tool_call" => input_tokens += token_count,
+                    "tool_output" => input_tokens += token_count,
+                    _ => {}
+                }
+            }
+        }
 
         Some(ResponseUsage {
             input_tokens,

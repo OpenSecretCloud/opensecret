@@ -172,8 +172,6 @@ impl ResponsePersister {
             self.response_id,
             ResponseStatus::Completed,
             Some(Utc::now()),
-            Some(data.prompt_tokens),
-            Some(completion_tokens),
         ) {
             error!("Failed to update response status to completed: {:?}", e);
             return Err(format!("Failed to update response status: {:?}", e));
@@ -190,8 +188,6 @@ impl ResponsePersister {
             self.response_id,
             ResponseStatus::Cancelled,
             Some(Utc::now()),
-            None,
-            Some(data.completion_tokens),
         ) {
             error!("Failed to update response status to cancelled: {:?}", e);
             return Err(format!("Failed to update response status: {:?}", e));
@@ -232,8 +228,6 @@ impl ResponsePersister {
             self.response_id,
             ResponseStatus::Failed,
             Some(Utc::now()),
-            None,
-            None,
         ) {
             error!("Failed to update response status to failed: {:?}", e);
             return Err(format!("Failed to update response status: {:?}", e));

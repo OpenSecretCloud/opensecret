@@ -229,8 +229,6 @@ diesel::table! {
         parallel_tool_calls -> Bool,
         store -> Bool,
         metadata_enc -> Nullable<Bytea>,
-        input_tokens -> Nullable<Int4>,
-        output_tokens -> Nullable<Int4>,
         created_at -> Timestamptz,
         completed_at -> Nullable<Timestamptz>,
         updated_at -> Timestamptz,

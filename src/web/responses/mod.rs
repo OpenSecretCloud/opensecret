@@ -27,7 +27,7 @@ pub use events::{ResponseEvent, SseEventEmitter};
 pub use pagination::Paginator;
 pub use storage::storage_task;
 pub use stream_processor::UpstreamStreamProcessor;
-pub use types::{MessageContent, MessageContentPart};
+pub use types::{DeletedObjectResponse, MessageContent, MessageContentPart};
 
 // Re-export routers
 pub use conversations::router as conversations_router;

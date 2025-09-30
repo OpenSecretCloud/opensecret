@@ -886,8 +886,43 @@ let (first_id, last_id) = Paginator::get_cursor_ids(&items, |item| match item { 
 
 ---
 
-#### Step 8: Unified Delete Response (Future)
-- Unified delete response types
+#### ✅ Step 8: Unified Delete Response
+**Commit**: `refactor: Create unified DeletedObjectResponse type to eliminate duplicate delete responses`
+**Status**: Completed
+
+##### Changes Made
+- **Created `DeletedObjectResponse`** in `src/web/responses/types.rs` (new type, ~50 lines with docs)
+  - Generic type for both conversation and response deletion
+  - Factory methods: `DeletedObjectResponse::conversation(id)` and `DeletedObjectResponse::response(id)`
+  - Uses existing constants internally: `OBJECT_TYPE_CONVERSATION_DELETED` and `OBJECT_TYPE_RESPONSE_DELETED`
+
+- **Exported from mod.rs**:
+  - Added `DeletedObjectResponse` to public re-exports
+
+- **Updated `src/web/responses/handlers.rs`** (2 changes):
+  1. ✅ Removed `ResponsesDeleteResponse` struct definition (6 lines)
+  2. ✅ Updated `delete_response` handler to use `DeletedObjectResponse::response(id)`
+
+- **Updated `src/web/responses/conversations.rs`** (2 changes):
+  1. ✅ Removed `DeletedConversationResponse` struct definition (6 lines)
+  2. ✅ Updated `delete_conversation` handler to use `DeletedObjectResponse::conversation(id)`
+  3. ✅ Removed unnecessary import of `OBJECT_TYPE_CONVERSATION_DELETED`
+
+##### Impact
+- ✅ **Eliminated duplicate types** - 2 identical struct definitions removed
+- ✅ **Consistent delete response format** - Both APIs use same type
+- ✅ **Type safety** - Factory methods ensure correct object type constants
+- ✅ **Easy to extend** - Adding new deletable object types requires single new factory method
+- ✅ **Lines saved** - ~12 lines of duplicate struct definitions removed
+- ✅ **Zero breaking changes** - External API responses identical
+
+##### Build Status
+- ✅ `cargo build` - Compiles successfully
+- ✅ `cargo fmt` - Clean
+- ✅ `cargo clippy` - Zero warnings or errors
+- ✅ Zero breaking changes to external APIs
+
+---
 
 #### Step 12: Additional Utilities (Future)
 - Add authorization middleware patterns when needed

@@ -13,8 +13,8 @@ use crate::{
         openai::get_chat_completion_response,
         responses::{
             build_prompt, build_usage, constants::*, error_mapping, storage_task,
-            ContentPartBuilder, MessageContent, MessageContentConverter, MessageContentPart,
-            OutputItemBuilder, ResponseBuilder, ResponseEvent, SseEventEmitter,
+            ContentPartBuilder, DeletedObjectResponse, MessageContent, MessageContentConverter,
+            MessageContentPart, OutputItemBuilder, ResponseBuilder, ResponseEvent, SseEventEmitter,
             UpstreamStreamProcessor,
         },
     },
@@ -550,14 +550,6 @@ pub struct ResponsesRetrieveResponse {
     pub model: String,
     pub usage: Option<ResponseUsage>,
     pub output: Option<String>,
-}
-
-/// Response returned by DELETE /v1/responses/{id}
-#[derive(Debug, Clone, Serialize)]
-pub struct ResponsesDeleteResponse {
-    pub id: Uuid,
-    pub object: &'static str,
-    pub deleted: bool,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -1534,7 +1526,7 @@ async fn delete_response(
     Path(id): Path<Uuid>,
     Extension(user): Extension<User>,
     Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<ResponsesDeleteResponse>>, ApiError> {
+) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
     debug!("Deleting response {} for user {}", id, user.uuid);
 
     // Delete the response (cascade will handle related records)
@@ -1550,11 +1542,7 @@ async fn delete_response(
         }
     })?;
 
-    let response = ResponsesDeleteResponse {
-        id,
-        object: OBJECT_TYPE_RESPONSE_DELETED,
-        deleted: true,
-    };
+    let response = DeletedObjectResponse::response(id);
 
     encrypt_response(&state, &session_id, &response).await
 }

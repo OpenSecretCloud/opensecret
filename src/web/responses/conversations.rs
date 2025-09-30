@@ -10,10 +10,10 @@ use crate::{
         responses::{
             constants::{
                 DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT,
-                OBJECT_TYPE_CONVERSATION_DELETED, OBJECT_TYPE_LIST,
+                OBJECT_TYPE_LIST,
             },
             error_mapping, ConversationBuilder, ConversationItem, ConversationItemConverter,
-            MessageContent, Paginator,
+            DeletedObjectResponse, MessageContent, Paginator,
         },
     },
     ApiError, AppState,
@@ -149,14 +149,6 @@ pub struct ConversationResponse {
 
     /// Unix timestamp when created
     pub created_at: i64,
-}
-
-/// Response for deleted conversation
-#[derive(Debug, Clone, Serialize)]
-pub struct DeletedConversationResponse {
-    pub id: Uuid,
-    pub object: &'static str,
-    pub deleted: bool,
 }
 
 /// Response for listing conversation items
@@ -346,7 +338,7 @@ async fn delete_conversation(
     Path(conversation_id): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
-) -> Result<Json<EncryptedResponse<DeletedConversationResponse>>, ApiError> {
+) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
     debug!(
         "Deleting conversation {} for user {}",
         conversation_id, user.uuid
@@ -360,11 +352,7 @@ async fn delete_conversation(
         .delete_conversation(ctx.conversation.id, user.uuid)
         .map_err(error_mapping::map_generic_db_error)?;
 
-    let response = DeletedConversationResponse {
-        id: ctx.conversation.uuid,
-        object: OBJECT_TYPE_CONVERSATION_DELETED,
-        deleted: true,
-    };
+    let response = DeletedObjectResponse::conversation(ctx.conversation.uuid);
 
     encrypt_response(&state, &session_id, &response).await
 }

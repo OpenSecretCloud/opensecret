@@ -121,3 +121,55 @@ impl From<MessageContent> for Vec<ConversationContent> {
         }
     }
 }
+
+// ============================================================================
+// Delete Response Types
+// ============================================================================
+
+/// Generic response for deleted objects
+///
+/// Used for both conversation and response deletion to provide a consistent
+/// response format across all delete operations.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletedObjectResponse {
+    /// ID of the deleted object
+    pub id: uuid::Uuid,
+
+    /// Object type (e.g., "conversation.deleted", "response.deleted")
+    pub object: &'static str,
+
+    /// Always true for successful deletions
+    pub deleted: bool,
+}
+
+impl DeletedObjectResponse {
+    /// Create a deleted conversation response
+    ///
+    /// # Arguments
+    /// * `id` - UUID of the deleted conversation
+    ///
+    /// # Returns
+    /// DeletedObjectResponse with object type "conversation.deleted"
+    pub fn conversation(id: uuid::Uuid) -> Self {
+        Self {
+            id,
+            object: crate::web::responses::constants::OBJECT_TYPE_CONVERSATION_DELETED,
+            deleted: true,
+        }
+    }
+
+    /// Create a deleted response object response
+    ///
+    /// # Arguments
+    /// * `id` - UUID of the deleted response
+    ///
+    /// # Returns
+    /// DeletedObjectResponse with object type "response.deleted"
+    pub fn response(id: uuid::Uuid) -> Self {
+        Self {
+            id,
+            object: crate::web::responses::constants::OBJECT_TYPE_RESPONSE_DELETED,
+            deleted: true,
+        }
+    }
+}

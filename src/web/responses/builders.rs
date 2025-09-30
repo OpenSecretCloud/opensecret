@@ -1,12 +1,15 @@
 //! Builder patterns for complex response structures
 
 use crate::{
-    models::responses::Response,
-    web::responses::{
-        constants::*,
-        handlers::{
-            ContentPart, InputTokenDetails, OutputItem, OutputTokenDetails, ReasoningInfo,
-            ResponseUsage, ResponsesCreateResponse, TextFormat, TextFormatSpec,
+    models::responses::{Conversation, Response},
+    web::{
+        conversations::ConversationResponse,
+        responses::{
+            constants::*,
+            handlers::{
+                ContentPart, InputTokenDetails, OutputItem, OutputTokenDetails, ReasoningInfo,
+                ResponseUsage, ResponsesCreateResponse, TextFormat, TextFormatSpec,
+            },
         },
     },
 };
@@ -216,6 +219,57 @@ pub fn build_usage(prompt_tokens: i32, completion_tokens: i32) -> ResponseUsage 
             reasoning_tokens: 0,
         },
         total_tokens: prompt_tokens + completion_tokens,
+    }
+}
+
+/// Builder for ConversationResponse with sensible defaults
+///
+/// This builder eliminates repeated ConversationResponse construction code
+/// by providing a fluent API for building conversation responses.
+///
+/// # Example
+/// ```ignore
+/// let response = ConversationBuilder::from_conversation(&conversation)
+///     .metadata(Some(json!({"title": "My Conversation"})))
+///     .build();
+/// ```
+pub struct ConversationBuilder {
+    conversation: ConversationResponse,
+}
+
+impl ConversationBuilder {
+    /// Create a new builder from a database Conversation model
+    ///
+    /// Sets all fields with sensible defaults based on the Conversation record.
+    /// Metadata can be overridden with the metadata() method.
+    ///
+    /// # Arguments
+    /// * `conv` - The database Conversation model to build from
+    pub fn from_conversation(conv: &Conversation) -> Self {
+        Self {
+            conversation: ConversationResponse {
+                id: conv.uuid,
+                object: OBJECT_TYPE_CONVERSATION,
+                metadata: None, // Set via .metadata()
+                created_at: conv.created_at.timestamp(),
+            },
+        }
+    }
+
+    /// Set metadata (already decrypted)
+    ///
+    /// # Arguments
+    /// * `metadata` - Optional JSON metadata object
+    pub fn metadata(mut self, metadata: Option<Value>) -> Self {
+        self.conversation.metadata = metadata;
+        self
+    }
+
+    /// Build the final ConversationResponse
+    ///
+    /// Consumes the builder and returns the constructed response.
+    pub fn build(self) -> ConversationResponse {
+        self.conversation
     }
 }
 

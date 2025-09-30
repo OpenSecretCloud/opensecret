@@ -15,7 +15,9 @@ pub mod stream_processor;
 pub mod types;
 
 // Re-export commonly used types
-pub use builders::{build_usage, ContentPartBuilder, OutputItemBuilder, ResponseBuilder};
+pub use builders::{
+    build_usage, ContentPartBuilder, ConversationBuilder, OutputItemBuilder, ResponseBuilder,
+};
 pub use context_builder::build_prompt;
 pub use conversions::MessageContentConverter;
 pub use errors::error_mapping;

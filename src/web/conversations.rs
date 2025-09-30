@@ -10,10 +10,11 @@ use crate::{
         responses::{
             constants::{
                 DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, DEFAULT_TOOL_FUNCTION_NAME,
-                MAX_PAGINATION_LIMIT, OBJECT_TYPE_CONVERSATION, OBJECT_TYPE_CONVERSATION_DELETED,
-                OBJECT_TYPE_LIST, ROLE_ASSISTANT, ROLE_USER,
+                MAX_PAGINATION_LIMIT, OBJECT_TYPE_CONVERSATION_DELETED, OBJECT_TYPE_LIST,
+                ROLE_ASSISTANT, ROLE_USER,
             },
-            error_mapping, ConversationContent, MessageContent, MessageContentConverter,
+            error_mapping, ConversationBuilder, ConversationContent, MessageContent,
+            MessageContentConverter,
         },
     },
     ApiError, AppState,
@@ -243,12 +244,9 @@ async fn create_conversation(
     let metadata = decrypt_content(&user_key, conversation.metadata_enc.as_ref())
         .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))?;
 
-    let response = ConversationResponse {
-        id: conversation.uuid,
-        object: OBJECT_TYPE_CONVERSATION,
-        metadata,
-        created_at: conversation.created_at.timestamp(),
-    };
+    let response = ConversationBuilder::from_conversation(&conversation)
+        .metadata(metadata)
+        .build();
 
     encrypt_response(&state, &session_id, &response).await
 }
@@ -280,12 +278,9 @@ async fn get_conversation(
     let metadata = decrypt_content(&user_key, conversation.metadata_enc.as_ref())
         .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))?;
 
-    let response = ConversationResponse {
-        id: conversation.uuid,
-        object: OBJECT_TYPE_CONVERSATION,
-        metadata,
-        created_at: conversation.created_at.timestamp(),
-    };
+    let response = ConversationBuilder::from_conversation(&conversation)
+        .metadata(metadata)
+        .build();
 
     encrypt_response(&state, &session_id, &response).await
 }
@@ -332,12 +327,9 @@ async fn update_conversation(
     // For the response, return the decrypted metadata
     let response_metadata = Some(body.metadata.clone());
 
-    let response = ConversationResponse {
-        id: conversation.uuid,
-        object: OBJECT_TYPE_CONVERSATION,
-        metadata: response_metadata,
-        created_at: conversation.created_at.timestamp(),
-    };
+    let response = ConversationBuilder::from_conversation(&conversation)
+        .metadata(response_metadata)
+        .build();
 
     encrypt_response(&state, &session_id, &response).await
 }
@@ -720,12 +712,9 @@ async fn list_conversations(
             let metadata = decrypt_content(&user_key, conv.metadata_enc.as_ref())
                 .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))?;
 
-            Ok(ConversationResponse {
-                id: conv.uuid,
-                object: OBJECT_TYPE_CONVERSATION,
-                metadata,
-                created_at: conv.created_at.timestamp(),
-            })
+            Ok(ConversationBuilder::from_conversation(conv)
+                .metadata(metadata)
+                .build())
         })
         .collect::<Result<Vec<_>, _>>()?;
 

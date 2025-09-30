@@ -578,9 +578,57 @@ Since this is purely organizational refactoring with no logic changes:
 
 ---
 
-#### Step 3: ConversationBuilder Pattern (Future)
-- Extract repeated ConversationResponse construction
-- Follow same pattern as ResponseBuilder
+#### ✅ Step 3: ConversationBuilder Pattern
+**Commit**: `refactor: Extract ConversationBuilder pattern to eliminate repeated response construction`
+**Status**: Completed
+
+##### Changes Made
+- **Created `ConversationBuilder`** in `src/web/responses/builders.rs`
+  - Follows same pattern as `ResponseBuilder`
+  - Takes `&Conversation` and constructs `ConversationResponse` with defaults
+  - Fluent API with `.metadata()` method
+  - Comprehensive inline documentation
+
+- **Updated module exports** in `src/web/responses/mod.rs`
+  - Added `ConversationBuilder` to public re-exports
+
+- **Updated `src/web/conversations.rs`** to use builder (4 replacements):
+  1. ✅ Line 247-249: `create_conversation` handler
+  2. ✅ Line 281-283: `get_conversation` handler
+  3. ✅ Line 330-332: `update_conversation` handler
+  4. ✅ Line 715-717: `list_conversations` handler (inside map closure)
+
+##### Impact
+- ✅ **Eliminated repeated construction** - 4 instances of manual struct construction
+- ✅ **Consistent with ResponseBuilder** - Same pattern across codebase
+- ✅ **Better maintainability** - Single place to update ConversationResponse defaults
+- ✅ **Type safety** - Builder ensures all required fields are set
+- ✅ **Lines saved** - ~20 lines reduced through builder usage
+
+##### Code Pattern Changed
+**Before (repeated 4 times):**
+```rust
+let response = ConversationResponse {
+    id: conversation.uuid,
+    object: OBJECT_TYPE_CONVERSATION,
+    metadata,
+    created_at: conversation.created_at.timestamp(),
+};
+```
+
+**After:**
+```rust
+let response = ConversationBuilder::from_conversation(&conversation)
+    .metadata(metadata)
+    .build();
+```
+
+##### Build Status
+- ✅ Compiles successfully
+- ✅ All builder methods work correctly
+- ✅ Zero runtime impact - same behavior, cleaner code
+
+---
 
 #### Step 4-8: Additional Refactoring (Future)
 - ConversationContext helper

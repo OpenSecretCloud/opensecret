@@ -183,6 +183,10 @@ impl ResponseEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::web::responses::constants::{
+        OBJECT_TYPE_RESPONSE, STATUS_IN_PROGRESS, TEXT_FORMAT_TYPE, TOOL_CHOICE_AUTO,
+        TRUNCATION_DISABLED,
+    };
 
     #[derive(Serialize)]
     struct TestEvent {
@@ -219,12 +223,12 @@ mod tests {
 
         // Test that event types map correctly
         let created = ResponseEvent::Created(ResponseCreatedEvent {
-            event_type: "response.created",
+            event_type: EVENT_RESPONSE_CREATED,
             response: ResponsesCreateResponse {
                 id: Uuid::new_v4(),
-                object: "response",
+                object: OBJECT_TYPE_RESPONSE,
                 created_at: 0,
-                status: "in_progress",
+                status: STATUS_IN_PROGRESS,
                 background: false,
                 error: None,
                 incomplete_details: None,
@@ -245,14 +249,14 @@ mod tests {
                 temperature: 1.0,
                 text: TextFormat {
                     format: TextFormatSpec {
-                        format_type: "text".to_string(),
+                        format_type: TEXT_FORMAT_TYPE.to_string(),
                     },
                 },
-                tool_choice: "auto".to_string(),
+                tool_choice: TOOL_CHOICE_AUTO.to_string(),
                 tools: vec![],
                 top_logprobs: 0,
                 top_p: 1.0,
-                truncation: "disabled",
+                truncation: TRUNCATION_DISABLED,
                 usage: None,
                 user: None,
                 metadata: None,

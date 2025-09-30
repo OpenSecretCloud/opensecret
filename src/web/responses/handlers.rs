@@ -71,7 +71,7 @@ impl InputMessage {
             InputMessage::String(s) => {
                 // Simple string -> user message with input_text content parts
                 vec![MessageInput {
-                    role: "user".to_string(),
+                    role: ROLE_USER.to_string(),
                     content: MessageContent::Parts(vec![MessageContentPart::InputText { text: s }]),
                 }]
             }
@@ -1154,7 +1154,7 @@ async fn create_response_stream(
             .build();
 
         let created_event = ResponseCreatedEvent {
-            event_type: "response.created",
+            event_type: EVENT_RESPONSE_CREATED,
             response: created_response.clone(),
             sequence_number: emitter.sequence_number(),
         };
@@ -1163,7 +1163,7 @@ async fn create_response_stream(
 
         // Event 2: response.in_progress
         let in_progress_event = ResponseInProgressEvent {
-            event_type: "response.in_progress",
+            event_type: EVENT_RESPONSE_IN_PROGRESS,
             response: created_response,
             sequence_number: emitter.sequence_number(),
         };
@@ -1176,7 +1176,7 @@ async fn create_response_stream(
 
         // Event 3: response.output_item.added
         let output_item_added_event = ResponseOutputItemAddedEvent {
-            event_type: "response.output_item.added",
+            event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
             sequence_number: emitter.sequence_number(),
             output_index: 0,
             item: OutputItem {
@@ -1192,7 +1192,7 @@ async fn create_response_stream(
 
         // Event 4: response.content_part.added
         let content_part_added_event = ResponseContentPartAddedEvent {
-            event_type: "response.content_part.added",
+            event_type: EVENT_RESPONSE_CONTENT_PART_ADDED,
             sequence_number: emitter.sequence_number(),
             item_id: assistant_message_id.to_string(),
             output_index: 0,
@@ -1217,7 +1217,7 @@ async fn create_response_stream(
 
                                 // Event 7: response.output_text.done
                                 let output_text_done_event = ResponseOutputTextDoneEvent {
-                                    event_type: "response.output_text.done",
+                                    event_type: EVENT_RESPONSE_OUTPUT_TEXT_DONE,
                                     sequence_number: emitter.sequence_number(),
                                     item_id: assistant_message_id.to_string(),
                                     output_index: 0,
@@ -1230,7 +1230,7 @@ async fn create_response_stream(
 
                                 // Event 8: response.content_part.done
                                 let content_part_done_event = ResponseContentPartDoneEvent {
-                                    event_type: "response.content_part.done",
+                                    event_type: EVENT_RESPONSE_CONTENT_PART_DONE,
                                     sequence_number: emitter.sequence_number(),
                                     item_id: assistant_message_id.to_string(),
                                     output_index: 0,
@@ -1247,14 +1247,14 @@ async fn create_response_stream(
 
                                 // Event 9: response.output_item.done
                                 let content_part = ContentPart {
-                                    part_type: "output_text".to_string(),
+                                    part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
                                     annotations: vec![],
                                     logprobs: vec![],
                                     text: assistant_content.clone(),
                                 };
 
                                 let output_item_done_event = ResponseOutputItemDoneEvent {
-                                    event_type: "response.output_item.done",
+                                    event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
                                     sequence_number: emitter.sequence_number(),
                                     output_index: 0,
                                     item: OutputItem {
@@ -1284,7 +1284,7 @@ async fn create_response_stream(
                                     .build();
 
                                 let completed_event = ResponseCompletedEvent {
-                                    event_type: "response.completed",
+                                    event_type: EVENT_RESPONSE_COMPLETED,
                                     response: done_response,
                                     sequence_number: emitter.sequence_number(),
                                 };
@@ -1298,7 +1298,7 @@ async fn create_response_stream(
 
                     // Send to client
                     let delta_event = ResponseOutputTextDeltaEvent {
-                        event_type: "response.output_text.delta",
+                        event_type: EVENT_RESPONSE_OUTPUT_TEXT_DELTA,
                         delta: content.clone(),
                         item_id: assistant_message_id.to_string(),
                         output_index: 0,
@@ -1319,7 +1319,7 @@ async fn create_response_stream(
                     // Send response.cancelled event
                     let cancelled_event = ResponseCancelledEvent {
                         id: Uuid::new_v4().to_string(),
-                        event_type: "response.cancelled",
+                        event_type: EVENT_RESPONSE_CANCELLED,
                         created_at: Utc::now().timestamp(),
                         data: ResponseCancelledData {
                             id: response.uuid,
@@ -1333,7 +1333,7 @@ async fn create_response_stream(
                     error!("Client stream received error: {}", error_msg);
                     // Send error event to client
                     let error_event = ResponseErrorEvent {
-                        event_type: "response.error",
+                        event_type: EVENT_RESPONSE_ERROR,
                         error: ResponseError {
                             error_type: "stream_error".to_string(),
                             message: error_msg,
@@ -1425,7 +1425,11 @@ async fn get_response(
 
                 // Build output item using builder
                 let output_item = OutputItemBuilder::new_message(msg.uuid)
-                    .status(&msg.status.clone().unwrap_or_else(|| STATUS_COMPLETED.to_string()))
+                    .status(
+                        &msg.status
+                            .clone()
+                            .unwrap_or_else(|| STATUS_COMPLETED.to_string()),
+                    )
                     .content(vec![content_part])
                     .build();
 

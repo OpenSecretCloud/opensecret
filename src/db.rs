@@ -556,6 +556,10 @@ pub trait DBConnection {
         &self,
         conversation_id: i64,
     ) -> Result<Vec<RawThreadMessage>, DBError>;
+    fn get_response_context_messages(
+        &self,
+        response_id: i64,
+    ) -> Result<Vec<RawThreadMessage>, DBError>;
 
     // Delete operation for user messages
     fn delete_user_message(&self, id: Uuid, user_id: Uuid) -> Result<(), DBError>;
@@ -2158,6 +2162,15 @@ impl DBConnection for PostgresConnection {
         debug!("Getting conversation context messages");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         RawThreadMessage::get_conversation_context(conn, conversation_id).map_err(DBError::from)
+    }
+
+    fn get_response_context_messages(
+        &self,
+        response_id: i64,
+    ) -> Result<Vec<RawThreadMessage>, DBError> {
+        debug!("Getting response context messages");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        RawThreadMessage::get_response_context(conn, response_id).map_err(DBError::from)
     }
 
     fn delete_user_message(&self, id: Uuid, user_id: Uuid) -> Result<(), DBError> {

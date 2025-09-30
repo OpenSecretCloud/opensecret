@@ -809,4 +809,89 @@ impl RawThreadMessage {
             .load::<RawThreadMessage>(conn)
             .map_err(ResponsesError::DatabaseError)
     }
+
+    pub fn get_response_context(
+        conn: &mut PgConnection,
+        response_id: i64,
+    ) -> Result<Vec<RawThreadMessage>, ResponsesError> {
+        let query = r#"
+            WITH response_messages AS (
+                -- User messages
+                SELECT
+                    'user' as message_type,
+                    um.id,
+                    um.uuid,
+                    um.content_enc,
+                    'completed'::text as status,
+                    um.created_at,
+                    r.model,
+                    um.prompt_tokens as token_count,
+                    NULL::uuid as tool_call_id,
+                    NULL::text as finish_reason
+                FROM user_messages um
+                LEFT JOIN responses r ON um.response_id = r.id
+                WHERE um.response_id = $1
+
+                UNION ALL
+
+                -- Assistant messages
+                SELECT
+                    'assistant' as message_type,
+                    am.id,
+                    am.uuid,
+                    am.content_enc,
+                    am.status,
+                    am.created_at,
+                    r.model,
+                    am.completion_tokens as token_count,
+                    NULL::uuid as tool_call_id,
+                    am.finish_reason
+                FROM assistant_messages am
+                LEFT JOIN responses r ON am.response_id = r.id
+                WHERE am.response_id = $1
+
+                UNION ALL
+
+                -- Tool calls
+                SELECT
+                    'tool_call' as message_type,
+                    tc.id,
+                    tc.uuid,
+                    tc.arguments_enc as content_enc,
+                    'completed'::text as status,
+                    tc.created_at,
+                    NULL::text as model,
+                    tc.argument_tokens as token_count,
+                    tc.tool_call_id,
+                    NULL::text as finish_reason
+                FROM tool_calls tc
+                WHERE tc.response_id = $1
+
+                UNION ALL
+
+                -- Tool outputs
+                SELECT
+                    'tool_output' as message_type,
+                    tto.id,
+                    tto.uuid,
+                    tto.output_enc as content_enc,
+                    'completed'::text as status,
+                    tto.created_at,
+                    NULL::text as model,
+                    tto.output_tokens as token_count,
+                    tc.tool_call_id,
+                    NULL::text as finish_reason
+                FROM tool_outputs tto
+                JOIN tool_calls tc ON tto.tool_call_fk = tc.id
+                WHERE tto.response_id = $1
+            )
+            SELECT * FROM response_messages
+            ORDER BY created_at ASC
+        "#;
+
+        sql_query(query)
+            .bind::<BigInt, _>(response_id)
+            .load::<RawThreadMessage>(conn)
+            .map_err(ResponsesError::DatabaseError)
+    }
 }

@@ -549,7 +549,7 @@ pub struct ResponsesRetrieveResponse {
     pub status: String,
     pub model: String,
     pub usage: Option<ResponseUsage>,
-    pub output: Option<String>,
+    pub output: Vec<OutputItem>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -1390,11 +1390,11 @@ async fn get_response(
         .get_response_by_uuid_and_user(id, user.uuid)
         .map_err(error_mapping::map_response_error)?;
 
-    // Get associated assistant messages
-    let assistant_messages = state
+    // Get all messages associated with this response (user, assistant, tool_call, tool_output)
+    let messages = state
         .db
-        .get_assistant_messages_for_response(response.id)
-        .map_err(error_mapping::map_message_error)?;
+        .get_response_context_messages(response.id)
+        .map_err(error_mapping::map_generic_db_error)?;
 
     // Get user's encryption key
     let user_key = state
@@ -1402,17 +1402,35 @@ async fn get_response(
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
-    // Build output from assistant messages
-    let mut output = String::new();
-    for msg in &assistant_messages {
-        if let Some(text) = decrypt_string(&user_key, msg.content_enc.as_ref()).map_err(|e| {
-            error!("Failed to decrypt assistant message content: {:?}", e);
-            error_mapping::map_decryption_error("assistant message content")
-        })? {
-            if !output.is_empty() {
-                output.push('\n');
+    // Build output from assistant messages only (user messages are input, not output)
+    // TODO: Add tool_call and tool_output items to output array once we implement tool support
+    // Need to determine correct OpenAI format for tool items in output array
+    let mut output_items = Vec::new();
+
+    for msg in &messages {
+        // Only include assistant messages in output
+        // TODO: When adding tool support, also handle msg.message_type == "tool_call" and "tool_output"
+        if msg.message_type != "assistant" {
+            continue;
+        }
+
+        // Only include messages that have content
+        if let Some(content_enc) = &msg.content_enc {
+            if let Some(text) = decrypt_string(&user_key, Some(content_enc)).map_err(|e| {
+                error!("Failed to decrypt assistant message content: {:?}", e);
+                error_mapping::map_decryption_error("assistant message content")
+            })? {
+                // Build content part using builder
+                let content_part = ContentPartBuilder::new_output_text(text).build();
+
+                // Build output item using builder
+                let output_item = OutputItemBuilder::new_message(msg.uuid)
+                    .status(&msg.status.clone().unwrap_or_else(|| STATUS_COMPLETED.to_string()))
+                    .content(vec![content_part])
+                    .build();
+
+                output_items.push(output_item);
             }
-            output.push_str(&text);
         }
     }
 
@@ -1434,9 +1452,6 @@ async fn get_response(
         None
     };
 
-    // TODO i'm not sure if this api response is correct
-    // where is user message? is it just assistent outputs?
-    // does ordering matter?
     let retrieve_response = ResponsesRetrieveResponse {
         id: response.uuid,
         object: OBJECT_TYPE_RESPONSE,
@@ -1447,11 +1462,7 @@ async fn get_response(
             .unwrap_or_else(|| "unknown".to_string()),
         model: response.model.clone(),
         usage,
-        output: if output.is_empty() {
-            None
-        } else {
-            Some(output)
-        },
+        output: output_items,
     };
 
     encrypt_response(&state, &session_id, &retrieve_response).await
@@ -1514,7 +1525,7 @@ async fn cancel_response(
         status: STATUS_CANCELLED.to_string(),
         model: response.model.clone(),
         usage: None,
-        output: None,
+        output: vec![],
     };
 
     encrypt_response(&state, &session_id, &retrieve_response).await

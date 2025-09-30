@@ -8,7 +8,11 @@ use crate::{
     web::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         responses::{
-            constants::{OBJECT_TYPE_CONVERSATION, OBJECT_TYPE_LIST, ROLE_ASSISTANT, ROLE_USER},
+            constants::{
+                DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, DEFAULT_TOOL_FUNCTION_NAME,
+                MAX_PAGINATION_LIMIT, OBJECT_TYPE_CONVERSATION, OBJECT_TYPE_CONVERSATION_DELETED,
+                OBJECT_TYPE_LIST, ROLE_ASSISTANT, ROLE_USER,
+            },
             error_mapping, ConversationContent, MessageContent, MessageContentConverter,
         },
     },
@@ -169,11 +173,11 @@ pub struct ListItemsParams {
 }
 
 fn default_limit() -> i64 {
-    20
+    DEFAULT_PAGINATION_LIMIT
 }
 
 fn default_order() -> String {
-    "desc".to_string()
+    DEFAULT_PAGINATION_ORDER.to_string()
 }
 
 // ============================================================================
@@ -364,7 +368,7 @@ async fn delete_conversation(
 
     let response = DeletedConversationResponse {
         id: conversation.uuid,
-        object: "conversation.deleted",
+        object: OBJECT_TYPE_CONVERSATION_DELETED,
         deleted: true,
     };
 
@@ -494,7 +498,7 @@ async fn list_conversation_items(
                 // Parse tool call
                 items.push(ConversationItem::FunctionToolCall {
                     id: msg.uuid,
-                    name: "function".to_string(), // We'd need to store this properly
+                    name: DEFAULT_TOOL_FUNCTION_NAME.to_string(),
                     arguments: content,
                     created_at: Some(msg.created_at.timestamp()),
                 });
@@ -519,7 +523,7 @@ async fn list_conversation_items(
     }
 
     // Apply pagination
-    let limit = params.limit.min(100) as usize;
+    let limit = params.limit.min(MAX_PAGINATION_LIMIT) as usize;
     let has_more = items.len() > limit;
     if has_more {
         items.truncate(limit);
@@ -627,7 +631,7 @@ async fn get_conversation_item(
                 }
                 "tool_call" => ConversationItem::FunctionToolCall {
                     id: msg.uuid,
-                    name: "function".to_string(),
+                    name: DEFAULT_TOOL_FUNCTION_NAME.to_string(),
                     arguments: content,
                     created_at: Some(msg.created_at.timestamp()),
                 },
@@ -659,7 +663,7 @@ async fn list_conversations(
 ) -> Result<Json<EncryptedResponse<ConversationListResponse>>, ApiError> {
     debug!("Listing conversations for user: {}", user.uuid);
 
-    let limit = params.limit.min(100);
+    let limit = params.limit.min(MAX_PAGINATION_LIMIT);
     let order = &params.order;
 
     // Convert UUID cursors to (updated_at, id) tuples

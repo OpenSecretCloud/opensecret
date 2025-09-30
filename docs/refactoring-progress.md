@@ -541,11 +541,42 @@ Since this is purely organizational refactoring with no logic changes:
 
 ---
 
-### Phase 6: Future Work
+### Phase 6: Conversations API Integration (Continued)
 
-#### Step 2: Add Missing Constants (Next)
-- Add conversation-specific constants to constants.rs
-- Replace remaining hardcoded strings in conversations.rs
+#### ✅ Step 2: Add Missing Constants
+**Commit**: `refactor: Add conversation-specific constants and use them in conversations.rs`
+**Status**: Completed
+
+##### Changes Made
+- **Added 5 new constants** to `src/web/responses/constants.rs`:
+  - `OBJECT_TYPE_CONVERSATION_DELETED = "conversation.deleted"`
+  - `DEFAULT_PAGINATION_LIMIT = 20`
+  - `MAX_PAGINATION_LIMIT = 100`
+  - `DEFAULT_PAGINATION_ORDER = "desc"`
+  - `DEFAULT_TOOL_FUNCTION_NAME = "function"`
+
+- **Updated `src/web/conversations.rs`** to use constants (7 replacements):
+  1. ✅ Line 367: `"conversation.deleted"` → `OBJECT_TYPE_CONVERSATION_DELETED`
+  2. ✅ Line 176: `20` → `DEFAULT_PAGINATION_LIMIT` (in default_limit function)
+  3. ✅ Line 180: `"desc"` → `DEFAULT_PAGINATION_ORDER` (in default_order function)
+  4. ✅ Line 526: `100` → `MAX_PAGINATION_LIMIT` (list_conversation_items)
+  5. ✅ Line 666: `100` → `MAX_PAGINATION_LIMIT` (list_conversations)
+  6. ✅ Line 501: `"function"` → `DEFAULT_TOOL_FUNCTION_NAME` (tool call in list items)
+  7. ✅ Line 634: `"function"` → `DEFAULT_TOOL_FUNCTION_NAME` (tool call in get item)
+
+##### Impact
+- ✅ **Complete constant coverage** - All magic strings replaced with named constants
+- ✅ **Single source of truth** - All pagination and tool defaults centralized
+- ✅ **Consistency** - Both Conversations and Responses APIs now use same constants
+- ✅ **Zero runtime impact** - Constants are inlined at compile time
+- ✅ **Build status** - Compiles successfully with cargo check
+
+##### Lines Changed
+- constants.rs: +5 constants added
+- conversations.rs: 7 replacements, improved imports
+- **Net benefit**: Eliminated all remaining magic values in conversations.rs
+
+---
 
 #### Step 3: ConversationBuilder Pattern (Future)
 - Extract repeated ConversationResponse construction

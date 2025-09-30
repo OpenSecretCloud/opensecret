@@ -19,6 +19,7 @@ pub const COST_PER_TOKEN: &str = "0.0000053";
 pub const OBJECT_TYPE_RESPONSE: &str = "response";
 pub const OBJECT_TYPE_RESPONSE_DELETED: &str = "response.deleted";
 pub const OBJECT_TYPE_CONVERSATION: &str = "conversation";
+pub const OBJECT_TYPE_CONVERSATION_DELETED: &str = "conversation.deleted";
 pub const OBJECT_TYPE_LIST: &str = "list";
 
 /// Event types for SSE streaming
@@ -67,3 +68,11 @@ pub const CONTENT_PART_TYPE_OUTPUT_TEXT: &str = "output_text";
 pub const ROLE_USER: &str = "user";
 pub const ROLE_ASSISTANT: &str = "assistant";
 pub const ROLE_SYSTEM: &str = "system";
+
+/// Default pagination values
+pub const DEFAULT_PAGINATION_LIMIT: i64 = 20;
+pub const MAX_PAGINATION_LIMIT: i64 = 100;
+pub const DEFAULT_PAGINATION_ORDER: &str = "desc";
+
+/// Tool call defaults
+pub const DEFAULT_TOOL_FUNCTION_NAME: &str = "function";

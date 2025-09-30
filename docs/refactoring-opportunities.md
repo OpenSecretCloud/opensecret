@@ -404,42 +404,6 @@ impl MessageContentConverter {
         }
     }
 
-    /// Convert MessageContent to ConversationContent array for API responses
-    pub fn to_conversation_content(content: MessageContent, role: &str) -> Vec<ConversationContent> {
-        match (content, role) {
-            (MessageContent::Text(text), "user") => {
-                vec![ConversationContent::InputText { text }]
-            }
-            (MessageContent::Text(text), "assistant") => {
-                vec![ConversationContent::OutputText { text }]
-            }
-            (MessageContent::Parts(parts), role) => {
-                parts.into_iter().map(|part| Self::content_part_to_conversation(part, role)).collect()
-            }
-            _ => vec![],
-        }
-    }
-
-    fn content_part_to_conversation(part: MessageContentPart, role: &str) -> ConversationContent {
-        match (part, role) {
-            (MessageContentPart::Text { text } | MessageContentPart::InputText { text }, "user") => {
-                ConversationContent::InputText { text }
-            }
-            (MessageContentPart::Text { text } | MessageContentPart::InputText { text }, "assistant") => {
-                ConversationContent::OutputText { text }
-            }
-            (MessageContentPart::InputImage { image_url, .. }, _) => {
-                ConversationContent::InputImage {
-                    image_url: image_url.unwrap_or_else(|| "[No URL]".to_string()),
-                }
-            }
-            (MessageContentPart::InputFile { filename, .. }, _) => {
-                ConversationContent::InputFile { filename }
-            }
-            _ => ConversationContent::InputText { text: "".to_string() },
-        }
-    }
-
     /// Extract text content for token counting purposes only
     pub fn extract_text_for_token_counting(content: &MessageContent) -> String {
         match content {
@@ -1814,21 +1778,6 @@ MessageContentConverter::assistant_text_to_content(text)
 
 ---
 
-### 🟢 Keep for Future Use (Conversations API)
-
-These are NOT unused - they're reserved for full Conversations API implementation:
-
-8. **`to_conversation_content()`** - conversions.rs:106
-   - Will be used when implementing full Conversations API item creation
-   - Alternative to From trait for direct conversion
-
-9. **`content_part_to_conversation()`** - conversions.rs:126
-   - Helper for to_conversation_content()
-
-**Recommendation:** KEEP - Mark with `#[allow(dead_code)]` until Conversations API is fully implemented
-
----
-
 ### 🗑️ Remove Dead Code (Genuinely Unused)
 
 #### 10. `map_encryption_error()` (errors.rs:98)
@@ -1939,23 +1888,6 @@ pub use storage::storage_task;
 
 ---
 
-### Step 4: Document Future Use Items
-**Estimated time:** 5 minutes
-**Risk:** None - documentation only
-
-Add `#[allow(dead_code)]` with explanatory comments:
-
-```rust
-// Reserved for full Conversations API implementation
-#[allow(dead_code)]
-pub fn to_conversation_content(
-    content: MessageContent,
-    role: &str,
-) -> Vec<ConversationContent> {
-    // ...
-}
-```
-
 ---
 
 ## Expected Outcomes
@@ -1978,6 +1910,770 @@ pub fn to_conversation_content(
 
 ---
 
+---
+
+## Phase 6: Conversations API Refactoring & Integration
+
+### Overview
+
+The Conversations API (`src/web/conversations.rs`, 952 lines) is closely related to the Responses API - conversations are essentially containers for responses. Now that we've refactored the Responses API with shared utilities, we should:
+
+1. **Eliminate code duplication** between conversations.rs and responses modules
+2. **Move conversations into responses directory** to reflect the logical relationship
+3. **Apply similar refactoring patterns** from the responses work
+4. **Extract conversation-specific builders and helpers**
+
+### 🔴 1. Eliminate MessageContent Duplication (CRITICAL)
+
+**Problem:** MessageContent types are fully duplicated between conversations.rs and the types used by responses.
+
+**Current Duplication:**
+```rust
+// conversations.rs:46-158
+pub enum MessageContentPart { ... }  // Duplicated!
+pub enum MessageContent { ... }      // Duplicated!
+impl MessageContent {
+    pub fn as_text_for_input_token_count_only(&self) -> String { ... }  // Duplicated!
+    pub fn to_openai_format(&self) -> serde_json::Value { ... }         // Duplicated!
+}
+```
+
+**Solution:** These types should live in ONE place, not two.
+
+**Options:**
+
+**Option A: Move to shared types module** (RECOMMENDED)
+```rust
+// src/web/types.rs or src/models/messages.rs
+pub enum MessageContentPart { ... }
+pub enum MessageContent { ... }
+
+// Both conversations and responses import from here
+```
+
+**Option B: Keep in conversations, responses imports from it**
+```rust
+// responses/handlers.rs and responses/conversions.rs
+use crate::web::conversations::{MessageContent, MessageContentPart};
+```
+
+**Current State:** responses already imports from conversations! (responses/conversions.rs:3)
+```rust
+use crate::web::conversations::{ConversationContent, MessageContent, MessageContentPart};
+```
+
+**Recommendation:**
+- Keep types in conversations.rs for now (already working)
+- When moving conversations to responses/, move types to `responses/types.rs`
+- This is the single source of truth
+
+**Impact:** Eliminates ~115 lines of duplication, ensures consistency
+
+---
+
+### 🟡 2. Move Conversations to Responses Directory
+
+**Current Structure:**
+```
+src/web/
+├── conversations.rs      (952 lines, orphaned)
+└── responses/
+    ├── handlers.rs
+    ├── builders.rs
+    ├── constants.rs
+    └── ...
+```
+
+**Proposed Structure:**
+```
+src/web/responses/
+├── handlers.rs            (responses API handlers)
+├── conversations.rs       (conversations API handlers)
+├── types.rs              (shared: MessageContent, MessageContentPart, etc.)
+├── builders.rs
+├── constants.rs
+└── ...
+```
+
+**Alternative (if conversations grows):**
+```
+src/web/responses/
+├── handlers.rs
+├── conversations/
+│   ├── mod.rs
+│   ├── handlers.rs       (conversation CRUD operations)
+│   └── builders.rs       (conversation-specific builders)
+├── types.rs
+└── ...
+```
+
+**Benefits:**
+- Logical grouping (conversations ARE the context for responses)
+- Shared types naturally accessible
+- Clearer module boundaries
+
+**Migration Steps:**
+1. Create `src/web/responses/types.rs` with shared message types
+2. Move MessageContent, MessageContentPart from conversations.rs to types.rs
+3. Update imports in both files
+4. Move conversations.rs to responses/conversations.rs
+5. Update mod.rs exports
+
+**Impact:** Better organization, clearer domain boundaries
+
+---
+
+### 🟢 3. Extract ConversationBuilder Pattern
+
+**Location:** Repeated 6 times across conversations.rs
+
+**Problem:** ConversationResponse construction repeated with same pattern:
+
+```rust
+// Lines 399-404, 436-441, 488-493, 876-881 (4+ times)
+let response = ConversationResponse {
+    id: conversation.uuid,
+    object: OBJECT_TYPE_CONVERSATION,
+    metadata,
+    created_at: conversation.created_at.timestamp(),
+};
+```
+
+**Solution:** Create builder similar to ResponseBuilder
+
+```rust
+// src/web/responses/builders.rs (add to existing file)
+
+/// Builder for ConversationResponse
+pub struct ConversationBuilder {
+    conversation: ConversationResponse,
+}
+
+impl ConversationBuilder {
+    /// Create from database Conversation model
+    pub fn from_conversation(conv: &Conversation) -> Self {
+        Self {
+            conversation: ConversationResponse {
+                id: conv.uuid,
+                object: OBJECT_TYPE_CONVERSATION,
+                metadata: None,  // Set via .metadata()
+                created_at: conv.created_at.timestamp(),
+            },
+        }
+    }
+
+    /// Set metadata (already decrypted)
+    pub fn metadata(mut self, metadata: Option<Value>) -> Self {
+        self.conversation.metadata = metadata;
+        self
+    }
+
+    /// Build final ConversationResponse
+    pub fn build(self) -> ConversationResponse {
+        self.conversation
+    }
+}
+
+// Usage:
+let response = ConversationBuilder::from_conversation(&conversation)
+    .metadata(decrypted_metadata)
+    .build();
+```
+
+**Impact:**
+- Eliminates 4 instances of manual construction (~20 lines)
+- Consistent with ResponseBuilder pattern
+- Easy to extend with new fields
+
+---
+
+### 🟡 4. Extract "Get Conversation with Key" Pattern
+
+**Location:** Repeated in almost every handler
+
+**Problem:** Every handler does:
+```rust
+// Get conversation
+let conversation = state.db
+    .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
+    .map_err(error_mapping::map_conversation_error)?;
+
+// Get user key
+let user_key = state
+    .get_user_key(user.uuid, None, None)
+    .await
+    .map_err(|_| error_mapping::map_key_retrieval_error())?;
+```
+
+**Solution:** Extract to helper function
+
+```rust
+// src/web/responses/conversations.rs (or context_builder.rs)
+
+/// Conversation context with decryption key
+pub struct ConversationContext {
+    pub conversation: Conversation,
+    pub user_key: SecretKey,
+}
+
+impl ConversationContext {
+    /// Get conversation and user's encryption key in one operation
+    ///
+    /// Verifies conversation exists, user owns it, and retrieves encryption key.
+    pub async fn load(
+        state: &AppState,
+        conversation_id: Uuid,
+        user_uuid: Uuid,
+    ) -> Result<Self, ApiError> {
+        // Get conversation (verifies ownership)
+        let conversation = state
+            .db
+            .get_conversation_by_uuid_and_user(conversation_id, user_uuid)
+            .map_err(error_mapping::map_conversation_error)?;
+
+        // Get user's encryption key
+        let user_key = state
+            .get_user_key(user_uuid, None, None)
+            .await
+            .map_err(|_| error_mapping::map_key_retrieval_error())?;
+
+        Ok(Self {
+            conversation,
+            user_key,
+        })
+    }
+
+    /// Decrypt conversation metadata
+    pub fn decrypt_metadata(&self) -> Result<Option<Value>, ApiError> {
+        decrypt_content(&self.user_key, self.conversation.metadata_enc.as_ref())
+            .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))
+    }
+}
+
+// Usage in handlers:
+async fn get_conversation(...) -> Result<...> {
+    let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
+    let metadata = ctx.decrypt_metadata()?;
+
+    let response = ConversationBuilder::from_conversation(&ctx.conversation)
+        .metadata(metadata)
+        .build();
+
+    encrypt_response(&state, &session_id, &response).await
+}
+```
+
+**Impact:**
+- Eliminates ~10 lines per handler (6 handlers = 60 lines saved)
+- Consistent error handling
+- Easy to add conversation-level authorization checks
+- Similar to how responses has PreparedRequest and BuiltContext
+
+---
+
+### 🟢 5. Extract Conversation Item Conversion Logic
+
+**Location:** `list_conversation_items` (lines 576-708) and `get_conversation_item` (lines 712-808)
+
+**Problem:** Complex message decryption and conversion logic duplicated in two places.
+
+**Solution:** Extract message-to-item converter
+
+```rust
+// src/web/responses/conversations.rs or conversions.rs
+
+pub struct ConversationItemConverter;
+
+impl ConversationItemConverter {
+    /// Convert database message to ConversationItem
+    ///
+    /// Handles decryption and format conversion for all message types.
+    pub async fn message_to_item(
+        msg: &Message,
+        user_key: &SecretKey,
+    ) -> Result<ConversationItem, ApiError> {
+        // Decrypt content
+        let content = decrypt_string(user_key, msg.content_enc.as_ref())
+            .map_err(|_| error_mapping::map_decryption_error("message content"))?
+            .unwrap_or_default();
+
+        match msg.message_type.as_str() {
+            "user" => {
+                Self::user_message_to_item(msg, content)
+            }
+            "assistant" => {
+                Self::assistant_message_to_item(msg, content)
+            }
+            "tool_call" => {
+                Self::tool_call_to_item(msg, content)
+            }
+            "tool_output" => {
+                Self::tool_output_to_item(msg, content)
+            }
+            _ => Err(ApiError::InternalServerError),
+        }
+    }
+
+    fn user_message_to_item(
+        msg: &Message,
+        content: String,
+    ) -> Result<ConversationItem, ApiError> {
+        let message_content: MessageContent = serde_json::from_str(&content)
+            .map_err(|_| error_mapping::map_serialization_error("user message content"))?;
+
+        Ok(ConversationItem::Message {
+            id: msg.uuid,
+            status: msg.status.clone(),
+            role: ROLE_USER.to_string(),
+            content: Vec::<ConversationContent>::from(message_content),
+            created_at: Some(msg.created_at.timestamp()),
+        })
+    }
+
+    fn assistant_message_to_item(
+        msg: &Message,
+        content: String,
+    ) -> Result<ConversationItem, ApiError> {
+        let content_parts = if content.is_empty() {
+            vec![]
+        } else {
+            MessageContentConverter::assistant_text_to_content(content)
+        };
+
+        Ok(ConversationItem::Message {
+            id: msg.uuid,
+            status: msg.status.clone(),
+            role: ROLE_ASSISTANT.to_string(),
+            content: content_parts,
+            created_at: Some(msg.created_at.timestamp()),
+        })
+    }
+
+    fn tool_call_to_item(
+        msg: &Message,
+        content: String,
+    ) -> Result<ConversationItem, ApiError> {
+        Ok(ConversationItem::FunctionToolCall {
+            id: msg.uuid,
+            name: "function".to_string(),
+            arguments: content,
+            created_at: Some(msg.created_at.timestamp()),
+        })
+    }
+
+    fn tool_output_to_item(
+        msg: &Message,
+        content: String,
+    ) -> Result<ConversationItem, ApiError> {
+        Ok(ConversationItem::FunctionToolCallOutput {
+            id: msg.uuid,
+            tool_call_id: msg.tool_call_id.unwrap_or(Uuid::nil()),
+            output: content,
+            created_at: Some(msg.created_at.timestamp()),
+        })
+    }
+
+    /// Convert multiple messages to items with pagination
+    pub async fn messages_to_items(
+        raw_messages: &[Message],
+        user_key: &SecretKey,
+        start_index: usize,
+        limit: usize,
+    ) -> Result<Vec<ConversationItem>, ApiError> {
+        let mut items = Vec::new();
+
+        for msg in raw_messages.iter().skip(start_index).take(limit) {
+            items.push(Self::message_to_item(msg, user_key).await?);
+        }
+
+        Ok(items)
+    }
+}
+
+// Usage in handlers:
+let items = ConversationItemConverter::messages_to_items(
+    &raw_messages,
+    &user_key,
+    start_index,
+    limit,
+).await?;
+```
+
+**Impact:**
+- Eliminates ~100 lines of duplication between two handlers
+- Testable in isolation
+- Easy to add new message types
+- Consistent error handling
+
+---
+
+### 🟢 6. Add Missing Constants
+
+**Locations:** Hardcoded strings throughout conversations.rs
+
+**Missing Constants:**
+
+```rust
+// src/web/responses/constants.rs (add to existing file)
+
+/// Conversation object types
+pub const OBJECT_TYPE_CONVERSATION_DELETED: &str = "conversation.deleted";
+
+/// Default pagination values
+pub const DEFAULT_PAGINATION_LIMIT: i64 = 20;
+pub const MAX_PAGINATION_LIMIT: i64 = 100;
+pub const DEFAULT_PAGINATION_ORDER: &str = "desc";
+
+/// Tool call defaults
+pub const DEFAULT_TOOL_FUNCTION_NAME: &str = "function";
+```
+
+**Usage in conversations.rs:**
+
+```rust
+// Line 524: Replace hardcoded string
+object: "conversation.deleted",
+// With:
+object: OBJECT_TYPE_CONVERSATION_DELETED,
+
+// Lines 328-333: Replace default functions
+fn default_limit() -> i64 {
+    20
+}
+fn default_order() -> String {
+    "desc".to_string()
+}
+// With:
+fn default_limit() -> i64 {
+    DEFAULT_PAGINATION_LIMIT
+}
+fn default_order() -> String {
+    DEFAULT_PAGINATION_ORDER.to_string()
+}
+
+// Line 654: Replace hardcoded tool name
+name: "function".to_string(),
+// With:
+name: DEFAULT_TOOL_FUNCTION_NAME.to_string(),
+```
+
+**Impact:**
+- Complete constant coverage
+- ~5 replacements
+- Single source of truth for all magic values
+
+---
+
+### 🟢 7. Extract Pagination Logic
+
+**Location:** Repeated in `list_conversation_items` (lines 678-688) and `list_conversations` (lines 849-857)
+
+**Problem:** Pagination logic duplicated
+
+**Solution:** Create reusable pagination helper
+
+```rust
+// src/web/responses/pagination.rs (new file)
+
+/// Pagination utilities for list endpoints
+pub struct Paginator;
+
+impl Paginator {
+    /// Apply limit and check for more results
+    ///
+    /// Returns (items, has_more) tuple
+    pub fn paginate<T>(mut items: Vec<T>, limit: i64) -> (Vec<T>, bool) {
+        let limit = limit.min(MAX_PAGINATION_LIMIT) as usize;
+        let has_more = items.len() > limit;
+
+        if has_more {
+            items.truncate(limit);
+        }
+
+        (items, has_more)
+    }
+
+    /// Reverse items if ascending order requested
+    pub fn apply_order<T>(mut items: Vec<T>, order: &str) -> Vec<T> {
+        if order == "asc" {
+            items.reverse();
+        }
+        items
+    }
+
+    /// Get first and last IDs from items
+    pub fn get_cursor_ids<T, F>(items: &[T], id_extractor: F) -> (Option<Uuid>, Option<Uuid>)
+    where
+        F: Fn(&T) -> Uuid,
+    {
+        let first_id = items.first().map(&id_extractor);
+        let last_id = items.last().map(&id_extractor);
+        (first_id, last_id)
+    }
+}
+
+// Usage:
+let (items, has_more) = Paginator::paginate(items, params.limit);
+let items = Paginator::apply_order(items, &params.order);
+let (first_id, last_id) = Paginator::get_cursor_ids(&items, |item| match item {
+    ConversationItem::Message { id, .. } => *id,
+    // ... other variants
+});
+```
+
+**Impact:**
+- Eliminates ~20 lines of duplication
+- Consistent pagination behavior across all list endpoints
+- Easy to modify pagination logic in one place
+
+---
+
+### 🟡 8. Type Safety for Delete Responses
+
+**Location:** Both conversations and responses have delete responses
+
+**Problem:** DeletedConversationResponse and ResponsesDeleteResponse are nearly identical
+
+**Solution:** Create generic deleted response type
+
+```rust
+// src/web/responses/types.rs
+
+/// Generic response for deleted objects
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletedObjectResponse {
+    pub id: Uuid,
+    pub object: &'static str,
+    pub deleted: bool,
+}
+
+impl DeletedObjectResponse {
+    pub fn conversation(id: Uuid) -> Self {
+        Self {
+            id,
+            object: OBJECT_TYPE_CONVERSATION_DELETED,
+            deleted: true,
+        }
+    }
+
+    pub fn response(id: Uuid) -> Self {
+        Self {
+            id,
+            object: OBJECT_TYPE_RESPONSE_DELETED,
+            deleted: true,
+        }
+    }
+}
+
+// Usage:
+let response = DeletedObjectResponse::conversation(conversation.uuid);
+let response = DeletedObjectResponse::response(id);
+```
+
+**Impact:**
+- Eliminates duplicate types
+- Consistent delete response format
+- Easy to add new deletable object types
+
+---
+
+## Phase 6 Implementation Plan
+
+### Step 1: Shared Types Extraction (Week 1, Day 1-2)
+**Estimated time:** 3-4 hours
+**Risk:** Low - pure code movement
+
+1. Create `src/web/responses/types.rs`
+2. Move MessageContent, MessageContentPart from conversations.rs to types.rs
+3. Update imports in conversations.rs and responses modules
+4. Run tests to verify no breakage
+
+**Testing:** Full integration test suite
+
+---
+
+### Step 2: Add Missing Constants (Week 1, Day 2)
+**Estimated time:** 30 minutes
+**Risk:** Very low
+
+1. Add constants to `constants.rs`:
+   - OBJECT_TYPE_CONVERSATION_DELETED
+   - DEFAULT_PAGINATION_LIMIT
+   - MAX_PAGINATION_LIMIT
+   - DEFAULT_PAGINATION_ORDER
+   - DEFAULT_TOOL_FUNCTION_NAME
+2. Replace hardcoded strings in conversations.rs
+
+**Testing:** Cargo build + clippy
+
+---
+
+### Step 3: ConversationBuilder (Week 1, Day 3)
+**Estimated time:** 1-2 hours
+**Risk:** Low
+
+1. Add ConversationBuilder to `builders.rs`
+2. Replace 6 manual construction sites in conversations.rs
+3. Add unit tests
+
+**Testing:** Unit tests + manual API testing
+
+---
+
+### Step 4: ConversationContext Helper (Week 1, Day 4)
+**Estimated time:** 2-3 hours
+**Risk:** Medium (changes handler flow)
+
+1. Create ConversationContext in conversations.rs or context_builder.rs
+2. Update 6 handlers to use ConversationContext::load()
+3. Test all conversation endpoints
+
+**Testing:** Full conversation API integration tests
+
+---
+
+### Step 5: ConversationItemConverter (Week 1, Day 5)
+**Estimated time:** 3-4 hours
+**Risk:** Medium (complex logic extraction)
+
+1. Create ConversationItemConverter
+2. Extract message-to-item conversion logic
+3. Update list_conversation_items and get_conversation_item handlers
+4. Add comprehensive unit tests
+
+**Testing:** Unit tests + conversation items API testing
+
+---
+
+### Step 6: Move Conversations to Responses Directory (Week 2, Day 1)
+**Estimated time:** 1-2 hours
+**Risk:** Low (file movement)
+
+1. Move `src/web/conversations.rs` to `src/web/responses/conversations.rs`
+2. Update mod.rs exports
+3. Update imports throughout codebase
+4. Run full test suite
+
+**Testing:** Full test suite + cargo check
+
+---
+
+### Step 7: Pagination Utilities (Week 2, Day 2)
+**Estimated time:** 1-2 hours
+**Risk:** Low
+
+1. Create `src/web/responses/pagination.rs`
+2. Extract pagination logic from both list handlers
+3. Add unit tests
+
+**Testing:** Unit tests + pagination testing
+
+---
+
+### Step 8: Unified Delete Response (Week 2, Day 3)
+**Estimated time:** 1 hour
+**Risk:** Low
+
+1. Create DeletedObjectResponse in types.rs
+2. Replace DeletedConversationResponse and ResponsesDeleteResponse
+3. Update delete handlers
+
+**Testing:** Delete endpoint testing
+
+---
+
+## Expected Outcomes
+
+**After Phase 6 Completion:**
+
+### Code Metrics
+- **conversations.rs**: 952 → ~650 lines (-302 lines, -31.8% reduction)
+- **Eliminated duplication**: ~250 lines
+- **New shared modules**: types.rs, pagination.rs
+- **Total responses/ directory**: Well-organized feature module
+
+### File Structure
+```
+src/web/responses/
+├── mod.rs                  - Module exports
+├── handlers.rs             - Responses API handlers (1561 lines)
+├── conversations.rs        - Conversations API handlers (~650 lines)
+├── types.rs               - Shared message types (NEW, ~200 lines)
+├── builders.rs            - Response & Conversation builders
+├── constants.rs           - All constants (extended)
+├── conversions.rs         - Message content converters
+├── errors.rs              - Error mapping
+├── events.rs              - SSE event system
+├── storage.rs             - Storage task
+├── stream_processor.rs    - Upstream processor
+├── context_builder.rs     - Prompt building
+└── pagination.rs          - Pagination utilities (NEW, ~50 lines)
+```
+
+### Benefits Achieved
+1. ✅ **Zero code duplication** between conversations and responses
+2. ✅ **Logical module organization** - conversations as part of responses feature
+3. ✅ **Shared utilities** - builders, converters, pagination all reusable
+4. ✅ **Consistent patterns** - same error handling, same builder pattern
+5. ✅ **Type safety** - shared types ensure compatibility
+6. ✅ **Testability** - all helpers isolated and testable
+7. ✅ **Maintainability** - clear separation of concerns
+
+### Code Quality
+- **No magic strings**: 100% constant coverage
+- **DRY principle**: All duplication eliminated
+- **Single responsibility**: Each module has clear purpose
+- **Type safety**: Compile-time verification of data flow
+- **Documentation**: All public APIs documented
+
+---
+
+## Risks and Mitigations
+
+### Risk 1: Breaking Existing Conversations API
+**Mitigation:**
+- Comprehensive integration tests before and after
+- Feature flag to rollback if issues arise
+- Gradual migration (types first, handlers last)
+
+### Risk 2: Import Cycle Issues
+**Mitigation:**
+- Move shared types to separate file first
+- Use pub(crate) for internal-only exports
+- Clear module hierarchy: types → converters → builders → handlers
+
+### Risk 3: Lost Git History
+**Mitigation:**
+- Use `git mv` for file moves to preserve history
+- Document moves in commit messages
+- Keep old path as comment in new files temporarily
+
+---
+
+## Success Metrics
+
+Track these before and after Phase 6:
+
+### Code Metrics
+- Lines of code in conversations.rs: 952 → ~650 (-31.8%)
+- Code duplication: ~250 lines eliminated
+- Magic strings: 100% replaced with constants
+- Handler function length: Average <100 lines
+
+### Quality Metrics
+- Test coverage: >80% for new utilities
+- Clippy warnings: 0 (excluding expected dead_code)
+- Build time: No increase (should improve due to less duplication)
+- Binary size: Slight decrease due to code deduplication
+
+### Developer Experience
+- Time to understand conversation flow: Reduced
+- Time to add new list endpoint: Reduced (reuse pagination)
+- Time to add new message type: Reduced (reuse converters)
+- Bug rate in conversation code: Should decrease
+
+---
+
 ## Conclusion
 
 These refactorings will significantly improve code maintainability while preserving the working functionality. Start with high-impact, low-risk changes (SSE event builder, error mapping) and progress to larger architectural improvements.
@@ -1985,3 +2681,5 @@ These refactorings will significantly improve code maintainability while preserv
 The key is to refactor incrementally, testing thoroughly after each change, and keeping the application working throughout the process.
 
 **Phase 5 represents the final polish** - using all the centralized constants we created, eliminating true dead code, and ensuring a clean public API. This is low-risk, high-value work that makes the codebase more maintainable.
+
+**Phase 6 completes the feature unification** - bringing conversations and responses together into a cohesive, well-organized module with zero duplication and consistent patterns throughout. This is the natural evolution of the refactoring work, creating a maintainable foundation for future development.

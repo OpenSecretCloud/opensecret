@@ -1676,8 +1676,312 @@ Track these metrics before and after refactoring:
 
 ---
 
+## Phase 5: Final Cleanup - Unused Code Analysis
+
+### Overview
+
+After the major refactorings, a clippy analysis revealed several "unused" warnings. Investigation showed that some items are actually used (but in different modules), some are reserved for future features (Conversations API), and some are genuinely unused dead code.
+
+### 🔴 Critical: Use Missing Constants (HIGH PRIORITY)
+
+These constants exist but hardcoded values are used instead. This breaks the "single source of truth" principle.
+
+#### 1. Channel Buffer Sizes (handlers.rs:1043-1044)
+**Current:**
+```rust
+let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(1024);
+let (tx_client, rx_client) = mpsc::channel::<StorageMessage>(1024);
+```
+
+**Should be:**
+```rust
+let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
+let (tx_client, rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
+```
+
+**Impact:** Medium - Centralizes buffer sizing configuration
+
+---
+
+#### 2. SSE Buffer Capacity (stream_processor.rs:33)
+**Current:**
+```rust
+buffer: String::with_capacity(8192),
+```
+
+**Should be:**
+```rust
+buffer: String::with_capacity(SSE_BUFFER_CAPACITY),
+```
+
+**Impact:** Medium - Centralizes SSE buffer sizing
+
+---
+
+#### 3. Cost Per Token (storage.rs:297-300)
+**Current:**
+```rust
+let input_cost = BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(prompt_tokens);
+let output_cost = BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(completion_tokens);
+```
+
+**Should be:**
+```rust
+let input_cost = BigDecimal::from_str(COST_PER_TOKEN).unwrap() * BigDecimal::from(prompt_tokens);
+let output_cost = BigDecimal::from_str(COST_PER_TOKEN).unwrap() * BigDecimal::from(completion_tokens);
+```
+
+**Impact:** HIGH - Centralized cost management for billing
+
+---
+
+#### 4. Default Request Parameters (handlers.rs:1023-1025)
+**Current:**
+```rust
+"temperature": body.temperature.unwrap_or(0.7),
+"top_p": body.top_p.unwrap_or(1.0),
+"max_tokens": body.max_output_tokens.unwrap_or(10_000),
+```
+
+**Should be:**
+```rust
+"temperature": body.temperature.unwrap_or(DEFAULT_TEMPERATURE),
+"top_p": body.top_p.unwrap_or(DEFAULT_TOP_P),
+"max_tokens": body.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+```
+
+**Impact:** Medium - Centralized default values
+
+---
+
+#### 5. Object Type Constants (conversations.rs:408, 454, 514, 743, 942, 950)
+**Current:**
+```rust
+object: "conversation",  // Hardcoded 6 times
+object: "list",          // Hardcoded 2 times
+```
+
+**Should be:**
+```rust
+use crate::web::responses::constants::{OBJECT_TYPE_CONVERSATION, OBJECT_TYPE_LIST};
+
+object: OBJECT_TYPE_CONVERSATION,
+object: OBJECT_TYPE_LIST,
+```
+
+**Impact:** Medium - Consistency with responses module
+
+---
+
+#### 6. Role Constants (conversations.rs:678, 695, 823, 839)
+**Current:**
+```rust
+role: "user".to_string(),      // Hardcoded multiple times
+role: "assistant".to_string(),  // Hardcoded multiple times
+```
+
+**Should be:**
+```rust
+use crate::web::responses::constants::{ROLE_USER, ROLE_ASSISTANT};
+
+role: ROLE_USER.to_string(),
+role: ROLE_ASSISTANT.to_string(),
+```
+
+**Impact:** Medium - Consistency across codebase
+
+---
+
+#### 7. Duplicate Helper Function (conversations.rs:279)
+**Current (DUPLICATE):**
+```rust
+// conversations.rs:279
+fn assistant_text_to_content(text: String) -> Vec<ConversationContent> {
+    vec![ConversationContent::OutputText { text }]
+}
+```
+
+**Should be:**
+```rust
+// Remove local function, use centralized version:
+use crate::web::responses::MessageContentConverter;
+
+// Replace calls to assistant_text_to_content() with:
+MessageContentConverter::assistant_text_to_content(text)
+```
+
+**Impact:** Medium - Eliminates code duplication
+
+---
+
+### 🟢 Keep for Future Use (Conversations API)
+
+These are NOT unused - they're reserved for full Conversations API implementation:
+
+8. **`to_conversation_content()`** - conversions.rs:106
+   - Will be used when implementing full Conversations API item creation
+   - Alternative to From trait for direct conversion
+
+9. **`content_part_to_conversation()`** - conversions.rs:126
+   - Helper for to_conversation_content()
+
+**Recommendation:** KEEP - Mark with `#[allow(dead_code)]` until Conversations API is fully implemented
+
+---
+
+### 🗑️ Remove Dead Code (Genuinely Unused)
+
+#### 10. `map_encryption_error()` (errors.rs:98)
+**Status:** Never used
+**Reason:** Encryption errors handled inline in handlers
+**Action:** REMOVE - Can be added back if needed
+**Impact:** Low - cleanup only
+
+---
+
+#### 11. `set_sequence_number()` (events.rs:123)
+**Status:** Never used
+**Reason:** Sequence numbers are auto-managed, no need to manually set
+**Action:** REMOVE - utility function not needed
+**Impact:** Low - cleanup only
+
+---
+
+#### 12. `PreparedRequest.normalized_messages` (handlers.rs:607)
+**Status:** Stored but never read
+**Reason:** Only `message_content` is used after normalization
+**Action:** REMOVE field from struct
+**Impact:** Low - minor memory optimization
+
+---
+
+#### 13. `PersistedData.conversation` (handlers.rs:623)
+**Status:** Stored but never read
+**Reason:** Already available via `context.conversation`
+**Action:** REMOVE field from struct, use `context.conversation` directly
+**Impact:** Low - cleanup duplicate data
+
+---
+
+#### 14. `ContentAccumulator.finish_reason` (storage.rs:26)
+**Status:** Stored but never read
+**Reason:** Only used to pass through in Done message, not accessed by accumulator
+**Action:** REMOVE field - not needed in accumulator state
+**Impact:** Low - minor memory optimization
+
+---
+
+### 📦 Adjust Module Visibility
+
+These are exported as `pub` but only used internally within the responses module:
+
+15. **`BillingEventPublisher`** (mod.rs:21)
+16. **`ContentAccumulator`** (mod.rs:21)
+17. **`ResponsePersister`** (mod.rs:21)
+
+**Current:**
+```rust
+pub use storage::{storage_task, BillingEventPublisher, ContentAccumulator, ResponsePersister};
+```
+
+**Should be:**
+```rust
+// In storage.rs, change from pub to pub(crate):
+pub(crate) struct BillingEventPublisher { ... }
+pub(crate) struct ContentAccumulator { ... }
+pub(crate) struct ResponsePersister { ... }
+
+// In mod.rs, only export storage_task:
+pub use storage::storage_task;
+```
+
+**Impact:** Low - Better encapsulation, cleaner public API
+
+---
+
+## Implementation Plan for Phase 5
+
+### Step 1: Use Missing Constants (HIGH VALUE)
+**Estimated time:** 30 minutes
+**Risk:** Very low - simple find-and-replace
+
+1. handlers.rs: Import and use buffer size constants
+2. stream_processor.rs: Import and use SSE_BUFFER_CAPACITY
+3. storage.rs: Import and use COST_PER_TOKEN
+4. handlers.rs: Import and use default parameter constants
+5. conversations.rs: Import and use OBJECT_TYPE_* and ROLE_* constants
+6. conversations.rs: Remove duplicate assistant_text_to_content(), use MessageContentConverter
+
+**Testing:** Full integration test suite + manual API testing
+
+---
+
+### Step 2: Clean Up Dead Code (CLEANUP)
+**Estimated time:** 15 minutes
+**Risk:** Very low - removing unused code
+
+1. Remove `map_encryption_error()` from errors.rs
+2. Remove `set_sequence_number()` from events.rs
+3. Remove unused fields from PreparedRequest, PersistedData, ContentAccumulator
+
+**Testing:** Cargo build + clippy
+
+---
+
+### Step 3: Fix Module Visibility (POLISH)
+**Estimated time:** 10 minutes
+**Risk:** Very low - internal change only
+
+1. Change visibility to `pub(crate)` for internal-only types
+2. Update mod.rs exports
+
+**Testing:** Cargo build (will catch any external usage)
+
+---
+
+### Step 4: Document Future Use Items
+**Estimated time:** 5 minutes
+**Risk:** None - documentation only
+
+Add `#[allow(dead_code)]` with explanatory comments:
+
+```rust
+// Reserved for full Conversations API implementation
+#[allow(dead_code)]
+pub fn to_conversation_content(
+    content: MessageContent,
+    role: &str,
+) -> Vec<ConversationContent> {
+    // ...
+}
+```
+
+---
+
+## Expected Outcomes
+
+**After Phase 5 cleanup:**
+- ✅ Zero clippy warnings for unused code in responses module
+- ✅ All magic strings replaced with constants
+- ✅ No code duplication between modules
+- ✅ Cleaner public API surface
+- ✅ Better documentation of future-use code
+
+**Lines of code impact:**
+- handlers.rs: ~10 lines changed (constant usage)
+- conversations.rs: ~15 lines changed (constant usage, remove duplicate)
+- constants.rs: No changes (constants already exist!)
+- errors.rs: -10 lines (remove unused function)
+- events.rs: -5 lines (remove unused method)
+- storage.rs: -1 line (remove unused field)
+- **Net change:** ~-15 lines with better consistency
+
+---
+
 ## Conclusion
 
 These refactorings will significantly improve code maintainability while preserving the working functionality. Start with high-impact, low-risk changes (SSE event builder, error mapping) and progress to larger architectural improvements.
 
 The key is to refactor incrementally, testing thoroughly after each change, and keeping the application working throughout the process.
+
+**Phase 5 represents the final polish** - using all the centralized constants we created, eliminating true dead code, and ensuring a clean public API. This is low-risk, high-value work that makes the codebase more maintainable.

@@ -1150,7 +1150,6 @@ async fn create_response_stream(
     .await?;
 
     let assistant_message_id = prepared.assistant_message_id;
-    let decrypted_metadata = persisted.decrypted_metadata;
     let total_prompt_tokens = context.total_prompt_tokens;
 
     trace!("Creating SSE event stream for client");
@@ -1164,7 +1163,7 @@ async fn create_response_stream(
         trace!("Building response.created event");
         let created_response = ResponseBuilder::from_response(&response)
             .status(STATUS_IN_PROGRESS)
-            .metadata(decrypted_metadata.clone())
+            .metadata(persisted.decrypted_metadata.clone())
             .build();
 
         let created_event = ResponseCreatedEvent {
@@ -1187,7 +1186,6 @@ async fn create_response_stream(
         // Process messages from upstream processor
         let mut assistant_content = String::new();
         let mut total_completion_tokens = 0i32;
-        let message_id = assistant_message_id; // Use the pre-generated UUID
 
         // Event 3: response.output_item.added
         let output_item_added_event = ResponseOutputItemAddedEvent {
@@ -1195,7 +1193,7 @@ async fn create_response_stream(
             sequence_number: emitter.sequence_number(),
             output_index: 0,
             item: OutputItem {
-                id: message_id.to_string(),
+                id: assistant_message_id.to_string(),
                 output_type: OUTPUT_TYPE_MESSAGE.to_string(),
                 status: STATUS_IN_PROGRESS.to_string(),
                 role: Some(ROLE_ASSISTANT.to_string()),
@@ -1209,7 +1207,7 @@ async fn create_response_stream(
         let content_part_added_event = ResponseContentPartAddedEvent {
             event_type: "response.content_part.added",
             sequence_number: emitter.sequence_number(),
-            item_id: message_id.to_string(),
+            item_id: assistant_message_id.to_string(),
             output_index: 0,
             content_index: 0,
             part: ContentPart {
@@ -1234,7 +1232,7 @@ async fn create_response_stream(
                                 let output_text_done_event = ResponseOutputTextDoneEvent {
                                     event_type: "response.output_text.done",
                                     sequence_number: emitter.sequence_number(),
-                                    item_id: message_id.to_string(),
+                                    item_id: assistant_message_id.to_string(),
                                     output_index: 0,
                                     content_index: 0,
                                     text: assistant_content.clone(),
@@ -1247,7 +1245,7 @@ async fn create_response_stream(
                                 let content_part_done_event = ResponseContentPartDoneEvent {
                                     event_type: "response.content_part.done",
                                     sequence_number: emitter.sequence_number(),
-                                    item_id: message_id.to_string(),
+                                    item_id: assistant_message_id.to_string(),
                                     output_index: 0,
                                     content_index: 0,
                                     part: ContentPart {
@@ -1273,7 +1271,7 @@ async fn create_response_stream(
                                     sequence_number: emitter.sequence_number(),
                                     output_index: 0,
                                     item: OutputItem {
-                                        id: message_id.to_string(),
+                                        id: assistant_message_id.to_string(),
                                         output_type: OUTPUT_TYPE_MESSAGE.to_string(),
                                         status: STATUS_COMPLETED.to_string(),
                                         role: Some(ROLE_ASSISTANT.to_string()),
@@ -1285,7 +1283,7 @@ async fn create_response_stream(
 
                                 // Event 10: response.completed
                                 let content_part = ContentPartBuilder::new_output_text(assistant_content.clone()).build();
-                                let output_item = OutputItemBuilder::new_message(message_id)
+                                let output_item = OutputItemBuilder::new_message(assistant_message_id)
                                     .status(STATUS_COMPLETED)
                                     .content(vec![content_part])
                                     .build();
@@ -1295,7 +1293,7 @@ async fn create_response_stream(
                                     .status(STATUS_COMPLETED)
                                     .output(vec![output_item])
                                     .usage(usage)
-                                    .metadata(decrypted_metadata.clone())
+                                    .metadata(persisted.decrypted_metadata.clone())
                                     .build();
 
                                 let completed_event = ResponseCompletedEvent {
@@ -1315,7 +1313,7 @@ async fn create_response_stream(
                     let delta_event = ResponseOutputTextDeltaEvent {
                         event_type: "response.output_text.delta",
                         delta: content.clone(),
-                        item_id: message_id.to_string(),
+                        item_id: assistant_message_id.to_string(),
                         output_index: 0,
                         content_index: 0,
                         sequence_number: emitter.sequence_number(),

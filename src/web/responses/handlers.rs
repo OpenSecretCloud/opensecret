@@ -15,8 +15,8 @@ use crate::{
         openai::get_chat_completion_response,
         responses::{
             build_usage, constants::*, error_mapping, storage_task, ContentPartBuilder,
-            MessageContentConverter, OutputItemBuilder, ResponseBuilder, SseEventEmitter,
-            UpstreamStreamProcessor,
+            MessageContentConverter, OutputItemBuilder, ResponseBuilder, ResponseEvent,
+            SseEventEmitter, UpstreamStreamProcessor,
         },
     },
     ApiError, AppState,
@@ -1057,7 +1057,7 @@ async fn create_response_stream(
             sequence_number: emitter.sequence_number(),
         };
 
-        yield Ok(emitter.emit("response.created", &created_event).await);
+        yield Ok(ResponseEvent::Created(created_event).to_sse_event(&mut emitter).await);
 
         // Event 2: response.in_progress
         let in_progress_event = ResponseInProgressEvent {
@@ -1066,7 +1066,7 @@ async fn create_response_stream(
             sequence_number: emitter.sequence_number(),
         };
 
-        yield Ok(emitter.emit("response.in_progress", &in_progress_event).await);
+        yield Ok(ResponseEvent::InProgress(in_progress_event).to_sse_event(&mut emitter).await);
 
         // Process messages from upstream processor
         let mut assistant_content = String::new();
@@ -1087,7 +1087,7 @@ async fn create_response_stream(
             },
         };
 
-        yield Ok(emitter.emit("response.output_item.added", &output_item_added_event).await);
+        yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
 
         // Event 4: response.content_part.added
         let content_part_added_event = ResponseContentPartAddedEvent {
@@ -1104,7 +1104,7 @@ async fn create_response_stream(
             },
         };
 
-        yield Ok(emitter.emit("response.content_part.added", &content_part_added_event).await);
+        yield Ok(ResponseEvent::ContentPartAdded(content_part_added_event).to_sse_event(&mut emitter).await);
 
         trace!("Starting to process messages from upstream processor");
         while let Some(msg) = rx_client.recv().await {
@@ -1125,7 +1125,7 @@ async fn create_response_stream(
                                     logprobs: vec![],
                                 };
 
-                                yield Ok(emitter.emit("response.output_text.done", &output_text_done_event).await);
+                                yield Ok(ResponseEvent::OutputTextDone(output_text_done_event).to_sse_event(&mut emitter).await);
 
                                 // Event 8: response.content_part.done
                                 let content_part_done_event = ResponseContentPartDoneEvent {
@@ -1142,7 +1142,7 @@ async fn create_response_stream(
                                     },
                                 };
 
-                                yield Ok(emitter.emit("response.content_part.done", &content_part_done_event).await);
+                                yield Ok(ResponseEvent::ContentPartDone(content_part_done_event).to_sse_event(&mut emitter).await);
 
                                 // Event 9: response.output_item.done
                                 let content_part = ContentPart {
@@ -1165,7 +1165,7 @@ async fn create_response_stream(
                                     },
                                 };
 
-                                yield Ok(emitter.emit("response.output_item.done", &output_item_done_event).await);
+                                yield Ok(ResponseEvent::OutputItemDone(output_item_done_event).to_sse_event(&mut emitter).await);
 
                                 // Event 10: response.completed
                                 let content_part = ContentPartBuilder::new_output_text(assistant_content.clone()).build();
@@ -1188,7 +1188,7 @@ async fn create_response_stream(
                                     sequence_number: emitter.sequence_number(),
                                 };
 
-                                yield Ok(emitter.emit("response.completed", &completed_event).await);
+                                yield Ok(ResponseEvent::Completed(completed_event).to_sse_event(&mut emitter).await);
                     break;
                 }
                 StorageMessage::ContentDelta(content) => {
@@ -1206,7 +1206,7 @@ async fn create_response_stream(
                         logprobs: vec![],
                     };
 
-                    yield Ok(emitter.emit("response.output_text.delta", &delta_event).await);
+                    yield Ok(ResponseEvent::OutputTextDelta(delta_event).to_sse_event(&mut emitter).await);
                 }
 
                 StorageMessage::Usage { prompt_tokens: _, completion_tokens } => {
@@ -1225,7 +1225,7 @@ async fn create_response_stream(
                         },
                     };
 
-                    yield Ok(emitter.emit_without_sequence("response.cancelled", &cancelled_event).await);
+                    yield Ok(ResponseEvent::Cancelled(cancelled_event).to_sse_event(&mut emitter).await);
                     break;
                 }
                 StorageMessage::Error(error_msg) => {
@@ -1239,7 +1239,7 @@ async fn create_response_stream(
                         },
                     };
 
-                    yield Ok(emitter.emit_without_sequence("response.error", &error_event).await);
+                    yield Ok(ResponseEvent::Error(error_event).to_sse_event(&mut emitter).await);
                     break;
                 }
             }

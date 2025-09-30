@@ -6,8 +6,19 @@ use serde::Serialize;
 use tracing::{error, trace};
 use uuid::Uuid;
 
-use super::constants::{ERROR_DATA_ENCRYPTION_FAILED, ERROR_DATA_SERIALIZATION_FAILED};
-use super::handlers::encrypt_event;
+use super::constants::{
+    ERROR_DATA_ENCRYPTION_FAILED, ERROR_DATA_SERIALIZATION_FAILED, EVENT_RESPONSE_CANCELLED,
+    EVENT_RESPONSE_COMPLETED, EVENT_RESPONSE_CONTENT_PART_ADDED, EVENT_RESPONSE_CONTENT_PART_DONE,
+    EVENT_RESPONSE_CREATED, EVENT_RESPONSE_ERROR, EVENT_RESPONSE_IN_PROGRESS,
+    EVENT_RESPONSE_OUTPUT_ITEM_ADDED, EVENT_RESPONSE_OUTPUT_ITEM_DONE,
+    EVENT_RESPONSE_OUTPUT_TEXT_DELTA, EVENT_RESPONSE_OUTPUT_TEXT_DONE,
+};
+use super::handlers::{
+    encrypt_event, ResponseCancelledEvent, ResponseCompletedEvent, ResponseContentPartAddedEvent,
+    ResponseContentPartDoneEvent, ResponseCreatedEvent, ResponseErrorEvent,
+    ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent,
+    ResponseOutputTextDeltaEvent, ResponseOutputTextDoneEvent,
+};
 
 /// Handles SSE event emission with automatic encryption and error handling
 ///
@@ -114,6 +125,66 @@ impl<'a> SseEventEmitter<'a> {
     }
 }
 
+/// Type-safe event wrapper for all Response API events
+///
+/// This enum provides compile-time safety for event types, eliminating
+/// the possibility of typos in event names and making refactoring easier.
+///
+/// Each variant wraps the corresponding event struct and knows its event type string.
+pub enum ResponseEvent {
+    Created(ResponseCreatedEvent),
+    InProgress(ResponseInProgressEvent),
+    OutputItemAdded(ResponseOutputItemAddedEvent),
+    ContentPartAdded(ResponseContentPartAddedEvent),
+    OutputTextDelta(ResponseOutputTextDeltaEvent),
+    OutputTextDone(ResponseOutputTextDoneEvent),
+    ContentPartDone(ResponseContentPartDoneEvent),
+    OutputItemDone(ResponseOutputItemDoneEvent),
+    Completed(ResponseCompletedEvent),
+    Cancelled(ResponseCancelledEvent),
+    Error(ResponseErrorEvent),
+}
+
+impl ResponseEvent {
+    /// Get the event type string for SSE
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            ResponseEvent::Created(_) => EVENT_RESPONSE_CREATED,
+            ResponseEvent::InProgress(_) => EVENT_RESPONSE_IN_PROGRESS,
+            ResponseEvent::OutputItemAdded(_) => EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
+            ResponseEvent::ContentPartAdded(_) => EVENT_RESPONSE_CONTENT_PART_ADDED,
+            ResponseEvent::OutputTextDelta(_) => EVENT_RESPONSE_OUTPUT_TEXT_DELTA,
+            ResponseEvent::OutputTextDone(_) => EVENT_RESPONSE_OUTPUT_TEXT_DONE,
+            ResponseEvent::ContentPartDone(_) => EVENT_RESPONSE_CONTENT_PART_DONE,
+            ResponseEvent::OutputItemDone(_) => EVENT_RESPONSE_OUTPUT_ITEM_DONE,
+            ResponseEvent::Completed(_) => EVENT_RESPONSE_COMPLETED,
+            ResponseEvent::Cancelled(_) => EVENT_RESPONSE_CANCELLED,
+            ResponseEvent::Error(_) => EVENT_RESPONSE_ERROR,
+        }
+    }
+
+    /// Convert to SSE event with encryption
+    ///
+    /// This is a convenience method that automatically serializes and encrypts the event.
+    pub async fn to_sse_event(&self, emitter: &mut SseEventEmitter<'_>) -> Event {
+        match self {
+            ResponseEvent::Created(e) => emitter.emit(self.event_type(), e).await,
+            ResponseEvent::InProgress(e) => emitter.emit(self.event_type(), e).await,
+            ResponseEvent::OutputItemAdded(e) => emitter.emit(self.event_type(), e).await,
+            ResponseEvent::ContentPartAdded(e) => emitter.emit(self.event_type(), e).await,
+            ResponseEvent::OutputTextDelta(e) => emitter.emit(self.event_type(), e).await,
+            ResponseEvent::OutputTextDone(e) => emitter.emit(self.event_type(), e).await,
+            ResponseEvent::ContentPartDone(e) => emitter.emit(self.event_type(), e).await,
+            ResponseEvent::OutputItemDone(e) => emitter.emit(self.event_type(), e).await,
+            ResponseEvent::Completed(e) => emitter.emit(self.event_type(), e).await,
+            ResponseEvent::Cancelled(e) => {
+                emitter.emit_without_sequence(self.event_type(), e).await
+            }
+            ResponseEvent::Error(e) => emitter.emit_without_sequence(self.event_type(), e).await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +215,56 @@ mod tests {
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["message"], "test");
+    }
+
+    #[test]
+    fn test_event_type_mapping() {
+        use crate::web::responses::handlers::*;
+        use uuid::Uuid;
+
+        // Test that event types map correctly
+        let created = ResponseEvent::Created(ResponseCreatedEvent {
+            event_type: "response.created",
+            response: ResponsesCreateResponse {
+                id: Uuid::new_v4(),
+                object: "response",
+                created_at: 0,
+                status: "in_progress",
+                background: false,
+                error: None,
+                incomplete_details: None,
+                instructions: None,
+                max_output_tokens: None,
+                max_tool_calls: None,
+                model: "test".to_string(),
+                output: vec![],
+                parallel_tool_calls: false,
+                previous_response_id: None,
+                prompt_cache_key: None,
+                reasoning: ReasoningInfo {
+                    effort: None,
+                    summary: None,
+                },
+                safety_identifier: None,
+                store: true,
+                temperature: 1.0,
+                text: TextFormat {
+                    format: TextFormatSpec {
+                        format_type: "text".to_string(),
+                    },
+                },
+                tool_choice: "auto".to_string(),
+                tools: vec![],
+                top_logprobs: 0,
+                top_p: 1.0,
+                truncation: "disabled",
+                usage: None,
+                user: None,
+                metadata: None,
+            },
+            sequence_number: 0,
+        });
+
+        assert_eq!(created.event_type(), EVENT_RESPONSE_CREATED);
     }
 }

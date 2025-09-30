@@ -17,7 +17,7 @@ pub use builders::{build_usage, ContentPartBuilder, OutputItemBuilder, ResponseB
 pub use constants::*;
 pub use conversions::MessageContentConverter;
 pub use errors::error_mapping;
-pub use events::SseEventEmitter;
+pub use events::{ResponseEvent, SseEventEmitter};
 pub use storage::{storage_task, BillingEventPublisher, ContentAccumulator, ResponsePersister};
 pub use stream_processor::UpstreamStreamProcessor;
 

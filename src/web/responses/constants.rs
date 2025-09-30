@@ -17,6 +17,7 @@ pub const COST_PER_TOKEN: &str = "0.0000053";
 
 /// Response object types
 pub const OBJECT_TYPE_RESPONSE: &str = "response";
+pub const OBJECT_TYPE_RESPONSE_DELETED: &str = "response.deleted";
 pub const OBJECT_TYPE_CONVERSATION: &str = "conversation";
 pub const OBJECT_TYPE_LIST: &str = "list";
 

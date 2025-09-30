@@ -625,7 +625,30 @@ struct PersistedData {
     decrypted_metadata: Option<Value>,
 }
 
-/// Validate input and prepare encrypted content
+/// Phase 1: Validate input and prepare encrypted content
+///
+/// This phase performs all input validation and normalization without any side effects
+/// (no database writes). It ensures the request is valid before proceeding.
+///
+/// # Validations
+/// - Rejects guest users
+/// - Gets user encryption key
+/// - Normalizes message content to Parts format
+/// - Rejects unsupported features (file uploads)
+/// - Counts tokens for billing check
+/// - Encrypts content for storage
+/// - Generates assistant message UUID
+///
+/// # Arguments
+/// * `state` - Application state
+/// * `user` - Authenticated user
+/// * `body` - Request body
+///
+/// # Returns
+/// PreparedRequest containing validated and encrypted data
+///
+/// # Errors
+/// Returns ApiError if validation fails or user is unauthorized
 async fn validate_and_normalize_input(
     state: &Arc<AppState>,
     user: &User,
@@ -690,7 +713,35 @@ async fn validate_and_normalize_input(
     })
 }
 
-/// Build conversation context and check billing (before any persistence)
+/// Phase 2: Build conversation context and check billing
+///
+/// This phase is read-only - it builds the conversation context from existing
+/// messages and performs billing checks WITHOUT writing to the database. This
+/// ensures we don't persist data if the user is over quota.
+///
+/// # Operations
+/// - Gets conversation from database
+/// - Builds context from all existing messages
+/// - Adds the NEW user message to context (not yet persisted)
+/// - Checks billing quota (only for free users)
+/// - Validates token limits
+///
+/// # Critical Design Note
+/// The new user message is added to the context array but NOT yet persisted.
+/// This allows accurate billing checks before committing to storage.
+///
+/// # Arguments
+/// * `state` - Application state
+/// * `user` - Authenticated user
+/// * `body` - Request body
+/// * `user_key` - User's encryption key
+/// * `prepared` - Validated request data from Phase 1
+///
+/// # Returns
+/// BuiltContext containing conversation, prompt messages, and token count
+///
+/// # Errors
+/// Returns ApiError if conversation not found, billing check fails, or user over quota
 async fn build_context_and_check_billing(
     state: &Arc<AppState>,
     user: &User,
@@ -771,7 +822,37 @@ async fn build_context_and_check_billing(
     })
 }
 
-/// Persist request data to database (only called after all validation passes)
+/// Phase 3: Persist request data to database
+///
+/// This phase writes to the database ONLY after all validation and billing checks
+/// have passed. This ensures atomic semantics - either everything is written or
+/// nothing is written.
+///
+/// # Database Operations
+/// - Creates Response record (job tracker) with status=in_progress
+/// - Creates user message record linked to response
+/// - Creates placeholder assistant message (status=in_progress, content=NULL)
+/// - Encrypts metadata if provided
+/// - Extracts internal_message_id from metadata if present
+///
+/// # Design Notes
+/// - Placeholder assistant message allows clients to see in-progress status
+/// - Content is NULL until streaming completes
+/// - Response ID is used to link all related records
+/// - Metadata is encrypted before storage
+///
+/// # Arguments
+/// * `state` - Application state
+/// * `user` - Authenticated user
+/// * `body` - Request body
+/// * `prepared` - Validated request data from Phase 1
+/// * `conversation` - Conversation from Phase 2
+///
+/// # Returns
+/// PersistedData containing created records and decrypted metadata
+///
+/// # Errors
+/// Returns ApiError if database operations fail
 async fn persist_request_data(
     state: &Arc<AppState>,
     user: &User,
@@ -884,7 +965,42 @@ async fn persist_request_data(
     })
 }
 
-/// Setup streaming pipeline with channels and tasks
+/// Phase 4: Setup streaming pipeline with channels and tasks
+///
+/// This phase sets up the dual-stream architecture that allows simultaneous
+/// streaming to the client and storage to the database. The streaming continues
+/// independently even if the client disconnects.
+///
+/// # Architecture
+/// - Creates two channels: storage (critical) and client (best-effort)
+/// - Spawns storage task to persist data as it arrives
+/// - Spawns upstream processor to parse SSE from chat API
+/// - Returns client channel for SSE event generation
+///
+/// # Key Design Principles
+/// 1. **Dual streaming**: Client and storage streams operate independently
+/// 2. **Storage priority**: Storage sends must succeed, client sends can fail
+/// 3. **Independent lifecycle**: Streaming continues even if client disconnects
+/// 4. **Cancellation support**: Listens for cancellation broadcast signals
+///
+/// # Task Spawning
+/// - Storage task: Accumulates content and persists on completion
+/// - Upstream processor: Parses SSE frames and broadcasts to both channels
+///
+/// # Arguments
+/// * `state` - Application state
+/// * `user` - Authenticated user
+/// * `body` - Request body
+/// * `context` - Built context from Phase 2
+/// * `prepared` - Validated request data from Phase 1
+/// * `persisted` - Persisted records from Phase 3
+/// * `headers` - Request headers for upstream API call
+///
+/// # Returns
+/// Tuple of (client channel receiver, response record) for SSE stream generation
+///
+/// # Errors
+/// Returns ApiError if chat API call fails or channel creation fails
 async fn setup_streaming_pipeline(
     state: &Arc<AppState>,
     user: &User,
@@ -1443,7 +1559,7 @@ async fn delete_response(
 
     let response = ResponsesDeleteResponse {
         id,
-        object: "response.deleted",
+        object: OBJECT_TYPE_RESPONSE_DELETED,
         deleted: true,
     };
 

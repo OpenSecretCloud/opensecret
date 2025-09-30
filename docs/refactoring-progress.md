@@ -630,9 +630,66 @@ let response = ConversationBuilder::from_conversation(&conversation)
 
 ---
 
-#### Step 4-8: Additional Refactoring (Future)
-- ConversationContext helper
+#### ✅ Step 4: ConversationContext Helper
+**Commit**: `refactor: Extract ConversationContext helper to eliminate repeated conversation loading pattern`
+**Status**: Completed
+
+##### Changes Made
+- **Created `ConversationContext` struct** in `src/web/conversations.rs`
+  - `load()` method that gets both conversation and user key in one operation
+  - `decrypt_metadata()` helper method for consistent metadata decryption
+  - Comprehensive inline documentation
+
+- **Updated 5 handlers** to use ConversationContext (all that needed it):
+  1. ✅ `get_conversation` (lines 318-338): 32 lines → 20 lines (-12 lines, -37.5%)
+  2. ✅ `update_conversation` (lines 340-374): 45 lines → 35 lines (-10 lines, -22.2%)
+  3. ✅ `delete_conversation` (lines 376-403): 32 lines → 28 lines (-4 lines, -12.5%)
+  4. ✅ `list_conversation_items` (lines 405-572): Reduced setup code by 12 lines
+  5. ✅ `get_conversation_item` (lines 575-668): Reduced setup code by 12 lines
+
+##### Impact
+- ✅ **Eliminated ~89 lines of repeated code** across 5 handlers
+- ✅ **Added 64 lines** for ConversationContext helper (well-documented, reusable)
+- ✅ **Net reduction: 25 lines** (827 → 802 lines, -3.0%)
+- ✅ **Consistent error handling** - All conversation loading uses same pattern
+- ✅ **Better maintainability** - Single place to update conversation loading logic
+- ✅ **Type safety** - Compiler ensures conversation and key are loaded together
+- ✅ **Similar pattern to responses handlers** - Consistent with PreparedRequest/BuiltContext
+
+##### Code Pattern Changed
+**Before (repeated 5 times):**
+```rust
+// Get conversation
+let conversation = state
+    .db
+    .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
+    .map_err(error_mapping::map_conversation_error)?;
+
+// Get user key
+let user_key = state
+    .get_user_key(user.uuid, None, None)
+    .await
+    .map_err(|_| error_mapping::map_key_retrieval_error())?;
+```
+
+**After:**
+```rust
+let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
+// Use: ctx.conversation and ctx.user_key
+// Optional: let metadata = ctx.decrypt_metadata()?;
+```
+
+##### Build Status
+- ✅ `cargo build` - Compiles successfully
+- ✅ `cargo fmt` - Clean
+- ✅ `cargo clippy` - No warnings
+- ✅ Zero breaking changes to external APIs
+
+---
+
+#### Step 5-8: Additional Refactoring (Future)
 - ConversationItemConverter
+- Move conversations to responses directory
 - Pagination utilities
 - Unified delete response types
 

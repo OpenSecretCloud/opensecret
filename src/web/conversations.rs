@@ -32,6 +32,70 @@ use tracing::{debug, error, trace};
 use uuid::Uuid;
 
 // ============================================================================
+// Context Helper
+// ============================================================================
+
+/// Conversation context with decryption key
+///
+/// This helper encapsulates the common pattern of loading a conversation
+/// and the user's encryption key together. Used by most conversation handlers.
+struct ConversationContext {
+    conversation: crate::models::responses::Conversation,
+    user_key: secp256k1::SecretKey,
+}
+
+impl ConversationContext {
+    /// Load conversation and user's encryption key in one operation
+    ///
+    /// Verifies conversation exists, user owns it, and retrieves encryption key.
+    ///
+    /// # Arguments
+    /// * `state` - Application state
+    /// * `conversation_id` - UUID of the conversation to load
+    /// * `user_uuid` - UUID of the user requesting access
+    ///
+    /// # Returns
+    /// ConversationContext containing the conversation and encryption key
+    ///
+    /// # Errors
+    /// Returns ApiError if conversation not found, user doesn't own it, or key retrieval fails
+    async fn load(
+        state: &AppState,
+        conversation_id: Uuid,
+        user_uuid: Uuid,
+    ) -> Result<Self, ApiError> {
+        // Get conversation (verifies ownership)
+        let conversation = state
+            .db
+            .get_conversation_by_uuid_and_user(conversation_id, user_uuid)
+            .map_err(error_mapping::map_conversation_error)?;
+
+        // Get user's encryption key
+        let user_key = state
+            .get_user_key(user_uuid, None, None)
+            .await
+            .map_err(|_| error_mapping::map_key_retrieval_error())?;
+
+        Ok(Self {
+            conversation,
+            user_key,
+        })
+    }
+
+    /// Decrypt conversation metadata
+    ///
+    /// # Returns
+    /// Option<Value> containing decrypted metadata, or None if no metadata exists
+    ///
+    /// # Errors
+    /// Returns ApiError if decryption fails
+    fn decrypt_metadata(&self) -> Result<Option<Value>, ApiError> {
+        decrypt_content(&self.user_key, self.conversation.metadata_enc.as_ref())
+            .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))
+    }
+}
+
+// ============================================================================
 // Request/Response Types
 // ============================================================================
 
@@ -263,22 +327,10 @@ async fn get_conversation(
         conversation_id, user.uuid
     );
 
-    let conversation = state
-        .db
-        .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
-        .map_err(error_mapping::map_conversation_error)?;
+    let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
+    let metadata = ctx.decrypt_metadata()?;
 
-    // Get user's encryption key for decrypting metadata
-    let user_key = state
-        .get_user_key(user.uuid, None, None)
-        .await
-        .map_err(|_| ApiError::InternalServerError)?;
-
-    // Decrypt metadata
-    let metadata = decrypt_content(&user_key, conversation.metadata_enc.as_ref())
-        .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))?;
-
-    let response = ConversationBuilder::from_conversation(&conversation)
+    let response = ConversationBuilder::from_conversation(&ctx.conversation)
         .metadata(metadata)
         .build();
 
@@ -298,36 +350,23 @@ async fn update_conversation(
         conversation_id, user.uuid
     );
 
-    // Get the conversation to ensure it exists and user owns it
-    let mut conversation = state
-        .db
-        .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
-        .map_err(error_mapping::map_conversation_error)?;
-
-    // Get user's encryption key
-    let user_key = state
-        .get_user_key(user.uuid, None, None)
-        .await
-        .map_err(|_| error_mapping::map_key_retrieval_error())?;
+    let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
 
     // Encrypt the updated metadata
     let metadata_json = serde_json::to_string(&body.metadata)
         .map_err(|_| error_mapping::map_serialization_error("metadata"))?;
-    let metadata_enc = encrypt_with_key(&user_key, metadata_json.as_bytes()).await;
+    let metadata_enc = encrypt_with_key(&ctx.user_key, metadata_json.as_bytes()).await;
 
     // Update metadata in database
     state
         .db
-        .update_conversation_metadata(conversation.id, user.uuid, metadata_enc.clone())
+        .update_conversation_metadata(ctx.conversation.id, user.uuid, metadata_enc.clone())
         .map_err(error_mapping::map_generic_db_error)?;
 
-    // Update the in-memory object to reflect the changes
-    conversation.metadata_enc = Some(metadata_enc);
-
-    // For the response, return the decrypted metadata
+    // For the response, return the decrypted metadata (already have it from body)
     let response_metadata = Some(body.metadata.clone());
 
-    let response = ConversationBuilder::from_conversation(&conversation)
+    let response = ConversationBuilder::from_conversation(&ctx.conversation)
         .metadata(response_metadata)
         .build();
 
@@ -346,20 +385,16 @@ async fn delete_conversation(
         conversation_id, user.uuid
     );
 
-    // Get the conversation to ensure it exists and user owns it
-    let conversation = state
-        .db
-        .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
-        .map_err(error_mapping::map_conversation_error)?;
+    let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
 
     // Delete the conversation (cascades will delete all associated responses)
     state
         .db
-        .delete_conversation(conversation.id, user.uuid)
+        .delete_conversation(ctx.conversation.id, user.uuid)
         .map_err(error_mapping::map_generic_db_error)?;
 
     let response = DeletedConversationResponse {
-        id: conversation.uuid,
+        id: ctx.conversation.uuid,
         object: OBJECT_TYPE_CONVERSATION_DELETED,
         deleted: true,
     };
@@ -380,22 +415,12 @@ async fn list_conversation_items(
         conversation_id, user.uuid
     );
 
-    // Verify conversation exists and user owns it
-    let conversation = state
-        .db
-        .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
-        .map_err(error_mapping::map_conversation_error)?;
-
-    // Get user's encryption key
-    let user_key = state
-        .get_user_key(user.uuid, None, None)
-        .await
-        .map_err(|_| error_mapping::map_key_retrieval_error())?;
+    let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
 
     // Get all messages from the conversation
     let raw_messages = state
         .db
-        .get_conversation_context_messages(conversation.id)
+        .get_conversation_context_messages(ctx.conversation.id)
         .map_err(error_mapping::map_message_error)?;
 
     trace!(
@@ -440,7 +465,7 @@ async fn list_conversation_items(
         );
 
         // Decrypt content (handle nullable content_enc)
-        let content = decrypt_string(&user_key, msg.content_enc.as_ref())
+        let content = decrypt_string(&ctx.user_key, msg.content_enc.as_ref())
             .map_err(|_| error_mapping::map_decryption_error("message content"))?
             .unwrap_or_default();
 
@@ -559,29 +584,19 @@ async fn get_conversation_item(
         item_id, conversation_id, user.uuid
     );
 
-    // Verify conversation exists and user owns it
-    let conversation = state
-        .db
-        .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
-        .map_err(error_mapping::map_conversation_error)?;
-
-    // Get user's encryption key
-    let user_key = state
-        .get_user_key(user.uuid, None, None)
-        .await
-        .map_err(|_| error_mapping::map_key_retrieval_error())?;
+    let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
 
     // Get all messages from the conversation
     let raw_messages = state
         .db
-        .get_conversation_context_messages(conversation.id)
+        .get_conversation_context_messages(ctx.conversation.id)
         .map_err(error_mapping::map_message_error)?;
 
     // Find the specific item
     for msg in raw_messages {
         if msg.uuid == item_id {
             // Decrypt content (handle nullable content_enc)
-            let content = decrypt_string(&user_key, msg.content_enc.as_ref())
+            let content = decrypt_string(&ctx.user_key, msg.content_enc.as_ref())
                 .map_err(|e| {
                     error!("Failed to decrypt message content: {:?}", e);
                     ApiError::InternalServerError

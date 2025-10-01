@@ -618,6 +618,129 @@ struct PersistedData {
     decrypted_metadata: Option<Value>,
 }
 
+/// Spawns a background task to generate a conversation title using AI
+///
+/// This function runs asynchronously and independently - it will not block the response stream.
+/// If it fails, it logs the error but does not affect the ongoing response.
+///
+/// # Arguments
+/// * `state` - Application state for database and API access
+/// * `conversation_id` - Database ID of the conversation
+/// * `conversation_uuid` - UUID of the conversation
+/// * `user` - The user who owns the conversation
+/// * `user_key` - User's encryption key for metadata
+/// * `user_content` - The user's first message content
+async fn spawn_title_generation_task(
+    state: Arc<AppState>,
+    conversation_id: i64,
+    conversation_uuid: Uuid,
+    user: User,
+    user_key: SecretKey,
+    user_content: String,
+) {
+    tokio::spawn(async move {
+        debug!("Starting background title generation for conversation {}", conversation_uuid);
+
+        // Truncate content to first 500 characters
+        let truncated_content: String = user_content.chars().take(500).collect();
+        trace!("Truncated content for title generation: {}", truncated_content);
+
+        // Build the title generation request
+        let title_request = json!({
+            "model": "llama-3.3-70b",
+            "messages": [
+                {
+                    "role": ROLE_SYSTEM,
+                    "content": "You are a helpful assistant that generates concise, meaningful titles (3-5 words) for chat conversations based on the user's first message. Return only the title without quotes or explanations."
+                },
+                {
+                    "role": ROLE_USER,
+                    "content": format!("Generate a concise, contextual title (3-5 words) for a chat that starts with this message: \"{}\"", truncated_content)
+                }
+            ],
+            "temperature": DEFAULT_TEMPERATURE,
+            "max_tokens": 15,
+            "stream": false
+        });
+
+        // Call the completions API with empty headers (no special headers needed)
+        let headers = HeaderMap::new();
+        match get_chat_completion_response(&state, &user, title_request, &headers).await {
+            Ok(response) => {
+                // Read the response body
+                match hyper::body::to_bytes(response.into_body()).await {
+                    Ok(body_bytes) => {
+                        let response_str = String::from_utf8_lossy(&body_bytes);
+
+                        // Parse the JSON response
+                        match serde_json::from_str::<Value>(&response_str) {
+                            Ok(response_json) => {
+                                // Extract the title from choices[0].message.content
+                                if let Some(title) = response_json
+                                    .get("choices")
+                                    .and_then(|c| c.get(0))
+                                    .and_then(|c| c.get("message"))
+                                    .and_then(|m| m.get("content"))
+                                    .and_then(|c| c.as_str())
+                                {
+                                    let title = title.trim();
+                                    trace!("Generated title for conversation {}: {}", conversation_uuid, title);
+
+                                    // Get current conversation metadata
+                                    match state.db.get_conversation_by_uuid_and_user(conversation_uuid, user.uuid) {
+                                        Ok(conversation) => {
+                                            // Decrypt existing metadata
+                                            match decrypt_content(&user_key, conversation.metadata_enc.as_ref()) {
+                                                Ok(metadata) => {
+                                                    // Update the title in metadata
+                                                    let mut meta_obj = metadata.unwrap_or_else(|| json!({}));
+                                                    if let Some(obj) = meta_obj.as_object_mut() {
+                                                        obj.insert("title".to_string(), json!(title));
+                                                    }
+
+                                                    // Encrypt and update
+                                                    if let Ok(metadata_json) = serde_json::to_string(&meta_obj) {
+                                                        let metadata_enc = encrypt_with_key(&user_key, metadata_json.as_bytes()).await;
+
+                                                        if let Err(e) = state.db.update_conversation_metadata(conversation_id, user.uuid, metadata_enc) {
+                                                            error!("Failed to update conversation metadata with generated title: {:?}", e);
+                                                        } else {
+                                                            debug!("Successfully updated conversation {} with generated title", conversation_uuid);
+                                                        }
+                                                    } else {
+                                                        error!("Failed to serialize updated metadata");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to decrypt conversation metadata: {:?}", e);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to get conversation for title update: {:?}", e);
+                                        }
+                                    }
+                                } else {
+                                    error!("Failed to extract title from API response");
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to parse title generation response: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to read title generation response body: {:?}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to generate conversation title: {:?}", e);
+            }
+        }
+    });
+}
+
 /// Phase 1: Validate input and prepare encrypted content
 ///
 /// This phase performs all input validation and normalization without any side effects
@@ -1137,9 +1260,42 @@ async fn create_response_stream(
         build_context_and_check_billing(&state, &user, &body, &prepared.user_key, &prepared)
             .await?;
 
+    // Check if this is the first user message in the conversation
+    // The context.prompt_messages includes the NEW user message (added in build_context_and_check_billing)
+    // Count user and assistant messages - if there's exactly 1 user and 0 assistant, it's the first message
+    let (user_count, assistant_count) = context
+        .prompt_messages
+        .iter()
+        .fold((0, 0), |(users, assistants), msg| {
+            match msg.get("role").and_then(|r| r.as_str()) {
+                Some(ROLE_USER) => (users + 1, assistants),
+                Some(ROLE_ASSISTANT) => (users, assistants + 1),
+                _ => (users, assistants),
+            }
+        });
+    let is_first_message = user_count == 1 && assistant_count == 0;
+
     // Phase 3: Persist to database (only after all checks pass)
     let persisted =
         persist_request_data(&state, &user, &body, &prepared, &context.conversation).await?;
+
+    // If this is the first message, spawn background task to generate conversation title
+    if is_first_message {
+        debug!("First message detected, spawning title generation task for conversation {}", context.conversation.uuid);
+
+        // Extract text content for title generation
+        let user_content = MessageContentConverter::extract_text_for_token_counting(&prepared.message_content);
+
+        spawn_title_generation_task(
+            state.clone(),
+            context.conversation.id,
+            context.conversation.uuid,
+            user.clone(),
+            prepared.user_key,
+            user_content,
+        )
+        .await;
+    }
 
     // Phase 4: Setup streaming pipeline
     let (mut rx_client, response) = setup_streaming_pipeline(

@@ -481,8 +481,8 @@ pub trait DBConnection {
         &self,
         user_id: Uuid,
         limit: i64,
-        after: Option<(DateTime<Utc>, i64)>,
-        before: Option<(DateTime<Utc>, i64)>,
+        after: Option<Uuid>,
+        order: &str,
     ) -> Result<Vec<Conversation>, DBError>;
     fn delete_conversation(&self, conversation_id: i64, user_id: Uuid) -> Result<(), DBError>;
 
@@ -1986,12 +1986,12 @@ impl DBConnection for PostgresConnection {
         &self,
         user_id: Uuid,
         limit: i64,
-        after: Option<(DateTime<Utc>, i64)>,
-        before: Option<(DateTime<Utc>, i64)>,
+        after: Option<Uuid>,
+        order: &str,
     ) -> Result<Vec<Conversation>, DBError> {
         debug!("Listing conversations for user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        Conversation::list_for_user(conn, user_id, limit, after, before).map_err(DBError::from)
+        Conversation::list_for_user(conn, user_id, limit, after, order).map_err(DBError::from)
     }
 
     fn delete_conversation(&self, conversation_id: i64, user_id: Uuid) -> Result<(), DBError> {

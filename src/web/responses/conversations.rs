@@ -177,7 +177,6 @@ pub struct ListConversationsParams {
     #[serde(default = "default_limit")]
     pub limit: i64,
     pub after: Option<Uuid>,
-    pub before: Option<Uuid>,
     #[serde(default = "default_order")]
     pub order: String,
 }
@@ -490,48 +489,43 @@ async fn list_conversations(
 ) -> Result<Json<EncryptedResponse<ConversationListResponse>>, ApiError> {
     debug!("Listing conversations for user: {}", user.uuid);
 
+    // Validate limit
     let limit = params.limit.min(MAX_PAGINATION_LIMIT);
-    let order = &params.order;
 
-    // Convert UUID cursors to (updated_at, id) tuples
-    let after_cursor = if let Some(after_uuid) = params.after {
-        state
-            .db
-            .get_conversation_by_uuid_and_user(after_uuid, user.uuid)
-            .ok()
-            .map(|conv| (conv.updated_at, conv.id))
-    } else {
-        None
-    };
-
-    let before_cursor = if let Some(before_uuid) = params.before {
-        state
-            .db
-            .get_conversation_by_uuid_and_user(before_uuid, user.uuid)
-            .ok()
-            .map(|conv| (conv.updated_at, conv.id))
-    } else {
-        None
-    };
-
-    // Get conversations
+    // Fetch conversations with database-level pagination
+    // We fetch limit + 1 to check if there are more results
     let conversations = state
         .db
-        .list_conversations(user.uuid, limit + 1, after_cursor, before_cursor)
+        .list_conversations(user.uuid, limit + 1, params.after, &params.order)
         .map_err(error_mapping::map_generic_db_error)?;
 
-    // Apply pagination using centralized utilities
-    let (conversations, has_more) = Paginator::paginate(conversations, limit);
-    let conversations = Paginator::apply_order(conversations, order);
+    trace!(
+        "Retrieved {} conversations for user {} (limit={}, after={:?}, order={})",
+        conversations.len(),
+        user.uuid,
+        limit,
+        params.after,
+        params.order
+    );
 
-    // Get user's encryption key for decrypting titles
+    // Check if there are more results
+    let has_more = conversations.len() > limit as usize;
+
+    // Take only the requested limit
+    let conversations_to_return = if has_more {
+        &conversations[..limit as usize]
+    } else {
+        &conversations[..]
+    };
+
+    // Get user's encryption key for decrypting metadata
     let user_key = state
         .get_user_key(user.uuid, None, None)
         .await
         .map_err(|_| ApiError::InternalServerError)?;
 
     // Convert to response format
-    let data: Vec<ConversationResponse> = conversations
+    let data: Vec<ConversationResponse> = conversations_to_return
         .iter()
         .map(|conv| -> Result<ConversationResponse, ApiError> {
             trace!("Raw conversation object: {:?}", conv);
@@ -547,8 +541,8 @@ async fn list_conversations(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    // Extract cursor IDs using centralized utility
-    let (first_id, last_id) = Paginator::get_cursor_ids(&conversations, |c| c.uuid);
+    // Extract cursor IDs
+    let (first_id, last_id) = Paginator::get_cursor_ids(conversations_to_return, |c| c.uuid);
 
     let response = ConversationListResponse {
         object: OBJECT_TYPE_LIST,

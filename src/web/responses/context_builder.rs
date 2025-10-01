@@ -110,19 +110,17 @@ pub fn build_prompt_from_chat_messages(
     let safety = 500usize;
     let ctx_budget = max_ctx.saturating_sub(response_reserve + safety);
 
+    let raw_msg_count = msgs.len();
     let mut total: usize = msgs.iter().map(|m| m.tok).sum();
 
     if total > ctx_budget {
         // Middle truncation: keep first messages + truncate middle
         let mut head: Vec<ChatMsg> = Vec::new();
         let mut tail: Vec<ChatMsg> = Vec::new();
-        let mut tail_tokens = 0usize;
 
         // Always preserve the first system message (user instructions) if present
-        // Then keep first user + first assistant if present
+        // Then keep first user message only (first assistant gets removed)
         let mut has_system = false;
-        let mut has_user = false;
-        let mut has_assistant = false;
 
         for m in &msgs {
             // Always keep the first system message (this is the user's default instructions)
@@ -132,22 +130,9 @@ pub fn build_prompt_from_chat_messages(
                 continue;
             }
             // Keep first user message
-            if m.role == ROLE_USER && !has_user {
+            if m.role == ROLE_USER {
                 head.push(m.clone());
-                has_user = true;
-                continue;
-            }
-            // Keep first assistant response
-            if m.role == ROLE_ASSISTANT && !has_assistant {
-                head.push(m.clone());
-                has_assistant = true;
-            }
-            // Stop once we have system (if any) + user + assistant
-            if (has_system || !msgs.iter().any(|m| m.role == ROLE_SYSTEM))
-                && has_user
-                && has_assistant
-            {
-                break;
+                break; // Stop after first user - don't keep first assistant
             }
         }
 
@@ -159,30 +144,44 @@ pub fn build_prompt_from_chat_messages(
         let available_for_tail = ctx_budget.saturating_sub(head_tokens + truncation_msg_tokens);
 
         // Collect messages from the end until we hit the budget
+        // We need to ensure tail starts with a user message (for proper alternation after assistant truncation)
+        let mut potential_tail: Vec<ChatMsg> = Vec::new();
+        let mut potential_tail_tokens = 0usize;
+
         for m in msgs.iter().rev() {
-            if tail_tokens + m.tok > available_for_tail {
+            if potential_tail_tokens + m.tok > available_for_tail {
                 break;
             }
-            tail.push(m.clone());
-            tail_tokens += m.tok;
+            potential_tail.push(m.clone());
+            potential_tail_tokens += m.tok;
         }
-        tail.reverse();
+        potential_tail.reverse();
+
+        // Ensure tail starts with a user message (drop leading assistant messages if needed)
+        let mut found_user = false;
+        for m in potential_tail {
+            if !found_user {
+                if m.role == ROLE_USER {
+                    found_user = true;
+                    tail.push(m);
+                }
+                // Skip any leading non-user messages
+            } else {
+                tail.push(m);
+            }
+        }
 
         // Reconstruct with truncation message
+        // Only add truncation message if we're actually truncating something
+        // The truncation message is always an assistant message, representing the removed assistant→...→assistant block
+        let total_msgs = head.len() + tail.len();
+        let did_truncate = total_msgs < raw_msg_count;
+
         msgs = head;
 
-        // Only add truncation message if we're actually truncating something
-        if !tail.is_empty() || msgs.len() < msgs.len() {
-            // Check last role to avoid duplicate user messages
-            let last_role = msgs.last().map(|m| m.role).unwrap_or("");
-            let truncation_role = if last_role == ROLE_USER {
-                ROLE_ASSISTANT
-            } else {
-                ROLE_USER
-            };
-
+        if did_truncate {
             msgs.push(ChatMsg {
-                role: truncation_role,
+                role: ROLE_ASSISTANT,
                 content: "[Previous messages truncated due to context limits]".to_string(),
                 tool_call_id: None,
                 tok: truncation_msg_tokens,
@@ -255,9 +254,20 @@ mod tests {
 
     // Helper to create a ChatMsg
     fn create_chat_msg(role: &'static str, content: &str, tokens: Option<usize>) -> ChatMsg {
+        use crate::web::responses::MessageContent;
+
+        // User messages need to be stored as MessageContent JSON
+        let content_str = if role == ROLE_USER {
+            // Serialize as MessageContent::Text (which is just a JSON string)
+            let mc = MessageContent::Text(content.to_string());
+            serde_json::to_string(&mc).unwrap()
+        } else {
+            content.to_string()
+        };
+
         ChatMsg {
             role,
-            content: content.to_string(),
+            content: content_str,
             tool_call_id: None,
             tok: tokens.unwrap_or_else(|| count_tokens(content)),
         }
@@ -348,8 +358,7 @@ mod tests {
             "deepseek-r1-70b", // 64k context limit
         );
 
-        assert!(result.is_ok());
-        let (messages, total_tokens) = result.unwrap();
+        let (messages, total_tokens) = result.expect("Failed to build prompt");
 
         // Should have truncated middle messages
         assert!(
@@ -357,18 +366,68 @@ mod tests {
             "Expected truncation to occur"
         );
 
-        // First messages should be preserved
+        // First user message should be preserved
         assert_eq!(messages[0]["content"], "First user message");
-        assert_eq!(messages[1]["content"], "First assistant reply");
+        assert_eq!(messages[0]["role"], "user");
 
-        // Should have truncation message
-        let has_truncation = messages
+        // Find truncation message
+        let truncation_idx = messages
             .iter()
-            .any(|m| m["content"].as_str().unwrap_or("").contains("truncated"));
-        assert!(has_truncation);
+            .position(|m| m["content"].as_str().unwrap_or("").contains("truncated"))
+            .expect("Should have truncation message");
+
+        // Truncation message must ALWAYS be assistant role
+        assert_eq!(
+            messages[truncation_idx]["role"], "assistant",
+            "Truncation message must always be assistant role"
+        );
+
+        // Message before truncation should be user (the first user message we kept)
+        assert_eq!(
+            messages[truncation_idx - 1]["role"], "user",
+            "Message before truncation should be user"
+        );
+        assert_eq!(
+            messages[truncation_idx - 1]["content"], "First user message",
+            "Should be the first user message"
+        );
+
+        // Message after truncation should be user (start of tail)
+        assert_eq!(
+            messages[truncation_idx + 1]["role"], "user",
+            "Message after truncation should be user"
+        );
 
         // Last message should be the new input
         assert_eq!(messages.last().unwrap()["content"], "Final message");
+        assert_eq!(messages.last().unwrap()["role"], "user");
+
+        // Verify proper role alternation throughout
+        for i in 0..messages.len() - 1 {
+            let curr_role = messages[i]["role"].as_str().unwrap();
+            let next_role = messages[i + 1]["role"].as_str().unwrap();
+
+            // Exception: user → assistant truncation message
+            if i == truncation_idx - 1 {
+                assert_eq!(curr_role, "user");
+                assert_eq!(next_role, "assistant");
+                continue;
+            }
+
+            // Exception: assistant truncation → user (start of tail)
+            if i == truncation_idx {
+                assert_eq!(curr_role, "assistant");
+                assert_eq!(next_role, "user");
+                continue;
+            }
+
+            // Otherwise roles should alternate
+            assert_ne!(
+                curr_role, next_role,
+                "Roles should alternate at position {}",
+                i
+            );
+        }
 
         // Total tokens should be within budget
         let budget = 64_000 - 4096 - 500; // max - response_reserve - safety
@@ -376,39 +435,42 @@ mod tests {
     }
 
     #[test]
-    fn test_role_alternation_with_truncation() {
-        // Force truncation by using massive token counts
+    fn test_truncation_with_system_message() {
+        // Force truncation with a system message at the start
         let msgs = vec![
+            create_chat_msg("system", "You are a helpful assistant", Some(10)),
             create_chat_msg("user", "First", Some(20000)),
-            create_chat_msg("user", "Second user message", Some(20000)), // Duplicate user
-            create_chat_msg("assistant", "Reply", Some(20000)),
+            create_chat_msg("assistant", "First reply", Some(20000)),
+            create_chat_msg("user", "Second", Some(20000)),
+            create_chat_msg("assistant", "Second reply", Some(20000)),
             create_chat_msg("user", "New message", Some(5)),
         ];
 
         let result = build_prompt_from_chat_messages(msgs, "deepseek-r1-70b");
 
-        assert!(result.is_ok());
-        let (messages, _) = result.unwrap();
+        let (messages, _) = result.expect("Failed to build prompt");
 
-        // Check that truncation message has appropriate role
+        // Find truncation message
         let truncation_idx = messages
             .iter()
-            .position(|m| m["content"].as_str().unwrap_or("").contains("truncated"));
+            .position(|m| m["content"].as_str().unwrap_or("").contains("truncated"))
+            .expect("Should have truncation message");
 
-        if let Some(idx) = truncation_idx {
-            // Check the role before truncation message
-            if idx > 0 {
-                let prev_role = messages[idx - 1]["role"].as_str().unwrap();
-                let truncation_role = messages[idx]["role"].as_str().unwrap();
+        // Should have pattern: system, user, assistant (truncation), user
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "You are a helpful assistant");
 
-                // If previous was user, truncation should be assistant
-                if prev_role == "user" {
-                    assert_eq!(
-                        truncation_role, "assistant",
-                        "Truncation message should alternate roles"
-                    );
-                }
-            }
-        }
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "First");
+
+        assert_eq!(messages[2]["role"], "assistant");
+        assert!(messages[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("truncated"));
+        assert_eq!(truncation_idx, 2);
+
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], "New message");
     }
 }

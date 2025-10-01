@@ -718,86 +718,205 @@ impl RawThreadMessage {
     pub fn get_conversation_context(
         conn: &mut PgConnection,
         conversation_id: i64,
+        limit: i64,
+        after: Option<Uuid>,
+        order: &str,
     ) -> Result<Vec<RawThreadMessage>, ResponsesError> {
-        let query = r#"
-            WITH conversation_messages AS (
-                -- User messages
-                SELECT
-                    'user' as message_type,
-                    um.id,
-                    um.uuid,
-                    um.content_enc,
-                    'completed'::text as status,
-                    um.created_at,
-                    r.model,
-                    um.prompt_tokens as token_count,
-                    NULL::uuid as tool_call_id,
-                    NULL::text as finish_reason
-                FROM user_messages um
-                LEFT JOIN responses r ON um.response_id = r.id
-                WHERE um.conversation_id = $1
+        // First, if we have an 'after' cursor, we need to find its created_at and id
+        // We'll use a subquery to handle this
+        let order_clause = if order == "desc" {
+            "ORDER BY created_at DESC, id DESC"
+        } else {
+            "ORDER BY created_at ASC, id ASC"
+        };
 
-                UNION ALL
+        let query = if after.is_some() {
+            format!(
+                r#"
+                WITH conversation_messages AS (
+                    -- User messages
+                    SELECT
+                        'user' as message_type,
+                        um.id,
+                        um.uuid,
+                        um.content_enc,
+                        'completed'::text as status,
+                        um.created_at,
+                        r.model,
+                        um.prompt_tokens as token_count,
+                        NULL::uuid as tool_call_id,
+                        NULL::text as finish_reason
+                    FROM user_messages um
+                    LEFT JOIN responses r ON um.response_id = r.id
+                    WHERE um.conversation_id = $1
 
-                -- Assistant messages
-                SELECT
-                    'assistant' as message_type,
-                    am.id,
-                    am.uuid,
-                    am.content_enc,
-                    am.status,
-                    am.created_at,
-                    r.model,
-                    am.completion_tokens as token_count,
-                    NULL::uuid as tool_call_id,
-                    am.finish_reason
-                FROM assistant_messages am
-                LEFT JOIN responses r ON am.response_id = r.id
-                WHERE am.conversation_id = $1
+                    UNION ALL
 
-                UNION ALL
+                    -- Assistant messages
+                    SELECT
+                        'assistant' as message_type,
+                        am.id,
+                        am.uuid,
+                        am.content_enc,
+                        am.status,
+                        am.created_at,
+                        r.model,
+                        am.completion_tokens as token_count,
+                        NULL::uuid as tool_call_id,
+                        am.finish_reason
+                    FROM assistant_messages am
+                    LEFT JOIN responses r ON am.response_id = r.id
+                    WHERE am.conversation_id = $1
 
-                -- Tool calls
-                SELECT
-                    'tool_call' as message_type,
-                    tc.id,
-                    tc.uuid,
-                    tc.arguments_enc as content_enc,
-                    'completed'::text as status,
-                    tc.created_at,
-                    NULL::text as model,
-                    tc.argument_tokens as token_count,
-                    tc.tool_call_id,
-                    NULL::text as finish_reason
-                FROM tool_calls tc
-                WHERE tc.conversation_id = $1
+                    UNION ALL
 
-                UNION ALL
+                    -- Tool calls
+                    SELECT
+                        'tool_call' as message_type,
+                        tc.id,
+                        tc.uuid,
+                        tc.arguments_enc as content_enc,
+                        'completed'::text as status,
+                        tc.created_at,
+                        NULL::text as model,
+                        tc.argument_tokens as token_count,
+                        tc.tool_call_id,
+                        NULL::text as finish_reason
+                    FROM tool_calls tc
+                    WHERE tc.conversation_id = $1
 
-                -- Tool outputs
-                SELECT
-                    'tool_output' as message_type,
-                    tto.id,
-                    tto.uuid,
-                    tto.output_enc as content_enc,
-                    'completed'::text as status,
-                    tto.created_at,
-                    NULL::text as model,
-                    tto.output_tokens as token_count,
-                    tc.tool_call_id,
-                    NULL::text as finish_reason
-                FROM tool_outputs tto
-                JOIN tool_calls tc ON tto.tool_call_fk = tc.id
-                WHERE tto.conversation_id = $1
+                    UNION ALL
+
+                    -- Tool outputs
+                    SELECT
+                        'tool_output' as message_type,
+                        tto.id,
+                        tto.uuid,
+                        tto.output_enc as content_enc,
+                        'completed'::text as status,
+                        tto.created_at,
+                        NULL::text as model,
+                        tto.output_tokens as token_count,
+                        tc.tool_call_id,
+                        NULL::text as finish_reason
+                    FROM tool_outputs tto
+                    JOIN tool_calls tc ON tto.tool_call_fk = tc.id
+                    WHERE tto.conversation_id = $1
+                ),
+                cursor_message AS (
+                    SELECT created_at, id
+                    FROM conversation_messages
+                    WHERE uuid = $2
+                )
+                SELECT cm.*
+                FROM conversation_messages cm, cursor_message
+                WHERE {}
+                {}
+                LIMIT $3
+                "#,
+                if order == "desc" {
+                    "(cm.created_at < cursor_message.created_at) OR (cm.created_at = cursor_message.created_at AND cm.id < cursor_message.id)"
+                } else {
+                    "(cm.created_at > cursor_message.created_at) OR (cm.created_at = cursor_message.created_at AND cm.id > cursor_message.id)"
+                },
+                order_clause
             )
-            SELECT * FROM conversation_messages
-            ORDER BY created_at ASC
-        "#;
+        } else {
+            format!(
+                r#"
+                WITH conversation_messages AS (
+                    -- User messages
+                    SELECT
+                        'user' as message_type,
+                        um.id,
+                        um.uuid,
+                        um.content_enc,
+                        'completed'::text as status,
+                        um.created_at,
+                        r.model,
+                        um.prompt_tokens as token_count,
+                        NULL::uuid as tool_call_id,
+                        NULL::text as finish_reason
+                    FROM user_messages um
+                    LEFT JOIN responses r ON um.response_id = r.id
+                    WHERE um.conversation_id = $1
 
-        sql_query(query)
-            .bind::<BigInt, _>(conversation_id)
-            .load::<RawThreadMessage>(conn)
-            .map_err(ResponsesError::DatabaseError)
+                    UNION ALL
+
+                    -- Assistant messages
+                    SELECT
+                        'assistant' as message_type,
+                        am.id,
+                        am.uuid,
+                        am.content_enc,
+                        am.status,
+                        am.created_at,
+                        r.model,
+                        am.completion_tokens as token_count,
+                        NULL::uuid as tool_call_id,
+                        am.finish_reason
+                    FROM assistant_messages am
+                    LEFT JOIN responses r ON am.response_id = r.id
+                    WHERE am.conversation_id = $1
+
+                    UNION ALL
+
+                    -- Tool calls
+                    SELECT
+                        'tool_call' as message_type,
+                        tc.id,
+                        tc.uuid,
+                        tc.arguments_enc as content_enc,
+                        'completed'::text as status,
+                        tc.created_at,
+                        NULL::text as model,
+                        tc.argument_tokens as token_count,
+                        tc.tool_call_id,
+                        NULL::text as finish_reason
+                    FROM tool_calls tc
+                    WHERE tc.conversation_id = $1
+
+                    UNION ALL
+
+                    -- Tool outputs
+                    SELECT
+                        'tool_output' as message_type,
+                        tto.id,
+                        tto.uuid,
+                        tto.output_enc as content_enc,
+                        'completed'::text as status,
+                        tto.created_at,
+                        NULL::text as model,
+                        tto.output_tokens as token_count,
+                        tc.tool_call_id,
+                        NULL::text as finish_reason
+                    FROM tool_outputs tto
+                    JOIN tool_calls tc ON tto.tool_call_fk = tc.id
+                    WHERE tto.conversation_id = $1
+                )
+                SELECT *
+                FROM conversation_messages
+                {}
+                LIMIT $2
+                "#,
+                order_clause
+            )
+        };
+
+        if let Some(after_uuid) = after {
+            sql_query(query)
+                .bind::<BigInt, _>(conversation_id)
+                .bind::<diesel::sql_types::Uuid, _>(after_uuid)
+                .bind::<BigInt, _>(limit)
+                .load::<RawThreadMessage>(conn)
+                .map_err(ResponsesError::DatabaseError)
+        } else {
+            sql_query(query)
+                .bind::<BigInt, _>(conversation_id)
+                .bind::<BigInt, _>(limit)
+                .load::<RawThreadMessage>(conn)
+                .map_err(ResponsesError::DatabaseError)
+        }
     }
 
     pub fn get_response_context(

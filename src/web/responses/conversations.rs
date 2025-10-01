@@ -371,62 +371,60 @@ async fn list_conversation_items(
 
     let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
 
-    // Get all messages from the conversation
-    // TODO we should apply paging to this method so we don't always fetch everything
+    // Validate limit
+    let limit = params.limit.min(MAX_PAGINATION_LIMIT);
+
+    // Fetch messages with database-level pagination
+    // We fetch limit + 1 to check if there are more results
     let raw_messages = state
         .db
-        .get_conversation_context_messages(ctx.conversation.id)
+        .get_conversation_context_messages(
+            ctx.conversation.id,
+            limit + 1,
+            params.after,
+            &params.order,
+        )
         .map_err(error_mapping::map_message_error)?;
 
     trace!(
-        "Retrieved {} raw messages for conversation {}",
+        "Retrieved {} raw messages for conversation {} (limit={}, after={:?}, order={})",
         raw_messages.len(),
-        conversation_id
+        conversation_id,
+        limit,
+        params.after,
+        params.order
     );
     for (i, msg) in raw_messages.iter().enumerate() {
         trace!(
-            "Message {}: uuid={}, type={}",
+            "Message {}: uuid={}, type={}, created_at={}",
             i,
             msg.uuid,
-            msg.message_type
+            msg.message_type,
+            msg.created_at
         );
     }
 
-    // If we have an after cursor, find where to start
-    let start_index = if let Some(after_uuid) = params.after {
-        raw_messages
-            .iter()
-            .position(|msg| msg.uuid == after_uuid)
-            .map(|idx| idx + 1) // Start from the message after the cursor
-            .unwrap_or(0)
+    // Check if there are more results
+    let has_more = raw_messages.len() > limit as usize;
+
+    // Take only the requested limit
+    let messages_to_return = if has_more {
+        &raw_messages[..limit as usize]
     } else {
-        0
+        &raw_messages[..]
     };
 
-    trace!(
-        "Starting from index {} (after cursor: {:?})",
-        start_index,
-        params.after
-    );
-
-    // Convert messages to items using the centralized converter
-    // Note: We don't apply limit here yet, we need to check has_more first
+    // Convert messages to items
     let items = ConversationItemConverter::messages_to_items(
-        &raw_messages,
+        messages_to_return,
         &ctx.user_key,
-        start_index,
-        raw_messages.len(), // Process all remaining messages for now
+        0, // Start from beginning since pagination is already applied at DB level
+        messages_to_return.len(),
     )?;
-
-    trace!("Built {} conversation items before pagination", items.len());
-
-    // Apply pagination using centralized utilities
-    let (items, has_more) = Paginator::paginate(items, params.limit);
-    let items = Paginator::apply_order(items, &params.order);
 
     trace!("Final items count: {}, has_more: {}", items.len(), has_more);
 
-    // Extract cursor IDs using centralized utility
+    // Extract cursor IDs
     let (first_id, last_id) = Paginator::get_cursor_ids(&items, |item| match item {
         ConversationItem::Message { id, .. } => *id,
         ConversationItem::FunctionToolCall { id, .. } => *id,
@@ -459,9 +457,16 @@ async fn get_conversation_item(
     let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
 
     // Get all messages from the conversation
+    // For this single item lookup, we fetch all messages (no pagination)
+    // TODO: Optimize this to fetch only the specific item
     let raw_messages = state
         .db
-        .get_conversation_context_messages(ctx.conversation.id)
+        .get_conversation_context_messages(
+            ctx.conversation.id,
+            i64::MAX, // No limit for single item lookup
+            None,     // No cursor
+            "asc",    // Default order
+        )
         .map_err(error_mapping::map_message_error)?;
 
     // Find the specific item and convert using centralized converter

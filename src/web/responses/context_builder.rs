@@ -54,7 +54,12 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
 
     // 2. Pull every stored message (already in chrono order ASC)
     let raw = db
-        .get_conversation_context_messages(conversation_id)
+        .get_conversation_context_messages(
+            conversation_id,
+            i64::MAX, // No limit - fetch all messages for context building
+            None,     // No cursor
+            "asc",    // Chronological order
+        )
         .map_err(|_| crate::ApiError::InternalServerError)?;
 
     // 3. Decrypt + map to ChatMsg

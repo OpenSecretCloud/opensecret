@@ -589,6 +589,9 @@ pub trait DBConnection {
     fn get_conversation_context_messages(
         &self,
         conversation_id: i64,
+        limit: i64,
+        after: Option<Uuid>,
+        order: &str,
     ) -> Result<Vec<RawThreadMessage>, DBError>;
     fn get_response_context_messages(
         &self,
@@ -2407,10 +2410,14 @@ impl DBConnection for PostgresConnection {
     fn get_conversation_context_messages(
         &self,
         conversation_id: i64,
+        limit: i64,
+        after: Option<Uuid>,
+        order: &str,
     ) -> Result<Vec<RawThreadMessage>, DBError> {
         debug!("Getting conversation context messages");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        RawThreadMessage::get_conversation_context(conn, conversation_id).map_err(DBError::from)
+        RawThreadMessage::get_conversation_context(conn, conversation_id, limit, after, order)
+            .map_err(DBError::from)
     }
 
     fn get_response_context_messages(

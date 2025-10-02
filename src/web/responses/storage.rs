@@ -2,20 +2,16 @@
 
 use crate::{
     encrypt::encrypt_with_key,
-    models::{responses::ResponseStatus, token_usage::NewTokenUsage},
-    sqs::UsageEvent,
+    models::responses::ResponseStatus,
     tokens::count_tokens,
-    web::responses::constants::{
-        COST_PER_TOKEN, FINISH_REASON_CANCELLED, STATUS_COMPLETED, STATUS_INCOMPLETE,
-    },
+    web::responses::constants::{FINISH_REASON_CANCELLED, STATUS_COMPLETED, STATUS_INCOMPLETE},
     DBConnection,
 };
-use bigdecimal::BigDecimal;
 use chrono::Utc;
 use secp256k1::SecretKey;
-use std::{str::FromStr, sync::Arc};
+use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
 use super::handlers::StorageMessage;
@@ -24,7 +20,6 @@ use super::handlers::StorageMessage;
 pub(crate) struct ContentAccumulator {
     content: String,
     completion_tokens: i32,
-    prompt_tokens: i32,
 }
 
 impl ContentAccumulator {
@@ -32,7 +27,6 @@ impl ContentAccumulator {
         Self {
             content: String::with_capacity(4096),
             completion_tokens: 0,
-            prompt_tokens: 0,
         }
     }
 
@@ -52,7 +46,8 @@ impl ContentAccumulator {
                     "Storage: received usage - prompt_tokens={}, completion_tokens={}",
                     prompt_tokens, completion_tokens
                 );
-                self.prompt_tokens = prompt_tokens;
+                // Note: prompt_tokens already tracked when user message was created in DB
+                // Only store completion_tokens for the assistant message
                 self.completion_tokens = completion_tokens;
                 AccumulatorState::Continue
             }
@@ -67,7 +62,6 @@ impl ContentAccumulator {
                 AccumulatorState::Complete(CompleteData {
                     content: self.content.clone(),
                     completion_tokens: self.completion_tokens,
-                    prompt_tokens: self.prompt_tokens,
                     finish_reason,
                     message_id,
                 })
@@ -103,7 +97,6 @@ pub enum AccumulatorState {
 pub struct CompleteData {
     pub content: String,
     pub completion_tokens: i32,
-    pub prompt_tokens: i32,
     pub finish_reason: String,
     pub message_id: Uuid,
 }
@@ -256,99 +249,16 @@ impl ResponsePersister {
     }
 }
 
-/// Publishes usage events for billing
-pub(crate) struct BillingEventPublisher {
-    db: Arc<dyn DBConnection + Send + Sync>,
-    sqs_publisher: Option<Arc<crate::sqs::SqsEventPublisher>>,
-    user_uuid: Uuid,
-}
-
-impl BillingEventPublisher {
-    pub fn new(
-        db: Arc<dyn DBConnection + Send + Sync>,
-        sqs_publisher: Option<Arc<crate::sqs::SqsEventPublisher>>,
-        user_uuid: Uuid,
-    ) -> Self {
-        Self {
-            db,
-            sqs_publisher,
-            user_uuid,
-        }
-    }
-
-    /// Publish usage event for billing
-    pub async fn publish(&self, prompt_tokens: i32, completion_tokens: i32) {
-        if prompt_tokens == 0 && completion_tokens == 0 {
-            return;
-        }
-
-        let db_clone = self.db.clone();
-        let sqs_pub = self.sqs_publisher.clone();
-        let user_uuid = self.user_uuid;
-
-        tokio::spawn(async move {
-            // Calculate estimated cost
-            let input_cost =
-                BigDecimal::from_str(COST_PER_TOKEN).unwrap() * BigDecimal::from(prompt_tokens);
-            let output_cost =
-                BigDecimal::from_str(COST_PER_TOKEN).unwrap() * BigDecimal::from(completion_tokens);
-            let total_cost = input_cost + output_cost;
-
-            info!(
-                "Responses API usage for user {}: prompt_tokens={}, completion_tokens={}, total_tokens={}, estimated_cost={}",
-                user_uuid, prompt_tokens, completion_tokens,
-                prompt_tokens + completion_tokens,
-                total_cost
-            );
-
-            // Create and store token usage record
-            let new_usage = NewTokenUsage::new(
-                user_uuid,
-                prompt_tokens,
-                completion_tokens,
-                total_cost.clone(),
-            );
-
-            if let Err(e) = db_clone.create_token_usage(new_usage) {
-                error!("Failed to save token usage: {:?}", e);
-            }
-
-            // Post event to SQS if configured
-            if let Some(publisher) = sqs_pub {
-                let event = UsageEvent {
-                    event_id: Uuid::new_v4(),
-                    user_id: user_uuid,
-                    input_tokens: prompt_tokens,
-                    output_tokens: completion_tokens,
-                    estimated_cost: total_cost,
-                    chat_time: Utc::now(),
-                    is_api_request: false,
-                    provider_name: String::new(),
-                    model_name: String::new(),
-                };
-
-                match publisher.publish_event(event).await {
-                    Ok(_) => debug!("published usage event successfully"),
-                    Err(e) => error!("error publishing usage event: {e}"),
-                }
-            }
-        });
-    }
-}
-
 /// Main storage task that orchestrates accumulation and persistence
 pub async fn storage_task(
     mut rx: mpsc::Receiver<StorageMessage>,
     db: Arc<dyn DBConnection + Send + Sync>,
     response_id: i64,
     user_key: SecretKey,
-    user_uuid: Uuid,
-    sqs_publisher: Option<Arc<crate::sqs::SqsEventPublisher>>,
     message_id: Uuid,
 ) {
     let mut accumulator = ContentAccumulator::new();
     let persister = ResponsePersister::new(db.clone(), response_id, message_id, user_key);
-    let billing = BillingEventPublisher::new(db.clone(), sqs_publisher, user_uuid);
 
     // Accumulate messages until completion or error
     while let Some(msg) = rx.recv().await {
@@ -356,14 +266,9 @@ pub async fn storage_task(
             AccumulatorState::Continue => continue,
 
             AccumulatorState::Complete(data) => {
-                let prompt_tokens = data.prompt_tokens;
-                let completion_tokens = data.completion_tokens;
-
                 if let Err(e) = persister.persist_completed(data).await {
                     error!("Failed to persist completed response: {}", e);
                 }
-
-                billing.publish(prompt_tokens, completion_tokens).await;
                 return;
             }
 

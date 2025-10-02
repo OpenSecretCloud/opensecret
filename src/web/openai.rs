@@ -17,16 +17,16 @@ use axum::{
 use base64::{engine::general_purpose, Engine as _};
 use bigdecimal::BigDecimal;
 use chrono::Utc;
-use futures::stream::{self, StreamExt};
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use hyper::body::to_bytes;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Body as HyperBody, Client, Request};
 use hyper_tls::HttpsConnector;
 use serde_json::{json, Value};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{debug, error, info, trace};
 use uuid::Uuid;
@@ -106,6 +106,64 @@ fn default_transcription_model() -> String {
 
 fn default_transcription_response_format() -> String {
     "json".to_string()
+}
+
+// ============================================================================
+// Centralized Billing Architecture - New Types
+// ============================================================================
+
+/// Context needed for billing/usage tracking
+#[derive(Debug, Clone)]
+pub struct BillingContext {
+    pub auth_method: AuthMethod,
+    pub model_name: String,
+}
+
+impl BillingContext {
+    pub fn new(auth_method: AuthMethod, model_name: String) -> Self {
+        Self {
+            auth_method,
+            model_name,
+        }
+    }
+}
+
+/// Usage statistics extracted from a completion
+#[derive(Debug, Clone)]
+pub struct CompletionUsage {
+    pub prompt_tokens: i32,
+    pub completion_tokens: i32,
+}
+
+/// A chunk from the completion stream
+#[derive(Clone, Debug)]
+pub enum CompletionChunk {
+    /// Streaming chunk with full JSON from upstream (includes all metadata)
+    StreamChunk(Value),
+    /// Complete response for non-streaming
+    FullResponse(Value),
+    /// Usage information (for streaming with include_usage)
+    Usage(CompletionUsage),
+    /// Stream finished
+    Done,
+    /// Stream error occurred
+    Error(String),
+}
+
+/// Metadata about the completion
+#[derive(Clone, Debug)]
+pub struct CompletionMetadata {
+    pub provider_name: String,
+    pub model_name: String,
+    pub is_streaming: bool,
+}
+
+/// Processed completion stream - billing happens automatically
+pub struct CompletionStream {
+    /// The actual data stream for consumers
+    pub stream: mpsc::Receiver<CompletionChunk>,
+    /// Metadata about the completion
+    pub metadata: CompletionMetadata,
 }
 
 pub fn router(app_state: Arc<AppState>) -> Router<()> {
@@ -188,12 +246,6 @@ async fn proxy_openai(
         }
     }
 
-    // Check if streaming is requested (default to false if not specified)
-    let is_streaming = body
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
-
     // Extract the model from the request
     let model_name = body
         .get("model")
@@ -204,121 +256,92 @@ async fn proxy_openai(
         })?
         .to_string();
 
-    // Get the raw response from the completion endpoint
-    let res = get_chat_completion_response(&state, &user, body, &headers).await?;
+    // Create billing context
+    let billing_context = BillingContext::new(auth_method, model_name.clone());
 
-    debug!("Successfully received response from OpenAI");
+    // Get the completion stream - billing happens automatically inside!
+    let completion =
+        get_chat_completion_response(&state, &user, body, &headers, billing_context).await?;
+
+    debug!(
+        "Received completion from provider: {} (streaming: {})",
+        completion.metadata.provider_name, completion.metadata.is_streaming
+    );
 
     // Handle non-streaming vs streaming responses differently
-    if !is_streaming {
-        // For non-streaming responses, read the entire body and return as JSON
+    if !completion.metadata.is_streaming {
+        // For non-streaming responses, get the full response chunk
         debug!("Handling non-streaming response");
-        let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
-            error!("Failed to read response body: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        let mut rx = completion.stream;
 
-        let response_str = String::from_utf8_lossy(&body_bytes);
-        trace!("Non-streaming response body: {}", response_str);
-
-        // Parse the response JSON
-        let response_json: Value = serde_json::from_str(&response_str).map_err(|e| {
-            error!("Failed to parse response JSON: {:?}", e);
-            ApiError::InternalServerError
-        })?;
-
-        // Handle usage statistics if available
-        handle_usage_tracking(
-            &state,
-            &user,
-            &response_json,
-            auth_method,
-            &model_name,
-            None, // provider_name will be extracted from response if needed
-        )
-        .await;
-
-        // Encrypt and return the response
-        let encrypted_response = encrypt_response(&state, &session_id, &response_json).await?;
-        debug!("Exiting proxy_openai function (non-streaming)");
-        return Ok(encrypted_response.into_response());
+        // Get the FullResponse chunk
+        if let Some(CompletionChunk::FullResponse(response_json)) = rx.recv().await {
+            // Billing already happened in get_chat_completion_response!
+            // Just encrypt and return
+            let encrypted_response = encrypt_response(&state, &session_id, &response_json).await?;
+            debug!("Exiting proxy_openai function (non-streaming)");
+            return Ok(encrypted_response.into_response());
+        } else {
+            error!("Expected FullResponse chunk but got something else");
+            return Err(ApiError::InternalServerError);
+        }
     }
 
-    // For streaming responses, continue with the existing SSE logic
+    // For streaming responses, process CompletionChunk stream
     debug!("Handling streaming response");
-    let stream = res.into_body().into_stream();
-    let buffer = Arc::new(Mutex::new(String::new()));
-    let stream = stream
-        .map(move |chunk| {
-            let state = state.clone();
-            let session_id = session_id;
-            let user = user.clone();
-            let buffer = buffer.clone();
-            let auth_method = auth_method;
-            let model_name = model_name.clone();
-            async move {
-                match chunk {
-                    Ok(chunk) => {
-                        let chunk_str = String::from_utf8_lossy(chunk.as_ref());
-                        let mut events = Vec::new();
-                        {
-                            let mut buffer = buffer.lock().unwrap();
-                            buffer.push_str(&chunk_str);
-                            while let Some(event_end) = buffer.find("\n\n") {
-                                let event = buffer[..event_end].to_string();
-                                *buffer = buffer[event_end + 2..].to_string();
-                                events.push(event);
-                            }
-                            if events.is_empty() {
-                                trace!("No complete events in buffer. Current buffer: {}", buffer);
-                            }
-                        }
+    let mut rx = completion.stream;
 
-                        let mut processed_events: Vec<Result<Event, std::convert::Infallible>> =
-                            Vec::new();
-                        for event in events {
-                            if let Some(processed_event) = encrypt_and_process_event(
-                                &state,
-                                &session_id,
-                                &user,
-                                &event,
-                                auth_method,
-                                &model_name,
-                            )
-                            .await
-                            {
-                                processed_events.push(Ok(processed_event));
-                            }
+    let stream = async_stream::stream! {
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                CompletionChunk::StreamChunk(json) => {
+                    // Pass through full JSON (includes all metadata from upstream)
+                    match encrypt_sse_event(&state, &session_id, &json).await {
+                        Ok(event) => yield Ok::<Event, std::convert::Infallible>(event),
+                        Err(e) => {
+                            error!("Encryption error: {:?}", e);
+                            break;
                         }
-                        processed_events
-                    }
-                    Err(e) => {
-                        error!(
-                            "Error reading response body: {:?}. Current buffer: {}",
-                            e,
-                            buffer.lock().unwrap()
-                        );
-                        vec![Ok(Event::default().data("Error reading response"))]
                     }
                 }
+                CompletionChunk::Usage(_usage) => {
+                    // Billing already handled internally, no need to send to client
+                    trace!("Received usage chunk (billing already processed)");
+                }
+                CompletionChunk::Done => {
+                    yield Ok(Event::default().data("[DONE]"));
+                    break;
+                }
+                CompletionChunk::Error(error_msg) => {
+                    error!("Stream error from completion API: {}", error_msg);
+                    yield Ok(Event::default().data(format!("Error: {}", error_msg)));
+                    break;
+                }
+                CompletionChunk::FullResponse(_) => {
+                    // Shouldn't happen in streaming mode
+                    error!("Received FullResponse in streaming mode");
+                    break;
+                }
             }
-        })
-        .flat_map(stream::once)
-        .flat_map(stream::iter);
+        }
+    };
 
     debug!("Exiting proxy_openai function (streaming)");
     Ok(Sse::new(stream).into_response())
 }
 
-/// Internal function to get chat completion response without HTTP handling
+/// Internal function to get chat completion response with automatic billing
 /// This can be used by both the proxy_openai endpoint and the responses API
+///
+/// Billing happens INTERNALLY within this function - consumers just receive processed chunks
 pub async fn get_chat_completion_response(
     state: &Arc<AppState>,
-    _user: &User,
+    user: &User,
     body: Value,
     headers: &HeaderMap,
-) -> Result<hyper::Response<HyperBody>, ApiError> {
-    debug!("Entering get_chat_completion_response");
+    billing_context: BillingContext,
+) -> Result<CompletionStream, ApiError> {
+    debug!("Entering get_chat_completion_response with billing context");
 
     if body.is_null() || body.as_object().map_or(true, |obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
@@ -508,138 +531,260 @@ pub async fn get_chat_completion_response(
         "Successfully received response from provider: {}",
         successful_provider
     );
-    Ok(res)
+
+    // NOW: Process the response internally and handle billing
+    if !is_streaming {
+        // NON-STREAMING: Simple case
+        debug!("Processing non-streaming response with internal billing");
+        let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
+            error!("Failed to read response body: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+        let response_json: Value = serde_json::from_str(&String::from_utf8_lossy(&body_bytes))
+            .map_err(|e| {
+                error!("Failed to parse response JSON: {:?}", e);
+                ApiError::InternalServerError
+            })?;
+
+        // ✅ Handle billing HERE, inside completions API
+        if let Some(usage) = extract_usage(&response_json) {
+            publish_usage_event_internal(
+                state,
+                user,
+                &billing_context,
+                usage,
+                &successful_provider,
+            )
+            .await;
+        }
+
+        // Return the full response as a single chunk
+        let (tx, rx) = mpsc::channel(2); // Need space for FullResponse + Done
+        let _ = tx.send(CompletionChunk::FullResponse(response_json)).await;
+        let _ = tx.send(CompletionChunk::Done).await;
+
+        return Ok(CompletionStream {
+            stream: rx,
+            metadata: CompletionMetadata {
+                provider_name: successful_provider,
+                model_name: billing_context.model_name.clone(),
+                is_streaming: false,
+            },
+        });
+    }
+
+    // STREAMING: Complex case - spawn internal processor
+    debug!("Processing streaming response with internal billing");
+    let (tx_consumer, rx_consumer) = mpsc::channel(100);
+
+    // Spawn INTERNAL task that handles billing
+    let state_clone = state.clone();
+    let user_clone = user.clone();
+    let billing_ctx = billing_context.clone();
+    let provider = successful_provider.clone();
+
+    tokio::spawn(async move {
+        let mut body_stream = res.into_body().into_stream();
+        let mut buffer = String::new();
+
+        while let Some(chunk_result) = body_stream.next().await {
+            match chunk_result {
+                Ok(bytes) => {
+                    let chunk_str = String::from_utf8_lossy(bytes.as_ref());
+                    buffer.push_str(&chunk_str);
+
+                    // Parse SSE frames
+                    while let Some(frame) = extract_sse_frame(&mut buffer) {
+                        if frame == "[DONE]" {
+                            let _ = tx_consumer.send(CompletionChunk::Done).await;
+                            return;
+                        }
+
+                        if let Ok(json) = serde_json::from_str::<Value>(&frame) {
+                            // ✅ Extract and publish billing HERE
+                            if let Some(usage) = extract_usage(&json) {
+                                publish_usage_event_internal(
+                                    &state_clone,
+                                    &user_clone,
+                                    &billing_ctx,
+                                    usage.clone(),
+                                    &provider,
+                                )
+                                .await;
+
+                                // Also send usage to consumer
+                                let _ = tx_consumer.send(CompletionChunk::Usage(usage)).await;
+                            }
+
+                            // Send full JSON chunk to consumer (preserves all metadata)
+                            let _ = tx_consumer.send(CompletionChunk::StreamChunk(json)).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Stream error: {:?}", e);
+                    let _ = tx_consumer
+                        .send(CompletionChunk::Error(e.to_string()))
+                        .await;
+                    break;
+                }
+            }
+        }
+
+        // Stream ended without explicit [DONE]
+        let _ = tx_consumer.send(CompletionChunk::Done).await;
+    });
+
+    Ok(CompletionStream {
+        stream: rx_consumer,
+        metadata: CompletionMetadata {
+            provider_name: successful_provider,
+            model_name: billing_context.model_name.clone(),
+            is_streaming: true,
+        },
+    })
 }
 
-/// Helper function to handle usage tracking for both streaming and non-streaming responses
-async fn handle_usage_tracking(
+// ============================================================================
+// Centralized Billing Architecture - Internal Functions
+// ============================================================================
+
+/// Helper to extract usage from response JSON
+fn extract_usage(json: &Value) -> Option<CompletionUsage> {
+    let usage_json = json.get("usage")?;
+    if usage_json.is_null() || !usage_json.is_object() {
+        return None;
+    }
+
+    Some(CompletionUsage {
+        prompt_tokens: usage_json
+            .get("prompt_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32,
+        completion_tokens: usage_json
+            .get("completion_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32,
+    })
+}
+
+/// Helper to extract SSE frame from buffer
+/// Returns the data portion of "data: <content>" frames, None if no complete frame available
+fn extract_sse_frame(buffer: &mut String) -> Option<String> {
+    loop {
+        // Look for a complete SSE frame (ends with \n\n)
+        if let Some(pos) = buffer.find("\n\n") {
+            let frame = buffer[..pos].to_string();
+            *buffer = buffer[pos + 2..].to_string();
+
+            // Skip empty frames
+            if frame.trim().is_empty() {
+                continue;
+            }
+
+            // Return data content if it's a data frame, otherwise keep looking
+            if let Some(data) = frame.strip_prefix("data: ") {
+                return Some(data.to_string());
+            }
+            // Skip non-data frames (comments, etc.) and continue looking
+            continue;
+        }
+
+        // No complete frame available
+        return None;
+    }
+}
+
+/// Internal billing function - NEVER exposed outside this module
+/// This function publishes usage events to both the database and SQS
+async fn publish_usage_event_internal(
     state: &Arc<AppState>,
     user: &User,
-    response_json: &Value,
-    auth_method: AuthMethod,
-    model_name: &str,
-    provider_name: Option<&str>,
+    billing_context: &BillingContext,
+    usage: CompletionUsage,
+    provider_name: &str,
 ) {
-    if let Some(usage) = response_json.get("usage") {
-        if !usage.is_null() && usage.is_object() {
-            let input_tokens = usage
-                .get("prompt_tokens")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32;
-            let output_tokens = usage
-                .get("completion_tokens")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32;
-
-            // Calculate estimated cost with correct pricing
-            let input_cost =
-                BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(input_tokens);
-            let output_cost =
-                BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(output_tokens);
-            let total_cost = input_cost + output_cost;
-
-            info!(
-                "OpenAI API usage for user {}: prompt_tokens={}, completion_tokens={}, total_tokens={}, estimated_cost={}",
-                user.uuid, input_tokens, output_tokens,
-                input_tokens + output_tokens,
-                total_cost
-            );
-
-            // Create token usage record and post to SQS in the background
-            let state_clone = state.clone();
-            let user_id = user.uuid;
-            let is_api_request = auth_method == AuthMethod::ApiKey;
-            let provider_name = provider_name.unwrap_or("unknown").to_string();
-            let model_name = model_name.to_string();
-            tokio::spawn(async move {
-                // Create and store token usage record
-                let new_usage =
-                    NewTokenUsage::new(user_id, input_tokens, output_tokens, total_cost.clone());
-
-                if let Err(e) = state_clone.db.create_token_usage(new_usage) {
-                    error!("Failed to save token usage: {:?}", e);
-                }
-
-                // Post event to SQS if configured
-                if let Some(publisher) = &state_clone.sqs_publisher {
-                    let event = UsageEvent {
-                        event_id: Uuid::new_v4(), // Generate new UUID for idempotency
-                        user_id,
-                        input_tokens,
-                        output_tokens,
-                        estimated_cost: total_cost,
-                        chat_time: Utc::now(),
-                        is_api_request,
-                        provider_name,
-                        model_name,
-                    };
-
-                    match publisher.publish_event(event).await {
-                        Ok(_) => debug!("published usage event successfully"),
-                        Err(e) => error!("error publishing usage event: {e}"),
-                    }
-                }
-            });
-        }
+    if usage.prompt_tokens == 0 && usage.completion_tokens == 0 {
+        return;
     }
+
+    let input_cost =
+        BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(usage.prompt_tokens);
+    let output_cost =
+        BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(usage.completion_tokens);
+    let total_cost = input_cost + output_cost;
+
+    info!(
+        "Chat completion usage for user {}: model={}, provider={}, prompt_tokens={}, completion_tokens={}, total_tokens={}, estimated_cost={}",
+        user.uuid,
+        billing_context.model_name,
+        provider_name,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.prompt_tokens + usage.completion_tokens,
+        total_cost
+    );
+
+    // Spawn background task for DB + SQS
+    let state_clone = state.clone();
+    let user_id = user.uuid;
+    let is_api_request = billing_context.auth_method == AuthMethod::ApiKey;
+    let provider_name = provider_name.to_string();
+    let model_name = billing_context.model_name.clone();
+
+    tokio::spawn(async move {
+        // Create and store token usage record
+        let new_usage = NewTokenUsage::new(
+            user_id,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            total_cost.clone(),
+        );
+
+        if let Err(e) = state_clone.db.create_token_usage(new_usage) {
+            error!("Failed to save token usage: {:?}", e);
+        }
+
+        // Post event to SQS if configured
+        if let Some(publisher) = &state_clone.sqs_publisher {
+            let event = UsageEvent {
+                event_id: Uuid::new_v4(),
+                user_id,
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+                estimated_cost: total_cost,
+                chat_time: Utc::now(),
+                is_api_request,
+                provider_name,
+                model_name,
+            };
+
+            match publisher.publish_event(event).await {
+                Ok(_) => debug!("published usage event successfully"),
+                Err(e) => error!("error publishing usage event: {e}"),
+            }
+        }
+    });
 }
 
-async fn encrypt_and_process_event(
+/// Helper to encrypt an SSE event
+async fn encrypt_sse_event(
     state: &AppState,
     session_id: &Uuid,
-    user: &User,
-    event: &str,
-    auth_method: AuthMethod,
-    model_name: &str,
-) -> Option<Event> {
-    if event.trim() == "data: [DONE]" {
-        return Some(Event::default().data("[DONE]"));
-    }
+    json: &Value,
+) -> Result<Event, ApiError> {
+    let json_str = json.to_string();
+    let encrypted_data = state
+        .encrypt_session_data(session_id, json_str.as_bytes())
+        .await
+        .map_err(|e| {
+            error!("Failed to encrypt SSE event data: {:?}", e);
+            ApiError::InternalServerError
+        })?;
 
-    if let Some(data) = event.strip_prefix("data: ") {
-        match serde_json::from_str::<Value>(data) {
-            Ok(json) => {
-                // Handle usage statistics if available (for streaming responses)
-                // Convert state to Arc for the async handle_usage_tracking call
-                let state_arc = Arc::new(state.clone());
-                handle_usage_tracking(
-                    &state_arc,
-                    user,
-                    &json,
-                    auth_method,
-                    model_name,
-                    None, // provider_name will be extracted from response if needed
-                )
-                .await;
-
-                let json_str = json.to_string();
-                match state
-                    .encrypt_session_data(session_id, json_str.as_bytes())
-                    .await
-                {
-                    Ok(encrypted_data) => {
-                        let base64_encrypted = general_purpose::STANDARD.encode(&encrypted_data);
-                        Some(process_event(&base64_encrypted))
-                    }
-                    Err(e) => {
-                        error!("Failed to encrypt event data: {:?}", e);
-                        Some(Event::default().data("Error: Encryption failed"))
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Received non-JSON data event. Error: {:?}", e);
-                Some(Event::default().data("Error: Invalid JSON"))
-            }
-        }
-    } else {
-        error!("Received non-data event");
-        Some(Event::default().data("Error: Invalid event format"))
-    }
-}
-
-fn process_event(data: &str) -> Event {
-    Event::default().data(data)
+    let base64_encrypted = general_purpose::STANDARD.encode(&encrypted_data);
+    Ok(Event::default().data(base64_encrypted))
 }
 
 async fn proxy_models(

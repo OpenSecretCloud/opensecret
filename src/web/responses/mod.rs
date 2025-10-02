@@ -14,7 +14,6 @@ pub mod handlers;
 pub mod instructions;
 pub mod pagination;
 pub mod storage;
-pub mod stream_processor;
 pub mod types;
 
 // Re-export commonly used types
@@ -27,7 +26,7 @@ pub use errors::error_mapping;
 pub use events::{ResponseEvent, SseEventEmitter};
 pub use pagination::Paginator;
 pub use storage::storage_task;
-pub use stream_processor::UpstreamStreamProcessor;
+// REMOVED: UpstreamStreamProcessor - no longer used with centralized billing architecture
 pub use types::{DeletedObjectResponse, MessageContent, MessageContentPart};
 
 // Re-export routers

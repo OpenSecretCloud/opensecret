@@ -384,17 +384,20 @@ mod tests {
 
         // Message before truncation should be user (the first user message we kept)
         assert_eq!(
-            messages[truncation_idx - 1]["role"], "user",
+            messages[truncation_idx - 1]["role"],
+            "user",
             "Message before truncation should be user"
         );
         assert_eq!(
-            messages[truncation_idx - 1]["content"], "First user message",
+            messages[truncation_idx - 1]["content"],
+            "First user message",
             "Should be the first user message"
         );
 
         // Message after truncation should be user (start of tail)
         assert_eq!(
-            messages[truncation_idx + 1]["role"], "user",
+            messages[truncation_idx + 1]["role"],
+            "user",
             "Message after truncation should be user"
         );
 

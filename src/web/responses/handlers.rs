@@ -15,7 +15,6 @@ use crate::{
             build_prompt, build_usage, constants::*, error_mapping, storage_task,
             ContentPartBuilder, DeletedObjectResponse, MessageContent, MessageContentConverter,
             MessageContentPart, OutputItemBuilder, ResponseBuilder, ResponseEvent, SseEventEmitter,
-            UpstreamStreamProcessor,
         },
     },
     ApiError, AppState,
@@ -30,7 +29,7 @@ use axum::{
 };
 use base64::Engine;
 use chrono::Utc;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::Stream;
 use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -639,11 +638,17 @@ async fn spawn_title_generation_task(
     user_content: String,
 ) {
     tokio::spawn(async move {
-        debug!("Starting background title generation for conversation {}", conversation_uuid);
+        debug!(
+            "Starting background title generation for conversation {}",
+            conversation_uuid
+        );
 
         // Truncate content to first 500 characters
         let truncated_content: String = user_content.chars().take(500).collect();
-        trace!("Truncated content for title generation: {}", truncated_content);
+        trace!(
+            "Truncated content for title generation: {}",
+            truncated_content
+        );
 
         // Build the title generation request
         let title_request = json!({
@@ -664,73 +669,106 @@ async fn spawn_title_generation_task(
         });
 
         // Call the completions API with empty headers (no special headers needed)
+        // Responses API always uses JWT auth (not API key)
         let headers = HeaderMap::new();
-        match get_chat_completion_response(&state, &user, title_request, &headers).await {
-            Ok(response) => {
-                // Read the response body
-                match hyper::body::to_bytes(response.into_body()).await {
-                    Ok(body_bytes) => {
-                        let response_str = String::from_utf8_lossy(&body_bytes);
+        let billing_context = crate::web::openai::BillingContext::new(
+            crate::web::openai_auth::AuthMethod::Jwt,
+            "llama-3.3-70b".to_string(),
+        );
 
-                        // Parse the JSON response
-                        match serde_json::from_str::<Value>(&response_str) {
-                            Ok(response_json) => {
-                                // Extract the title from choices[0].message.content
-                                if let Some(title) = response_json
-                                    .get("choices")
-                                    .and_then(|c| c.get(0))
-                                    .and_then(|c| c.get("message"))
-                                    .and_then(|m| m.get("content"))
-                                    .and_then(|c| c.as_str())
-                                {
-                                    let title = title.trim();
-                                    trace!("Generated title for conversation {}: {}", conversation_uuid, title);
+        debug!("Title generation: about to call get_chat_completion_response");
+        match get_chat_completion_response(&state, &user, title_request, &headers, billing_context)
+            .await
+        {
+            Ok(mut completion) => {
+                debug!("Title generation: received completion stream from API");
+                // Get the FullResponse chunk (title generation is non-streaming)
+                match completion.stream.recv().await {
+                    Some(crate::web::openai::CompletionChunk::FullResponse(response_json)) => {
+                        debug!("Title generation: received FullResponse chunk");
+                        // Extract the title from choices[0].message.content
+                        if let Some(title) = response_json
+                            .get("choices")
+                            .and_then(|c| c.get(0))
+                            .and_then(|c| c.get("message"))
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_str())
+                        {
+                            let title = title.trim();
+                            trace!(
+                                "Generated title for conversation {}: {}",
+                                conversation_uuid,
+                                title
+                            );
 
-                                    // Get current conversation metadata
-                                    match state.db.get_conversation_by_uuid_and_user(conversation_uuid, user.uuid) {
-                                        Ok(conversation) => {
-                                            // Decrypt existing metadata
-                                            match decrypt_content(&user_key, conversation.metadata_enc.as_ref()) {
-                                                Ok(metadata) => {
-                                                    // Update the title in metadata
-                                                    let mut meta_obj = metadata.unwrap_or_else(|| json!({}));
-                                                    if let Some(obj) = meta_obj.as_object_mut() {
-                                                        obj.insert("title".to_string(), json!(title));
-                                                    }
+                            // Get current conversation metadata
+                            match state
+                                .db
+                                .get_conversation_by_uuid_and_user(conversation_uuid, user.uuid)
+                            {
+                                Ok(conversation) => {
+                                    // Decrypt existing metadata
+                                    match decrypt_content(
+                                        &user_key,
+                                        conversation.metadata_enc.as_ref(),
+                                    ) {
+                                        Ok(metadata) => {
+                                            // Update the title in metadata
+                                            let mut meta_obj =
+                                                metadata.unwrap_or_else(|| json!({}));
+                                            if let Some(obj) = meta_obj.as_object_mut() {
+                                                obj.insert("title".to_string(), json!(title));
+                                            }
 
-                                                    // Encrypt and update
-                                                    if let Ok(metadata_json) = serde_json::to_string(&meta_obj) {
-                                                        let metadata_enc = encrypt_with_key(&user_key, metadata_json.as_bytes()).await;
+                                            // Encrypt and update
+                                            if let Ok(metadata_json) =
+                                                serde_json::to_string(&meta_obj)
+                                            {
+                                                let metadata_enc = encrypt_with_key(
+                                                    &user_key,
+                                                    metadata_json.as_bytes(),
+                                                )
+                                                .await;
 
-                                                        if let Err(e) = state.db.update_conversation_metadata(conversation_id, user.uuid, metadata_enc) {
-                                                            error!("Failed to update conversation metadata with generated title: {:?}", e);
-                                                        } else {
-                                                            debug!("Successfully updated conversation {} with generated title", conversation_uuid);
-                                                        }
-                                                    } else {
-                                                        error!("Failed to serialize updated metadata");
-                                                    }
+                                                if let Err(e) =
+                                                    state.db.update_conversation_metadata(
+                                                        conversation_id,
+                                                        user.uuid,
+                                                        metadata_enc,
+                                                    )
+                                                {
+                                                    error!("Failed to update conversation metadata with generated title: {:?}", e);
+                                                } else {
+                                                    debug!("Successfully updated conversation {} with generated title", conversation_uuid);
                                                 }
-                                                Err(e) => {
-                                                    error!("Failed to decrypt conversation metadata: {:?}", e);
-                                                }
+                                            } else {
+                                                error!("Failed to serialize updated metadata");
                                             }
                                         }
                                         Err(e) => {
-                                            error!("Failed to get conversation for title update: {:?}", e);
+                                            error!(
+                                                "Failed to decrypt conversation metadata: {:?}",
+                                                e
+                                            );
                                         }
                                     }
-                                } else {
-                                    error!("Failed to extract title from API response");
+                                }
+                                Err(e) => {
+                                    error!("Failed to get conversation for title update: {:?}", e);
                                 }
                             }
-                            Err(e) => {
-                                error!("Failed to parse title generation response: {:?}", e);
-                            }
+                        } else {
+                            error!(
+                                "Failed to extract title from API response - missing content field"
+                            );
                         }
                     }
-                    Err(e) => {
-                        error!("Failed to read title generation response body: {:?}", e);
+                    Some(other_chunk) => {
+                        error!("Expected FullResponse chunk for title generation but got unexpected chunk type");
+                        trace!("Unexpected chunk details: {:?}", other_chunk);
+                    }
+                    None => {
+                        error!("Title generation: stream ended without receiving any chunks");
                     }
                 }
             }
@@ -801,7 +839,14 @@ async fn validate_and_normalize_input(
     }
 
     // Get the first message's content (for user messages there should only be one)
-    let message_content = normalized_messages[0].content.clone();
+    let message_content = normalized_messages
+        .first()
+        .ok_or_else(|| {
+            error!("No messages provided in request");
+            ApiError::BadRequest
+        })?
+        .content
+        .clone();
 
     // Count tokens for the user's input message (text only for token counting)
     let input_text_for_tokens =
@@ -1156,76 +1201,115 @@ async fn setup_streaming_pipeline(
             .unwrap_or_else(|_| "failed to serialize".to_string())
     );
 
-    // Call the chat API
-    let upstream_response =
-        get_chat_completion_response(state, user, chat_request, headers).await?;
+    // Create billing context - Responses API always uses JWT auth (not API key)
+    let billing_context = crate::web::openai::BillingContext::new(
+        crate::web::openai_auth::AuthMethod::Jwt,
+        body.model.clone(),
+    );
+
+    // Call the chat API - billing happens automatically inside!
+    let completion =
+        get_chat_completion_response(state, user, chat_request, headers, billing_context).await?;
+
+    debug!(
+        "Received completion from provider: {} (model: {})",
+        completion.metadata.provider_name, completion.metadata.model_name
+    );
 
     // Create channels for storage task and client stream
     let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
     let (tx_client, rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
 
-    // Spawn storage task
+    // Spawn storage task (no longer needs sqs_publisher - billing is centralized!)
     let _storage_handle = {
         let db = state.db.clone();
         let response_id = persisted.response.id;
-        let user_uuid = user.uuid;
         let user_key = prepared.user_key;
-        let sqs_publisher = state.sqs_publisher.clone();
         let message_id = prepared.assistant_message_id;
 
         tokio::spawn(async move {
-            storage_task(
-                rx_storage,
-                db,
-                response_id,
-                user_key,
-                user_uuid,
-                sqs_publisher,
-                message_id,
-            )
-            .await;
+            storage_task(rx_storage, db, response_id, user_key, message_id).await;
         })
     };
 
-    // Spawn upstream processor task that runs independently of client connection
-    let _upstream_handle = {
-        let mut body_stream = upstream_response.into_body().into_stream();
+    // Spawn stream processor task that converts CompletionChunks to StorageMessages
+    let _processor_handle = {
+        let mut rx_completion = completion.stream;
         let message_id = prepared.assistant_message_id;
         let response_uuid = persisted.response.uuid;
         let mut cancel_rx = state.cancellation_broadcast.subscribe();
 
         tokio::spawn(async move {
-            let mut processor =
-                UpstreamStreamProcessor::new(message_id, response_uuid, tx_storage, tx_client);
-
-            trace!("Starting upstream processor task");
+            trace!("Starting completion stream processor task");
             loop {
                 tokio::select! {
                     // Check for cancellation
                     Ok(cancelled_id) = cancel_rx.recv() => {
                         if cancelled_id == response_uuid {
-                            let _ = processor.send_cancellation().await;
+                            debug!("Received cancellation signal for response {}", response_uuid);
+                            let _ = tx_storage.send(StorageMessage::Cancelled).await;
+                            let _ = tx_client.send(StorageMessage::Cancelled).await;
                             break;
                         }
                     }
 
-                    // Process stream chunks
-                    chunk_result = body_stream.next() => {
-                        let Some(chunk_result) = chunk_result else {
+                    // Process CompletionChunks from centralized billing API
+                    chunk_opt = rx_completion.recv() => {
+                        let Some(chunk) = chunk_opt else {
+                            debug!("Completion stream ended without explicit Done");
                             break;
                         };
 
-                        match chunk_result {
-                            Ok(bytes) => {
-                                if let Err(e) = processor.process_chunk(bytes.as_ref()).await {
-                                    error!("Upstream processor error: {:?}", e);
-                                    let _ = processor.send_error(e.to_string()).await;
-                                    break;
+                        match chunk {
+                            crate::web::openai::CompletionChunk::StreamChunk(json) => {
+                                // Extract content from the full JSON chunk (safe chaining to avoid panics)
+                                if let Some(content) = json
+                                    .get("choices")
+                                    .and_then(|c| c.get(0))
+                                    .and_then(|c| c.get("delta"))
+                                    .and_then(|d| d.get("content"))
+                                    .and_then(|c| c.as_str())
+                                {
+                                    let msg = StorageMessage::ContentDelta(content.to_string());
+                                    // Must send to storage (critical)
+                                    if tx_storage.send(msg.clone()).await.is_err() {
+                                        error!("Storage channel closed unexpectedly");
+                                        break;
+                                    }
+                                    // Best-effort send to client
+                                    let _ = tx_client.send(msg).await;
                                 }
                             }
-                            Err(e) => {
-                                error!("Upstream processor: error reading response: {:?}", e);
-                                let _ = processor.send_error(e.to_string()).await;
+                            crate::web::openai::CompletionChunk::Usage(usage) => {
+                                // Billing already happened in openai.rs!
+                                // Just forward to storage for token counting
+                                let msg = StorageMessage::Usage {
+                                    prompt_tokens: usage.prompt_tokens,
+                                    completion_tokens: usage.completion_tokens,
+                                };
+                                let _ = tx_storage.send(msg.clone()).await;
+                                let _ = tx_client.send(msg).await;
+                            }
+                            crate::web::openai::CompletionChunk::Done => {
+                                debug!("Received Done chunk from completion stream");
+                                let msg = StorageMessage::Done {
+                                    finish_reason: "stop".to_string(),
+                                    message_id,
+                                };
+                                let _ = tx_storage.send(msg.clone()).await;
+                                let _ = tx_client.send(msg).await;
+                                break;
+                            }
+                            crate::web::openai::CompletionChunk::Error(error_msg) => {
+                                error!("Received error from completion stream: {}", error_msg);
+                                let msg = StorageMessage::Error(error_msg);
+                                let _ = tx_storage.send(msg.clone()).await;
+                                let _ = tx_client.send(msg).await;
+                                break;
+                            }
+                            crate::web::openai::CompletionChunk::FullResponse(_) => {
+                                // Shouldn't happen for streaming
+                                error!("Received FullResponse in streaming mode");
                                 break;
                             }
                         }
@@ -1233,7 +1317,7 @@ async fn setup_streaming_pipeline(
                 }
             }
 
-            debug!("Upstream processor task completed");
+            debug!("Completion stream processor task completed");
         })
     };
 
@@ -1263,16 +1347,17 @@ async fn create_response_stream(
     // Check if this is the first user message in the conversation
     // The context.prompt_messages includes the NEW user message (added in build_context_and_check_billing)
     // Count user and assistant messages - if there's exactly 1 user and 0 assistant, it's the first message
-    let (user_count, assistant_count) = context
-        .prompt_messages
-        .iter()
-        .fold((0, 0), |(users, assistants), msg| {
-            match msg.get("role").and_then(|r| r.as_str()) {
-                Some(ROLE_USER) => (users + 1, assistants),
-                Some(ROLE_ASSISTANT) => (users, assistants + 1),
-                _ => (users, assistants),
-            }
-        });
+    let (user_count, assistant_count) =
+        context
+            .prompt_messages
+            .iter()
+            .fold((0, 0), |(users, assistants), msg| {
+                match msg.get("role").and_then(|r| r.as_str()) {
+                    Some(ROLE_USER) => (users + 1, assistants),
+                    Some(ROLE_ASSISTANT) => (users, assistants + 1),
+                    _ => (users, assistants),
+                }
+            });
     let is_first_message = user_count == 1 && assistant_count == 0;
 
     // Phase 3: Persist to database (only after all checks pass)
@@ -1281,10 +1366,14 @@ async fn create_response_stream(
 
     // If this is the first message, spawn background task to generate conversation title
     if is_first_message {
-        debug!("First message detected, spawning title generation task for conversation {}", context.conversation.uuid);
+        debug!(
+            "First message detected, spawning title generation task for conversation {}",
+            context.conversation.uuid
+        );
 
         // Extract text content for title generation
-        let user_content = MessageContentConverter::extract_text_for_token_counting(&prepared.message_content);
+        let user_content =
+            MessageContentConverter::extract_text_for_token_counting(&prepared.message_content);
 
         spawn_title_generation_task(
             state.clone(),

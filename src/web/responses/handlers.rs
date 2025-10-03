@@ -1256,7 +1256,11 @@ async fn setup_streaming_pipeline(
                     // Process CompletionChunks from centralized billing API
                     chunk_opt = rx_completion.recv() => {
                         let Some(chunk) = chunk_opt else {
-                            debug!("Completion stream ended without explicit Done");
+                            error!("Completion stream closed unexpectedly without Done signal");
+                            // Explicitly notify storage and client of the failure
+                            let msg = StorageMessage::Error("Stream closed unexpectedly".to_string());
+                            let _ = tx_storage.send(msg.clone()).await;
+                            let _ = tx_client.send(msg).await;
                             break;
                         };
 
@@ -1387,10 +1391,48 @@ async fn create_response_stream(
     }
 
     // Phase 4: Setup streaming pipeline
-    let (mut rx_client, response) = setup_streaming_pipeline(
+    let (mut rx_client, response) = match setup_streaming_pipeline(
         &state, &user, &body, &context, &prepared, &persisted, &headers,
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            // Streaming setup failed - clean up the database records
+            error!(
+                "Failed to setup streaming pipeline for response {}: {:?}",
+                persisted.response.uuid, e
+            );
+
+            // Update response status to failed
+            if let Err(db_err) = state.db.update_response_status(
+                persisted.response.id,
+                ResponseStatus::Failed,
+                Some(Utc::now()),
+            ) {
+                error!(
+                    "Failed to update response status after pipeline error: {:?}",
+                    db_err
+                );
+            }
+
+            // Update assistant message to incomplete with no content
+            if let Err(db_err) = state.db.update_assistant_message(
+                prepared.assistant_message_id,
+                None, // No content
+                0,    // No tokens
+                STATUS_INCOMPLETE.to_string(),
+                None, // No finish_reason since we failed before streaming
+            ) {
+                error!(
+                    "Failed to update assistant message after pipeline error: {:?}",
+                    db_err
+                );
+            }
+
+            return Err(e);
+        }
+    };
 
     let assistant_message_id = prepared.assistant_message_id;
     let total_prompt_tokens = context.total_prompt_tokens;

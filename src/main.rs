@@ -258,6 +258,9 @@ pub enum ApiError {
 
     #[error("Unprocessable entity")]
     UnprocessableEntity,
+
+    #[error("Payload too large")]
+    PayloadTooLarge,
 }
 
 impl IntoResponse for ApiError {
@@ -281,6 +284,7 @@ impl IntoResponse for ApiError {
             ApiError::FreeTokenLimitExceeded => StatusCode::FORBIDDEN,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         };
         (
             status,

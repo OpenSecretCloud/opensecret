@@ -630,7 +630,11 @@ ENCODER.lock().expect("encoder lock")
 
 ## Updated Implementation Checklist
 
-- [ ] Limit encrypted body size in `decrypt_request`
+- [x] **#8 FIXED (2025-01-XX)**: Limit encrypted body size in `decrypt_request` to 50MB
+  - Added `ApiError::PayloadTooLarge` error variant
+  - Added `MAX_ENCRYPTED_BODY_BYTES` constant (50MB) in `encryption_middleware.rs`
+  - Changed `to_bytes(body, usize::MAX)` to use size limit
+- [ ] **#1**: Add content size limits in response handlers and storage accumulator
 - [ ] Redact/remove content-bearing logs in prod (requests, deltas, chat_request)
 - [ ] Add connect/request/read timeouts and idle chunk timeouts in provider calls
 - [ ] Throttle/flag or cheapen title generation path; add per-user quotas

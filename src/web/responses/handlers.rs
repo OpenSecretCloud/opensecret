@@ -851,7 +851,16 @@ async fn validate_and_normalize_input(
     // Count tokens for the user's input message (text only for token counting)
     let input_text_for_tokens =
         MessageContentConverter::extract_text_for_token_counting(&message_content);
-    let user_message_tokens = count_tokens(&input_text_for_tokens) as i32;
+    let token_count = count_tokens(&input_text_for_tokens);
+    let user_message_tokens = if token_count > i32::MAX as usize {
+        warn!(
+            "Token count {} exceeds i32::MAX, clamping to i32::MAX",
+            token_count
+        );
+        i32::MAX
+    } else {
+        token_count as i32
+    };
 
     // Serialize the MessageContent for storage
     let content_for_storage = serde_json::to_string(&message_content)

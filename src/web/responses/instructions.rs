@@ -26,6 +26,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::warn;
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
@@ -269,7 +270,16 @@ async fn create_instruction(
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
     // Count tokens for the prompt
-    let prompt_tokens = count_tokens(&body.prompt) as i32;
+    let token_count = count_tokens(&body.prompt);
+    let prompt_tokens = if token_count > i32::MAX as usize {
+        warn!(
+            "Prompt token count {} exceeds i32::MAX, clamping to i32::MAX",
+            token_count
+        );
+        i32::MAX
+    } else {
+        token_count as i32
+    };
 
     // Encrypt name and prompt
     let name_enc = encrypt_with_key(&user_key, body.name.as_bytes()).await;
@@ -367,7 +377,16 @@ async fn update_instruction(
     let prompt_enc = encrypt_with_key(&ctx.user_key, final_prompt.as_bytes()).await;
 
     // Count tokens for the final prompt
-    let prompt_tokens = count_tokens(final_prompt) as i32;
+    let token_count = count_tokens(final_prompt);
+    let prompt_tokens = if token_count > i32::MAX as usize {
+        warn!(
+            "Final prompt token count {} exceeds i32::MAX, clamping to i32::MAX",
+            token_count
+        );
+        i32::MAX
+    } else {
+        token_count as i32
+    };
 
     // Update instruction in database
     let updated_instruction = state

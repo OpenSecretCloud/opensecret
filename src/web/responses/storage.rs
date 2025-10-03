@@ -141,7 +141,16 @@ impl ResponsePersister {
     pub async fn persist_completed(&self, data: CompleteData) -> Result<(), String> {
         // Fallback token counting if not provided
         let completion_tokens = if data.completion_tokens == 0 && !data.content.is_empty() {
-            count_tokens(&data.content) as i32
+            let token_count = count_tokens(&data.content);
+            if token_count > i32::MAX as usize {
+                warn!(
+                    "Completion token count {} exceeds i32::MAX, clamping to i32::MAX",
+                    token_count
+                );
+                i32::MAX
+            } else {
+                token_count as i32
+            }
         } else {
             data.completion_tokens
         };

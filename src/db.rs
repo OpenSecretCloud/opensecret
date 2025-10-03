@@ -30,8 +30,8 @@ use crate::models::project_settings::{
 };
 use crate::models::responses::{
     AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewResponse, NewToolCall,
-    NewToolOutput, NewUserInstruction, NewUserMessage, RawThreadMessage, Response, ResponseStatus,
-    ResponsesError, ToolCall, ToolOutput, UserInstruction, UserMessage,
+    NewToolOutput, NewUserInstruction, NewUserMessage, RawThreadMessage, RawThreadMessageMetadata,
+    Response, ResponseStatus, ResponsesError, ToolCall, ToolOutput, UserInstruction, UserMessage,
 };
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
 use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
@@ -596,6 +596,17 @@ pub trait DBConnection {
     fn get_response_context_messages(
         &self,
         response_id: i64,
+    ) -> Result<Vec<RawThreadMessage>, DBError>;
+
+    // Optimized context reconstruction (metadata-based)
+    fn get_conversation_context_metadata(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Vec<RawThreadMessageMetadata>, DBError>;
+    fn get_messages_by_ids(
+        &self,
+        conversation_id: i64,
+        message_ids: &[(String, i64)],
     ) -> Result<Vec<RawThreadMessage>, DBError>;
 
     // Delete operation for user messages
@@ -2427,6 +2438,28 @@ impl DBConnection for PostgresConnection {
         debug!("Getting response context messages");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         RawThreadMessage::get_response_context(conn, response_id).map_err(DBError::from)
+    }
+
+    // Optimized context reconstruction (metadata-based)
+    fn get_conversation_context_metadata(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Vec<RawThreadMessageMetadata>, DBError> {
+        debug!("Getting conversation context metadata (lightweight)");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        RawThreadMessageMetadata::get_conversation_context_metadata(conn, conversation_id)
+            .map_err(DBError::from)
+    }
+
+    fn get_messages_by_ids(
+        &self,
+        conversation_id: i64,
+        message_ids: &[(String, i64)],
+    ) -> Result<Vec<RawThreadMessage>, DBError> {
+        debug!("Getting {} specific messages by ID", message_ids.len());
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        RawThreadMessage::get_messages_by_ids(conn, conversation_id, message_ids)
+            .map_err(DBError::from)
     }
 
     fn delete_user_message(&self, id: Uuid, user_id: Uuid) -> Result<(), DBError> {

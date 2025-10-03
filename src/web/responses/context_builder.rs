@@ -18,6 +18,11 @@ pub struct ChatMsg {
 }
 
 /// Return (messages, total_prompt_tokens)
+///
+/// Optimized two-pass approach:
+/// 1. Fetch metadata only (lightweight, no decryption)
+/// 2. Run truncation logic on metadata to determine which messages to keep
+/// 3. Fetch and decrypt only the needed messages
 pub fn build_prompt<D: DBConnection + ?Sized>(
     db: &D,
     conversation_id: i64,
@@ -27,42 +32,57 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
     override_instructions: Option<&str>,
 ) -> Result<(Vec<serde_json::Value>, usize), crate::ApiError> {
     // 1. Get default user instructions if they exist (unless override provided)
-    let mut msgs: Vec<ChatMsg> = Vec::new();
-
-    if let Some(instruction_text) = override_instructions {
+    let mut system_tokens = 0usize;
+    let system_msg_opt = if let Some(instruction_text) = override_instructions {
         // Use override instructions if provided
         let tok = count_tokens(instruction_text);
-        msgs.push(ChatMsg {
-            role: ROLE_SYSTEM,
-            content: instruction_text.to_string(),
-            tool_call_id: None,
-            tok,
-        });
+        system_tokens = tok;
+        Some((ROLE_SYSTEM, instruction_text.to_string(), tok))
     } else if let Ok(Some(default_instruction)) = db.get_default_user_instruction(user_id) {
         // Otherwise use default user instructions
         let plain = decrypt_with_key(user_key, &default_instruction.prompt_enc)
             .map_err(|_| crate::ApiError::InternalServerError)?;
         let content = String::from_utf8_lossy(&plain).into_owned();
         let tok = default_instruction.prompt_tokens as usize;
+        system_tokens = tok;
+        Some((ROLE_SYSTEM, content, tok))
+    } else {
+        None
+    };
+
+    // 2. PASS 1: Fetch only metadata (lightweight, no content/decryption)
+    let metadata = db
+        .get_conversation_context_metadata(conversation_id)
+        .map_err(|_| crate::ApiError::InternalServerError)?;
+
+    // 3. Run truncation logic on metadata to determine which messages we need
+    let (needed_ids, did_truncate) = determine_needed_message_ids(&metadata, model, system_tokens)?;
+
+    // 4. PASS 2: Fetch and decrypt ONLY the messages we need
+    let raw = if needed_ids.is_empty() {
+        Vec::new()
+    } else {
+        db.get_messages_by_ids(conversation_id, &needed_ids)
+            .map_err(|_| crate::ApiError::InternalServerError)?
+    };
+
+    // 5. Build ChatMsg vector with system message + needed messages
+    let mut msgs: Vec<ChatMsg> = Vec::new();
+
+    // Track if we have a system message for truncation insert position
+    let has_system_msg = system_msg_opt.is_some();
+
+    // Add system message if present
+    if let Some((role, content, tok)) = system_msg_opt {
         msgs.push(ChatMsg {
-            role: ROLE_SYSTEM,
+            role,
             content,
             tool_call_id: None,
             tok,
         });
     }
 
-    // 2. Pull every stored message (already in chrono order ASC)
-    let raw = db
-        .get_conversation_context_messages(
-            conversation_id,
-            i64::MAX, // No limit - fetch all messages for context building
-            None,     // No cursor
-            "asc",    // Chronological order
-        )
-        .map_err(|_| crate::ApiError::InternalServerError)?;
-
-    // 3. Decrypt + map to ChatMsg
+    // Decrypt and add the messages we fetched
     for r in raw {
         // Skip messages with no content (in_progress assistant messages)
         let content_enc = match &r.content_enc {
@@ -91,12 +111,156 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
         });
     }
 
+    // Insert truncation message if we truncated
+    if did_truncate {
+        // Insert after system message (if exists) + first kept message
+        // The first kept message is always a user message (from our truncation logic)
+        let insert_pos = if has_system_msg { 2 } else { 1 };
+
+        let truncation_content = "[Previous messages truncated due to context limits]";
+        let truncation_msg = ChatMsg {
+            role: ROLE_ASSISTANT,
+            content: truncation_content.to_string(),
+            tool_call_id: None,
+            tok: count_tokens(truncation_content),
+        };
+
+        // Only insert if we have enough messages (safety check)
+        if msgs.len() > insert_pos {
+            msgs.insert(insert_pos, truncation_msg);
+        }
+    }
+
     // Note: In the Responses API flow, the current user message is already persisted
     // to the database before this function is called, so it's included in the
-    // get_conversation_context_messages result above.
+    // get_conversation_context_metadata result above.
 
-    // 4. Delegate to the pure function for truncation and formatting
+    // 6. Format for LLM API (no further truncation needed - already done in step 3)
     build_prompt_from_chat_messages(msgs, model)
+}
+
+/// Determine which message IDs are needed based on truncation logic
+///
+/// Runs the same middle-truncation algorithm as `build_prompt_from_chat_messages`,
+/// but operates on lightweight metadata to avoid fetching/decrypting unnecessary messages.
+///
+/// Returns (needed_ids, did_truncate)
+fn determine_needed_message_ids(
+    metadata: &[crate::models::responses::RawThreadMessageMetadata],
+    model: &str,
+    system_tokens: usize,
+) -> Result<(Vec<(String, i64)>, bool), crate::ApiError> {
+    use tracing::debug;
+
+    // Calculate token budget
+    let max_ctx = model_max_ctx(model);
+    let response_reserve = 4096usize;
+    let safety = 500usize;
+    let ctx_budget = max_ctx.saturating_sub(response_reserve + safety);
+
+    // Calculate total tokens in all messages
+    let total_msg_tokens: usize = metadata
+        .iter()
+        .filter_map(|m| m.token_count.map(|t| t as usize))
+        .sum();
+
+    // If everything fits, return all IDs with no truncation
+    if system_tokens + total_msg_tokens <= ctx_budget {
+        debug!(
+            "All {} messages fit in context budget ({}+ {} = {} <= {})",
+            metadata.len(),
+            system_tokens,
+            total_msg_tokens,
+            system_tokens + total_msg_tokens,
+            ctx_budget
+        );
+        return Ok((
+            metadata
+                .iter()
+                .map(|m| (m.message_type.clone(), m.id))
+                .collect(),
+            false, // did not truncate
+        ));
+    }
+
+    // Need to truncate - apply middle truncation logic
+    debug!(
+        "Truncating {} messages: total tokens {}+{} = {} exceeds budget {}",
+        metadata.len(),
+        system_tokens,
+        total_msg_tokens,
+        system_tokens + total_msg_tokens,
+        ctx_budget
+    );
+
+    let mut needed_ids: Vec<(String, i64)> = Vec::new();
+
+    // Always preserve the first system message (already accounted for in system_tokens)
+    // Then keep first user message only (first assistant gets removed)
+    let mut has_seen_first_user = false;
+    for m in metadata {
+        if m.message_type == "user" && !has_seen_first_user {
+            needed_ids.push((m.message_type.clone(), m.id));
+            has_seen_first_user = true;
+            break; // Stop after first user - don't keep first assistant
+        }
+    }
+
+    let head_tokens: usize = needed_ids
+        .iter()
+        .filter_map(|(msg_type, id)| {
+            metadata
+                .iter()
+                .find(|m| &m.message_type == msg_type && m.id == *id)
+                .and_then(|m| m.token_count.map(|t| t as usize))
+        })
+        .sum();
+
+    let truncation_msg_tokens = count_tokens("[Previous messages truncated due to context limits]");
+
+    // Calculate how many tokens we have left for the tail
+    let available_for_tail =
+        ctx_budget.saturating_sub(system_tokens + head_tokens + truncation_msg_tokens);
+
+    // Collect messages from the end until we hit the budget
+    // We need to ensure tail starts with a user message (for proper alternation after assistant truncation)
+    let mut potential_tail: Vec<(String, i64, usize)> = Vec::new(); // (type, id, tokens)
+    let mut potential_tail_tokens = 0usize;
+
+    for m in metadata.iter().rev() {
+        let tok = m.token_count.map(|t| t as usize).unwrap_or(0);
+        if potential_tail_tokens + tok > available_for_tail {
+            break;
+        }
+        potential_tail.push((m.message_type.clone(), m.id, tok));
+        potential_tail_tokens += tok;
+    }
+    potential_tail.reverse();
+
+    // Ensure tail starts with a user message (drop leading assistant messages if needed)
+    let mut found_user = false;
+    for (msg_type, id, _tok) in potential_tail {
+        if !found_user {
+            if msg_type == "user" {
+                found_user = true;
+                needed_ids.push((msg_type, id));
+            }
+            // Skip any leading non-user messages
+        } else {
+            needed_ids.push((msg_type, id));
+        }
+    }
+
+    // Add the truncation indicator to the needed IDs (it will be inserted by build_prompt_from_chat_messages)
+    // Note: The truncation message itself is inserted by build_prompt_from_chat_messages if truncation occurred
+
+    debug!(
+        "Truncation: keeping {} out of {} messages",
+        needed_ids.len(),
+        metadata.len()
+    );
+
+    Ok((needed_ids, true)) // did truncate
 }
 
 /// Build prompt from chat messages - pure function for testing

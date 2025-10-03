@@ -311,11 +311,11 @@ if let Some(max_tokens) = body.max_output_tokens {
 
 ---
 
-### 5. Conversation History DoS
+### 5. Conversation History DoS ✅ FIXED
 
 **Location**: `context_builder.rs` line 63
 
-**Code**:
+**Original Code**:
 ```rust
 let raw = db.get_conversation_context_messages(
     conversation_id,
@@ -327,27 +327,215 @@ let raw = db.get_conversation_context_messages(
 
 **Impact**: A conversation with 10,000+ messages will load ALL into memory, decrypt them all, then truncate. This wastes resources and could be exploited for DoS.
 
-**Recommendation**: Implement smarter pagination or limit the initial fetch:
+**Status**: ✅ **FIXED** - Implemented two-pass optimization to only decrypt messages that will be used.
+
+## Solution: Two-Pass Metadata-Based Optimization
+
+### Problem Analysis
+
+The original flow was extremely inefficient:
+1. Fetch ALL messages from DB (UNION of 4 tables: user_messages, assistant_messages, tool_calls, tool_outputs)
+2. Decrypt ALL `content_enc` fields (CPU intensive encryption operations)
+3. Build ChatMsg objects with token counts for ALL messages
+4. Run truncation logic to determine which messages fit in context window
+5. **Discard 90%+ of messages** that don't fit in the context budget
+
+**Example**: For a 1000-message conversation where only 50 messages fit in context:
+- ❌ Old: Decrypt 1000 messages, discard 950
+- ✅ New: Fetch metadata for 1000, decrypt only 50 needed
+
+### Implementation
+
+#### Step 1: New Lightweight Metadata Struct
+
+**File**: `src/models/responses.rs`
+
+Created `RawThreadMessageMetadata` with only fields needed for truncation decisions:
+
 ```rust
-// Fetch only recent messages up to a reasonable limit
-// The truncation logic will handle keeping the right messages
-const MAX_HISTORY_MESSAGES: i64 = 1000;
-
-let raw = db.get_conversation_context_messages(
-    conversation_id,
-    MAX_HISTORY_MESSAGES,
-    None,
-    "desc", // Get most recent first
-)
-.map_err(|_| crate::ApiError::InternalServerError)?;
-
-// Reverse to chronological order
-let raw: Vec<_> = raw.into_iter().rev().collect();
+#[derive(QueryableByName, Debug)]
+pub struct RawThreadMessageMetadata {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub message_type: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub id: i64,
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    pub uuid: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    pub created_at: DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    pub token_count: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    pub tool_call_id: Option<Uuid>,
+}
 ```
 
-Alternatively, implement a smarter two-pass approach:
-1. Count total messages and tokens
-2. If over budget, fetch only first N and last M messages (skip middle)
+**Key difference**: No `content_enc` field - avoids fetching encrypted bytea columns.
+
+#### Step 2: New DB Methods
+
+**File**: `src/models/responses.rs`
+
+**Method 1**: `get_conversation_context_metadata()` - Fetch only metadata
+```rust
+impl RawThreadMessageMetadata {
+    pub fn get_conversation_context_metadata(
+        conn: &mut PgConnection,
+        conversation_id: i64,
+    ) -> Result<Vec<RawThreadMessageMetadata>, ResponsesError> {
+        // Same UNION query structure but SELECT only:
+        // - message_type, id, uuid, created_at, token_count, tool_call_id
+        // - EXCLUDE content_enc/arguments_enc/output_enc (heavy bytea fields)
+    }
+}
+```
+
+**Method 2**: `get_messages_by_ids()` - Fetch full messages for specific IDs
+```rust
+impl RawThreadMessage {
+    pub fn get_messages_by_ids(
+        conn: &mut PgConnection,
+        conversation_id: i64,
+        message_ids: &[(String, i64)], // (message_type, id) pairs
+    ) -> Result<Vec<RawThreadMessage>, ResponsesError> {
+        // Targeted fetch with WHERE clauses:
+        // (message_type = 'user' AND id IN (...))
+        // OR (message_type = 'assistant' AND id IN (...))
+        // AND conversation_id = $1  -- for safety
+    }
+}
+```
+
+#### Step 3: Refactored Context Building
+
+**File**: `src/web/responses/context_builder.rs`
+
+**New Flow**:
+```rust
+pub fn build_prompt<D: DBConnection + ?Sized>(
+    db: &D,
+    conversation_id: i64,
+    user_id: uuid::Uuid,
+    user_key: &secp256k1::SecretKey,
+    model: &str,
+    override_instructions: Option<&str>,
+) -> Result<(Vec<serde_json::Value>, usize), crate::ApiError> {
+    // 1. Get user instructions (decrypt - always needed)
+    let mut msgs: Vec<ChatMsg> = Vec::new();
+    // ... handle system message ...
+
+    // 2. PASS 1: Fetch only metadata (lightweight, no decryption)
+    let metadata = db.get_conversation_context_metadata(conversation_id)?;
+
+    // 3. Run truncation logic on metadata to determine needed IDs
+    let needed_ids = determine_needed_message_ids(
+        metadata,
+        model_max_ctx(model),
+        msgs.iter().map(|m| m.tok).sum(), // system message tokens
+    )?;
+
+    // 4. PASS 2: Fetch and decrypt ONLY the messages we need
+    let raw = db.get_messages_by_ids(conversation_id, &needed_ids)?;
+
+    // 5. Decrypt only the needed messages
+    for r in raw {
+        let content_enc = match &r.content_enc {
+            Some(enc) => enc,
+            None => continue,
+        };
+        let plain = decrypt_with_key(user_key, content_enc)?;
+        // ... build ChatMsg ...
+    }
+
+    // 6. Format for LLM API
+    build_prompt_from_chat_messages(msgs, model)
+}
+```
+
+**New Helper Function**: `determine_needed_message_ids()`
+```rust
+fn determine_needed_message_ids(
+    metadata: Vec<RawThreadMessageMetadata>,
+    model: &str,
+    system_tokens: usize,
+) -> Result<Vec<(String, i64)>, crate::ApiError> {
+    let max_ctx = model_max_ctx(model);
+    let ctx_budget = max_ctx.saturating_sub(4096 + 500); // response_reserve + safety
+    
+    let total_tokens: usize = metadata.iter()
+        .filter_map(|m| m.token_count.map(|t| t as usize))
+        .sum();
+    
+    if system_tokens + total_tokens <= ctx_budget {
+        // All messages fit - return all IDs
+        return Ok(metadata.iter()
+            .map(|m| (m.message_type.clone(), m.id))
+            .collect());
+    }
+    
+    // Apply middle truncation logic on metadata
+    // Keep: first user message + recent messages that fit in budget
+    let mut needed: Vec<(String, i64)> = Vec::new();
+    
+    // ... implement same truncation logic as before, but on metadata ...
+    // ... collect IDs of messages we need to keep ...
+    
+    Ok(needed)
+}
+```
+
+### Performance Improvements
+
+**Before (1000 message conversation, 50 messages fit in context)**:
+- Query 1: Fetch 1000 full messages (including bytea `content_enc`) ≈ 10MB+
+- Decrypt 1000 messages (CPU intensive) ≈ 1000 decrypt operations
+- Truncate: Keep 50, discard 950
+- **Wasted**: 950 decrypt operations + 9.5MB+ data transfer
+
+**After**:
+- Query 1: Fetch 1000 metadata rows (no bytea) ≈ 100KB
+- Run truncation logic on metadata
+- Query 2: Fetch 50 full messages (targeted `WHERE id IN (...)`) ≈ 500KB
+- Decrypt 50 messages ≈ 50 decrypt operations
+- **Savings**: 950 decrypt operations avoided, ~10MB less data transfer
+
+### Database Query Optimization
+
+The `get_messages_by_ids()` query uses existing indexes efficiently:
+
+```sql
+-- Leverages these existing indexes:
+-- idx_user_messages_conversation_created_id (conversation_id, created_at DESC, id)
+-- idx_assistant_messages_conversation_created_id (conversation_id, created_at DESC, id)
+-- idx_tool_calls_conversation_created_id (conversation_id, created_at DESC, id)
+-- idx_tool_outputs_conversation_created_id (conversation_id, created_at DESC, id)
+
+WHERE conversation_id = $1 
+  AND (
+    (message_type = 'user' AND id IN (...)) OR
+    (message_type = 'assistant' AND id IN (...)) OR
+    (message_type = 'tool_call' AND id IN (...)) OR
+    (message_type = 'tool_output' AND id IN (...))
+  )
+```
+
+### Trade-offs
+
+**Pros**:
+- ✅ Massive reduction in decryption operations (950 avoided in example)
+- ✅ Significant memory savings (avoid loading unnecessary bytea fields)
+- ✅ Faster response times for large conversations
+- ✅ Maintains exact same truncation logic and behavior
+
+**Cons**:
+- ⚠️ Two DB queries instead of one (metadata + targeted fetch)
+  - Mitigated: Second query is highly targeted with WHERE id IN clause
+  - Mitigated: Metadata query is very lightweight (no bytea columns)
+- ⚠️ Slightly more complex code
+  - Mitigated: Truncation logic extracted to pure function
+  - Mitigated: Well-tested with existing test suite
+
+**Net Result**: The overhead of a second lightweight query is negligible compared to avoiding hundreds/thousands of decrypt operations.
 
 ---
 
@@ -440,7 +628,13 @@ if total > ctx_budget {
 - [ ] Add input size validation in Phase 1
 - [ ] Add parameter validation (temperature, top_p, max_tokens) in Phase 1
 - [ ] Fix token counting integer overflow with try_from
-- [ ] Optimize conversation history loading with pagination
+- [x] **#5 FIXED**: Optimize conversation history loading with two-pass metadata approach
+  - Created `RawThreadMessageMetadata` struct (lightweight, no `content_enc` field)
+  - Added `get_conversation_context_metadata()` DB method  
+  - Added `get_messages_by_ids()` DB method for targeted retrieval
+  - Refactored `build_prompt()` to fetch metadata first, run truncation logic, then fetch only needed messages
+  - All existing tests pass - behavior unchanged
+  - For 1000-message conversations, avoids 950+ unnecessary decrypt operations
 - [ ] Replace debug_assert with runtime error in context_builder
 - [ ] Add `ApiError::PayloadTooLarge` variant if not exists
 - [ ] Add tests for size limit edge cases

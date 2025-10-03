@@ -1022,4 +1022,259 @@ impl RawThreadMessage {
             .load::<RawThreadMessage>(conn)
             .map_err(ResponsesError::DatabaseError)
     }
+
+    /// Fetch messages by specific IDs (for targeted retrieval after metadata-based truncation)
+    pub fn get_messages_by_ids(
+        conn: &mut PgConnection,
+        conversation_id: i64,
+        message_ids: &[(String, i64)], // (message_type, id) pairs
+    ) -> Result<Vec<RawThreadMessage>, ResponsesError> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Separate IDs by message type
+        let user_ids: Vec<i64> = message_ids
+            .iter()
+            .filter(|(t, _)| t == "user")
+            .map(|(_, id)| *id)
+            .collect();
+        let assistant_ids: Vec<i64> = message_ids
+            .iter()
+            .filter(|(t, _)| t == "assistant")
+            .map(|(_, id)| *id)
+            .collect();
+        let tool_call_ids: Vec<i64> = message_ids
+            .iter()
+            .filter(|(t, _)| t == "tool_call")
+            .map(|(_, id)| *id)
+            .collect();
+        let tool_output_ids: Vec<i64> = message_ids
+            .iter()
+            .filter(|(t, _)| t == "tool_output")
+            .map(|(_, id)| *id)
+            .collect();
+
+        // Build WHERE clause with inline arrays (safe since IDs are i64)
+        let mut conditions = Vec::new();
+        if !user_ids.is_empty() {
+            let ids_str = user_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            conditions.push(format!("(message_type = 'user' AND id IN ({}))", ids_str));
+        }
+        if !assistant_ids.is_empty() {
+            let ids_str = assistant_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            conditions.push(format!(
+                "(message_type = 'assistant' AND id IN ({}))",
+                ids_str
+            ));
+        }
+        if !tool_call_ids.is_empty() {
+            let ids_str = tool_call_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            conditions.push(format!(
+                "(message_type = 'tool_call' AND id IN ({}))",
+                ids_str
+            ));
+        }
+        if !tool_output_ids.is_empty() {
+            let ids_str = tool_output_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            conditions.push(format!(
+                "(message_type = 'tool_output' AND id IN ({}))",
+                ids_str
+            ));
+        }
+
+        let where_clause = conditions.join(" OR ");
+
+        let query = format!(
+            r#"
+            WITH conversation_messages AS (
+                -- User messages
+                SELECT
+                    'user' as message_type,
+                    um.id,
+                    um.uuid,
+                    um.content_enc,
+                    'completed'::text as status,
+                    um.created_at,
+                    r.model,
+                    um.prompt_tokens as token_count,
+                    NULL::uuid as tool_call_id,
+                    NULL::text as finish_reason
+                FROM user_messages um
+                LEFT JOIN responses r ON um.response_id = r.id
+                WHERE um.conversation_id = $1
+
+                UNION ALL
+
+                -- Assistant messages
+                SELECT
+                    'assistant' as message_type,
+                    am.id,
+                    am.uuid,
+                    am.content_enc,
+                    am.status,
+                    am.created_at,
+                    r.model,
+                    am.completion_tokens as token_count,
+                    NULL::uuid as tool_call_id,
+                    am.finish_reason
+                FROM assistant_messages am
+                LEFT JOIN responses r ON am.response_id = r.id
+                WHERE am.conversation_id = $1
+
+                UNION ALL
+
+                -- Tool calls
+                SELECT
+                    'tool_call' as message_type,
+                    tc.id,
+                    tc.uuid,
+                    tc.arguments_enc as content_enc,
+                    'completed'::text as status,
+                    tc.created_at,
+                    NULL::text as model,
+                    tc.argument_tokens as token_count,
+                    tc.tool_call_id,
+                    NULL::text as finish_reason
+                FROM tool_calls tc
+                WHERE tc.conversation_id = $1
+
+                UNION ALL
+
+                -- Tool outputs
+                SELECT
+                    'tool_output' as message_type,
+                    tto.id,
+                    tto.uuid,
+                    tto.output_enc as content_enc,
+                    'completed'::text as status,
+                    tto.created_at,
+                    NULL::text as model,
+                    tto.output_tokens as token_count,
+                    tc.tool_call_id,
+                    NULL::text as finish_reason
+                FROM tool_outputs tto
+                JOIN tool_calls tc ON tto.tool_call_fk = tc.id
+                WHERE tto.conversation_id = $1
+            )
+            SELECT * FROM conversation_messages
+            WHERE {}
+            ORDER BY created_at ASC, id ASC
+            "#,
+            where_clause
+        );
+
+        sql_query(query)
+            .bind::<BigInt, _>(conversation_id)
+            .load::<RawThreadMessage>(conn)
+            .map_err(ResponsesError::DatabaseError)
+    }
+}
+
+// ============================================================================
+// Lightweight metadata struct for efficient truncation decisions
+// ============================================================================
+
+/// Metadata-only version of RawThreadMessage for efficient context building.
+/// Excludes `content_enc` to avoid fetching and decrypting messages that will be truncated.
+#[derive(QueryableByName, Debug, Clone)]
+pub struct RawThreadMessageMetadata {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub message_type: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub id: i64,
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    pub uuid: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    pub created_at: DateTime<Utc>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    pub token_count: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    pub tool_call_id: Option<Uuid>,
+}
+
+impl RawThreadMessageMetadata {
+    /// Fetch only message metadata (no content) for efficient truncation logic
+    pub fn get_conversation_context_metadata(
+        conn: &mut PgConnection,
+        conversation_id: i64,
+    ) -> Result<Vec<RawThreadMessageMetadata>, ResponsesError> {
+        let query = r#"
+            WITH conversation_messages AS (
+                -- User messages
+                SELECT
+                    'user' as message_type,
+                    um.id,
+                    um.uuid,
+                    um.created_at,
+                    um.prompt_tokens as token_count,
+                    NULL::uuid as tool_call_id
+                FROM user_messages um
+                WHERE um.conversation_id = $1
+
+                UNION ALL
+
+                -- Assistant messages
+                SELECT
+                    'assistant' as message_type,
+                    am.id,
+                    am.uuid,
+                    am.created_at,
+                    am.completion_tokens as token_count,
+                    NULL::uuid as tool_call_id
+                FROM assistant_messages am
+                WHERE am.conversation_id = $1
+
+                UNION ALL
+
+                -- Tool calls
+                SELECT
+                    'tool_call' as message_type,
+                    tc.id,
+                    tc.uuid,
+                    tc.created_at,
+                    tc.argument_tokens as token_count,
+                    tc.tool_call_id
+                FROM tool_calls tc
+                WHERE tc.conversation_id = $1
+
+                UNION ALL
+
+                -- Tool outputs
+                SELECT
+                    'tool_output' as message_type,
+                    tto.id,
+                    tto.uuid,
+                    tto.created_at,
+                    tto.output_tokens as token_count,
+                    tc.tool_call_id
+                FROM tool_outputs tto
+                JOIN tool_calls tc ON tto.tool_call_fk = tc.id
+                WHERE tto.conversation_id = $1
+            )
+            SELECT * FROM conversation_messages
+            ORDER BY created_at ASC, id ASC
+        "#;
+
+        sql_query(query)
+            .bind::<BigInt, _>(conversation_id)
+            .load::<RawThreadMessageMetadata>(conn)
+            .map_err(ResponsesError::DatabaseError)
+    }
 }

@@ -27,12 +27,16 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
 // Maximum audio file size (100MB) - sanity check, CF already limits to 50MB
 const MAX_AUDIO_SIZE: usize = 100 * 1024 * 1024;
+
+// Timeout constants for provider requests
+const REQUEST_TIMEOUT_SECS: u64 = 120; // Request timeout (generous for large non-streaming responses)
+const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming reads
 
 /// Parameters for transcription requests
 struct TranscriptionParams<'a> {
@@ -588,52 +592,73 @@ pub async fn get_chat_completion_response(
         let mut body_stream = res.into_body().into_stream();
         let mut buffer = String::new();
 
-        while let Some(chunk_result) = body_stream.next().await {
-            match chunk_result {
-                Ok(bytes) => {
-                    let chunk_str = String::from_utf8_lossy(bytes.as_ref());
-                    buffer.push_str(&chunk_str);
+        loop {
+            match timeout(
+                Duration::from_secs(STREAM_CHUNK_TIMEOUT_SECS),
+                body_stream.next(),
+            )
+            .await
+            {
+                Ok(Some(chunk_result)) => {
+                    match chunk_result {
+                        Ok(bytes) => {
+                            let chunk_str = String::from_utf8_lossy(bytes.as_ref());
+                            buffer.push_str(&chunk_str);
 
-                    // Parse SSE frames
-                    while let Some(frame) = extract_sse_frame(&mut buffer) {
-                        if frame == "[DONE]" {
-                            let _ = tx_consumer.send(CompletionChunk::Done).await;
-                            return;
-                        }
+                            // Parse SSE frames
+                            while let Some(frame) = extract_sse_frame(&mut buffer) {
+                                if frame == "[DONE]" {
+                                    let _ = tx_consumer.send(CompletionChunk::Done).await;
+                                    return;
+                                }
 
-                        if let Ok(json) = serde_json::from_str::<Value>(&frame) {
-                            // ✅ Extract and publish billing HERE
-                            if let Some(usage) = extract_usage(&json) {
-                                publish_usage_event_internal(
-                                    &state_clone,
-                                    &user_clone,
-                                    &billing_ctx,
-                                    usage.clone(),
-                                    &provider,
-                                )
-                                .await;
+                                if let Ok(json) = serde_json::from_str::<Value>(&frame) {
+                                    // ✅ Extract and publish billing HERE
+                                    if let Some(usage) = extract_usage(&json) {
+                                        publish_usage_event_internal(
+                                            &state_clone,
+                                            &user_clone,
+                                            &billing_ctx,
+                                            usage.clone(),
+                                            &provider,
+                                        )
+                                        .await;
 
-                                // Also send usage to consumer
-                                let _ = tx_consumer.send(CompletionChunk::Usage(usage)).await;
+                                        // Also send usage to consumer
+                                        let _ =
+                                            tx_consumer.send(CompletionChunk::Usage(usage)).await;
+                                    }
+
+                                    // Send full JSON chunk to consumer (preserves all metadata)
+                                    let _ =
+                                        tx_consumer.send(CompletionChunk::StreamChunk(json)).await;
+                                }
                             }
-
-                            // Send full JSON chunk to consumer (preserves all metadata)
-                            let _ = tx_consumer.send(CompletionChunk::StreamChunk(json)).await;
+                        }
+                        Err(e) => {
+                            error!("Stream error: {:?}", e);
+                            let _ = tx_consumer
+                                .send(CompletionChunk::Error(e.to_string()))
+                                .await;
+                            break;
                         }
                     }
                 }
-                Err(e) => {
-                    error!("Stream error: {:?}", e);
+                Ok(None) => {
+                    // Stream ended without explicit [DONE]
+                    let _ = tx_consumer.send(CompletionChunk::Done).await;
+                    break;
+                }
+                Err(_) => {
+                    // Timeout waiting for next chunk
+                    error!("Stream chunk timeout after {}s", STREAM_CHUNK_TIMEOUT_SECS);
                     let _ = tx_consumer
-                        .send(CompletionChunk::Error(e.to_string()))
+                        .send(CompletionChunk::Error("Stream timeout".to_string()))
                         .await;
                     break;
                 }
             }
         }
-
-        // Stream ended without explicit [DONE]
-        let _ = tx_consumer.send(CompletionChunk::Done).await;
     });
 
     Ok(CompletionStream {
@@ -1218,9 +1243,14 @@ async fn send_transcription_request(
         .body(HyperBody::from(form_data))
         .map_err(|e| format!("Failed to create request: {:?}", e))?;
 
-    // Send request
-    match client.request(req).await {
-        Ok(res) => {
+    // Send request with timeout
+    match timeout(
+        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        client.request(req),
+    )
+    .await
+    {
+        Ok(Ok(res)) => {
             if res.status().is_success() {
                 let body_bytes = to_bytes(res.into_body())
                     .await
@@ -1243,9 +1273,13 @@ async fn send_transcription_request(
                 ))
             }
         }
-        Err(e) => Err(format!(
+        Ok(Err(e)) => Err(format!(
             "Failed to send request to {}: {:?}",
             provider.provider_name, e
+        )),
+        Err(_) => Err(format!(
+            "Request to {} timed out after {}s",
+            provider.provider_name, REQUEST_TIMEOUT_SECS
         )),
     }
 }
@@ -1326,8 +1360,17 @@ async fn proxy_tts(
             ApiError::InternalServerError
         })?;
 
-    // Send request
-    let res = client.request(req).await.map_err(|e| {
+    // Send request with timeout
+    let res = timeout(
+        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        client.request(req),
+    )
+    .await
+    .map_err(|_| {
+        error!("TTS request timed out after {}s", REQUEST_TIMEOUT_SECS);
+        ApiError::InternalServerError
+    })?
+    .map_err(|e| {
         error!("Failed to send TTS request: {:?}", e);
         ApiError::InternalServerError
     })?;
@@ -1404,8 +1447,13 @@ async fn try_provider(
         .body(HyperBody::from(body_json.to_string()))
         .map_err(|e| format!("Failed to create request body: {:?}", e))?;
 
-    match client.request(req).await {
-        Ok(response) => {
+    match timeout(
+        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        client.request(req),
+    )
+    .await
+    {
+        Ok(Ok(response)) => {
             if response.status().is_success() {
                 Ok(response)
             } else {
@@ -1432,7 +1480,7 @@ async fn try_provider(
                 }
             }
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             error!(
                 "Failed to send request to {}: {:?}",
                 proxy_config.provider_name, e
@@ -1440,6 +1488,16 @@ async fn try_provider(
             Err(format!(
                 "Failed to connect to {}: {}",
                 proxy_config.provider_name, e
+            ))
+        }
+        Err(_) => {
+            error!(
+                "Request to {} timed out after {}s",
+                proxy_config.provider_name, REQUEST_TIMEOUT_SECS
+            );
+            Err(format!(
+                "Request to {} timed out",
+                proxy_config.provider_name
             ))
         }
     }

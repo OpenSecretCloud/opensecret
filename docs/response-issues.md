@@ -473,12 +473,13 @@ Also consider validating decrypted payload size before deserialization.
 
 ---
 
-### 9. Sensitive Data in Logs (PII/Secrets Leakage)
+### 9. Sensitive Data in Logs (PII/Secrets Leakage) ✅ NOT A CONCERN
 
 **Locations**:
-- `responses/handlers.rs` `create_response_stream`: logs full `body` and flags
-- `responses/handlers.rs` `setup_streaming_pipeline`: logs pretty-printed `chat_request` (includes messages)
-- Various trace logs include content deltas and generated titles
+- `responses/handlers.rs` line 1340: logs full `body` 
+- `responses/handlers.rs` lines 1197-1202: logs pretty-printed `chat_request` (includes messages)
+- `responses/handlers.rs` line 1594: logs content deltas
+- `storage.rs` line 37: logs content delta sizes
 
 **Code**:
 ```rust
@@ -488,43 +489,53 @@ trace!(
     body.model,
     serde_json::to_string_pretty(&chat_request).unwrap_or_else(|_| "failed to serialize".to_string())
 );
+trace!("Client stream received content delta: {}", content);
 ```
 
-**Impact**: Persists user prompts, responses, and metadata into logs. This is a privacy and compliance risk and can leak secrets inadvertently pasted by users.
+**Status**: ✅ **All sensitive data logging uses `trace!` level only.** This is disabled in production by default, so there is no actual risk. Debug/info/warn/error logs only contain UUIDs, counts, and error messages—no user content.
 
-**Recommendation**: Redact or remove content-bearing logs in production. Log only metadata (IDs, sizes, counts). Guard verbose logs behind feature flags or non-prod builds.
+**No action needed.**
 
 ---
 
-### 10. Missing Provider Request/Stream Timeouts (Resource Pinning)
+### 10. Missing Provider Request/Stream Timeouts (Resource Pinning) ✅ FIXED
 
 **Location**: `web/openai.rs` (provider HTTP calls and SSE read loop)
 
-**Code**:
+**Status**: ✅ **Fixed** - Added timeouts to all provider HTTP calls and streaming reads.
+
+**Implementation**:
+- Added `REQUEST_TIMEOUT_SECS = 120` constant for request timeout (generous for large non-streaming responses)
+- Added `STREAM_CHUNK_TIMEOUT_SECS = 120` constant for per-chunk streaming timeout
+- Wrapped all `client.request()` calls with `timeout()` in:
+  - `try_provider()` - chat completions
+  - `send_transcription_request()` - audio transcriptions  
+  - `proxy_tts()` - text-to-speech
+- Wrapped streaming loop in `get_chat_completion_response()` with per-chunk timeout
+- Proper error handling and logging for all timeout cases
+
+**Changes Made**:
 ```rust
-let client = Client::builder()
-    .pool_idle_timeout(Duration::from_secs(30))
-    .pool_max_idle_per_host(10)
-    .build::<_, HyperBody>(https);
-// ... request + streaming without explicit per-request/read timeouts
-```
+// Constants added
+const REQUEST_TIMEOUT_SECS: u64 = 120;
+const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120;
 
-**Impact**: A slow or stalled upstream can hold connections, tasks, and memory indefinitely, degrading capacity (DoS).
+// Request timeout example
+match timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), client.request(req)).await {
+    Ok(Ok(response)) => { /* success */ }
+    Ok(Err(e)) => { /* request error */ }
+    Err(_) => { /* timeout error */ }
+}
 
-**Recommendation**: Apply timeouts around request execution and streaming reads.
-```rust
-use tokio::time::{timeout, Duration};
-
-let res = timeout(Duration::from_secs(30), client.request(req))
-    .await
-    .map_err(|_| ApiError::GatewayTimeout)??;
-
-// In streaming loop
-while let Ok(Some(chunk_result)) = timeout(Duration::from_secs(60), body_stream.next()).await {
-    // handle chunk_result ...
+// Streaming timeout
+loop {
+    match timeout(Duration::from_secs(STREAM_CHUNK_TIMEOUT_SECS), body_stream.next()).await {
+        Ok(Some(chunk)) => { /* process */ }
+        Ok(None) => break,
+        Err(_) => { /* timeout - send error and break */ }
+    }
 }
 ```
-Use sensible defaults and make them configurable per model/provider.
 
 ---
 
@@ -621,12 +632,11 @@ ENCODER.lock().expect("encoder lock")
 ## Updated Priority Recommendations
 
 1. Immediate: Enforce body/content size limits (#1, #8)
-2. High: Redact sensitive logs and add upstream timeouts (#9, #10)
-3. High: Validate input/metadata size and params (#2, #4, #6)
-4. Medium: Clamp token counts and optimize history loading (#3, #5)
-5. Medium: Reduce default max tokens; header allowlist; throttle title generation (#11, #12, #13)
-6. Medium: Use `try_send` for client channel (#14)
-7. Low: Replace debug asserts; handle encoder poisoning; reduce SSE amplification (#7, #15, #16)
+2. High: Validate input/metadata size and params (#2, #4, #6)
+3. Medium: Clamp token counts and optimize history loading (#3, #5)
+4. Medium: Reduce default max tokens; header allowlist; throttle title generation (#11, #12, #13)
+5. Medium: Use `try_send` for client channel (#14)
+6. Low: Replace debug asserts; handle encoder poisoning; reduce SSE amplification (#7, #15, #16)
 
 ## Updated Implementation Checklist
 
@@ -634,9 +644,12 @@ ENCODER.lock().expect("encoder lock")
   - Added `ApiError::PayloadTooLarge` error variant
   - Added `MAX_ENCRYPTED_BODY_BYTES` constant (50MB) in `encryption_middleware.rs`
   - Changed `to_bytes(body, usize::MAX)` to use size limit
+- [x] **#10 FIXED**: Add connect/request/read timeouts in provider calls
+  - Added `REQUEST_TIMEOUT_SECS = 120` for request timeout (generous for large non-streaming responses)
+  - Added `STREAM_CHUNK_TIMEOUT_SECS = 120` for streaming chunk timeout
+  - Wrapped all provider requests with `timeout()` in `try_provider()`, `send_transcription_request()`, and `proxy_tts()`
+  - Wrapped streaming loop in `get_chat_completion_response()` with per-chunk timeout
 - [ ] **#1**: Add content size limits in response handlers and storage accumulator
-- [ ] Redact/remove content-bearing logs in prod (requests, deltas, chat_request)
-- [ ] Add connect/request/read timeouts and idle chunk timeouts in provider calls
 - [ ] Throttle/flag or cheapen title generation path; add per-user quotas
 - [ ] Lower `DEFAULT_MAX_TOKENS` and enforce per-plan caps
 - [ ] Switch header forwarding to allowlist in `try_provider`

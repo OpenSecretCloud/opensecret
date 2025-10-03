@@ -197,11 +197,9 @@ fn determine_needed_message_ids(
 
     // Always preserve the first system message (already accounted for in system_tokens)
     // Then keep first user message only (first assistant gets removed)
-    let mut has_seen_first_user = false;
     for m in metadata {
-        if m.message_type == "user" && !has_seen_first_user {
+        if m.message_type == "user" {
             needed_ids.push((m.message_type.clone(), m.id));
-            has_seen_first_user = true;
             break; // Stop after first user - don't keep first assistant
         }
     }

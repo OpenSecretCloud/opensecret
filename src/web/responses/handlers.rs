@@ -1250,6 +1250,8 @@ async fn setup_streaming_pipeline(
 
         tokio::spawn(async move {
             trace!("Starting completion stream processor task");
+            let mut client_alive = true;
+
             loop {
                 tokio::select! {
                     // Check for cancellation
@@ -1257,7 +1259,10 @@ async fn setup_streaming_pipeline(
                         if cancelled_id == response_uuid {
                             debug!("Received cancellation signal for response {}", response_uuid);
                             let _ = tx_storage.send(StorageMessage::Cancelled).await;
-                            let _ = tx_client.send(StorageMessage::Cancelled).await;
+                            if client_alive && tx_client.try_send(StorageMessage::Cancelled).is_err() {
+                                warn!("Client channel full or closed during cancellation, terminating client stream");
+                                client_alive = false;
+                            }
                             break;
                         }
                     }
@@ -1269,7 +1274,10 @@ async fn setup_streaming_pipeline(
                             // Explicitly notify storage and client of the failure
                             let msg = StorageMessage::Error("Stream closed unexpectedly".to_string());
                             let _ = tx_storage.send(msg.clone()).await;
-                            let _ = tx_client.send(msg).await;
+                            if client_alive && tx_client.try_send(msg).is_err() {
+                                warn!("Client channel full or closed during stream error, terminating client stream");
+                                client_alive = false;
+                            }
                             break;
                         };
 
@@ -1284,13 +1292,16 @@ async fn setup_streaming_pipeline(
                                     .and_then(|c| c.as_str())
                                 {
                                     let msg = StorageMessage::ContentDelta(content.to_string());
-                                    // Must send to storage (critical)
+                                    // Must send to storage (critical, can block)
                                     if tx_storage.send(msg.clone()).await.is_err() {
                                         error!("Storage channel closed unexpectedly");
                                         break;
                                     }
-                                    // Best-effort send to client
-                                    let _ = tx_client.send(msg).await;
+                                    // Best-effort send to client (non-blocking, never blocks storage)
+                                    if client_alive && tx_client.try_send(msg).is_err() {
+                                        warn!("Client channel full or closed, terminating client stream");
+                                        client_alive = false;
+                                    }
                                 }
                             }
                             crate::web::openai::CompletionChunk::Usage(usage) => {
@@ -1301,7 +1312,10 @@ async fn setup_streaming_pipeline(
                                     completion_tokens: usage.completion_tokens,
                                 };
                                 let _ = tx_storage.send(msg.clone()).await;
-                                let _ = tx_client.send(msg).await;
+                                if client_alive && tx_client.try_send(msg).is_err() {
+                                    warn!("Client channel full or closed during usage message, terminating client stream");
+                                    client_alive = false;
+                                }
                             }
                             crate::web::openai::CompletionChunk::Done => {
                                 debug!("Received Done chunk from completion stream");
@@ -1310,14 +1324,20 @@ async fn setup_streaming_pipeline(
                                     message_id,
                                 };
                                 let _ = tx_storage.send(msg.clone()).await;
-                                let _ = tx_client.send(msg).await;
+                                if client_alive && tx_client.try_send(msg).is_err() {
+                                    warn!("Client channel full or closed during done message, terminating client stream");
+                                    client_alive = false;
+                                }
                                 break;
                             }
                             crate::web::openai::CompletionChunk::Error(error_msg) => {
                                 error!("Received error from completion stream: {}", error_msg);
                                 let msg = StorageMessage::Error(error_msg);
                                 let _ = tx_storage.send(msg.clone()).await;
-                                let _ = tx_client.send(msg).await;
+                                if client_alive && tx_client.try_send(msg).is_err() {
+                                    warn!("Client channel full or closed during error message, terminating client stream");
+                                    client_alive = false;
+                                }
                                 break;
                             }
                             crate::web::openai::CompletionChunk::FullResponse(_) => {

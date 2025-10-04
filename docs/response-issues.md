@@ -567,6 +567,7 @@ if total > ctx_budget {
 - ✅ #8: Encrypted body size (fixed with 50MB limit)
 - ✅ #9: Sensitive logs (uses trace! only)
 - ✅ #10: Provider timeouts (fixed with request and stream timeouts)
+- ✅ #14: Client backpressure blocking storage (fixed with try_send)
 
 ---
 
@@ -607,7 +608,7 @@ if total > ctx_budget {
 - [ ] **#11**: Throttle/flag or cheapen title generation path; add per-user quotas
 - [ ] **#12**: Lower `DEFAULT_MAX_TOKENS` and enforce per-plan caps
 - [ ] **#13**: Switch header forwarding to allowlist in `try_provider`
-- [ ] **#14**: Use `try_send` for client channel; keep awaited storage sends
+- [x] **#14 FIXED**: Use `try_send` for client channel; keep awaited storage sends
 - [ ] **#15**: Handle encoder mutex poisoning gracefully
 
 ---

@@ -7,7 +7,6 @@ pub const CLIENT_CHANNEL_BUFFER: usize = 1024;
 /// Default values
 pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 pub const DEFAULT_TOP_P: f32 = 1.0;
-pub const DEFAULT_MAX_TOKENS: i32 = 10_000;
 
 /// Response object types
 pub const OBJECT_TYPE_RESPONSE: &str = "response";

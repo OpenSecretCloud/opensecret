@@ -1197,7 +1197,7 @@ async fn setup_streaming_pipeline(
         "messages": context.prompt_messages,
         "temperature": body.temperature.unwrap_or(DEFAULT_TEMPERATURE),
         "top_p": body.top_p.unwrap_or(DEFAULT_TOP_P),
-        "max_tokens": body.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        "max_tokens": body.max_output_tokens,
         "stream": true,
         "stream_options": { "include_usage": true }
     });

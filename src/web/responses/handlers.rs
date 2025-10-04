@@ -1261,7 +1261,8 @@ async fn setup_streaming_pipeline(
                             let _ = tx_storage.send(StorageMessage::Cancelled).await;
                             if client_alive && tx_client.try_send(StorageMessage::Cancelled).is_err() {
                                 warn!("Client channel full or closed during cancellation, terminating client stream");
-                                client_alive = false;
+                                #[allow(unused_assignments)]
+                                { client_alive = false; }
                             }
                             break;
                         }
@@ -1276,7 +1277,8 @@ async fn setup_streaming_pipeline(
                             let _ = tx_storage.send(msg.clone()).await;
                             if client_alive && tx_client.try_send(msg).is_err() {
                                 warn!("Client channel full or closed during stream error, terminating client stream");
-                                client_alive = false;
+                                #[allow(unused_assignments)]
+                                { client_alive = false; }
                             }
                             break;
                         };
@@ -1326,7 +1328,8 @@ async fn setup_streaming_pipeline(
                                 let _ = tx_storage.send(msg.clone()).await;
                                 if client_alive && tx_client.try_send(msg).is_err() {
                                     warn!("Client channel full or closed during done message, terminating client stream");
-                                    client_alive = false;
+                                    #[allow(unused_assignments)]
+                                    { client_alive = false; }
                                 }
                                 break;
                             }
@@ -1336,7 +1339,8 @@ async fn setup_streaming_pipeline(
                                 let _ = tx_storage.send(msg.clone()).await;
                                 if client_alive && tx_client.try_send(msg).is_err() {
                                     warn!("Client channel full or closed during error message, terminating client stream");
-                                    client_alive = false;
+                                    #[allow(unused_assignments)]
+                                    { client_alive = false; }
                                 }
                                 break;
                             }

@@ -235,6 +235,8 @@ let user_message_tokens = i32::try_from(token_count).map_err(|_| {
 
 **Impact**: Invalid parameters could be passed to upstream APIs, potentially causing errors or unexpected behavior. Could also allow negative `max_output_tokens`.
 
+**Status**: Ignored by product decision — not a big deal; leaving current behavior.
+
 **Recommendation**: Add validation in Phase 1 (`validate_and_normalize_input`):
 ```rust
 // Validate temperature
@@ -527,6 +529,8 @@ debug_assert!(
 
 **Impact**: In debug builds, this could panic if the assertion fails. Production builds are fine, but it indicates a logic error.
 
+**Status**: Ignored by product decision — not a big deal.
+
 **Recommendation**: Replace with a runtime check and error return:
 ```rust
 if total > ctx_budget {
@@ -555,9 +559,9 @@ if total > ctx_budget {
 
 ### Remaining Issues Worth Addressing:
 
-1. **Medium**: Add parameter validation (#4) - Defensive coding to catch invalid temperature/top_p/max_tokens early
-2. **Medium**: Fix integer overflow on token counting (#3) - Use checked conversion to prevent billing/limit bypasses
-3. **Low**: Replace debug assertions with runtime checks (#7) - Better error handling in production
+1. **Medium**: Add parameter validation (#4) — Ignored by product decision
+2. **Medium**: Fix integer overflow on token counting (#3) — Already fixed
+3. **Low**: Replace debug assertions with runtime checks (#7) — Ignored by product decision
 
 ### Already Protected:
 - ✅ #1: Unbounded memory growth (mitigated by trusted providers + token limits + upstream limits)
@@ -602,14 +606,15 @@ if total > ctx_budget {
   - Ensures billing still happens and no panics/errors
   - Fixed in 4 locations: handlers.rs (user messages), storage.rs (completion fallback), instructions.rs (create/update)
 - [ ] **#4**: Add parameter validation (temperature, top_p, max_tokens) in Phase 1
-- [ ] **#7**: Replace debug_assert with runtime error in context_builder
+- [ ] **#4**: Add parameter validation (temperature, top_p, max_tokens) in Phase 1 — Ignored by product decision
+- [ ] **#7**: Replace debug_assert with runtime error in context_builder — Ignored by product decision
 
 ### Optional Improvements (Lower Priority)
-- [ ] **#11**: Throttle/flag or cheapen title generation path; add per-user quotas
+- [ ] **#11**: Title generation is desired and already enforced by per-user quotas — no action needed
 - [ ] **#12**: Lower `DEFAULT_MAX_TOKENS` and enforce per-plan caps
 - [ ] **#13**: Switch header forwarding to allowlist in `try_provider`
 - [x] **#14 FIXED**: Use `try_send` for client channel; keep awaited storage sends
-- [ ] **#15**: Handle encoder mutex poisoning gracefully
+- [x] **#15 FIXED**: Removed unnecessary mutex from token encoder - `CoreBPE` is immutable and thread-safe
 
 ---
 
@@ -713,7 +718,9 @@ loop {
 
 **Impact**: Each first message triggers an extra LLM call (70B model). Attackers can create many new conversations to multiply costs and background workloads.
 
-**Recommendation**: Gate behind feature flag/plan, throttle per user, use a cheaper model, or defer to a queued background job with rate controls. Consider caching/dedup (don’t re-title similar openings).
+**Status**: Accepted by design — title generation is desired and already governed by per-user quotas; no action needed.
+
+**Recommendation**: No action needed beyond existing per-user quotas.
 
 ---
 
@@ -770,18 +777,37 @@ let _ = tx_client.send(msg).await; // still awaits if buffer is full
 
 ## Additional 🟢 LOW SEVERITY
 
-### 15. Potential Panic on Mutex Poisoning in Token Encoder
+### 15. Potential Panic on Mutex Poisoning in Token Encoder ✅ FIXED
 
 **Location**: `tokens.rs`
 
-**Code**:
+**Original Code**:
 ```rust
-ENCODER.lock().expect("encoder lock")
+static ENCODER: Lazy<Mutex<tiktoken_rs::CoreBPE>> =
+    Lazy::new(|| Mutex::new(cl100k_base().expect("init cl100k encoder")));
+
+pub fn count_tokens(text: &str) -> usize {
+    ENCODER.lock().expect("encoder lock")
+        .encode_with_special_tokens(text)
+        .len()
+}
 ```
 
-**Impact**: A poisoned mutex will panic future callers. Rare, but can crash a worker.
+**Impact**: A poisoned mutex would panic future callers. Rare, but could crash a worker and cause cascading failures.
 
-**Recommendation**: Handle poisoning gracefully (e.g., `unwrap_or_else(|e| e.into_inner())`) or reinitialize encoder.
+**Status**: ✅ **FIXED** - Removed unnecessary mutex entirely.
+
+**New Implementation**:
+```rust
+static ENCODER: Lazy<tiktoken_rs::CoreBPE> =
+    Lazy::new(|| cl100k_base().expect("init cl100k encoder"));
+
+pub fn count_tokens(text: &str) -> usize {
+    ENCODER.encode_with_special_tokens(text).len()
+}
+```
+
+**Rationale**: `tiktoken_rs::CoreBPE` is immutable and thread-safe by design. The mutex was unnecessary overhead - `Lazy` already handles thread-safe initialization, and `CoreBPE` can be safely shared across threads without additional locking. This eliminates the mutex poisoning risk entirely and improves performance by removing lock contention.
 
 ---
 

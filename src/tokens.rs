@@ -1,20 +1,16 @@
 //! Thin wrapper around tiktoken for fast, cached token counting.
 
 use once_cell::sync::Lazy;
-use std::sync::Mutex;
 use tiktoken_rs::cl100k_base;
 
 /// Cached encoder – created once per process.
-static ENCODER: Lazy<Mutex<tiktoken_rs::CoreBPE>> =
-    Lazy::new(|| Mutex::new(cl100k_base().expect("init cl100k encoder")));
+/// No mutex needed: CoreBPE is immutable and thread-safe.
+static ENCODER: Lazy<tiktoken_rs::CoreBPE> =
+    Lazy::new(|| cl100k_base().expect("init cl100k encoder"));
 
 /// Count tokens for a piece of UTF‑8 text.
 pub fn count_tokens(text: &str) -> usize {
-    ENCODER
-        .lock()
-        .expect("encoder lock")
-        .encode_with_special_tokens(text)
-        .len()
+    ENCODER.encode_with_special_tokens(text).len()
 }
 
 /// Per‑model context windows (hard limits).  

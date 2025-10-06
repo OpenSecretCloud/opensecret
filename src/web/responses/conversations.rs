@@ -216,6 +216,16 @@ async fn create_conversation(
 ) -> Result<Json<EncryptedResponse<ConversationResponse>>, ApiError> {
     debug!("Creating new conversation for user: {}", user.uuid);
 
+    // Reject initial items - not supported in our simplified flow
+    // Users must use POST /v1/responses to add messages to conversations
+    if body.items.is_some() && !body.items.as_ref().unwrap().is_empty() {
+        error!(
+            "Initial items not supported in conversation creation for user: {}",
+            user.uuid
+        );
+        return Err(ApiError::BadRequest);
+    }
+
     // Get user's encryption key
     let user_key = state
         .get_user_key(user.uuid, None, None)
@@ -252,16 +262,6 @@ async fn create_conversation(
         .map_err(error_mapping::map_generic_db_error)?;
 
     trace!("Created conversation: {:?}", conversation);
-
-    // Reject initial items - not supported in our simplified flow
-    // Users must use POST /v1/responses to add messages to conversations
-    if body.items.is_some() && !body.items.as_ref().unwrap().is_empty() {
-        error!(
-            "Initial items not supported in conversation creation for user: {}",
-            user.uuid
-        );
-        return Err(ApiError::BadRequest);
-    }
 
     // Decrypt metadata for response
     let metadata = decrypt_content(&user_key, conversation.metadata_enc.as_ref())

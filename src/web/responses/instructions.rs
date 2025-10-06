@@ -517,7 +517,7 @@ async fn list_instructions(
 
     let response = InstructionListResponse {
         object: OBJECT_TYPE_LIST,
-        data: data.clone(),
+        data,
         has_more,
         first_id,
         last_id,

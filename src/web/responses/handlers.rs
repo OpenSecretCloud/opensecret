@@ -155,7 +155,7 @@ pub struct ResponsesCreateResponse {
     pub created_at: i64,
 
     /// Current status (always "in_progress" for immediate response)
-    pub status: &'static str,
+    pub status: String,
 
     /// Whether this is a background response
     pub background: bool,

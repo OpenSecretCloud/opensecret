@@ -46,7 +46,7 @@ impl ResponseBuilder {
                 id: response.uuid,
                 object: OBJECT_TYPE_RESPONSE,
                 created_at: response.created_at.timestamp(),
-                status: STATUS_IN_PROGRESS, // Default to in_progress
+                status: STATUS_IN_PROGRESS.to_string(), // Default to in_progress
                 background: false,
                 error: None,
                 incomplete_details: None,
@@ -89,8 +89,8 @@ impl ResponseBuilder {
     ///
     /// # Arguments
     /// * `status` - Status constant (e.g., STATUS_IN_PROGRESS, STATUS_COMPLETED)
-    pub fn status(mut self, status: &'static str) -> Self {
-        self.response.status = status;
+    pub fn status(mut self, status: &str) -> Self {
+        self.response.status = status.to_string();
         self
     }
 

@@ -227,7 +227,7 @@ mod tests {
                 id: Uuid::new_v4(),
                 object: OBJECT_TYPE_RESPONSE,
                 created_at: 0,
-                status: STATUS_IN_PROGRESS,
+                status: STATUS_IN_PROGRESS.to_string(),
                 background: false,
                 error: None,
                 incomplete_details: None,

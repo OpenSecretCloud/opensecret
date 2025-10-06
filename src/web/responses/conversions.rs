@@ -22,6 +22,35 @@ use uuid::Uuid;
 pub struct MessageContentConverter;
 
 impl MessageContentConverter {
+    /// Validate MessageContent parts to ensure unsupported features are rejected
+    ///
+    /// Currently validates:
+    /// - file_id is not supported in InputImage (only image_url)
+    ///
+    /// # Arguments
+    /// * `content` - The content to validate
+    ///
+    /// # Returns
+    /// Ok(()) if valid, Err(ApiError) if validation fails
+    pub fn validate_content(content: &MessageContent) -> Result<(), ApiError> {
+        if let MessageContent::Parts(parts) = content {
+            for part in parts {
+                if let MessageContentPart::InputImage {
+                    file_id, image_url, ..
+                } = part
+                {
+                    if file_id.is_some() {
+                        return Err(ApiError::BadRequest);
+                    }
+                    if image_url.is_none() {
+                        return Err(ApiError::BadRequest);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Normalize MessageContent to always use Parts format
     ///
     /// Converts simple Text format to Parts with InputText, ensuring

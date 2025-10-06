@@ -65,21 +65,24 @@ pub enum InputMessage {
 
 impl InputMessage {
     /// Normalize any input format to our standard format: always MessageContent::Parts
-    pub fn normalize(self) -> Vec<MessageInput> {
+    ///
+    /// Also validates that unsupported features are not used (e.g., file_id for images)
+    pub fn normalize(self) -> Result<Vec<MessageInput>, ApiError> {
         match self {
             InputMessage::String(s) => {
                 // Simple string -> user message with input_text content parts
-                vec![MessageInput {
+                Ok(vec![MessageInput {
                     role: ROLE_USER.to_string(),
                     content: MessageContent::Parts(vec![MessageContentPart::InputText { text: s }]),
-                }]
+                }])
             }
             InputMessage::Messages(mut messages) => {
-                // Ensure all message content is normalized to Parts format
+                // Ensure all message content is normalized to Parts format and validated
                 for msg in &mut messages {
+                    MessageContentConverter::validate_content(&msg.content)?;
                     msg.content = MessageContentConverter::normalize_content(msg.content.clone());
                 }
-                messages
+                Ok(messages)
             }
         }
     }
@@ -820,8 +823,8 @@ async fn validate_and_normalize_input(
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
-    // Normalize input to our standard format
-    let normalized_messages = body.input.clone().normalize();
+    // Normalize input to our standard format (validates unsupported features like file_id)
+    let normalized_messages = body.input.clone().normalize()?;
 
     // Check if any message contains file uploads (currently unsupported)
     for msg in &normalized_messages {

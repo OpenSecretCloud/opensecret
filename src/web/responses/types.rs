@@ -102,17 +102,15 @@ impl From<MessageContent> for Vec<ConversationContent> {
             MessageContent::Text(text) => vec![ConversationContent::InputText { text }],
             MessageContent::Parts(parts) => parts
                 .into_iter()
-                .map(|part| match part {
+                .filter_map(|part| match part {
                     MessageContentPart::Text { text } | MessageContentPart::InputText { text } => {
-                        ConversationContent::InputText { text }
+                        Some(ConversationContent::InputText { text })
                     }
                     MessageContentPart::InputImage { image_url, .. } => {
-                        ConversationContent::InputImage {
-                            image_url: image_url.unwrap_or_else(|| "[No URL]".to_string()),
-                        }
+                        image_url.map(|url| ConversationContent::InputImage { image_url: url })
                     }
                     MessageContentPart::InputFile { filename, .. } => {
-                        ConversationContent::InputFile { filename }
+                        Some(ConversationContent::InputFile { filename })
                     }
                 })
                 .collect(),

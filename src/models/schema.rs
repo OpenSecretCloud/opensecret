@@ -256,7 +256,7 @@ diesel::table! {
         name -> Text,
         arguments_enc -> Nullable<Bytea>,
         argument_tokens -> Int4,
-        status -> Nullable<Text>,
+        status -> Text,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }

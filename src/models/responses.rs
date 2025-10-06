@@ -555,7 +555,7 @@ pub struct ToolCall {
     pub name: String,
     pub arguments_enc: Option<Vec<u8>>,
     pub argument_tokens: i32,
-    pub status: Option<String>,
+    pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -571,7 +571,7 @@ pub struct NewToolCall {
     pub name: String,
     pub arguments_enc: Option<Vec<u8>>,
     pub argument_tokens: i32,
-    pub status: Option<String>,
+    pub status: String,
 }
 
 impl NewToolCall {

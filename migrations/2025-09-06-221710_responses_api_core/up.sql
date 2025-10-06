@@ -140,7 +140,7 @@ CREATE TABLE tool_calls (
     name           TEXT    NOT NULL,
     arguments_enc  BYTEA,
     argument_tokens INTEGER NOT NULL,
-    status         TEXT    DEFAULT 'completed',
+    status         TEXT    NOT NULL DEFAULT 'completed',
     created_at     TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

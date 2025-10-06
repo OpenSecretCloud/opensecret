@@ -221,12 +221,22 @@ fn determine_needed_message_ids(
         ctx_budget.saturating_sub(system_tokens + head_tokens + truncation_msg_tokens);
 
     // Collect messages from the end until we hit the budget
-    // We need to ensure tail starts with a user message (for proper alternation after assistant truncation)
+    // CRITICAL: Always include the most recent message (even if it exceeds budget)
+    // to ensure the current user query is never lost
     let mut potential_tail: Vec<(String, i64, usize)> = Vec::new(); // (type, id, tokens)
     let mut potential_tail_tokens = 0usize;
 
-    for m in metadata.iter().rev() {
+    for (i, m) in metadata.iter().rev().enumerate() {
         let tok = m.token_count.map(|t| t as usize).unwrap_or(0);
+
+        // Always include the most recent message (first iteration), even if it exceeds budget
+        if i == 0 {
+            potential_tail.push((m.message_type.clone(), m.id, tok));
+            potential_tail_tokens += tok;
+            continue;
+        }
+
+        // For subsequent messages, respect the budget
         if potential_tail_tokens + tok > available_for_tail {
             break;
         }
@@ -306,11 +316,20 @@ pub fn build_prompt_from_chat_messages(
         let available_for_tail = ctx_budget.saturating_sub(head_tokens + truncation_msg_tokens);
 
         // Collect messages from the end until we hit the budget
-        // We need to ensure tail starts with a user message (for proper alternation after assistant truncation)
+        // CRITICAL: Always include the most recent message (even if it exceeds budget)
+        // to ensure the current user query is never lost
         let mut potential_tail: Vec<ChatMsg> = Vec::new();
         let mut potential_tail_tokens = 0usize;
 
-        for m in msgs.iter().rev() {
+        for (i, m) in msgs.iter().rev().enumerate() {
+            // Always include the most recent message (first iteration), even if it exceeds budget
+            if i == 0 {
+                potential_tail.push(m.clone());
+                potential_tail_tokens += m.tok;
+                continue;
+            }
+
+            // For subsequent messages, respect the budget
             if potential_tail_tokens + m.tok > available_for_tail {
                 break;
             }
@@ -637,5 +656,85 @@ mod tests {
 
         assert_eq!(messages[3]["role"], "user");
         assert_eq!(messages[3]["content"], "New message");
+    }
+
+    #[test]
+    fn test_oversized_recent_message_survives_truncation() {
+        // Regression test for critical bug: ensure the most recent user message
+        // is ALWAYS included, even if it alone exceeds the available tail budget.
+        //
+        // Scenario:
+        // - First user message: 100 tokens (kept in head)
+        // - Middle messages: 50,000 tokens total (will be truncated)
+        // - Recent user message: 10,000 tokens (HUGE - exceeds available tail budget)
+        //
+        // The recent message must survive even though it's larger than available_for_tail
+
+        let mut msgs = vec![];
+
+        // First user message (will be in head)
+        msgs.push(create_chat_msg("user", "First message", Some(100)));
+
+        // Many middle messages to consume most of the budget
+        for i in 0..25 {
+            msgs.push(create_chat_msg(
+                "user",
+                &format!("Middle user {}", i),
+                Some(1000),
+            ));
+            msgs.push(create_chat_msg(
+                "assistant",
+                &format!("Middle assistant {}", i),
+                Some(1000),
+            ));
+        }
+
+        // Recent HUGE user message that exceeds available_for_tail
+        // This is the critical message that must not be lost
+        msgs.push(create_chat_msg(
+            "user",
+            "This is a very long recent user message that exceeds the available tail budget",
+            Some(10000),
+        ));
+
+        let result = build_prompt_from_chat_messages(
+            msgs.clone(),
+            "deepseek-r1-70b", // 64k context
+        );
+
+        let (messages, _total_tokens) = result.expect("Failed to build prompt");
+
+        // CRITICAL: The recent huge message MUST be in the output
+        let recent_msg_found = messages.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("very long recent user message")
+        });
+
+        assert!(
+            recent_msg_found,
+            "Recent user message must be preserved even if it exceeds tail budget. Messages: {:?}",
+            messages
+        );
+
+        // The last message in the output should be our recent message
+        assert_eq!(messages.last().unwrap()["role"], "user");
+        assert!(messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("very long recent user message"));
+
+        // Should have truncated (has truncation message)
+        let has_truncation = messages
+            .iter()
+            .any(|m| m["content"].as_str().unwrap_or("").contains("truncated"));
+        assert!(
+            has_truncation,
+            "Should have truncated middle messages"
+        );
+
+        // First message should be the first user message
+        assert_eq!(messages[0]["content"], "First message");
     }
 }

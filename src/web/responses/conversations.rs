@@ -232,8 +232,10 @@ async fn create_conversation(
     }
 
     // Encrypt the entire metadata object
-    let metadata_json = serde_json::to_string(&metadata)
-        .map_err(|_| error_mapping::map_serialization_error("metadata"))?;
+    let metadata_json = serde_json::to_string(&metadata).map_err(|e| {
+        error!("Failed to serialize metadata: {:?}", e);
+        ApiError::InternalServerError
+    })?;
     let metadata_enc = Some(encrypt_with_key(&user_key, metadata_json.as_bytes()).await);
 
     let new_conversation = NewConversation {
@@ -310,8 +312,10 @@ async fn update_conversation(
     let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
 
     // Encrypt the updated metadata
-    let metadata_json = serde_json::to_string(&body.metadata)
-        .map_err(|_| error_mapping::map_serialization_error("metadata"))?;
+    let metadata_json = serde_json::to_string(&body.metadata).map_err(|e| {
+        error!("Failed to serialize metadata: {:?}", e);
+        ApiError::InternalServerError
+    })?;
     let metadata_enc = encrypt_with_key(&ctx.user_key, metadata_json.as_bytes()).await;
 
     // Update metadata in database

@@ -863,8 +863,10 @@ async fn validate_and_normalize_input(
     };
 
     // Serialize the MessageContent for storage
-    let content_for_storage = serde_json::to_string(&message_content)
-        .map_err(|_| error_mapping::map_serialization_error("message content"))?;
+    let content_for_storage = serde_json::to_string(&message_content).map_err(|e| {
+        error!("Failed to serialize message content: {:?}", e);
+        ApiError::InternalServerError
+    })?;
 
     // Encrypt the serialized MessageContent
     let content_enc = encrypt_with_key(&user_key, content_for_storage.as_bytes()).await;
@@ -1062,8 +1064,10 @@ async fn persist_request_data(
 
     // Encrypt metadata if provided
     let metadata_enc = if let Some(metadata) = &body.metadata {
-        let metadata_json = serde_json::to_string(metadata)
-            .map_err(|_| error_mapping::map_serialization_error("metadata"))?;
+        let metadata_json = serde_json::to_string(metadata).map_err(|e| {
+            error!("Failed to serialize metadata: {:?}", e);
+            ApiError::InternalServerError
+        })?;
         Some(encrypt_with_key(&prepared.user_key, metadata_json.as_bytes()).await)
     } else {
         None

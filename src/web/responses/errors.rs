@@ -108,18 +108,6 @@ pub mod error_mapping {
         ApiError::InternalServerError
     }
 
-    /// Map serialization errors to API errors
-    ///
-    /// # Arguments
-    /// * `context` - Description of what was being serialized (for logging)
-    ///
-    /// # Returns
-    /// ApiError with logging
-    pub fn map_serialization_error(context: &str) -> ApiError {
-        error!("Failed to serialize {}", context);
-        ApiError::InternalServerError
-    }
-
     /// Map key retrieval errors to API errors
     ///
     /// # Returns

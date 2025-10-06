@@ -112,9 +112,7 @@ impl From<MessageContent> for Vec<ConversationContent> {
                         }
                     }
                     MessageContentPart::InputFile { filename, .. } => {
-                        ConversationContent::InputFile {
-                            filename: filename.clone(),
-                        }
+                        ConversationContent::InputFile { filename }
                     }
                 })
                 .collect(),

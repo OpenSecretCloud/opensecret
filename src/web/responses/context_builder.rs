@@ -378,11 +378,11 @@ pub fn build_prompt_from_chat_messages(
                 "role": "tool",
                 "content": m.content,
                 "tool_call_id": m.tool_call_id
-                    .map(|u| u.to_string())
-                    .unwrap_or_else(|| {
+                    .ok_or_else(|| {
                         error!("tool_call_id missing for tool output message");
-                        "error-missing-tool-call-id".to_string()
-                    })
+                        crate::ApiError::InternalServerError
+                    })?
+                    .to_string()
             })
         } else {
             // Deserialize stored MessageContent and convert to OpenAI format

@@ -8,6 +8,7 @@ use crate::{
 };
 use secp256k1::SecretKey;
 use serde_json::{json, Value};
+use tracing::error;
 use uuid::Uuid;
 
 /// Centralized message content conversion utilities
@@ -165,16 +166,21 @@ pub enum ConversationItem {
     #[serde(rename = "function_tool_call")]
     FunctionToolCall {
         id: Uuid,
+        call_id: Uuid,
         name: String,
         arguments: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         created_at: Option<i64>,
     },
     #[serde(rename = "function_tool_call_output")]
     FunctionToolCallOutput {
         id: Uuid,
-        tool_call_id: Uuid,
+        call_id: Uuid,
         output: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         created_at: Option<i64>,
     },
@@ -265,8 +271,13 @@ impl ConversationItemConverter {
     ) -> Result<ConversationItem, ApiError> {
         Ok(ConversationItem::FunctionToolCall {
             id: msg.uuid,
+            call_id: msg.tool_call_id.ok_or_else(|| {
+                error!("tool_call_id missing for tool call");
+                ApiError::InternalServerError
+            })?,
             name: DEFAULT_TOOL_FUNCTION_NAME.to_string(),
             arguments: content,
+            status: msg.status.clone(),
             created_at: Some(msg.created_at.timestamp()),
         })
     }
@@ -278,8 +289,12 @@ impl ConversationItemConverter {
     ) -> Result<ConversationItem, ApiError> {
         Ok(ConversationItem::FunctionToolCallOutput {
             id: msg.uuid,
-            tool_call_id: msg.tool_call_id.unwrap_or(Uuid::nil()),
+            call_id: msg.tool_call_id.ok_or_else(|| {
+                error!("tool_call_id missing for tool output");
+                ApiError::InternalServerError
+            })?,
             output: content,
+            status: msg.status.clone(),
             created_at: Some(msg.created_at.timestamp()),
         })
     }

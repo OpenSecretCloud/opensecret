@@ -46,9 +46,9 @@ impl<'a> SseEventEmitter<'a> {
     /// Emit an SSE event with automatic serialization, encryption, and error handling
     ///
     /// This method:
-    /// 1. Increments sequence number
-    /// 2. Serializes the event data to JSON
-    /// 3. Encrypts the JSON payload
+    /// 1. Serializes the event data to JSON
+    /// 2. Encrypts the JSON payload
+    /// 3. Increments sequence number on success
     /// 4. Returns an SSE Event ready to yield to the client
     ///
     /// # Arguments
@@ -58,12 +58,11 @@ impl<'a> SseEventEmitter<'a> {
     /// # Returns
     /// An SSE Event with encrypted data, or an error event if serialization/encryption fails
     pub async fn emit<T: Serialize>(&mut self, event_type: &str, data: &T) -> Event {
-        self.sequence_number += 1;
-
         match serde_json::to_value(data) {
             Ok(json) => {
                 match encrypt_event(self.state, &self.session_id, event_type, &json).await {
                     Ok(event) => {
+                        self.sequence_number += 1;
                         trace!(
                             "Emitted {} event (seq: {})",
                             event_type,

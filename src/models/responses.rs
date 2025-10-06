@@ -5,7 +5,7 @@ use crate::models::schema::{
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use diesel::sql_query;
-use diesel::sql_types::{BigInt, Nullable};
+use diesel::sql_types::{Array, BigInt, Nullable};
 use diesel_derive_enum::DbEnum;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -1055,54 +1055,9 @@ impl RawThreadMessage {
             .map(|(_, id)| *id)
             .collect();
 
-        // Build WHERE clause with inline arrays (safe since IDs are i64)
-        let mut conditions = Vec::new();
-        if !user_ids.is_empty() {
-            let ids_str = user_ids
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            conditions.push(format!("(message_type = 'user' AND id IN ({}))", ids_str));
-        }
-        if !assistant_ids.is_empty() {
-            let ids_str = assistant_ids
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            conditions.push(format!(
-                "(message_type = 'assistant' AND id IN ({}))",
-                ids_str
-            ));
-        }
-        if !tool_call_ids.is_empty() {
-            let ids_str = tool_call_ids
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            conditions.push(format!(
-                "(message_type = 'tool_call' AND id IN ({}))",
-                ids_str
-            ));
-        }
-        if !tool_output_ids.is_empty() {
-            let ids_str = tool_output_ids
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            conditions.push(format!(
-                "(message_type = 'tool_output' AND id IN ({}))",
-                ids_str
-            ));
-        }
-
-        let where_clause = conditions.join(" OR ");
-
-        let query = format!(
-            r#"
+        // Build WHERE clause with proper parameter binding
+        // Always use all 4 parameters ($2-$5) to maintain consistent type signature
+        let query = r#"
             WITH conversation_messages AS (
                 -- User messages
                 SELECT
@@ -1174,14 +1129,19 @@ impl RawThreadMessage {
                 WHERE tto.conversation_id = $1
             )
             SELECT * FROM conversation_messages
-            WHERE {}
+            WHERE (message_type = 'user' AND id = ANY($2::bigint[]))
+               OR (message_type = 'assistant' AND id = ANY($3::bigint[]))
+               OR (message_type = 'tool_call' AND id = ANY($4::bigint[]))
+               OR (message_type = 'tool_output' AND id = ANY($5::bigint[]))
             ORDER BY created_at ASC, id ASC
-            "#,
-            where_clause
-        );
+        "#;
 
         sql_query(query)
             .bind::<BigInt, _>(conversation_id)
+            .bind::<Array<BigInt>, _>(&user_ids)
+            .bind::<Array<BigInt>, _>(&assistant_ids)
+            .bind::<Array<BigInt>, _>(&tool_call_ids)
+            .bind::<Array<BigInt>, _>(&tool_output_ids)
             .load::<RawThreadMessage>(conn)
             .map_err(ResponsesError::DatabaseError)
     }

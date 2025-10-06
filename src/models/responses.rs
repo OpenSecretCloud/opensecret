@@ -1257,12 +1257,18 @@ impl RawThreadMessageMetadata {
                 WHERE tto.conversation_id = $1
             )
             SELECT * FROM conversation_messages
-            ORDER BY created_at ASC, id ASC
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1000
         "#;
 
-        sql_query(query)
+        let mut results = sql_query(query)
             .bind::<BigInt, _>(conversation_id)
             .load::<RawThreadMessageMetadata>(conn)
-            .map_err(ResponsesError::DatabaseError)
+            .map_err(ResponsesError::DatabaseError)?;
+
+        // Reverse to chronological order (oldest first) since query returns newest first
+        results.reverse();
+
+        Ok(results)
     }
 }

@@ -447,7 +447,11 @@ async fn list_instructions(
 ) -> Result<Json<EncryptedResponse<InstructionListResponse>>, ApiError> {
     debug!("Listing instructions for user: {}", user.uuid);
 
-    let limit = params.limit.min(MAX_PAGINATION_LIMIT);
+    let limit = if params.limit <= 0 {
+        DEFAULT_PAGINATION_LIMIT
+    } else {
+        params.limit.min(MAX_PAGINATION_LIMIT)
+    };
     let order = &params.order;
 
     // Convert UUID cursors to (updated_at, id) tuples

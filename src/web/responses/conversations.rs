@@ -380,7 +380,11 @@ async fn list_conversation_items(
     let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
 
     // Validate limit
-    let limit = params.limit.min(MAX_PAGINATION_LIMIT);
+    let limit = if params.limit <= 0 {
+        DEFAULT_PAGINATION_LIMIT
+    } else {
+        params.limit.min(MAX_PAGINATION_LIMIT)
+    };
 
     // Fetch messages with database-level pagination
     // We fetch limit + 1 to check if there are more results
@@ -499,7 +503,11 @@ async fn list_conversations(
     debug!("Listing conversations for user: {}", user.uuid);
 
     // Validate limit
-    let limit = params.limit.min(MAX_PAGINATION_LIMIT);
+    let limit = if params.limit <= 0 {
+        DEFAULT_PAGINATION_LIMIT
+    } else {
+        params.limit.min(MAX_PAGINATION_LIMIT)
+    };
 
     // Fetch conversations with database-level pagination
     // We fetch limit + 1 to check if there are more results

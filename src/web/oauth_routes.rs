@@ -639,7 +639,13 @@ pub async fn oauth_callback(
             ApiError::InternalServerError
         })?;
 
-        let redirect_uri = oauth_client.redirect_url().unwrap().as_str();
+        let redirect_uri = oauth_client
+            .redirect_url()
+            .ok_or_else(|| {
+                error!("OAuth redirect URL not configured");
+                ApiError::InternalServerError
+            })?
+            .as_str();
 
         // Make sure the client_id parameter matches what's in the JWT's sub claim
         // Apple requires these to be exactly the same

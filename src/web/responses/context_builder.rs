@@ -729,10 +729,7 @@ mod tests {
         let has_truncation = messages
             .iter()
             .any(|m| m["content"].as_str().unwrap_or("").contains("truncated"));
-        assert!(
-            has_truncation,
-            "Should have truncated middle messages"
-        );
+        assert!(has_truncation, "Should have truncated middle messages");
 
         // First message should be the first user message
         assert_eq!(messages[0]["content"], "First message");

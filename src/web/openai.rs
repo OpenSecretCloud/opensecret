@@ -352,7 +352,13 @@ pub async fn get_chat_completion_response(
         return Err(ApiError::BadRequest);
     }
 
-    let modified_body = body.as_object().expect("body was just checked").clone();
+    let modified_body = body
+        .as_object()
+        .ok_or_else(|| {
+            error!("Request body is not a JSON object");
+            ApiError::BadRequest
+        })?
+        .clone();
 
     // Check if streaming is requested (default to false if not specified)
     let is_streaming = modified_body
@@ -379,8 +385,6 @@ pub async fn get_chat_completion_response(
         }
     };
 
-    let modified_body_json = Value::Object(modified_body);
-
     // Create a new hyper client with better timeout configuration
     let https = HttpsConnector::new();
     let client = Client::builder()
@@ -403,7 +407,7 @@ pub async fn get_chat_completion_response(
         let primary_model_name = state
             .proxy_router
             .get_model_name_for_provider(&model_name, &route.primary.provider_name);
-        let mut primary_body = modified_body_json.as_object().unwrap().clone();
+        let mut primary_body = modified_body.clone();
         primary_body.insert("model".to_string(), json!(primary_model_name));
 
         // Add stream_options based on provider capabilities
@@ -422,7 +426,7 @@ pub async fn get_chat_completion_response(
             let fallback_model_name = state
                 .proxy_router
                 .get_model_name_for_provider(&model_name, &fallback.provider_name);
-            let mut fallback_body = modified_body_json.as_object().unwrap().clone();
+            let mut fallback_body = modified_body.clone();
             fallback_body.insert("model".to_string(), json!(fallback_model_name));
 
             if fallback.provider_name.to_lowercase() == "tinfoil" || is_streaming {

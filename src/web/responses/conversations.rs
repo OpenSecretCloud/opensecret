@@ -218,12 +218,14 @@ async fn create_conversation(
 
     // Reject initial items - not supported in our simplified flow
     // Users must use POST /v1/responses to add messages to conversations
-    if body.items.is_some() && !body.items.as_ref().unwrap().is_empty() {
-        error!(
-            "Initial items not supported in conversation creation for user: {}",
-            user.uuid
-        );
-        return Err(ApiError::BadRequest);
+    if let Some(items) = &body.items {
+        if !items.is_empty() {
+            error!(
+                "Initial items not supported in conversation creation for user: {}",
+                user.uuid
+            );
+            return Err(ApiError::BadRequest);
+        }
     }
 
     // Get user's encryption key
@@ -237,6 +239,9 @@ async fn create_conversation(
 
     // Create metadata with title
     let mut metadata = body.metadata.clone().unwrap_or_else(|| json!({}));
+    if !metadata.is_object() {
+        return Err(ApiError::BadRequest);
+    }
     if metadata.get("title").is_none() {
         metadata["title"] = json!("New Conversation");
     }

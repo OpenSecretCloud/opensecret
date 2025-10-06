@@ -264,16 +264,44 @@ impl Conversation {
     pub fn update_metadata(
         conn: &mut PgConnection,
         conversation_id: i64,
+        user_id: Uuid,
         metadata_enc: Vec<u8>,
     ) -> Result<(), ResponsesError> {
-        diesel::update(conversations::table.filter(conversations::id.eq(conversation_id)))
-            .set((
-                conversations::metadata_enc.eq(metadata_enc),
-                conversations::updated_at.eq(diesel::dsl::now),
-            ))
-            .execute(conn)
-            .map(|_| ())
-            .map_err(ResponsesError::DatabaseError)
+        let updated = diesel::update(
+            conversations::table
+                .filter(conversations::id.eq(conversation_id))
+                .filter(conversations::user_id.eq(user_id)),
+        )
+        .set((
+            conversations::metadata_enc.eq(metadata_enc),
+            conversations::updated_at.eq(diesel::dsl::now),
+        ))
+        .execute(conn)?;
+
+        if updated == 0 {
+            return Err(ResponsesError::ConversationNotFound);
+        }
+
+        Ok(())
+    }
+
+    pub fn delete_by_id_and_user(
+        conn: &mut PgConnection,
+        conversation_id: i64,
+        user_id: Uuid,
+    ) -> Result<(), ResponsesError> {
+        let deleted = diesel::delete(
+            conversations::table
+                .filter(conversations::id.eq(conversation_id))
+                .filter(conversations::user_id.eq(user_id)),
+        )
+        .execute(conn)?;
+
+        if deleted == 0 {
+            return Err(ResponsesError::ConversationNotFound);
+        }
+
+        Ok(())
     }
 
     pub fn list_for_user(

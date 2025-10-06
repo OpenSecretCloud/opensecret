@@ -1968,29 +1968,8 @@ impl DBConnection for PostgresConnection {
     ) -> Result<(), DBError> {
         debug!("Updating conversation metadata");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-
-        use crate::models::schema::conversations;
-        use diesel::prelude::*;
-
-        // Verify the conversation belongs to the user and update metadata
-        let updated = diesel::update(
-            conversations::table
-                .filter(conversations::id.eq(conversation_id))
-                .filter(conversations::user_id.eq(user_id)),
-        )
-        .set((
-            conversations::metadata_enc.eq(metadata_enc),
-            conversations::updated_at.eq(diesel::dsl::now),
-        ))
-        .execute(conn)?;
-
-        if updated == 0 {
-            return Err(DBError::ResponsesError(
-                ResponsesError::ConversationNotFound,
-            ));
-        }
-
-        Ok(())
+        Conversation::update_metadata(conn, conversation_id, user_id, metadata_enc)
+            .map_err(DBError::from)
     }
 
     fn list_conversations(
@@ -2008,25 +1987,7 @@ impl DBConnection for PostgresConnection {
     fn delete_conversation(&self, conversation_id: i64, user_id: Uuid) -> Result<(), DBError> {
         debug!("Deleting conversation");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-
-        use crate::models::schema::conversations;
-        use diesel::prelude::*;
-
-        // Delete the conversation - cascades will handle related records
-        let deleted = diesel::delete(
-            conversations::table
-                .filter(conversations::id.eq(conversation_id))
-                .filter(conversations::user_id.eq(user_id)),
-        )
-        .execute(conn)?;
-
-        if deleted == 0 {
-            return Err(DBError::ResponsesError(
-                ResponsesError::ConversationNotFound,
-            ));
-        }
-
-        Ok(())
+        Conversation::delete_by_id_and_user(conn, conversation_id, user_id).map_err(DBError::from)
     }
 
     // Responses (job tracker) implementations

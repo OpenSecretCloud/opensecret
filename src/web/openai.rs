@@ -303,7 +303,8 @@ async fn proxy_openai(
                     match encrypt_sse_event(&state, &session_id, &json).await {
                         Ok(event) => yield Ok::<Event, std::convert::Infallible>(event),
                         Err(e) => {
-                            error!("Encryption error: {:?}", e);
+                            error!("Failed to encrypt event data: {:?}", e);
+                            yield Ok(Event::default().data("Error: Encryption failed"));
                             break;
                         }
                     }
@@ -324,6 +325,7 @@ async fn proxy_openai(
                 CompletionChunk::FullResponse(_) => {
                     // Shouldn't happen in streaming mode
                     error!("Received FullResponse in streaming mode");
+                    yield Ok(Event::default().data("Error: Invalid event format"));
                     break;
                 }
             }
@@ -616,26 +618,39 @@ pub async fn get_chat_completion_response(
                                     return;
                                 }
 
-                                if let Ok(json) = serde_json::from_str::<Value>(&frame) {
-                                    // ✅ Extract and publish billing HERE
-                                    if let Some(usage) = extract_usage(&json) {
-                                        publish_usage_event_internal(
-                                            &state_clone,
-                                            &user_clone,
-                                            &billing_ctx,
-                                            usage.clone(),
-                                            &provider,
-                                        )
-                                        .await;
+                                match serde_json::from_str::<Value>(&frame) {
+                                    Ok(json) => {
+                                        // ✅ Extract and publish billing HERE
+                                        if let Some(usage) = extract_usage(&json) {
+                                            publish_usage_event_internal(
+                                                &state_clone,
+                                                &user_clone,
+                                                &billing_ctx,
+                                                usage.clone(),
+                                                &provider,
+                                            )
+                                            .await;
 
-                                        // Also send usage to consumer
-                                        let _ =
-                                            tx_consumer.send(CompletionChunk::Usage(usage)).await;
+                                            // Also send usage to consumer
+                                            let _ = tx_consumer
+                                                .send(CompletionChunk::Usage(usage))
+                                                .await;
+                                        }
+
+                                        // Send full JSON chunk to consumer (preserves all metadata)
+                                        let _ = tx_consumer
+                                            .send(CompletionChunk::StreamChunk(json))
+                                            .await;
                                     }
-
-                                    // Send full JSON chunk to consumer (preserves all metadata)
-                                    let _ =
-                                        tx_consumer.send(CompletionChunk::StreamChunk(json)).await;
+                                    Err(e) => {
+                                        error!("Received non-JSON data event. Error: {:?}", e);
+                                        let _ = tx_consumer
+                                            .send(CompletionChunk::Error(
+                                                "Invalid JSON".to_string(),
+                                            ))
+                                            .await;
+                                        break;
+                                    }
                                 }
                             }
                         }

@@ -579,7 +579,6 @@ pub struct ToolCall {
     pub conversation_id: i64,
     pub response_id: Option<i64>,
     pub user_id: Uuid,
-    pub tool_call_id: Uuid,
     pub name: String,
     pub arguments_enc: Option<Vec<u8>>,
     pub argument_tokens: i32,
@@ -595,7 +594,6 @@ pub struct NewToolCall {
     pub conversation_id: i64,
     pub response_id: Option<i64>,
     pub user_id: Uuid,
-    pub tool_call_id: Uuid,
     pub name: String,
     pub arguments_enc: Option<Vec<u8>>,
     pub argument_tokens: i32,
@@ -827,7 +825,7 @@ impl RawThreadMessage {
                         tc.created_at,
                         NULL::text as model,
                         tc.argument_tokens as token_count,
-                        tc.tool_call_id,
+                        tc.uuid as tool_call_id,
                         NULL::text as finish_reason
                     FROM tool_calls tc
                     WHERE tc.conversation_id = $1
@@ -844,7 +842,7 @@ impl RawThreadMessage {
                         tto.created_at,
                         NULL::text as model,
                         tto.output_tokens as token_count,
-                        tc.tool_call_id,
+                        tc.uuid as tool_call_id,
                         NULL::text as finish_reason
                     FROM tool_outputs tto
                     JOIN tool_calls tc ON tto.tool_call_fk = tc.id
@@ -918,7 +916,7 @@ impl RawThreadMessage {
                         tc.created_at,
                         NULL::text as model,
                         tc.argument_tokens as token_count,
-                        tc.tool_call_id,
+                        tc.uuid as tool_call_id,
                         NULL::text as finish_reason
                     FROM tool_calls tc
                     WHERE tc.conversation_id = $1
@@ -935,7 +933,7 @@ impl RawThreadMessage {
                         tto.created_at,
                         NULL::text as model,
                         tto.output_tokens as token_count,
-                        tc.tool_call_id,
+                        tc.uuid as tool_call_id,
                         NULL::text as finish_reason
                     FROM tool_outputs tto
                     JOIN tool_calls tc ON tto.tool_call_fk = tc.id
@@ -1018,7 +1016,7 @@ impl RawThreadMessage {
                     tc.created_at,
                     NULL::text as model,
                     tc.argument_tokens as token_count,
-                    tc.tool_call_id,
+                    tc.uuid as tool_call_id,
                     NULL::text as finish_reason
                 FROM tool_calls tc
                 WHERE tc.response_id = $1
@@ -1035,7 +1033,7 @@ impl RawThreadMessage {
                     tto.created_at,
                     NULL::text as model,
                     tto.output_tokens as token_count,
-                    tc.tool_call_id,
+                    tc.uuid as tool_call_id,
                     NULL::text as finish_reason
                 FROM tool_outputs tto
                 JOIN tool_calls tc ON tto.tool_call_fk = tc.id
@@ -1133,7 +1131,7 @@ impl RawThreadMessage {
                     tc.created_at,
                     NULL::text as model,
                     tc.argument_tokens as token_count,
-                    tc.tool_call_id,
+                    tc.uuid as tool_call_id,
                     NULL::text as finish_reason
                 FROM tool_calls tc
                 WHERE tc.conversation_id = $1
@@ -1150,7 +1148,7 @@ impl RawThreadMessage {
                     tto.created_at,
                     NULL::text as model,
                     tto.output_tokens as token_count,
-                    tc.tool_call_id,
+                    tc.uuid as tool_call_id,
                     NULL::text as finish_reason
                 FROM tool_outputs tto
                 JOIN tool_calls tc ON tto.tool_call_fk = tc.id
@@ -1238,7 +1236,7 @@ impl RawThreadMessageMetadata {
                     tc.uuid,
                     tc.created_at,
                     tc.argument_tokens as token_count,
-                    tc.tool_call_id
+                    tc.uuid as tool_call_id
                 FROM tool_calls tc
                 WHERE tc.conversation_id = $1
 
@@ -1251,7 +1249,7 @@ impl RawThreadMessageMetadata {
                     tto.uuid,
                     tto.created_at,
                     tto.output_tokens as token_count,
-                    tc.tool_call_id
+                    tc.uuid as tool_call_id
                 FROM tool_outputs tto
                 JOIN tool_calls tc ON tto.tool_call_fk = tc.id
                 WHERE tto.conversation_id = $1

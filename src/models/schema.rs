@@ -252,7 +252,6 @@ diesel::table! {
         conversation_id -> Int8,
         response_id -> Nullable<Int8>,
         user_id -> Uuid,
-        tool_call_id -> Uuid,
         name -> Text,
         arguments_enc -> Nullable<Bytea>,
         argument_tokens -> Int4,

@@ -128,7 +128,7 @@ CREATE INDEX idx_assistant_messages_conversation_created
 
 -- 7. tool_calls table - Tool invocations by the model (can be created via Conversations or Responses API)
 -- response_id: NULL if created via Conversations API, populated if created via Responses API
--- tool_call_id: The call_id from OpenAI
+-- uuid: Used as both the external ID and the tool_call_id in OpenAI protocol
 -- status: in_progress, completed, incomplete
 CREATE TABLE tool_calls (
     id             BIGSERIAL PRIMARY KEY,
@@ -136,7 +136,6 @@ CREATE TABLE tool_calls (
     conversation_id BIGINT  NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     response_id     BIGINT  REFERENCES responses(id) ON DELETE CASCADE,
     user_id        UUID    NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
-    tool_call_id   UUID    NOT NULL,
     name           TEXT    NOT NULL,
     arguments_enc  BYTEA,
     argument_tokens INTEGER NOT NULL,

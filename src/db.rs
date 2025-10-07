@@ -555,13 +555,6 @@ pub trait DBConnection {
         -> Result<(), DBError>;
     fn get_user_message(&self, id: i64, user_id: Uuid) -> Result<UserMessage, DBError>;
     fn get_user_message_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<UserMessage, DBError>;
-    fn list_user_messages(
-        &self,
-        user_id: Uuid,
-        limit: i64,
-        after: Option<(DateTime<Utc>, i64)>,
-        before: Option<(DateTime<Utc>, i64)>,
-    ) -> Result<Vec<UserMessage>, DBError>;
 
     // Assistant messages
     fn create_assistant_message(
@@ -576,10 +569,6 @@ pub trait DBConnection {
         status: String,
         finish_reason: Option<String>,
     ) -> Result<AssistantMessage, DBError>;
-    fn get_assistant_messages_for_response(
-        &self,
-        response_id: i64,
-    ) -> Result<Vec<AssistantMessage>, DBError>;
 
     // Tool calls / outputs
     fn create_tool_call(&self, new_call: NewToolCall) -> Result<ToolCall, DBError>;
@@ -2313,18 +2302,6 @@ impl DBConnection for PostgresConnection {
         UserMessage::get_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
     }
 
-    fn list_user_messages(
-        &self,
-        user_id: Uuid,
-        limit: i64,
-        after: Option<(DateTime<Utc>, i64)>,
-        before: Option<(DateTime<Utc>, i64)>,
-    ) -> Result<Vec<UserMessage>, DBError> {
-        debug!("Listing user messages");
-        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        UserMessage::list_for_user(conn, user_id, limit, after, before).map_err(DBError::from)
-    }
-
     // Assistant messages
     fn create_assistant_message(
         &self,
@@ -2354,15 +2331,6 @@ impl DBConnection for PostgresConnection {
             finish_reason,
         )
         .map_err(DBError::from)
-    }
-
-    fn get_assistant_messages_for_response(
-        &self,
-        response_id: i64,
-    ) -> Result<Vec<AssistantMessage>, DBError> {
-        debug!("Getting assistant messages for response");
-        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        AssistantMessage::get_by_response_id(conn, response_id).map_err(DBError::from)
     }
 
     // Tool calls / outputs

@@ -23,7 +23,6 @@ CREATE TABLE user_instructions (
 );
 
 -- Indexes for user_instructions
-CREATE INDEX idx_user_instructions_uuid      ON user_instructions(uuid);
 CREATE INDEX idx_user_instructions_user_id   ON user_instructions(user_id);
 CREATE UNIQUE INDEX idx_user_instructions_one_default
     ON user_instructions(user_id)
@@ -40,9 +39,7 @@ CREATE TABLE conversations (
 );
 
 -- Indexes for conversations
-CREATE INDEX idx_conversations_uuid        ON conversations(uuid);
-CREATE INDEX idx_conversations_user_id     ON conversations(user_id);
-CREATE INDEX idx_conversations_updated     ON conversations(user_id, updated_at DESC);
+CREATE INDEX idx_conversations_updated_id  ON conversations(user_id, updated_at DESC, id DESC);
 
 -- 4. responses table - Pure job/task tracker for the Responses API
 -- Note: We intentionally don't support previous_response_id - use conversations instead
@@ -68,10 +65,7 @@ CREATE TABLE responses (
 );
 
 -- Indexes for responses
-CREATE INDEX idx_responses_uuid             ON responses(uuid);
-CREATE INDEX idx_responses_user_id          ON responses(user_id);
 CREATE INDEX idx_responses_conversation_id  ON responses(conversation_id);
-CREATE INDEX idx_responses_status           ON responses(status);
 
 -- 5. user_messages table - User inputs (can be created via Conversations or Responses API)
 -- response_id: NULL if created via Conversations API, populated if created via Responses API
@@ -89,14 +83,10 @@ CREATE TABLE user_messages (
 );
 
 -- Indexes for user_messages
-CREATE INDEX idx_user_messages_uuid             ON user_messages(uuid);
 CREATE INDEX idx_user_messages_conversation_id  ON user_messages(conversation_id);
 CREATE INDEX idx_user_messages_response_id      ON user_messages(response_id);
-CREATE INDEX idx_user_messages_user_id          ON user_messages(user_id);
-CREATE INDEX idx_user_messages_conversation_created_id 
+CREATE INDEX idx_user_messages_conversation_created_id
     ON user_messages(conversation_id, created_at DESC, id);
-CREATE INDEX idx_user_messages_conversation_created
-    ON user_messages(conversation_id, created_at);
 
 -- 6. assistant_messages table - LLM responses (can be created via Conversations or Responses API)
 -- response_id: NULL if created via Conversations API, populated if created via Responses API
@@ -117,14 +107,10 @@ CREATE TABLE assistant_messages (
 );
 
 -- Indexes for assistant_messages
-CREATE INDEX idx_assistant_messages_uuid             ON assistant_messages(uuid);
 CREATE INDEX idx_assistant_messages_conversation_id  ON assistant_messages(conversation_id);
 CREATE INDEX idx_assistant_messages_response_id      ON assistant_messages(response_id);
-CREATE INDEX idx_assistant_messages_user_id          ON assistant_messages(user_id);
 CREATE INDEX idx_assistant_messages_conversation_created_id
     ON assistant_messages(conversation_id, created_at DESC, id);
-CREATE INDEX idx_assistant_messages_conversation_created
-    ON assistant_messages(conversation_id, created_at);
 
 -- 7. tool_calls table - Tool invocations by the model (can be created via Conversations or Responses API)
 -- response_id: NULL if created via Conversations API, populated if created via Responses API
@@ -145,14 +131,10 @@ CREATE TABLE tool_calls (
 );
 
 -- Indexes for tool_calls
-CREATE INDEX idx_tool_calls_uuid               ON tool_calls(uuid);
 CREATE INDEX idx_tool_calls_conversation_id     ON tool_calls(conversation_id);
 CREATE INDEX idx_tool_calls_response_id         ON tool_calls(response_id);
-CREATE INDEX idx_tool_calls_user_id            ON tool_calls(user_id);
-CREATE INDEX idx_tool_calls_conversation_created_id  
+CREATE INDEX idx_tool_calls_conversation_created_id
     ON tool_calls(conversation_id, created_at DESC, id);
-CREATE INDEX idx_tool_calls_conversation_created
-    ON tool_calls(conversation_id, created_at);
 
 -- 8. tool_outputs table - Tool execution results (can be created via Conversations or Responses API)
 -- response_id: NULL if created via Conversations API, populated if created via Responses API
@@ -173,15 +155,11 @@ CREATE TABLE tool_outputs (
 );
 
 -- Indexes for tool_outputs
-CREATE INDEX idx_tool_outputs_uuid              ON tool_outputs(uuid);
 CREATE INDEX idx_tool_outputs_conversation_id   ON tool_outputs(conversation_id);
 CREATE INDEX idx_tool_outputs_response_id       ON tool_outputs(response_id);
-CREATE INDEX idx_tool_outputs_user_id           ON tool_outputs(user_id);
 CREATE INDEX idx_tool_outputs_tool_call_fk      ON tool_outputs(tool_call_fk);
-CREATE INDEX idx_tool_outputs_conversation_created_id 
+CREATE INDEX idx_tool_outputs_conversation_created_id
     ON tool_outputs(conversation_id, created_at DESC, id);
-CREATE INDEX idx_tool_outputs_conversation_created
-    ON tool_outputs(conversation_id, created_at);
 
 -- 9. Create triggers for updated_at columns
 -- Note: update_updated_at_column() function already exists from previous migrations

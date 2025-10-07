@@ -496,44 +496,6 @@ impl UserMessage {
 
     // Note: status is now tracked on Response, not UserMessage
 
-    pub fn list_for_user(
-        conn: &mut PgConnection,
-        user_id: Uuid,
-        limit: i64,
-        after: Option<(DateTime<Utc>, i64)>,
-        before: Option<(DateTime<Utc>, i64)>,
-    ) -> Result<Vec<UserMessage>, ResponsesError> {
-        let mut query = user_messages::table
-            .filter(user_messages::user_id.eq(user_id))
-            .into_boxed();
-
-        if let Some((created_at, id)) = after {
-            query = query.filter(
-                user_messages::created_at
-                    .lt(created_at)
-                    .or(user_messages::created_at
-                        .eq(created_at)
-                        .and(user_messages::id.lt(id))),
-            );
-        }
-
-        if let Some((created_at, id)) = before {
-            query = query.filter(
-                user_messages::created_at
-                    .gt(created_at)
-                    .or(user_messages::created_at
-                        .eq(created_at)
-                        .and(user_messages::id.gt(id))),
-            );
-        }
-
-        query
-            .order(user_messages::created_at.desc())
-            .limit(limit)
-            .load::<UserMessage>(conn)
-            .map_err(ResponsesError::DatabaseError)
-    }
-
     pub fn delete_by_id_and_user(
         conn: &mut PgConnection,
         id: i64,
@@ -689,17 +651,6 @@ pub struct NewAssistantMessage {
 }
 
 impl AssistantMessage {
-    pub fn get_by_response_id(
-        conn: &mut PgConnection,
-        response_id: i64,
-    ) -> Result<Vec<AssistantMessage>, ResponsesError> {
-        assistant_messages::table
-            .filter(assistant_messages::response_id.eq(response_id))
-            .order(assistant_messages::created_at.asc())
-            .load::<AssistantMessage>(conn)
-            .map_err(ResponsesError::DatabaseError)
-    }
-
     pub fn update(
         conn: &mut PgConnection,
         message_uuid: Uuid,

@@ -249,7 +249,10 @@ impl ConversationItemConverter {
             "assistant" => Self::assistant_message_to_item(msg, content),
             "tool_call" => Self::tool_call_to_item(msg, content),
             "tool_output" => Self::tool_output_to_item(msg, content),
-            _ => Err(ApiError::InternalServerError),
+            unknown => {
+                error!("Unknown message type: {}", unknown);
+                Err(ApiError::InternalServerError)
+            }
         }
     }
 

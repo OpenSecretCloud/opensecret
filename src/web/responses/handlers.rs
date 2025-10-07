@@ -7,7 +7,7 @@ use crate::{
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
     models::responses::{NewAssistantMessage, NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
-    tokens::count_tokens,
+    tokens::{count_tokens, model_max_ctx},
     web::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
@@ -864,6 +864,21 @@ async fn validate_and_normalize_input(
     } else {
         token_count as i32
     };
+
+    // Validate that the user message doesn't exceed the context budget
+    // Even if we drop everything else, we need to fit at least the user's message
+    let max_ctx = model_max_ctx(&body.model);
+    let response_reserve = 4096usize;
+    let safety = 500usize;
+    let ctx_budget = max_ctx.saturating_sub(response_reserve + safety);
+
+    if user_message_tokens as usize >= ctx_budget {
+        error!(
+            "User message too large for user {}: {} tokens exceeds budget {} for model {}",
+            user.uuid, user_message_tokens, ctx_budget, body.model
+        );
+        return Err(ApiError::BadRequest);
+    }
 
     // Serialize the MessageContent for storage
     let content_for_storage = serde_json::to_string(&message_content).map_err(|e| {

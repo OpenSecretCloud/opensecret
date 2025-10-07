@@ -369,7 +369,36 @@ pub fn build_prompt_from_chat_messages(
             });
         }
 
-        msgs.extend(tail);
+        msgs.extend(tail.clone());
+
+        // Check if head + truncation + tail still exceeds budget
+        // This can happen when the last message is very large
+        let total_after_truncation: usize = msgs.iter().map(|m| m.tok).sum();
+        if total_after_truncation > ctx_budget {
+            // Try to fit just tail (possibly with system message)
+            // First, try system + tail if we have a system message
+            if has_system {
+                let system_msg = msgs.iter().find(|m| m.role == ROLE_SYSTEM).cloned();
+                if let Some(sys) = system_msg {
+                    let tail_tokens: usize = tail.iter().map(|m| m.tok).sum();
+                    if sys.tok + tail_tokens <= ctx_budget {
+                        // System + tail fits
+                        msgs = vec![sys];
+                        msgs.extend(tail);
+                        // No truncation message in this case
+                    } else {
+                        // Only tail fits
+                        msgs = tail;
+                    }
+                } else {
+                    // Only tail fits
+                    msgs = tail;
+                }
+            } else {
+                // No system message, just use tail
+                msgs = tail;
+            }
+        }
     }
 
     // Recalculate total after potential truncation
@@ -656,6 +685,61 @@ mod tests {
 
         assert_eq!(messages[3]["role"], "user");
         assert_eq!(messages[3]["content"], "New message");
+    }
+
+    #[test]
+    fn test_only_last_message_fits() {
+        // Scenario: Budget is so tight that ONLY the last user message can fit
+        // No room for system, first user, or truncation message
+        // Expected: Just return the last user message alone
+
+        let msgs = vec![
+            create_chat_msg("user", "First", Some(20000)),
+            create_chat_msg("assistant", "First reply", Some(20000)),
+            create_chat_msg("user", "Second", Some(20000)),
+            create_chat_msg("assistant", "Second reply", Some(20000)),
+            // Last message fits, but adding anything else (system, first, truncation) would exceed
+            create_chat_msg("user", "Final message that barely fits", Some(58000)),
+        ];
+
+        let result = build_prompt_from_chat_messages(msgs, "deepseek-r1-70b");
+
+        let (messages, _) = result.expect("Failed to build prompt");
+
+        // Should have ONLY the last user message
+        assert_eq!(messages.len(), 1, "Should only have the last user message");
+        assert_eq!(messages[0]["role"], "user");
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Final message that barely fits"));
+    }
+
+    #[test]
+    fn test_last_message_plus_system_fits() {
+        // Scenario: Last message + system message fits, but not first user + truncation
+        // Expected: system + last user message (no truncation, no first user)
+
+        let msgs = vec![
+            create_chat_msg("system", "You are helpful", Some(10)),
+            create_chat_msg("user", "First", Some(20000)),
+            create_chat_msg("assistant", "First reply", Some(20000)),
+            create_chat_msg("user", "Second", Some(20000)),
+            create_chat_msg("assistant", "Second reply", Some(20000)),
+            // Last message is large enough that first+truncation won't fit
+            create_chat_msg("user", "Final", Some(58000)),
+        ];
+
+        let result = build_prompt_from_chat_messages(msgs, "deepseek-r1-70b");
+
+        let (messages, _) = result.expect("Failed to build prompt");
+
+        // Should have system + last user only (no truncation because we couldn't fit head)
+        assert_eq!(messages.len(), 2, "Should have system + last user");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "You are helpful");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "Final");
     }
 
     #[test]

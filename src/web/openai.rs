@@ -614,7 +614,10 @@ pub async fn get_chat_completion_response(
                             // Parse SSE frames
                             while let Some(frame) = extract_sse_frame(&mut buffer) {
                                 if frame == "[DONE]" {
-                                    let _ = tx_consumer.send(CompletionChunk::Done).await;
+                                    if tx_consumer.send(CompletionChunk::Done).await.is_err() {
+                                        // Receiver dropped, stop processing
+                                        return;
+                                    }
                                     return;
                                 }
 
@@ -632,23 +635,35 @@ pub async fn get_chat_completion_response(
                                             .await;
 
                                             // Also send usage to consumer
-                                            let _ = tx_consumer
+                                            if tx_consumer
                                                 .send(CompletionChunk::Usage(usage))
-                                                .await;
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
                                         }
 
                                         // Send full JSON chunk to consumer (preserves all metadata)
-                                        let _ = tx_consumer
+                                        if tx_consumer
                                             .send(CompletionChunk::StreamChunk(json))
-                                            .await;
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
                                     }
                                     Err(e) => {
                                         error!("Received non-JSON data event. Error: {:?}", e);
-                                        let _ = tx_consumer
+                                        if tx_consumer
                                             .send(CompletionChunk::Error(
                                                 "Invalid JSON".to_string(),
                                             ))
-                                            .await;
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
                                         break;
                                     }
                                 }
@@ -656,24 +671,34 @@ pub async fn get_chat_completion_response(
                         }
                         Err(e) => {
                             error!("Stream error: {:?}", e);
-                            let _ = tx_consumer
+                            if tx_consumer
                                 .send(CompletionChunk::Error(e.to_string()))
-                                .await;
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                             break;
                         }
                     }
                 }
                 Ok(None) => {
                     // Stream ended without explicit [DONE]
-                    let _ = tx_consumer.send(CompletionChunk::Done).await;
+                    if tx_consumer.send(CompletionChunk::Done).await.is_err() {
+                        return;
+                    }
                     break;
                 }
                 Err(_) => {
                     // Timeout waiting for next chunk
                     error!("Stream chunk timeout after {}s", STREAM_CHUNK_TIMEOUT_SECS);
-                    let _ = tx_consumer
+                    if tx_consumer
                         .send(CompletionChunk::Error("Stream timeout".to_string()))
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                     break;
                 }
             }

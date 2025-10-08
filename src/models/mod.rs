@@ -13,6 +13,7 @@ pub mod platform_invite_codes;
 pub mod platform_password_reset;
 pub mod platform_users;
 pub mod project_settings;
+pub mod responses;
 pub mod schema;
 pub mod token_usage;
 pub mod user_api_keys;

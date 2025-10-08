@@ -5,6 +5,8 @@ use uuid::Uuid;
 #[derive(Debug, Deserialize)]
 pub struct UsageResponse {
     pub can_use: bool,
+    #[serde(default)]
+    pub is_free: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -15,6 +17,10 @@ pub enum BillingError {
     ParseError(String),
     #[error("Service error: {0}")]
     ServiceError(String),
+    #[error("Usage limit reached")]
+    UsageLimitExceeded,
+    #[error("Token limit exceeded on free plan")]
+    FreeTokenLimitExceeded,
 }
 
 #[derive(Clone)]
@@ -33,7 +39,11 @@ impl BillingClient {
         }
     }
 
-    async fn check_usage(&self, user_id: Uuid, is_api: bool) -> Result<bool, BillingError> {
+    async fn check_usage(
+        &self,
+        user_id: Uuid,
+        is_api: bool,
+    ) -> Result<UsageResponse, BillingError> {
         let mut request = self
             .client
             .get(format!("{}/v1/admin/check-usage", self.base_url))
@@ -53,7 +63,6 @@ impl BillingClient {
             response
                 .json::<UsageResponse>()
                 .await
-                .map(|usage| usage.can_use)
                 .map_err(|e| BillingError::ParseError(e.to_string()))
         } else {
             let error = response
@@ -65,10 +74,34 @@ impl BillingClient {
     }
 
     pub async fn can_user_chat(&self, user_id: Uuid) -> Result<bool, BillingError> {
-        self.check_usage(user_id, false).await
+        self.check_usage(user_id, false)
+            .await
+            .map(|usage| usage.can_use)
     }
 
     pub async fn can_user_chat_api(&self, user_id: Uuid) -> Result<bool, BillingError> {
-        self.check_usage(user_id, true).await
+        self.check_usage(user_id, true)
+            .await
+            .map(|usage| usage.can_use)
+    }
+
+    pub async fn check_user_chat_with_tokens(
+        &self,
+        user_id: Uuid,
+        is_api: bool,
+        input_tokens: i32,
+    ) -> Result<(), BillingError> {
+        let usage = self.check_usage(user_id, is_api).await?;
+
+        if !usage.can_use {
+            return Err(BillingError::UsageLimitExceeded);
+        }
+
+        // Check free tier token limit (20k tokens)
+        if usage.is_free && input_tokens > 20_000 {
+            return Err(BillingError::FreeTokenLimitExceeded);
+        }
+
+        Ok(())
     }
 }

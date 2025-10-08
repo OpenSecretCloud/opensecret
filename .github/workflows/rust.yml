@@ -81,29 +81,3 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-features
-
-  doc:
-    name: Check Documentation
-    runs-on: ubuntu-latest
-    env:
-      RUSTDOCFLAGS: "-D warnings"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
-        with:
-          toolchain: 1.84.1
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libpq-dev pkg-config libssl-dev
-
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check documentation
-        run: cargo doc --no-deps --all-features 

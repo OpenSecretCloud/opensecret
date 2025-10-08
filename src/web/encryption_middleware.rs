@@ -14,6 +14,8 @@ use uuid::Uuid;
 
 use crate::{ApiError, AppState};
 
+const MAX_ENCRYPTED_BODY_BYTES: usize = 50 * 1024 * 1024; // 50MB
+
 #[derive(Deserialize)]
 pub struct EncryptedRequest {
     pub encrypted: String,
@@ -64,9 +66,9 @@ where
     }
 
     let body = std::mem::replace(request.body_mut(), Body::empty());
-    let body_bytes = axum::body::to_bytes(body, usize::MAX)
+    let body_bytes = axum::body::to_bytes(body, MAX_ENCRYPTED_BODY_BYTES)
         .await
-        .map_err(|_| ApiError::BadRequest)?;
+        .map_err(|_| ApiError::PayloadTooLarge)?;
 
     let encrypted_request: EncryptedRequest =
         serde_json::from_slice(&body_bytes).map_err(|_| ApiError::BadRequest)?;

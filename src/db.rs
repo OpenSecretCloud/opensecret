@@ -28,6 +28,11 @@ use crate::models::project_settings::OAuthSettings;
 use crate::models::project_settings::{
     EmailSettings, NewProjectSetting, ProjectSetting, ProjectSettingError, SettingCategory,
 };
+use crate::models::responses::{
+    AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewResponse, NewToolCall,
+    NewToolOutput, NewUserInstruction, NewUserMessage, RawThreadMessage, RawThreadMessageMetadata,
+    Response, ResponseStatus, ResponsesError, ToolCall, ToolOutput, UserInstruction, UserMessage,
+};
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
 use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
 use crate::models::users::{NewUser, User, UserError};
@@ -35,6 +40,7 @@ use crate::models::{
     email_verification::{EmailVerification, EmailVerificationError, NewEmailVerification},
     org_memberships::OrgRole,
 };
+use chrono::{DateTime, Utc};
 use diesel::Connection;
 use diesel::{
     pg::PgConnection,
@@ -118,6 +124,8 @@ pub enum DBError {
     ProjectSettingError(#[from] ProjectSettingError),
     #[error("Project setting not found")]
     ProjectSettingNotFound,
+    #[error("Responses API error: {0}")]
+    ResponsesError(#[from] crate::models::responses::ResponsesError),
 }
 
 #[allow(dead_code)]
@@ -445,6 +453,153 @@ pub trait DBConnection {
 
     // Platform invite code methods
     fn validate_platform_invite_code(&self, code: Uuid) -> Result<PlatformInviteCode, DBError>;
+
+    // ---------- Responses API helpers ----------
+
+    // Conversations
+    fn create_conversation(
+        &self,
+        new_conversation: NewConversation,
+    ) -> Result<Conversation, DBError>;
+    fn get_conversation_by_id_and_user(
+        &self,
+        conversation_id: i64,
+        user_id: Uuid,
+    ) -> Result<Conversation, DBError>;
+    fn get_conversation_by_uuid_and_user(
+        &self,
+        conversation_uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<Conversation, DBError>;
+    fn update_conversation_metadata(
+        &self,
+        conversation_id: i64,
+        user_id: Uuid,
+        metadata_enc: Vec<u8>,
+    ) -> Result<(), DBError>;
+    fn list_conversations(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<Uuid>,
+        order: &str,
+    ) -> Result<Vec<Conversation>, DBError>;
+    fn delete_conversation(&self, conversation_id: i64, user_id: Uuid) -> Result<(), DBError>;
+
+    // Responses (job tracker)
+    fn create_response(&self, new_response: NewResponse) -> Result<Response, DBError>;
+    fn get_response_by_uuid_and_user(&self, uuid: Uuid, user_id: Uuid)
+        -> Result<Response, DBError>;
+    fn update_response_status(
+        &self,
+        id: i64,
+        status: ResponseStatus,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<(), DBError>;
+    fn cancel_response(&self, uuid: Uuid, user_id: Uuid) -> Result<Response, DBError>;
+    fn delete_response(&self, uuid: Uuid, user_id: Uuid) -> Result<(), DBError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_conversation_with_response_and_message(
+        &self,
+        conversation_uuid: Uuid,
+        user_id: Uuid,
+        metadata_enc: Option<Vec<u8>>,
+        response: Option<NewResponse>,
+        first_message_content: Vec<u8>,
+        first_message_tokens: i32,
+        message_uuid: Uuid,
+        assistant_message_uuid: Option<Uuid>,
+    ) -> Result<(Conversation, Option<Response>, UserMessage), DBError>;
+
+    // User instructions methods
+    fn get_default_user_instruction(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<UserInstruction>, DBError>;
+    fn get_user_instruction_by_uuid_and_user(
+        &self,
+        uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<UserInstruction, DBError>;
+    fn create_user_instruction(
+        &self,
+        new_instruction: NewUserInstruction,
+    ) -> Result<UserInstruction, DBError>;
+    fn update_user_instruction(
+        &self,
+        id: i64,
+        user_id: Uuid,
+        name_enc: Vec<u8>,
+        prompt_enc: Vec<u8>,
+        prompt_tokens: i32,
+        is_default: bool,
+    ) -> Result<UserInstruction, DBError>;
+    fn delete_user_instruction(&self, id: i64, user_id: Uuid) -> Result<(), DBError>;
+    fn list_user_instructions(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<(DateTime<Utc>, i64)>,
+        before: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<Vec<UserInstruction>, DBError>;
+    fn set_default_user_instruction(
+        &self,
+        id: i64,
+        user_id: Uuid,
+    ) -> Result<UserInstruction, DBError>;
+
+    // User messages
+    fn create_user_message(&self, new_msg: NewUserMessage) -> Result<UserMessage, DBError>;
+    fn update_user_message_prompt_tokens(&self, id: i64, prompt_tokens: i32)
+        -> Result<(), DBError>;
+    fn get_user_message(&self, id: i64, user_id: Uuid) -> Result<UserMessage, DBError>;
+    fn get_user_message_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<UserMessage, DBError>;
+
+    // Assistant messages
+    fn create_assistant_message(
+        &self,
+        new_msg: NewAssistantMessage,
+    ) -> Result<AssistantMessage, DBError>;
+    fn update_assistant_message(
+        &self,
+        message_uuid: Uuid,
+        content_enc: Option<Vec<u8>>,
+        completion_tokens: i32,
+        status: String,
+        finish_reason: Option<String>,
+    ) -> Result<AssistantMessage, DBError>;
+
+    // Tool calls / outputs
+    fn create_tool_call(&self, new_call: NewToolCall) -> Result<ToolCall, DBError>;
+    fn create_tool_output(&self, new_output: NewToolOutput) -> Result<ToolOutput, DBError>;
+
+    // Context reconstruction
+    fn get_conversation_context_messages(
+        &self,
+        conversation_id: i64,
+        limit: i64,
+        after: Option<Uuid>,
+        order: &str,
+    ) -> Result<Vec<RawThreadMessage>, DBError>;
+    fn get_response_context_messages(
+        &self,
+        response_id: i64,
+    ) -> Result<Vec<RawThreadMessage>, DBError>;
+
+    // Optimized context reconstruction (metadata-based)
+    fn get_conversation_context_metadata(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Vec<RawThreadMessageMetadata>, DBError>;
+    fn get_messages_by_ids(
+        &self,
+        conversation_id: i64,
+        message_ids: &[(String, i64)],
+    ) -> Result<Vec<RawThreadMessage>, DBError>;
+
+    // Delete operation for user messages
+    fn delete_user_message(&self, id: Uuid, user_id: Uuid) -> Result<(), DBError>;
 }
 
 pub(crate) struct PostgresConnection {
@@ -1761,6 +1916,490 @@ impl DBConnection for PostgresConnection {
             Ok(())
         })
     }
+
+    // ---------- Responses API implementations ----------
+
+    // Conversations
+    fn create_conversation(
+        &self,
+        new_conversation: NewConversation,
+    ) -> Result<Conversation, DBError> {
+        debug!("Creating new conversation");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_conversation.insert(conn).map_err(DBError::from)
+    }
+
+    fn get_conversation_by_id_and_user(
+        &self,
+        conversation_id: i64,
+        user_id: Uuid,
+    ) -> Result<Conversation, DBError> {
+        debug!("Getting conversation by ID and user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Conversation::get_by_id_and_user(conn, conversation_id, user_id).map_err(DBError::from)
+    }
+
+    fn get_conversation_by_uuid_and_user(
+        &self,
+        conversation_uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<Conversation, DBError> {
+        debug!("Getting conversation by UUID and user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Conversation::get_by_uuid_and_user(conn, conversation_uuid, user_id).map_err(DBError::from)
+    }
+
+    fn update_conversation_metadata(
+        &self,
+        conversation_id: i64,
+        user_id: Uuid,
+        metadata_enc: Vec<u8>,
+    ) -> Result<(), DBError> {
+        debug!("Updating conversation metadata");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Conversation::update_metadata(conn, conversation_id, user_id, metadata_enc)
+            .map_err(DBError::from)
+    }
+
+    fn list_conversations(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<Uuid>,
+        order: &str,
+    ) -> Result<Vec<Conversation>, DBError> {
+        debug!("Listing conversations for user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Conversation::list_for_user(conn, user_id, limit, after, order).map_err(DBError::from)
+    }
+
+    fn delete_conversation(&self, conversation_id: i64, user_id: Uuid) -> Result<(), DBError> {
+        debug!("Deleting conversation");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Conversation::delete_by_id_and_user(conn, conversation_id, user_id).map_err(DBError::from)
+    }
+
+    // Responses (job tracker) implementations
+    fn create_response(&self, new_response: NewResponse) -> Result<Response, DBError> {
+        debug!("Creating new response");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_response.insert(conn).map_err(DBError::from)
+    }
+
+    fn get_response_by_uuid_and_user(
+        &self,
+        uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<Response, DBError> {
+        debug!("Getting response by UUID and user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Response::get_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
+    }
+
+    fn update_response_status(
+        &self,
+        id: i64,
+        status: ResponseStatus,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<(), DBError> {
+        debug!("Updating response status");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Response::update_status(conn, id, status, completed_at).map_err(DBError::from)
+    }
+
+    fn cancel_response(&self, uuid: Uuid, user_id: Uuid) -> Result<Response, DBError> {
+        debug!("Cancelling response");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Response::cancel_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
+    }
+
+    fn delete_response(&self, uuid: Uuid, user_id: Uuid) -> Result<(), DBError> {
+        debug!("Deleting response");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Response::delete_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
+    }
+
+    fn create_conversation_with_response_and_message(
+        &self,
+        conversation_uuid: Uuid,
+        user_id: Uuid,
+        metadata_enc: Option<Vec<u8>>,
+        response: Option<NewResponse>,
+        first_message_content: Vec<u8>,
+        first_message_tokens: i32,
+        message_uuid: Uuid,
+        assistant_message_uuid: Option<Uuid>,
+    ) -> Result<(Conversation, Option<Response>, UserMessage), DBError> {
+        debug!("Creating conversation with response and message");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        NewConversation::create_with_response_and_message(
+            conn,
+            conversation_uuid,
+            user_id,
+            metadata_enc,
+            response,
+            first_message_content,
+            first_message_tokens,
+            message_uuid,
+            assistant_message_uuid,
+        )
+        .map_err(DBError::from)
+    }
+
+    // User instructions implementations
+    fn get_default_user_instruction(
+        &self,
+        user_id: Uuid,
+    ) -> Result<Option<UserInstruction>, DBError> {
+        debug!("Getting default user instruction for user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        user_instructions::table
+            .filter(user_instructions::user_id.eq(user_id))
+            .filter(user_instructions::is_default.eq(true))
+            .first::<UserInstruction>(conn)
+            .optional()
+            .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
+    }
+
+    fn get_user_instruction_by_uuid_and_user(
+        &self,
+        uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<UserInstruction, DBError> {
+        debug!("Getting user instruction by UUID for user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        user_instructions::table
+            .filter(user_instructions::uuid.eq(uuid))
+            .filter(user_instructions::user_id.eq(user_id))
+            .first::<UserInstruction>(conn)
+            .map_err(|e| match e {
+                diesel::result::Error::NotFound => {
+                    DBError::ResponsesError(ResponsesError::SystemPromptNotFound)
+                }
+                _ => DBError::ResponsesError(ResponsesError::DatabaseError(e)),
+            })
+    }
+
+    fn create_user_instruction(
+        &self,
+        new_instruction: NewUserInstruction,
+    ) -> Result<UserInstruction, DBError> {
+        debug!("Creating new user instruction");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        conn.transaction(|tx| {
+            // If this instruction should be default, clear other defaults first
+            if new_instruction.is_default {
+                diesel::update(
+                    user_instructions::table
+                        .filter(user_instructions::user_id.eq(new_instruction.user_id))
+                        .filter(user_instructions::is_default.eq(true)),
+                )
+                .set(user_instructions::is_default.eq(false))
+                .execute(tx)?;
+            }
+
+            diesel::insert_into(user_instructions::table)
+                .values(&new_instruction)
+                .get_result(tx)
+        })
+        .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
+    }
+
+    fn update_user_instruction(
+        &self,
+        id: i64,
+        user_id: Uuid,
+        name_enc: Vec<u8>,
+        prompt_enc: Vec<u8>,
+        prompt_tokens: i32,
+        is_default: bool,
+    ) -> Result<UserInstruction, DBError> {
+        debug!("Updating user instruction");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        conn.transaction(|tx| {
+            // If setting this as default, clear other defaults first
+            if is_default {
+                diesel::update(
+                    user_instructions::table
+                        .filter(user_instructions::user_id.eq(user_id))
+                        .filter(user_instructions::is_default.eq(true))
+                        .filter(user_instructions::id.ne(id)),
+                )
+                .set(user_instructions::is_default.eq(false))
+                .execute(tx)?;
+            }
+
+            diesel::update(
+                user_instructions::table
+                    .filter(user_instructions::id.eq(id))
+                    .filter(user_instructions::user_id.eq(user_id)),
+            )
+            .set((
+                user_instructions::name_enc.eq(name_enc),
+                user_instructions::prompt_enc.eq(prompt_enc),
+                user_instructions::prompt_tokens.eq(prompt_tokens),
+                user_instructions::is_default.eq(is_default),
+                user_instructions::updated_at.eq(diesel::dsl::now),
+            ))
+            .get_result(tx)
+        })
+        .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
+    }
+
+    fn delete_user_instruction(&self, id: i64, user_id: Uuid) -> Result<(), DBError> {
+        debug!("Deleting user instruction");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        diesel::delete(
+            user_instructions::table
+                .filter(user_instructions::id.eq(id))
+                .filter(user_instructions::user_id.eq(user_id)),
+        )
+        .execute(conn)
+        .map(|rows| {
+            if rows == 0 {
+                Err(DBError::ResponsesError(
+                    ResponsesError::SystemPromptNotFound,
+                ))
+            } else {
+                Ok(())
+            }
+        })?
+    }
+
+    fn list_user_instructions(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<(DateTime<Utc>, i64)>,
+        before: Option<(DateTime<Utc>, i64)>,
+    ) -> Result<Vec<UserInstruction>, DBError> {
+        debug!("Listing user instructions");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        let mut query = user_instructions::table
+            .filter(user_instructions::user_id.eq(user_id))
+            .into_boxed();
+
+        if let Some((updated_at, id)) = after {
+            query = query.filter(
+                user_instructions::updated_at
+                    .lt(updated_at)
+                    .or(user_instructions::updated_at
+                        .eq(updated_at)
+                        .and(user_instructions::id.lt(id))),
+            );
+        }
+
+        if let Some((updated_at, id)) = before {
+            query = query.filter(
+                user_instructions::updated_at
+                    .gt(updated_at)
+                    .or(user_instructions::updated_at
+                        .eq(updated_at)
+                        .and(user_instructions::id.gt(id))),
+            );
+        }
+
+        query
+            .order(user_instructions::updated_at.desc())
+            .limit(limit)
+            .load::<UserInstruction>(conn)
+            .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
+    }
+
+    fn set_default_user_instruction(
+        &self,
+        id: i64,
+        user_id: Uuid,
+    ) -> Result<UserInstruction, DBError> {
+        debug!("Setting default user instruction");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        conn.transaction(|tx| {
+            // Clear all defaults for this user
+            diesel::update(
+                user_instructions::table
+                    .filter(user_instructions::user_id.eq(user_id))
+                    .filter(user_instructions::is_default.eq(true)),
+            )
+            .set(user_instructions::is_default.eq(false))
+            .execute(tx)?;
+
+            // Set this one as default
+            diesel::update(
+                user_instructions::table
+                    .filter(user_instructions::id.eq(id))
+                    .filter(user_instructions::user_id.eq(user_id)),
+            )
+            .set((
+                user_instructions::is_default.eq(true),
+                user_instructions::updated_at.eq(diesel::dsl::now),
+            ))
+            .get_result(tx)
+        })
+        .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
+    }
+
+    // User messages
+    fn create_user_message(&self, new_msg: NewUserMessage) -> Result<UserMessage, DBError> {
+        debug!("Creating new user message");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_msg.insert(conn).map_err(DBError::from)
+    }
+
+    fn update_user_message_prompt_tokens(
+        &self,
+        id: i64,
+        prompt_tokens: i32,
+    ) -> Result<(), DBError> {
+        debug!("Updating user message prompt tokens");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        use crate::models::schema::user_messages;
+        use diesel::prelude::*;
+
+        diesel::update(user_messages::table.filter(user_messages::id.eq(id)))
+            .set(user_messages::prompt_tokens.eq(prompt_tokens))
+            .execute(conn)
+            .map(|_| ())
+            .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
+    }
+
+    fn get_user_message(&self, id: i64, user_id: Uuid) -> Result<UserMessage, DBError> {
+        debug!("Getting user message by ID and user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserMessage::get_by_id_and_user(conn, id, user_id).map_err(DBError::from)
+    }
+
+    fn get_user_message_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<UserMessage, DBError> {
+        debug!("Getting user message by UUID and user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserMessage::get_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
+    }
+
+    // Assistant messages
+    fn create_assistant_message(
+        &self,
+        new_msg: NewAssistantMessage,
+    ) -> Result<AssistantMessage, DBError> {
+        debug!("Creating new assistant message");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_msg.insert(conn).map_err(DBError::from)
+    }
+
+    fn update_assistant_message(
+        &self,
+        message_uuid: Uuid,
+        content_enc: Option<Vec<u8>>,
+        completion_tokens: i32,
+        status: String,
+        finish_reason: Option<String>,
+    ) -> Result<AssistantMessage, DBError> {
+        debug!("Updating assistant message {}", message_uuid);
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        AssistantMessage::update(
+            conn,
+            message_uuid,
+            content_enc,
+            completion_tokens,
+            status,
+            finish_reason,
+        )
+        .map_err(DBError::from)
+    }
+
+    // Tool calls / outputs
+    fn create_tool_call(&self, new_call: NewToolCall) -> Result<ToolCall, DBError> {
+        debug!("Creating new tool call");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_call.insert(conn).map_err(DBError::from)
+    }
+
+    fn create_tool_output(&self, new_output: NewToolOutput) -> Result<ToolOutput, DBError> {
+        debug!("Creating new tool output");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_output.insert(conn).map_err(DBError::from)
+    }
+
+    // Context reconstruction
+    fn get_conversation_context_messages(
+        &self,
+        conversation_id: i64,
+        limit: i64,
+        after: Option<Uuid>,
+        order: &str,
+    ) -> Result<Vec<RawThreadMessage>, DBError> {
+        debug!("Getting conversation context messages");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        RawThreadMessage::get_conversation_context(conn, conversation_id, limit, after, order)
+            .map_err(DBError::from)
+    }
+
+    fn get_response_context_messages(
+        &self,
+        response_id: i64,
+    ) -> Result<Vec<RawThreadMessage>, DBError> {
+        debug!("Getting response context messages");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        RawThreadMessage::get_response_context(conn, response_id).map_err(DBError::from)
+    }
+
+    // Optimized context reconstruction (metadata-based)
+    fn get_conversation_context_metadata(
+        &self,
+        conversation_id: i64,
+    ) -> Result<Vec<RawThreadMessageMetadata>, DBError> {
+        debug!("Getting conversation context metadata (lightweight)");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        RawThreadMessageMetadata::get_conversation_context_metadata(conn, conversation_id)
+            .map_err(DBError::from)
+    }
+
+    fn get_messages_by_ids(
+        &self,
+        conversation_id: i64,
+        message_ids: &[(String, i64)],
+    ) -> Result<Vec<RawThreadMessage>, DBError> {
+        debug!("Getting {} specific messages by ID", message_ids.len());
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        RawThreadMessage::get_messages_by_ids(conn, conversation_id, message_ids)
+            .map_err(DBError::from)
+    }
+
+    fn delete_user_message(&self, id: Uuid, user_id: Uuid) -> Result<(), DBError> {
+        debug!("Deleting user message");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        // First get the message by UUID to find its ID
+        let msg = UserMessage::get_by_uuid_and_user(conn, id, user_id)?;
+        UserMessage::delete_by_id_and_user(conn, msg.id, user_id).map_err(DBError::from)
+    }
+
+    // Maintenance
 }
 
 pub(crate) fn setup_db(url: String) -> Arc<dyn DBConnection + Send + Sync> {

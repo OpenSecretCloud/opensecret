@@ -13,18 +13,23 @@ pub fn count_tokens(text: &str) -> usize {
     ENCODER.encode_with_special_tokens(text).len()
 }
 
-/// Per‑model context windows (hard limits).  
-/// Any unknown model defaults to 64 k tokens.
+/// Per‑model context windows (hard limits).
+/// Any unknown model defaults to 64k tokens.
 pub fn model_max_ctx(model: &str) -> usize {
     const LIMITS: &[(&str, usize)] = &[
-        // Free Tier
-        ("ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4", 70_000), // Llama 3.3 70B
-        // Starter Tier
-        ("leon-se/gemma-3-27b-it-fp8-dynamic", 70_000), // Gemma 3 27B (vision)
-        // Pro Tier
-        ("deepseek-r1-70b", 64_000),        // DeepSeek R1 70B
-        ("mistral-small-3-1-24b", 128_000), // Mistral Small 3.1 24B (vision)
-        ("qwen2-5-72b", 128_000),           // Qwen 2.5 72B
+        // Canonical names
+        ("llama-3.3-70b", 128_000),
+        ("gpt-oss-120b", 128_000),
+        ("qwen3-coder-480b", 128_000),
+        // Provider-specific equivalents
+        ("llama3-3-70b", 128_000), // Tinfoil alias
+        ("ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4", 128_000), // Continuum alias
+        // Chat models
+        ("deepseek-r1-0528", 128_000),
+        ("mistral-small-3-1-24b", 128_000), // Vision-capable
+        ("qwen2-5-72b", 128_000),
+        // Gemma 3 27B (vision) — capped at 20k
+        ("leon-se/gemma-3-27b-it-fp8-dynamic", 20_000),
     ];
 
     LIMITS
@@ -64,12 +69,18 @@ mod tests {
         // Test known models
         assert_eq!(
             model_max_ctx("ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"),
-            70_000
+            128_000
         );
-        assert_eq!(model_max_ctx("leon-se/gemma-3-27b-it-fp8-dynamic"), 70_000);
-        assert_eq!(model_max_ctx("deepseek-r1-70b"), 64_000);
+        assert_eq!(model_max_ctx("leon-se/gemma-3-27b-it-fp8-dynamic"), 20_000);
+        assert_eq!(model_max_ctx("deepseek-r1-0528"), 128_000);
         assert_eq!(model_max_ctx("mistral-small-3-1-24b"), 128_000);
         assert_eq!(model_max_ctx("qwen2-5-72b"), 128_000);
+
+        // Canonical and tinfoil aliases
+        assert_eq!(model_max_ctx("llama-3.3-70b"), 128_000);
+        assert_eq!(model_max_ctx("llama3-3-70b"), 128_000);
+        assert_eq!(model_max_ctx("gpt-oss-120b"), 128_000);
+        assert_eq!(model_max_ctx("qwen3-coder-480b"), 128_000);
     }
 
     #[test]

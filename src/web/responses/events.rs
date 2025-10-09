@@ -11,13 +11,15 @@ use super::constants::{
     EVENT_RESPONSE_COMPLETED, EVENT_RESPONSE_CONTENT_PART_ADDED, EVENT_RESPONSE_CONTENT_PART_DONE,
     EVENT_RESPONSE_CREATED, EVENT_RESPONSE_ERROR, EVENT_RESPONSE_IN_PROGRESS,
     EVENT_RESPONSE_OUTPUT_ITEM_ADDED, EVENT_RESPONSE_OUTPUT_ITEM_DONE,
-    EVENT_RESPONSE_OUTPUT_TEXT_DELTA, EVENT_RESPONSE_OUTPUT_TEXT_DONE,
+    EVENT_RESPONSE_OUTPUT_TEXT_DELTA, EVENT_RESPONSE_OUTPUT_TEXT_DONE, EVENT_TOOL_CALL_CREATED,
+    EVENT_TOOL_OUTPUT_CREATED,
 };
 use super::handlers::{
     encrypt_event, ResponseCancelledEvent, ResponseCompletedEvent, ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent, ResponseCreatedEvent, ResponseErrorEvent,
     ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent,
-    ResponseOutputTextDeltaEvent, ResponseOutputTextDoneEvent,
+    ResponseOutputTextDeltaEvent, ResponseOutputTextDoneEvent, ToolCallCreatedEvent,
+    ToolOutputCreatedEvent,
 };
 
 /// Handles SSE event emission with automatic encryption and error handling
@@ -137,6 +139,8 @@ pub enum ResponseEvent {
     Completed(ResponseCompletedEvent),
     Cancelled(ResponseCancelledEvent),
     Error(ResponseErrorEvent),
+    ToolCallCreated(ToolCallCreatedEvent),
+    ToolOutputCreated(ToolOutputCreatedEvent),
 }
 
 impl ResponseEvent {
@@ -154,6 +158,8 @@ impl ResponseEvent {
             ResponseEvent::Completed(_) => EVENT_RESPONSE_COMPLETED,
             ResponseEvent::Cancelled(_) => EVENT_RESPONSE_CANCELLED,
             ResponseEvent::Error(_) => EVENT_RESPONSE_ERROR,
+            ResponseEvent::ToolCallCreated(_) => EVENT_TOOL_CALL_CREATED,
+            ResponseEvent::ToolOutputCreated(_) => EVENT_TOOL_OUTPUT_CREATED,
         }
     }
 
@@ -175,6 +181,8 @@ impl ResponseEvent {
                 emitter.emit_without_sequence(self.event_type(), e).await
             }
             ResponseEvent::Error(e) => emitter.emit_without_sequence(self.event_type(), e).await,
+            ResponseEvent::ToolCallCreated(e) => emitter.emit(self.event_type(), e).await,
+            ResponseEvent::ToolOutputCreated(e) => emitter.emit(self.event_type(), e).await,
         }
     }
 }

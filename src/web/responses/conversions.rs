@@ -192,7 +192,7 @@ pub enum ConversationItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         created_at: Option<i64>,
     },
-    #[serde(rename = "function_tool_call")]
+    #[serde(rename = "function_call")]
     FunctionToolCall {
         id: Uuid,
         call_id: Uuid,
@@ -203,7 +203,7 @@ pub enum ConversationItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         created_at: Option<i64>,
     },
-    #[serde(rename = "function_tool_call_output")]
+    #[serde(rename = "function_call_output")]
     FunctionToolCallOutput {
         id: Uuid,
         call_id: Uuid,
@@ -309,7 +309,10 @@ impl ConversationItemConverter {
                 error!("tool_call_id missing for tool call");
                 ApiError::InternalServerError
             })?,
-            name: DEFAULT_TOOL_FUNCTION_NAME.to_string(),
+            name: msg.tool_name.clone().unwrap_or_else(|| {
+                error!("tool_name missing for tool call, using default");
+                DEFAULT_TOOL_FUNCTION_NAME.to_string()
+            }),
             arguments: content,
             status: msg.status.clone(),
             created_at: Some(msg.created_at.timestamp()),

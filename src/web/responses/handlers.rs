@@ -623,7 +623,7 @@ pub struct ToolOutputCreatedEvent {
 }
 
 /// Message types for the storage task
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum StorageMessage {
     ContentDelta(String),
     Usage {
@@ -647,58 +647,6 @@ pub enum StorageMessage {
         tool_call_id: Uuid,
         output: String,
     },
-    /// Barrier message to persist accumulated tools and send acknowledgment
-    PersistTools {
-        ack: tokio::sync::oneshot::Sender<Result<(), String>>,
-    },
-}
-
-// Manual Clone implementation (oneshot::Sender cannot be cloned)
-impl Clone for StorageMessage {
-    fn clone(&self) -> Self {
-        match self {
-            Self::ContentDelta(s) => Self::ContentDelta(s.clone()),
-            Self::Usage {
-                prompt_tokens,
-                completion_tokens,
-            } => Self::Usage {
-                prompt_tokens: *prompt_tokens,
-                completion_tokens: *completion_tokens,
-            },
-            Self::Done {
-                finish_reason,
-                message_id,
-            } => Self::Done {
-                finish_reason: finish_reason.clone(),
-                message_id: *message_id,
-            },
-            Self::Error(s) => Self::Error(s.clone()),
-            Self::Cancelled => Self::Cancelled,
-            Self::ToolCall {
-                tool_call_id,
-                name,
-                arguments,
-            } => Self::ToolCall {
-                tool_call_id: *tool_call_id,
-                name: name.clone(),
-                arguments: arguments.clone(),
-            },
-            Self::ToolOutput {
-                tool_output_id,
-                tool_call_id,
-                output,
-            } => Self::ToolOutput {
-                tool_output_id: *tool_output_id,
-                tool_call_id: *tool_call_id,
-                output: output.clone(),
-            },
-            Self::PersistTools { .. } => {
-                panic!(
-                    "Cannot clone StorageMessage::PersistTools - oneshot sender is not cloneable"
-                )
-            }
-        }
-    }
 }
 
 /// Validated and prepared request data
@@ -1220,7 +1168,7 @@ async fn persist_request_data(
 /// 2. If web_search: extract query and execute tool
 /// 3. Send ToolCall event to streams
 /// 4. Send ToolOutput event to streams (always, even on error)
-/// 5. Send PersistTools barrier and wait for acknowledgment
+/// 5. Send persistence command via dedicated channel and wait for acknowledgment
 ///
 /// Tool execution is best-effort and uses fast model (llama-3.3-70b).
 async fn classify_and_execute_tools(
@@ -1230,6 +1178,7 @@ async fn classify_and_execute_tools(
     persisted: &PersistedData,
     tx_client: &mpsc::Sender<StorageMessage>,
     tx_storage: &mpsc::Sender<StorageMessage>,
+    rx_tool_ack: tokio::sync::oneshot::Receiver<Result<(), String>>,
 ) -> Result<Option<()>, ApiError> {
     // Extract text from user message for classification
     let user_text =
@@ -1403,18 +1352,8 @@ async fn classify_and_execute_tools(
             tool_call_id, tool_output_id, persisted.response.conversation_id
         );
 
-        // Send PersistTools barrier and wait for acknowledgment
-        let (tx_ack, rx_ack) = tokio::sync::oneshot::channel();
-        if let Err(e) = tx_storage
-            .send(StorageMessage::PersistTools { ack: tx_ack })
-            .await
-        {
-            error!("Failed to send PersistTools barrier: {:?}", e);
-            return Ok(Some(()));
-        }
-
         // Wait for storage task to confirm persistence (with timeout)
-        match tokio::time::timeout(std::time::Duration::from_secs(5), rx_ack).await {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx_tool_ack).await {
             Ok(Ok(Ok(()))) => {
                 debug!("Tools persisted successfully to database");
                 return Ok(Some(()));
@@ -1450,6 +1389,7 @@ async fn classify_and_execute_tools(
 /// - Spawns processor task that converts CompletionChunks to StorageMessages
 /// - Processor feeds into dual streams (storage=critical, client=best-effort)
 /// - Listens for cancellation signals
+#[allow(clippy::too_many_arguments)]
 async fn setup_completion_processor(
     state: &Arc<AppState>,
     user: &User,
@@ -1689,6 +1629,9 @@ async fn create_response_stream(
     let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
     let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
 
+    // Create oneshot channel for tool persistence acknowledgment
+    let (tx_tool_ack, rx_tool_ack) = tokio::sync::oneshot::channel();
+
     let _storage_handle = {
         let db = state.db.clone();
         let response_id = persisted.response.id;
@@ -1700,6 +1643,7 @@ async fn create_response_stream(
         tokio::spawn(async move {
             storage_task(
                 rx_storage,
+                Some(tx_tool_ack),
                 db,
                 response_id,
                 conversation_id,
@@ -1719,6 +1663,7 @@ async fn create_response_stream(
         &persisted,
         &tx_client,
         &tx_storage,
+        rx_tool_ack,
     )
     .await
     {
@@ -2017,11 +1962,6 @@ async fn create_response_stream(
                     };
 
                     yield Ok(ResponseEvent::ToolOutputCreated(tool_output_event).to_sse_event(&mut emitter).await);
-                }
-                StorageMessage::PersistTools { .. } => {
-                    // PersistTools is only sent to storage stream, not client stream
-                    // This should never happen, but we need to handle it for exhaustiveness
-                    warn!("Client stream received PersistTools message (should only go to storage)");
                 }
             }
         }

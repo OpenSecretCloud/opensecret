@@ -141,17 +141,13 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
                     serde_json::from_str(&arguments_str).unwrap_or_else(|_| serde_json::json!({}));
 
                 // Get tool name from database
-                let tool_name = r
-                    .tool_name
-                    .as_ref()
-                    .map(|s| s.as_str())
-                    .unwrap_or("function");
+                let tool_name = r.tool_name.as_deref().unwrap_or("function");
 
                 // Format as assistant message with tool_calls
                 let tool_call_msg = serde_json::json!({
                     "role": "assistant",
                     "tool_calls": [{
-                        "id": r.tool_call_id.unwrap_or_else(|| uuid::Uuid::new_v4()).to_string(),
+                        "id": r.tool_call_id.unwrap_or_else(uuid::Uuid::new_v4).to_string(),
                         "type": "function",
                         "function": {
                             "name": tool_name,

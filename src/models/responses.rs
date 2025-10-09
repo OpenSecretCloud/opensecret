@@ -708,6 +708,8 @@ pub struct RawThreadMessage {
     pub tool_call_id: Option<Uuid>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     pub finish_reason: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub tool_name: Option<String>,
 }
 
 impl RawThreadMessage {
@@ -741,7 +743,8 @@ impl RawThreadMessage {
                         r.model,
                         um.prompt_tokens as token_count,
                         NULL::uuid as tool_call_id,
-                        NULL::text as finish_reason
+                        NULL::text as finish_reason,
+                        NULL::text as tool_name
                     FROM user_messages um
                     LEFT JOIN responses r ON um.response_id = r.id
                     WHERE um.conversation_id = $1
@@ -759,7 +762,8 @@ impl RawThreadMessage {
                         r.model,
                         am.completion_tokens as token_count,
                         NULL::uuid as tool_call_id,
-                        am.finish_reason
+                        am.finish_reason,
+                        NULL::text as tool_name
                     FROM assistant_messages am
                     LEFT JOIN responses r ON am.response_id = r.id
                     WHERE am.conversation_id = $1
@@ -777,7 +781,8 @@ impl RawThreadMessage {
                         NULL::text as model,
                         tc.argument_tokens as token_count,
                         tc.uuid as tool_call_id,
-                        NULL::text as finish_reason
+                        NULL::text as finish_reason,
+                        tc.name as tool_name
                     FROM tool_calls tc
                     WHERE tc.conversation_id = $1
 
@@ -794,7 +799,8 @@ impl RawThreadMessage {
                         NULL::text as model,
                         tto.output_tokens as token_count,
                         tc.uuid as tool_call_id,
-                        NULL::text as finish_reason
+                        NULL::text as finish_reason,
+                        tc.name as tool_name
                     FROM tool_outputs tto
                     JOIN tool_calls tc ON tto.tool_call_fk = tc.id
                     WHERE tto.conversation_id = $1
@@ -832,7 +838,8 @@ impl RawThreadMessage {
                         r.model,
                         um.prompt_tokens as token_count,
                         NULL::uuid as tool_call_id,
-                        NULL::text as finish_reason
+                        NULL::text as finish_reason,
+                        NULL::text as tool_name
                     FROM user_messages um
                     LEFT JOIN responses r ON um.response_id = r.id
                     WHERE um.conversation_id = $1
@@ -850,7 +857,8 @@ impl RawThreadMessage {
                         r.model,
                         am.completion_tokens as token_count,
                         NULL::uuid as tool_call_id,
-                        am.finish_reason
+                        am.finish_reason,
+                        NULL::text as tool_name
                     FROM assistant_messages am
                     LEFT JOIN responses r ON am.response_id = r.id
                     WHERE am.conversation_id = $1
@@ -868,7 +876,8 @@ impl RawThreadMessage {
                         NULL::text as model,
                         tc.argument_tokens as token_count,
                         tc.uuid as tool_call_id,
-                        NULL::text as finish_reason
+                        NULL::text as finish_reason,
+                        tc.name as tool_name
                     FROM tool_calls tc
                     WHERE tc.conversation_id = $1
 
@@ -885,7 +894,8 @@ impl RawThreadMessage {
                         NULL::text as model,
                         tto.output_tokens as token_count,
                         tc.uuid as tool_call_id,
-                        NULL::text as finish_reason
+                        NULL::text as finish_reason,
+                        tc.name as tool_name
                     FROM tool_outputs tto
                     JOIN tool_calls tc ON tto.tool_call_fk = tc.id
                     WHERE tto.conversation_id = $1
@@ -932,7 +942,8 @@ impl RawThreadMessage {
                     r.model,
                     um.prompt_tokens as token_count,
                     NULL::uuid as tool_call_id,
-                    NULL::text as finish_reason
+                    NULL::text as finish_reason,
+                    NULL::text as tool_name
                 FROM user_messages um
                 LEFT JOIN responses r ON um.response_id = r.id
                 WHERE um.response_id = $1
@@ -950,7 +961,8 @@ impl RawThreadMessage {
                     r.model,
                     am.completion_tokens as token_count,
                     NULL::uuid as tool_call_id,
-                    am.finish_reason
+                    am.finish_reason,
+                    NULL::text as tool_name
                 FROM assistant_messages am
                 LEFT JOIN responses r ON am.response_id = r.id
                 WHERE am.response_id = $1
@@ -968,7 +980,8 @@ impl RawThreadMessage {
                     NULL::text as model,
                     tc.argument_tokens as token_count,
                     tc.uuid as tool_call_id,
-                    NULL::text as finish_reason
+                    NULL::text as finish_reason,
+                    tc.name as tool_name
                 FROM tool_calls tc
                 WHERE tc.response_id = $1
 
@@ -985,7 +998,8 @@ impl RawThreadMessage {
                     NULL::text as model,
                     tto.output_tokens as token_count,
                     tc.uuid as tool_call_id,
-                    NULL::text as finish_reason
+                    NULL::text as finish_reason,
+                    tc.name as tool_name
                 FROM tool_outputs tto
                 JOIN tool_calls tc ON tto.tool_call_fk = tc.id
                 WHERE tto.response_id = $1
@@ -1047,7 +1061,8 @@ impl RawThreadMessage {
                     r.model,
                     um.prompt_tokens as token_count,
                     NULL::uuid as tool_call_id,
-                    NULL::text as finish_reason
+                    NULL::text as finish_reason,
+                    NULL::text as tool_name
                 FROM user_messages um
                 LEFT JOIN responses r ON um.response_id = r.id
                 WHERE um.conversation_id = $1
@@ -1065,7 +1080,8 @@ impl RawThreadMessage {
                     r.model,
                     am.completion_tokens as token_count,
                     NULL::uuid as tool_call_id,
-                    am.finish_reason
+                    am.finish_reason,
+                    NULL::text as tool_name
                 FROM assistant_messages am
                 LEFT JOIN responses r ON am.response_id = r.id
                 WHERE am.conversation_id = $1
@@ -1083,7 +1099,8 @@ impl RawThreadMessage {
                     NULL::text as model,
                     tc.argument_tokens as token_count,
                     tc.uuid as tool_call_id,
-                    NULL::text as finish_reason
+                    NULL::text as finish_reason,
+                    tc.name as tool_name
                 FROM tool_calls tc
                 WHERE tc.conversation_id = $1
 
@@ -1100,7 +1117,8 @@ impl RawThreadMessage {
                     NULL::text as model,
                     tto.output_tokens as token_count,
                     tc.uuid as tool_call_id,
-                    NULL::text as finish_reason
+                    NULL::text as finish_reason,
+                    tc.name as tool_name
                 FROM tool_outputs tto
                 JOIN tool_calls tc ON tto.tool_call_fk = tc.id
                 WHERE tto.conversation_id = $1

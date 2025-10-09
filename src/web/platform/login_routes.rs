@@ -115,6 +115,7 @@ pub struct PlatformPasswordResetConfirmPayload {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct PlatformOrg {
     pub id: i32,
     pub uuid: Uuid,
@@ -125,6 +126,7 @@ pub struct PlatformOrg {
 }
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct PlatformProject {
     pub id: i32,
     pub uuid: Uuid,

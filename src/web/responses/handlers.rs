@@ -1158,6 +1158,23 @@ async fn persist_request_data(
     })
 }
 
+/// Helper function to check if web_search tool is enabled in the request
+///
+/// Returns true if the tools array contains an object with type="web_search"
+fn is_web_search_enabled(tools: &Option<Value>) -> bool {
+    if let Some(tools_value) = tools {
+        if let Some(tools_array) = tools_value.as_array() {
+            return tools_array.iter().any(|tool| {
+                tool.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s == "web_search")
+                    .unwrap_or(false)
+            });
+        }
+    }
+    false
+}
+
 /// Phase 5: Classify intent and execute tools (optional)
 ///
 /// Classifies user intent and executes tools if needed. Runs after dual streams
@@ -1658,26 +1675,34 @@ async fn create_response_stream(
         })
     };
 
-    // Phase 5: Classify intent and execute tools (if needed)
-    let tools_executed = match classify_and_execute_tools(
-        &state,
-        &user,
-        &prepared,
-        &persisted,
-        &tx_client,
-        &tx_storage,
-        rx_tool_ack,
-    )
-    .await
-    {
-        Ok(result) => result.is_some(),
-        Err(e) => {
-            warn!(
-                "Tool classification/execution encountered an error (continuing): {:?}",
-                e
-            );
-            false
+    // Phase 5: Classify intent and execute tools (if web_search is enabled)
+    let tools_executed = if is_web_search_enabled(&body.tools) {
+        debug!("Web search tool is enabled, proceeding with classification");
+        match classify_and_execute_tools(
+            &state,
+            &user,
+            &prepared,
+            &persisted,
+            &tx_client,
+            &tx_storage,
+            rx_tool_ack,
+        )
+        .await
+        {
+            Ok(result) => result.is_some(),
+            Err(e) => {
+                warn!(
+                    "Tool classification/execution encountered an error (continuing): {:?}",
+                    e
+                );
+                false
+            }
         }
+    } else {
+        debug!("Web search tool not enabled, skipping classification");
+        // Drop rx_tool_ack - storage task won't send on it since no tools were executed
+        drop(rx_tool_ack);
+        false
     };
 
     // Phase 6: Setup completion processor

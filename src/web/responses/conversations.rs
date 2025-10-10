@@ -130,6 +130,7 @@ pub struct UpdateConversationRequest {
 
 /// Request to create items in a conversation
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[allow(dead_code)]
 pub struct CreateConversationItemsRequest {
     /// Items to add to the conversation (max 20 at a time)
     pub items: Vec<ConversationInputItem>,

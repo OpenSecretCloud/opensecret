@@ -349,7 +349,7 @@ pub async fn get_chat_completion_response(
 ) -> Result<CompletionStream, ApiError> {
     debug!("Entering get_chat_completion_response with billing context");
 
-    if body.is_null() || body.as_object().map_or(true, |obj| obj.is_empty()) {
+    if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
         return Err(ApiError::BadRequest);
     }

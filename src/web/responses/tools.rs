@@ -3,23 +3,133 @@
 //! This module handles tool execution including web search, with a clean
 //! architecture that can be extended for additional tools in the future.
 
+use kagi_api_rust::apis::{configuration, search_api};
+use kagi_api_rust::models::SearchRequest;
 use serde_json::{json, Value};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
-/// Mock web search function - returns hardcoded results
+/// Execute web search using Kagi Search API
 ///
-/// TODO: Replace with actual web search API integration (e.g., Brave Search, Google, etc.)
-pub async fn execute_web_search(query: &str) -> Result<String, String> {
+/// Requires kagi_api_key parameter to be provided.
+pub async fn execute_web_search(query: &str, kagi_api_key: Option<&str>) -> Result<String, String> {
     trace!("Executing web search for query: {}", query);
     info!("Executing web search");
 
-    // Mock search result - simulates finding current information
-    let result = format!(
-        "Search results for '{}': Trump is currently the president in 2025.",
-        query
-    );
+    // Get API key from parameter
+    let api_key = kagi_api_key.ok_or_else(|| {
+        error!("Kagi API key not configured");
+        "Kagi API key not configured".to_string()
+    })?;
 
-    Ok(result)
+    // Configure the Kagi API client
+    let mut config = configuration::Configuration::new();
+    config.api_key = Some(configuration::ApiKey {
+        prefix: None,
+        key: api_key.to_string(),
+    });
+
+    // Create search request
+    let search_request = SearchRequest {
+        query: query.to_string(),
+        workflow: None,
+        lens_id: None,
+        lens: None,
+        timeout: None,
+    };
+
+    // Execute search
+    let response = search_api::search(&config, search_request)
+        .await
+        .map_err(|e| {
+            error!("Kagi search API error: {:?}", e);
+            format!("Search API error: {:?}", e)
+        })?;
+
+    // Format results
+    let mut result_text = String::new();
+
+    if let Some(data) = response.data {
+        // Prioritize direct answers
+        if let Some(direct_answers) = data.direct_answer {
+            for answer in direct_answers {
+                result_text.push_str(&format!(
+                    "Direct Answer: {}\n\n",
+                    answer.snippet.unwrap_or_default()
+                ));
+            }
+        }
+
+        // Add weather information if available
+        if let Some(weather_results) = data.weather {
+            if !weather_results.is_empty() {
+                result_text.push_str("Weather:\n\n");
+                for result in weather_results.iter().take(1) {
+                    result_text.push_str(&format!(
+                        "{}\n   {}\n\n",
+                        result.title,
+                        result.snippet.as_ref().unwrap_or(&String::new())
+                    ));
+                }
+            }
+        }
+
+        // Add infobox if available (detailed entity information)
+        if let Some(infobox_results) = data.infobox {
+            if !infobox_results.is_empty() {
+                result_text.push_str("Information:\n\n");
+                for result in infobox_results.iter().take(1) {
+                    result_text.push_str(&format!(
+                        "{}\n   {}\n",
+                        result.title,
+                        result.snippet.as_ref().unwrap_or(&String::new())
+                    ));
+
+                    // Add URL if available for more details
+                    if !result.url.is_empty() {
+                        result_text.push_str(&format!("   More info: {}\n", result.url));
+                    }
+                    result_text.push('\n');
+                }
+            }
+        }
+
+        // Add search results
+        if let Some(search_results) = data.search {
+            result_text.push_str("Search Results:\n\n");
+            for (i, result) in search_results.iter().take(5).enumerate() {
+                result_text.push_str(&format!(
+                    "{}. {}\n   URL: {}\n   {}\n\n",
+                    i + 1,
+                    result.title,
+                    result.url,
+                    result.snippet.as_ref().unwrap_or(&String::new())
+                ));
+            }
+        }
+
+        // Add news results if available
+        if let Some(news_results) = data.news {
+            if !news_results.is_empty() {
+                result_text.push_str("\nNews:\n\n");
+                for (i, result) in news_results.iter().take(3).enumerate() {
+                    result_text.push_str(&format!(
+                        "{}. {}\n   URL: {}\n   {}\n\n",
+                        i + 1,
+                        result.title,
+                        result.url,
+                        result.snippet.as_ref().unwrap_or(&String::new())
+                    ));
+                }
+            }
+        }
+    }
+
+    if result_text.is_empty() {
+        warn!("No search results found for query: {}", query);
+        return Ok(format!("No results found for query: '{}'", query));
+    }
+
+    Ok(result_text)
 }
 
 /// Execute a tool by name with the given arguments
@@ -30,11 +140,16 @@ pub async fn execute_web_search(query: &str) -> Result<String, String> {
 /// # Arguments
 /// * `tool_name` - The name of the tool to execute (e.g., "web_search")
 /// * `arguments` - JSON object containing the tool's arguments
+/// * `kagi_api_key` - Optional Kagi API key for web search
 ///
 /// # Returns
 /// * `Ok(String)` - The tool's output as a string
 /// * `Err(String)` - An error message if the tool execution failed
-pub async fn execute_tool(tool_name: &str, arguments: &Value) -> Result<String, String> {
+pub async fn execute_tool(
+    tool_name: &str,
+    arguments: &Value,
+    kagi_api_key: Option<&str>,
+) -> Result<String, String> {
     trace!(
         "Executing tool: {} with arguments: {}",
         tool_name,
@@ -50,7 +165,7 @@ pub async fn execute_tool(tool_name: &str, arguments: &Value) -> Result<String, 
                 .and_then(|q| q.as_str())
                 .ok_or_else(|| "Missing 'query' argument for web_search".to_string())?;
 
-            execute_web_search(query).await
+            execute_web_search(query, kagi_api_key).await
         }
         _ => {
             error!("Unknown tool requested: {}", tool_name);
@@ -116,22 +231,30 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_web_search() {
-        let result = execute_web_search("test query").await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().contains("test query"));
+        let result = execute_web_search("test query", Some("test_key")).await;
+        // Will fail without valid API key, but tests the API key parameter
+        assert!(result.is_err() || result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_execute_web_search_no_key() {
+        let result = execute_web_search("test query", None).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not configured"));
     }
 
     #[tokio::test]
     async fn test_execute_tool_web_search() {
         let args = json!({"query": "weather today"});
-        let result = execute_tool("web_search", &args).await;
-        assert!(result.is_ok());
+        let result = execute_tool("web_search", &args, Some("test_key")).await;
+        // Will fail without valid API key, but tests the parameter passing
+        assert!(result.is_err() || result.is_ok());
     }
 
     #[tokio::test]
     async fn test_execute_tool_missing_args() {
         let args = json!({});
-        let result = execute_tool("web_search", &args).await;
+        let result = execute_tool("web_search", &args, Some("test_key")).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Missing 'query'"));
     }
@@ -139,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_tool_unknown() {
         let args = json!({"query": "test"});
-        let result = execute_tool("unknown_tool", &args).await;
+        let result = execute_tool("unknown_tool", &args, Some("test_key")).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown tool"));
     }

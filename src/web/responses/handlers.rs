@@ -1316,20 +1316,23 @@ async fn classify_and_execute_tools(
         debug!("Sent tool_call {} to streams", tool_call_id);
 
         // Execute web search tool (or capture error as content)
-        let tool_output = match tools::execute_tool("web_search", &tool_arguments).await {
-            Ok(output) => {
-                debug!(
-                    "Tool execution successful, output length: {} chars",
-                    output.len()
-                );
-                output
-            }
-            Err(e) => {
-                warn!("Tool execution failed, including error in output: {:?}", e);
-                // Failure becomes content, not a skip!
-                format!("Error: {}", e)
-            }
-        };
+        let tool_output =
+            match tools::execute_tool("web_search", &tool_arguments, state.kagi_api_key.as_deref())
+                .await
+            {
+                Ok(output) => {
+                    debug!(
+                        "Tool execution successful, output length: {} chars",
+                        output.len()
+                    );
+                    output
+                }
+                Err(e) => {
+                    warn!("Tool execution failed, including error in output: {:?}", e);
+                    // Failure becomes content, not a skip!
+                    format!("Error: {}", e)
+                }
+            };
 
         // Send tool_output event through both streams (ALWAYS sent, even on failure)
         let tool_output_msg = StorageMessage::ToolOutput {

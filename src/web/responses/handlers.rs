@@ -647,6 +647,8 @@ pub enum StorageMessage {
         tool_call_id: Uuid,
         output: String,
     },
+    /// Signal that assistant message is about to start streaming
+    AssistantMessageStarting,
 }
 
 /// Validated and prepared request data
@@ -1666,122 +1668,22 @@ async fn create_response_stream(
         .await;
     }
 
-    // Phase 4: Create dual streams and spawn storage task
-    let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
-    let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
-
-    // Create oneshot channel for tool persistence acknowledgment
-    let (tx_tool_ack, rx_tool_ack) = tokio::sync::oneshot::channel();
-
-    let _storage_handle = {
-        let db = state.db.clone();
-        let response_id = persisted.response.id;
-        let conversation_id = context.conversation.id;
-        let user_id = user.uuid;
-        let user_key = prepared.user_key;
-        let message_id = prepared.assistant_message_id;
-
-        tokio::spawn(async move {
-            storage_task(
-                rx_storage,
-                Some(tx_tool_ack),
-                db,
-                response_id,
-                conversation_id,
-                user_id,
-                user_key,
-                message_id,
-            )
-            .await;
-        })
-    };
-
-    // Phase 5: Classify intent and execute tools (if web_search is enabled)
-    let tools_executed = if is_web_search_enabled(&body.tools) {
-        debug!("Web search tool is enabled, proceeding with classification");
-        match classify_and_execute_tools(
-            &state,
-            &user,
-            &prepared,
-            &persisted,
-            &tx_client,
-            &tx_storage,
-            rx_tool_ack,
-        )
-        .await
-        {
-            Ok(result) => result.is_some(),
-            Err(e) => {
-                warn!(
-                    "Tool classification/execution encountered an error (continuing): {:?}",
-                    e
-                );
-                false
-            }
-        }
-    } else {
-        debug!("Web search tool not enabled, skipping classification");
-        // Drop rx_tool_ack - storage task won't send on it since no tools were executed
-        drop(rx_tool_ack);
-        false
-    };
-
-    // Phase 6: Setup completion processor
-    let response = match setup_completion_processor(
-        &state,
-        &user,
-        &body,
-        &context,
-        &prepared,
-        &persisted,
-        &headers,
-        tx_client.clone(),
-        tx_storage.clone(),
-        tools_executed,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            // Streaming setup failed - clean up the database records
-            error!(
-                "Failed to setup streaming pipeline for response {}: {:?}",
-                persisted.response.uuid, e
-            );
-
-            // Update response status to failed
-            if let Err(db_err) = state.db.update_response_status(
-                persisted.response.id,
-                ResponseStatus::Failed,
-                Some(Utc::now()),
-            ) {
-                error!(
-                    "Failed to update response status after pipeline error: {:?}",
-                    db_err
-                );
-            }
-
-            // Update assistant message to incomplete with no content
-            if let Err(db_err) = state.db.update_assistant_message(
-                prepared.assistant_message_id,
-                None, // No content
-                0,    // No tokens
-                STATUS_INCOMPLETE.to_string(),
-                None, // No finish_reason since we failed before streaming
-            ) {
-                error!(
-                    "Failed to update assistant message after pipeline error: {:?}",
-                    db_err
-                );
-            }
-
-            return Err(e);
-        }
-    };
-
+    // Capture variables needed inside the stream
+    let response_for_stream = persisted.response.clone();
+    let decrypted_metadata = persisted.decrypted_metadata.clone();
     let assistant_message_id = prepared.assistant_message_id;
     let total_prompt_tokens = context.total_prompt_tokens;
+    let response_id = persisted.response.id;
+    let response_uuid = persisted.response.uuid;
+    let conversation_id = context.conversation.id;
+    let user_id = user.uuid;
+    let user_key = prepared.user_key;
+    let message_content = prepared.message_content.clone();
+    let content_enc = prepared.content_enc.clone();
+    let conversation_for_stream = context.conversation.clone();
+    let prompt_messages = context.prompt_messages.clone();
 
+    // Phases 4-6 now happen INSIDE the stream to start sending events ASAP
     trace!("Creating SSE event stream for client");
     let event_stream = async_stream::stream! {
         trace!("=== STARTING SSE STREAM ===");
@@ -1789,11 +1691,11 @@ async fn create_response_stream(
         // Initialize the SSE event emitter
         let mut emitter = SseEventEmitter::new(&state, session_id, 0);
 
-        // Send initial response.created event
+        // Send initial response.created event IMMEDIATELY (before any processing)
         trace!("Building response.created event");
-        let created_response = ResponseBuilder::from_response(&response)
+        let created_response = ResponseBuilder::from_response(&response_for_stream)
             .status(STATUS_IN_PROGRESS)
-            .metadata(persisted.decrypted_metadata.clone())
+            .metadata(decrypted_metadata.clone())
             .build();
 
         let created_event = ResponseCreatedEvent {
@@ -1813,44 +1715,164 @@ async fn create_response_stream(
 
         yield Ok(ResponseEvent::InProgress(in_progress_event).to_sse_event(&mut emitter).await);
 
-        // Process messages from upstream processor
+        // Phase 4: Create dual streams and spawn storage task
+        trace!("Phase 4: Creating dual streams and spawning storage task");
+        let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
+        let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
+
+        // Create oneshot channel for tool persistence acknowledgment
+        let (tx_tool_ack, rx_tool_ack) = tokio::sync::oneshot::channel();
+
+        let _storage_handle = {
+            let db = state.db.clone();
+
+            tokio::spawn(async move {
+                storage_task(
+                    rx_storage,
+                    Some(tx_tool_ack),
+                    db,
+                    response_id,
+                    conversation_id,
+                    user_id,
+                    user_key,
+                    assistant_message_id,
+                )
+                .await;
+            })
+        };
+
+        // Spawn orchestrator task for phases 5-6 (runs in background, sends events to tx_client)
+        trace!("Spawning background orchestrator for phases 5-6");
+        let orchestrator_tx_client = tx_client.clone();
+        let orchestrator_tx_storage = tx_storage.clone();
+        let orchestrator_state = state.clone();
+        let orchestrator_user = user.clone();
+        let orchestrator_body = body.clone();
+        let orchestrator_headers = headers.clone();
+        let orchestrator_response = response_for_stream.clone();
+        let orchestrator_metadata = decrypted_metadata.clone();
+        let orchestrator_conversation = conversation_for_stream.clone();
+        let orchestrator_prompt_messages = prompt_messages.clone();
+
+        tokio::spawn(async move {
+            trace!("Orchestrator: Starting phases 5-6 in background");
+
+            // Phase 5: Classify intent and execute tools (if web_search is enabled)
+            let tools_executed = if is_web_search_enabled(&orchestrator_body.tools) {
+                debug!("Orchestrator: Web search tool is enabled, proceeding with classification");
+
+                let prepared_for_tools = PreparedRequest {
+                    user_key,
+                    message_content: message_content.clone(),
+                    user_message_tokens: 0,
+                    content_enc: content_enc.clone(),
+                    assistant_message_id,
+                };
+
+                let persisted_for_tools = PersistedData {
+                    response: orchestrator_response.clone(),
+                    decrypted_metadata: orchestrator_metadata.clone(),
+                };
+
+                match classify_and_execute_tools(
+                    &orchestrator_state,
+                    &orchestrator_user,
+                    &prepared_for_tools,
+                    &persisted_for_tools,
+                    &orchestrator_tx_client,
+                    &orchestrator_tx_storage,
+                    rx_tool_ack,
+                )
+                .await
+                {
+                    Ok(result) => result.is_some(),
+                    Err(e) => {
+                        warn!("Orchestrator: Tool execution error (continuing): {:?}", e);
+                        false
+                    }
+                }
+            } else {
+                debug!("Orchestrator: Web search tool not enabled, skipping classification");
+                drop(rx_tool_ack);
+                false
+            };
+
+            // Phase 6: Setup completion processor
+            trace!("Orchestrator: Setting up completion processor");
+
+            let context_for_completion = BuiltContext {
+                conversation: orchestrator_conversation,
+                prompt_messages: orchestrator_prompt_messages,
+                total_prompt_tokens,
+            };
+
+            let prepared_for_completion = PreparedRequest {
+                user_key,
+                message_content,
+                user_message_tokens: 0,
+                content_enc,
+                assistant_message_id,
+            };
+
+            let persisted_for_completion = PersistedData {
+                response: orchestrator_response.clone(),
+                decrypted_metadata: orchestrator_metadata.clone(),
+            };
+
+            match setup_completion_processor(
+                &orchestrator_state,
+                &orchestrator_user,
+                &orchestrator_body,
+                &context_for_completion,
+                &prepared_for_completion,
+                &persisted_for_completion,
+                &orchestrator_headers,
+                orchestrator_tx_client.clone(),
+                orchestrator_tx_storage.clone(),
+                tools_executed,
+            )
+            .await
+            {
+                Ok(_) => {
+                    trace!("Orchestrator: Completion processor setup complete");
+                    // Signal that assistant message is about to start streaming
+                    let _ = orchestrator_tx_client.try_send(StorageMessage::AssistantMessageStarting);
+                }
+                Err(e) => {
+                    error!("Orchestrator: Failed to setup completion processor: {:?}", e);
+
+                    // Update response status to failed
+                    if let Err(db_err) = orchestrator_state.db.update_response_status(
+                        response_id,
+                        ResponseStatus::Failed,
+                        Some(Utc::now()),
+                    ) {
+                        error!("Orchestrator: Failed to update response status: {:?}", db_err);
+                    }
+
+                    // Update assistant message to incomplete
+                    if let Err(db_err) = orchestrator_state.db.update_assistant_message(
+                        assistant_message_id,
+                        None,
+                        0,
+                        STATUS_INCOMPLETE.to_string(),
+                        None,
+                    ) {
+                        error!("Orchestrator: Failed to update assistant message: {:?}", db_err);
+                    }
+
+                    // Send error to client via channel (best-effort)
+                    let _ = orchestrator_tx_client.try_send(StorageMessage::Error(
+                        format!("Failed to setup streaming: {:?}", e)
+                    ));
+                }
+            }
+        });
+
+        // NOW immediately start the event loop - it will receive events from orchestrator as they happen
+        trace!("Starting event loop to receive messages from background tasks");
         let mut assistant_content = String::new();
         let mut total_completion_tokens = 0i32;
-
-        // Event 3: response.output_item.added
-        let output_item_added_event = ResponseOutputItemAddedEvent {
-            event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
-            sequence_number: emitter.sequence_number(),
-            output_index: 0,
-            item: OutputItem {
-                id: assistant_message_id.to_string(),
-                output_type: OUTPUT_TYPE_MESSAGE.to_string(),
-                status: STATUS_IN_PROGRESS.to_string(),
-                role: Some(ROLE_ASSISTANT.to_string()),
-                content: Some(vec![]),
-            },
-        };
-
-        yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
-
-        // Event 4: response.content_part.added
-        let content_part_added_event = ResponseContentPartAddedEvent {
-            event_type: EVENT_RESPONSE_CONTENT_PART_ADDED,
-            sequence_number: emitter.sequence_number(),
-            item_id: assistant_message_id.to_string(),
-            output_index: 0,
-            content_index: 0,
-            part: ContentPart {
-                part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
-                annotations: vec![],
-                logprobs: vec![],
-                text: String::new(),
-            },
-        };
-
-        yield Ok(ResponseEvent::ContentPartAdded(content_part_added_event).to_sse_event(&mut emitter).await);
-
-        trace!("Starting to process messages from upstream processor");
         while let Some(msg) = rx_client.recv().await {
             trace!("Client stream received message from upstream processor");
             match msg {
@@ -1919,11 +1941,11 @@ async fn create_response_stream(
                                     .build();
                                 let usage = build_usage(total_prompt_tokens as i32, total_completion_tokens);
 
-                                let done_response = ResponseBuilder::from_response(&response)
+                                let done_response = ResponseBuilder::from_response(&response_for_stream)
                                     .status(STATUS_COMPLETED)
                                     .output(vec![output_item])
                                     .usage(usage)
-                                    .metadata(persisted.decrypted_metadata.clone())
+                                    .metadata(decrypted_metadata.clone())
                                     .build();
 
                                 let completed_event = ResponseCompletedEvent {
@@ -1965,7 +1987,7 @@ async fn create_response_stream(
                         event_type: EVENT_RESPONSE_CANCELLED,
                         created_at: Utc::now().timestamp(),
                         data: ResponseCancelledData {
-                            id: response.uuid,
+                            id: response_uuid,
                         },
                     };
 
@@ -2011,6 +2033,42 @@ async fn create_response_stream(
                     };
 
                     yield Ok(ResponseEvent::ToolOutputCreated(tool_output_event).to_sse_event(&mut emitter).await);
+                }
+                StorageMessage::AssistantMessageStarting => {
+                    debug!("Client stream received assistant message starting signal");
+
+                    // Event 3: response.output_item.added
+                    let output_item_added_event = ResponseOutputItemAddedEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
+                        sequence_number: emitter.sequence_number(),
+                        output_index: 0,
+                        item: OutputItem {
+                            id: assistant_message_id.to_string(),
+                            output_type: OUTPUT_TYPE_MESSAGE.to_string(),
+                            status: STATUS_IN_PROGRESS.to_string(),
+                            role: Some(ROLE_ASSISTANT.to_string()),
+                            content: Some(vec![]),
+                        },
+                    };
+
+                    yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
+
+                    // Event 4: response.content_part.added
+                    let content_part_added_event = ResponseContentPartAddedEvent {
+                        event_type: EVENT_RESPONSE_CONTENT_PART_ADDED,
+                        sequence_number: emitter.sequence_number(),
+                        item_id: assistant_message_id.to_string(),
+                        output_index: 0,
+                        content_index: 0,
+                        part: ContentPart {
+                            part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
+                            annotations: vec![],
+                            logprobs: vec![],
+                            text: String::new(),
+                        },
+                    };
+
+                    yield Ok(ResponseEvent::ContentPartAdded(content_part_added_event).to_sse_event(&mut emitter).await);
                 }
             }
         }

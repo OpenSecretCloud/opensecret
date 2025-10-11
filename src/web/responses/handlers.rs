@@ -1044,7 +1044,13 @@ async fn build_context_and_check_billing(
 /// Database operations:
 /// - Creates Response record (status=in_progress)
 /// - Creates user message
-/// - Creates placeholder assistant message (content=NULL, status=in_progress)
+///
+/// Note: Assistant message is NOT created here - it's created later in Phase 6 (after tools).
+/// Originally, the assistant placeholder was created here, but this caused timestamp
+/// ordering issues: the assistant message would get created_at=T1 (early), then tools
+/// would execute at T2/T3, making the assistant appear BEFORE its tools in queries
+/// ordered by created_at. By creating the assistant message in Phase 6 (after tools),
+/// we ensure the correct semantic order: user → tool_call → tool_output → assistant.
 async fn persist_request_data(
     state: &Arc<AppState>,
     user: &User,
@@ -1120,25 +1126,6 @@ async fn persist_request_data(
         .db
         .create_user_message(new_msg)
         .map_err(error_mapping::map_generic_db_error)?;
-
-    // Create placeholder assistant message with status='in_progress' and NULL content
-    let placeholder_assistant = NewAssistantMessage {
-        uuid: prepared.assistant_message_id,
-        conversation_id: conversation.id,
-        response_id: Some(response.id),
-        user_id: user.uuid,
-        content_enc: None,
-        completion_tokens: 0,
-        status: STATUS_IN_PROGRESS.to_string(),
-        finish_reason: None,
-    };
-    state
-        .db
-        .create_assistant_message(placeholder_assistant)
-        .map_err(|e| {
-            error!("Error creating placeholder assistant message: {:?}", e);
-            ApiError::InternalServerError
-        })?;
 
     info!(
         "Created response {} for user {} in conversation {}",
@@ -1404,6 +1391,7 @@ async fn classify_and_execute_tools(
 /// Gets completion stream from chat API and spawns processor task.
 ///
 /// Operations:
+/// - Creates placeholder assistant message (AFTER tools, so timestamp is ordered correctly)
 /// - Rebuilds prompt from DB if tools were executed (automatically includes tools)
 /// - Calls chat API with streaming enabled
 /// - Spawns processor task that converts CompletionChunks to StorageMessages
@@ -1422,6 +1410,39 @@ async fn setup_completion_processor(
     tx_storage: mpsc::Sender<StorageMessage>,
     tools_executed: bool,
 ) -> Result<crate::models::responses::Response, ApiError> {
+    // Create placeholder assistant message with status='in_progress' and NULL content
+    //
+    // TIMING: This happens here in Phase 6 (not earlier in Phase 3) for two reasons:
+    // 1. Must happen AFTER tool execution (Phase 5) to get correct timestamp ordering
+    // 2. Must happen BEFORE calling completion API (below) so storage task can UPDATE it
+    //
+    // Previously, this was created in Phase 3 under the assumption it needed to exist early.
+    // However, it only needs to exist before the storage task tries to UPDATE it (when
+    // streaming completes). By creating it here, we ensure proper message ordering:
+    // user → tool_call → tool_output → assistant (this creation) → assistant content (update)
+    let placeholder_assistant = NewAssistantMessage {
+        uuid: prepared.assistant_message_id,
+        conversation_id: context.conversation.id,
+        response_id: Some(persisted.response.id),
+        user_id: user.uuid,
+        content_enc: None,
+        completion_tokens: 0,
+        status: STATUS_IN_PROGRESS.to_string(),
+        finish_reason: None,
+    };
+    state
+        .db
+        .create_assistant_message(placeholder_assistant)
+        .map_err(|e| {
+            error!("Error creating placeholder assistant message: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    debug!(
+        "Created placeholder assistant message {} after tool execution",
+        prepared.assistant_message_id
+    );
+
     // If tools were executed, rebuild prompt from DB (will now include persisted tools)
     // Otherwise use the context we built earlier
     let prompt_messages = if tools_executed {

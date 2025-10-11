@@ -1334,7 +1334,7 @@ async fn classify_and_execute_tools(
 
         // Execute web search tool (or capture error as content)
         let tool_output =
-            match tools::execute_tool("web_search", &tool_arguments, state.kagi_api_key.as_deref())
+            match tools::execute_tool("web_search", &tool_arguments, state.kagi_client.as_ref())
                 .await
             {
                 Ok(output) => {

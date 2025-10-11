@@ -3,47 +3,35 @@
 //! This module handles tool execution including web search, with a clean
 //! architecture that can be extended for additional tools in the future.
 
-use kagi_api_rust::apis::{configuration, search_api};
-use kagi_api_rust::models::SearchRequest;
+use crate::kagi::{KagiClient, SearchRequest};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
 /// Execute web search using Kagi Search API
 ///
-/// Requires kagi_api_key parameter to be provided.
-pub async fn execute_web_search(query: &str, kagi_api_key: Option<&str>) -> Result<String, String> {
+/// Requires kagi_client to be provided (initialized at startup with connection pooling).
+pub async fn execute_web_search(
+    query: &str,
+    kagi_client: Option<&Arc<KagiClient>>,
+) -> Result<String, String> {
     trace!("Executing web search for query: {}", query);
     info!("Executing web search");
 
-    // Get API key from parameter
-    let api_key = kagi_api_key.ok_or_else(|| {
-        error!("Kagi API key not configured");
-        "Kagi API key not configured".to_string()
+    // Get client from parameter
+    let client = kagi_client.ok_or_else(|| {
+        error!("Kagi client not configured");
+        "Kagi client not configured".to_string()
     })?;
 
-    // Configure the Kagi API client
-    let mut config = configuration::Configuration::new();
-    config.api_key = Some(configuration::ApiKey {
-        prefix: None,
-        key: api_key.to_string(),
-    });
-
     // Create search request
-    let search_request = SearchRequest {
-        query: query.to_string(),
-        workflow: None,
-        lens_id: None,
-        lens: None,
-        timeout: None,
-    };
+    let search_request = SearchRequest::new(query.to_string());
 
     // Execute search
-    let response = search_api::search(&config, search_request)
-        .await
-        .map_err(|e| {
-            error!("Kagi search API error: {:?}", e);
-            format!("Search API error: {:?}", e)
-        })?;
+    let response = client.search(search_request).await.map_err(|e| {
+        error!("Kagi search API error: {:?}", e);
+        format!("Search API error: {:?}", e)
+    })?;
 
     // Format results
     let mut result_text = String::new();
@@ -140,7 +128,7 @@ pub async fn execute_web_search(query: &str, kagi_api_key: Option<&str>) -> Resu
 /// # Arguments
 /// * `tool_name` - The name of the tool to execute (e.g., "web_search")
 /// * `arguments` - JSON object containing the tool's arguments
-/// * `kagi_api_key` - Optional Kagi API key for web search
+/// * `kagi_client` - Optional Kagi client (with connection pooling)
 ///
 /// # Returns
 /// * `Ok(String)` - The tool's output as a string
@@ -148,7 +136,7 @@ pub async fn execute_web_search(query: &str, kagi_api_key: Option<&str>) -> Resu
 pub async fn execute_tool(
     tool_name: &str,
     arguments: &Value,
-    kagi_api_key: Option<&str>,
+    kagi_client: Option<&Arc<KagiClient>>,
 ) -> Result<String, String> {
     trace!(
         "Executing tool: {} with arguments: {}",
@@ -165,7 +153,7 @@ pub async fn execute_tool(
                 .and_then(|q| q.as_str())
                 .ok_or_else(|| "Missing 'query' argument for web_search".to_string())?;
 
-            execute_web_search(query, kagi_api_key).await
+            execute_web_search(query, kagi_client).await
         }
         _ => {
             error!("Unknown tool requested: {}", tool_name);
@@ -230,31 +218,17 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_execute_web_search() {
-        let result = execute_web_search("test query", Some("test_key")).await;
-        // Will fail without valid API key, but tests the API key parameter
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_execute_web_search_no_key() {
+    async fn test_execute_web_search_no_client() {
         let result = execute_web_search("test query", None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not configured"));
     }
 
     #[tokio::test]
-    async fn test_execute_tool_web_search() {
-        let args = json!({"query": "weather today"});
-        let result = execute_tool("web_search", &args, Some("test_key")).await;
-        // Will fail without valid API key, but tests the parameter passing
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[tokio::test]
     async fn test_execute_tool_missing_args() {
+        // Test with None client - should fail on missing args before client check
         let args = json!({});
-        let result = execute_tool("web_search", &args, Some("test_key")).await;
+        let result = execute_tool("web_search", &args, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Missing 'query'"));
     }
@@ -262,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_tool_unknown() {
         let args = json!({"query": "test"});
-        let result = execute_tool("unknown_tool", &args, Some("test_key")).await;
+        let result = execute_tool("unknown_tool", &args, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown tool"));
     }

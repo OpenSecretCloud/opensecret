@@ -1,6 +1,3 @@
 [submodule "nitro-toolkit"]
 	path = nitro-toolkit
 	url = https://github.com/OpenSecretCloud/nitro-toolkit.git
-[submodule "modules/kagi-api-rust"]
-	path = modules/kagi-api-rust
-	url = https://github.com/kagisearch/kagi-api-rust.git

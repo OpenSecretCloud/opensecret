@@ -75,6 +75,7 @@ mod db;
 mod email;
 mod encrypt;
 mod jwt;
+mod kagi;
 mod kv;
 mod message_signing;
 mod migrations;
@@ -410,7 +411,7 @@ pub struct AppState {
     billing_client: Option<BillingClient>,
     apple_jwt_verifier: Arc<AppleJwtVerifier>,
     cancellation_broadcast: tokio::sync::broadcast::Sender<Uuid>,
-    kagi_api_key: Option<String>,
+    kagi_client: Option<Arc<crate::kagi::KagiClient>>,
 }
 
 #[derive(Default)]
@@ -640,6 +641,24 @@ impl AppStateBuilder {
 
         let (cancellation_tx, _) = tokio::sync::broadcast::channel(1024);
 
+        // Initialize Kagi client if API key is provided
+        let kagi_client = if let Some(ref api_key) = self.kagi_api_key {
+            tracing::info!("Initializing Kagi client with connection pooling (max 100 idle connections, 10s timeout)");
+            match crate::kagi::KagiClient::new(api_key.clone()) {
+                Ok(client) => {
+                    tracing::debug!("Kagi client initialized successfully");
+                    Some(Arc::new(client))
+                }
+                Err(e) => {
+                    tracing::error!("Failed to initialize Kagi client: {:?}", e);
+                    panic!("Failed to initialize Kagi client during startup: {:?}. This is a fatal error - please check your Kagi API configuration.", e);
+                }
+            }
+        } else {
+            tracing::debug!("Kagi API key not configured, web search tool will be unavailable");
+            None
+        };
+
         Ok(AppState {
             app_mode,
             db,
@@ -655,7 +674,7 @@ impl AppStateBuilder {
             billing_client,
             apple_jwt_verifier,
             cancellation_broadcast: cancellation_tx,
-            kagi_api_key: self.kagi_api_key,
+            kagi_client,
         })
     }
 }

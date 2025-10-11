@@ -116,6 +116,11 @@ impl ContentAccumulator {
                     output,
                 }
             }
+            StorageMessage::AssistantMessageStarting => {
+                trace!("Storage: received assistant message starting signal (no-op for storage)");
+                // This is a signal for the client stream only, storage doesn't need to act on it
+                AccumulatorState::Continue
+            }
         }
     }
 }

@@ -877,7 +877,7 @@ async fn validate_and_normalize_input(
             "User message too large for user {}: {} tokens exceeds budget {} for model {}",
             user.uuid, user_message_tokens, ctx_budget, body.model
         );
-        return Err(ApiError::BadRequest);
+        return Err(ApiError::MessageExceedsContextLimit);
     }
 
     // Serialize the MessageContent for storage

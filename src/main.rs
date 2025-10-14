@@ -253,6 +253,9 @@ pub enum ApiError {
     #[error("Free tier token limit exceeded")]
     FreeTokenLimitExceeded,
 
+    #[error("Message exceeds context limit")]
+    MessageExceedsContextLimit,
+
     #[error("Resource not found")]
     NotFound,
 
@@ -282,6 +285,7 @@ impl IntoResponse for ApiError {
             ApiError::EmailAlreadyExists => StatusCode::CONFLICT,
             ApiError::UsageLimitReached => StatusCode::FORBIDDEN,
             ApiError::FreeTokenLimitExceeded => StatusCode::FORBIDDEN,
+            ApiError::MessageExceedsContextLimit => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,

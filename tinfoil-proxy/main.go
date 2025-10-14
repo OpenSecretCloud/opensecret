@@ -30,6 +30,11 @@ var modelConfigs = map[string]struct {
 		Description: "Advanced reasoning and complex problem-solving model",
 		Active:      true,
 	},
+	"deepseek-v31-terminus": {
+		ModelID:     "deepseek-v31-terminus",
+		Description: "Advanced reasoning and complex problem-solving model (V3.1 Terminus)",
+		Active:      true,
+	},
 	"mistral-small-3-1-24b": {
 		ModelID:     "mistral-small-3-1-24b",
 		Description: "Vision capabilities for image analysis, efficient performance",

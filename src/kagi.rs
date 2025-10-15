@@ -29,6 +29,7 @@ pub struct KagiClient {
 
 impl KagiClient {
     /// Create a new Kagi client with the given API key
+    /// The API key will automatically be prefixed with "Bot " for authorization
     pub fn new(api_key: String) -> Result<Self, KagiError> {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
@@ -38,9 +39,16 @@ impl KagiClient {
             .build()
             .map_err(KagiError::Request)?;
 
+        // Automatically prefix with "Bot " if not already present
+        let formatted_key = if api_key.starts_with("Bot ") {
+            api_key
+        } else {
+            format!("Bot {}", api_key)
+        };
+
         Ok(Self {
             client,
-            api_key: Arc::new(api_key),
+            api_key: Arc::new(formatted_key),
         })
     }
 

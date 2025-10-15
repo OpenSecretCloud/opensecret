@@ -650,8 +650,11 @@ impl AppStateBuilder {
                     Some(Arc::new(client))
                 }
                 Err(e) => {
-                    tracing::error!("Failed to initialize Kagi client: {:?}", e);
-                    panic!("Failed to initialize Kagi client during startup: {:?}. This is a fatal error - please check your Kagi API configuration.", e);
+                    tracing::error!(
+                        "Failed to initialize Kagi client: {:?}. Web search will be unavailable.",
+                        e
+                    );
+                    None
                 }
             }
         } else {

@@ -1757,9 +1757,9 @@ async fn create_response_stream(
         tokio::spawn(async move {
             trace!("Orchestrator: Starting phases 5-6 in background");
 
-            // Phase 5: Classify intent and execute tools (if web_search is enabled)
-            let tools_executed = if is_web_search_enabled(&orchestrator_body.tools) {
-                debug!("Orchestrator: Web search tool is enabled, proceeding with classification");
+            // Phase 5: Classify intent and execute tools (if web_search is enabled AND Kagi client available)
+            let tools_executed = if is_web_search_enabled(&orchestrator_body.tools) && orchestrator_state.kagi_client.is_some() {
+                debug!("Orchestrator: Web search tool is enabled and Kagi client available, proceeding with classification");
 
                 let prepared_for_tools = PreparedRequest {
                     user_key,
@@ -1792,7 +1792,7 @@ async fn create_response_stream(
                     }
                 }
             } else {
-                debug!("Orchestrator: Web search tool not enabled, skipping classification");
+                debug!("Orchestrator: Web search tool not enabled or Kagi client not available, skipping classification");
                 drop(rx_tool_ack);
                 false
             };

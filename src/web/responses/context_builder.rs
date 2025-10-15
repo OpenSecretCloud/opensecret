@@ -136,12 +136,25 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
                     .map_err(|_| crate::ApiError::InternalServerError)?;
                 let arguments_str = String::from_utf8_lossy(&plain).into_owned();
 
-                // Parse arguments as JSON
+                // Parse arguments as JSON - if malformed, use empty object but continue safely
                 let arguments: serde_json::Value =
-                    serde_json::from_str(&arguments_str).unwrap_or_else(|_| serde_json::json!({}));
+                    serde_json::from_str(&arguments_str).unwrap_or_else(|e| {
+                        error!("Failed to parse tool call arguments as JSON: {:?}. Using empty object.", e);
+                        serde_json::json!({})
+                    });
 
                 // Get tool name from database
                 let tool_name = r.tool_name.as_deref().unwrap_or("function");
+
+                // Serialize arguments back to string for OpenAI format
+                // OpenAI expects arguments as a JSON string, not a JSON object
+                let arguments_string = serde_json::to_string(&arguments).unwrap_or_else(|e| {
+                    error!(
+                        "Failed to serialize tool arguments: {:?}. Using empty object string.",
+                        e
+                    );
+                    "{}".to_string()
+                });
 
                 // Format as assistant message with tool_calls
                 let tool_call_msg = serde_json::json!({
@@ -151,13 +164,25 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
                         "type": "function",
                         "function": {
                             "name": tool_name,
-                            "arguments": serde_json::to_string(&arguments).unwrap_or_default()
+                            "arguments": arguments_string
                         }
                     }]
                 });
 
-                // Serialize for storage in ChatMsg
-                let content = serde_json::to_string(&tool_call_msg).unwrap_or_default();
+                // Serialize tool_call_msg for storage in ChatMsg
+                // This should never fail since we're serializing a well-formed JSON structure
+                let content = match serde_json::to_string(&tool_call_msg) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(
+                            "Failed to serialize tool_call message: {:?}. Skipping this tool call.",
+                            e
+                        );
+                        // If this fails, skip this message entirely rather than corrupting the conversation
+                        continue;
+                    }
+                };
+
                 let t = r
                     .token_count
                     .map(|v| v as usize)

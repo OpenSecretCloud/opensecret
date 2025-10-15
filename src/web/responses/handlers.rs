@@ -1147,6 +1147,13 @@ async fn persist_request_data(
     })
 }
 
+/// Helper function to check if tool_choice allows tool execution
+///
+/// Returns false if tool_choice is explicitly set to "none", true otherwise
+fn is_tool_choice_allowed(tool_choice: &Option<String>) -> bool {
+    tool_choice.as_deref() != Some("none")
+}
+
 /// Helper function to check if web_search tool is enabled in the request
 ///
 /// Returns true if the tools array contains an object with type="web_search"
@@ -1757,9 +1764,11 @@ async fn create_response_stream(
         tokio::spawn(async move {
             trace!("Orchestrator: Starting phases 5-6 in background");
 
-            // Phase 5: Classify intent and execute tools (if web_search is enabled AND Kagi client available)
-            let tools_executed = if is_web_search_enabled(&orchestrator_body.tools) && orchestrator_state.kagi_client.is_some() {
-                debug!("Orchestrator: Web search tool is enabled and Kagi client available, proceeding with classification");
+            // Phase 5: Classify intent and execute tools (if tool_choice allows it AND web_search is enabled AND Kagi client available)
+            let tools_executed = if is_tool_choice_allowed(&orchestrator_body.tool_choice)
+                && is_web_search_enabled(&orchestrator_body.tools)
+                && orchestrator_state.kagi_client.is_some() {
+                debug!("Orchestrator: tool_choice allows tools, web search enabled, and Kagi client available, proceeding with classification");
 
                 let prepared_for_tools = PreparedRequest {
                     user_key,

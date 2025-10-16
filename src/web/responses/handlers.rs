@@ -1316,10 +1316,31 @@ async fn classify_and_execute_tools(
             name: "web_search".to_string(),
             arguments: tool_arguments.clone(),
         };
+
         // Send to storage (critical - must succeed)
+        //
+        // IMPORTANT: Storage channel failure means the storage task has died or the
+        // channel buffer (1024) is full. This is a catastrophic systemic failure, not
+        // a normal error. If this happens:
+        // 1. Nothing will be persisted to database
+        // 2. Continuing would waste LLM API calls for unsaved data
+        // 3. Client would see tool_call.created but never get completion
+        //
+        // We abort the entire request and notify the client with response.error event.
+        // If you see this error in production, investigate immediately - it indicates
+        // serious issues with the storage task or database connection.
         if let Err(e) = tx_storage.send(tool_call_msg.clone()).await {
-            error!("Failed to send tool_call to storage channel: {:?}", e);
-            return Ok(None);
+            error!(
+                "Critical: Storage channel closed during tool_call for response {} - {:?}",
+                persisted.response.uuid, e
+            );
+            // Notify client and abort - storage failure is catastrophic
+            let _ = tx_client
+                .send(StorageMessage::Error(
+                    "Internal storage failure - request aborted".to_string(),
+                ))
+                .await;
+            return Err(ApiError::InternalServerError);
         }
         // Send to client (best-effort)
         if tx_client.try_send(tool_call_msg).is_err() {
@@ -1353,10 +1374,30 @@ async fn classify_and_execute_tools(
             tool_call_id,
             output: tool_output.clone(),
         };
+
         // Send to storage (critical - must succeed)
+        //
+        // IMPORTANT: Storage channel failure is catastrophic (see tool_call comment above).
+        // At this point, client has already seen tool_call.created event. If storage fails
+        // here, we have an inconsistency:
+        // - Database has tool_call record but no tool_output
+        // - Client saw tool_call.created but won't see tool_output.created
+        //
+        // We abort and send response.error so the client knows the request failed rather
+        // than hanging indefinitely waiting for completion. The database inconsistency
+        // (orphaned tool_call) is acceptable given this is a catastrophic failure scenario.
         if let Err(e) = tx_storage.send(tool_output_msg.clone()).await {
-            error!("Failed to send tool_output to storage channel: {:?}", e);
-            return Ok(None);
+            error!(
+                "Critical: Storage channel closed during tool_output for response {} - {:?}",
+                persisted.response.uuid, e
+            );
+            // Notify client and abort - storage failure is catastrophic
+            let _ = tx_client
+                .send(StorageMessage::Error(
+                    "Internal storage failure - request aborted".to_string(),
+                ))
+                .await;
+            return Err(ApiError::InternalServerError);
         }
         // Send to client (best-effort)
         if tx_client.try_send(tool_output_msg).is_err() {
@@ -1814,8 +1855,16 @@ async fn create_response_stream(
                         {
                             Ok(result) => result.is_some(),
                             Err(e) => {
-                                warn!("Orchestrator: Tool execution error (continuing): {:?}", e);
-                                false
+                                error!("Orchestrator: Critical error during tool execution, treating as cancellation: {:?}", e);
+
+                                // Treat critical errors (storage failure) same as cancellation
+                                // Send cancellation to both channels - storage task will handle cleanup
+                                let _ = orchestrator_tx_storage.send(StorageMessage::Cancelled).await;
+                                let _ = orchestrator_tx_client.send(StorageMessage::Cancelled).await;
+
+                                // Abort orchestrator - don't waste resources on LLM call
+                                // Storage task will update response status and assistant message
+                                return;
                             }
                         }
                     } else {

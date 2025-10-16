@@ -323,8 +323,7 @@ pub async fn storage_task(
     let mut accumulator = ContentAccumulator::new();
     let persister = ResponsePersister::new(db.clone(), response_id, message_id, user_key);
 
-    // Track tool call ID for matching with tool output
-    let mut pending_tool_call_db_id: Option<i64> = None;
+    // Track tool acknowledgment channel
     let mut tool_ack = tool_persist_ack;
 
     // Accumulate messages until completion or error
@@ -371,7 +370,7 @@ pub async fn storage_task(
                             "Persisted tool_call {} (db id: {})",
                             tool_call_id, tool_call.id
                         );
-                        pending_tool_call_db_id = Some(tool_call.id);
+                        // No need to track the ID in memory - we'll look it up when needed
                     }
                     Err(e) => {
                         error!("Failed to persist tool_call {}: {:?}", tool_call_id, e);
@@ -390,13 +389,18 @@ pub async fn storage_task(
                 // Persist tool output immediately to database
                 use crate::models::responses::NewToolOutput;
 
-                let tool_call_fk = match pending_tool_call_db_id {
-                    Some(id) => id,
-                    None => {
-                        error!("Tool output references unknown tool_call: {}", tool_call_id);
+                // Look up the tool_call by UUID to get its database ID (primary key)
+                // This is more reliable than tracking in memory across async operations
+                let tool_call_fk = match db.get_tool_call_by_uuid(tool_call_id) {
+                    Ok(tool_call) => tool_call.id,
+                    Err(e) => {
+                        error!(
+                            "Failed to find tool_call {} for tool_output: {:?}",
+                            tool_call_id, e
+                        );
                         if let Some(ack) = tool_ack.take() {
                             let _ =
-                                ack.send(Err("Tool output received before tool call".to_string()));
+                                ack.send(Err(format!("Tool call not found in database: {:?}", e)));
                         }
                         continue;
                     }
@@ -437,9 +441,6 @@ pub async fn storage_task(
                         }
                     }
                 }
-
-                // Clear pending tool call
-                pending_tool_call_db_id = None;
             }
 
             AccumulatorState::Complete(data) => {

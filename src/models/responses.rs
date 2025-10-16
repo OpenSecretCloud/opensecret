@@ -562,6 +562,18 @@ pub struct NewToolCall {
     pub status: String,
 }
 
+impl ToolCall {
+    pub fn get_by_uuid(conn: &mut PgConnection, uuid: Uuid) -> Result<ToolCall, ResponsesError> {
+        tool_calls::table
+            .filter(tool_calls::uuid.eq(uuid))
+            .first::<ToolCall>(conn)
+            .map_err(|e| match e {
+                diesel::result::Error::NotFound => ResponsesError::ToolCallNotFound,
+                _ => ResponsesError::DatabaseError(e),
+            })
+    }
+}
+
 impl NewToolCall {
     pub fn insert(&self, conn: &mut PgConnection) -> Result<ToolCall, ResponsesError> {
         diesel::insert_into(tool_calls::table)

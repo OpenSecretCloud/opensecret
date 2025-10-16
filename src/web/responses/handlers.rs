@@ -1609,16 +1609,19 @@ async fn setup_completion_processor(
                                     .and_then(|d| d.get("content"))
                                     .and_then(|c| c.as_str())
                                 {
-                                    let msg = StorageMessage::ContentDelta(content.to_string());
-                                    // Must send to storage (critical, can block)
-                                    if tx_storage.send(msg.clone()).await.is_err() {
-                                        error!("Storage channel closed unexpectedly");
-                                        break;
-                                    }
-                                    // Best-effort send to client (non-blocking, never blocks storage)
-                                    if client_alive && tx_client.try_send(msg).is_err() {
-                                        warn!("Client channel full or closed, terminating client stream");
-                                        client_alive = false;
+                                    // Skip empty content deltas to avoid sending unnecessary events to client
+                                    if !content.is_empty() {
+                                        let msg = StorageMessage::ContentDelta(content.to_string());
+                                        // Must send to storage (critical, can block)
+                                        if tx_storage.send(msg.clone()).await.is_err() {
+                                            error!("Storage channel closed unexpectedly");
+                                            break;
+                                        }
+                                        // Best-effort send to client (non-blocking, never blocks storage)
+                                        if client_alive && tx_client.try_send(msg).is_err() {
+                                            warn!("Client channel full or closed, terminating client stream");
+                                            client_alive = false;
+                                        }
                                     }
                                 }
                             }

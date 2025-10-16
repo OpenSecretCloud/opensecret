@@ -663,7 +663,7 @@ struct PreparedRequest {
 /// Context and conversation data after building prompt
 struct BuiltContext {
     conversation: crate::models::responses::Conversation,
-    prompt_messages: Vec<Value>,
+    prompt_messages: Arc<Vec<Value>>,
     total_prompt_tokens: usize,
 }
 
@@ -1034,7 +1034,7 @@ async fn build_context_and_check_billing(
 
     Ok(BuiltContext {
         conversation,
-        prompt_messages,
+        prompt_messages: Arc::new(prompt_messages),
         total_prompt_tokens,
     })
 }
@@ -1466,7 +1466,8 @@ async fn setup_completion_processor(
         )?;
         rebuilt_messages
     } else {
-        context.prompt_messages.clone()
+        // Clone out of Arc only when actually needed for the completion request
+        Arc::as_ref(&context.prompt_messages).clone()
     };
 
     // Build chat completion request
@@ -1502,6 +1503,17 @@ async fn setup_completion_processor(
         "Received completion from provider: {} (model: {})",
         completion.metadata.provider_name, completion.metadata.model_name
     );
+
+    // Signal that assistant message is about to start streaming
+    // CRITICAL: Must send BEFORE spawning processor to guarantee ordering
+    // (processor will immediately start sending ContentDelta messages)
+    if let Err(e) = tx_client
+        .send(StorageMessage::AssistantMessageStarting)
+        .await
+    {
+        error!("Failed to send AssistantMessageStarting signal: {:?}", e);
+        // Client channel closed - not critical, continue anyway
+    }
 
     // Spawn stream processor task that converts CompletionChunks to StorageMessages
     // and feeds them into the master stream channels (created in Phase 3.5)
@@ -1764,116 +1776,138 @@ async fn create_response_stream(
         tokio::spawn(async move {
             trace!("Orchestrator: Starting phases 5-6 in background");
 
-            // Phase 5: Classify intent and execute tools (if tool_choice allows it AND web_search is enabled AND Kagi client available)
-            let tools_executed = if is_tool_choice_allowed(&orchestrator_body.tool_choice)
-                && is_web_search_enabled(&orchestrator_body.tools)
-                && orchestrator_state.kagi_client.is_some() {
-                debug!("Orchestrator: tool_choice allows tools, web search enabled, and Kagi client available, proceeding with classification");
+            // Subscribe to cancellation broadcast
+            let mut cancel_rx = orchestrator_state.cancellation_broadcast.subscribe();
 
-                let prepared_for_tools = PreparedRequest {
-                    user_key,
-                    message_content: message_content.clone(),
-                    user_message_tokens: 0,
-                    content_enc: content_enc.clone(),
-                    assistant_message_id,
-                };
+            // Run phases 5-6 with cancellation support
+            tokio::select! {
+                _ = async {
+                    // Phase 5: Classify intent and execute tools (if tool_choice allows it AND web_search is enabled AND Kagi client available)
+                    let tools_executed = if is_tool_choice_allowed(&orchestrator_body.tool_choice)
+                        && is_web_search_enabled(&orchestrator_body.tools)
+                        && orchestrator_state.kagi_client.is_some() {
+                        debug!("Orchestrator: tool_choice allows tools, web search enabled, and Kagi client available, proceeding with classification");
 
-                let persisted_for_tools = PersistedData {
-                    response: orchestrator_response.clone(),
-                    decrypted_metadata: orchestrator_metadata.clone(),
-                };
+                        let prepared_for_tools = PreparedRequest {
+                            user_key,
+                            message_content: message_content.clone(),
+                            user_message_tokens: 0,
+                            content_enc: content_enc.clone(),
+                            assistant_message_id,
+                        };
 
-                match classify_and_execute_tools(
-                    &orchestrator_state,
-                    &orchestrator_user,
-                    &prepared_for_tools,
-                    &persisted_for_tools,
-                    &orchestrator_tx_client,
-                    &orchestrator_tx_storage,
-                    rx_tool_ack,
-                )
-                .await
-                {
-                    Ok(result) => result.is_some(),
-                    Err(e) => {
-                        warn!("Orchestrator: Tool execution error (continuing): {:?}", e);
+                        let persisted_for_tools = PersistedData {
+                            response: orchestrator_response.clone(),
+                            decrypted_metadata: orchestrator_metadata.clone(),
+                        };
+
+                        match classify_and_execute_tools(
+                            &orchestrator_state,
+                            &orchestrator_user,
+                            &prepared_for_tools,
+                            &persisted_for_tools,
+                            &orchestrator_tx_client,
+                            &orchestrator_tx_storage,
+                            rx_tool_ack,
+                        )
+                        .await
+                        {
+                            Ok(result) => result.is_some(),
+                            Err(e) => {
+                                warn!("Orchestrator: Tool execution error (continuing): {:?}", e);
+                                false
+                            }
+                        }
+                    } else {
+                        debug!("Orchestrator: Web search tool not enabled or Kagi client not available, skipping classification");
+                        drop(rx_tool_ack);
                         false
-                    }
-                }
-            } else {
-                debug!("Orchestrator: Web search tool not enabled or Kagi client not available, skipping classification");
-                drop(rx_tool_ack);
-                false
-            };
+                    };
 
-            // Phase 6: Setup completion processor
-            trace!("Orchestrator: Setting up completion processor");
+                    // Phase 6: Setup completion processor
+                    trace!("Orchestrator: Setting up completion processor");
 
-            let context_for_completion = BuiltContext {
-                conversation: orchestrator_conversation,
-                prompt_messages: orchestrator_prompt_messages,
-                total_prompt_tokens,
-            };
+                    let context_for_completion = BuiltContext {
+                        conversation: orchestrator_conversation,
+                        prompt_messages: orchestrator_prompt_messages,
+                        total_prompt_tokens,
+                    };
 
-            let prepared_for_completion = PreparedRequest {
-                user_key,
-                message_content,
-                user_message_tokens: 0,
-                content_enc,
-                assistant_message_id,
-            };
-
-            let persisted_for_completion = PersistedData {
-                response: orchestrator_response.clone(),
-                decrypted_metadata: orchestrator_metadata.clone(),
-            };
-
-            match setup_completion_processor(
-                &orchestrator_state,
-                &orchestrator_user,
-                &orchestrator_body,
-                &context_for_completion,
-                &prepared_for_completion,
-                &persisted_for_completion,
-                &orchestrator_headers,
-                orchestrator_tx_client.clone(),
-                orchestrator_tx_storage.clone(),
-                tools_executed,
-            )
-            .await
-            {
-                Ok(_) => {
-                    trace!("Orchestrator: Completion processor setup complete");
-                    // Signal that assistant message is about to start streaming
-                    let _ = orchestrator_tx_client.try_send(StorageMessage::AssistantMessageStarting);
-                }
-                Err(e) => {
-                    error!("Orchestrator: Failed to setup completion processor: {:?}", e);
-
-                    // Update response status to failed
-                    if let Err(db_err) = orchestrator_state.db.update_response_status(
-                        response_id,
-                        ResponseStatus::Failed,
-                        Some(Utc::now()),
-                    ) {
-                        error!("Orchestrator: Failed to update response status: {:?}", db_err);
-                    }
-
-                    // Update assistant message to incomplete
-                    if let Err(db_err) = orchestrator_state.db.update_assistant_message(
+                    let prepared_for_completion = PreparedRequest {
+                        user_key,
+                        message_content,
+                        user_message_tokens: 0,
+                        content_enc,
                         assistant_message_id,
-                        None,
-                        0,
-                        STATUS_INCOMPLETE.to_string(),
-                        None,
-                    ) {
-                        error!("Orchestrator: Failed to update assistant message: {:?}", db_err);
-                    }
+                    };
 
-                    // Send error to client via channel (best-effort)
-                    let _ = orchestrator_tx_client.try_send(StorageMessage::Error(
-                        format!("Failed to setup streaming: {:?}", e)
-                    ));
+                    let persisted_for_completion = PersistedData {
+                        response: orchestrator_response.clone(),
+                        decrypted_metadata: orchestrator_metadata.clone(),
+                    };
+
+                    match setup_completion_processor(
+                        &orchestrator_state,
+                        &orchestrator_user,
+                        &orchestrator_body,
+                        &context_for_completion,
+                        &prepared_for_completion,
+                        &persisted_for_completion,
+                        &orchestrator_headers,
+                        orchestrator_tx_client.clone(),
+                        orchestrator_tx_storage.clone(),
+                        tools_executed,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            trace!("Orchestrator: Completion processor setup complete");
+                            // AssistantMessageStarting is now sent from inside setup_completion_processor
+                            // to guarantee it arrives before any completion deltas
+                        }
+                        Err(e) => {
+                            error!("Orchestrator: Failed to setup completion processor: {:?}", e);
+
+                            // Update response status to failed
+                            if let Err(db_err) = orchestrator_state.db.update_response_status(
+                                response_id,
+                                ResponseStatus::Failed,
+                                Some(Utc::now()),
+                            ) {
+                                error!("Orchestrator: Failed to update response status: {:?}", db_err);
+                            }
+
+                            // Update assistant message to incomplete
+                            if let Err(db_err) = orchestrator_state.db.update_assistant_message(
+                                assistant_message_id,
+                                None,
+                                0,
+                                STATUS_INCOMPLETE.to_string(),
+                                None,
+                            ) {
+                                error!("Orchestrator: Failed to update assistant message: {:?}", db_err);
+                            }
+
+                            // Send error to client via channel (best-effort)
+                            let _ = orchestrator_tx_client.try_send(StorageMessage::Error(
+                                format!("Failed to setup streaming: {:?}", e)
+                            ));
+                        }
+                    }
+                } => {
+                    trace!("Orchestrator: Phases 5-6 completed normally");
+                }
+
+                Ok(cancelled_id) = cancel_rx.recv() => {
+                    if cancelled_id == response_uuid {
+                        debug!("Orchestrator: Received cancellation during phases 5-6 for response {}", response_uuid);
+
+                        // Send cancellation to both channels
+                        let _ = orchestrator_tx_storage.send(StorageMessage::Cancelled).await;
+                        let _ = orchestrator_tx_client.send(StorageMessage::Cancelled).await;
+
+                        trace!("Orchestrator: Cancellation handled, exiting");
+                    }
                 }
             }
         });

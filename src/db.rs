@@ -572,7 +572,7 @@ pub trait DBConnection {
 
     // Tool calls / outputs
     fn create_tool_call(&self, new_call: NewToolCall) -> Result<ToolCall, DBError>;
-    fn get_tool_call_by_uuid(&self, uuid: Uuid) -> Result<ToolCall, DBError>;
+    fn get_tool_call_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<ToolCall, DBError>;
     fn create_tool_output(&self, new_output: NewToolOutput) -> Result<ToolOutput, DBError>;
 
     // Context reconstruction
@@ -2341,10 +2341,10 @@ impl DBConnection for PostgresConnection {
         new_call.insert(conn).map_err(DBError::from)
     }
 
-    fn get_tool_call_by_uuid(&self, uuid: Uuid) -> Result<ToolCall, DBError> {
-        debug!("Getting tool call by UUID: {}", uuid);
+    fn get_tool_call_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<ToolCall, DBError> {
+        debug!("Getting tool call by UUID: {} for user: {}", uuid, user_id);
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        ToolCall::get_by_uuid(conn, uuid).map_err(DBError::from)
+        ToolCall::get_by_uuid(conn, uuid, user_id).map_err(DBError::from)
     }
 
     fn create_tool_output(&self, new_output: NewToolOutput) -> Result<ToolOutput, DBError> {

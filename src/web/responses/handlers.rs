@@ -13,8 +13,9 @@ use crate::{
         openai::get_chat_completion_response,
         responses::{
             build_prompt, build_usage, constants::*, error_mapping, prompts, storage_task, tools,
-            ContentPartBuilder, DeletedObjectResponse, MessageContent, MessageContentConverter,
-            MessageContentPart, OutputItemBuilder, ResponseBuilder, ResponseEvent, SseEventEmitter,
+            ContentPartBuilder, DeletedObjectResponse, IntentClassifier, MessageContent,
+            MessageContentConverter, MessageContentPart, OutputItemBuilder, QueryExtractor,
+            ResponseBuilder, ResponseEvent, SseEventEmitter,
         },
     },
     ApiError, AppState,
@@ -1201,55 +1202,19 @@ async fn classify_and_execute_tools(
         "Classifying user intent for message: {}",
         user_text.chars().take(100).collect::<String>()
     );
-    debug!("Starting intent classification");
+    debug!("Starting DSPy-based intent classification");
 
-    // Step 1: Classify intent using LLM
-    let classification_request = prompts::build_intent_classification_request(&user_text);
-    let headers = HeaderMap::new();
-    let billing_context = crate::web::openai::BillingContext::new(
-        crate::web::openai_auth::AuthMethod::Jwt,
-        "llama-3.3-70b".to_string(),
-    );
-
-    let intent = match get_chat_completion_response(
-        state,
-        user,
-        classification_request,
-        &headers,
-        billing_context,
-    )
-    .await
-    {
-        Ok(mut completion) => {
-            match completion.stream.recv().await {
-                Some(crate::web::openai::CompletionChunk::FullResponse(response_json)) => {
-                    // Extract intent from response
-                    if let Some(intent_str) = response_json
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("message"))
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        let intent = intent_str.trim().to_lowercase();
-                        debug!("Classified intent: {}", intent);
-                        intent
-                    } else {
-                        warn!(
-                            "Failed to extract intent from classifier response, defaulting to chat"
-                        );
-                        "chat".to_string()
-                    }
-                }
-                _ => {
-                    warn!("Unexpected classifier response format, defaulting to chat");
-                    "chat".to_string()
-                }
-            }
+    // Step 1: Classify intent using DSPy IntentClassifier module
+    let classifier = IntentClassifier::new(state.clone(), user.clone()).await;
+    
+    let intent = match classifier.classify(&user_text).await {
+        Ok(intent) => {
+            debug!("Classified intent: {}", intent);
+            intent
         }
         Err(e) => {
             // Best effort - if classification fails, default to chat
-            warn!("Classification failed (defaulting to chat): {:?}", e);
+            warn!("DSPy classification failed (defaulting to chat): {:?}", e);
             "chat".to_string()
         }
     };
@@ -1258,47 +1223,17 @@ async fn classify_and_execute_tools(
     if intent == "web_search" {
         debug!("User message classified as web_search, executing tool");
 
-        // Extract search query
-        let query_request = prompts::build_query_extraction_request(&user_text);
-        let billing_context = crate::web::openai::BillingContext::new(
-            crate::web::openai_auth::AuthMethod::Jwt,
-            "llama-3.3-70b".to_string(),
-        );
-
-        let search_query = match get_chat_completion_response(
-            state,
-            user,
-            query_request,
-            &headers,
-            billing_context,
-        )
-        .await
-        {
-            Ok(mut completion) => match completion.stream.recv().await {
-                Some(crate::web::openai::CompletionChunk::FullResponse(response_json)) => {
-                    if let Some(query) = response_json
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("message"))
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        let query = query.trim().to_string();
-                        trace!("Extracted search query: {}", query);
-                        debug!("Search query extracted successfully");
-                        query
-                    } else {
-                        warn!("Failed to extract query, using original message");
-                        user_text.clone()
-                    }
-                }
-                _ => {
-                    warn!("Unexpected query extraction response, using original message");
-                    user_text.clone()
-                }
-            },
+        // Extract search query using DSPy QueryExtractor module
+        let extractor = QueryExtractor::new(state.clone(), user.clone()).await;
+        
+        let search_query = match extractor.extract(&user_text).await {
+            Ok(query) => {
+                trace!("Extracted search query: {}", query);
+                debug!("Search query extracted successfully");
+                query
+            }
             Err(e) => {
-                warn!("Query extraction failed, using original message: {:?}", e);
+                warn!("DSPy query extraction failed, using original message: {:?}", e);
                 user_text.clone()
             }
         };

@@ -391,7 +391,8 @@ pub async fn storage_task(
 
                 // Look up the tool_call by UUID to get its database ID (primary key)
                 // This is more reliable than tracking in memory across async operations
-                let tool_call_fk = match db.get_tool_call_by_uuid(tool_call_id) {
+                // Also validates that the tool_call belongs to this user (security check)
+                let tool_call_fk = match db.get_tool_call_by_uuid(tool_call_id, user_id) {
                     Ok(tool_call) => tool_call.id,
                     Err(e) => {
                         error!(

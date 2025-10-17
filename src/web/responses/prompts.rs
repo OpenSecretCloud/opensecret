@@ -1,9 +1,72 @@
-//! Prompt templates for the Responses API
+//! Prompt templates and DSPy signatures for the Responses API
 //!
 //! This module contains all prompt templates used for intent classification,
 //! query extraction, and other AI-driven features of the Responses API.
 
+use dspy_rs::Signature;
 use serde_json::{json, Value};
+
+// ============================================================================
+// DSPy Signatures
+// ============================================================================
+
+/// Intent classification signature
+///
+/// Classifies whether a user message requires web search or is a chat conversation.
+/// Uses deterministic temperature (0.0) for consistent classification.
+#[Signature]
+struct IntentClassificationInner {
+    /// Classify the user's intent. Return ONLY one of these exact values:
+    /// - "web_search" if the user needs current information, facts, news, real-time data, or web search
+    /// - "chat" if the user wants casual conversation, greetings, explanations, or general discussion
+    ///
+    /// Examples:
+    /// - "What's the weather today?" → web_search
+    /// - "Who is the current president?" → web_search
+    /// - "What happened in the news today?" → web_search
+    /// - "Hello, how are you?" → chat
+    /// - "Explain how photosynthesis works" → chat
+    /// - "Tell me a joke" → chat
+    #[input]
+    pub user_message: String,
+
+    #[output]
+    pub intent: String,
+}
+
+// Helper function to create IntentClassification (workaround for private struct)
+pub fn new_intent_classifier() -> impl dspy_rs::MetaSignature {
+    IntentClassificationInner::new()
+}
+
+/// Search query extraction signature
+///
+/// Extracts a clean, focused search query from a natural language question.
+/// Uses deterministic temperature (0.0) for consistent extraction.
+#[Signature]
+struct QueryExtractionInner {
+    /// Extract the main search query from the user's question.
+    /// Return only the search terms, nothing else. Be concise and specific.
+    ///
+    /// Examples:
+    /// - "What's the weather in San Francisco today?" → weather San Francisco today
+    /// - "Who is the current president of the United States?" → current president United States
+    /// - "Tell me about the latest SpaceX launch" → latest SpaceX launch
+    #[input]
+    pub user_message: String,
+
+    #[output]
+    pub search_query: String,
+}
+
+// Helper function to create QueryExtraction (workaround for private struct)
+pub fn new_query_extractor() -> impl dspy_rs::MetaSignature {
+    QueryExtractionInner::new()
+}
+
+// ============================================================================
+// Legacy Prompt Templates (DEPRECATED - will be removed after DSPy migration)
+// ============================================================================
 
 /// System prompt for intent classification
 ///

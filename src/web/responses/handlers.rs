@@ -12,9 +12,10 @@ use crate::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
         responses::{
-            build_prompt, build_usage, constants::*, error_mapping, prompts, storage_task, tools,
-            ContentPartBuilder, DeletedObjectResponse, MessageContent, MessageContentConverter,
-            MessageContentPart, OutputItemBuilder, ResponseBuilder, ResponseEvent, SseEventEmitter,
+            build_prompt, build_usage, constants::*, dspy_adapter::OpenSecretLM, error_mapping,
+            prompts, storage_task, tools, ContentPartBuilder, DeletedObjectResponse,
+            MessageContent, MessageContentConverter, MessageContentPart, OutputItemBuilder,
+            ResponseBuilder, ResponseEvent, SseEventEmitter,
         },
     },
     ApiError, AppState,
@@ -1201,55 +1202,47 @@ async fn classify_and_execute_tools(
         "Classifying user intent for message: {}",
         user_text.chars().take(100).collect::<String>()
     );
-    debug!("Starting intent classification");
+    debug!("Starting DSPy-based intent classification");
 
-    // Step 1: Classify intent using LLM
-    let classification_request = prompts::build_intent_classification_request(&user_text);
-    let headers = HeaderMap::new();
-    let billing_context = crate::web::openai::BillingContext::new(
-        crate::web::openai_auth::AuthMethod::Jwt,
-        "llama-3.3-70b".to_string(),
+    // Create custom LM that uses our completions API
+    let lm = OpenSecretLM::new(
+        state.clone(),
+        user.clone(),
+        crate::web::openai::BillingContext::new(
+            crate::web::openai_auth::AuthMethod::Jwt,
+            "llama-3.3-70b".to_string(),
+        ),
     );
 
-    let intent = match get_chat_completion_response(
-        state,
-        user,
-        classification_request,
-        &headers,
-        billing_context,
-    )
-    .await
-    {
-        Ok(mut completion) => {
-            match completion.stream.recv().await {
-                Some(crate::web::openai::CompletionChunk::FullResponse(response_json)) => {
-                    // Extract intent from response
-                    if let Some(intent_str) = response_json
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("message"))
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        let intent = intent_str.trim().to_lowercase();
-                        debug!("Classified intent: {}", intent);
-                        intent
-                    } else {
-                        warn!(
-                            "Failed to extract intent from classifier response, defaulting to chat"
-                        );
-                        "chat".to_string()
-                    }
-                }
-                _ => {
-                    warn!("Unexpected classifier response format, defaulting to chat");
-                    "chat".to_string()
-                }
-            }
+    // Step 1: Classify intent using DSPy signature
+    // Create DSPy signature for structure (but use our LM directly)
+    let classifier_sig = prompts::new_intent_classifier();
+    
+    // Build prompt messages from signature
+    use dspy_rs::MetaSignature;
+    let messages = dspy_rs::Chat::new(vec![
+        dspy_rs::Message::System {
+            content: classifier_sig.instruction(),
+        },
+        dspy_rs::Message::User {
+            content: user_text.clone(),
+        },
+    ]);
+
+    // Call our custom LM
+    let intent = match lm.call(messages).await {
+        Ok(response) => {
+            let intent_str = match &response.output {
+                dspy_rs::Message::Assistant { content } => content,
+                _ => "chat",
+            };
+            let intent = intent_str.trim().to_lowercase();
+            debug!("Classified intent: {}", intent);
+            intent
         }
         Err(e) => {
             // Best effort - if classification fails, default to chat
-            warn!("Classification failed (defaulting to chat): {:?}", e);
+            warn!("DSPy classification failed (defaulting to chat): {:?}", e);
             "chat".to_string()
         }
     };
@@ -1258,47 +1251,32 @@ async fn classify_and_execute_tools(
     if intent == "web_search" {
         debug!("User message classified as web_search, executing tool");
 
-        // Extract search query
-        let query_request = prompts::build_query_extraction_request(&user_text);
-        let billing_context = crate::web::openai::BillingContext::new(
-            crate::web::openai_auth::AuthMethod::Jwt,
-            "llama-3.3-70b".to_string(),
-        );
-
-        let search_query = match get_chat_completion_response(
-            state,
-            user,
-            query_request,
-            &headers,
-            billing_context,
-        )
-        .await
-        {
-            Ok(mut completion) => match completion.stream.recv().await {
-                Some(crate::web::openai::CompletionChunk::FullResponse(response_json)) => {
-                    if let Some(query) = response_json
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("message"))
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        let query = query.trim().to_string();
-                        trace!("Extracted search query: {}", query);
-                        debug!("Search query extracted successfully");
-                        query
-                    } else {
-                        warn!("Failed to extract query, using original message");
-                        user_text.clone()
-                    }
-                }
-                _ => {
-                    warn!("Unexpected query extraction response, using original message");
-                    user_text.clone()
-                }
+        // Extract search query using DSPy signature
+        let extractor_sig = prompts::new_query_extractor();
+        
+        // Build prompt messages from signature
+        let messages = dspy_rs::Chat::new(vec![
+            dspy_rs::Message::System {
+                content: extractor_sig.instruction(),
             },
+            dspy_rs::Message::User {
+                content: user_text.clone(),
+            },
+        ]);
+
+        // Call our custom LM
+        let search_query = match lm.call(messages).await {
+            Ok(response) => {
+                let query = match &response.output {
+                    dspy_rs::Message::Assistant { content } => content.trim().to_string(),
+                    _ => user_text.clone(),
+                };
+                trace!("Extracted search query: {}", query);
+                debug!("Search query extracted successfully");
+                query
+            }
             Err(e) => {
-                warn!("Query extraction failed, using original message: {:?}", e);
+                warn!("DSPy query extraction failed, using original message: {:?}", e);
                 user_text.clone()
             }
         };

@@ -8,6 +8,7 @@ pub mod constants;
 pub mod context_builder;
 pub mod conversations;
 pub mod conversions;
+pub mod dspy_adapter;
 pub mod errors;
 pub mod events;
 pub mod handlers;

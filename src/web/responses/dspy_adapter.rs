@@ -1,6 +1,6 @@
 //! DSPy adapter for OpenSecret's completions API
 //!
-//! This module provides a custom LM implementation that integrates DSRs (DSPy Rust)
+//! This module provides a custom Adapter implementation that integrates DSRs (DSPy Rust)
 //! with our existing completions API infrastructure, ensuring billing, routing,
 //! and auth are handled correctly.
 
@@ -9,11 +9,13 @@ use crate::{
     web::openai::{get_chat_completion_response, BillingContext, CompletionChunk},
     ApiError, AppState,
 };
+use async_trait::async_trait;
 use axum::http::HeaderMap;
-use dspy_rs::{Chat, LMResponse, LmUsage, Message};
-use serde_json::json;
+use dspy_rs::{adapter::Adapter, Chat, ChatAdapter, Example, LMResponse, LmUsage, Message, MetaSignature, Prediction, LM};
+use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 /// Custom LM implementation that wraps our completions API
 ///
@@ -138,5 +140,94 @@ impl OpenSecretLM {
             error!("OpenSecretLM: Did not receive FullResponse chunk");
             Err(ApiError::InternalServerError)
         }
+    }
+}
+
+/// Custom Adapter that uses OpenSecret's completions API instead of DSRs's default LM
+///
+/// This adapter implements the DSRs Adapter trait, allowing us to use DSRs's `Predict`
+/// module and other patterns while maintaining our existing infrastructure for billing,
+/// routing, and auth.
+///
+/// The adapter delegates formatting and parsing to ChatAdapter but overrides the `call`
+/// method to use our custom OpenSecretLM instead of the standard DSRs LM.
+#[derive(Clone)]
+pub struct OpenSecretAdapter {
+    state: Arc<AppState>,
+    user: User,
+    billing_context: BillingContext,
+    /// We use ChatAdapter for standard formatting and parsing
+    chat_adapter: ChatAdapter,
+}
+
+impl OpenSecretAdapter {
+    pub fn new(state: Arc<AppState>, user: User, billing_context: BillingContext) -> Self {
+        Self {
+            state,
+            user,
+            billing_context,
+            chat_adapter: ChatAdapter::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl Adapter for OpenSecretAdapter {
+    /// Format the signature and inputs into a Chat (reuses ChatAdapter's logic)
+    fn format(&self, signature: &dyn MetaSignature, inputs: Example) -> Chat {
+        self.chat_adapter.format(signature, inputs)
+    }
+
+    /// Parse the LM response back into structured output (reuses ChatAdapter's logic)
+    fn parse_response(
+        &self,
+        signature: &dyn MetaSignature,
+        response: Message,
+    ) -> HashMap<String, Value> {
+        self.chat_adapter.parse_response(signature, response)
+    }
+
+    /// Call the LM - THIS is where we use our custom OpenSecretLM
+    ///
+    /// Note: The `lm` parameter is ignored because DSRs passes Arc<LM> but we need
+    /// to use our custom OpenSecretLM that wraps our infrastructure. This is a
+    /// necessary bridge to make DSRs work with our existing systems.
+    async fn call(
+        &self,
+        _lm: Arc<LM>, // Ignored - we use our own LM
+        signature: &dyn MetaSignature,
+        inputs: Example,
+    ) -> anyhow::Result<Prediction> {
+        debug!(
+            "OpenSecretAdapter: Calling {} signature",
+            std::any::type_name_of_val(signature)
+        );
+
+        // Format inputs into Chat messages using standard ChatAdapter logic
+        let messages = self.format(signature, inputs);
+
+        // Use our custom LM that integrates with our infrastructure
+        let our_lm = OpenSecretLM::new(
+            self.state.clone(),
+            self.user.clone(),
+            self.billing_context.clone(),
+        );
+
+        // Call our LM
+        let response = our_lm.call(messages).await.map_err(|e| {
+            error!("OpenSecretAdapter: LM call failed: {:?}", e);
+            anyhow::anyhow!("LM call failed: {:?}", e)
+        })?;
+
+        // Parse the response using standard ChatAdapter logic
+        let output = self.parse_response(signature, response.output);
+
+        debug!("OpenSecretAdapter: Successfully parsed response");
+
+        // Return prediction with usage stats
+        Ok(Prediction {
+            data: output,
+            lm_usage: response.usage,
+        })
     }
 }

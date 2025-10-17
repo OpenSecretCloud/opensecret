@@ -12,9 +12,9 @@ use crate::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
         responses::{
-            build_prompt, build_usage, constants::*, dspy_adapter::OpenSecretLM, error_mapping,
-            prompts, storage_task, tools, ContentPartBuilder, DeletedObjectResponse,
-            MessageContent, MessageContentConverter, MessageContentPart, OutputItemBuilder,
+            build_prompt, build_usage, constants::*, error_mapping, prompts, storage_task, tools,
+            ContentPartBuilder, DeletedObjectResponse, IntentClassifier, MessageContent,
+            MessageContentConverter, MessageContentPart, OutputItemBuilder, QueryExtractor,
             ResponseBuilder, ResponseEvent, SseEventEmitter,
         },
     },
@@ -1204,39 +1204,11 @@ async fn classify_and_execute_tools(
     );
     debug!("Starting DSPy-based intent classification");
 
-    // Create custom LM that uses our completions API
-    let lm = OpenSecretLM::new(
-        state.clone(),
-        user.clone(),
-        crate::web::openai::BillingContext::new(
-            crate::web::openai_auth::AuthMethod::Jwt,
-            "llama-3.3-70b".to_string(),
-        ),
-    );
-
-    // Step 1: Classify intent using DSPy signature
-    // Create DSPy signature for structure (but use our LM directly)
-    let classifier_sig = prompts::new_intent_classifier();
+    // Step 1: Classify intent using DSPy IntentClassifier module
+    let classifier = IntentClassifier::new(state.clone(), user.clone()).await;
     
-    // Build prompt messages from signature
-    use dspy_rs::MetaSignature;
-    let messages = dspy_rs::Chat::new(vec![
-        dspy_rs::Message::System {
-            content: classifier_sig.instruction(),
-        },
-        dspy_rs::Message::User {
-            content: user_text.clone(),
-        },
-    ]);
-
-    // Call our custom LM
-    let intent = match lm.call(messages).await {
-        Ok(response) => {
-            let intent_str = match &response.output {
-                dspy_rs::Message::Assistant { content } => content,
-                _ => "chat",
-            };
-            let intent = intent_str.trim().to_lowercase();
+    let intent = match classifier.classify(&user_text).await {
+        Ok(intent) => {
             debug!("Classified intent: {}", intent);
             intent
         }
@@ -1251,26 +1223,11 @@ async fn classify_and_execute_tools(
     if intent == "web_search" {
         debug!("User message classified as web_search, executing tool");
 
-        // Extract search query using DSPy signature
-        let extractor_sig = prompts::new_query_extractor();
+        // Extract search query using DSPy QueryExtractor module
+        let extractor = QueryExtractor::new(state.clone(), user.clone()).await;
         
-        // Build prompt messages from signature
-        let messages = dspy_rs::Chat::new(vec![
-            dspy_rs::Message::System {
-                content: extractor_sig.instruction(),
-            },
-            dspy_rs::Message::User {
-                content: user_text.clone(),
-            },
-        ]);
-
-        // Call our custom LM
-        let search_query = match lm.call(messages).await {
-            Ok(response) => {
-                let query = match &response.output {
-                    dspy_rs::Message::Assistant { content } => content.trim().to_string(),
-                    _ => user_text.clone(),
-                };
+        let search_query = match extractor.extract(&user_text).await {
+            Ok(query) => {
                 trace!("Extracted search query: {}", query);
                 debug!("Search query extracted successfully");
                 query

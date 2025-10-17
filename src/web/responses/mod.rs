@@ -9,6 +9,7 @@ pub mod context_builder;
 pub mod conversations;
 pub mod conversions;
 pub mod dspy_adapter;
+pub mod dspy_modules;
 pub mod errors;
 pub mod events;
 pub mod handlers;
@@ -25,6 +26,8 @@ pub use builders::{
 };
 pub use context_builder::build_prompt;
 pub use conversions::{ConversationItem, ConversationItemConverter, MessageContentConverter};
+pub use dspy_adapter::{OpenSecretAdapter, OpenSecretLM};
+pub use dspy_modules::{IntentClassifier, QueryExtractor};
 pub use errors::error_mapping;
 pub use events::{ResponseEvent, SseEventEmitter};
 pub use pagination::Paginator;

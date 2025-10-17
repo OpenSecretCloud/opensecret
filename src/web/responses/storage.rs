@@ -351,7 +351,16 @@ pub async fn storage_task(
                     }
                 };
                 let arguments_enc = encrypt_with_key(&user_key, arguments_json.as_bytes()).await;
-                let argument_tokens = count_tokens(&arguments_json) as i32;
+                let token_count = count_tokens(&arguments_json);
+                let argument_tokens = if token_count > i32::MAX as usize {
+                    warn!(
+                        "Tool argument token count {} exceeds i32::MAX, clamping",
+                        token_count
+                    );
+                    i32::MAX
+                } else {
+                    token_count as i32
+                };
 
                 let new_tool_call = NewToolCall {
                     uuid: tool_call_id,
@@ -408,7 +417,16 @@ pub async fn storage_task(
                 };
 
                 let output_enc = encrypt_with_key(&user_key, output.as_bytes()).await;
-                let output_tokens = count_tokens(&output) as i32;
+                let token_count = count_tokens(&output);
+                let output_tokens = if token_count > i32::MAX as usize {
+                    warn!(
+                        "Tool output token count {} exceeds i32::MAX, clamping",
+                        token_count
+                    );
+                    i32::MAX
+                } else {
+                    token_count as i32
+                };
 
                 let new_tool_output = NewToolOutput {
                     uuid: tool_output_id,

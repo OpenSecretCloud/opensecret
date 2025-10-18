@@ -1183,12 +1183,13 @@ fn is_web_search_enabled(tools: &Option<Value>) -> bool {
 /// 4. Send ToolOutput event to streams (always, even on error)
 /// 5. Send persistence command via dedicated channel and wait for acknowledgment
 ///
-/// Tool execution is best-effort and uses fast model (llama-3.3-70b).
+/// Tool execution is best-effort and uses fast model (gpt-oss-120b).
 async fn classify_and_execute_tools(
     state: &Arc<AppState>,
     user: &User,
     prepared: &PreparedRequest,
     persisted: &PersistedData,
+    prompt_messages: &[Value],
     tx_client: &mpsc::Sender<StorageMessage>,
     tx_storage: &mpsc::Sender<StorageMessage>,
     rx_tool_ack: tokio::sync::oneshot::Receiver<Result<(), String>>,
@@ -1201,14 +1202,21 @@ async fn classify_and_execute_tools(
         "Classifying user intent for message: {}",
         user_text.chars().take(100).collect::<String>()
     );
-    debug!("Starting intent classification");
+    debug!("Starting intent classification with {} conversation messages", prompt_messages.len());
 
-    // Step 1: Classify intent using LLM
-    let classification_request = prompts::build_intent_classification_request(&user_text);
+    // Step 1: Classify intent using LLM with conversation history
+    let classification_request = prompts::build_intent_classification_request(prompt_messages, &user_text);
+    
+    trace!(
+        "Intent classification request: {}",
+        serde_json::to_string_pretty(&classification_request)
+            .unwrap_or_else(|_| "failed to serialize".to_string())
+    );
+    
     let headers = HeaderMap::new();
     let billing_context = crate::web::openai::BillingContext::new(
         crate::web::openai_auth::AuthMethod::Jwt,
-        "llama-3.3-70b".to_string(),
+        "gpt-oss-120b".to_string(),
     );
 
     let intent = match get_chat_completion_response(
@@ -1223,6 +1231,12 @@ async fn classify_and_execute_tools(
         Ok(mut completion) => {
             match completion.stream.recv().await {
                 Some(crate::web::openai::CompletionChunk::FullResponse(response_json)) => {
+                    trace!(
+                        "Intent classification response: {}",
+                        serde_json::to_string_pretty(&response_json)
+                            .unwrap_or_else(|_| "failed to serialize".to_string())
+                    );
+                    
                     // Extract intent from response
                     if let Some(intent_str) = response_json
                         .get("choices")
@@ -1238,6 +1252,7 @@ async fn classify_and_execute_tools(
                         warn!(
                             "Failed to extract intent from classifier response, defaulting to chat"
                         );
+                        trace!("Response structure: {:?}", response_json);
                         "chat".to_string()
                     }
                 }
@@ -1258,11 +1273,11 @@ async fn classify_and_execute_tools(
     if intent == "web_search" {
         debug!("User message classified as web_search, executing tool");
 
-        // Extract search query
-        let query_request = prompts::build_query_extraction_request(&user_text);
+        // Extract search query with conversation history for context
+        let query_request = prompts::build_query_extraction_request(prompt_messages, &user_text);
         let billing_context = crate::web::openai::BillingContext::new(
             crate::web::openai_auth::AuthMethod::Jwt,
-            "llama-3.3-70b".to_string(),
+            "gpt-oss-120b".to_string(),
         );
 
         let search_query = match get_chat_completion_response(
@@ -1850,6 +1865,7 @@ async fn create_response_stream(
                             &orchestrator_user,
                             &prepared_for_tools,
                             &persisted_for_tools,
+                            &orchestrator_prompt_messages,
                             &orchestrator_tx_client,
                             &orchestrator_tx_storage,
                             rx_tool_ack,

@@ -1202,17 +1202,21 @@ async fn classify_and_execute_tools(
         "Classifying user intent for message: {}",
         user_text.chars().take(100).collect::<String>()
     );
-    debug!("Starting intent classification with {} conversation messages", prompt_messages.len());
+    debug!(
+        "Starting intent classification with {} conversation messages",
+        prompt_messages.len()
+    );
 
     // Step 1: Classify intent using LLM with conversation history
-    let classification_request = prompts::build_intent_classification_request(prompt_messages, &user_text);
-    
+    let classification_request =
+        prompts::build_intent_classification_request(prompt_messages, &user_text);
+
     trace!(
         "Intent classification request: {}",
         serde_json::to_string_pretty(&classification_request)
             .unwrap_or_else(|_| "failed to serialize".to_string())
     );
-    
+
     let headers = HeaderMap::new();
     let billing_context = crate::web::openai::BillingContext::new(
         crate::web::openai_auth::AuthMethod::Jwt,
@@ -1236,7 +1240,7 @@ async fn classify_and_execute_tools(
                         serde_json::to_string_pretty(&response_json)
                             .unwrap_or_else(|_| "failed to serialize".to_string())
                     );
-                    
+
                     // Extract intent from response
                     if let Some(intent_str) = response_json
                         .get("choices")
@@ -1365,23 +1369,27 @@ async fn classify_and_execute_tools(
         debug!("Sent tool_call {} to streams", tool_call_id);
 
         // Execute web search tool (or capture error as content)
-        let tool_output =
-            match tools::execute_tool("web_search", &tool_arguments, state.kagi_client.as_ref())
-                .await
-            {
-                Ok(output) => {
-                    debug!(
-                        "Tool execution successful, output length: {} chars",
-                        output.len()
-                    );
-                    output
-                }
-                Err(e) => {
-                    warn!("Tool execution failed, including error in output: {:?}", e);
-                    // Failure becomes content, not a skip!
-                    format!("Error: {}", e)
-                }
-            };
+        let tool_output = match tools::execute_tool(
+            "web_search",
+            &tool_arguments,
+            state.brave_client.as_ref(),
+            state.kagi_client.as_ref(),
+        )
+        .await
+        {
+            Ok(output) => {
+                debug!(
+                    "Tool execution successful, output length: {} chars",
+                    output.len()
+                );
+                output
+            }
+            Err(e) => {
+                warn!("Tool execution failed, including error in output: {:?}", e);
+                // Failure becomes content, not a skip!
+                format!("Error: {}", e)
+            }
+        };
 
         // Send tool_output event through both streams (ALWAYS sent, even on failure)
         let tool_output_msg = StorageMessage::ToolOutput {

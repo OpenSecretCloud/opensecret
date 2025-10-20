@@ -58,11 +58,14 @@ pub fn build_intent_classification_request(
                 Some(format!("{}: {}", role, truncated_content))
             })
             .collect();
-        
+
         if formatted_messages.is_empty() {
             String::new()
         } else {
-            format!("Conversation history:\n{}\n\n", formatted_messages.join("\n"))
+            format!(
+                "Conversation history:\n{}\n\n",
+                formatted_messages.join("\n")
+            )
         }
     } else {
         String::new()
@@ -93,14 +96,15 @@ pub fn build_intent_classification_request(
 fn extract_text_from_content(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
-        Value::Array(arr) => {
-            arr.iter()
-                .filter_map(|part| {
-                    part.get("text").and_then(|t| t.as_str()).map(|s| s.to_string())
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
         _ => String::new(),
     }
 }
@@ -115,10 +119,7 @@ fn extract_text_from_content(content: &Value) -> String {
 ///
 /// # Returns
 /// A JSON request ready to be sent to `get_chat_completion_response`
-pub fn build_query_extraction_request(
-    conversation_history: &[Value],
-    user_message: &str,
-) -> Value {
+pub fn build_query_extraction_request(conversation_history: &[Value], user_message: &str) -> Value {
     // Format conversation history as text for context
     let history_text = if !conversation_history.is_empty() {
         let formatted_messages: Vec<String> = conversation_history
@@ -133,11 +134,14 @@ pub fn build_query_extraction_request(
                 Some(format!("{}: {}", role, truncated_content))
             })
             .collect();
-        
+
         if formatted_messages.is_empty() {
             String::new()
         } else {
-            format!("Conversation history:\n{}\n\n", formatted_messages.join("\n"))
+            format!(
+                "Conversation history:\n{}\n\n",
+                formatted_messages.join("\n")
+            )
         }
     } else {
         String::new()
@@ -200,7 +204,7 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["role"], "user");
-        
+
         let user_content = messages[1]["content"].as_str().unwrap();
         // Should contain formatted history
         assert!(user_content.contains("Conversation history:"));
@@ -219,24 +223,29 @@ mod tests {
 
         let messages = request["messages"].as_array().unwrap();
         let user_content = messages[1]["content"].as_str().unwrap();
-        
+
         // History should be truncated to 200 chars per message
         // Format is: "Conversation history:\nuser: <200 chars>\n\nCurrent user query: test"
         assert!(user_content.contains("Conversation history:"));
         assert!(user_content.contains("user: "));
         assert!(user_content.contains("Current user query: test"));
-        
+
         // Extract just the history part to verify truncation
-        let history_part = user_content
-            .split("Current user query:")
-            .next()
-            .unwrap();
+        let history_part = user_content.split("Current user query:").next().unwrap();
         // The 'aaa...' part should be truncated (much less than original 500 chars)
         let a_count = history_part.chars().filter(|&c| c == 'a').count();
         // Should be around 200 (within reasonable bounds, accounting for any formatting)
-        assert!(a_count >= 190 && a_count <= 210, "Expected around 200 'a' characters, got {}", a_count);
+        assert!(
+            a_count >= 190 && a_count <= 210,
+            "Expected around 200 'a' characters, got {}",
+            a_count
+        );
         // Definitely should be much less than the original 500
-        assert!(a_count < 300, "Truncation failed: got {} 'a' characters (original was 500)", a_count);
+        assert!(
+            a_count < 300,
+            "Truncation failed: got {} 'a' characters (original was 500)",
+            a_count
+        );
     }
 
     #[test]
@@ -250,7 +259,7 @@ mod tests {
         let messages = request["messages"].as_array().unwrap();
         // Should have only 2 messages: system + single user message
         assert_eq!(messages.len(), 2);
-        
+
         let user_content = messages[1]["content"].as_str().unwrap();
         // Should have last 6 messages (4-9)
         assert!(user_content.contains("user: Message 4"));
@@ -269,9 +278,12 @@ mod tests {
 
         let messages = request["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
-        
+
         let user_content = messages[1]["content"].as_str().unwrap();
-        assert_eq!(user_content, "Current user question: What's the weather in New York?");
+        assert_eq!(
+            user_content,
+            "Current user question: What's the weather in New York?"
+        );
     }
 
     #[test]
@@ -285,7 +297,7 @@ mod tests {
 
         let messages = request["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);
-        
+
         let user_content = messages[1]["content"].as_str().unwrap();
         assert!(user_content.contains("Conversation history:"));
         assert!(user_content.contains("iPhone 15"));

@@ -67,6 +67,9 @@ impl BraveClient {
         if let Some(freshness) = &request.freshness {
             query_params.push(("freshness", freshness.clone()));
         }
+        if let Some(summary) = request.summary {
+            query_params.push(("summary", if summary { "1" } else { "0" }.to_string()));
+        }
 
         let response = self
             .client
@@ -89,6 +92,33 @@ impl BraveClient {
 
         let search_response = response.json::<SearchResponse>().await?;
         Ok(search_response)
+    }
+
+    /// Execute a summarizer query using a key from web search
+    pub async fn summarizer(&self, key: &str) -> Result<SummarizerSearchResponse, BraveError> {
+        let url = format!("{}/summarizer/search", BRAVE_API_BASE);
+
+        let response = self
+            .client
+            .get(&url)
+            .header("X-Subscription-Token", self.api_key.as_str())
+            .header("Accept", "application/json")
+            .query(&[("key", key)])
+            .send()
+            .await?;
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(BraveError::Api {
+                status: status.as_u16(),
+                message: error_text,
+            });
+        }
+
+        let summarizer_response = response.json::<SummarizerSearchResponse>().await?;
+        Ok(summarizer_response)
     }
 }
 
@@ -115,6 +145,8 @@ pub struct SearchRequest {
     pub safesearch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<bool>,
 }
 
 impl SearchRequest {
@@ -127,6 +159,7 @@ impl SearchRequest {
             offset: None,
             safesearch: None,
             freshness: None,
+            summary: None,
         }
     }
 }
@@ -144,6 +177,8 @@ pub struct SearchResponse {
     pub news: Option<NewsResults>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub infobox: Option<Infobox>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summarizer: Option<Summarizer>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -208,4 +243,32 @@ pub struct Infobox {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub long_desc: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct Summarizer {
+    #[serde(rename = "type")]
+    pub summarizer_type: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct SummarizerSearchResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<Vec<SummaryItem>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+pub struct SummaryItem {
+    #[serde(rename = "type")]
+    pub item_type: String,
+    /// For type="token", data is a string with the text
+    /// For type="enum_item", data is a SummaryEntity object
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }

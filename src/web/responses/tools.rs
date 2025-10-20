@@ -36,8 +36,9 @@ pub async fn execute_web_search(
 async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<String, String> {
     trace!("Executing Brave search for query: {}", query);
 
-    // Create search request
-    let search_request = BraveSearchRequest::new(query.to_string());
+    // Create search request with summary enabled
+    let mut search_request = BraveSearchRequest::new(query.to_string());
+    search_request.summary = Some(true);
 
     // Execute search
     let response = client.search(search_request).await.map_err(|e| {
@@ -93,8 +94,38 @@ async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<
     }
 
     if result_text.is_empty() {
-        warn!("No search results found for query: {}", query);
+        warn!("No search results found");
         return Ok(format!("No results found for query: '{}'", query));
+    }
+
+    // Check if we have a summarizer key and fetch the summary
+    if let Some(summarizer) = response.summarizer {
+        debug!("Summarizer key found, fetching summary");
+        match client.summarizer(&summarizer.key).await {
+            Ok(summarizer_response) => {
+                if let Some(summary_items) = summarizer_response.summary {
+                    if !summary_items.is_empty() {
+                        result_text.push_str("\n--- Search Summary ---\n\n");
+                        for item in summary_items.iter() {
+                            // Extract text from "token" type items
+                            if item.item_type == "token" {
+                                if let Some(data) = &item.data {
+                                    if let Some(text) = data.as_str() {
+                                        result_text.push_str(text);
+                                    }
+                                }
+                            }
+                        }
+                        result_text.push_str("\n\n");
+                        debug!("Successfully added summary to results");
+                    }
+                }
+            }
+            Err(e) => {
+                // Best effort - log but don't fail the entire request
+                warn!("Failed to fetch summarizer content: {:?}", e);
+            }
+        }
     }
 
     Ok(result_text)
@@ -193,7 +224,7 @@ async fn execute_kagi_search(query: &str, client: &Arc<KagiClient>) -> Result<St
     }
 
     if result_text.is_empty() {
-        warn!("No search results found for query: {}", query);
+        warn!("No search results found");
         return Ok(format!("No results found for query: '{}'", query));
     }
 

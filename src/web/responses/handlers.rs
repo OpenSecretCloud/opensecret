@@ -1184,16 +1184,24 @@ fn is_web_search_enabled(tools: &Option<Value>) -> bool {
 /// 5. Send persistence command via dedicated channel and wait for acknowledgment
 ///
 /// Tool execution is best-effort and uses fast model (gpt-oss-120b).
+struct ToolChannels<'a> {
+    client: &'a mpsc::Sender<StorageMessage>,
+    storage: &'a mpsc::Sender<StorageMessage>,
+}
+
 async fn classify_and_execute_tools(
     state: &Arc<AppState>,
     user: &User,
     prepared: &PreparedRequest,
     persisted: &PersistedData,
     prompt_messages: &[Value],
-    tx_client: &mpsc::Sender<StorageMessage>,
-    tx_storage: &mpsc::Sender<StorageMessage>,
+    channels: ToolChannels<'_>,
     rx_tool_ack: tokio::sync::oneshot::Receiver<Result<(), String>>,
 ) -> Result<Option<()>, ApiError> {
+    let ToolChannels {
+        client: tx_client,
+        storage: tx_storage,
+    } = channels;
     // Extract text from user message for classification
     let user_text =
         MessageContentConverter::extract_text_for_token_counting(&prepared.message_content);
@@ -1874,8 +1882,10 @@ async fn create_response_stream(
                             &prepared_for_tools,
                             &persisted_for_tools,
                             &orchestrator_prompt_messages,
-                            &orchestrator_tx_client,
-                            &orchestrator_tx_storage,
+                            ToolChannels {
+                                client: &orchestrator_tx_client,
+                                storage: &orchestrator_tx_storage,
+                            },
                             rx_tool_ack,
                         )
                         .await

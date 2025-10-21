@@ -236,7 +236,7 @@ mod tests {
         let a_count = history_part.chars().filter(|&c| c == 'a').count();
         // Should be around 200 (within reasonable bounds, accounting for any formatting)
         assert!(
-            a_count >= 190 && a_count <= 210,
+            (190..=210).contains(&a_count),
             "Expected around 200 'a' characters, got {}",
             a_count
         );

@@ -284,6 +284,14 @@ echo "127.0.0.21 doc-upload.model.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.22 inference.tinfoil.sh" >> /etc/hosts
 log "Added Tinfoil proxy domains to /etc/hosts"
 
+# Add Kagi Search hostname to /etc/hosts
+echo "127.0.0.23 kagi.com" >> /etc/hosts
+log "Added Kagi Search domain to /etc/hosts"
+
+# Add Brave Search hostname to /etc/hosts
+echo "127.0.0.24 api.search.brave.com" >> /etc/hosts
+log "Added Brave Search domain to /etc/hosts"
+
 touch /app/libnsm.so
 log "Created /app/libnsm.so"
 
@@ -375,6 +383,14 @@ python3 /app/traffic_forwarder.py 127.0.0.21 443 3 8024 &
 
 log "Starting Tinfoil Inference traffic forwarder"
 python3 /app/traffic_forwarder.py 127.0.0.22 443 3 8025 &
+
+# Start the traffic forwarder for Kagi Search in the background
+log "Starting Kagi Search traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.23 443 3 8026 &
+
+# Start the traffic forwarder for Brave Search in the background
+log "Starting Brave Search traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.24 443 3 8027 &
 
 # Wait for the forwarders to start
 log "Waiting for forwarders to start"
@@ -537,6 +553,22 @@ if timeout 5 bash -c '</dev/tcp/127.0.0.22/443'; then
     log "Tinfoil Inference connection successful"
 else
     log "Tinfoil Inference connection failed"
+fi
+
+# Test the connection to Kagi Search
+log "Testing connection to Kagi Search:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.23/443'; then
+    log "Kagi Search connection successful"
+else
+    log "Kagi Search connection failed"
+fi
+
+# Test the connection to Brave Search
+log "Testing connection to Brave Search:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.24/443'; then
+    log "Brave Search connection successful"
+else
+    log "Brave Search connection failed"
 fi
 
 # Start the continuum-proxy if we're in AWS Nitro mode

@@ -81,6 +81,46 @@ impl ContentAccumulator {
                     completion_tokens: self.completion_tokens,
                 })
             }
+            StorageMessage::ToolCall {
+                tool_call_id,
+                name,
+                arguments,
+            } => {
+                trace!(
+                    "Storage: received tool_call - id={}, name={}",
+                    tool_call_id,
+                    name
+                );
+                // Signal immediate persistence
+                AccumulatorState::PersistToolCall {
+                    tool_call_id,
+                    name,
+                    arguments,
+                }
+            }
+            StorageMessage::ToolOutput {
+                tool_output_id,
+                tool_call_id,
+                output,
+            } => {
+                trace!(
+                    "Storage: received tool_output - id={}, tool_call_id={}, output_len={}",
+                    tool_output_id,
+                    tool_call_id,
+                    output.len()
+                );
+                // Signal immediate persistence
+                AccumulatorState::PersistToolOutput {
+                    tool_output_id,
+                    tool_call_id,
+                    output,
+                }
+            }
+            StorageMessage::AssistantMessageStarting => {
+                trace!("Storage: received assistant message starting signal (no-op for storage)");
+                // This is a signal for the client stream only, storage doesn't need to act on it
+                AccumulatorState::Continue
+            }
         }
     }
 }
@@ -91,6 +131,16 @@ pub enum AccumulatorState {
     Complete(CompleteData),
     Cancelled(PartialData),
     Failed(FailureData),
+    PersistToolCall {
+        tool_call_id: Uuid,
+        name: String,
+        arguments: serde_json::Value,
+    },
+    PersistToolOutput {
+        tool_output_id: Uuid,
+        tool_call_id: Uuid,
+        output: String,
+    },
 }
 
 /// Data for a completed response
@@ -259,20 +309,158 @@ impl ResponsePersister {
 }
 
 /// Main storage task that orchestrates accumulation and persistence
+#[allow(clippy::too_many_arguments)]
 pub async fn storage_task(
     mut rx: mpsc::Receiver<StorageMessage>,
+    tool_persist_ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     db: Arc<dyn DBConnection + Send + Sync>,
     response_id: i64,
+    conversation_id: i64,
+    user_id: Uuid,
     user_key: SecretKey,
     message_id: Uuid,
 ) {
     let mut accumulator = ContentAccumulator::new();
     let persister = ResponsePersister::new(db.clone(), response_id, message_id, user_key);
 
+    // Track tool acknowledgment channel
+    let mut tool_ack = tool_persist_ack;
+
     // Accumulate messages until completion or error
     while let Some(msg) = rx.recv().await {
         match accumulator.handle_message(msg) {
             AccumulatorState::Continue => continue,
+
+            AccumulatorState::PersistToolCall {
+                tool_call_id,
+                name,
+                arguments,
+            } => {
+                // Persist tool call immediately to database
+                use crate::models::responses::NewToolCall;
+
+                let arguments_json = match serde_json::to_string(&arguments) {
+                    Ok(json) => json,
+                    Err(e) => {
+                        error!("Failed to serialize tool arguments: {:?}", e);
+                        if let Some(ack) = tool_ack.take() {
+                            let _ = ack
+                                .send(Err(format!("Failed to serialize tool arguments: {:?}", e)));
+                        }
+                        continue;
+                    }
+                };
+                let arguments_enc = encrypt_with_key(&user_key, arguments_json.as_bytes()).await;
+                let token_count = count_tokens(&arguments_json);
+                let argument_tokens = if token_count > i32::MAX as usize {
+                    warn!(
+                        "Tool argument token count {} exceeds i32::MAX, clamping",
+                        token_count
+                    );
+                    i32::MAX
+                } else {
+                    token_count as i32
+                };
+
+                let new_tool_call = NewToolCall {
+                    uuid: tool_call_id,
+                    conversation_id,
+                    response_id: Some(response_id),
+                    user_id,
+                    name,
+                    arguments_enc: Some(arguments_enc),
+                    argument_tokens,
+                    status: "completed".to_string(),
+                };
+
+                match db.create_tool_call(new_tool_call) {
+                    Ok(tool_call) => {
+                        debug!(
+                            "Persisted tool_call {} (db id: {})",
+                            tool_call_id, tool_call.id
+                        );
+                        // No need to track the ID in memory - we'll look it up when needed
+                    }
+                    Err(e) => {
+                        error!("Failed to persist tool_call {}: {:?}", tool_call_id, e);
+                        if let Some(ack) = tool_ack.take() {
+                            let _ = ack.send(Err(format!("Failed to persist tool_call: {:?}", e)));
+                        }
+                    }
+                }
+            }
+
+            AccumulatorState::PersistToolOutput {
+                tool_output_id,
+                tool_call_id,
+                output,
+            } => {
+                // Persist tool output immediately to database
+                use crate::models::responses::NewToolOutput;
+
+                // Look up the tool_call by UUID to get its database ID (primary key)
+                // This is more reliable than tracking in memory across async operations
+                // Also validates that the tool_call belongs to this user (security check)
+                let tool_call_fk = match db.get_tool_call_by_uuid(tool_call_id, user_id) {
+                    Ok(tool_call) => tool_call.id,
+                    Err(e) => {
+                        error!(
+                            "Failed to find tool_call {} for tool_output: {:?}",
+                            tool_call_id, e
+                        );
+                        if let Some(ack) = tool_ack.take() {
+                            let _ =
+                                ack.send(Err(format!("Tool call not found in database: {:?}", e)));
+                        }
+                        continue;
+                    }
+                };
+
+                let output_enc = encrypt_with_key(&user_key, output.as_bytes()).await;
+                let token_count = count_tokens(&output);
+                let output_tokens = if token_count > i32::MAX as usize {
+                    warn!(
+                        "Tool output token count {} exceeds i32::MAX, clamping",
+                        token_count
+                    );
+                    i32::MAX
+                } else {
+                    token_count as i32
+                };
+
+                let new_tool_output = NewToolOutput {
+                    uuid: tool_output_id,
+                    conversation_id,
+                    response_id: Some(response_id),
+                    user_id,
+                    tool_call_fk,
+                    output_enc,
+                    output_tokens,
+                    status: "completed".to_string(),
+                    error: None,
+                };
+
+                match db.create_tool_output(new_tool_output) {
+                    Ok(_) => {
+                        debug!(
+                            "Persisted tool_output {} for tool_call {}",
+                            tool_output_id, tool_call_id
+                        );
+
+                        // Send acknowledgment after tool output is persisted
+                        if let Some(ack) = tool_ack.take() {
+                            let _ = ack.send(Ok(()));
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to persist tool_output {}: {:?}", tool_output_id, e);
+                        if let Some(ack) = tool_ack.take() {
+                            let _ =
+                                ack.send(Err(format!("Failed to persist tool_output: {:?}", e)));
+                        }
+                    }
+                }
+            }
 
             AccumulatorState::Complete(data) => {
                 if let Err(e) = persister.persist_completed(data).await {

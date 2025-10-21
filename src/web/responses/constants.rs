@@ -68,3 +68,7 @@ pub const DEFAULT_PAGINATION_ORDER: &str = "desc";
 
 /// Tool call defaults
 pub const DEFAULT_TOOL_FUNCTION_NAME: &str = "function";
+
+/// Tool-related event types
+pub const EVENT_TOOL_CALL_CREATED: &str = "tool_call.created";
+pub const EVENT_TOOL_OUTPUT_CREATED: &str = "tool_output.created";

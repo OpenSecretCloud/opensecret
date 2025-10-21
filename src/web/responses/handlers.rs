@@ -12,7 +12,7 @@ use crate::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
         responses::{
-            build_prompt, build_usage, constants::*, error_mapping, storage_task,
+            build_prompt, build_usage, constants::*, error_mapping, prompts, storage_task, tools,
             ContentPartBuilder, DeletedObjectResponse, MessageContent, MessageContentConverter,
             MessageContentPart, OutputItemBuilder, ResponseBuilder, ResponseEvent, SseEventEmitter,
         },
@@ -582,6 +582,46 @@ pub fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// SSE Event wrapper for tool_call.created
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallCreatedEvent {
+    /// Event type (always "tool_call.created")
+    #[serde(rename = "type")]
+    pub event_type: &'static str,
+
+    /// Sequence number for ordering
+    pub sequence_number: i32,
+
+    /// Tool call ID
+    pub tool_call_id: Uuid,
+
+    /// Tool name
+    pub name: String,
+
+    /// Tool arguments (JSON value)
+    pub arguments: Value,
+}
+
+/// SSE Event wrapper for tool_output.created
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolOutputCreatedEvent {
+    /// Event type (always "tool_output.created")
+    #[serde(rename = "type")]
+    pub event_type: &'static str,
+
+    /// Sequence number for ordering
+    pub sequence_number: i32,
+
+    /// Tool output ID
+    pub tool_output_id: Uuid,
+
+    /// Tool call ID this output belongs to
+    pub tool_call_id: Uuid,
+
+    /// Tool output content
+    pub output: String,
+}
+
 /// Message types for the storage task
 #[derive(Debug, Clone)]
 pub enum StorageMessage {
@@ -596,6 +636,19 @@ pub enum StorageMessage {
     },
     Error(String),
     Cancelled,
+    /// Tool-related messages
+    ToolCall {
+        tool_call_id: Uuid,
+        name: String,
+        arguments: Value,
+    },
+    ToolOutput {
+        tool_output_id: Uuid,
+        tool_call_id: Uuid,
+        output: String,
+    },
+    /// Signal that assistant message is about to start streaming
+    AssistantMessageStarting,
 }
 
 /// Validated and prepared request data
@@ -610,7 +663,7 @@ struct PreparedRequest {
 /// Context and conversation data after building prompt
 struct BuiltContext {
     conversation: crate::models::responses::Conversation,
-    prompt_messages: Vec<Value>,
+    prompt_messages: Arc<Vec<Value>>,
     total_prompt_tokens: usize,
 }
 
@@ -782,30 +835,18 @@ async fn spawn_title_generation_task(
     });
 }
 
-/// Phase 1: Validate input and prepare encrypted content
+/// Phase 1: Validate and normalize input
 ///
-/// This phase performs all input validation and normalization without any side effects
-/// (no database writes). It ensures the request is valid before proceeding.
+/// Performs all input validation and normalization without any side effects.
+/// Ensures the request is valid before proceeding.
 ///
-/// # Validations
-/// - Rejects guest users
+/// Operations:
+/// - Validates user is not guest
 /// - Gets user encryption key
 /// - Normalizes message content to Parts format
-/// - Rejects unsupported features (file uploads)
-/// - Counts tokens for billing check
-/// - Encrypts content for storage
+/// - Validates no unsupported features (file uploads)
+/// - Counts tokens and encrypts content
 /// - Generates assistant message UUID
-///
-/// # Arguments
-/// * `state` - Application state
-/// * `user` - Authenticated user
-/// * `body` - Request body
-///
-/// # Returns
-/// PreparedRequest containing validated and encrypted data
-///
-/// # Errors
-/// Returns ApiError if validation fails or user is unauthorized
 async fn validate_and_normalize_input(
     state: &Arc<AppState>,
     user: &User,
@@ -902,35 +943,15 @@ async fn validate_and_normalize_input(
     })
 }
 
-/// Phase 2: Build conversation context and check billing
+/// Phase 2: Build context and check billing
 ///
-/// This phase is read-only - it builds the conversation context from existing
-/// messages and performs billing checks WITHOUT writing to the database. This
-/// ensures we don't persist data if the user is over quota.
+/// Read-only phase that builds conversation context and validates billing quota
+/// before any database writes occur.
 ///
-/// # Operations
-/// - Gets conversation from database
-/// - Builds context from all existing messages
-/// - Adds the NEW user message to context (not yet persisted)
-/// - Checks billing quota (only for free users)
-/// - Validates token limits
-///
-/// # Critical Design Note
-/// The new user message is added to the context array but NOT yet persisted.
-/// This allows accurate billing checks before committing to storage.
-///
-/// # Arguments
-/// * `state` - Application state
-/// * `user` - Authenticated user
-/// * `body` - Request body
-/// * `user_key` - User's encryption key
-/// * `prepared` - Validated request data from Phase 1
-///
-/// # Returns
-/// BuiltContext containing conversation, prompt messages, and token count
-///
-/// # Errors
-/// Returns ApiError if conversation not found, billing check fails, or user over quota
+/// Operations:
+/// - Fetches conversation and existing messages
+/// - Builds prompt context with new user message (not yet persisted)
+/// - Checks billing quota and token limits
 async fn build_context_and_check_billing(
     state: &Arc<AppState>,
     user: &User,
@@ -1013,42 +1034,25 @@ async fn build_context_and_check_billing(
 
     Ok(BuiltContext {
         conversation,
-        prompt_messages,
+        prompt_messages: Arc::new(prompt_messages),
         total_prompt_tokens,
     })
 }
 
-/// Phase 3: Persist request data to database
+/// Phase 3: Persist request data
 ///
-/// This phase writes to the database ONLY after all validation and billing checks
-/// have passed. This ensures atomic semantics - either everything is written or
-/// nothing is written.
+/// Writes to database after all validation and billing checks have passed.
 ///
-/// # Database Operations
-/// - Creates Response record (job tracker) with status=in_progress
-/// - Creates user message record linked to response
-/// - Creates placeholder assistant message (status=in_progress, content=NULL)
-/// - Encrypts metadata if provided
-/// - Extracts internal_message_id from metadata if present
+/// Database operations:
+/// - Creates Response record (status=in_progress)
+/// - Creates user message
 ///
-/// # Design Notes
-/// - Placeholder assistant message allows clients to see in-progress status
-/// - Content is NULL until streaming completes
-/// - Response ID is used to link all related records
-/// - Metadata is encrypted before storage
-///
-/// # Arguments
-/// * `state` - Application state
-/// * `user` - Authenticated user
-/// * `body` - Request body
-/// * `prepared` - Validated request data from Phase 1
-/// * `conversation` - Conversation from Phase 2
-///
-/// # Returns
-/// PersistedData containing created records and decrypted metadata
-///
-/// # Errors
-/// Returns ApiError if database operations fail
+/// Note: Assistant message is NOT created here - it's created later in Phase 6 (after tools).
+/// Originally, the assistant placeholder was created here, but this caused timestamp
+/// ordering issues: the assistant message would get created_at=T1 (early), then tools
+/// would execute at T2/T3, making the assistant appear BEFORE its tools in queries
+/// ordered by created_at. By creating the assistant message in Phase 6 (after tools),
+/// we ensure the correct semantic order: user → tool_call → tool_output → assistant.
 async fn persist_request_data(
     state: &Arc<AppState>,
     user: &User,
@@ -1125,25 +1129,6 @@ async fn persist_request_data(
         .create_user_message(new_msg)
         .map_err(error_mapping::map_generic_db_error)?;
 
-    // Create placeholder assistant message with status='in_progress' and NULL content
-    let placeholder_assistant = NewAssistantMessage {
-        uuid: prepared.assistant_message_id,
-        conversation_id: conversation.id,
-        response_id: Some(response.id),
-        user_id: user.uuid,
-        content_enc: None,
-        completion_tokens: 0,
-        status: STATUS_IN_PROGRESS.to_string(),
-        finish_reason: None,
-    };
-    state
-        .db
-        .create_assistant_message(placeholder_assistant)
-        .map_err(|e| {
-            error!("Error creating placeholder assistant message: {:?}", e);
-            ApiError::InternalServerError
-        })?;
-
     info!(
         "Created response {} for user {} in conversation {}",
         response.uuid, user.uuid, conversation.uuid
@@ -1162,43 +1147,339 @@ async fn persist_request_data(
     })
 }
 
-/// Phase 4: Setup streaming pipeline with channels and tasks
+/// Helper function to check if tool_choice allows tool execution
 ///
-/// This phase sets up the dual-stream architecture that allows simultaneous
-/// streaming to the client and storage to the database. The streaming continues
-/// independently even if the client disconnects.
+/// Returns false if tool_choice is explicitly set to "none", true otherwise
+fn is_tool_choice_allowed(tool_choice: &Option<String>) -> bool {
+    tool_choice.as_deref() != Some("none")
+}
+
+/// Helper function to check if web_search tool is enabled in the request
 ///
-/// # Architecture
-/// - Creates two channels: storage (critical) and client (best-effort)
-/// - Spawns storage task to persist data as it arrives
-/// - Spawns upstream processor to parse SSE from chat API
-/// - Returns client channel for SSE event generation
+/// Returns true if the tools array contains an object with type="web_search"
+fn is_web_search_enabled(tools: &Option<Value>) -> bool {
+    if let Some(tools_value) = tools {
+        if let Some(tools_array) = tools_value.as_array() {
+            return tools_array.iter().any(|tool| {
+                tool.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s == "web_search")
+                    .unwrap_or(false)
+            });
+        }
+    }
+    false
+}
+
+/// Phase 5: Classify intent and execute tools (optional)
 ///
-/// # Key Design Principles
-/// 1. **Dual streaming**: Client and storage streams operate independently
-/// 2. **Storage priority**: Storage sends must succeed, client sends can fail
-/// 3. **Independent lifecycle**: Streaming continues even if client disconnects
-/// 4. **Cancellation support**: Listens for cancellation broadcast signals
+/// Classifies user intent and executes tools if needed. Runs after dual streams
+/// are created so tool events can be sent to both client and storage.
 ///
-/// # Task Spawning
-/// - Storage task: Accumulates content and persists on completion
-/// - Upstream processor: Parses SSE frames and broadcasts to both channels
+/// Flow:
+/// 1. Classify intent: chat vs web_search
+/// 2. If web_search: extract query and execute tool
+/// 3. Send ToolCall event to streams
+/// 4. Send ToolOutput event to streams (always, even on error)
+/// 5. Send persistence command via dedicated channel and wait for acknowledgment
 ///
-/// # Arguments
-/// * `state` - Application state
-/// * `user` - Authenticated user
-/// * `body` - Request body
-/// * `context` - Built context from Phase 2
-/// * `prepared` - Validated request data from Phase 1
-/// * `persisted` - Persisted records from Phase 3
-/// * `headers` - Request headers for upstream API call
+/// Tool execution is best-effort and uses fast model (gpt-oss-120b).
+struct ToolChannels<'a> {
+    client: &'a mpsc::Sender<StorageMessage>,
+    storage: &'a mpsc::Sender<StorageMessage>,
+}
+
+async fn classify_and_execute_tools(
+    state: &Arc<AppState>,
+    user: &User,
+    prepared: &PreparedRequest,
+    persisted: &PersistedData,
+    prompt_messages: &[Value],
+    channels: ToolChannels<'_>,
+    rx_tool_ack: tokio::sync::oneshot::Receiver<Result<(), String>>,
+) -> Result<Option<()>, ApiError> {
+    let ToolChannels {
+        client: tx_client,
+        storage: tx_storage,
+    } = channels;
+    // Extract text from user message for classification
+    let user_text =
+        MessageContentConverter::extract_text_for_token_counting(&prepared.message_content);
+
+    trace!(
+        "Classifying user intent for message: {}",
+        user_text.chars().take(100).collect::<String>()
+    );
+    debug!(
+        "Starting intent classification with {} conversation messages",
+        prompt_messages.len()
+    );
+
+    // Step 1: Classify intent using LLM with conversation history
+    let classification_request =
+        prompts::build_intent_classification_request(prompt_messages, &user_text);
+
+    trace!(
+        "Intent classification request: {}",
+        serde_json::to_string_pretty(&classification_request)
+            .unwrap_or_else(|_| "failed to serialize".to_string())
+    );
+
+    let headers = HeaderMap::new();
+    let billing_context = crate::web::openai::BillingContext::new(
+        crate::web::openai_auth::AuthMethod::Jwt,
+        "gpt-oss-120b".to_string(),
+    );
+
+    let intent = match get_chat_completion_response(
+        state,
+        user,
+        classification_request,
+        &headers,
+        billing_context,
+    )
+    .await
+    {
+        Ok(mut completion) => {
+            match completion.stream.recv().await {
+                Some(crate::web::openai::CompletionChunk::FullResponse(response_json)) => {
+                    trace!(
+                        "Intent classification response: {}",
+                        serde_json::to_string_pretty(&response_json)
+                            .unwrap_or_else(|_| "failed to serialize".to_string())
+                    );
+
+                    // Extract intent from response
+                    if let Some(intent_str) = response_json
+                        .get("choices")
+                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get("message"))
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_str())
+                    {
+                        let intent = intent_str.trim().to_lowercase();
+                        debug!("Classified intent: {}", intent);
+                        intent
+                    } else {
+                        warn!(
+                            "Failed to extract intent from classifier response, defaulting to chat"
+                        );
+                        trace!("Response structure: {:?}", response_json);
+                        "chat".to_string()
+                    }
+                }
+                _ => {
+                    warn!("Unexpected classifier response format, defaulting to chat");
+                    "chat".to_string()
+                }
+            }
+        }
+        Err(e) => {
+            // Best effort - if classification fails, default to chat
+            warn!("Classification failed (defaulting to chat): {:?}", e);
+            "chat".to_string()
+        }
+    };
+
+    // Step 2: If intent is web_search, execute tool
+    if intent == "web_search" {
+        debug!("User message classified as web_search, executing tool");
+
+        // Extract search query with conversation history for context
+        let query_request = prompts::build_query_extraction_request(prompt_messages, &user_text);
+        let billing_context = crate::web::openai::BillingContext::new(
+            crate::web::openai_auth::AuthMethod::Jwt,
+            "gpt-oss-120b".to_string(),
+        );
+
+        let search_query = match get_chat_completion_response(
+            state,
+            user,
+            query_request,
+            &headers,
+            billing_context,
+        )
+        .await
+        {
+            Ok(mut completion) => match completion.stream.recv().await {
+                Some(crate::web::openai::CompletionChunk::FullResponse(response_json)) => {
+                    if let Some(query) = response_json
+                        .get("choices")
+                        .and_then(|c| c.get(0))
+                        .and_then(|c| c.get("message"))
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| c.as_str())
+                    {
+                        let query = query.trim().to_string();
+                        trace!("Extracted search query: {}", query);
+                        debug!("Search query extracted successfully");
+                        query
+                    } else {
+                        warn!("Failed to extract query, using original message");
+                        user_text.clone()
+                    }
+                }
+                _ => {
+                    warn!("Unexpected query extraction response, using original message");
+                    user_text.clone()
+                }
+            },
+            Err(e) => {
+                warn!("Query extraction failed, using original message: {:?}", e);
+                user_text.clone()
+            }
+        };
+
+        // Generate UUIDs for tool_call and tool_output
+        let tool_call_id = Uuid::new_v4();
+        let tool_output_id = Uuid::new_v4();
+
+        // Prepare tool arguments
+        let tool_arguments = json!({"query": search_query});
+
+        // Send tool_call event through both streams FIRST (before execution)
+        let tool_call_msg = StorageMessage::ToolCall {
+            tool_call_id,
+            name: "web_search".to_string(),
+            arguments: tool_arguments.clone(),
+        };
+
+        // Send to storage (critical - must succeed)
+        //
+        // IMPORTANT: Storage channel failure means the storage task has died or the
+        // channel buffer (1024) is full. This is a catastrophic systemic failure, not
+        // a normal error. If this happens:
+        // 1. Nothing will be persisted to database
+        // 2. Continuing would waste LLM API calls for unsaved data
+        // 3. Client would see tool_call.created but never get completion
+        //
+        // We abort the entire request and notify the client with response.error event.
+        // If you see this error in production, investigate immediately - it indicates
+        // serious issues with the storage task or database connection.
+        if let Err(e) = tx_storage.send(tool_call_msg.clone()).await {
+            error!(
+                "Critical: Storage channel closed during tool_call for response {} - {:?}",
+                persisted.response.uuid, e
+            );
+            // Notify client and abort - storage failure is catastrophic
+            let _ = tx_client
+                .send(StorageMessage::Error(
+                    "Internal storage failure - request aborted".to_string(),
+                ))
+                .await;
+            return Err(ApiError::InternalServerError);
+        }
+        // Send to client (best-effort)
+        if tx_client.try_send(tool_call_msg).is_err() {
+            warn!("Client channel full or closed, skipping tool_call event to client");
+        }
+
+        debug!("Sent tool_call {} to streams", tool_call_id);
+
+        // Execute web search tool (or capture error as content)
+        let tool_output = match tools::execute_tool(
+            "web_search",
+            &tool_arguments,
+            state.brave_client.as_ref(),
+            state.kagi_client.as_ref(),
+        )
+        .await
+        {
+            Ok(output) => {
+                debug!(
+                    "Tool execution successful, output length: {} chars",
+                    output.len()
+                );
+                output
+            }
+            Err(e) => {
+                warn!("Tool execution failed, including error in output: {:?}", e);
+                // Failure becomes content, not a skip!
+                format!("Error: {}", e)
+            }
+        };
+
+        // Send tool_output event through both streams (ALWAYS sent, even on failure)
+        let tool_output_msg = StorageMessage::ToolOutput {
+            tool_output_id,
+            tool_call_id,
+            output: tool_output.clone(),
+        };
+
+        // Send to storage (critical - must succeed)
+        //
+        // IMPORTANT: Storage channel failure is catastrophic (see tool_call comment above).
+        // At this point, client has already seen tool_call.created event. If storage fails
+        // here, we have an inconsistency:
+        // - Database has tool_call record but no tool_output
+        // - Client saw tool_call.created but won't see tool_output.created
+        //
+        // We abort and send response.error so the client knows the request failed rather
+        // than hanging indefinitely waiting for completion. The database inconsistency
+        // (orphaned tool_call) is acceptable given this is a catastrophic failure scenario.
+        if let Err(e) = tx_storage.send(tool_output_msg.clone()).await {
+            error!(
+                "Critical: Storage channel closed during tool_output for response {} - {:?}",
+                persisted.response.uuid, e
+            );
+            // Notify client and abort - storage failure is catastrophic
+            let _ = tx_client
+                .send(StorageMessage::Error(
+                    "Internal storage failure - request aborted".to_string(),
+                ))
+                .await;
+            return Err(ApiError::InternalServerError);
+        }
+        // Send to client (best-effort)
+        if tx_client.try_send(tool_output_msg).is_err() {
+            warn!("Client channel full or closed, skipping tool_output event to client");
+        }
+
+        info!(
+            "Successfully sent tool_call {} and tool_output {} to streams for conversation {}",
+            tool_call_id, tool_output_id, persisted.response.conversation_id
+        );
+
+        // Wait for storage task to confirm persistence (with timeout)
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx_tool_ack).await {
+            Ok(Ok(Ok(()))) => {
+                debug!("Tools persisted successfully to database");
+                return Ok(Some(()));
+            }
+            Ok(Ok(Err(e))) => {
+                error!("Failed to persist tools to database: {}", e);
+                // Continue anyway - best effort
+                return Ok(Some(()));
+            }
+            Ok(Err(_)) => {
+                error!("Storage task dropped before sending acknowledgment");
+                return Ok(Some(()));
+            }
+            Err(_) => {
+                error!("Timeout waiting for tool persistence (5s)");
+                return Ok(Some(()));
+            }
+        }
+    } else {
+        debug!("User message classified as chat, skipping tool execution");
+    }
+
+    Ok(None)
+}
+
+/// Phase 6: Setup completion processor
 ///
-/// # Returns
-/// Tuple of (client channel receiver, response record) for SSE stream generation
+/// Gets completion stream from chat API and spawns processor task.
 ///
-/// # Errors
-/// Returns ApiError if chat API call fails or channel creation fails
-async fn setup_streaming_pipeline(
+/// Operations:
+/// - Creates placeholder assistant message (AFTER tools, so timestamp is ordered correctly)
+/// - Rebuilds prompt from DB if tools were executed (automatically includes tools)
+/// - Calls chat API with streaming enabled
+/// - Spawns processor task that converts CompletionChunks to StorageMessages
+/// - Processor feeds into dual streams (storage=critical, client=best-effort)
+/// - Listens for cancellation signals
+#[allow(clippy::too_many_arguments)]
+async fn setup_completion_processor(
     state: &Arc<AppState>,
     user: &User,
     body: &ResponsesCreateRequest,
@@ -1206,17 +1487,65 @@ async fn setup_streaming_pipeline(
     prepared: &PreparedRequest,
     persisted: &PersistedData,
     headers: &HeaderMap,
-) -> Result<
-    (
-        mpsc::Receiver<StorageMessage>,
-        crate::models::responses::Response,
-    ),
-    ApiError,
-> {
+    tx_client: mpsc::Sender<StorageMessage>,
+    tx_storage: mpsc::Sender<StorageMessage>,
+    tools_executed: bool,
+) -> Result<crate::models::responses::Response, ApiError> {
+    // Create placeholder assistant message with status='in_progress' and NULL content
+    //
+    // TIMING: This happens here in Phase 6 (not earlier in Phase 3) for two reasons:
+    // 1. Must happen AFTER tool execution (Phase 5) to get correct timestamp ordering
+    // 2. Must happen BEFORE calling completion API (below) so storage task can UPDATE it
+    //
+    // Previously, this was created in Phase 3 under the assumption it needed to exist early.
+    // However, it only needs to exist before the storage task tries to UPDATE it (when
+    // streaming completes). By creating it here, we ensure proper message ordering:
+    // user → tool_call → tool_output → assistant (this creation) → assistant content (update)
+    let placeholder_assistant = NewAssistantMessage {
+        uuid: prepared.assistant_message_id,
+        conversation_id: context.conversation.id,
+        response_id: Some(persisted.response.id),
+        user_id: user.uuid,
+        content_enc: None,
+        completion_tokens: 0,
+        status: STATUS_IN_PROGRESS.to_string(),
+        finish_reason: None,
+    };
+    state
+        .db
+        .create_assistant_message(placeholder_assistant)
+        .map_err(|e| {
+            error!("Error creating placeholder assistant message: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    debug!(
+        "Created placeholder assistant message {} after tool execution",
+        prepared.assistant_message_id
+    );
+
+    // If tools were executed, rebuild prompt from DB (will now include persisted tools)
+    // Otherwise use the context we built earlier
+    let prompt_messages = if tools_executed {
+        debug!("Tools were executed - rebuilding prompt from DB to include tool messages");
+        let (rebuilt_messages, _tokens) = build_prompt(
+            state.db.as_ref(),
+            context.conversation.id,
+            user.uuid,
+            &prepared.user_key,
+            &body.model,
+            body.instructions.as_deref(),
+        )?;
+        rebuilt_messages
+    } else {
+        // Clone out of Arc only when actually needed for the completion request
+        Arc::as_ref(&context.prompt_messages).clone()
+    };
+
     // Build chat completion request
     let chat_request = json!({
         "model": body.model,
-        "messages": context.prompt_messages,
+        "messages": prompt_messages,
         "temperature": body.temperature.unwrap_or(DEFAULT_TEMPERATURE),
         "top_p": body.top_p.unwrap_or(DEFAULT_TOP_P),
         "max_tokens": body.max_output_tokens,
@@ -1247,23 +1576,19 @@ async fn setup_streaming_pipeline(
         completion.metadata.provider_name, completion.metadata.model_name
     );
 
-    // Create channels for storage task and client stream
-    let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
-    let (tx_client, rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
-
-    // Spawn storage task (no longer needs sqs_publisher - billing is centralized!)
-    let _storage_handle = {
-        let db = state.db.clone();
-        let response_id = persisted.response.id;
-        let user_key = prepared.user_key;
-        let message_id = prepared.assistant_message_id;
-
-        tokio::spawn(async move {
-            storage_task(rx_storage, db, response_id, user_key, message_id).await;
-        })
-    };
+    // Signal that assistant message is about to start streaming
+    // CRITICAL: Must send BEFORE spawning processor to guarantee ordering
+    // (processor will immediately start sending ContentDelta messages)
+    if let Err(e) = tx_client
+        .send(StorageMessage::AssistantMessageStarting)
+        .await
+    {
+        error!("Failed to send AssistantMessageStarting signal: {:?}", e);
+        // Client channel closed - not critical, continue anyway
+    }
 
     // Spawn stream processor task that converts CompletionChunks to StorageMessages
+    // and feeds them into the master stream channels (created in Phase 3.5)
     let _processor_handle = {
         let mut rx_completion = completion.stream;
         let message_id = prepared.assistant_message_id;
@@ -1315,16 +1640,19 @@ async fn setup_streaming_pipeline(
                                     .and_then(|d| d.get("content"))
                                     .and_then(|c| c.as_str())
                                 {
-                                    let msg = StorageMessage::ContentDelta(content.to_string());
-                                    // Must send to storage (critical, can block)
-                                    if tx_storage.send(msg.clone()).await.is_err() {
-                                        error!("Storage channel closed unexpectedly");
-                                        break;
-                                    }
-                                    // Best-effort send to client (non-blocking, never blocks storage)
-                                    if client_alive && tx_client.try_send(msg).is_err() {
-                                        warn!("Client channel full or closed, terminating client stream");
-                                        client_alive = false;
+                                    // Skip empty content deltas to avoid sending unnecessary events to client
+                                    if !content.is_empty() {
+                                        let msg = StorageMessage::ContentDelta(content.to_string());
+                                        // Must send to storage (critical, can block)
+                                        if tx_storage.send(msg.clone()).await.is_err() {
+                                            error!("Storage channel closed unexpectedly");
+                                            break;
+                                        }
+                                        // Best-effort send to client (non-blocking, never blocks storage)
+                                        if client_alive && tx_client.try_send(msg).is_err() {
+                                            warn!("Client channel full or closed, terminating client stream");
+                                            client_alive = false;
+                                        }
                                     }
                                 }
                             }
@@ -1380,7 +1708,7 @@ async fn setup_streaming_pipeline(
         })
     };
 
-    Ok((rx_client, persisted.response.clone()))
+    Ok(persisted.response.clone())
 }
 
 async fn create_response_stream(
@@ -1395,17 +1723,19 @@ async fn create_response_stream(
     trace!("Request body: {:?}", body);
     trace!("Stream requested: {}", body.stream);
 
-    // Phase 1: Validate and normalize input (no side effects)
+    // Phase 1: Validate and normalize input
     let prepared = validate_and_normalize_input(&state, &user, &body).await?;
 
-    // Phase 2: Build context and check billing (read-only, no DB writes)
+    // Phase 2: Build context and check billing
     let context =
         build_context_and_check_billing(&state, &user, &body, &prepared.user_key, &prepared)
             .await?;
 
-    // Check if this is the first user message in the conversation
-    // The context.prompt_messages includes the NEW user message (added in build_context_and_check_billing)
-    // Count user and assistant messages - if there's exactly 1 user and 0 assistant, it's the first message
+    // Phase 3: Persist request data
+    let persisted =
+        persist_request_data(&state, &user, &body, &prepared, &context.conversation).await?;
+
+    // Check if first message and spawn title generation task
     let (user_count, assistant_count) =
         context
             .prompt_messages
@@ -1417,23 +1747,10 @@ async fn create_response_stream(
                     _ => (users, assistants),
                 }
             });
-    let is_first_message = user_count == 1 && assistant_count == 0;
 
-    // Phase 3: Persist to database (only after all checks pass)
-    let persisted =
-        persist_request_data(&state, &user, &body, &prepared, &context.conversation).await?;
-
-    // If this is the first message, spawn background task to generate conversation title
-    if is_first_message {
-        debug!(
-            "First message detected, spawning title generation task for conversation {}",
-            context.conversation.uuid
-        );
-
-        // Extract text content for title generation
+    if user_count == 1 && assistant_count == 0 {
         let user_content =
             MessageContentConverter::extract_text_for_token_counting(&prepared.message_content);
-
         spawn_title_generation_task(
             state.clone(),
             context.conversation.id,
@@ -1445,53 +1762,22 @@ async fn create_response_stream(
         .await;
     }
 
-    // Phase 4: Setup streaming pipeline
-    let (mut rx_client, response) = match setup_streaming_pipeline(
-        &state, &user, &body, &context, &prepared, &persisted, &headers,
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            // Streaming setup failed - clean up the database records
-            error!(
-                "Failed to setup streaming pipeline for response {}: {:?}",
-                persisted.response.uuid, e
-            );
-
-            // Update response status to failed
-            if let Err(db_err) = state.db.update_response_status(
-                persisted.response.id,
-                ResponseStatus::Failed,
-                Some(Utc::now()),
-            ) {
-                error!(
-                    "Failed to update response status after pipeline error: {:?}",
-                    db_err
-                );
-            }
-
-            // Update assistant message to incomplete with no content
-            if let Err(db_err) = state.db.update_assistant_message(
-                prepared.assistant_message_id,
-                None, // No content
-                0,    // No tokens
-                STATUS_INCOMPLETE.to_string(),
-                None, // No finish_reason since we failed before streaming
-            ) {
-                error!(
-                    "Failed to update assistant message after pipeline error: {:?}",
-                    db_err
-                );
-            }
-
-            return Err(e);
-        }
-    };
-
+    // Capture variables needed inside the stream
+    let response_for_stream = persisted.response.clone();
+    let decrypted_metadata = persisted.decrypted_metadata.clone();
     let assistant_message_id = prepared.assistant_message_id;
     let total_prompt_tokens = context.total_prompt_tokens;
+    let response_id = persisted.response.id;
+    let response_uuid = persisted.response.uuid;
+    let conversation_id = context.conversation.id;
+    let user_id = user.uuid;
+    let user_key = prepared.user_key;
+    let message_content = prepared.message_content.clone();
+    let content_enc = prepared.content_enc.clone();
+    let conversation_for_stream = context.conversation.clone();
+    let prompt_messages = context.prompt_messages.clone();
 
+    // Phases 4-6 now happen INSIDE the stream to start sending events ASAP
     trace!("Creating SSE event stream for client");
     let event_stream = async_stream::stream! {
         trace!("=== STARTING SSE STREAM ===");
@@ -1499,11 +1785,11 @@ async fn create_response_stream(
         // Initialize the SSE event emitter
         let mut emitter = SseEventEmitter::new(&state, session_id, 0);
 
-        // Send initial response.created event
+        // Send initial response.created event IMMEDIATELY (before any processing)
         trace!("Building response.created event");
-        let created_response = ResponseBuilder::from_response(&response)
+        let created_response = ResponseBuilder::from_response(&response_for_stream)
             .status(STATUS_IN_PROGRESS)
-            .metadata(persisted.decrypted_metadata.clone())
+            .metadata(decrypted_metadata.clone())
             .build();
 
         let created_event = ResponseCreatedEvent {
@@ -1523,44 +1809,199 @@ async fn create_response_stream(
 
         yield Ok(ResponseEvent::InProgress(in_progress_event).to_sse_event(&mut emitter).await);
 
-        // Process messages from upstream processor
+        // Phase 4: Create dual streams and spawn storage task
+        trace!("Phase 4: Creating dual streams and spawning storage task");
+        let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
+        let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
+
+        // Create oneshot channel for tool persistence acknowledgment
+        let (tx_tool_ack, rx_tool_ack) = tokio::sync::oneshot::channel();
+
+        let _storage_handle = {
+            let db = state.db.clone();
+
+            tokio::spawn(async move {
+                storage_task(
+                    rx_storage,
+                    Some(tx_tool_ack),
+                    db,
+                    response_id,
+                    conversation_id,
+                    user_id,
+                    user_key,
+                    assistant_message_id,
+                )
+                .await;
+            })
+        };
+
+        // Spawn orchestrator task for phases 5-6 (runs in background, sends events to tx_client)
+        trace!("Spawning background orchestrator for phases 5-6");
+        let orchestrator_tx_client = tx_client.clone();
+        let orchestrator_tx_storage = tx_storage.clone();
+        let orchestrator_state = state.clone();
+        let orchestrator_user = user.clone();
+        let orchestrator_body = body.clone();
+        let orchestrator_headers = headers.clone();
+        let orchestrator_response = response_for_stream.clone();
+        let orchestrator_metadata = decrypted_metadata.clone();
+        let orchestrator_conversation = conversation_for_stream.clone();
+        let orchestrator_prompt_messages = prompt_messages.clone();
+
+        tokio::spawn(async move {
+            trace!("Orchestrator: Starting phases 5-6 in background");
+
+            // Subscribe to cancellation broadcast
+            let mut cancel_rx = orchestrator_state.cancellation_broadcast.subscribe();
+
+            // Run phases 5-6 with cancellation support
+            tokio::select! {
+                _ = async {
+                    // Phase 5: Classify intent and execute tools (if tool_choice allows it AND web_search is enabled AND Kagi client available)
+                    let tools_executed = if is_tool_choice_allowed(&orchestrator_body.tool_choice)
+                        && is_web_search_enabled(&orchestrator_body.tools)
+                        && orchestrator_state.kagi_client.is_some() {
+                        debug!("Orchestrator: tool_choice allows tools, web search enabled, and Kagi client available, proceeding with classification");
+
+                        let prepared_for_tools = PreparedRequest {
+                            user_key,
+                            message_content: message_content.clone(),
+                            user_message_tokens: 0,
+                            content_enc: content_enc.clone(),
+                            assistant_message_id,
+                        };
+
+                        let persisted_for_tools = PersistedData {
+                            response: orchestrator_response.clone(),
+                            decrypted_metadata: orchestrator_metadata.clone(),
+                        };
+
+                        match classify_and_execute_tools(
+                            &orchestrator_state,
+                            &orchestrator_user,
+                            &prepared_for_tools,
+                            &persisted_for_tools,
+                            &orchestrator_prompt_messages,
+                            ToolChannels {
+                                client: &orchestrator_tx_client,
+                                storage: &orchestrator_tx_storage,
+                            },
+                            rx_tool_ack,
+                        )
+                        .await
+                        {
+                            Ok(result) => result.is_some(),
+                            Err(e) => {
+                                error!("Orchestrator: Critical error during tool execution, treating as cancellation: {:?}", e);
+
+                                // Treat critical errors (storage failure) same as cancellation
+                                // Send cancellation to both channels - storage task will handle cleanup
+                                let _ = orchestrator_tx_storage.send(StorageMessage::Cancelled).await;
+                                let _ = orchestrator_tx_client.send(StorageMessage::Cancelled).await;
+
+                                // Abort orchestrator - don't waste resources on LLM call
+                                // Storage task will update response status and assistant message
+                                return;
+                            }
+                        }
+                    } else {
+                        debug!("Orchestrator: Web search tool not enabled or Kagi client not available, skipping classification");
+                        drop(rx_tool_ack);
+                        false
+                    };
+
+                    // Phase 6: Setup completion processor
+                    trace!("Orchestrator: Setting up completion processor");
+
+                    let context_for_completion = BuiltContext {
+                        conversation: orchestrator_conversation,
+                        prompt_messages: orchestrator_prompt_messages,
+                        total_prompt_tokens,
+                    };
+
+                    let prepared_for_completion = PreparedRequest {
+                        user_key,
+                        message_content,
+                        user_message_tokens: 0,
+                        content_enc,
+                        assistant_message_id,
+                    };
+
+                    let persisted_for_completion = PersistedData {
+                        response: orchestrator_response.clone(),
+                        decrypted_metadata: orchestrator_metadata.clone(),
+                    };
+
+                    match setup_completion_processor(
+                        &orchestrator_state,
+                        &orchestrator_user,
+                        &orchestrator_body,
+                        &context_for_completion,
+                        &prepared_for_completion,
+                        &persisted_for_completion,
+                        &orchestrator_headers,
+                        orchestrator_tx_client.clone(),
+                        orchestrator_tx_storage.clone(),
+                        tools_executed,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            trace!("Orchestrator: Completion processor setup complete");
+                            // AssistantMessageStarting is now sent from inside setup_completion_processor
+                            // to guarantee it arrives before any completion deltas
+                        }
+                        Err(e) => {
+                            error!("Orchestrator: Failed to setup completion processor: {:?}", e);
+
+                            // Update response status to failed
+                            if let Err(db_err) = orchestrator_state.db.update_response_status(
+                                response_id,
+                                ResponseStatus::Failed,
+                                Some(Utc::now()),
+                            ) {
+                                error!("Orchestrator: Failed to update response status: {:?}", db_err);
+                            }
+
+                            // Update assistant message to incomplete
+                            if let Err(db_err) = orchestrator_state.db.update_assistant_message(
+                                assistant_message_id,
+                                None,
+                                0,
+                                STATUS_INCOMPLETE.to_string(),
+                                None,
+                            ) {
+                                error!("Orchestrator: Failed to update assistant message: {:?}", db_err);
+                            }
+
+                            // Send error to client via channel (best-effort)
+                            let _ = orchestrator_tx_client.try_send(StorageMessage::Error(
+                                format!("Failed to setup streaming: {:?}", e)
+                            ));
+                        }
+                    }
+                } => {
+                    trace!("Orchestrator: Phases 5-6 completed normally");
+                }
+
+                Ok(cancelled_id) = cancel_rx.recv() => {
+                    if cancelled_id == response_uuid {
+                        debug!("Orchestrator: Received cancellation during phases 5-6 for response {}", response_uuid);
+
+                        // Send cancellation to both channels
+                        let _ = orchestrator_tx_storage.send(StorageMessage::Cancelled).await;
+                        let _ = orchestrator_tx_client.send(StorageMessage::Cancelled).await;
+
+                        trace!("Orchestrator: Cancellation handled, exiting");
+                    }
+                }
+            }
+        });
+
+        // NOW immediately start the event loop - it will receive events from orchestrator as they happen
+        trace!("Starting event loop to receive messages from background tasks");
         let mut assistant_content = String::new();
         let mut total_completion_tokens = 0i32;
-
-        // Event 3: response.output_item.added
-        let output_item_added_event = ResponseOutputItemAddedEvent {
-            event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
-            sequence_number: emitter.sequence_number(),
-            output_index: 0,
-            item: OutputItem {
-                id: assistant_message_id.to_string(),
-                output_type: OUTPUT_TYPE_MESSAGE.to_string(),
-                status: STATUS_IN_PROGRESS.to_string(),
-                role: Some(ROLE_ASSISTANT.to_string()),
-                content: Some(vec![]),
-            },
-        };
-
-        yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
-
-        // Event 4: response.content_part.added
-        let content_part_added_event = ResponseContentPartAddedEvent {
-            event_type: EVENT_RESPONSE_CONTENT_PART_ADDED,
-            sequence_number: emitter.sequence_number(),
-            item_id: assistant_message_id.to_string(),
-            output_index: 0,
-            content_index: 0,
-            part: ContentPart {
-                part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
-                annotations: vec![],
-                logprobs: vec![],
-                text: String::new(),
-            },
-        };
-
-        yield Ok(ResponseEvent::ContentPartAdded(content_part_added_event).to_sse_event(&mut emitter).await);
-
-        trace!("Starting to process messages from upstream processor");
         while let Some(msg) = rx_client.recv().await {
             trace!("Client stream received message from upstream processor");
             match msg {
@@ -1629,11 +2070,11 @@ async fn create_response_stream(
                                     .build();
                                 let usage = build_usage(total_prompt_tokens as i32, total_completion_tokens);
 
-                                let done_response = ResponseBuilder::from_response(&response)
+                                let done_response = ResponseBuilder::from_response(&response_for_stream)
                                     .status(STATUS_COMPLETED)
                                     .output(vec![output_item])
                                     .usage(usage)
-                                    .metadata(persisted.decrypted_metadata.clone())
+                                    .metadata(decrypted_metadata.clone())
                                     .build();
 
                                 let completed_event = ResponseCompletedEvent {
@@ -1675,7 +2116,7 @@ async fn create_response_stream(
                         event_type: EVENT_RESPONSE_CANCELLED,
                         created_at: Utc::now().timestamp(),
                         data: ResponseCancelledData {
-                            id: response.uuid,
+                            id: response_uuid,
                         },
                     };
 
@@ -1695,6 +2136,68 @@ async fn create_response_stream(
 
                     yield Ok(ResponseEvent::Error(error_event).to_sse_event(&mut emitter).await);
                     break;
+                }
+                StorageMessage::ToolCall { tool_call_id, name, arguments } => {
+                    debug!("Client stream received tool_call event: {} ({})", name, tool_call_id);
+                    // Send tool_call.created event
+                    let tool_call_event = ToolCallCreatedEvent {
+                        event_type: EVENT_TOOL_CALL_CREATED,
+                        sequence_number: emitter.sequence_number(),
+                        tool_call_id,
+                        name,
+                        arguments,
+                    };
+
+                    yield Ok(ResponseEvent::ToolCallCreated(tool_call_event).to_sse_event(&mut emitter).await);
+                }
+                StorageMessage::ToolOutput { tool_output_id, tool_call_id, output } => {
+                    debug!("Client stream received tool_output event: {}", tool_output_id);
+                    // Send tool_output.created event
+                    let tool_output_event = ToolOutputCreatedEvent {
+                        event_type: EVENT_TOOL_OUTPUT_CREATED,
+                        sequence_number: emitter.sequence_number(),
+                        tool_output_id,
+                        tool_call_id,
+                        output,
+                    };
+
+                    yield Ok(ResponseEvent::ToolOutputCreated(tool_output_event).to_sse_event(&mut emitter).await);
+                }
+                StorageMessage::AssistantMessageStarting => {
+                    debug!("Client stream received assistant message starting signal");
+
+                    // Event 3: response.output_item.added
+                    let output_item_added_event = ResponseOutputItemAddedEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
+                        sequence_number: emitter.sequence_number(),
+                        output_index: 0,
+                        item: OutputItem {
+                            id: assistant_message_id.to_string(),
+                            output_type: OUTPUT_TYPE_MESSAGE.to_string(),
+                            status: STATUS_IN_PROGRESS.to_string(),
+                            role: Some(ROLE_ASSISTANT.to_string()),
+                            content: Some(vec![]),
+                        },
+                    };
+
+                    yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
+
+                    // Event 4: response.content_part.added
+                    let content_part_added_event = ResponseContentPartAddedEvent {
+                        event_type: EVENT_RESPONSE_CONTENT_PART_ADDED,
+                        sequence_number: emitter.sequence_number(),
+                        item_id: assistant_message_id.to_string(),
+                        output_index: 0,
+                        content_index: 0,
+                        part: ContentPart {
+                            part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
+                            annotations: vec![],
+                            logprobs: vec![],
+                            text: String::new(),
+                        },
+                    };
+
+                    yield Ok(ResponseEvent::ContentPartAdded(content_part_added_event).to_sse_event(&mut emitter).await);
                 }
             }
         }

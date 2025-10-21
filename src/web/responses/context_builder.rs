@@ -84,31 +84,142 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
 
     // Decrypt and add the messages we fetched
     for r in raw {
-        // Skip messages with no content (in_progress assistant messages)
-        let content_enc = match &r.content_enc {
-            Some(enc) => enc,
-            None => continue,
-        };
+        match r.message_type.as_str() {
+            "user" => {
+                // User messages have encrypted MessageContent
+                let content_enc = match &r.content_enc {
+                    Some(enc) => enc,
+                    None => continue,
+                };
+                let plain = decrypt_with_key(user_key, content_enc)
+                    .map_err(|_| crate::ApiError::InternalServerError)?;
+                let content = String::from_utf8_lossy(&plain).into_owned();
+                let t = r
+                    .token_count
+                    .map(|v| v as usize)
+                    .unwrap_or_else(|| count_tokens(&content));
+                msgs.push(ChatMsg {
+                    role: ROLE_USER,
+                    content,
+                    tool_call_id: None,
+                    tok: t,
+                });
+            }
+            "assistant" => {
+                // Skip in_progress assistant messages (no content yet)
+                let content_enc = match &r.content_enc {
+                    Some(enc) => enc,
+                    None => continue,
+                };
+                let plain = decrypt_with_key(user_key, content_enc)
+                    .map_err(|_| crate::ApiError::InternalServerError)?;
+                let content = String::from_utf8_lossy(&plain).into_owned();
+                let t = r
+                    .token_count
+                    .map(|v| v as usize)
+                    .unwrap_or_else(|| count_tokens(&content));
+                msgs.push(ChatMsg {
+                    role: ROLE_ASSISTANT,
+                    content,
+                    tool_call_id: None,
+                    tok: t,
+                });
+            }
+            "tool_call" => {
+                // Tool calls are stored with encrypted arguments
+                // We need to format these as assistant messages with tool_calls array
+                let content_enc = match &r.content_enc {
+                    Some(enc) => enc,
+                    None => continue,
+                };
+                let plain = decrypt_with_key(user_key, content_enc)
+                    .map_err(|_| crate::ApiError::InternalServerError)?;
+                let arguments_str = String::from_utf8_lossy(&plain).into_owned();
 
-        let plain = decrypt_with_key(user_key, content_enc)
-            .map_err(|_| crate::ApiError::InternalServerError)?;
-        let content = String::from_utf8_lossy(&plain).into_owned();
-        let role = match r.message_type.as_str() {
-            "user" => ROLE_USER,
-            "assistant" => ROLE_ASSISTANT,
-            "tool_output" => "tool",
-            _ => continue, // Skip tool_call itself
-        };
-        let t = r
-            .token_count
-            .map(|v| v as usize)
-            .unwrap_or_else(|| count_tokens(&content));
-        msgs.push(ChatMsg {
-            role,
-            content,
-            tool_call_id: r.tool_call_id,
-            tok: t,
-        });
+                // Parse arguments as JSON - if malformed, use empty object but continue safely
+                let arguments: serde_json::Value =
+                    serde_json::from_str(&arguments_str).unwrap_or_else(|e| {
+                        error!("Failed to parse tool call arguments as JSON: {:?}. Using empty object.", e);
+                        serde_json::json!({})
+                    });
+
+                // Get tool name from database
+                let tool_name = r.tool_name.as_deref().unwrap_or("function");
+
+                // Serialize arguments back to string for OpenAI format
+                // OpenAI expects arguments as a JSON string, not a JSON object
+                let arguments_string = serde_json::to_string(&arguments).unwrap_or_else(|e| {
+                    error!(
+                        "Failed to serialize tool arguments: {:?}. Using empty object string.",
+                        e
+                    );
+                    "{}".to_string()
+                });
+
+                // Format as assistant message with tool_calls
+                let tool_call_msg = serde_json::json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": r.tool_call_id.unwrap_or_else(uuid::Uuid::new_v4).to_string(),
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": arguments_string
+                        }
+                    }]
+                });
+
+                // Serialize tool_call_msg for storage in ChatMsg
+                // This should never fail since we're serializing a well-formed JSON structure
+                let content = match serde_json::to_string(&tool_call_msg) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(
+                            "Failed to serialize tool_call message: {:?}. Skipping this tool call.",
+                            e
+                        );
+                        // If this fails, skip this message entirely rather than corrupting the conversation
+                        continue;
+                    }
+                };
+
+                let t = r
+                    .token_count
+                    .map(|v| v as usize)
+                    .unwrap_or_else(|| count_tokens(&arguments_str));
+
+                msgs.push(ChatMsg {
+                    role: ROLE_ASSISTANT,
+                    content,
+                    tool_call_id: None,
+                    tok: t,
+                });
+            }
+            "tool_output" => {
+                // Tool outputs have encrypted output content
+                let content_enc = match &r.content_enc {
+                    Some(enc) => enc,
+                    None => continue,
+                };
+                let plain = decrypt_with_key(user_key, content_enc)
+                    .map_err(|_| crate::ApiError::InternalServerError)?;
+                let content = String::from_utf8_lossy(&plain).into_owned();
+                let t = r
+                    .token_count
+                    .map(|v| v as usize)
+                    .unwrap_or_else(|| count_tokens(&content));
+                msgs.push(ChatMsg {
+                    role: "tool",
+                    content,
+                    tool_call_id: r.tool_call_id,
+                    tok: t,
+                });
+            }
+            _ => {
+                // Unknown message type, skip
+                continue;
+            }
+        }
     }
 
     // Insert truncation message if we truncated
@@ -432,7 +543,28 @@ pub fn build_prompt_from_chat_messages(
                     })?
                     .to_string()
             })
+        } else if m.role == ROLE_ASSISTANT {
+            // Check if this is a tool_call message (JSON with tool_calls field) or regular assistant message
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&m.content) {
+                if parsed.get("tool_calls").is_some() {
+                    // This is a tool_call message - use the JSON directly
+                    parsed
+                } else {
+                    // Regular assistant message - plain string
+                    json!({
+                        "role": ROLE_ASSISTANT,
+                        "content": m.content
+                    })
+                }
+            } else {
+                // Not valid JSON, treat as regular assistant message
+                json!({
+                    "role": ROLE_ASSISTANT,
+                    "content": m.content
+                })
+            }
         } else {
+            // User messages
             // Deserialize stored MessageContent and convert to OpenAI format
             let content = if m.role == ROLE_USER {
                 // User messages are stored as MessageContent - convert to OpenAI format
@@ -443,7 +575,7 @@ pub fn build_prompt_from_chat_messages(
                 })?;
                 MessageContentConverter::to_openai_format(&mc)
             } else {
-                // Assistant messages are plain strings
+                // Fallback for any other role
                 serde_json::Value::String(m.content.clone())
             };
 

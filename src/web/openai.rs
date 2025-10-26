@@ -597,6 +597,7 @@ pub async fn get_chat_completion_response(
     tokio::spawn(async move {
         let mut body_stream = res.into_body().into_stream();
         let mut buffer = String::new();
+        let mut usage_sent = false; // Track if we've already published usage for this stream
 
         loop {
             match timeout(
@@ -623,24 +624,40 @@ pub async fn get_chat_completion_response(
 
                                 match serde_json::from_str::<Value>(&frame) {
                                     Ok(json) => {
-                                        // ✅ Extract and publish billing HERE
-                                        if let Some(usage) = extract_usage(&json) {
-                                            publish_usage_event_internal(
-                                                &state_clone,
-                                                &user_clone,
-                                                &billing_ctx,
-                                                usage.clone(),
-                                                &provider,
-                                            )
-                                            .await;
+                                        // ✅ Extract and publish billing HERE - but ONLY on final chunk
+                                        // This prevents sending usage data on intermediate chunks that vLLM now includes
+                                        let has_finish = has_finish_reason(&json);
 
-                                            // Also send usage to consumer
-                                            if tx_consumer
-                                                .send(CompletionChunk::Usage(usage))
-                                                .await
-                                                .is_err()
+                                        if let Some(usage) = extract_usage(&json) {
+                                            // Only publish usage on final chunk (has finish_reason) with actual completion tokens
+                                            // Also ensure we only send usage once per stream
+                                            if has_finish
+                                                && usage.completion_tokens > 0
+                                                && !usage_sent
                                             {
-                                                return;
+                                                publish_usage_event_internal(
+                                                    &state_clone,
+                                                    &user_clone,
+                                                    &billing_ctx,
+                                                    usage.clone(),
+                                                    &provider,
+                                                )
+                                                .await;
+                                                usage_sent = true;
+
+                                                // Also send usage to consumer
+                                                if tx_consumer
+                                                    .send(CompletionChunk::Usage(usage))
+                                                    .await
+                                                    .is_err()
+                                                {
+                                                    return;
+                                                }
+                                            } else {
+                                                trace!(
+                                                    "Skipping usage publish: has_finish={}, completion_tokens={}, usage_sent={}",
+                                                    has_finish, usage.completion_tokens, usage_sent
+                                                );
                                             }
                                         }
 
@@ -736,6 +753,22 @@ fn extract_usage(json: &Value) -> Option<CompletionUsage> {
             .and_then(|v| v.as_i64())
             .unwrap_or(0) as i32,
     })
+}
+
+/// Helper to check if a streaming chunk has a finish_reason
+/// This indicates it's the final chunk in the stream
+fn has_finish_reason(json: &Value) -> bool {
+    if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+        for choice in choices {
+            if let Some(finish_reason) = choice.get("finish_reason") {
+                // finish_reason is present and not null
+                if !finish_reason.is_null() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Helper to extract SSE frame from buffer

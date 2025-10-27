@@ -939,11 +939,16 @@ Add these lines:
 ```
 - {address: api-github-proxy.tinfoil.sh, port: 443}
 - {address: tuf-repo-cdn.sigstore.dev, port: 443}
-- {address: deepseek-r1-70b-p.model.tinfoil.sh, port: 443}  # DEPRECATED: Will be removed after full migration to inference.tinfoil.sh
-- {address: doc-upload.model.tinfoil.sh, port: 443}
 - {address: kds-proxy.tinfoil.sh, port: 443}
 - {address: gh-attestation-proxy.tinfoil.sh, port: 443}
-- {address: inference.tinfoil.sh, port: 443}  # NEW: Unified inference endpoint for all models
+- {address: atc.tinfoil.sh, port: 443}
+- {address: router.inf4.tinfoil.sh, port: 443}
+- {address: router.inf5.tinfoil.sh, port: 443}
+- {address: router.inf6.tinfoil.sh, port: 443}
+- {address: router.inf7.tinfoil.sh, port: 443}
+- {address: router.inf8.tinfoil.sh, port: 443}
+- {address: router.inf9.tinfoil.sh, port: 443}
+- {address: router.inf10.tinfoil.sh, port: 443}
 ```
 
 Restart the nitro vsock proxy service:
@@ -991,27 +996,6 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-#### Tinfoil DeepSeek Model (DEPRECATED - Use Tinfoil Inference service instead)
-```sh
-# DEPRECATED: This service will be removed after full migration to the unified inference endpoint
-sudo vim /etc/systemd/system/vsock-tinfoil-deepseek.service
-```
-
-Add the following content:
-```
-[Unit]
-Description=Vsock Tinfoil DeepSeek Model Service (DEPRECATED)
-After=network.target
-
-[Service]
-User=root
-ExecStart=/usr/bin/vsock-proxy 8021 deepseek-r1-70b-p.model.tinfoil.sh 443
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
 #### Tinfoil KDS Proxy
 ```sh
 sudo vim /etc/systemd/system/vsock-tinfoil-kds-proxy.service
@@ -1052,40 +1036,160 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-#### Tinfoil Document Upload
+#### Tinfoil ATC
 ```sh
-sudo vim /etc/systemd/system/vsock-tinfoil-doc-upload.service
+sudo vim /etc/systemd/system/vsock-tinfoil-atc.service
 ```
 
 Add the following content:
 ```
 [Unit]
-Description=Vsock Tinfoil Document Upload Service
+Description=Vsock Tinfoil ATC Service
 After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8024 doc-upload.model.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy 8021 atc.tinfoil.sh 443
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-#### Tinfoil Inference
+#### Tinfoil Router Inf4
 ```sh
-sudo vim /etc/systemd/system/vsock-tinfoil-inference.service
+sudo vim /etc/systemd/system/vsock-tinfoil-router-inf4.service
 ```
 
 Add the following content:
 ```
 [Unit]
-Description=Vsock Tinfoil Inference Service
+Description=Vsock Tinfoil Router Inf4 Service
 After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8025 inference.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy 8034 router.inf4.tinfoil.sh 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil Router Inf5
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-router-inf5.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Router Inf5 Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8035 router.inf5.tinfoil.sh 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil Router Inf6
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-router-inf6.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Router Inf6 Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8036 router.inf6.tinfoil.sh 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil Router Inf7
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-router-inf7.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Router Inf7 Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8037 router.inf7.tinfoil.sh 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil Router Inf8
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-router-inf8.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Router Inf8 Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8038 router.inf8.tinfoil.sh 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil Router Inf9
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-router-inf9.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Router Inf9 Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8039 router.inf9.tinfoil.sh 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil Router Inf10
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-router-inf10.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Router Inf10 Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8040 router.inf10.tinfoil.sh 443
 Restart=always
 
 [Install]
@@ -1102,32 +1206,52 @@ sudo systemctl status vsock-tinfoil-api-github-proxy.service
 sudo systemctl enable vsock-tuf-repo-cdn.service
 sudo systemctl start vsock-tuf-repo-cdn.service
 sudo systemctl status vsock-tuf-repo-cdn.service
-sudo systemctl enable vsock-tinfoil-deepseek.service
-sudo systemctl start vsock-tinfoil-deepseek.service
-sudo systemctl status vsock-tinfoil-deepseek.service
 sudo systemctl enable vsock-tinfoil-kds-proxy.service
 sudo systemctl start vsock-tinfoil-kds-proxy.service
 sudo systemctl status vsock-tinfoil-kds-proxy.service
 sudo systemctl enable vsock-tinfoil-github-proxy.service
 sudo systemctl start vsock-tinfoil-github-proxy.service
 sudo systemctl status vsock-tinfoil-github-proxy.service
-sudo systemctl enable vsock-tinfoil-doc-upload.service
-sudo systemctl start vsock-tinfoil-doc-upload.service
-sudo systemctl status vsock-tinfoil-doc-upload.service
-sudo systemctl enable vsock-tinfoil-inference.service
-sudo systemctl start vsock-tinfoil-inference.service
-sudo systemctl status vsock-tinfoil-inference.service
+sudo systemctl enable vsock-tinfoil-atc.service
+sudo systemctl start vsock-tinfoil-atc.service
+sudo systemctl status vsock-tinfoil-atc.service
+sudo systemctl enable vsock-tinfoil-router-inf4.service
+sudo systemctl start vsock-tinfoil-router-inf4.service
+sudo systemctl status vsock-tinfoil-router-inf4.service
+sudo systemctl enable vsock-tinfoil-router-inf5.service
+sudo systemctl start vsock-tinfoil-router-inf5.service
+sudo systemctl status vsock-tinfoil-router-inf5.service
+sudo systemctl enable vsock-tinfoil-router-inf6.service
+sudo systemctl start vsock-tinfoil-router-inf6.service
+sudo systemctl status vsock-tinfoil-router-inf6.service
+sudo systemctl enable vsock-tinfoil-router-inf7.service
+sudo systemctl start vsock-tinfoil-router-inf7.service
+sudo systemctl status vsock-tinfoil-router-inf7.service
+sudo systemctl enable vsock-tinfoil-router-inf8.service
+sudo systemctl start vsock-tinfoil-router-inf8.service
+sudo systemctl status vsock-tinfoil-router-inf8.service
+sudo systemctl enable vsock-tinfoil-router-inf9.service
+sudo systemctl start vsock-tinfoil-router-inf9.service
+sudo systemctl status vsock-tinfoil-router-inf9.service
+sudo systemctl enable vsock-tinfoil-router-inf10.service
+sudo systemctl start vsock-tinfoil-router-inf10.service
+sudo systemctl status vsock-tinfoil-router-inf10.service
 ```
 
 If you need to restart these services:
 ```sh
 sudo systemctl restart vsock-tinfoil-api-github-proxy.service
 sudo systemctl restart vsock-tuf-repo-cdn.service
-sudo systemctl restart vsock-tinfoil-deepseek.service
 sudo systemctl restart vsock-tinfoil-kds-proxy.service
 sudo systemctl restart vsock-tinfoil-github-proxy.service
-sudo systemctl restart vsock-tinfoil-doc-upload.service
-sudo systemctl restart vsock-tinfoil-inference.service
+sudo systemctl restart vsock-tinfoil-atc.service
+sudo systemctl restart vsock-tinfoil-router-inf4.service
+sudo systemctl restart vsock-tinfoil-router-inf5.service
+sudo systemctl restart vsock-tinfoil-router-inf6.service
+sudo systemctl restart vsock-tinfoil-router-inf7.service
+sudo systemctl restart vsock-tinfoil-router-inf8.service
+sudo systemctl restart vsock-tinfoil-router-inf9.service
+sudo systemctl restart vsock-tinfoil-router-inf10.service
 ```
 
 ## KMS Key

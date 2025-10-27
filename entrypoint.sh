@@ -276,12 +276,16 @@ fi
 # Add Tinfoil proxy hostnames to /etc/hosts
 echo "127.0.0.16 api-github-proxy.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.17 tuf-repo-cdn.sigstore.dev" >> /etc/hosts
-# DEPRECATED: Will be removed after full migration to inference.tinfoil.sh
-echo "127.0.0.18 deepseek-r1-70b-p.model.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.19 kds-proxy.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.20 gh-attestation-proxy.tinfoil.sh" >> /etc/hosts
-echo "127.0.0.21 doc-upload.model.tinfoil.sh" >> /etc/hosts
-echo "127.0.0.22 inference.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.25 atc.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.26 router.inf4.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.27 router.inf5.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.28 router.inf6.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.29 router.inf7.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.30 router.inf8.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.31 router.inf9.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.32 router.inf10.tinfoil.sh" >> /etc/hosts
 log "Added Tinfoil proxy domains to /etc/hosts"
 
 # Add Kagi Search hostname to /etc/hosts
@@ -368,21 +372,35 @@ python3 /app/traffic_forwarder.py 127.0.0.16 443 3 8019 &
 log "Starting TUF Repository CDN traffic forwarder"
 python3 /app/traffic_forwarder.py 127.0.0.17 443 3 8020 &
 
-# DEPRECATED: Will be removed after full migration to inference.tinfoil.sh
-log "Starting Tinfoil DeepSeek model traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.18 443 3 8021 &
-
 log "Starting Tinfoil KDS proxy traffic forwarder"
 python3 /app/traffic_forwarder.py 127.0.0.19 443 3 8022 &
 
 log "Starting Tinfoil GitHub proxy traffic forwarder"
 python3 /app/traffic_forwarder.py 127.0.0.20 443 3 8023 &
 
-log "Starting Tinfoil Document Upload traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.21 443 3 8024 &
+log "Starting Tinfoil ATC traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.25 443 3 8021 &
 
-log "Starting Tinfoil Inference traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.22 443 3 8025 &
+log "Starting Tinfoil Router Inf4 traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.26 443 3 8034 &
+
+log "Starting Tinfoil Router Inf5 traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.27 443 3 8035 &
+
+log "Starting Tinfoil Router Inf6 traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.28 443 3 8036 &
+
+log "Starting Tinfoil Router Inf7 traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.29 443 3 8037 &
+
+log "Starting Tinfoil Router Inf8 traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.30 443 3 8038 &
+
+log "Starting Tinfoil Router Inf9 traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.31 443 3 8039 &
+
+log "Starting Tinfoil Router Inf10 traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.32 443 3 8040 &
 
 # Start the traffic forwarder for Kagi Search in the background
 log "Starting Kagi Search traffic forwarder"
@@ -519,14 +537,6 @@ else
     log "TUF Repository CDN connection failed"
 fi
 
-# DEPRECATED: Will be removed after full migration
-log "Testing connection to Tinfoil DeepSeek model:"
-if timeout 5 bash -c '</dev/tcp/127.0.0.18/443'; then
-    log "Tinfoil DeepSeek model connection successful"
-else
-    log "Tinfoil DeepSeek model connection failed"
-fi
-
 log "Testing connection to Tinfoil KDS proxy:"
 if timeout 5 bash -c '</dev/tcp/127.0.0.19/443'; then
     log "Tinfoil KDS proxy connection successful"
@@ -541,18 +551,60 @@ else
     log "Tinfoil GitHub proxy connection failed"
 fi
 
-log "Testing connection to Tinfoil Document Upload:"
-if timeout 5 bash -c '</dev/tcp/127.0.0.21/443'; then
-    log "Tinfoil Document Upload connection successful"
+log "Testing connection to Tinfoil ATC:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.25/443'; then
+    log "Tinfoil ATC connection successful"
 else
-    log "Tinfoil Document Upload connection failed"
+    log "Tinfoil ATC connection failed"
 fi
 
-log "Testing connection to Tinfoil Inference:"
-if timeout 5 bash -c '</dev/tcp/127.0.0.22/443'; then
-    log "Tinfoil Inference connection successful"
+log "Testing connection to Tinfoil Router Inf4:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.26/443'; then
+    log "Tinfoil Router Inf4 connection successful"
 else
-    log "Tinfoil Inference connection failed"
+    log "Tinfoil Router Inf4 connection failed"
+fi
+
+log "Testing connection to Tinfoil Router Inf5:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.27/443'; then
+    log "Tinfoil Router Inf5 connection successful"
+else
+    log "Tinfoil Router Inf5 connection failed"
+fi
+
+log "Testing connection to Tinfoil Router Inf6:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.28/443'; then
+    log "Tinfoil Router Inf6 connection successful"
+else
+    log "Tinfoil Router Inf6 connection failed"
+fi
+
+log "Testing connection to Tinfoil Router Inf7:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.29/443'; then
+    log "Tinfoil Router Inf7 connection successful"
+else
+    log "Tinfoil Router Inf7 connection failed"
+fi
+
+log "Testing connection to Tinfoil Router Inf8:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.30/443'; then
+    log "Tinfoil Router Inf8 connection successful"
+else
+    log "Tinfoil Router Inf8 connection failed"
+fi
+
+log "Testing connection to Tinfoil Router Inf9:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.31/443'; then
+    log "Tinfoil Router Inf9 connection successful"
+else
+    log "Tinfoil Router Inf9 connection failed"
+fi
+
+log "Testing connection to Tinfoil Router Inf10:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.32/443'; then
+    log "Tinfoil Router Inf10 connection successful"
+else
+    log "Tinfoil Router Inf10 connection failed"
 fi
 
 # Test the connection to Kagi Search

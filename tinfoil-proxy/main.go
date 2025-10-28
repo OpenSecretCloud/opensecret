@@ -74,22 +74,50 @@ var modelConfigs = map[string]struct {
 
 // Request/Response models
 type ChatMessage struct {
-	Role    string      `json:"role"`
-	Content interface{} `json:"content"`
+	Role         string           `json:"role,omitempty"`
+	Content      interface{}      `json:"content,omitempty"`
+	ToolCalls    []map[string]any `json:"tool_calls,omitempty"`
+	Refusal      string           `json:"refusal,omitempty"`
+	FunctionCall map[string]any   `json:"function_call,omitempty"` // Deprecated but keeping for compatibility
 }
 
 type ChatCompletionRequest struct {
-	Model            string          `json:"model"`
-	Messages         []ChatMessage   `json:"messages"`
-	Stream           *bool           `json:"stream,omitempty"`
-	Temperature      *float32        `json:"temperature,omitempty"`
-	MaxTokens        *int            `json:"max_tokens,omitempty"`
-	TopP             *float32        `json:"top_p,omitempty"`
-	FrequencyPenalty *float32        `json:"frequency_penalty,omitempty"`
-	PresencePenalty  *float32        `json:"presence_penalty,omitempty"`
-	N                *int            `json:"n,omitempty"`
-	Stop             []string        `json:"stop,omitempty"`
-	StreamOptions    *map[string]any `json:"stream_options,omitempty"`
+	Model             string          `json:"model"`
+	Messages          []ChatMessage   `json:"messages"`
+	Stream            *bool           `json:"stream,omitempty"`
+	Temperature       *float32        `json:"temperature,omitempty"`
+	MaxTokens         *int            `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int          `json:"max_completion_tokens,omitempty"`
+	TopP              *float32        `json:"top_p,omitempty"`
+	FrequencyPenalty  *float32        `json:"frequency_penalty,omitempty"`
+	PresencePenalty   *float32        `json:"presence_penalty,omitempty"`
+	N                 *int            `json:"n,omitempty"`
+	Stop              []string        `json:"stop,omitempty"`
+	StreamOptions     *map[string]any `json:"stream_options,omitempty"`
+	// Function calling / Tools
+	Tools             []map[string]any `json:"tools,omitempty"`
+	ToolChoice        any              `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool            `json:"parallel_tool_calls,omitempty"`
+	// Response formatting
+	ResponseFormat    *map[string]any `json:"response_format,omitempty"`
+	// Reasoning and verbosity controls
+	ReasoningEffort   *string         `json:"reasoning_effort,omitempty"`
+	Verbosity         *string         `json:"verbosity,omitempty"`
+	// Log probabilities
+	Logprobs          *bool           `json:"logprobs,omitempty"`
+	TopLogprobs       *int            `json:"top_logprobs,omitempty"`
+	// Determinism and storage
+	Seed              *int            `json:"seed,omitempty"`
+	Store             *bool           `json:"store,omitempty"`
+	// User identification and caching
+	User              *string         `json:"user,omitempty"`
+	PromptCacheKey    *string         `json:"prompt_cache_key,omitempty"`
+	SafetyIdentifier  *string         `json:"safety_identifier,omitempty"`
+	// Advanced parameters
+	LogitBias         map[string]int  `json:"logit_bias,omitempty"`
+	Metadata          map[string]any  `json:"metadata,omitempty"`
+	Modalities        []string        `json:"modalities,omitempty"`
+	ServiceTier       *string         `json:"service_tier,omitempty"`
 }
 
 type ModelInfo struct {
@@ -357,6 +385,99 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 		}
 	}
 
+	// Add tools support (function calling)
+	if req.Tools != nil && len(req.Tools) > 0 {
+		// Convert tools from raw JSON to SDK types
+		toolsJSON, _ := json.Marshal(req.Tools)
+		var tools []openai.ChatCompletionToolUnionParam
+		if err := json.Unmarshal(toolsJSON, &tools); err != nil {
+			log.Printf("Failed to unmarshal tools: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tools format"})
+			return
+		}
+		params.Tools = tools
+	}
+	if req.ToolChoice != nil {
+		// Convert tool_choice from raw JSON to SDK type
+		toolChoiceJSON, _ := json.Marshal(req.ToolChoice)
+		var toolChoice openai.ChatCompletionToolChoiceOptionUnionParam
+		if err := json.Unmarshal(toolChoiceJSON, &toolChoice); err != nil {
+			log.Printf("Failed to unmarshal tool_choice: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tool_choice format"})
+			return
+		}
+		params.ToolChoice = toolChoice
+	}
+	if req.ParallelToolCalls != nil {
+		params.ParallelToolCalls = openai.Bool(*req.ParallelToolCalls)
+	}
+	if req.ResponseFormat != nil {
+		// Convert response_format from raw JSON to SDK type
+		responseFormatJSON, _ := json.Marshal(req.ResponseFormat)
+		var responseFormat openai.ChatCompletionNewParamsResponseFormatUnion
+		if err := json.Unmarshal(responseFormatJSON, &responseFormat); err != nil {
+			log.Printf("Failed to unmarshal response_format: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid response_format"})
+			return
+		}
+		params.ResponseFormat = responseFormat
+	}
+
+	// Add new parameters
+	if req.MaxCompletionTokens != nil {
+		params.MaxCompletionTokens = openai.Int(int64(*req.MaxCompletionTokens))
+	}
+	if req.ReasoningEffort != nil {
+		params.ReasoningEffort = openai.ReasoningEffort(*req.ReasoningEffort)
+	}
+	if req.Verbosity != nil {
+		params.Verbosity = openai.ChatCompletionNewParamsVerbosity(*req.Verbosity)
+	}
+	if req.Logprobs != nil {
+		params.Logprobs = openai.Bool(*req.Logprobs)
+	}
+	if req.TopLogprobs != nil {
+		params.TopLogprobs = openai.Int(int64(*req.TopLogprobs))
+	}
+	if req.Seed != nil {
+		params.Seed = openai.Int(int64(*req.Seed))
+	}
+	if req.Store != nil {
+		params.Store = openai.Bool(*req.Store)
+	}
+	if req.User != nil {
+		params.User = openai.String(*req.User)
+	}
+	if req.PromptCacheKey != nil {
+		params.PromptCacheKey = openai.String(*req.PromptCacheKey)
+	}
+	if req.SafetyIdentifier != nil {
+		params.SafetyIdentifier = openai.String(*req.SafetyIdentifier)
+	}
+	if req.LogitBias != nil && len(req.LogitBias) > 0 {
+		logitBias := make(map[string]int64)
+		for k, v := range req.LogitBias {
+			logitBias[k] = int64(v)
+		}
+		params.LogitBias = logitBias
+	}
+	if req.Metadata != nil && len(req.Metadata) > 0 {
+		metadataJSON, _ := json.Marshal(req.Metadata)
+		var metadata map[string]string
+		if err := json.Unmarshal(metadataJSON, &metadata); err != nil {
+			log.Printf("Failed to unmarshal metadata: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid metadata format"})
+			return
+		}
+		params.Metadata = metadata
+	}
+	if req.Modalities != nil && len(req.Modalities) > 0 {
+		params.Modalities = req.Modalities
+	}
+	if req.ServiceTier != nil {
+		params.ServiceTier = openai.ChatCompletionNewParamsServiceTier(*req.ServiceTier)
+	}
+
 	// Create context for cancellation
 	ctx := c.Request.Context()
 
@@ -451,22 +572,24 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 			chunkData.Choices = append(chunkData.Choices, choiceData)
 			hasFinishReason = true
 		} else {
+			// Use marshal/unmarshal to preserve all fields including tool_calls
 			for _, choice := range chunk.Choices {
-				choiceData := Choice{
-					Index: int(choice.Index),
-					Delta: &ChatMessage{},
+				// Marshal the SDK choice to JSON
+				choiceJSON, err := json.Marshal(choice)
+				if err != nil {
+					log.Printf("Failed to marshal choice: %v", err)
+					continue
 				}
 
-				if choice.Delta.Role != "" {
-					choiceData.Delta.Role = string(choice.Delta.Role)
-				}
-				if choice.Delta.Content != "" {
-					choiceData.Delta.Content = choice.Delta.Content
+				// Unmarshal into our Choice type to preserve all fields
+				var choiceData Choice
+				if err := json.Unmarshal(choiceJSON, &choiceData); err != nil {
+					log.Printf("Failed to unmarshal choice: %v", err)
+					continue
 				}
 
-				if choice.FinishReason != "" {
-					finishReason := string(choice.FinishReason)
-					choiceData.FinishReason = &finishReason
+				// Check if this chunk has a finish_reason
+				if choiceData.FinishReason != nil && *choiceData.FinishReason != "" {
 					hasFinishReason = true
 				}
 
@@ -576,6 +699,99 @@ func (s *TinfoilProxyServer) nonStreamingChatCompletion(c *gin.Context, req Chat
 		params.N = openai.Int(int64(*req.N))
 	}
 
+	// Add tools support (function calling)
+	if req.Tools != nil && len(req.Tools) > 0 {
+		// Convert tools from raw JSON to SDK types
+		toolsJSON, _ := json.Marshal(req.Tools)
+		var tools []openai.ChatCompletionToolUnionParam
+		if err := json.Unmarshal(toolsJSON, &tools); err != nil {
+			log.Printf("Failed to unmarshal tools: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tools format"})
+			return
+		}
+		params.Tools = tools
+	}
+	if req.ToolChoice != nil {
+		// Convert tool_choice from raw JSON to SDK type
+		toolChoiceJSON, _ := json.Marshal(req.ToolChoice)
+		var toolChoice openai.ChatCompletionToolChoiceOptionUnionParam
+		if err := json.Unmarshal(toolChoiceJSON, &toolChoice); err != nil {
+			log.Printf("Failed to unmarshal tool_choice: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid tool_choice format"})
+			return
+		}
+		params.ToolChoice = toolChoice
+	}
+	if req.ParallelToolCalls != nil {
+		params.ParallelToolCalls = openai.Bool(*req.ParallelToolCalls)
+	}
+	if req.ResponseFormat != nil {
+		// Convert response_format from raw JSON to SDK type
+		responseFormatJSON, _ := json.Marshal(req.ResponseFormat)
+		var responseFormat openai.ChatCompletionNewParamsResponseFormatUnion
+		if err := json.Unmarshal(responseFormatJSON, &responseFormat); err != nil {
+			log.Printf("Failed to unmarshal response_format: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid response_format"})
+			return
+		}
+		params.ResponseFormat = responseFormat
+	}
+
+	// Add new parameters (same as streaming)
+	if req.MaxCompletionTokens != nil {
+		params.MaxCompletionTokens = openai.Int(int64(*req.MaxCompletionTokens))
+	}
+	if req.ReasoningEffort != nil {
+		params.ReasoningEffort = openai.ReasoningEffort(*req.ReasoningEffort)
+	}
+	if req.Verbosity != nil {
+		params.Verbosity = openai.ChatCompletionNewParamsVerbosity(*req.Verbosity)
+	}
+	if req.Logprobs != nil {
+		params.Logprobs = openai.Bool(*req.Logprobs)
+	}
+	if req.TopLogprobs != nil {
+		params.TopLogprobs = openai.Int(int64(*req.TopLogprobs))
+	}
+	if req.Seed != nil {
+		params.Seed = openai.Int(int64(*req.Seed))
+	}
+	if req.Store != nil {
+		params.Store = openai.Bool(*req.Store)
+	}
+	if req.User != nil {
+		params.User = openai.String(*req.User)
+	}
+	if req.PromptCacheKey != nil {
+		params.PromptCacheKey = openai.String(*req.PromptCacheKey)
+	}
+	if req.SafetyIdentifier != nil {
+		params.SafetyIdentifier = openai.String(*req.SafetyIdentifier)
+	}
+	if req.LogitBias != nil && len(req.LogitBias) > 0 {
+		logitBias := make(map[string]int64)
+		for k, v := range req.LogitBias {
+			logitBias[k] = int64(v)
+		}
+		params.LogitBias = logitBias
+	}
+	if req.Metadata != nil && len(req.Metadata) > 0 {
+		metadataJSON, _ := json.Marshal(req.Metadata)
+		var metadata map[string]string
+		if err := json.Unmarshal(metadataJSON, &metadata); err != nil {
+			log.Printf("Failed to unmarshal metadata: %v", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid metadata format"})
+			return
+		}
+		params.Metadata = metadata
+	}
+	if req.Modalities != nil && len(req.Modalities) > 0 {
+		params.Modalities = req.Modalities
+	}
+	if req.ServiceTier != nil {
+		params.ServiceTier = openai.ChatCompletionNewParamsServiceTier(*req.ServiceTier)
+	}
+
 	// Create completion
 	ctx := c.Request.Context()
 	completion, err := client.Chat.Completions.New(ctx, params)
@@ -584,37 +800,25 @@ func (s *TinfoilProxyServer) nonStreamingChatCompletion(c *gin.Context, req Chat
 		return
 	}
 
-	// Convert to OpenAI-compatible format
-	response := ChatCompletionResponse{
-		ID:      completion.ID,
-		Object:  "chat.completion",
-		Created: completion.Created,
-		Model:   req.Model,
-		Choices: make([]Choice, 0),
+	// Convert to OpenAI-compatible format using marshal/unmarshal to preserve all fields
+	// This ensures we don't drop tool_calls, refusal, or any future fields
+	completionJSON, err := json.Marshal(completion)
+	if err != nil {
+		log.Printf("Failed to marshal completion: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process completion"})
+		return
 	}
 
-	for _, choice := range completion.Choices {
-		finishReason := string(choice.FinishReason)
-		choiceData := Choice{
-			Index: int(choice.Index),
-			Message: &ChatMessage{
-				Role:    string(choice.Message.Role),
-				Content: choice.Message.Content,
-			},
-			FinishReason: &finishReason,
-		}
-		response.Choices = append(response.Choices, choiceData)
+	var response ChatCompletionResponse
+	if err := json.Unmarshal(completionJSON, &response); err != nil {
+		log.Printf("Failed to unmarshal completion: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to process completion"})
+		return
 	}
 
-	// Include usage data
-	// Note: Usage is a struct, not a pointer in the OpenAI SDK
-	if completion.Usage.TotalTokens > 0 {
-		response.Usage = &Usage{
-			PromptTokens:     int(completion.Usage.PromptTokens),
-			CompletionTokens: int(completion.Usage.CompletionTokens),
-			TotalTokens:      int(completion.Usage.TotalTokens),
-		}
-	}
+	// Override model with the requested model name
+	response.Model = req.Model
+	response.Object = "chat.completion"
 
 	c.JSON(http.StatusOK, response)
 }

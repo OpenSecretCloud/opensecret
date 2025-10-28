@@ -104,4 +104,10 @@ impl BillingClient {
 
         Ok(())
     }
+
+    /// Check if a user is on a paid plan (not free)
+    pub async fn is_user_paid(&self, user_id: Uuid) -> Result<bool, BillingError> {
+        let usage = self.check_usage(user_id, false).await?;
+        Ok(!usage.is_free)
+    }
 }

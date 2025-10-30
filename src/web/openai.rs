@@ -398,7 +398,7 @@ pub async fn get_chat_completion_response(
         .to_string();
 
     // Get the model route configuration
-    let route = match state.proxy_router.get_model_route(&model_name).await {
+    let route = match state.proxy_router.get_model_route(&model_name) {
         Some(r) => r,
         None => {
             error!("Model '{}' not found in routing table", model_name);
@@ -920,7 +920,7 @@ async fn proxy_models(
 
     // Use the proxy router to get all models from all configured proxies
     // The proxy router now handles caching internally with a 5-minute TTL
-    let models_response = state.proxy_router.get_all_models().await.map_err(|e| {
+    let models_response = state.proxy_router.get_all_models().map_err(|e| {
         error!("Failed to fetch models from proxy router: {:?}", e);
         ApiError::InternalServerError
     })?;
@@ -1087,7 +1087,6 @@ async fn proxy_transcription(
     let route = match state
         .proxy_router
         .get_model_route(&transcription_request.model)
-        .await
     {
         Some(r) => r,
         None => {

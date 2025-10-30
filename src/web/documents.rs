@@ -73,13 +73,32 @@ async fn upload_document(
 ) -> Result<Json<EncryptedResponse<DocumentUploadInitResponse>>, ApiError> {
     debug!("Entering upload_document function for user: {}", user.uuid);
 
-    // Prevent guest users from using the document upload feature
+    // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
-        error!(
-            "Guest user attempted to use document upload feature: {}",
-            user.uuid
-        );
-        return Err(ApiError::Unauthorized);
+        if let Some(billing_client) = &state.billing_client {
+            match billing_client.is_user_paid(user.uuid).await {
+                Ok(true) => {
+                    debug!("Paid guest user allowed for document upload: {}", user.uuid);
+                }
+                Ok(false) => {
+                    error!(
+                        "Free guest user attempted to use document upload feature: {}",
+                        user.uuid
+                    );
+                    return Err(ApiError::Unauthorized);
+                }
+                Err(e) => {
+                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
+                    return Err(ApiError::Unauthorized);
+                }
+            }
+        } else {
+            error!(
+                "Guest user attempted to use document upload without billing client: {}",
+                user.uuid
+            );
+            return Err(ApiError::Unauthorized);
+        }
     }
 
     // Check billing if client exists
@@ -218,13 +237,35 @@ async fn check_document_status(
 ) -> Result<Json<EncryptedResponse<DocumentStatusResponse>>, ApiError> {
     debug!("Checking document status for task: {}", body.task_id);
 
-    // Prevent guest users from using the document upload feature
+    // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
-        error!(
-            "Guest user attempted to check document status: {}",
-            user.uuid
-        );
-        return Err(ApiError::Unauthorized);
+        if let Some(billing_client) = &state.billing_client {
+            match billing_client.is_user_paid(user.uuid).await {
+                Ok(true) => {
+                    debug!(
+                        "Paid guest user allowed for document status check: {}",
+                        user.uuid
+                    );
+                }
+                Ok(false) => {
+                    error!(
+                        "Free guest user attempted to check document status: {}",
+                        user.uuid
+                    );
+                    return Err(ApiError::Unauthorized);
+                }
+                Err(e) => {
+                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
+                    return Err(ApiError::Unauthorized);
+                }
+            }
+        } else {
+            error!(
+                "Guest user attempted to check document status without billing client: {}",
+                user.uuid
+            );
+            return Err(ApiError::Unauthorized);
+        }
     }
 
     // Get the Tinfoil API base URL from the proxy router

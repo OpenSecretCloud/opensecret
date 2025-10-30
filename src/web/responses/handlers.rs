@@ -852,10 +852,32 @@ async fn validate_and_normalize_input(
     user: &User,
     body: &ResponsesCreateRequest,
 ) -> Result<PreparedRequest, ApiError> {
-    // Prevent guest users
+    // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
-        error!("Guest user attempted to use Responses API: {}", user.uuid);
-        return Err(ApiError::Unauthorized);
+        if let Some(billing_client) = &state.billing_client {
+            match billing_client.is_user_paid(user.uuid).await {
+                Ok(true) => {
+                    debug!("Paid guest user allowed for Responses API: {}", user.uuid);
+                }
+                Ok(false) => {
+                    error!(
+                        "Free guest user attempted to use Responses API: {}",
+                        user.uuid
+                    );
+                    return Err(ApiError::Unauthorized);
+                }
+                Err(e) => {
+                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
+                    return Err(ApiError::Unauthorized);
+                }
+            }
+        } else {
+            error!(
+                "Guest user attempted to use Responses API without billing client: {}",
+                user.uuid
+            );
+            return Err(ApiError::Unauthorized);
+        }
     }
 
     // Get user's encryption key

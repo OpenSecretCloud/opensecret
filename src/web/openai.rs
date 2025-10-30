@@ -213,13 +213,32 @@ async fn proxy_openai(
 ) -> Result<Response, ApiError> {
     debug!("Entering proxy_openai function");
 
-    // Prevent guest users from using the OpenAI chat feature
+    // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
-        error!(
-            "Guest user attempted to use OpenAI chat feature: {}",
-            user.uuid
-        );
-        return Err(ApiError::Unauthorized);
+        if let Some(billing_client) = &state.billing_client {
+            match billing_client.is_user_paid(user.uuid).await {
+                Ok(true) => {
+                    debug!("Paid guest user allowed for chat: {}", user.uuid);
+                }
+                Ok(false) => {
+                    error!(
+                        "Free guest user attempted to use chat feature: {}",
+                        user.uuid
+                    );
+                    return Err(ApiError::Unauthorized);
+                }
+                Err(e) => {
+                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
+                    return Err(ApiError::Unauthorized);
+                }
+            }
+        } else {
+            error!(
+                "Guest user attempted to use chat without billing client: {}",
+                user.uuid
+            );
+            return Err(ApiError::Unauthorized);
+        }
     }
 
     // Check billing if client exists
@@ -893,20 +912,11 @@ async fn proxy_models(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
     axum::Extension(session_id): axum::Extension<Uuid>,
-    axum::Extension(user): axum::Extension<User>,
+    axum::Extension(_user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(_body): axum::Extension<()>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
     debug!("Entering proxy_models function");
-
-    // Prevent guest users from using the models endpoint
-    if user.is_guest() {
-        error!(
-            "Guest user attempted to access models endpoint: {}",
-            user.uuid
-        );
-        return Err(ApiError::Unauthorized);
-    }
 
     // Use the proxy router to get all models from all configured proxies
     // The proxy router now handles caching internally with a 5-minute TTL
@@ -1019,13 +1029,32 @@ async fn proxy_transcription(
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
     debug!("Entering proxy_transcription function");
 
-    // Prevent guest users from using the transcription feature
+    // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
-        error!(
-            "Guest user attempted to use transcription feature: {}",
-            user.uuid
-        );
-        return Err(ApiError::Unauthorized);
+        if let Some(billing_client) = &state.billing_client {
+            match billing_client.is_user_paid(user.uuid).await {
+                Ok(true) => {
+                    debug!("Paid guest user allowed for transcription: {}", user.uuid);
+                }
+                Ok(false) => {
+                    error!(
+                        "Free guest user attempted to use transcription feature: {}",
+                        user.uuid
+                    );
+                    return Err(ApiError::Unauthorized);
+                }
+                Err(e) => {
+                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
+                    return Err(ApiError::Unauthorized);
+                }
+            }
+        } else {
+            error!(
+                "Guest user attempted to use transcription without billing client: {}",
+                user.uuid
+            );
+            return Err(ApiError::Unauthorized);
+        }
     }
 
     // Decode base64 audio file
@@ -1371,10 +1400,32 @@ async fn proxy_tts(
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
     debug!("Entering proxy_tts function");
 
-    // Prevent guest users from using the TTS feature
+    // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
-        error!("Guest user attempted to use TTS feature: {}", user.uuid);
-        return Err(ApiError::Unauthorized);
+        if let Some(billing_client) = &state.billing_client {
+            match billing_client.is_user_paid(user.uuid).await {
+                Ok(true) => {
+                    debug!("Paid guest user allowed for TTS: {}", user.uuid);
+                }
+                Ok(false) => {
+                    error!(
+                        "Free guest user attempted to use TTS feature: {}",
+                        user.uuid
+                    );
+                    return Err(ApiError::Unauthorized);
+                }
+                Err(e) => {
+                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
+                    return Err(ApiError::Unauthorized);
+                }
+            }
+        } else {
+            error!(
+                "Guest user attempted to use TTS without billing client: {}",
+                user.uuid
+            );
+            return Err(ApiError::Unauthorized);
+        }
     }
 
     // Validate input is not empty

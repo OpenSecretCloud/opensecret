@@ -1,55 +1,16 @@
-use chrono::{DateTime, Utc};
-use hyper::{Body, Client, Request};
-use hyper_tls::HttpsConnector;
-use lazy_static::lazy_static;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::warn;
 
-// Model name constants
-const CONTINUUM_LLAMA_33_70B: &str = "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4";
-const TINFOIL_LLAMA_33_70B: &str = "llama3-3-70b";
-const CANONICAL_LLAMA_33_70B: &str = "llama-3.3-70b";
-
-const CONTINUUM_GPT_OSS_120B: &str = "openai/gpt-oss-120b";
-const TINFOIL_GPT_OSS_120B: &str = "gpt-oss-120b";
-const CANONICAL_GPT_OSS_120B: &str = "gpt-oss-120b";
-
-// Whisper model constants
-const CONTINUUM_WHISPER_LARGE_V3: &str = "openai/whisper-large-v3";
-const TINFOIL_WHISPER_LARGE_V3_TURBO: &str = "whisper-large-v3-turbo";
-const CANONICAL_WHISPER_LARGE_V3: &str = "whisper-large-v3";
-
-lazy_static! {
-    /// Known model equivalencies across providers
-    /// This maps a canonical model identifier to provider-specific names
-    static ref MODEL_EQUIVALENCIES: HashMap<&'static str, HashMap<&'static str, &'static str>> = {
-        let mut equivalencies = HashMap::new();
-
-        // Llama 3.3 70B
-        let mut llama_33_70b = HashMap::new();
-        llama_33_70b.insert("continuum", CONTINUUM_LLAMA_33_70B);
-        llama_33_70b.insert("tinfoil", TINFOIL_LLAMA_33_70B);
-        equivalencies.insert(CANONICAL_LLAMA_33_70B, llama_33_70b);
-
-        // GPT-OSS 120B
-        let mut gpt_oss_120b = HashMap::new();
-        gpt_oss_120b.insert("continuum", CONTINUUM_GPT_OSS_120B);
-        gpt_oss_120b.insert("tinfoil", TINFOIL_GPT_OSS_120B);
-        equivalencies.insert(CANONICAL_GPT_OSS_120B, gpt_oss_120b);
-
-        // Whisper Large V3
-        let mut whisper_large_v3 = HashMap::new();
-        whisper_large_v3.insert("continuum", CONTINUUM_WHISPER_LARGE_V3);
-        whisper_large_v3.insert("tinfoil", TINFOIL_WHISPER_LARGE_V3_TURBO);
-        equivalencies.insert(CANONICAL_WHISPER_LARGE_V3, whisper_large_v3);
-
-        equivalencies
-    };
-}
+// Canonical model names - exported for use across the codebase
+#[allow(dead_code)]
+pub const MODEL_LLAMA_33_70B: &str = "llama-3.3-70b";
+#[allow(dead_code)]
+pub const MODEL_GEMMA_3_27B: &str = "gemma-3-27b";
+#[allow(dead_code)]
+pub const MODEL_GPT_OSS_120B: &str = "gpt-oss-120b";
+#[allow(dead_code)]
+pub const MODEL_WHISPER_LARGE_V3: &str = "whisper-large-v3";
 
 /// Model routing configuration
 #[derive(Debug, Clone)]
@@ -68,55 +29,12 @@ pub struct ProxyConfig {
     pub provider_name: String,
 }
 
-#[derive(Debug)]
-struct ModelsCache {
-    // Cached models response for user-facing API
-    models_response: Option<Value>,
-    // Map from model name to proxy configuration for internal routing
-    model_to_proxy: HashMap<String, ProxyConfig>,
-    // Model routing configurations with fallback support
-    model_routes: HashMap<String, ModelRoute>,
-    // When the cache expires
-    expires_at: DateTime<Utc>,
-}
-
-impl ModelsCache {
-    fn new_with_default() -> Self {
-        // Start with empty cache
-        let models_response = serde_json::json!({
-            "object": "list",
-            "data": []
-        });
-
-        Self {
-            models_response: Some(models_response),
-            model_to_proxy: HashMap::new(),
-            model_routes: HashMap::new(),
-            expires_at: Utc::now(),
-        }
-    }
-
-    fn is_expired(&self) -> bool {
-        Utc::now() >= self.expires_at
-    }
-
-    fn update(
-        &mut self,
-        models_response: Value,
-        model_to_proxy: HashMap<String, ProxyConfig>,
-        model_routes: HashMap<String, ModelRoute>,
-    ) {
-        self.models_response = Some(models_response);
-        self.model_to_proxy = model_to_proxy;
-        self.model_routes = model_routes;
-        self.expires_at = Utc::now() + chrono::Duration::minutes(5);
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ProxyRouter {
-    // Unified cache for both models response and routing map
-    cache: Arc<RwLock<ModelsCache>>,
+    // Static routing table built at initialization
+    model_routes: HashMap<String, ModelRoute>,
+    // Static models response for user-facing API
+    models_response: Value,
     // Default proxy if model not found
     default_proxy: ProxyConfig,
     // Tinfoil proxy configuration if configured
@@ -128,34 +46,22 @@ impl ProxyRouter {
     pub fn get_default_proxy(&self) -> ProxyConfig {
         self.default_proxy.clone()
     }
+
     /// Get the provider-specific model name for a given canonical model
-    pub fn get_model_name_for_provider(
-        &self,
-        canonical_model: &str,
-        provider_name: &str,
-    ) -> String {
-        // Direct lookup: check if input is a canonical name with a mapping
-        if let Some(provider_map) = MODEL_EQUIVALENCIES.get(canonical_model) {
-            if let Some(provider_specific_name) = provider_map.get(provider_name) {
-                return provider_specific_name.to_string();
-            }
-        }
+    pub fn get_model_name_for_provider(&self, model: &str, provider_name: &str) -> String {
+        // Simple hardcoded translations for models that have different names
+        match (model, provider_name) {
+            // Llama 3.3 70B translations
+            ("llama-3.3-70b", "tinfoil") => "llama3-3-70b".to_string(),
+            ("llama3-3-70b", "continuum") => "llama-3.3-70b".to_string(),
 
-        // Reverse lookup: check if input is already a provider-specific name
-        for (canonical_name, provider_map) in &*MODEL_EQUIVALENCIES {
-            // If this model name exists in any provider's mapping
-            if provider_map.values().any(|name| *name == canonical_model) {
-                // Return the name for the requested provider
-                if let Some(provider_specific_name) = provider_map.get(provider_name) {
-                    return provider_specific_name.to_string();
-                }
-                // If the requested provider doesn't have this model, return canonical
-                return canonical_name.to_string();
-            }
-        }
+            // Whisper translations
+            ("whisper-large-v3", "tinfoil") => "whisper-large-v3-turbo".to_string(),
+            ("whisper-large-v3-turbo", "continuum") => "whisper-large-v3".to_string(),
 
-        // No translation needed - return as-is
-        canonical_model.to_string()
+            // All other models use the same name on both providers
+            _ => model.to_string(),
+        }
     }
 
     pub fn new(
@@ -163,8 +69,6 @@ impl ProxyRouter {
         openai_key: Option<String>,
         tinfoil_base: Option<String>,
     ) -> Self {
-        let cache = Arc::new(RwLock::new(ModelsCache::new_with_default()));
-
         // Default OpenAI/Continuum proxy config
         let default_proxy = ProxyConfig {
             base_url: openai_base.clone(),
@@ -187,23 +91,129 @@ impl ProxyRouter {
             provider_name: "tinfoil".to_string(),
         });
 
+        // Build static routing table
+        let model_routes = Self::build_static_routes(&default_proxy, &tinfoil_proxy);
+
+        // Build static models response
+        let models_response = Self::build_models_response(&tinfoil_proxy);
+
         ProxyRouter {
-            cache,
+            model_routes,
+            models_response,
             default_proxy,
             tinfoil_proxy,
         }
     }
 
+    /// Build static routing table at initialization
+    fn build_static_routes(
+        continuum_proxy: &ProxyConfig,
+        tinfoil_proxy: &Option<ProxyConfig>,
+    ) -> HashMap<String, ModelRoute> {
+        let mut routes = HashMap::new();
+
+        if let Some(tinfoil) = tinfoil_proxy {
+            // Models on both providers: Tinfoil primary, Continuum fallback
+            let both_route = ModelRoute {
+                primary: tinfoil.clone(),
+                fallbacks: vec![continuum_proxy.clone()],
+            };
+
+            // Llama 3.3 70B (on both)
+            routes.insert("llama-3.3-70b".to_string(), both_route.clone());
+            routes.insert("llama3-3-70b".to_string(), both_route.clone());
+
+            // GPT-OSS 120B (on both, same name)
+            routes.insert("gpt-oss-120b".to_string(), both_route.clone());
+
+            // Whisper Large V3 (on both)
+            routes.insert("whisper-large-v3".to_string(), both_route.clone());
+            routes.insert("whisper-large-v3-turbo".to_string(), both_route.clone());
+
+            // Tinfoil-only models
+            let tinfoil_route = ModelRoute {
+                primary: tinfoil.clone(),
+                fallbacks: vec![],
+            };
+            routes.insert("mistral-small-3-1-24b".to_string(), tinfoil_route.clone());
+            routes.insert("deepseek-r1-0528".to_string(), tinfoil_route.clone());
+            routes.insert("deepseek-v31-terminus".to_string(), tinfoil_route.clone());
+            routes.insert("qwen2-5-72b".to_string(), tinfoil_route.clone());
+            routes.insert("qwen3-coder-480b".to_string(), tinfoil_route.clone());
+
+            // Continuum-only models
+            let continuum_route = ModelRoute {
+                primary: continuum_proxy.clone(),
+                fallbacks: vec![],
+            };
+            routes.insert("gemma-3-27b".to_string(), continuum_route);
+        } else {
+            // No Tinfoil: all Continuum models
+            let continuum_route = ModelRoute {
+                primary: continuum_proxy.clone(),
+                fallbacks: vec![],
+            };
+            routes.insert("llama-3.3-70b".to_string(), continuum_route.clone());
+            routes.insert("gemma-3-27b".to_string(), continuum_route.clone());
+            routes.insert("gpt-oss-120b".to_string(), continuum_route.clone());
+            routes.insert("whisper-large-v3".to_string(), continuum_route);
+        }
+
+        routes
+    }
+
+    /// Build static models response for user-facing API
+    fn build_models_response(tinfoil_proxy: &Option<ProxyConfig>) -> Value {
+        let created_timestamp = 1700000000i64;
+
+        let models = if tinfoil_proxy.is_some() {
+            // With Tinfoil: show all available models using canonical names
+            vec![
+                // Models available on both (use canonical names)
+                "llama-3.3-70b",
+                "gpt-oss-120b",
+                "whisper-large-v3",
+                // Continuum-only
+                "gemma-3-27b",
+                // Tinfoil-only
+                "mistral-small-3-1-24b",
+                "deepseek-r1-0528",
+                "deepseek-v31-terminus",
+                "qwen2-5-72b",
+                "qwen3-coder-480b",
+            ]
+        } else {
+            // Without Tinfoil: only Continuum models
+            vec![
+                "llama-3.3-70b",
+                "gemma-3-27b",
+                "gpt-oss-120b",
+                "whisper-large-v3",
+            ]
+        };
+
+        let model_objects: Vec<Value> = models
+            .iter()
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "object": "model",
+                    "created": created_timestamp,
+                    "owned_by": "system"
+                })
+            })
+            .collect();
+
+        json!({
+            "object": "list",
+            "data": model_objects
+        })
+    }
+
     /// Get the model route configuration for a given model
     /// Returns None if the model is not found
-    pub async fn get_model_route(&self, model_name: &str) -> Option<ModelRoute> {
-        // Ensure cache is fresh
-        self.refresh_cache_if_needed().await;
-
-        let cache = self.cache.read().await;
-
-        // Return the route if found, None otherwise
-        let route = cache.model_routes.get(model_name).cloned();
+    pub fn get_model_route(&self, model_name: &str) -> Option<ModelRoute> {
+        let route = self.model_routes.get(model_name).cloned();
 
         if route.is_none() {
             warn!("Unknown model '{}' requested - no route found", model_name);
@@ -212,334 +222,9 @@ impl ProxyRouter {
         route
     }
 
-    /// Refresh the cache if it's expired
-    async fn refresh_cache_if_needed(&self) {
-        let should_refresh = {
-            let cache = self.cache.read().await;
-            cache.is_expired()
-        };
-
-        if should_refresh {
-            if let Err(e) = self.refresh_cache().await {
-                error!("Failed to refresh models cache: {:?}", e);
-            }
-        }
-    }
-
-    /// Force refresh the cache with latest data from all proxies
-    async fn refresh_cache(&self) -> Result<(), Box<dyn std::error::Error>> {
-        info!("Refreshing models cache from all configured proxies");
-
-        // Create HTTP client
-        let https = HttpsConnector::new();
-        let client = Client::builder()
-            .pool_idle_timeout(Duration::from_secs(15))
-            .build::<_, Body>(https);
-
-        let mut all_models = Vec::new();
-        let mut model_to_proxy = HashMap::new();
-        let mut available_models_by_provider: HashMap<String, Vec<String>> = HashMap::new();
-        let mut tinfoil_models = HashMap::new();
-
-        // First, fetch from Tinfoil if configured - these will be primary
-        if let Some(ref tinfoil_proxy) = self.tinfoil_proxy {
-            match self.fetch_models_from_proxy(&client, tinfoil_proxy).await {
-                Ok(models) => {
-                    let mut provider_models = Vec::new();
-
-                    for model in &models {
-                        if let Some(model_id) = model.get("id").and_then(|v| v.as_str()) {
-                            provider_models.push(model_id.to_string());
-                            tinfoil_models.insert(model_id.to_string(), model.clone());
-
-                            debug!("Tinfoil model '{}' will be primary", model_id);
-                            model_to_proxy.insert(model_id.to_string(), tinfoil_proxy.clone());
-
-                            // Check if this model has a canonical name
-                            let mut canonical_model = model.clone();
-
-                            for (canonical_name, provider_names) in &*MODEL_EQUIVALENCIES {
-                                if let Some(tinfoil_name) = provider_names.get("tinfoil") {
-                                    if *tinfoil_name == model_id {
-                                        // Replace the model ID with the canonical name
-                                        if let Some(obj) = canonical_model.as_object_mut() {
-                                            obj.insert("id".to_string(), json!(canonical_name));
-                                            debug!("Replacing Tinfoil model '{}' with canonical name '{}'", model_id, canonical_name);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Add the model (with canonical name if applicable)
-                            all_models.push(canonical_model);
-                        }
-                    }
-                    available_models_by_provider.insert("tinfoil".to_string(), provider_models);
-                    info!("Fetched {} models from Tinfoil", tinfoil_models.len());
-                }
-                Err(e) => {
-                    warn!("Failed to fetch models from Tinfoil: {:?}", e);
-                    available_models_by_provider.insert("tinfoil".to_string(), Vec::new());
-                }
-            }
-        }
-
-        // Then fetch from Continuum - only primary if not available from Tinfoil
-        match self
-            .fetch_models_from_proxy(&client, &self.default_proxy)
-            .await
-        {
-            Ok(models) => {
-                let mut provider_models = Vec::new();
-
-                for model in &models {
-                    if let Some(model_id) = model.get("id").and_then(|v| v.as_str()) {
-                        provider_models.push(model_id.to_string());
-
-                        // Check if this is equivalent to any Tinfoil model
-                        let mut is_equivalent_to_tinfoil = false;
-
-                        for provider_names in MODEL_EQUIVALENCIES.values() {
-                            if let (Some(continuum_name), Some(tinfoil_name)) = (
-                                provider_names.get("continuum"),
-                                provider_names.get("tinfoil"),
-                            ) {
-                                if *continuum_name == model_id
-                                    && tinfoil_models.contains_key(*tinfoil_name)
-                                {
-                                    is_equivalent_to_tinfoil = true;
-                                    debug!("Continuum model '{}' is equivalent to Tinfoil model '{}' - will be fallback", 
-                                           model_id, tinfoil_name);
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Only add to all_models if not equivalent to a Tinfoil model
-                        if !is_equivalent_to_tinfoil {
-                            // Check if this model has a canonical name
-                            let mut canonical_model = model.clone();
-
-                            for (canonical_name, provider_names) in &*MODEL_EQUIVALENCIES {
-                                if let Some(continuum_name) = provider_names.get("continuum") {
-                                    if *continuum_name == model_id {
-                                        // Replace the model ID with the canonical name
-                                        if let Some(obj) = canonical_model.as_object_mut() {
-                                            obj.insert("id".to_string(), json!(canonical_name));
-                                            debug!("Replacing Continuum model '{}' with canonical name '{}'", model_id, canonical_name);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-
-                            all_models.push(canonical_model);
-                            debug!(
-                                "Continuum model '{}' will be primary (no Tinfoil equivalent)",
-                                model_id
-                            );
-                        }
-                    }
-                }
-
-                let model_count = provider_models.len();
-                available_models_by_provider.insert("continuum".to_string(), provider_models);
-                info!("Fetched {} models from Continuum", model_count);
-            }
-            Err(e) => {
-                warn!("Failed to fetch models from Continuum: {:?}", e);
-                available_models_by_provider.insert("continuum".to_string(), Vec::new());
-            }
-        }
-
-        // Note: If adding a third provider in the future, consider deduplicating models
-        // by ID to prevent duplicates in the all_models list. Currently not needed as:
-        // 1. We control Tinfoil proxy and ensure no duplicates
-        // 2. Continuum models are filtered for known equivalencies
-        // 3. Only two providers exist currently
-        let models_response = serde_json::json!({
-            "object": "list",
-            "data": all_models
-        });
-
-        // Build model routes - create a route for EVERY model
-        let mut model_routes = HashMap::new();
-
-        // First, create routes for all Tinfoil models
-        if let Some(ref tinfoil_proxy) = self.tinfoil_proxy {
-            if let Some(tinfoil_model_list) = available_models_by_provider.get("tinfoil") {
-                for model_name in tinfoil_model_list {
-                    // Check if this model has an equivalent in Continuum
-                    let mut has_continuum_fallback = false;
-
-                    for provider_names in MODEL_EQUIVALENCIES.values() {
-                        if let (Some(tinfoil_equiv), Some(continuum_equiv)) = (
-                            provider_names.get("tinfoil"),
-                            provider_names.get("continuum"),
-                        ) {
-                            if *tinfoil_equiv == model_name {
-                                // Check if Continuum has the equivalent model
-                                if let Some(continuum_models) =
-                                    available_models_by_provider.get("continuum")
-                                {
-                                    if continuum_models.contains(&continuum_equiv.to_string()) {
-                                        // This model has a Continuum fallback
-                                        let route = ModelRoute {
-                                            primary: tinfoil_proxy.clone(),
-                                            fallbacks: vec![self.default_proxy.clone()],
-                                        };
-                                        model_routes.insert(model_name.clone(), route.clone());
-                                        // Also map the Continuum name to the same route
-                                        model_routes
-                                            .insert(continuum_equiv.to_string(), route.clone());
-
-                                        // Also map the canonical name to the same route
-                                        for (canonical_name, provider_map) in &*MODEL_EQUIVALENCIES
-                                        {
-                                            if provider_map.get("tinfoil") == Some(tinfoil_equiv) {
-                                                model_routes.insert(
-                                                    canonical_name.to_string(),
-                                                    route.clone(),
-                                                );
-                                                debug!(
-                                                    "Also mapping canonical name '{}' to route",
-                                                    canonical_name
-                                                );
-                                                break;
-                                            }
-                                        }
-
-                                        has_continuum_fallback = true;
-                                        info!("Model available from both providers - Tinfoil ({}) primary, Continuum ({}) fallback",
-                                              model_name, continuum_equiv);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // If no fallback found, create route with just Tinfoil
-                    if !has_continuum_fallback {
-                        let route = ModelRoute {
-                            primary: tinfoil_proxy.clone(),
-                            fallbacks: vec![],
-                        };
-                        model_routes.insert(model_name.clone(), route.clone());
-
-                        // Also map canonical name if this is a provider-specific name
-                        for (canonical_name, provider_names) in &*MODEL_EQUIVALENCIES {
-                            if let Some(tinfoil_name) = provider_names.get("tinfoil") {
-                                if *tinfoil_name == model_name {
-                                    model_routes.insert(canonical_name.to_string(), route.clone());
-                                    debug!(
-                                        "Also mapping canonical name '{}' to Tinfoil route",
-                                        canonical_name
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-
-                        debug!("Tinfoil-only model '{}' has no fallbacks", model_name);
-                    }
-                }
-            }
-        }
-
-        // Then, create routes for Continuum models that aren't already mapped
-        if let Some(continuum_model_list) = available_models_by_provider.get("continuum") {
-            for model_name in continuum_model_list {
-                if !model_routes.contains_key(model_name) {
-                    // This is a Continuum-only model
-                    let route = ModelRoute {
-                        primary: self.default_proxy.clone(),
-                        fallbacks: vec![],
-                    };
-                    model_routes.insert(model_name.clone(), route.clone());
-
-                    // Also map canonical name if this is a provider-specific name
-                    for (canonical_name, provider_names) in &*MODEL_EQUIVALENCIES {
-                        if let Some(continuum_name) = provider_names.get("continuum") {
-                            if *continuum_name == model_name {
-                                model_routes.insert(canonical_name.to_string(), route.clone());
-                                debug!(
-                                    "Also mapping canonical name '{}' to Continuum route",
-                                    canonical_name
-                                );
-                                break;
-                            }
-                        }
-                    }
-
-                    debug!("Continuum-only model '{}' has no fallbacks", model_name);
-                }
-            }
-        }
-
-        // Update the cache
-        let mut cache = self.cache.write().await;
-        cache.update(models_response, model_to_proxy, model_routes);
-
-        info!(
-            "Models cache refreshed. Total models: {}, Additional proxy models: {}",
-            all_models.len(),
-            cache.model_to_proxy.len()
-        );
-
-        Ok(())
-    }
-
-    /// Get all available models from all configured proxies
-    pub async fn get_all_models(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        // Ensure cache is fresh
-        self.refresh_cache_if_needed().await;
-
-        // Return the cached response
-        let cache = self.cache.read().await;
-        cache
-            .models_response
-            .clone()
-            .ok_or_else(|| "No models available".into())
-    }
-
-    async fn fetch_models_from_proxy(
-        &self,
-        client: &Client<HttpsConnector<hyper::client::HttpConnector>>,
-        proxy_config: &ProxyConfig,
-    ) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
-        debug!("Fetching models from proxy: {}", proxy_config.base_url);
-
-        let mut req = Request::builder()
-            .method("GET")
-            .uri(format!("{}/v1/models", proxy_config.base_url));
-
-        if let Some(api_key) = &proxy_config.api_key {
-            if !api_key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", api_key));
-            }
-        }
-
-        let req = req.body(Body::empty())?;
-        let res = client.request(req).await?;
-
-        if !res.status().is_success() {
-            let status = res.status();
-            let body_bytes = hyper::body::to_bytes(res.into_body()).await?;
-            let body_str = String::from_utf8_lossy(&body_bytes);
-            return Err(format!("Failed to fetch models: {} - {}", status, body_str).into());
-        }
-
-        let body_bytes = hyper::body::to_bytes(res.into_body()).await?;
-        let models_response: Value = serde_json::from_slice(&body_bytes)?;
-
-        // Extract the model list
-        if let Some(data) = models_response.get("data").and_then(|d| d.as_array()) {
-            Ok(data.clone())
-        } else {
-            Ok(vec![])
-        }
+    /// Get all available models (static list built at initialization)
+    pub fn get_all_models(&self) -> Result<Value, Box<dyn std::error::Error>> {
+        Ok(self.models_response.clone())
     }
 
     /// Get the Tinfoil proxy base URL if configured
@@ -551,77 +236,44 @@ impl ProxyRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
 
     #[test]
-    fn test_get_model_equivalencies() {
-        // Should have at least one canonical model
-        assert!(!MODEL_EQUIVALENCIES.is_empty());
+    fn test_model_name_translation() {
+        let router = ProxyRouter::new(
+            "http://continuum.example.com".to_string(),
+            None,
+            Some("http://tinfoil.example.com".to_string()),
+        );
 
-        // Check Llama 3.3 70B mapping
-        let llama_mapping = MODEL_EQUIVALENCIES.get(CANONICAL_LLAMA_33_70B).unwrap();
+        // Llama translations
         assert_eq!(
-            llama_mapping.get("continuum"),
-            Some(&CONTINUUM_LLAMA_33_70B)
+            router.get_model_name_for_provider("llama-3.3-70b", "tinfoil"),
+            "llama3-3-70b"
         );
-        assert_eq!(llama_mapping.get("tinfoil"), Some(&TINFOIL_LLAMA_33_70B));
-    }
-
-    #[test]
-    fn test_models_cache_new_with_default() {
-        let cache = ModelsCache::new_with_default();
-
-        // Should start with empty models
-        assert!(cache.models_response.is_some());
-        let response = cache.models_response.as_ref().unwrap();
-        assert_eq!(response["object"], "list");
-        assert_eq!(response["data"].as_array().unwrap().len(), 0);
-
-        // Should be immediately expired
-        assert!(cache.is_expired());
-        assert!(cache.model_to_proxy.is_empty());
-        assert!(cache.model_routes.is_empty());
-    }
-
-    #[test]
-    fn test_models_cache_update_and_expiry() {
-        let mut cache = ModelsCache::new_with_default();
-
-        // Update cache
-        let test_models = serde_json::json!({
-            "object": "list",
-            "data": [{"id": "test-model"}]
-        });
-        let mut model_to_proxy = HashMap::new();
-        model_to_proxy.insert(
-            "test-model".to_string(),
-            ProxyConfig {
-                base_url: "http://test".to_string(),
-                api_key: None,
-                provider_name: "test".to_string(),
-            },
-        );
-        let model_routes = HashMap::new();
-
-        cache.update(
-            test_models.clone(),
-            model_to_proxy.clone(),
-            model_routes.clone(),
+        assert_eq!(
+            router.get_model_name_for_provider("llama3-3-70b", "continuum"),
+            "llama-3.3-70b"
         );
 
-        // Should not be expired immediately after update
-        assert!(!cache.is_expired());
-        assert_eq!(cache.models_response, Some(test_models));
-        assert_eq!(cache.model_to_proxy.len(), 1);
+        // Whisper translations
+        assert_eq!(
+            router.get_model_name_for_provider("whisper-large-v3", "tinfoil"),
+            "whisper-large-v3-turbo"
+        );
+        assert_eq!(
+            router.get_model_name_for_provider("whisper-large-v3-turbo", "continuum"),
+            "whisper-large-v3"
+        );
 
-        // Test that expiry is set to 5 minutes in the future
-        let expected_expiry = Utc::now() + Duration::minutes(5);
-        let time_diff = cache
-            .expires_at
-            .signed_duration_since(expected_expiry)
-            .num_seconds()
-            .abs();
-        assert!(time_diff <= 1); // Allow 1 second tolerance
+        // Models with same name on both providers
+        assert_eq!(
+            router.get_model_name_for_provider("gpt-oss-120b", "tinfoil"),
+            "gpt-oss-120b"
+        );
+        assert_eq!(
+            router.get_model_name_for_provider("gemma-3-27b", "continuum"),
+            "gemma-3-27b"
+        );
     }
 
     #[test]
@@ -676,84 +328,48 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_proxy_router_default() {
+    #[test]
+    fn test_proxy_router_static_routing() {
         let router = ProxyRouter::new(
-            "https://api.openai.com".to_string(),
-            Some("test-key".to_string()),
+            "http://continuum.example.com".to_string(),
             None,
+            Some("http://tinfoil.example.com".to_string()),
         );
 
-        let route = router.get_model_route("gpt-4").await;
-        // Should return None for unknown model after cache initialization
-        // In real usage, the cache would be populated with actual models
-        assert!(route.is_none());
-    }
+        // Test canonical model names
+        let llama_route = router.get_model_route("llama-3.3-70b");
+        assert!(llama_route.is_some());
+        let route = llama_route.unwrap();
+        assert_eq!(route.primary.provider_name, "tinfoil");
+        assert_eq!(route.fallbacks.len(), 1);
+        assert_eq!(route.fallbacks[0].provider_name, "continuum");
 
-    #[tokio::test]
-    async fn test_proxy_router_with_tinfoil() {
-        let router = ProxyRouter::new(
-            "http://127.0.0.1:8092".to_string(),
-            None,
-            Some("http://127.0.0.1:8093".to_string()),
-        );
+        // Test provider-specific names work too
+        let tinfoil_llama_route = router.get_model_route("llama3-3-70b");
+        assert!(tinfoil_llama_route.is_some());
 
-        // Since model discovery is async, we can't test specific model mapping
-        // without mocking the HTTP client. Test the default proxy behavior instead.
-        let route = router.get_model_route("gpt-4").await;
-        // Should return None for unknown model after cache initialization
-        assert!(route.is_none());
-
-        // Verify Tinfoil proxy was configured
-        assert!(router.tinfoil_proxy.is_some());
-        assert_eq!(
-            router.get_tinfoil_base_url(),
-            Some("http://127.0.0.1:8093".to_string())
-        );
+        // Unknown model should return None
+        let unknown_route = router.get_model_route("gpt-4");
+        assert!(unknown_route.is_none());
     }
 
     #[test]
-    fn test_model_name_translation() {
+    fn test_proxy_router_without_tinfoil() {
         let router = ProxyRouter::new(
-            "http://127.0.0.1:8092".to_string(),
+            "http://continuum.example.com".to_string(),
             None,
-            Some("http://127.0.0.1:8093".to_string()),
+            None, // No Tinfoil
         );
 
-        // Test canonical name -> provider specific
-        assert_eq!(
-            router.get_model_name_for_provider("llama-3.3-70b", "tinfoil"),
-            "llama3-3-70b"
-        );
-        assert_eq!(
-            router.get_model_name_for_provider("llama-3.3-70b", "continuum"),
-            "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"
-        );
+        // Continuum models should be primary
+        let llama_route = router.get_model_route("llama-3.3-70b");
+        assert!(llama_route.is_some());
+        let route = llama_route.unwrap();
+        assert_eq!(route.primary.provider_name, "continuum");
+        assert!(route.fallbacks.is_empty());
 
-        // Test provider specific -> same provider (should return as-is)
-        assert_eq!(
-            router.get_model_name_for_provider("llama3-3-70b", "tinfoil"),
-            "llama3-3-70b"
-        );
-
-        // Test provider specific -> different provider (should translate)
-        assert_eq!(
-            router.get_model_name_for_provider("llama3-3-70b", "continuum"),
-            "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"
-        );
-        assert_eq!(
-            router.get_model_name_for_provider(
-                "ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4",
-                "tinfoil"
-            ),
-            "llama3-3-70b"
-        );
-
-        // Test unknown model (should return as-is)
-        assert_eq!(
-            router.get_model_name_for_provider("gpt-4", "tinfoil"),
-            "gpt-4"
-        );
+        // Verify Tinfoil proxy not configured
+        assert!(router.tinfoil_proxy.is_none());
     }
 
     #[test]
@@ -798,22 +414,6 @@ mod tests {
         assert!(debug_str.contains("api_key"));
     }
 
-    #[tokio::test]
-    async fn test_get_model_route_with_cache() {
-        let router = ProxyRouter::new(
-            "http://continuum.example.com".to_string(),
-            None,
-            Some("http://tinfoil.example.com".to_string()),
-        );
-
-        // Before cache is populated, should return None for unknown model
-        let route = router.get_model_route("unknown-model").await;
-        assert!(route.is_none());
-
-        // Test that cache is checked (this is implementation detail but good to verify)
-        // The actual cache population would happen via refresh_cache which requires HTTP mocking
-    }
-
     #[test]
     fn test_model_route_with_empty_fallbacks() {
         // Test edge case where primary provider has no fallbacks
@@ -834,37 +434,30 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_expiry_edge_case() {
-        let mut cache = ModelsCache::new_with_default();
-
-        // Set expiry to past time to test immediate expiration
-        cache.expires_at = Utc::now() - chrono::Duration::seconds(1);
-        assert!(cache.is_expired());
-
-        // Update and verify not expired
-        cache.update(
-            serde_json::json!({"object": "list", "data": []}),
-            HashMap::new(),
-            HashMap::new(),
-        );
-        assert!(!cache.is_expired());
-    }
-
-    #[tokio::test]
-    async fn test_get_all_models_with_empty_cache() {
+    fn test_get_all_models_static() {
         let router = ProxyRouter::new(
             "http://continuum.example.com".to_string(),
             None,
-            None, // No Tinfoil configured
+            Some("http://tinfoil.example.com".to_string()),
         );
 
-        // This will attempt to refresh cache but fail due to no actual HTTP client
-        // In real usage, this would return an error when providers are unavailable
-        let result = router.get_all_models().await;
-
-        // The implementation will return cached empty response on refresh failure
+        // Should return static models list immediately
+        let result = router.get_all_models();
         assert!(result.is_ok());
+
         let models = result.unwrap();
         assert_eq!(models["object"], "list");
+
+        // Should have models in the data array
+        let data = models["data"].as_array().unwrap();
+        assert!(!data.is_empty());
+
+        // Check that canonical names are used
+        let model_ids: Vec<String> = data
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(model_ids.contains(&"llama-3.3-70b".to_string()));
+        assert!(model_ids.contains(&"gpt-oss-120b".to_string()));
     }
 }

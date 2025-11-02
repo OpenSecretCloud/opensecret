@@ -23,7 +23,6 @@ pub fn model_max_ctx(model: &str) -> usize {
         ("qwen3-coder-480b", 128_000),
         // Provider-specific equivalents
         ("llama3-3-70b", 128_000), // Tinfoil alias
-        ("ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4", 128_000), // Continuum alias
         // Chat models
         ("deepseek-r1-0528", 128_000),
         ("deepseek-v31-terminus", 128_000),
@@ -68,10 +67,6 @@ mod tests {
     #[test]
     fn test_model_max_ctx_known_models() {
         // Test known models
-        assert_eq!(
-            model_max_ctx("ibnzterrell/Meta-Llama-3.3-70B-Instruct-AWQ-INT4"),
-            128_000
-        );
         assert_eq!(model_max_ctx("leon-se/gemma-3-27b-it-fp8-dynamic"), 20_000);
         assert_eq!(model_max_ctx("deepseek-r1-0528"), 128_000);
         assert_eq!(model_max_ctx("deepseek-v31-terminus"), 128_000);

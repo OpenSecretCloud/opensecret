@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const BRAVE_API_BASE: &str = "https://api.search.brave.com/res/v1";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]

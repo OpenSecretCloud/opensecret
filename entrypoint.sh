@@ -279,6 +279,7 @@ echo "127.0.0.17 tuf-repo-cdn.sigstore.dev" >> /etc/hosts
 echo "127.0.0.19 kds-proxy.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.20 gh-attestation-proxy.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.25 atc.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.33 inference.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.26 router.inf4.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.27 router.inf5.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.28 router.inf6.tinfoil.sh" >> /etc/hosts
@@ -380,6 +381,9 @@ python3 /app/traffic_forwarder.py 127.0.0.20 443 3 8023 &
 
 log "Starting Tinfoil ATC traffic forwarder"
 python3 /app/traffic_forwarder.py 127.0.0.25 443 3 8021 &
+
+log "Starting Tinfoil Inference traffic forwarder"
+python3 /app/traffic_forwarder.py 127.0.0.33 443 3 8041 &
 
 log "Starting Tinfoil Router Inf4 traffic forwarder"
 python3 /app/traffic_forwarder.py 127.0.0.26 443 3 8034 &
@@ -556,6 +560,13 @@ if timeout 5 bash -c '</dev/tcp/127.0.0.25/443'; then
     log "Tinfoil ATC connection successful"
 else
     log "Tinfoil ATC connection failed"
+fi
+
+log "Testing connection to Tinfoil Inference:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.33/443'; then
+    log "Tinfoil Inference connection successful"
+else
+    log "Tinfoil Inference connection failed"
 fi
 
 log "Testing connection to Tinfoil Router Inf4:"

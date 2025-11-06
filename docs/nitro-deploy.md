@@ -942,6 +942,7 @@ Add these lines:
 - {address: kds-proxy.tinfoil.sh, port: 443}
 - {address: gh-attestation-proxy.tinfoil.sh, port: 443}
 - {address: atc.tinfoil.sh, port: 443}
+- {address: inference.tinfoil.sh, port: 443}
 - {address: router.inf4.tinfoil.sh, port: 443}
 - {address: router.inf5.tinfoil.sh, port: 443}
 - {address: router.inf6.tinfoil.sh, port: 443}
@@ -1050,6 +1051,26 @@ After=network.target
 [Service]
 User=root
 ExecStart=/usr/bin/vsock-proxy 8021 atc.tinfoil.sh 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil Inference
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-inference.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Inference Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8041 inference.tinfoil.sh 443
 Restart=always
 
 [Install]
@@ -1215,6 +1236,9 @@ sudo systemctl status vsock-tinfoil-github-proxy.service
 sudo systemctl enable vsock-tinfoil-atc.service
 sudo systemctl start vsock-tinfoil-atc.service
 sudo systemctl status vsock-tinfoil-atc.service
+sudo systemctl enable vsock-tinfoil-inference.service
+sudo systemctl start vsock-tinfoil-inference.service
+sudo systemctl status vsock-tinfoil-inference.service
 sudo systemctl enable vsock-tinfoil-router-inf4.service
 sudo systemctl start vsock-tinfoil-router-inf4.service
 sudo systemctl status vsock-tinfoil-router-inf4.service
@@ -1245,6 +1269,7 @@ sudo systemctl restart vsock-tuf-repo-cdn.service
 sudo systemctl restart vsock-tinfoil-kds-proxy.service
 sudo systemctl restart vsock-tinfoil-github-proxy.service
 sudo systemctl restart vsock-tinfoil-atc.service
+sudo systemctl restart vsock-tinfoil-inference.service
 sudo systemctl restart vsock-tinfoil-router-inf4.service
 sudo systemctl restart vsock-tinfoil-router-inf5.service
 sudo systemctl restart vsock-tinfoil-router-inf6.service

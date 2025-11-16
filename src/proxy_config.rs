@@ -135,10 +135,8 @@ impl ProxyRouter {
                 primary: tinfoil.clone(),
                 fallbacks: vec![],
             };
-            routes.insert("mistral-small-3-1-24b".to_string(), tinfoil_route.clone());
             routes.insert("deepseek-r1-0528".to_string(), tinfoil_route.clone());
             routes.insert("deepseek-v31-terminus".to_string(), tinfoil_route.clone());
-            routes.insert("qwen2-5-72b".to_string(), tinfoil_route.clone());
             routes.insert("qwen3-coder-480b".to_string(), tinfoil_route.clone());
 
             // Continuum-only models
@@ -176,10 +174,8 @@ impl ProxyRouter {
                 // Continuum-only
                 "gemma-3-27b",
                 // Tinfoil-only
-                "mistral-small-3-1-24b",
                 "deepseek-r1-0528",
                 "deepseek-v31-terminus",
-                "qwen2-5-72b",
                 "qwen3-coder-480b",
             ]
         } else {

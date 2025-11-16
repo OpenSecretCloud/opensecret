@@ -26,8 +26,6 @@ pub fn model_max_ctx(model: &str) -> usize {
         // Chat models
         ("deepseek-r1-0528", 128_000),
         ("deepseek-v31-terminus", 128_000),
-        ("mistral-small-3-1-24b", 128_000), // Vision-capable
-        ("qwen2-5-72b", 128_000),
         // Gemma 3 27B (vision) — capped at 20k
         ("leon-se/gemma-3-27b-it-fp8-dynamic", 20_000),
     ];
@@ -70,8 +68,6 @@ mod tests {
         assert_eq!(model_max_ctx("leon-se/gemma-3-27b-it-fp8-dynamic"), 20_000);
         assert_eq!(model_max_ctx("deepseek-r1-0528"), 128_000);
         assert_eq!(model_max_ctx("deepseek-v31-terminus"), 128_000);
-        assert_eq!(model_max_ctx("mistral-small-3-1-24b"), 128_000);
-        assert_eq!(model_max_ctx("qwen2-5-72b"), 128_000);
 
         // Canonical and tinfoil aliases
         assert_eq!(model_max_ctx("llama-3.3-70b"), 128_000);
@@ -93,6 +89,5 @@ mod tests {
     fn test_model_max_ctx_prefix_matching() {
         // Should match by prefix
         assert_eq!(model_max_ctx("deepseek-r1-70b-instruct"), 64_000);
-        assert_eq!(model_max_ctx("qwen2-5-72b-chat"), 128_000);
     }
 }

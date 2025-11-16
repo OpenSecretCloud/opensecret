@@ -35,19 +35,9 @@ var modelConfigs = map[string]struct {
 		Description: "Advanced reasoning and complex problem-solving model (V3.1 Terminus)",
 		Active:      true,
 	},
-	"mistral-small-3-1-24b": {
-		ModelID:     "mistral-small-3-1-24b",
-		Description: "Vision capabilities for image analysis, efficient performance",
-		Active:      true,
-	},
 	"llama3-3-70b": {
 		ModelID:     "llama3-3-70b",
 		Description: "Multilingual understanding, dialogue optimization",
-		Active:      true,
-	},
-	"qwen2-5-72b": {
-		ModelID:     "qwen2-5-72b",
-		Description: "Exceptional function calling, multilingual capabilities",
 		Active:      true,
 	},
 	"nomic-embed-text": {

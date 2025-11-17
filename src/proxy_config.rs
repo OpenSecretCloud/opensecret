@@ -138,6 +138,7 @@ impl ProxyRouter {
             routes.insert("deepseek-r1-0528".to_string(), tinfoil_route.clone());
             routes.insert("deepseek-v31-terminus".to_string(), tinfoil_route.clone());
             routes.insert("qwen3-coder-480b".to_string(), tinfoil_route.clone());
+            routes.insert("qwen3-vl-30b".to_string(), tinfoil_route.clone());
 
             // Continuum-only models
             let continuum_route = ModelRoute {
@@ -177,6 +178,7 @@ impl ProxyRouter {
                 "deepseek-r1-0528",
                 "deepseek-v31-terminus",
                 "qwen3-coder-480b",
+                "qwen3-vl-30b",
             ]
         } else {
             // Without Tinfoil: only Continuum models

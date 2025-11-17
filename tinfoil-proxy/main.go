@@ -55,6 +55,11 @@ var modelConfigs = map[string]struct {
 		Description: "Advanced coding model with 480B parameters for complex programming tasks",
 		Active:      true,
 	},
+	"qwen3-vl-30b": {
+		ModelID:     "qwen3-vl-30b",
+		Description: "A 30B-parameter vision-language model that understands images and videos. Excels at visual tasks including GUI interaction, generating code from screenshots, spatial understanding, video analysis, and OCR across 32 languages. Supports up to 256K context for processing long videos and documents.",
+		Active:      true,
+	},
 	"whisper-large-v3-turbo": {
 		ModelID:     "whisper-large-v3-turbo",
 		Description: "Fast and accurate speech-to-text transcription model",

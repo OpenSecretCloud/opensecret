@@ -28,7 +28,7 @@ pub fn model_max_ctx(model: &str) -> usize {
         ("deepseek-r1-0528", 128_000),
         ("deepseek-v31-terminus", 128_000),
         // Gemma 3 27B (vision) — capped at 20k
-        ("leon-se/gemma-3-27b-it-fp8-dynamic", 20_000),
+        ("gemma-3-27b", 20_000),
     ];
 
     LIMITS
@@ -66,7 +66,7 @@ mod tests {
     #[test]
     fn test_model_max_ctx_known_models() {
         // Test known models
-        assert_eq!(model_max_ctx("leon-se/gemma-3-27b-it-fp8-dynamic"), 20_000);
+        assert_eq!(model_max_ctx("gemma-3-27b"), 20_000);
         assert_eq!(model_max_ctx("deepseek-r1-0528"), 128_000);
         assert_eq!(model_max_ctx("deepseek-v31-terminus"), 128_000);
 

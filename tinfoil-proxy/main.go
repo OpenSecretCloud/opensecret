@@ -583,6 +583,11 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 					continue
 				}
 
+				// Fix for finish_reason: ensure empty strings are converted to nil
+				if choiceData.FinishReason != nil && *choiceData.FinishReason == "" {
+					choiceData.FinishReason = nil
+				}
+
 				// Check if this chunk has a finish_reason
 				if choiceData.FinishReason != nil && *choiceData.FinishReason != "" {
 					hasFinishReason = true
@@ -814,6 +819,13 @@ func (s *TinfoilProxyServer) nonStreamingChatCompletion(c *gin.Context, req Chat
 	// Override model with the requested model name
 	response.Model = req.Model
 	response.Object = "chat.completion"
+
+	// Fix for finish_reason: ensure empty strings are converted to nil
+	for i := range response.Choices {
+		if response.Choices[i].FinishReason != nil && *response.Choices[i].FinishReason == "" {
+			response.Choices[i].FinishReason = nil
+		}
+	}
 
 	c.JSON(http.StatusOK, response)
 }

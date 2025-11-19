@@ -536,6 +536,9 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 	// Process the first chunk we already read
 	firstChunk := true
 
+	// Track if we have seen a finish reason in ANY chunk
+	streamFinished := false
+
 	for firstChunk || stream.Next() {
 		if firstChunk {
 			firstChunk = false
@@ -556,16 +559,20 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 
 		// Handle empty choices array - this appears to be Tinfoil's way of signaling end
 		if len(chunk.Choices) == 0 {
-			// Inject a proper final chunk with finish_reason
-			log.Printf("Empty choices array detected - injecting finish_reason: 'stop'")
-			finishReason := "stop"
-			choiceData := Choice{
-				Index:        0,
-				Delta:        &ChatMessage{},
-				FinishReason: &finishReason,
+			// Only inject stop if we haven't seen a finish reason yet
+			if !streamFinished {
+				// Inject a proper final chunk with finish_reason
+				log.Printf("Empty choices array detected - injecting finish_reason: 'stop'")
+				finishReason := "stop"
+				choiceData := Choice{
+					Index:        0,
+					Delta:        &ChatMessage{},
+					FinishReason: &finishReason,
+				}
+				chunkData.Choices = append(chunkData.Choices, choiceData)
+				hasFinishReason = true
+				streamFinished = true
 			}
-			chunkData.Choices = append(chunkData.Choices, choiceData)
-			hasFinishReason = true
 		} else {
 			// Use marshal/unmarshal to preserve all fields including tool_calls
 			for _, choice := range chunk.Choices {
@@ -583,9 +590,15 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 					continue
 				}
 
+				// Fix for finish_reason: ensure empty strings are converted to nil
+				if choiceData.FinishReason != nil && *choiceData.FinishReason == "" {
+					choiceData.FinishReason = nil
+				}
+
 				// Check if this chunk has a finish_reason
 				if choiceData.FinishReason != nil && *choiceData.FinishReason != "" {
 					hasFinishReason = true
+					streamFinished = true
 				}
 
 				chunkData.Choices = append(chunkData.Choices, choiceData)
@@ -814,6 +827,13 @@ func (s *TinfoilProxyServer) nonStreamingChatCompletion(c *gin.Context, req Chat
 	// Override model with the requested model name
 	response.Model = req.Model
 	response.Object = "chat.completion"
+
+	// Fix for finish_reason: ensure empty strings are converted to nil
+	for i := range response.Choices {
+		if response.Choices[i].FinishReason != nil && *response.Choices[i].FinishReason == "" {
+			response.Choices[i].FinishReason = nil
+		}
+	}
 
 	c.JSON(http.StatusOK, response)
 }

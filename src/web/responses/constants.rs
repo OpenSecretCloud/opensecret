@@ -14,6 +14,7 @@ pub const OBJECT_TYPE_RESPONSE_DELETED: &str = "response.deleted";
 pub const OBJECT_TYPE_CONVERSATION: &str = "conversation";
 pub const OBJECT_TYPE_CONVERSATION_DELETED: &str = "conversation.deleted";
 pub const OBJECT_TYPE_LIST: &str = "list";
+pub const OBJECT_TYPE_LIST_DELETED: &str = "list.deleted";
 
 /// Event types for SSE streaming
 pub const EVENT_RESPONSE_CREATED: &str = "response.created";

@@ -485,6 +485,7 @@ pub trait DBConnection {
         order: &str,
     ) -> Result<Vec<Conversation>, DBError>;
     fn delete_conversation(&self, conversation_id: i64, user_id: Uuid) -> Result<(), DBError>;
+    fn delete_all_conversations(&self, user_id: Uuid) -> Result<(), DBError>;
 
     // Responses (job tracker)
     fn create_response(&self, new_response: NewResponse) -> Result<Response, DBError>;
@@ -1978,6 +1979,12 @@ impl DBConnection for PostgresConnection {
         debug!("Deleting conversation");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Conversation::delete_by_id_and_user(conn, conversation_id, user_id).map_err(DBError::from)
+    }
+
+    fn delete_all_conversations(&self, user_id: Uuid) -> Result<(), DBError> {
+        debug!("Deleting all conversations for user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Conversation::delete_all_for_user(conn, user_id).map_err(DBError::from)
     }
 
     // Responses (job tracker) implementations

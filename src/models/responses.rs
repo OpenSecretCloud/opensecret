@@ -304,6 +304,17 @@ impl Conversation {
         Ok(())
     }
 
+    pub fn delete_all_for_user(
+        conn: &mut PgConnection,
+        user_id: Uuid,
+    ) -> Result<(), ResponsesError> {
+        diesel::delete(conversations::table.filter(conversations::user_id.eq(user_id)))
+            .execute(conn)
+            .map_err(ResponsesError::DatabaseError)?;
+
+        Ok(())
+    }
+
     pub fn list_for_user(
         conn: &mut PgConnection,
         user_id: Uuid,

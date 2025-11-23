@@ -10,7 +10,7 @@ use crate::{
         responses::{
             constants::{
                 DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT,
-                OBJECT_TYPE_LIST,
+                OBJECT_TYPE_LIST, OBJECT_TYPE_LIST_DELETED,
             },
             error_mapping, ConversationBuilder, ConversationItem, ConversationItemConverter,
             DeletedObjectResponse, MessageContent, Paginator,
@@ -575,6 +575,27 @@ async fn list_conversations(
     encrypt_response(&state, &session_id, &response).await
 }
 
+/// DELETE /v1/conversations - Delete all conversations
+async fn delete_all_conversations(
+    State(state): State<Arc<AppState>>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    debug!("Deleting all conversations for user {}", user.uuid);
+
+    state
+        .db
+        .delete_all_conversations(user.uuid)
+        .map_err(error_mapping::map_generic_db_error)?;
+
+    let response = json!({
+        "object": OBJECT_TYPE_LIST_DELETED,
+        "deleted": true
+    });
+
+    encrypt_response(&state, &session_id, &response).await
+}
+
 // ============================================================================
 // Router Configuration
 // ============================================================================
@@ -591,6 +612,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/v1/conversations",
             get(list_conversations).layer(from_fn_with_state(state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/v1/conversations",
+            delete(delete_all_conversations)
+                .layer(from_fn_with_state(state.clone(), decrypt_request::<()>)),
         )
         .route(
             "/v1/conversations/:id",

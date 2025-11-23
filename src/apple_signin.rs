@@ -341,7 +341,8 @@ pub fn generate_apple_client_secret(
     header.kid = Some(key_id.to_owned());
 
     // Current timestamp for iat claim
-    let now = Utc::now().timestamp();
+    // Backdate by 60 seconds to account for potential clock drift
+    let now = Utc::now().timestamp() - 60;
 
     // Create claims - exp must be less than 6 months (15,777,000 seconds) in the future
     // Using 5 months (150 days) to be safe

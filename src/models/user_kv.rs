@@ -73,6 +73,17 @@ impl UserKV {
             .map(|_| ())
             .map_err(UserKVError::DatabaseError)
     }
+
+    pub fn delete_all_for_user(
+        conn: &mut PgConnection,
+        lookup_user_id: Uuid,
+    ) -> Result<(), UserKVError> {
+        diesel::delete(user_kv::table)
+            .filter(user_kv::user_id.eq(lookup_user_id))
+            .execute(conn)
+            .map(|_| ())
+            .map_err(UserKVError::DatabaseError)
+    }
 }
 
 #[derive(Insertable)]

@@ -468,6 +468,11 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
             get(list_kv).layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
         )
         .route(
+            "/protected/kv",
+            delete(delete_all_kv)
+                .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
+        )
+        .route(
             "/protected/request_verification",
             post(request_new_verification_code)
                 .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
@@ -691,6 +696,29 @@ pub async fn delete_kv(
         }
         Err(e) => {
             tracing::error!("Error deleting key-value pair: {:?}", e);
+            Err(ApiError::InternalServerError)
+        }
+    }
+}
+
+pub async fn delete_all_kv(
+    State(data): State<Arc<AppState>>,
+    Extension(user): Extension<User>,
+    Extension(session_id): Extension<Uuid>,
+) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    debug!("Entering delete_all_kv function");
+    info!("Deleting all key-value pairs for user");
+
+    match data.delete_all(user.uuid).await {
+        Ok(_) => {
+            let response = json!({
+                "message": "All key-value pairs deleted successfully"
+            });
+            debug!("Exiting delete_all_kv function");
+            encrypt_response(&data, &session_id, &response).await
+        }
+        Err(e) => {
+            tracing::error!("Error deleting all key-value pairs: {:?}", e);
             Err(ApiError::InternalServerError)
         }
     }

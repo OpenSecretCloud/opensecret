@@ -987,6 +987,10 @@ impl AppState {
         kv::delete(self.db.get_pool(), user_id, &key, &user_key)
     }
 
+    async fn delete_all(&self, user_id: Uuid) -> StoreResult<()> {
+        kv::delete_all(self.db.get_pool(), user_id)
+    }
+
     async fn list(&self, user_id: Uuid) -> StoreResult<Vec<KVPair>> {
         let user_key = self
             .get_user_key(user_id, None, None)

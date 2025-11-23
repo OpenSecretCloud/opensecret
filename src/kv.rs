@@ -119,6 +119,17 @@ pub fn delete(
     }
 }
 
+pub fn delete_all(
+    pool: &diesel::r2d2::Pool<diesel::r2d2::ConnectionManager<PgConnection>>,
+    user_id: Uuid,
+) -> StoreResult<()> {
+    let mut conn = pool.get().map_err(|_| {
+        StoreError::DatabaseError(UserKVError::DatabaseError(diesel::result::Error::NotFound))
+    })?;
+
+    UserKV::delete_all_for_user(&mut conn, user_id).map_err(StoreError::DatabaseError)
+}
+
 pub fn list(
     pool: &diesel::r2d2::Pool<diesel::r2d2::ConnectionManager<PgConnection>>,
     user_id: Uuid,

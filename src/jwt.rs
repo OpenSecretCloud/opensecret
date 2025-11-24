@@ -10,7 +10,7 @@ use axum::{
     middleware::Next,
     response::IntoResponse,
 };
-use chrono::Duration;
+use chrono::{Duration, Utc};
 use jwt_compact::{alg::Es256k, prelude::*, AlgorithmExt};
 use secp256k1::{All, PublicKey, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -292,8 +292,15 @@ impl NewToken {
 
         tracing::debug!("Creating new token with claims: {:?}", custom_claims);
 
-        let time_options = TimeOptions::default();
-        let claims = Claims::new(custom_claims).set_duration_and_issuance(&time_options, duration);
+        // Account for clock drift by setting issued_at 1 minute in the past
+        let now = Utc::now();
+        let iat = now - Duration::minutes(1);
+        let exp = iat + duration;
+
+        let mut claims = Claims::new(custom_claims);
+        claims.issued_at = Some(iat);
+        claims.expiration = Some(exp);
+        claims.not_before = Some(iat);
 
         // Create header with typ field
         let header = Header::empty().with_token_type("JWT");
@@ -355,8 +362,15 @@ impl NewToken {
             custom_claims
         );
 
-        let time_options = TimeOptions::default();
-        let claims = Claims::new(custom_claims).set_duration_and_issuance(&time_options, duration);
+        // Account for clock drift by setting issued_at 1 minute in the past
+        let now = Utc::now();
+        let iat = now - Duration::minutes(1);
+        let exp = iat + duration;
+
+        let mut claims = Claims::new(custom_claims);
+        claims.issued_at = Some(iat);
+        claims.expiration = Some(exp);
+        claims.not_before = Some(iat);
 
         let header = Header::empty().with_token_type("JWT");
         let es256k = Es256k::<Sha256>::new(app_state.config.jwt_keys.secp.clone());

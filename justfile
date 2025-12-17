@@ -189,37 +189,43 @@ update-continuum-proxy:
 
 ### Enclave Management ###
 
-# Terminate the running enclave (dev)
+# Terminate the running application enclave (dev)
+# Skips p11ne (ACM/TLS enclave) - only terminates non-p11ne enclaves
+# Does not fail if no enclave is running
 terminate-enclave-dev:
     ssh -i $DEV_SSH_KEY $DEV_SERVER 'bash -c "\
-    ENCLAVE_ID=\$(nitro-cli describe-enclaves | jq -r \".[0].EnclaveID\") && \
-    if [ ! -z \"\$ENCLAVE_ID\" ]; then \
+    ENCLAVE_ID=\$(nitro-cli describe-enclaves | jq -r \".[] | select(.EnclaveName != \\\"p11ne\\\") | .EnclaveID\" | head -1) && \
+    if [ ! -z \"\$ENCLAVE_ID\" ] && [ \"\$ENCLAVE_ID\" != \"null\" ]; then \
         echo \"Terminating enclave with ID: \$ENCLAVE_ID\" && \
-        nitro-cli terminate-enclave --enclave-id \$ENCLAVE_ID; \
+        nitro-cli terminate-enclave --enclave-id \$ENCLAVE_ID || true; \
     else \
-        echo \"No running enclave found.\"; \
+        echo \"No application enclave running (p11ne is preserved).\"; \
     fi"'
 
-# Terminate the running enclave (prod)
+# Terminate the running application enclave (prod)
+# Skips p11ne (ACM/TLS enclave) - only terminates non-p11ne enclaves
+# Does not fail if no enclave is running
 terminate-enclave-prod:
     ssh -i $PROD_SSH_KEY $PROD_SERVER 'bash -c "\
-    ENCLAVE_ID=\$(nitro-cli describe-enclaves | jq -r \".[0].EnclaveID\") && \
-    if [ ! -z \"\$ENCLAVE_ID\" ]; then \
+    ENCLAVE_ID=\$(nitro-cli describe-enclaves | jq -r \".[] | select(.EnclaveName != \\\"p11ne\\\") | .EnclaveID\" | head -1) && \
+    if [ ! -z \"\$ENCLAVE_ID\" ] && [ \"\$ENCLAVE_ID\" != \"null\" ]; then \
         echo \"Terminating enclave with ID: \$ENCLAVE_ID\" && \
-        nitro-cli terminate-enclave --enclave-id \$ENCLAVE_ID; \
+        nitro-cli terminate-enclave --enclave-id \$ENCLAVE_ID || true; \
     else \
-        echo \"No running enclave found.\"; \
+        echo \"No application enclave running (p11ne is preserved).\"; \
     fi"'
 
-# Terminate the running enclave (preview)
+# Terminate the running application enclave (preview)
+# Skips p11ne (ACM/TLS enclave) - only terminates non-p11ne enclaves
+# Does not fail if no enclave is running
 terminate-enclave-preview:
     ssh -i $PREVIEW_SSH_KEY $PREVIEW_SERVER 'bash -c "\
-    ENCLAVE_ID=\$(nitro-cli describe-enclaves | jq -r \".[0].EnclaveID\") && \
-    if [ ! -z \"\$ENCLAVE_ID\" ]; then \
+    ENCLAVE_ID=\$(nitro-cli describe-enclaves | jq -r \".[] | select(.EnclaveName != \\\"p11ne\\\") | .EnclaveID\" | head -1) && \
+    if [ ! -z \"\$ENCLAVE_ID\" ] && [ \"\$ENCLAVE_ID\" != \"null\" ]; then \
         echo \"Terminating enclave with ID: \$ENCLAVE_ID\" && \
-        nitro-cli terminate-enclave --enclave-id \$ENCLAVE_ID; \
+        nitro-cli terminate-enclave --enclave-id \$ENCLAVE_ID || true; \
     else \
-        echo \"No running enclave found.\"; \
+        echo \"No application enclave running (p11ne is preserved).\"; \
     fi"'
 
 # Restart socat-proxy service (dev)

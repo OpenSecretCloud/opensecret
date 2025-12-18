@@ -74,11 +74,12 @@ var modelConfigs = map[string]struct {
 
 // Request/Response models
 type ChatMessage struct {
-	Role         string           `json:"role,omitempty"`
-	Content      interface{}      `json:"content,omitempty"`
-	ToolCalls    []map[string]any `json:"tool_calls,omitempty"`
-	Refusal      string           `json:"refusal,omitempty"`
-	FunctionCall map[string]any   `json:"function_call,omitempty"` // Deprecated but keeping for compatibility
+	Role             string           `json:"role,omitempty"`
+	Content          interface{}      `json:"content,omitempty"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"`
+	ToolCalls        []map[string]any `json:"tool_calls,omitempty"`
+	Refusal          string           `json:"refusal,omitempty"`
+	FunctionCall     map[string]any   `json:"function_call,omitempty"` // Deprecated but keeping for compatibility
 }
 
 type ChatCompletionRequest struct {

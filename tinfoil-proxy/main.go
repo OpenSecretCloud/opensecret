@@ -60,6 +60,11 @@ var modelConfigs = map[string]struct {
 		Description: "A 30B-parameter vision-language model that understands images and videos. Excels at visual tasks including GUI interaction, generating code from screenshots, spatial understanding, video analysis, and OCR across 32 languages. Supports up to 256K context for processing long videos and documents.",
 		Active:      true,
 	},
+	"kimi-k2-thinking": {
+		ModelID:     "kimi-k2-thinking",
+		Description: "Advanced thinking agent with deep multi-step reasoning and stable long-horizon tool orchestration. 1T parameters (32B active), 256K context.",
+		Active:      true,
+	},
 	"whisper-large-v3-turbo": {
 		ModelID:     "whisper-large-v3-turbo",
 		Description: "Fast and accurate speech-to-text transcription model",

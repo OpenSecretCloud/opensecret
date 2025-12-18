@@ -442,6 +442,7 @@ async fn list_conversation_items(
         ConversationItem::Message { id, .. } => *id,
         ConversationItem::FunctionToolCall { id, .. } => *id,
         ConversationItem::FunctionToolCallOutput { id, .. } => *id,
+        ConversationItem::Reasoning { id, .. } => *id,
     });
 
     let response = ConversationItemListResponse {

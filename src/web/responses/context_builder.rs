@@ -215,6 +215,12 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
                     tok: t,
                 });
             }
+            "reasoning" => {
+                // TODO: Skip reasoning items for now until we confirm how models expect
+                // reasoning to be passed back in subsequent turns. Reasoning is stored
+                // and returned via conversations/items API but not included in LLM context.
+                continue;
+            }
             _ => {
                 // Unknown message type, skip
                 continue;

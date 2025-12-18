@@ -741,6 +741,7 @@ pub struct NewReasoningItem {
     pub summary_enc: Option<Vec<u8>>,
     pub reasoning_tokens: i32,
     pub status: String,
+    pub created_at: DateTime<Utc>,
 }
 
 impl ReasoningItem {
@@ -895,6 +896,24 @@ impl RawThreadMessage {
                     FROM tool_outputs tto
                     JOIN tool_calls tc ON tto.tool_call_fk = tc.id
                     WHERE tto.conversation_id = $1
+
+                    UNION ALL
+
+                    -- Reasoning items
+                    SELECT
+                        'reasoning' as message_type,
+                        ri.id,
+                        ri.uuid,
+                        ri.content_enc,
+                        ri.status,
+                        ri.created_at,
+                        NULL::text as model,
+                        ri.reasoning_tokens as token_count,
+                        NULL::uuid as tool_call_id,
+                        NULL::text as finish_reason,
+                        NULL::text as tool_name
+                    FROM reasoning_items ri
+                    WHERE ri.conversation_id = $1
                 ),
                 cursor_message AS (
                     SELECT created_at, id
@@ -990,6 +1009,24 @@ impl RawThreadMessage {
                     FROM tool_outputs tto
                     JOIN tool_calls tc ON tto.tool_call_fk = tc.id
                     WHERE tto.conversation_id = $1
+
+                    UNION ALL
+
+                    -- Reasoning items
+                    SELECT
+                        'reasoning' as message_type,
+                        ri.id,
+                        ri.uuid,
+                        ri.content_enc,
+                        ri.status,
+                        ri.created_at,
+                        NULL::text as model,
+                        ri.reasoning_tokens as token_count,
+                        NULL::uuid as tool_call_id,
+                        NULL::text as finish_reason,
+                        NULL::text as tool_name
+                    FROM reasoning_items ri
+                    WHERE ri.conversation_id = $1
                 )
                 SELECT *
                 FROM conversation_messages
@@ -1094,6 +1131,24 @@ impl RawThreadMessage {
                 FROM tool_outputs tto
                 JOIN tool_calls tc ON tto.tool_call_fk = tc.id
                 WHERE tto.response_id = $1
+
+                UNION ALL
+
+                -- Reasoning items
+                SELECT
+                    'reasoning' as message_type,
+                    ri.id,
+                    ri.uuid,
+                    ri.content_enc,
+                    ri.status,
+                    ri.created_at,
+                    NULL::text as model,
+                    ri.reasoning_tokens as token_count,
+                    NULL::uuid as tool_call_id,
+                    NULL::text as finish_reason,
+                    NULL::text as tool_name
+                FROM reasoning_items ri
+                WHERE ri.response_id = $1
             )
             SELECT * FROM response_messages
             ORDER BY created_at ASC
@@ -1136,9 +1191,14 @@ impl RawThreadMessage {
             .filter(|(t, _)| t == "tool_output")
             .map(|(_, id)| *id)
             .collect();
+        let reasoning_ids: Vec<i64> = message_ids
+            .iter()
+            .filter(|(t, _)| t == "reasoning")
+            .map(|(_, id)| *id)
+            .collect();
 
         // Build WHERE clause with proper parameter binding
-        // Always use all 4 parameters ($2-$5) to maintain consistent type signature
+        // Always use all 5 parameters ($2-$6) to maintain consistent type signature
         let query = r#"
             WITH conversation_messages AS (
                 -- User messages
@@ -1213,12 +1273,31 @@ impl RawThreadMessage {
                 FROM tool_outputs tto
                 JOIN tool_calls tc ON tto.tool_call_fk = tc.id
                 WHERE tto.conversation_id = $1
+
+                UNION ALL
+
+                -- Reasoning items
+                SELECT
+                    'reasoning' as message_type,
+                    ri.id,
+                    ri.uuid,
+                    ri.content_enc,
+                    ri.status,
+                    ri.created_at,
+                    NULL::text as model,
+                    ri.reasoning_tokens as token_count,
+                    NULL::uuid as tool_call_id,
+                    NULL::text as finish_reason,
+                    NULL::text as tool_name
+                FROM reasoning_items ri
+                WHERE ri.conversation_id = $1
             )
             SELECT * FROM conversation_messages
             WHERE (message_type = 'user' AND id = ANY($2::bigint[]))
                OR (message_type = 'assistant' AND id = ANY($3::bigint[]))
                OR (message_type = 'tool_call' AND id = ANY($4::bigint[]))
                OR (message_type = 'tool_output' AND id = ANY($5::bigint[]))
+               OR (message_type = 'reasoning' AND id = ANY($6::bigint[]))
             ORDER BY created_at ASC, id ASC
         "#;
 
@@ -1228,6 +1307,7 @@ impl RawThreadMessage {
             .bind::<Array<BigInt>, _>(&assistant_ids)
             .bind::<Array<BigInt>, _>(&tool_call_ids)
             .bind::<Array<BigInt>, _>(&tool_output_ids)
+            .bind::<Array<BigInt>, _>(&reasoning_ids)
             .load::<RawThreadMessage>(conn)
             .map_err(ResponsesError::DatabaseError)
     }
@@ -1313,6 +1393,21 @@ impl RawThreadMessageMetadata {
                 FROM tool_outputs tto
                 JOIN tool_calls tc ON tto.tool_call_fk = tc.id
                 WHERE tto.conversation_id = $1
+
+                UNION ALL
+
+                -- Reasoning items
+                -- TODO: Currently included for completeness but dropped in context_builder
+                -- until we confirm how models expect reasoning to be passed back
+                SELECT
+                    'reasoning' as message_type,
+                    ri.id,
+                    ri.uuid,
+                    ri.created_at,
+                    ri.reasoning_tokens as token_count,
+                    NULL::uuid as tool_call_id
+                FROM reasoning_items ri
+                WHERE ri.conversation_id = $1
             )
             SELECT * FROM conversation_messages
             ORDER BY created_at DESC, id DESC

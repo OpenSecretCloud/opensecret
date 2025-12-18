@@ -423,6 +423,7 @@ pub async fn storage_task(
     tool_persist_ack: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     db: Arc<dyn DBConnection + Send + Sync>,
     response_id: i64,
+    reasoning_base_timestamp: chrono::DateTime<chrono::Utc>,
     conversation_id: i64,
     user_id: Uuid,
     user_key: SecretKey,
@@ -452,6 +453,7 @@ pub async fn storage_task(
                     summary_enc: None,
                     reasoning_tokens: 0,
                     status: "in_progress".to_string(),
+                    created_at: reasoning_base_timestamp,
                 };
 
                 match db.create_reasoning_item(new_reasoning_item) {

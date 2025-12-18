@@ -213,6 +213,25 @@ pub enum ConversationItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         created_at: Option<i64>,
     },
+    /// Reasoning chain-of-thought from thinking models
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        id: Uuid,
+        /// Reasoning text content
+        content: Vec<ReasoningContentItem>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        created_at: Option<i64>,
+    },
+}
+
+/// Reasoning content item (text only for now)
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type")]
+pub enum ReasoningContentItem {
+    #[serde(rename = "text")]
+    Text { text: String },
 }
 
 /// Centralized conversation item conversion utilities
@@ -249,6 +268,7 @@ impl ConversationItemConverter {
             "assistant" => Self::assistant_message_to_item(msg, content),
             "tool_call" => Self::tool_call_to_item(msg, content),
             "tool_output" => Self::tool_output_to_item(msg, content),
+            "reasoning" => Self::reasoning_to_item(msg, content),
             unknown => {
                 error!("Unknown message type: {}", unknown);
                 Err(ApiError::InternalServerError)
@@ -331,6 +351,26 @@ impl ConversationItemConverter {
                 ApiError::InternalServerError
             })?,
             output: content,
+            status: msg.status.clone(),
+            created_at: Some(msg.created_at.timestamp()),
+        })
+    }
+
+    /// Convert reasoning item to ConversationItem
+    fn reasoning_to_item(
+        msg: &RawThreadMessage,
+        content: String,
+    ) -> Result<ConversationItem, ApiError> {
+        // Reasoning content is stored as plain text, wrap in content array
+        let content_items = if content.is_empty() {
+            vec![]
+        } else {
+            vec![ReasoningContentItem::Text { text: content }]
+        };
+
+        Ok(ConversationItem::Reasoning {
+            id: msg.uuid,
+            content: content_items,
             status: msg.status.clone(),
             created_at: Some(msg.created_at.timestamp()),
         })

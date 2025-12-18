@@ -598,9 +598,11 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 
 				// Extract reasoning_content from ExtraFields (SDK doesn't have this field)
 				if rcField, ok := choice.Delta.JSON.ExtraFields["reasoning_content"]; ok && rcField.Raw() != "null" {
-					// Remove surrounding quotes from JSON string value
-					rc := strings.Trim(rcField.Raw(), `"`)
-					delta.ReasoningContent = rc
+					// Properly unmarshal JSON string to handle escape sequences (\", \\, \n, etc.)
+					var rc string
+					if err := json.Unmarshal([]byte(rcField.Raw()), &rc); err == nil {
+						delta.ReasoningContent = rc
+					}
 				}
 
 				// Handle tool_calls via raw JSON since it's complex

@@ -1,6 +1,6 @@
 use crate::models::schema::{
-    assistant_messages, conversations, responses, tool_calls, tool_outputs, user_instructions,
-    user_messages,
+    assistant_messages, conversations, reasoning_items, responses, tool_calls, tool_outputs,
+    user_instructions, user_messages,
 };
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
@@ -703,6 +703,69 @@ impl AssistantMessage {
 impl NewAssistantMessage {
     pub fn insert(&self, conn: &mut PgConnection) -> Result<AssistantMessage, ResponsesError> {
         diesel::insert_into(assistant_messages::table)
+            .values(self)
+            .get_result(conn)
+            .map_err(ResponsesError::DatabaseError)
+    }
+}
+
+// ============================================================================
+// Reasoning Items
+// ============================================================================
+
+#[derive(Queryable, Selectable, Identifiable, Debug, Clone, Serialize, Deserialize)]
+#[diesel(table_name = reasoning_items)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ReasoningItem {
+    pub id: i64,
+    pub uuid: Uuid,
+    pub conversation_id: i64,
+    pub response_id: Option<i64>,
+    pub user_id: Uuid,
+    pub content_enc: Option<Vec<u8>>,
+    pub summary_enc: Option<Vec<u8>>,
+    pub reasoning_tokens: i32,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Insertable, Debug)]
+#[diesel(table_name = reasoning_items)]
+pub struct NewReasoningItem {
+    pub uuid: Uuid,
+    pub conversation_id: i64,
+    pub response_id: Option<i64>,
+    pub user_id: Uuid,
+    pub content_enc: Option<Vec<u8>>,
+    pub summary_enc: Option<Vec<u8>>,
+    pub reasoning_tokens: i32,
+    pub status: String,
+}
+
+impl ReasoningItem {
+    pub fn update(
+        conn: &mut PgConnection,
+        item_uuid: Uuid,
+        content_enc: Option<Vec<u8>>,
+        reasoning_tokens: i32,
+        status: String,
+    ) -> Result<ReasoningItem, ResponsesError> {
+        diesel::update(reasoning_items::table.filter(reasoning_items::uuid.eq(item_uuid)))
+            .set((
+                reasoning_items::content_enc.eq(content_enc),
+                reasoning_items::reasoning_tokens.eq(reasoning_tokens),
+                reasoning_items::status.eq(status),
+                reasoning_items::updated_at.eq(diesel::dsl::now),
+            ))
+            .get_result(conn)
+            .map_err(ResponsesError::DatabaseError)
+    }
+}
+
+impl NewReasoningItem {
+    pub fn insert(&self, conn: &mut PgConnection) -> Result<ReasoningItem, ResponsesError> {
+        diesel::insert_into(reasoning_items::table)
             .values(self)
             .get_result(conn)
             .map_err(ResponsesError::DatabaseError)

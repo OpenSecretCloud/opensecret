@@ -1722,7 +1722,12 @@ async fn setup_completion_processor(
                                 {
                                     if !reasoning.is_empty() {
                                         let msg = StorageMessage::ReasoningDelta(reasoning.to_string());
-                                        // Best-effort send to client only (reasoning not stored)
+                                        // Send to storage for persistence
+                                        if tx_storage.send(msg.clone()).await.is_err() {
+                                            error!("Storage channel closed unexpectedly during reasoning");
+                                            break;
+                                        }
+                                        // Send to client for streaming
                                         if client_alive && tx_client.try_send(msg).is_err() {
                                             warn!("Client channel full or closed during reasoning delta, terminating client stream");
                                             client_alive = false;

@@ -29,9 +29,10 @@ use crate::models::project_settings::{
     EmailSettings, NewProjectSetting, ProjectSetting, ProjectSettingError, SettingCategory,
 };
 use crate::models::responses::{
-    AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewResponse, NewToolCall,
-    NewToolOutput, NewUserInstruction, NewUserMessage, RawThreadMessage, RawThreadMessageMetadata,
-    Response, ResponseStatus, ResponsesError, ToolCall, ToolOutput, UserInstruction, UserMessage,
+    AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewReasoningItem,
+    NewResponse, NewToolCall, NewToolOutput, NewUserInstruction, NewUserMessage, RawThreadMessage,
+    RawThreadMessageMetadata, ReasoningItem, Response, ResponseStatus, ResponsesError, ToolCall,
+    ToolOutput, UserInstruction, UserMessage,
 };
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
 use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
@@ -570,6 +571,16 @@ pub trait DBConnection {
         status: String,
         finish_reason: Option<String>,
     ) -> Result<AssistantMessage, DBError>;
+
+    // Reasoning items
+    fn create_reasoning_item(&self, new_item: NewReasoningItem) -> Result<ReasoningItem, DBError>;
+    fn update_reasoning_item(
+        &self,
+        item_uuid: Uuid,
+        content_enc: Option<Vec<u8>>,
+        reasoning_tokens: i32,
+        status: String,
+    ) -> Result<ReasoningItem, DBError>;
 
     // Tool calls / outputs
     fn create_tool_call(&self, new_call: NewToolCall) -> Result<ToolCall, DBError>;
@@ -2339,6 +2350,26 @@ impl DBConnection for PostgresConnection {
             finish_reason,
         )
         .map_err(DBError::from)
+    }
+
+    // Reasoning items
+    fn create_reasoning_item(&self, new_item: NewReasoningItem) -> Result<ReasoningItem, DBError> {
+        debug!("Creating new reasoning item");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_item.insert(conn).map_err(DBError::from)
+    }
+
+    fn update_reasoning_item(
+        &self,
+        item_uuid: Uuid,
+        content_enc: Option<Vec<u8>>,
+        reasoning_tokens: i32,
+        status: String,
+    ) -> Result<ReasoningItem, DBError> {
+        debug!("Updating reasoning item {}", item_uuid);
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        ReasoningItem::update(conn, item_uuid, content_enc, reasoning_tokens, status)
+            .map_err(DBError::from)
     }
 
     // Tool calls / outputs

@@ -211,6 +211,22 @@ diesel::table! {
 }
 
 diesel::table! {
+    reasoning_items (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        conversation_id -> Int8,
+        response_id -> Nullable<Int8>,
+        user_id -> Uuid,
+        content_enc -> Nullable<Bytea>,
+        summary_enc -> Nullable<Bytea>,
+        reasoning_tokens -> Int4,
+        status -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     use diesel::sql_types::*;
     use super::sql_types::ResponseStatus;
 
@@ -365,6 +381,8 @@ diesel::joinable!(org_memberships -> orgs (org_id));
 diesel::joinable!(org_project_secrets -> org_projects (project_id));
 diesel::joinable!(org_projects -> orgs (org_id));
 diesel::joinable!(project_settings -> org_projects (project_id));
+diesel::joinable!(reasoning_items -> conversations (conversation_id));
+diesel::joinable!(reasoning_items -> responses (response_id));
 diesel::joinable!(responses -> conversations (conversation_id));
 diesel::joinable!(tool_calls -> conversations (conversation_id));
 diesel::joinable!(tool_calls -> responses (response_id));
@@ -394,6 +412,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     platform_password_reset_requests,
     platform_users,
     project_settings,
+    reasoning_items,
     responses,
     token_usage,
     tool_calls,

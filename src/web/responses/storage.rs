@@ -19,6 +19,8 @@ use super::handlers::StorageMessage;
 /// Accumulates streaming content and metadata
 pub(crate) struct ContentAccumulator {
     content: String,
+    reasoning_content: String,
+    reasoning_item_id: Option<Uuid>,
     completion_tokens: i32,
 }
 
@@ -26,8 +28,20 @@ impl ContentAccumulator {
     pub fn new() -> Self {
         Self {
             content: String::with_capacity(4096),
+            reasoning_content: String::with_capacity(4096),
+            reasoning_item_id: None,
             completion_tokens: 0,
         }
+    }
+
+    /// Get the reasoning item ID if one was created
+    pub fn reasoning_item_id(&self) -> Option<Uuid> {
+        self.reasoning_item_id
+    }
+
+    /// Get accumulated reasoning content
+    pub fn reasoning_content(&self) -> &str {
+        &self.reasoning_content
     }
 
     /// Handle a storage message and return the accumulator state
@@ -38,11 +52,17 @@ impl ContentAccumulator {
                 self.content.push_str(&delta);
                 AccumulatorState::Continue
             }
-            StorageMessage::ReasoningDelta(_) => {
-                // TODO: Consider storing reasoning content in the future
-                // - Add reasoning_content_enc column to assistant_messages table
-                // - Accumulate reasoning like content and encrypt on Done
-                // For now, reasoning is only streamed to client, not persisted
+            StorageMessage::ReasoningDelta(delta) => {
+                trace!("Storage: received reasoning delta: {} chars", delta.len());
+                self.reasoning_content.push_str(&delta);
+
+                // If this is the first reasoning delta, generate an ID and signal creation
+                if self.reasoning_item_id.is_none() {
+                    let item_id = Uuid::new_v4();
+                    self.reasoning_item_id = Some(item_id);
+                    return AccumulatorState::CreateReasoningItem { item_id };
+                }
+
                 AccumulatorState::Continue
             }
             StorageMessage::Usage {
@@ -71,6 +91,8 @@ impl ContentAccumulator {
                     completion_tokens: self.completion_tokens,
                     finish_reason,
                     message_id,
+                    reasoning_content: self.reasoning_content.clone(),
+                    reasoning_item_id: self.reasoning_item_id,
                 })
             }
             StorageMessage::Cancelled => {
@@ -78,6 +100,8 @@ impl ContentAccumulator {
                 AccumulatorState::Cancelled(PartialData {
                     content: self.content.clone(),
                     completion_tokens: self.completion_tokens,
+                    reasoning_content: self.reasoning_content.clone(),
+                    reasoning_item_id: self.reasoning_item_id,
                 })
             }
             StorageMessage::Error(e) => {
@@ -86,6 +110,8 @@ impl ContentAccumulator {
                     error: e,
                     partial_content: self.content.clone(),
                     completion_tokens: self.completion_tokens,
+                    reasoning_content: self.reasoning_content.clone(),
+                    reasoning_item_id: self.reasoning_item_id,
                 })
             }
             StorageMessage::ToolCall {
@@ -138,6 +164,9 @@ pub enum AccumulatorState {
     Complete(CompleteData),
     Cancelled(PartialData),
     Failed(FailureData),
+    CreateReasoningItem {
+        item_id: Uuid,
+    },
     PersistToolCall {
         tool_call_id: Uuid,
         name: String,
@@ -156,12 +185,16 @@ pub struct CompleteData {
     pub completion_tokens: i32,
     pub finish_reason: String,
     pub message_id: Uuid,
+    pub reasoning_content: String,
+    pub reasoning_item_id: Option<Uuid>,
 }
 
 /// Data for a partial/cancelled response
 pub struct PartialData {
     pub content: String,
     pub completion_tokens: i32,
+    pub reasoning_content: String,
+    pub reasoning_item_id: Option<Uuid>,
 }
 
 /// Data for a failed response
@@ -169,6 +202,8 @@ pub struct FailureData {
     pub error: String,
     pub partial_content: String,
     pub completion_tokens: i32,
+    pub reasoning_content: String,
+    pub reasoning_item_id: Option<Uuid>,
 }
 
 /// Handles persistence of responses in various states
@@ -236,6 +271,34 @@ impl ResponsePersister {
             return Err(format!("Failed to update response status: {:?}", e));
         }
 
+        // Update reasoning item if present
+        if let Some(reasoning_item_id) = data.reasoning_item_id {
+            if !data.reasoning_content.is_empty() {
+                let reasoning_enc =
+                    encrypt_with_key(&self.user_key, data.reasoning_content.as_bytes()).await;
+                let reasoning_tokens = count_tokens(&data.reasoning_content);
+                let reasoning_tokens_i32 = if reasoning_tokens > i32::MAX as usize {
+                    warn!(
+                        "Reasoning token count {} exceeds i32::MAX, clamping",
+                        reasoning_tokens
+                    );
+                    i32::MAX
+                } else {
+                    reasoning_tokens as i32
+                };
+
+                if let Err(e) = self.db.update_reasoning_item(
+                    reasoning_item_id,
+                    Some(reasoning_enc),
+                    reasoning_tokens_i32,
+                    STATUS_COMPLETED.to_string(),
+                ) {
+                    error!("Failed to update reasoning item: {:?}", e);
+                    // Non-fatal: assistant message was saved successfully
+                }
+            }
+        }
+
         debug!("Successfully persisted completed response");
         Ok(())
     }
@@ -271,6 +334,25 @@ impl ResponsePersister {
                 e
             );
             return Err(format!("Failed to update assistant message: {:?}", e));
+        }
+
+        // Update reasoning item to incomplete if present
+        if let Some(reasoning_item_id) = data.reasoning_item_id {
+            if !data.reasoning_content.is_empty() {
+                let reasoning_enc =
+                    encrypt_with_key(&self.user_key, data.reasoning_content.as_bytes()).await;
+                let reasoning_tokens = count_tokens(&data.reasoning_content) as i32;
+
+                if let Err(e) = self.db.update_reasoning_item(
+                    reasoning_item_id,
+                    Some(reasoning_enc),
+                    reasoning_tokens,
+                    STATUS_INCOMPLETE.to_string(),
+                ) {
+                    error!("Failed to update reasoning item after cancellation: {:?}", e);
+                    // Non-fatal
+                }
+            }
         }
 
         debug!(
@@ -310,6 +392,25 @@ impl ResponsePersister {
             return Err(format!("Failed to update assistant message: {:?}", e));
         }
 
+        // Update reasoning item to incomplete if present
+        if let Some(reasoning_item_id) = data.reasoning_item_id {
+            if !data.reasoning_content.is_empty() {
+                let reasoning_enc =
+                    encrypt_with_key(&self.user_key, data.reasoning_content.as_bytes()).await;
+                let reasoning_tokens = count_tokens(&data.reasoning_content) as i32;
+
+                if let Err(e) = self.db.update_reasoning_item(
+                    reasoning_item_id,
+                    Some(reasoning_enc),
+                    reasoning_tokens,
+                    STATUS_INCOMPLETE.to_string(),
+                ) {
+                    error!("Failed to update reasoning item after failure: {:?}", e);
+                    // Non-fatal
+                }
+            }
+        }
+
         debug!("Persisted failed response with error: {}", data.error);
         Ok(())
     }
@@ -337,6 +438,35 @@ pub async fn storage_task(
     while let Some(msg) = rx.recv().await {
         match accumulator.handle_message(msg) {
             AccumulatorState::Continue => continue,
+
+            AccumulatorState::CreateReasoningItem { item_id } => {
+                // Create reasoning item record with in_progress status
+                use crate::models::responses::NewReasoningItem;
+
+                let new_reasoning_item = NewReasoningItem {
+                    uuid: item_id,
+                    conversation_id,
+                    response_id: Some(response_id),
+                    user_id,
+                    content_enc: None,
+                    summary_enc: None,
+                    reasoning_tokens: 0,
+                    status: "in_progress".to_string(),
+                };
+
+                match db.create_reasoning_item(new_reasoning_item) {
+                    Ok(reasoning_item) => {
+                        debug!(
+                            "Created reasoning item {} (db id: {})",
+                            item_id, reasoning_item.id
+                        );
+                    }
+                    Err(e) => {
+                        error!("Failed to create reasoning item {}: {:?}", item_id, e);
+                        // Non-fatal: reasoning will be lost but response can continue
+                    }
+                }
+            }
 
             AccumulatorState::PersistToolCall {
                 tool_call_id,
@@ -499,6 +629,8 @@ pub async fn storage_task(
             error: "Channel closed prematurely".to_string(),
             partial_content: String::new(),
             completion_tokens: 0,
+            reasoning_content: accumulator.reasoning_content().to_string(),
+            reasoning_item_id: accumulator.reasoning_item_id(),
         })
         .await
     {

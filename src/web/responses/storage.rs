@@ -38,6 +38,13 @@ impl ContentAccumulator {
                 self.content.push_str(&delta);
                 AccumulatorState::Continue
             }
+            StorageMessage::ReasoningDelta(_) => {
+                // TODO: Consider storing reasoning content in the future
+                // - Add reasoning_content_enc column to assistant_messages table
+                // - Accumulate reasoning like content and encrypt on Done
+                // For now, reasoning is only streamed to client, not persisted
+                AccumulatorState::Continue
+            }
             StorageMessage::Usage {
                 prompt_tokens,
                 completion_tokens,

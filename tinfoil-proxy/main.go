@@ -580,33 +580,40 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 				streamFinished = true
 			}
 		} else {
-			// Use marshal/unmarshal to preserve all fields including tool_calls
 			for _, choice := range chunk.Choices {
-				// Marshal the SDK choice to JSON
-				choiceJSON, err := json.Marshal(choice)
-				if err != nil {
-					log.Printf("Failed to marshal choice: %v", err)
-					continue
-				}
-
-				// Unmarshal into our Choice type to preserve all fields
-				var choiceData Choice
-				if err := json.Unmarshal(choiceJSON, &choiceData); err != nil {
-					log.Printf("Failed to unmarshal choice: %v", err)
-					continue
-				}
-
-				// Fix for finish_reason: ensure empty strings are converted to nil
-				if choiceData.FinishReason != nil && *choiceData.FinishReason == "" {
-					choiceData.FinishReason = nil
-				}
-
-				// Check if this chunk has a finish_reason
-				if choiceData.FinishReason != nil && *choiceData.FinishReason != "" {
+				var finishReason *string
+				if choice.FinishReason != "" {
+					fr := choice.FinishReason
+					finishReason = &fr
 					hasFinishReason = true
 					streamFinished = true
 				}
 
+				// Build delta with reasoning_content from ExtraFields
+				delta := ChatMessage{
+					Role:    choice.Delta.Role,
+					Content: choice.Delta.Content,
+					Refusal: choice.Delta.Refusal,
+				}
+
+				// Extract reasoning_content from ExtraFields (SDK doesn't have this field)
+				if rcField, ok := choice.Delta.JSON.ExtraFields["reasoning_content"]; ok && rcField.Raw() != "null" {
+					// Remove surrounding quotes from JSON string value
+					rc := strings.Trim(rcField.Raw(), `"`)
+					delta.ReasoningContent = rc
+				}
+
+				// Handle tool_calls via raw JSON since it's complex
+				if len(choice.Delta.ToolCalls) > 0 {
+					toolCallsJSON, _ := json.Marshal(choice.Delta.ToolCalls)
+					json.Unmarshal(toolCallsJSON, &delta.ToolCalls)
+				}
+
+				choiceData := Choice{
+					Index:        int(choice.Index),
+					Delta:        &delta,
+					FinishReason: finishReason,
+				}
 				chunkData.Choices = append(chunkData.Choices, choiceData)
 			}
 		}

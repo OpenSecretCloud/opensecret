@@ -460,6 +460,54 @@ pub struct ResponseOutputTextDoneEvent {
     pub logprobs: Vec<serde_json::Value>,
 }
 
+/// SSE Event wrapper for response.reasoning_text.delta
+/// Used for thinking/reasoning models (e.g., kimi-k2-thinking) that emit reasoning tokens
+/// TODO: Consider adding reasoning to final response output (like OpenAI's reasoning summary)
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseReasoningTextDeltaEvent {
+    /// Event type (always "response.reasoning_text.delta")
+    #[serde(rename = "type")]
+    pub event_type: &'static str,
+
+    /// The reasoning delta
+    pub delta: String,
+
+    /// The ID of the output item
+    pub item_id: String,
+
+    /// The index of the output item
+    pub output_index: i32,
+
+    /// The index of the content part
+    pub content_index: i32,
+
+    /// Sequence number for ordering
+    pub sequence_number: i32,
+}
+
+/// SSE Event wrapper for response.reasoning_text.done
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseReasoningTextDoneEvent {
+    /// Event type (always "response.reasoning_text.done")
+    #[serde(rename = "type")]
+    pub event_type: &'static str,
+
+    /// Sequence number for ordering
+    pub sequence_number: i32,
+
+    /// The ID of the output item
+    pub item_id: String,
+
+    /// The index of the output item
+    pub output_index: i32,
+
+    /// The index of the content part
+    pub content_index: i32,
+
+    /// The complete reasoning text
+    pub text: String,
+}
+
 /// SSE Event wrapper for response.content_part.done
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseContentPartDoneEvent {
@@ -626,6 +674,7 @@ pub struct ToolOutputCreatedEvent {
 #[derive(Debug, Clone)]
 pub enum StorageMessage {
     ContentDelta(String),
+    ReasoningDelta(String),
     Usage {
         prompt_tokens: i32,
         completion_tokens: i32,
@@ -1654,11 +1703,35 @@ async fn setup_completion_processor(
 
                         match chunk {
                             crate::web::openai::CompletionChunk::StreamChunk(json) => {
-                                // Extract content from the full JSON chunk (safe chaining to avoid panics)
-                                if let Some(content) = json
+                                // Extract delta for inspection
+                                let delta = json
                                     .get("choices")
                                     .and_then(|c| c.get(0))
-                                    .and_then(|c| c.get("delta"))
+                                    .and_then(|c| c.get("delta"));
+
+                                // Log full delta to see reasoning_content if present
+                                if let Some(d) = delta {
+                                    trace!("Stream delta: {}", d);
+                                }
+
+                                // Extract reasoning_content for thinking models (e.g., kimi-k2-thinking)
+                                // Only send to client, not to storage (reasoning is not persisted)
+                                if let Some(reasoning) = delta
+                                    .and_then(|d| d.get("reasoning_content"))
+                                    .and_then(|c| c.as_str())
+                                {
+                                    if !reasoning.is_empty() {
+                                        let msg = StorageMessage::ReasoningDelta(reasoning.to_string());
+                                        // Best-effort send to client only (reasoning not stored)
+                                        if client_alive && tx_client.try_send(msg).is_err() {
+                                            warn!("Client channel full or closed during reasoning delta, terminating client stream");
+                                            client_alive = false;
+                                        }
+                                    }
+                                }
+
+                                // Extract content from the full JSON chunk (safe chaining to avoid panics)
+                                if let Some(content) = delta
                                     .and_then(|d| d.get("content"))
                                     .and_then(|c| c.as_str())
                                 {
@@ -2023,6 +2096,7 @@ async fn create_response_stream(
         // NOW immediately start the event loop - it will receive events from orchestrator as they happen
         trace!("Starting event loop to receive messages from background tasks");
         let mut assistant_content = String::new();
+        let mut reasoning_content = String::new();
         let mut total_completion_tokens = 0i32;
         while let Some(msg) = rx_client.recv().await {
             trace!("Client stream received message from upstream processor");
@@ -2030,6 +2104,19 @@ async fn create_response_stream(
                 StorageMessage::Done { finish_reason, message_id: msg_id } => {
                     trace!("Client stream received Done signal with finish_reason={}, message_id={}", finish_reason, msg_id);
                     // Note: msg_id should match our pre-generated assistant_message_id
+
+                                // Event 6.5: response.reasoning_text.done (if there was reasoning content)
+                                if !reasoning_content.is_empty() {
+                                    let reasoning_done_event = ResponseReasoningTextDoneEvent {
+                                        event_type: EVENT_RESPONSE_REASONING_TEXT_DONE,
+                                        sequence_number: emitter.sequence_number(),
+                                        item_id: assistant_message_id.to_string(),
+                                        output_index: 0,
+                                        content_index: 0,
+                                        text: reasoning_content.clone(),
+                                    };
+                                    yield Ok(ResponseEvent::ReasoningTextDone(reasoning_done_event).to_sse_event(&mut emitter).await);
+                                }
 
                                 // Event 7: response.output_text.done
                                 let output_text_done_event = ResponseOutputTextDoneEvent {
@@ -2124,6 +2211,22 @@ async fn create_response_stream(
                     };
 
                     yield Ok(ResponseEvent::OutputTextDelta(delta_event).to_sse_event(&mut emitter).await);
+                }
+                StorageMessage::ReasoningDelta(reasoning) => {
+                    trace!("Client stream received reasoning delta: {}", reasoning);
+                    reasoning_content.push_str(&reasoning);
+
+                    // Send reasoning delta to client
+                    let delta_event = ResponseReasoningTextDeltaEvent {
+                        event_type: EVENT_RESPONSE_REASONING_TEXT_DELTA,
+                        delta: reasoning.clone(),
+                        item_id: assistant_message_id.to_string(),
+                        output_index: 0,
+                        content_index: 0,
+                        sequence_number: emitter.sequence_number(),
+                    };
+
+                    yield Ok(ResponseEvent::ReasoningTextDelta(delta_event).to_sse_event(&mut emitter).await);
                 }
 
                 StorageMessage::Usage { prompt_tokens: _, completion_tokens } => {

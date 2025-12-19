@@ -52,13 +52,12 @@ impl ContentAccumulator {
                 self.content.push_str(&delta);
                 AccumulatorState::Continue
             }
-            StorageMessage::ReasoningDelta(delta) => {
+            StorageMessage::ReasoningDelta { item_id, delta } => {
                 trace!("Storage: received reasoning delta: {} chars", delta.len());
                 self.reasoning_content.push_str(&delta);
 
-                // If this is the first reasoning delta, generate an ID and signal creation
+                // Use the item_id from the message - same UUID as SSE events
                 if self.reasoning_item_id.is_none() {
-                    let item_id = Uuid::new_v4();
                     self.reasoning_item_id = Some(item_id);
                     return AccumulatorState::CreateReasoningItem { item_id };
                 }

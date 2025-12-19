@@ -674,7 +674,11 @@ pub struct ToolOutputCreatedEvent {
 #[derive(Debug, Clone)]
 pub enum StorageMessage {
     ContentDelta(String),
-    ReasoningDelta(String),
+    /// Reasoning delta with item_id to ensure SSE and DB use the same UUID
+    ReasoningDelta {
+        item_id: Uuid,
+        delta: String,
+    },
     Usage {
         prompt_tokens: i32,
         completion_tokens: i32,
@@ -1675,6 +1679,8 @@ async fn setup_completion_processor(
         tokio::spawn(async move {
             trace!("Starting completion stream processor task");
             let mut client_alive = true;
+            // Single source of truth for reasoning item UUID - generated on first reasoning delta
+            let mut reasoning_item_id: Option<Uuid> = None;
 
             loop {
                 tokio::select! {
@@ -1721,13 +1727,18 @@ async fn setup_completion_processor(
                                 }
 
                                 // Extract reasoning_content for thinking models (e.g., kimi-k2-thinking)
-                                // Only send to client, not to storage (reasoning is not persisted)
                                 if let Some(reasoning) = delta
                                     .and_then(|d| d.get("reasoning_content"))
                                     .and_then(|c| c.as_str())
                                 {
                                     if !reasoning.is_empty() {
-                                        let msg = StorageMessage::ReasoningDelta(reasoning.to_string());
+                                        // Generate UUID on first reasoning delta - this ensures SSE and DB use the same ID
+                                        let item_id = *reasoning_item_id.get_or_insert_with(Uuid::new_v4);
+
+                                        let msg = StorageMessage::ReasoningDelta {
+                                            item_id,
+                                            delta: reasoning.to_string(),
+                                        };
                                         // Send to storage for persistence
                                         if tx_storage.send(msg.clone()).await.is_err() {
                                             error!("Storage channel closed unexpectedly during reasoning");
@@ -2120,7 +2131,8 @@ async fn create_response_stream(
         let mut reasoning_done_emitted = false;
         let mut reasoning_item_started = false;
         let mut message_item_started = false;
-        let reasoning_item_id = Uuid::new_v4(); // Separate ID for reasoning item
+        // Reasoning item ID comes from the message - same UUID used for SSE and DB
+        let mut reasoning_item_id: Option<Uuid> = None;
         let mut total_completion_tokens = 0i32;
         while let Some(msg) = rx_client.recv().await {
             trace!("Client stream received message from upstream processor");
@@ -2134,36 +2146,38 @@ async fn create_response_stream(
 
                     // Fallback: emit reasoning done events if not already done (edge case)
                     if !reasoning_done_emitted && !reasoning_content.is_empty() {
-                        reasoning_done_emitted = true;
+                        if let Some(rid) = reasoning_item_id {
+                            // No need to set reasoning_done_emitted = true since we break after this block
 
-                        let reasoning_done_event = ResponseReasoningTextDoneEvent {
-                            event_type: EVENT_RESPONSE_REASONING_TEXT_DONE,
-                            sequence_number: emitter.sequence_number(),
-                            item_id: reasoning_item_id.to_string(),
-                            output_index: 0,
-                            content_index: 0,
-                            text: reasoning_content.clone(),
-                        };
-                        yield Ok(ResponseEvent::ReasoningTextDone(reasoning_done_event).to_sse_event(&mut emitter).await);
+                            let reasoning_done_event = ResponseReasoningTextDoneEvent {
+                                event_type: EVENT_RESPONSE_REASONING_TEXT_DONE,
+                                sequence_number: emitter.sequence_number(),
+                                item_id: rid.to_string(),
+                                output_index: 0,
+                                content_index: 0,
+                                text: reasoning_content.clone(),
+                            };
+                            yield Ok(ResponseEvent::ReasoningTextDone(reasoning_done_event).to_sse_event(&mut emitter).await);
 
-                        let reasoning_item_done = ResponseOutputItemDoneEvent {
-                            event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
-                            sequence_number: emitter.sequence_number(),
-                            output_index: 0,
-                            item: OutputItem {
-                                id: reasoning_item_id.to_string(),
-                                output_type: "reasoning".to_string(),
-                                status: STATUS_COMPLETED.to_string(),
-                                role: None,
-                                content: Some(vec![]),
-                            },
-                        };
-                        yield Ok(ResponseEvent::OutputItemDone(reasoning_item_done).to_sse_event(&mut emitter).await);
+                            let reasoning_item_done = ResponseOutputItemDoneEvent {
+                                event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
+                                sequence_number: emitter.sequence_number(),
+                                output_index: 0,
+                                item: OutputItem {
+                                    id: rid.to_string(),
+                                    output_type: "reasoning".to_string(),
+                                    status: STATUS_COMPLETED.to_string(),
+                                    role: None,
+                                    content: Some(vec![]),
+                                },
+                            };
+                            yield Ok(ResponseEvent::OutputItemDone(reasoning_item_done).to_sse_event(&mut emitter).await);
+                        }
                     }
 
                     // Emit message start events if not yet started (edge case: no content deltas)
                     if !message_item_started {
-                        message_item_started = true;
+                        // No need to set message_item_started = true since we break after this block
 
                         let output_item_added_event = ResponseOutputItemAddedEvent {
                             event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
@@ -2252,10 +2266,10 @@ async fn create_response_stream(
                         .content(vec![content_part])
                         .build();
 
-                    let output_items = if reasoning_item_started {
+                    let output_items = if let Some(rid) = reasoning_item_id {
                         // Include reasoning item in output
                         let reasoning_item = OutputItem {
-                            id: reasoning_item_id.to_string(),
+                            id: rid.to_string(),
                             output_type: "reasoning".to_string(),
                             status: STATUS_COMPLETED.to_string(),
                             role: None,
@@ -2291,33 +2305,35 @@ async fn create_response_stream(
 
                     // Complete reasoning phase when first content arrives
                     if !reasoning_done_emitted && !reasoning_content.is_empty() {
-                        reasoning_done_emitted = true;
+                        if let Some(rid) = reasoning_item_id {
+                            reasoning_done_emitted = true;
 
-                        // response.reasoning_text.done
-                        let reasoning_done_event = ResponseReasoningTextDoneEvent {
-                            event_type: EVENT_RESPONSE_REASONING_TEXT_DONE,
-                            sequence_number: emitter.sequence_number(),
-                            item_id: reasoning_item_id.to_string(),
-                            output_index: 0,
-                            content_index: 0,
-                            text: reasoning_content.clone(),
-                        };
-                        yield Ok(ResponseEvent::ReasoningTextDone(reasoning_done_event).to_sse_event(&mut emitter).await);
+                            // response.reasoning_text.done
+                            let reasoning_done_event = ResponseReasoningTextDoneEvent {
+                                event_type: EVENT_RESPONSE_REASONING_TEXT_DONE,
+                                sequence_number: emitter.sequence_number(),
+                                item_id: rid.to_string(),
+                                output_index: 0,
+                                content_index: 0,
+                                text: reasoning_content.clone(),
+                            };
+                            yield Ok(ResponseEvent::ReasoningTextDone(reasoning_done_event).to_sse_event(&mut emitter).await);
 
-                        // response.output_item.done for reasoning
-                        let reasoning_item_done = ResponseOutputItemDoneEvent {
-                            event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
-                            sequence_number: emitter.sequence_number(),
-                            output_index: 0,
-                            item: OutputItem {
-                                id: reasoning_item_id.to_string(),
-                                output_type: "reasoning".to_string(),
-                                status: STATUS_COMPLETED.to_string(),
-                                role: None,
-                                content: Some(vec![]), // Reasoning content is in the text field, not content array
-                            },
-                        };
-                        yield Ok(ResponseEvent::OutputItemDone(reasoning_item_done).to_sse_event(&mut emitter).await);
+                            // response.output_item.done for reasoning
+                            let reasoning_item_done = ResponseOutputItemDoneEvent {
+                                event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
+                                sequence_number: emitter.sequence_number(),
+                                output_index: 0,
+                                item: OutputItem {
+                                    id: rid.to_string(),
+                                    output_type: "reasoning".to_string(),
+                                    status: STATUS_COMPLETED.to_string(),
+                                    role: None,
+                                    content: Some(vec![]), // Reasoning content is in the text field, not content array
+                                },
+                            };
+                            yield Ok(ResponseEvent::OutputItemDone(reasoning_item_done).to_sse_event(&mut emitter).await);
+                        }
                     }
 
                     // Emit message start events if not yet started
@@ -2371,8 +2387,14 @@ async fn create_response_stream(
 
                     yield Ok(ResponseEvent::OutputTextDelta(delta_event).to_sse_event(&mut emitter).await);
                 }
-                StorageMessage::ReasoningDelta(reasoning) => {
+                StorageMessage::ReasoningDelta { item_id, delta: reasoning } => {
                     trace!("Client stream received reasoning delta: {}", reasoning);
+
+                    // Store the item_id from the message (same UUID used for SSE and DB)
+                    if reasoning_item_id.is_none() {
+                        reasoning_item_id = Some(item_id);
+                    }
+                    let rid = reasoning_item_id.expect("reasoning_item_id should be set");
 
                     // Emit reasoning item start events on first reasoning delta
                     if !reasoning_item_started {
@@ -2384,7 +2406,7 @@ async fn create_response_stream(
                             sequence_number: emitter.sequence_number(),
                             output_index: 0,
                             item: OutputItem {
-                                id: reasoning_item_id.to_string(),
+                                id: rid.to_string(),
                                 output_type: "reasoning".to_string(),
                                 status: STATUS_IN_PROGRESS.to_string(),
                                 role: None,
@@ -2400,7 +2422,7 @@ async fn create_response_stream(
                     let delta_event = ResponseReasoningTextDeltaEvent {
                         event_type: EVENT_RESPONSE_REASONING_TEXT_DELTA,
                         delta: reasoning.clone(),
-                        item_id: reasoning_item_id.to_string(),
+                        item_id: rid.to_string(),
                         output_index: 0,
                         content_index: 0,
                         sequence_number: emitter.sequence_number(),

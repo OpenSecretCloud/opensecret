@@ -216,6 +216,7 @@ diesel::table! {
         uuid -> Uuid,
         conversation_id -> Int8,
         response_id -> Nullable<Int8>,
+        assistant_message_id -> Nullable<Int8>,
         user_id -> Uuid,
         content_enc -> Nullable<Bytea>,
         summary_enc -> Nullable<Bytea>,
@@ -381,6 +382,7 @@ diesel::joinable!(org_memberships -> orgs (org_id));
 diesel::joinable!(org_project_secrets -> org_projects (project_id));
 diesel::joinable!(org_projects -> orgs (org_id));
 diesel::joinable!(project_settings -> org_projects (project_id));
+diesel::joinable!(reasoning_items -> assistant_messages (assistant_message_id));
 diesel::joinable!(reasoning_items -> conversations (conversation_id));
 diesel::joinable!(reasoning_items -> responses (response_id));
 diesel::joinable!(responses -> conversations (conversation_id));

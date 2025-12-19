@@ -76,7 +76,7 @@ var modelConfigs = map[string]struct {
 type ChatMessage struct {
 	Role             string           `json:"role,omitempty"`
 	Content          interface{}      `json:"content,omitempty"`
-	ReasoningContent string           `json:"reasoning_content,omitempty"`
+	ReasoningContent string           `json:"reasoning_content,omitempty"` // For reasoning_content in LLM responses
 	ToolCalls        []map[string]any `json:"tool_calls,omitempty"`
 	Refusal          string           `json:"refusal,omitempty"`
 	FunctionCall     map[string]any   `json:"function_call,omitempty"` // Deprecated but keeping for compatibility

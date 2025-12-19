@@ -721,6 +721,7 @@ pub struct ReasoningItem {
     pub uuid: Uuid,
     pub conversation_id: i64,
     pub response_id: Option<i64>,
+    pub assistant_message_id: Option<i64>,
     pub user_id: Uuid,
     pub content_enc: Option<Vec<u8>>,
     pub summary_enc: Option<Vec<u8>>,
@@ -736,6 +737,7 @@ pub struct NewReasoningItem {
     pub uuid: Uuid,
     pub conversation_id: i64,
     pub response_id: Option<i64>,
+    pub assistant_message_id: Option<i64>,
     pub user_id: Uuid,
     pub content_enc: Option<Vec<u8>>,
     pub summary_enc: Option<Vec<u8>>,
@@ -899,7 +901,7 @@ impl RawThreadMessage {
 
                     UNION ALL
 
-                    -- Reasoning items
+                    -- Reasoning items (for conversation items API, skipped in context builder)
                     SELECT
                         'reasoning' as message_type,
                         ri.id,
@@ -1012,7 +1014,7 @@ impl RawThreadMessage {
 
                     UNION ALL
 
-                    -- Reasoning items
+                    -- Reasoning items (for conversation items API, skipped in context builder)
                     SELECT
                         'reasoning' as message_type,
                         ri.id,
@@ -1134,7 +1136,7 @@ impl RawThreadMessage {
 
                 UNION ALL
 
-                -- Reasoning items
+                -- Reasoning items (for conversation items API, skipped in context builder)
                 SELECT
                     'reasoning' as message_type,
                     ri.id,
@@ -1276,7 +1278,7 @@ impl RawThreadMessage {
 
                 UNION ALL
 
-                -- Reasoning items
+                -- Reasoning items (for conversation items API, skipped in context builder)
                 SELECT
                     'reasoning' as message_type,
                     ri.id,

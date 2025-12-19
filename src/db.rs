@@ -563,6 +563,10 @@ pub trait DBConnection {
         &self,
         new_msg: NewAssistantMessage,
     ) -> Result<AssistantMessage, DBError>;
+    fn get_assistant_message_by_uuid(
+        &self,
+        message_uuid: Uuid,
+    ) -> Result<Option<AssistantMessage>, DBError>;
     fn update_assistant_message(
         &self,
         message_uuid: Uuid,
@@ -2329,6 +2333,21 @@ impl DBConnection for PostgresConnection {
         debug!("Creating new assistant message");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_msg.insert(conn).map_err(DBError::from)
+    }
+
+    fn get_assistant_message_by_uuid(
+        &self,
+        message_uuid: Uuid,
+    ) -> Result<Option<AssistantMessage>, DBError> {
+        use crate::models::schema::assistant_messages::dsl::*;
+        use diesel::{OptionalExtension, QueryDsl, RunQueryDsl, ExpressionMethods};
+        debug!("Getting assistant message by UUID: {}", message_uuid);
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        assistant_messages
+            .filter(uuid.eq(message_uuid))
+            .first::<AssistantMessage>(conn)
+            .optional()
+            .map_err(DBError::from)
     }
 
     fn update_assistant_message(

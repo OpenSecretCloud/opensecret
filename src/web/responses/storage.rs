@@ -444,10 +444,31 @@ pub async fn storage_task(
                 // Create reasoning item record with in_progress status
                 use crate::models::responses::NewReasoningItem;
 
+                // Look up assistant_message database ID from UUID
+                // The assistant_message should exist by now (created before streaming starts)
+                let assistant_message_db_id = match db.get_assistant_message_by_uuid(message_id) {
+                    Ok(Some(am)) => Some(am.id),
+                    Ok(None) => {
+                        warn!(
+                            "Assistant message {} not found when creating reasoning item",
+                            message_id
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to look up assistant message {}: {:?}",
+                            message_id, e
+                        );
+                        None
+                    }
+                };
+
                 let new_reasoning_item = NewReasoningItem {
                     uuid: item_id,
                     conversation_id,
                     response_id: Some(response_id),
+                    assistant_message_id: assistant_message_db_id,
                     user_id,
                     content_enc: None,
                     summary_enc: None,
@@ -459,8 +480,8 @@ pub async fn storage_task(
                 match db.create_reasoning_item(new_reasoning_item) {
                     Ok(reasoning_item) => {
                         debug!(
-                            "Created reasoning item {} (db id: {})",
-                            item_id, reasoning_item.id
+                            "Created reasoning item {} (db id: {}, assistant_message_id: {:?})",
+                            item_id, reasoning_item.id, assistant_message_db_id
                         );
                     }
                     Err(e) => {

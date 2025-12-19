@@ -460,6 +460,54 @@ pub struct ResponseOutputTextDoneEvent {
     pub logprobs: Vec<serde_json::Value>,
 }
 
+/// SSE Event wrapper for response.reasoning_text.delta
+/// Used for thinking/reasoning models (e.g., kimi-k2-thinking) that emit reasoning tokens
+/// TODO: Consider adding reasoning to final response output (like OpenAI's reasoning summary)
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseReasoningTextDeltaEvent {
+    /// Event type (always "response.reasoning_text.delta")
+    #[serde(rename = "type")]
+    pub event_type: &'static str,
+
+    /// The reasoning delta
+    pub delta: String,
+
+    /// The ID of the output item
+    pub item_id: String,
+
+    /// The index of the output item
+    pub output_index: i32,
+
+    /// The index of the content part
+    pub content_index: i32,
+
+    /// Sequence number for ordering
+    pub sequence_number: i32,
+}
+
+/// SSE Event wrapper for response.reasoning_text.done
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseReasoningTextDoneEvent {
+    /// Event type (always "response.reasoning_text.done")
+    #[serde(rename = "type")]
+    pub event_type: &'static str,
+
+    /// Sequence number for ordering
+    pub sequence_number: i32,
+
+    /// The ID of the output item
+    pub item_id: String,
+
+    /// The index of the output item
+    pub output_index: i32,
+
+    /// The index of the content part
+    pub content_index: i32,
+
+    /// The complete reasoning text
+    pub text: String,
+}
+
 /// SSE Event wrapper for response.content_part.done
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseContentPartDoneEvent {
@@ -626,6 +674,11 @@ pub struct ToolOutputCreatedEvent {
 #[derive(Debug, Clone)]
 pub enum StorageMessage {
     ContentDelta(String),
+    /// Reasoning delta with item_id to ensure SSE and DB use the same UUID
+    ReasoningDelta {
+        item_id: Uuid,
+        delta: String,
+    },
     Usage {
         prompt_tokens: i32,
         completion_tokens: i32,
@@ -671,6 +724,7 @@ struct BuiltContext {
 struct PersistedData {
     response: crate::models::responses::Response,
     decrypted_metadata: Option<Value>,
+    user_message_created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Spawns a background task to generate a conversation title using AI
@@ -1146,10 +1200,14 @@ async fn persist_request_data(
         content_enc: prepared.content_enc.clone(),
         prompt_tokens: prepared.user_message_tokens,
     };
-    let _user_message = state
+    let user_message = state
         .db
         .create_user_message(new_msg)
         .map_err(error_mapping::map_generic_db_error)?;
+
+    // Capture user message timestamp for reasoning item ordering
+    // Reasoning should appear after user message but before assistant message
+    let user_message_created_at = user_message.created_at;
 
     info!(
         "Created response {} for user {} in conversation {}",
@@ -1166,6 +1224,7 @@ async fn persist_request_data(
     Ok(PersistedData {
         response,
         decrypted_metadata,
+        user_message_created_at,
     })
 }
 
@@ -1620,6 +1679,8 @@ async fn setup_completion_processor(
         tokio::spawn(async move {
             trace!("Starting completion stream processor task");
             let mut client_alive = true;
+            // Single source of truth for reasoning item UUID - generated on first reasoning delta
+            let mut reasoning_item_id: Option<Uuid> = None;
 
             loop {
                 tokio::select! {
@@ -1654,11 +1715,45 @@ async fn setup_completion_processor(
 
                         match chunk {
                             crate::web::openai::CompletionChunk::StreamChunk(json) => {
-                                // Extract content from the full JSON chunk (safe chaining to avoid panics)
-                                if let Some(content) = json
+                                // Extract delta for inspection
+                                let delta = json
                                     .get("choices")
                                     .and_then(|c| c.get(0))
-                                    .and_then(|c| c.get("delta"))
+                                    .and_then(|c| c.get("delta"));
+
+                                // Log full delta to see reasoning_content if present
+                                if let Some(d) = delta {
+                                    trace!("Stream delta: {}", d);
+                                }
+
+                                // Extract reasoning_content for thinking models (e.g., kimi-k2-thinking)
+                                if let Some(reasoning) = delta
+                                    .and_then(|d| d.get("reasoning_content"))
+                                    .and_then(|c| c.as_str())
+                                {
+                                    if !reasoning.is_empty() {
+                                        // Generate UUID on first reasoning delta - this ensures SSE and DB use the same ID
+                                        let item_id = *reasoning_item_id.get_or_insert_with(Uuid::new_v4);
+
+                                        let msg = StorageMessage::ReasoningDelta {
+                                            item_id,
+                                            delta: reasoning.to_string(),
+                                        };
+                                        // Send to storage for persistence
+                                        if tx_storage.send(msg.clone()).await.is_err() {
+                                            error!("Storage channel closed unexpectedly during reasoning");
+                                            break;
+                                        }
+                                        // Send to client for streaming
+                                        if client_alive && tx_client.try_send(msg).is_err() {
+                                            warn!("Client channel full or closed during reasoning delta, terminating client stream");
+                                            client_alive = false;
+                                        }
+                                    }
+                                }
+
+                                // Extract content from the full JSON chunk (safe chaining to avoid panics)
+                                if let Some(content) = delta
                                     .and_then(|d| d.get("content"))
                                     .and_then(|c| c.as_str())
                                 {
@@ -1791,6 +1886,11 @@ async fn create_response_stream(
     let total_prompt_tokens = context.total_prompt_tokens;
     let response_id = persisted.response.id;
     let response_uuid = persisted.response.uuid;
+    // Use user_message timestamp + 1 microsecond for reasoning items to ensure proper ordering:
+    // user_message < reasoning < assistant_message
+    // Using 1 microsecond because it's the smallest safe offset - DB roundtrips always take more than this
+    let reasoning_base_timestamp =
+        persisted.user_message_created_at + chrono::Duration::microseconds(1);
     let conversation_id = context.conversation.id;
     let user_id = user.uuid;
     let user_key = prepared.user_key;
@@ -1848,6 +1948,7 @@ async fn create_response_stream(
                     Some(tx_tool_ack),
                     db,
                     response_id,
+                    reasoning_base_timestamp,
                     conversation_id,
                     user_id,
                     user_key,
@@ -1867,6 +1968,7 @@ async fn create_response_stream(
         let orchestrator_headers = headers.clone();
         let orchestrator_response = response_for_stream.clone();
         let orchestrator_metadata = decrypted_metadata.clone();
+        let orchestrator_user_message_created_at = persisted.user_message_created_at;
         let orchestrator_conversation = conversation_for_stream.clone();
         let orchestrator_prompt_messages = prompt_messages.clone();
 
@@ -1896,6 +1998,7 @@ async fn create_response_stream(
                         let persisted_for_tools = PersistedData {
                             response: orchestrator_response.clone(),
                             decrypted_metadata: orchestrator_metadata.clone(),
+                            user_message_created_at: orchestrator_user_message_created_at,
                         };
 
                         match classify_and_execute_tools(
@@ -1952,6 +2055,7 @@ async fn create_response_stream(
                     let persisted_for_completion = PersistedData {
                         response: orchestrator_response.clone(),
                         decrypted_metadata: orchestrator_metadata.clone(),
+                        user_message_created_at: orchestrator_user_message_created_at,
                     };
 
                     match setup_completion_processor(
@@ -2023,6 +2127,12 @@ async fn create_response_stream(
         // NOW immediately start the event loop - it will receive events from orchestrator as they happen
         trace!("Starting event loop to receive messages from background tasks");
         let mut assistant_content = String::new();
+        let mut reasoning_content = String::new();
+        let mut reasoning_done_emitted = false;
+        let mut reasoning_item_started = false;
+        let mut message_item_started = false;
+        // Reasoning item ID comes from the message - same UUID used for SSE and DB
+        let mut reasoning_item_id: Option<Uuid> = None;
         let mut total_completion_tokens = 0i32;
         while let Some(msg) = rx_client.recv().await {
             trace!("Client stream received message from upstream processor");
@@ -2031,99 +2141,294 @@ async fn create_response_stream(
                     trace!("Client stream received Done signal with finish_reason={}, message_id={}", finish_reason, msg_id);
                     // Note: msg_id should match our pre-generated assistant_message_id
 
-                                // Event 7: response.output_text.done
-                                let output_text_done_event = ResponseOutputTextDoneEvent {
-                                    event_type: EVENT_RESPONSE_OUTPUT_TEXT_DONE,
-                                    sequence_number: emitter.sequence_number(),
-                                    item_id: assistant_message_id.to_string(),
-                                    output_index: 0,
-                                    content_index: 0,
-                                    text: assistant_content.clone(),
-                                    logprobs: vec![],
-                                };
+                    // Calculate message output_index based on whether reasoning exists
+                    let message_output_index = if reasoning_item_started { 1 } else { 0 };
 
-                                yield Ok(ResponseEvent::OutputTextDone(output_text_done_event).to_sse_event(&mut emitter).await);
+                    // Fallback: emit reasoning done events if not already done (edge case)
+                    if !reasoning_done_emitted && !reasoning_content.is_empty() {
+                        if let Some(rid) = reasoning_item_id {
+                            // No need to set reasoning_done_emitted = true since we break after this block
 
-                                // Event 8: response.content_part.done
-                                let content_part_done_event = ResponseContentPartDoneEvent {
-                                    event_type: EVENT_RESPONSE_CONTENT_PART_DONE,
-                                    sequence_number: emitter.sequence_number(),
-                                    item_id: assistant_message_id.to_string(),
-                                    output_index: 0,
-                                    content_index: 0,
-                                    part: ContentPart {
-                                        part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
-                                        annotations: vec![],
-                                        logprobs: vec![],
-                                        text: assistant_content.clone(),
-                                    },
-                                };
+                            let reasoning_done_event = ResponseReasoningTextDoneEvent {
+                                event_type: EVENT_RESPONSE_REASONING_TEXT_DONE,
+                                sequence_number: emitter.sequence_number(),
+                                item_id: rid.to_string(),
+                                output_index: 0,
+                                content_index: 0,
+                                text: reasoning_content.clone(),
+                            };
+                            yield Ok(ResponseEvent::ReasoningTextDone(reasoning_done_event).to_sse_event(&mut emitter).await);
 
-                                yield Ok(ResponseEvent::ContentPartDone(content_part_done_event).to_sse_event(&mut emitter).await);
+                            let reasoning_item_done = ResponseOutputItemDoneEvent {
+                                event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
+                                sequence_number: emitter.sequence_number(),
+                                output_index: 0,
+                                item: OutputItem {
+                                    id: rid.to_string(),
+                                    output_type: "reasoning".to_string(),
+                                    status: STATUS_COMPLETED.to_string(),
+                                    role: None,
+                                    content: Some(vec![]),
+                                },
+                            };
+                            yield Ok(ResponseEvent::OutputItemDone(reasoning_item_done).to_sse_event(&mut emitter).await);
+                        }
+                    }
 
-                                // Event 9: response.output_item.done
-                                let content_part = ContentPart {
-                                    part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
-                                    annotations: vec![],
-                                    logprobs: vec![],
-                                    text: assistant_content.clone(),
-                                };
+                    // Emit message start events if not yet started (edge case: no content deltas)
+                    if !message_item_started {
+                        // No need to set message_item_started = true since we break after this block
 
-                                let output_item_done_event = ResponseOutputItemDoneEvent {
-                                    event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
-                                    sequence_number: emitter.sequence_number(),
-                                    output_index: 0,
-                                    item: OutputItem {
-                                        id: assistant_message_id.to_string(),
-                                        output_type: OUTPUT_TYPE_MESSAGE.to_string(),
-                                        status: STATUS_COMPLETED.to_string(),
-                                        role: Some(ROLE_ASSISTANT.to_string()),
-                                        content: Some(vec![content_part]),
-                                    },
-                                };
+                        let output_item_added_event = ResponseOutputItemAddedEvent {
+                            event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
+                            sequence_number: emitter.sequence_number(),
+                            output_index: message_output_index,
+                            item: OutputItem {
+                                id: assistant_message_id.to_string(),
+                                output_type: OUTPUT_TYPE_MESSAGE.to_string(),
+                                status: STATUS_IN_PROGRESS.to_string(),
+                                role: Some(ROLE_ASSISTANT.to_string()),
+                                content: Some(vec![]),
+                            },
+                        };
+                        yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
 
-                                yield Ok(ResponseEvent::OutputItemDone(output_item_done_event).to_sse_event(&mut emitter).await);
+                        let content_part_added_event = ResponseContentPartAddedEvent {
+                            event_type: EVENT_RESPONSE_CONTENT_PART_ADDED,
+                            sequence_number: emitter.sequence_number(),
+                            item_id: assistant_message_id.to_string(),
+                            output_index: message_output_index,
+                            content_index: 0,
+                            part: ContentPart {
+                                part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
+                                annotations: vec![],
+                                logprobs: vec![],
+                                text: String::new(),
+                            },
+                        };
+                        yield Ok(ResponseEvent::ContentPartAdded(content_part_added_event).to_sse_event(&mut emitter).await);
+                    }
 
-                                // Event 10: response.completed
-                                let content_part = ContentPartBuilder::new_output_text(assistant_content.clone()).build();
-                                let output_item = OutputItemBuilder::new_message(assistant_message_id)
-                                    .status(STATUS_COMPLETED)
-                                    .content(vec![content_part])
-                                    .build();
-                                let usage = build_usage(total_prompt_tokens as i32, total_completion_tokens);
+                    // response.output_text.done
+                    let output_text_done_event = ResponseOutputTextDoneEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_TEXT_DONE,
+                        sequence_number: emitter.sequence_number(),
+                        item_id: assistant_message_id.to_string(),
+                        output_index: message_output_index,
+                        content_index: 0,
+                        text: assistant_content.clone(),
+                        logprobs: vec![],
+                    };
+                    yield Ok(ResponseEvent::OutputTextDone(output_text_done_event).to_sse_event(&mut emitter).await);
 
-                                let done_response = ResponseBuilder::from_response(&response_for_stream)
-                                    .status(STATUS_COMPLETED)
-                                    .output(vec![output_item])
-                                    .usage(usage)
-                                    .metadata(decrypted_metadata.clone())
-                                    .build();
+                    // response.content_part.done
+                    let content_part_done_event = ResponseContentPartDoneEvent {
+                        event_type: EVENT_RESPONSE_CONTENT_PART_DONE,
+                        sequence_number: emitter.sequence_number(),
+                        item_id: assistant_message_id.to_string(),
+                        output_index: message_output_index,
+                        content_index: 0,
+                        part: ContentPart {
+                            part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
+                            annotations: vec![],
+                            logprobs: vec![],
+                            text: assistant_content.clone(),
+                        },
+                    };
+                    yield Ok(ResponseEvent::ContentPartDone(content_part_done_event).to_sse_event(&mut emitter).await);
 
-                                let completed_event = ResponseCompletedEvent {
-                                    event_type: EVENT_RESPONSE_COMPLETED,
-                                    response: done_response,
-                                    sequence_number: emitter.sequence_number(),
-                                };
+                    // response.output_item.done for message
+                    let message_content_part = ContentPart {
+                        part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
+                        annotations: vec![],
+                        logprobs: vec![],
+                        text: assistant_content.clone(),
+                    };
 
-                                yield Ok(ResponseEvent::Completed(completed_event).to_sse_event(&mut emitter).await);
+                    let output_item_done_event = ResponseOutputItemDoneEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
+                        sequence_number: emitter.sequence_number(),
+                        output_index: message_output_index,
+                        item: OutputItem {
+                            id: assistant_message_id.to_string(),
+                            output_type: OUTPUT_TYPE_MESSAGE.to_string(),
+                            status: STATUS_COMPLETED.to_string(),
+                            role: Some(ROLE_ASSISTANT.to_string()),
+                            content: Some(vec![message_content_part]),
+                        },
+                    };
+                    yield Ok(ResponseEvent::OutputItemDone(output_item_done_event).to_sse_event(&mut emitter).await);
+
+                    // response.completed - build output array with reasoning + message if reasoning exists
+                    let content_part = ContentPartBuilder::new_output_text(assistant_content.clone()).build();
+                    let message_item = OutputItemBuilder::new_message(assistant_message_id)
+                        .status(STATUS_COMPLETED)
+                        .content(vec![content_part])
+                        .build();
+
+                    let output_items = if let Some(rid) = reasoning_item_id {
+                        // Include reasoning item in output
+                        let reasoning_item = OutputItem {
+                            id: rid.to_string(),
+                            output_type: "reasoning".to_string(),
+                            status: STATUS_COMPLETED.to_string(),
+                            role: None,
+                            content: Some(vec![]),
+                        };
+                        vec![reasoning_item, message_item]
+                    } else {
+                        vec![message_item]
+                    };
+
+                    let usage = build_usage(total_prompt_tokens as i32, total_completion_tokens);
+                    let done_response = ResponseBuilder::from_response(&response_for_stream)
+                        .status(STATUS_COMPLETED)
+                        .output(output_items)
+                        .usage(usage)
+                        .metadata(decrypted_metadata.clone())
+                        .build();
+
+                    let completed_event = ResponseCompletedEvent {
+                        event_type: EVENT_RESPONSE_COMPLETED,
+                        response: done_response,
+                        sequence_number: emitter.sequence_number(),
+                    };
+
+                    yield Ok(ResponseEvent::Completed(completed_event).to_sse_event(&mut emitter).await);
                     break;
                 }
                 StorageMessage::ContentDelta(content) => {
                     trace!("Client stream received content delta: {}", content);
+
+                    // Calculate message output_index based on whether reasoning exists
+                    let message_output_index = if reasoning_item_started { 1 } else { 0 };
+
+                    // Complete reasoning phase when first content arrives
+                    if !reasoning_done_emitted && !reasoning_content.is_empty() {
+                        if let Some(rid) = reasoning_item_id {
+                            reasoning_done_emitted = true;
+
+                            // response.reasoning_text.done
+                            let reasoning_done_event = ResponseReasoningTextDoneEvent {
+                                event_type: EVENT_RESPONSE_REASONING_TEXT_DONE,
+                                sequence_number: emitter.sequence_number(),
+                                item_id: rid.to_string(),
+                                output_index: 0,
+                                content_index: 0,
+                                text: reasoning_content.clone(),
+                            };
+                            yield Ok(ResponseEvent::ReasoningTextDone(reasoning_done_event).to_sse_event(&mut emitter).await);
+
+                            // response.output_item.done for reasoning
+                            let reasoning_item_done = ResponseOutputItemDoneEvent {
+                                event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
+                                sequence_number: emitter.sequence_number(),
+                                output_index: 0,
+                                item: OutputItem {
+                                    id: rid.to_string(),
+                                    output_type: "reasoning".to_string(),
+                                    status: STATUS_COMPLETED.to_string(),
+                                    role: None,
+                                    content: Some(vec![]), // Reasoning content is in the text field, not content array
+                                },
+                            };
+                            yield Ok(ResponseEvent::OutputItemDone(reasoning_item_done).to_sse_event(&mut emitter).await);
+                        }
+                    }
+
+                    // Emit message start events if not yet started
+                    if !message_item_started {
+                        message_item_started = true;
+
+                        // response.output_item.added for message
+                        let output_item_added_event = ResponseOutputItemAddedEvent {
+                            event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
+                            sequence_number: emitter.sequence_number(),
+                            output_index: message_output_index,
+                            item: OutputItem {
+                                id: assistant_message_id.to_string(),
+                                output_type: OUTPUT_TYPE_MESSAGE.to_string(),
+                                status: STATUS_IN_PROGRESS.to_string(),
+                                role: Some(ROLE_ASSISTANT.to_string()),
+                                content: Some(vec![]),
+                            },
+                        };
+                        yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
+
+                        // response.content_part.added
+                        let content_part_added_event = ResponseContentPartAddedEvent {
+                            event_type: EVENT_RESPONSE_CONTENT_PART_ADDED,
+                            sequence_number: emitter.sequence_number(),
+                            item_id: assistant_message_id.to_string(),
+                            output_index: message_output_index,
+                            content_index: 0,
+                            part: ContentPart {
+                                part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
+                                annotations: vec![],
+                                logprobs: vec![],
+                                text: String::new(),
+                            },
+                        };
+                        yield Ok(ResponseEvent::ContentPartAdded(content_part_added_event).to_sse_event(&mut emitter).await);
+                    }
+
                     assistant_content.push_str(&content);
 
-                    // Send to client
+                    // Send content delta to client
                     let delta_event = ResponseOutputTextDeltaEvent {
                         event_type: EVENT_RESPONSE_OUTPUT_TEXT_DELTA,
                         delta: content.clone(),
                         item_id: assistant_message_id.to_string(),
-                        output_index: 0,
+                        output_index: message_output_index,
                         content_index: 0,
                         sequence_number: emitter.sequence_number(),
                         logprobs: vec![],
                     };
 
                     yield Ok(ResponseEvent::OutputTextDelta(delta_event).to_sse_event(&mut emitter).await);
+                }
+                StorageMessage::ReasoningDelta { item_id, delta: reasoning } => {
+                    trace!("Client stream received reasoning delta: {}", reasoning);
+
+                    // Store the item_id from the message (same UUID used for SSE and DB)
+                    if reasoning_item_id.is_none() {
+                        reasoning_item_id = Some(item_id);
+                    }
+                    let rid = reasoning_item_id.expect("reasoning_item_id should be set");
+
+                    // Emit reasoning item start events on first reasoning delta
+                    if !reasoning_item_started {
+                        reasoning_item_started = true;
+
+                        // response.output_item.added for reasoning (output_index: 0)
+                        let reasoning_item_added = ResponseOutputItemAddedEvent {
+                            event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
+                            sequence_number: emitter.sequence_number(),
+                            output_index: 0,
+                            item: OutputItem {
+                                id: rid.to_string(),
+                                output_type: "reasoning".to_string(),
+                                status: STATUS_IN_PROGRESS.to_string(),
+                                role: None,
+                                content: Some(vec![]),
+                            },
+                        };
+                        yield Ok(ResponseEvent::OutputItemAdded(reasoning_item_added).to_sse_event(&mut emitter).await);
+                    }
+
+                    reasoning_content.push_str(&reasoning);
+
+                    // Send reasoning delta to client
+                    let delta_event = ResponseReasoningTextDeltaEvent {
+                        event_type: EVENT_RESPONSE_REASONING_TEXT_DELTA,
+                        delta: reasoning.clone(),
+                        item_id: rid.to_string(),
+                        output_index: 0,
+                        content_index: 0,
+                        sequence_number: emitter.sequence_number(),
+                    };
+
+                    yield Ok(ResponseEvent::ReasoningTextDelta(delta_event).to_sse_event(&mut emitter).await);
                 }
 
                 StorageMessage::Usage { prompt_tokens: _, completion_tokens } => {
@@ -2186,40 +2491,10 @@ async fn create_response_stream(
                     yield Ok(ResponseEvent::ToolOutputCreated(tool_output_event).to_sse_event(&mut emitter).await);
                 }
                 StorageMessage::AssistantMessageStarting => {
-                    debug!("Client stream received assistant message starting signal");
-
-                    // Event 3: response.output_item.added
-                    let output_item_added_event = ResponseOutputItemAddedEvent {
-                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
-                        sequence_number: emitter.sequence_number(),
-                        output_index: 0,
-                        item: OutputItem {
-                            id: assistant_message_id.to_string(),
-                            output_type: OUTPUT_TYPE_MESSAGE.to_string(),
-                            status: STATUS_IN_PROGRESS.to_string(),
-                            role: Some(ROLE_ASSISTANT.to_string()),
-                            content: Some(vec![]),
-                        },
-                    };
-
-                    yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
-
-                    // Event 4: response.content_part.added
-                    let content_part_added_event = ResponseContentPartAddedEvent {
-                        event_type: EVENT_RESPONSE_CONTENT_PART_ADDED,
-                        sequence_number: emitter.sequence_number(),
-                        item_id: assistant_message_id.to_string(),
-                        output_index: 0,
-                        content_index: 0,
-                        part: ContentPart {
-                            part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
-                            annotations: vec![],
-                            logprobs: vec![],
-                            text: String::new(),
-                        },
-                    };
-
-                    yield Ok(ResponseEvent::ContentPartAdded(content_part_added_event).to_sse_event(&mut emitter).await);
+                    // Don't emit output_item.added here - we defer it until we know if there's reasoning
+                    // This allows us to emit reasoning item at output_index 0 if present,
+                    // then message item at output_index 1 (or 0 if no reasoning)
+                    debug!("Client stream received assistant message starting signal (events deferred)");
                 }
             }
         }

@@ -21,7 +21,8 @@ pub fn model_max_ctx(model: &str) -> usize {
         ("llama-3.3-70b", 128_000),
         ("gpt-oss-120b", 128_000),
         ("qwen3-coder-480b", 128_000),
-        ("qwen3-vl-30b", 256_000), // Vision-language model
+        ("qwen3-vl-30b", 256_000),     // Vision-language model
+        ("kimi-k2-thinking", 256_000), // Thinking agent with 256K context
         // Provider-specific equivalents
         ("llama3-3-70b", 128_000), // Tinfoil alias
         // Chat models

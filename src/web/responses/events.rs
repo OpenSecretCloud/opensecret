@@ -11,15 +11,16 @@ use super::constants::{
     EVENT_RESPONSE_COMPLETED, EVENT_RESPONSE_CONTENT_PART_ADDED, EVENT_RESPONSE_CONTENT_PART_DONE,
     EVENT_RESPONSE_CREATED, EVENT_RESPONSE_ERROR, EVENT_RESPONSE_IN_PROGRESS,
     EVENT_RESPONSE_OUTPUT_ITEM_ADDED, EVENT_RESPONSE_OUTPUT_ITEM_DONE,
-    EVENT_RESPONSE_OUTPUT_TEXT_DELTA, EVENT_RESPONSE_OUTPUT_TEXT_DONE, EVENT_TOOL_CALL_CREATED,
-    EVENT_TOOL_OUTPUT_CREATED,
+    EVENT_RESPONSE_OUTPUT_TEXT_DELTA, EVENT_RESPONSE_OUTPUT_TEXT_DONE,
+    EVENT_RESPONSE_REASONING_TEXT_DELTA, EVENT_RESPONSE_REASONING_TEXT_DONE,
+    EVENT_TOOL_CALL_CREATED, EVENT_TOOL_OUTPUT_CREATED,
 };
 use super::handlers::{
     encrypt_event, ResponseCancelledEvent, ResponseCompletedEvent, ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent, ResponseCreatedEvent, ResponseErrorEvent,
     ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent,
-    ResponseOutputTextDeltaEvent, ResponseOutputTextDoneEvent, ToolCallCreatedEvent,
-    ToolOutputCreatedEvent,
+    ResponseOutputTextDeltaEvent, ResponseOutputTextDoneEvent, ResponseReasoningTextDeltaEvent,
+    ResponseReasoningTextDoneEvent, ToolCallCreatedEvent, ToolOutputCreatedEvent,
 };
 
 /// Handles SSE event emission with automatic encryption and error handling
@@ -134,6 +135,8 @@ pub enum ResponseEvent {
     ContentPartAdded(ResponseContentPartAddedEvent),
     OutputTextDelta(ResponseOutputTextDeltaEvent),
     OutputTextDone(ResponseOutputTextDoneEvent),
+    ReasoningTextDelta(ResponseReasoningTextDeltaEvent),
+    ReasoningTextDone(ResponseReasoningTextDoneEvent),
     ContentPartDone(ResponseContentPartDoneEvent),
     OutputItemDone(ResponseOutputItemDoneEvent),
     Completed(ResponseCompletedEvent),
@@ -153,6 +156,8 @@ impl ResponseEvent {
             ResponseEvent::ContentPartAdded(_) => EVENT_RESPONSE_CONTENT_PART_ADDED,
             ResponseEvent::OutputTextDelta(_) => EVENT_RESPONSE_OUTPUT_TEXT_DELTA,
             ResponseEvent::OutputTextDone(_) => EVENT_RESPONSE_OUTPUT_TEXT_DONE,
+            ResponseEvent::ReasoningTextDelta(_) => EVENT_RESPONSE_REASONING_TEXT_DELTA,
+            ResponseEvent::ReasoningTextDone(_) => EVENT_RESPONSE_REASONING_TEXT_DONE,
             ResponseEvent::ContentPartDone(_) => EVENT_RESPONSE_CONTENT_PART_DONE,
             ResponseEvent::OutputItemDone(_) => EVENT_RESPONSE_OUTPUT_ITEM_DONE,
             ResponseEvent::Completed(_) => EVENT_RESPONSE_COMPLETED,
@@ -174,6 +179,8 @@ impl ResponseEvent {
             ResponseEvent::ContentPartAdded(e) => emitter.emit(self.event_type(), e).await,
             ResponseEvent::OutputTextDelta(e) => emitter.emit(self.event_type(), e).await,
             ResponseEvent::OutputTextDone(e) => emitter.emit(self.event_type(), e).await,
+            ResponseEvent::ReasoningTextDelta(e) => emitter.emit(self.event_type(), e).await,
+            ResponseEvent::ReasoningTextDone(e) => emitter.emit(self.event_type(), e).await,
             ResponseEvent::ContentPartDone(e) => emitter.emit(self.event_type(), e).await,
             ResponseEvent::OutputItemDone(e) => emitter.emit(self.event_type(), e).await,
             ResponseEvent::Completed(e) => emitter.emit(self.event_type(), e).await,

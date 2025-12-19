@@ -340,12 +340,21 @@ impl ResponsePersister {
             if !data.reasoning_content.is_empty() {
                 let reasoning_enc =
                     encrypt_with_key(&self.user_key, data.reasoning_content.as_bytes()).await;
-                let reasoning_tokens = count_tokens(&data.reasoning_content) as i32;
+                let reasoning_tokens = count_tokens(&data.reasoning_content);
+                let reasoning_tokens_i32 = if reasoning_tokens > i32::MAX as usize {
+                    warn!(
+                        "Reasoning token count {} exceeds i32::MAX, clamping",
+                        reasoning_tokens
+                    );
+                    i32::MAX
+                } else {
+                    reasoning_tokens as i32
+                };
 
                 if let Err(e) = self.db.update_reasoning_item(
                     reasoning_item_id,
                     Some(reasoning_enc),
-                    reasoning_tokens,
+                    reasoning_tokens_i32,
                     STATUS_INCOMPLETE.to_string(),
                 ) {
                     error!(
@@ -399,12 +408,21 @@ impl ResponsePersister {
             if !data.reasoning_content.is_empty() {
                 let reasoning_enc =
                     encrypt_with_key(&self.user_key, data.reasoning_content.as_bytes()).await;
-                let reasoning_tokens = count_tokens(&data.reasoning_content) as i32;
+                let reasoning_tokens = count_tokens(&data.reasoning_content);
+                let reasoning_tokens_i32 = if reasoning_tokens > i32::MAX as usize {
+                    warn!(
+                        "Reasoning token count {} exceeds i32::MAX, clamping",
+                        reasoning_tokens
+                    );
+                    i32::MAX
+                } else {
+                    reasoning_tokens as i32
+                };
 
                 if let Err(e) = self.db.update_reasoning_item(
                     reasoning_item_id,
                     Some(reasoning_enc),
-                    reasoning_tokens,
+                    reasoning_tokens_i32,
                     STATUS_INCOMPLETE.to_string(),
                 ) {
                     error!("Failed to update reasoning item after failure: {:?}", e);

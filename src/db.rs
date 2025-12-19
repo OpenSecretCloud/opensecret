@@ -2340,7 +2340,7 @@ impl DBConnection for PostgresConnection {
         message_uuid: Uuid,
     ) -> Result<Option<AssistantMessage>, DBError> {
         use crate::models::schema::assistant_messages::dsl::*;
-        use diesel::{OptionalExtension, QueryDsl, RunQueryDsl, ExpressionMethods};
+        use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, RunQueryDsl};
         debug!("Getting assistant message by UUID: {}", message_uuid);
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         assistant_messages

@@ -348,7 +348,10 @@ impl ResponsePersister {
                     reasoning_tokens,
                     STATUS_INCOMPLETE.to_string(),
                 ) {
-                    error!("Failed to update reasoning item after cancellation: {:?}", e);
+                    error!(
+                        "Failed to update reasoning item after cancellation: {:?}",
+                        e
+                    );
                     // Non-fatal
                 }
             }

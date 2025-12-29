@@ -9,7 +9,7 @@ use crate::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         responses::{
             constants::{
-                DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT,
+                self, DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT,
                 OBJECT_TYPE_LIST, OBJECT_TYPE_LIST_DELETED,
             },
             error_mapping, ConversationBuilder, ConversationItem, ConversationItemConverter,
@@ -134,6 +134,40 @@ pub struct UpdateConversationRequest {
 pub struct CreateConversationItemsRequest {
     /// Items to add to the conversation (max 20 at a time)
     pub items: Vec<ConversationInputItem>,
+}
+
+/// Request to batch delete multiple conversations
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BatchDeleteConversationsRequest {
+    /// IDs of conversations to delete
+    pub ids: Vec<Uuid>,
+}
+
+/// Individual result for a batch delete operation
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchDeleteItemResult {
+    /// ID of the conversation
+    pub id: Uuid,
+
+    /// Object type (always "conversation.deleted")
+    pub object: &'static str,
+
+    /// Whether the deletion was successful
+    pub deleted: bool,
+
+    /// Error message if deletion failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<&'static str>,
+}
+
+/// Response for batch delete operations
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchDeleteConversationsResponse {
+    /// Object type (always "list")
+    pub object: &'static str,
+
+    /// Results for each requested deletion
+    pub data: Vec<BatchDeleteItemResult>,
 }
 
 /// Response for a conversation object
@@ -597,6 +631,76 @@ async fn delete_all_conversations(
     encrypt_response(&state, &session_id, &response).await
 }
 
+/// Maximum number of conversations that can be deleted in a single batch request
+const MAX_BATCH_DELETE_SIZE: usize = 20;
+
+/// POST /v1/conversations/batch-delete - Delete multiple specific conversations
+async fn batch_delete_conversations(
+    State(state): State<Arc<AppState>>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+    Extension(body): Extension<BatchDeleteConversationsRequest>,
+) -> Result<Json<EncryptedResponse<BatchDeleteConversationsResponse>>, ApiError> {
+    // Validate batch size
+    if body.ids.is_empty() || body.ids.len() > MAX_BATCH_DELETE_SIZE {
+        return Err(ApiError::BadRequest);
+    }
+
+    debug!(
+        "Batch deleting {} conversations for user {}",
+        body.ids.len(),
+        user.uuid
+    );
+
+    let mut results = Vec::with_capacity(body.ids.len());
+
+    for conversation_id in body.ids {
+        // Try to get the conversation first to verify ownership
+        match state
+            .db
+            .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
+        {
+            Ok(conversation) => {
+                // Delete the conversation
+                match state.db.delete_conversation(conversation.id, user.uuid) {
+                    Ok(()) => {
+                        results.push(BatchDeleteItemResult {
+                            id: conversation_id,
+                            object: constants::OBJECT_TYPE_CONVERSATION_DELETED,
+                            deleted: true,
+                            error: None,
+                        });
+                    }
+                    Err(e) => {
+                        error!("Failed to delete conversation {}: {:?}", conversation_id, e);
+                        results.push(BatchDeleteItemResult {
+                            id: conversation_id,
+                            object: constants::OBJECT_TYPE_CONVERSATION_DELETED,
+                            deleted: false,
+                            error: Some("delete_failed"),
+                        });
+                    }
+                }
+            }
+            Err(_) => {
+                results.push(BatchDeleteItemResult {
+                    id: conversation_id,
+                    object: constants::OBJECT_TYPE_CONVERSATION_DELETED,
+                    deleted: false,
+                    error: Some("not_found"),
+                });
+            }
+        }
+    }
+
+    let response = BatchDeleteConversationsResponse {
+        object: OBJECT_TYPE_LIST,
+        data: results,
+    };
+
+    encrypt_response(&state, &session_id, &response).await
+}
+
 // ============================================================================
 // Router Configuration
 // ============================================================================
@@ -618,6 +722,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/conversations",
             delete(delete_all_conversations)
                 .layer(from_fn_with_state(state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/v1/conversations/batch-delete",
+            post(batch_delete_conversations).layer(from_fn_with_state(
+                state.clone(),
+                decrypt_request::<BatchDeleteConversationsRequest>,
+            )),
         )
         .route(
             "/v1/conversations/:id",

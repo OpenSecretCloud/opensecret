@@ -42,8 +42,8 @@ var modelConfigs = map[string]struct {
 	},
 	"nomic-embed-text": {
 		ModelID:     "nomic-embed-text",
-		Description: "Text embedding model",
-		Active:      false,
+		Description: "Text embedding model for semantic search and similarity",
+		Active:      true,
 	},
 	"gpt-oss-120b": {
 		ModelID:     "gpt-oss-120b",
@@ -83,42 +83,42 @@ type ChatMessage struct {
 }
 
 type ChatCompletionRequest struct {
-	Model             string          `json:"model"`
-	Messages          []ChatMessage   `json:"messages"`
-	Stream            *bool           `json:"stream,omitempty"`
-	Temperature       *float32        `json:"temperature,omitempty"`
-	MaxTokens         *int            `json:"max_tokens,omitempty"`
-	MaxCompletionTokens *int          `json:"max_completion_tokens,omitempty"`
-	TopP              *float32        `json:"top_p,omitempty"`
-	FrequencyPenalty  *float32        `json:"frequency_penalty,omitempty"`
-	PresencePenalty   *float32        `json:"presence_penalty,omitempty"`
-	N                 *int            `json:"n,omitempty"`
-	Stop              []string        `json:"stop,omitempty"`
-	StreamOptions     *map[string]any `json:"stream_options,omitempty"`
+	Model               string          `json:"model"`
+	Messages            []ChatMessage   `json:"messages"`
+	Stream              *bool           `json:"stream,omitempty"`
+	Temperature         *float32        `json:"temperature,omitempty"`
+	MaxTokens           *int            `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int            `json:"max_completion_tokens,omitempty"`
+	TopP                *float32        `json:"top_p,omitempty"`
+	FrequencyPenalty    *float32        `json:"frequency_penalty,omitempty"`
+	PresencePenalty     *float32        `json:"presence_penalty,omitempty"`
+	N                   *int            `json:"n,omitempty"`
+	Stop                []string        `json:"stop,omitempty"`
+	StreamOptions       *map[string]any `json:"stream_options,omitempty"`
 	// Function calling / Tools
 	Tools             []map[string]any `json:"tools,omitempty"`
 	ToolChoice        any              `json:"tool_choice,omitempty"`
 	ParallelToolCalls *bool            `json:"parallel_tool_calls,omitempty"`
 	// Response formatting
-	ResponseFormat    *map[string]any `json:"response_format,omitempty"`
+	ResponseFormat *map[string]any `json:"response_format,omitempty"`
 	// Reasoning and verbosity controls
-	ReasoningEffort   *string         `json:"reasoning_effort,omitempty"`
-	Verbosity         *string         `json:"verbosity,omitempty"`
+	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
+	Verbosity       *string `json:"verbosity,omitempty"`
 	// Log probabilities
-	Logprobs          *bool           `json:"logprobs,omitempty"`
-	TopLogprobs       *int            `json:"top_logprobs,omitempty"`
+	Logprobs    *bool `json:"logprobs,omitempty"`
+	TopLogprobs *int  `json:"top_logprobs,omitempty"`
 	// Determinism and storage
-	Seed              *int            `json:"seed,omitempty"`
-	Store             *bool           `json:"store,omitempty"`
+	Seed  *int  `json:"seed,omitempty"`
+	Store *bool `json:"store,omitempty"`
 	// User identification and caching
-	User              *string         `json:"user,omitempty"`
-	PromptCacheKey    *string         `json:"prompt_cache_key,omitempty"`
-	SafetyIdentifier  *string         `json:"safety_identifier,omitempty"`
+	User             *string `json:"user,omitempty"`
+	PromptCacheKey   *string `json:"prompt_cache_key,omitempty"`
+	SafetyIdentifier *string `json:"safety_identifier,omitempty"`
 	// Advanced parameters
-	LogitBias         map[string]int  `json:"logit_bias,omitempty"`
-	Metadata          map[string]any  `json:"metadata,omitempty"`
-	Modalities        []string        `json:"modalities,omitempty"`
-	ServiceTier       *string         `json:"service_tier,omitempty"`
+	LogitBias   map[string]int `json:"logit_bias,omitempty"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
+	Modalities  []string       `json:"modalities,omitempty"`
+	ServiceTier *string        `json:"service_tier,omitempty"`
 }
 
 type ModelInfo struct {
@@ -166,6 +166,32 @@ type TTSRequest struct {
 
 type TranscriptionResponse struct {
 	Text string `json:"text"`
+}
+
+type EmbeddingRequest struct {
+	Input          interface{} `json:"input"` // string or []string
+	Model          string      `json:"model"`
+	EncodingFormat string      `json:"encoding_format,omitempty"` // "float" or "base64"
+	Dimensions     *int        `json:"dimensions,omitempty"`
+	User           *string     `json:"user,omitempty"`
+}
+
+type EmbeddingData struct {
+	Object    string    `json:"object"`
+	Index     int       `json:"index"`
+	Embedding []float64 `json:"embedding"`
+}
+
+type EmbeddingUsage struct {
+	PromptTokens int `json:"prompt_tokens"`
+	TotalTokens  int `json:"total_tokens"`
+}
+
+type EmbeddingResponse struct {
+	Object string          `json:"object"`
+	Data   []EmbeddingData `json:"data"`
+	Model  string          `json:"model"`
+	Usage  EmbeddingUsage  `json:"usage"`
 }
 
 type TinfoilProxyServer struct {
@@ -1062,6 +1088,103 @@ func (s *TinfoilProxyServer) handleTTS(c *gin.Context) {
 	}
 }
 
+func (s *TinfoilProxyServer) handleEmbeddings(c *gin.Context) {
+	var req EmbeddingRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	log.Printf("Embeddings request for model: %s", req.Model)
+
+	client, err := s.getClient()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Convert input to []string format
+	var inputs []string
+	switch v := req.Input.(type) {
+	case string:
+		inputs = []string{v}
+	case []interface{}:
+		for _, item := range v {
+			if str, ok := item.(string); ok {
+				inputs = append(inputs, str)
+			}
+		}
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Input must be a string or array of strings"})
+		return
+	}
+
+	if len(inputs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Input cannot be empty"})
+		return
+	}
+
+	// Build embeddings params
+	params := openai.EmbeddingNewParams{
+		Model: req.Model,
+		Input: openai.EmbeddingNewParamsInputUnion{
+			OfArrayOfStrings: inputs,
+		},
+	}
+
+	// Add optional parameters
+	if req.Dimensions != nil {
+		params.Dimensions = openai.Int(int64(*req.Dimensions))
+	}
+	if req.User != nil {
+		params.User = openai.String(*req.User)
+	}
+	if req.EncodingFormat != "" {
+		params.EncodingFormat = openai.EmbeddingNewParamsEncodingFormat(req.EncodingFormat)
+	}
+
+	// Create embeddings
+	ctx := c.Request.Context()
+	embedding, err := client.Embeddings.New(ctx, params)
+	if err != nil {
+		log.Printf("Embeddings error: %v", err)
+
+		// Check if this is a certificate error and reinitialize if needed
+		if isCertificateError(err) {
+			go func() {
+				if reinitErr := s.reinitializeClient(); reinitErr != nil {
+					log.Printf("Failed to reinitialize client: %v", reinitErr)
+				}
+			}()
+		}
+
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Convert to response format
+	var embeddingData []EmbeddingData
+	for _, e := range embedding.Data {
+		embeddingData = append(embeddingData, EmbeddingData{
+			Object:    "embedding",
+			Index:     int(e.Index),
+			Embedding: e.Embedding,
+		})
+	}
+
+	response := EmbeddingResponse{
+		Object: "list",
+		Data:   embeddingData,
+		Model:  req.Model,
+		Usage: EmbeddingUsage{
+			PromptTokens: int(embedding.Usage.PromptTokens),
+			TotalTokens:  int(embedding.Usage.TotalTokens),
+		},
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
 func main() {
 	// Initialize proxy server
 	server, err := NewTinfoilProxyServer()
@@ -1128,6 +1251,11 @@ func main() {
 	// Transcription endpoint
 	r.POST("/v1/audio/transcriptions", func(c *gin.Context) {
 		server.handleTranscription(c)
+	})
+
+	// Embeddings endpoint
+	r.POST("/v1/embeddings", func(c *gin.Context) {
+		server.handleEmbeddings(c)
 	})
 
 	// Start server

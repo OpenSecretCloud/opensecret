@@ -140,6 +140,7 @@ impl ProxyRouter {
             routes.insert("qwen3-coder-480b".to_string(), tinfoil_route.clone());
             routes.insert("qwen3-vl-30b".to_string(), tinfoil_route.clone());
             routes.insert("kimi-k2-thinking".to_string(), tinfoil_route.clone());
+            routes.insert("nomic-embed-text".to_string(), tinfoil_route.clone());
 
             // Continuum-only models
             let continuum_route = ModelRoute {
@@ -181,6 +182,7 @@ impl ProxyRouter {
                 "qwen3-coder-480b",
                 "qwen3-vl-30b",
                 "kimi-k2-thinking",
+                "nomic-embed-text",
             ]
         } else {
             // Without Tinfoil: only Continuum models

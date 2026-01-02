@@ -112,6 +112,24 @@ fn default_transcription_response_format() -> String {
     "json".to_string()
 }
 
+/// Request structure for embeddings endpoints
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct EmbeddingRequest {
+    input: serde_json::Value, // string or array of strings
+    #[serde(default = "default_embedding_model")]
+    model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encoding_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dimensions: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+}
+
+fn default_embedding_model() -> String {
+    "nomic-embed-text".to_string()
+}
+
 // ============================================================================
 // Centralized Billing Architecture - New Types
 // ============================================================================
@@ -198,6 +216,13 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
             post(proxy_transcription).layer(axum::middleware::from_fn_with_state(
                 app_state.clone(),
                 decrypt_request::<TranscriptionRequest>,
+            )),
+        )
+        .route(
+            "/v1/embeddings",
+            post(proxy_embeddings).layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                decrypt_request::<EmbeddingRequest>,
             )),
         )
         .with_state(app_state)
@@ -1531,6 +1556,171 @@ async fn proxy_tts(
 
     // Encrypt and return the response
     encrypt_response(&state, &session_id, &audio_response).await
+}
+
+async fn proxy_embeddings(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(user): axum::Extension<User>,
+    axum::Extension(_auth_method): axum::Extension<AuthMethod>,
+    axum::Extension(embedding_request): axum::Extension<EmbeddingRequest>,
+) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+    debug!("Entering proxy_embeddings function");
+
+    // Check if guest user is allowed (paid guests are allowed, free guests are not)
+    if user.is_guest() {
+        if let Some(billing_client) = &state.billing_client {
+            match billing_client.is_user_paid(user.uuid).await {
+                Ok(true) => {
+                    debug!("Paid guest user allowed for embeddings: {}", user.uuid);
+                }
+                Ok(false) => {
+                    error!(
+                        "Free guest user attempted to use embeddings feature: {}",
+                        user.uuid
+                    );
+                    return Err(ApiError::Unauthorized);
+                }
+                Err(e) => {
+                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
+                    return Err(ApiError::Unauthorized);
+                }
+            }
+        } else {
+            error!(
+                "Guest user attempted to use embeddings without billing client: {}",
+                user.uuid
+            );
+            return Err(ApiError::Unauthorized);
+        }
+    }
+
+    // Validate input is not empty
+    let is_empty = match &embedding_request.input {
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(arr) => arr.is_empty(),
+        _ => true,
+    };
+    if is_empty {
+        error!("Input is empty or invalid");
+        return Err(ApiError::BadRequest);
+    }
+
+    // Get the model route configuration
+    let route = match state.proxy_router.get_model_route(&embedding_request.model) {
+        Some(r) => r,
+        None => {
+            error!(
+                "Model '{}' not found in routing table",
+                embedding_request.model
+            );
+            return Err(ApiError::BadRequest);
+        }
+    };
+
+    // Create a new hyper client
+    let https = HttpsConnector::new();
+    let client = Client::builder()
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(10)
+        .build::<_, HyperBody>(https);
+
+    // Build request body
+    let request_body = serde_json::to_string(&embedding_request).map_err(|e| {
+        error!("Failed to serialize embedding request: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    // Build request to provider
+    let endpoint = format!("{}/v1/embeddings", route.primary.base_url);
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(&endpoint)
+        .header("Content-Type", "application/json");
+
+    if let Some(api_key) = &route.primary.api_key {
+        if !api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", api_key));
+        }
+    }
+
+    let req = req.body(HyperBody::from(request_body)).map_err(|e| {
+        error!("Failed to create request: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    // Send request with timeout
+    let res = timeout(
+        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        client.request(req),
+    )
+    .await
+    .map_err(|_| {
+        error!(
+            "Embeddings request timed out after {}s",
+            REQUEST_TIMEOUT_SECS
+        );
+        ApiError::InternalServerError
+    })?
+    .map_err(|e| {
+        error!("Failed to send embeddings request: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body_bytes = to_bytes(res.into_body()).await.ok();
+        let error_msg = body_bytes
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .unwrap_or_else(|| status.to_string());
+        error!(
+            "Embeddings proxy returned non-success status: {} - {}",
+            status, error_msg
+        );
+        return Err(ApiError::InternalServerError);
+    }
+
+    // Parse response
+    let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
+        error!("Failed to read embeddings response body: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    let response_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+        error!("Failed to parse embeddings response: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    // Handle billing - embeddings only have prompt_tokens (no completion_tokens)
+    if let Some(usage) = response_json.get("usage") {
+        let prompt_tokens = usage
+            .get("prompt_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
+
+        if prompt_tokens > 0 {
+            let billing_context =
+                BillingContext::new(_auth_method, embedding_request.model.clone());
+            let embedding_usage = CompletionUsage {
+                prompt_tokens,
+                completion_tokens: 0, // Embeddings don't have completion tokens
+            };
+            publish_usage_event_internal(
+                &state,
+                &user,
+                &billing_context,
+                embedding_usage,
+                &route.primary.provider_name,
+            )
+            .await;
+        }
+    }
+
+    debug!("Exiting proxy_embeddings function");
+
+    // Encrypt and return the response
+    encrypt_response(&state, &session_id, &response_json).await
 }
 
 /// Helper function to try a provider once

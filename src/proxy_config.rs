@@ -119,10 +119,6 @@ impl ProxyRouter {
                 fallbacks: vec![continuum_proxy.clone()],
             };
 
-            // Llama 3.3 70B (on both)
-            routes.insert("llama-3.3-70b".to_string(), both_route.clone());
-            routes.insert("llama3-3-70b".to_string(), both_route.clone());
-
             // GPT-OSS 120B (on both, same name)
             routes.insert("gpt-oss-120b".to_string(), both_route.clone());
 
@@ -135,6 +131,8 @@ impl ProxyRouter {
                 primary: tinfoil.clone(),
                 fallbacks: vec![],
             };
+            routes.insert("llama-3.3-70b".to_string(), tinfoil_route.clone());
+            routes.insert("llama3-3-70b".to_string(), tinfoil_route.clone());
             routes.insert("deepseek-r1-0528".to_string(), tinfoil_route.clone());
             routes.insert("deepseek-v31-terminus".to_string(), tinfoil_route.clone());
             routes.insert("qwen3-coder-480b".to_string(), tinfoil_route.clone());
@@ -149,12 +147,11 @@ impl ProxyRouter {
             };
             routes.insert("gemma-3-27b".to_string(), continuum_route);
         } else {
-            // No Tinfoil: all Continuum models
+            // No Tinfoil: only Continuum models (llama-3.3-70b not available without Tinfoil)
             let continuum_route = ModelRoute {
                 primary: continuum_proxy.clone(),
                 fallbacks: vec![],
             };
-            routes.insert("llama-3.3-70b".to_string(), continuum_route.clone());
             routes.insert("gemma-3-27b".to_string(), continuum_route.clone());
             routes.insert("gpt-oss-120b".to_string(), continuum_route.clone());
             routes.insert("whisper-large-v3".to_string(), continuum_route);
@@ -171,12 +168,12 @@ impl ProxyRouter {
             // With Tinfoil: show all available models using canonical names
             vec![
                 // Models available on both (use canonical names)
-                "llama-3.3-70b",
                 "gpt-oss-120b",
                 "whisper-large-v3",
                 // Continuum-only
                 "gemma-3-27b",
                 // Tinfoil-only
+                "llama-3.3-70b",
                 "deepseek-r1-0528",
                 "deepseek-v31-terminus",
                 "qwen3-coder-480b",
@@ -185,13 +182,8 @@ impl ProxyRouter {
                 "nomic-embed-text",
             ]
         } else {
-            // Without Tinfoil: only Continuum models
-            vec![
-                "llama-3.3-70b",
-                "gemma-3-27b",
-                "gpt-oss-120b",
-                "whisper-large-v3",
-            ]
+            // Without Tinfoil: only Continuum models (llama-3.3-70b not available)
+            vec!["gemma-3-27b", "gpt-oss-120b", "whisper-large-v3"]
         };
 
         let model_objects: Vec<Value> = models
@@ -338,17 +330,24 @@ mod tests {
             Some("http://tinfoil.example.com".to_string()),
         );
 
-        // Test canonical model names
+        // Test llama-3.3-70b is Tinfoil-only (no Continuum fallback)
         let llama_route = router.get_model_route("llama-3.3-70b");
         assert!(llama_route.is_some());
         let route = llama_route.unwrap();
         assert_eq!(route.primary.provider_name, "tinfoil");
-        assert_eq!(route.fallbacks.len(), 1);
-        assert_eq!(route.fallbacks[0].provider_name, "continuum");
+        assert!(route.fallbacks.is_empty()); // No Continuum fallback
 
         // Test provider-specific names work too
         let tinfoil_llama_route = router.get_model_route("llama3-3-70b");
         assert!(tinfoil_llama_route.is_some());
+
+        // Test gpt-oss-120b has both providers (Tinfoil primary, Continuum fallback)
+        let gpt_route = router.get_model_route("gpt-oss-120b");
+        assert!(gpt_route.is_some());
+        let route = gpt_route.unwrap();
+        assert_eq!(route.primary.provider_name, "tinfoil");
+        assert_eq!(route.fallbacks.len(), 1);
+        assert_eq!(route.fallbacks[0].provider_name, "continuum");
 
         // Unknown model should return None
         let unknown_route = router.get_model_route("gpt-4");
@@ -363,10 +362,14 @@ mod tests {
             None, // No Tinfoil
         );
 
-        // Continuum models should be primary
+        // llama-3.3-70b should NOT be available without Tinfoil
         let llama_route = router.get_model_route("llama-3.3-70b");
-        assert!(llama_route.is_some());
-        let route = llama_route.unwrap();
+        assert!(llama_route.is_none());
+
+        // But gemma and gpt-oss should be available on Continuum
+        let gemma_route = router.get_model_route("gemma-3-27b");
+        assert!(gemma_route.is_some());
+        let route = gemma_route.unwrap();
         assert_eq!(route.primary.provider_name, "continuum");
         assert!(route.fallbacks.is_empty());
 

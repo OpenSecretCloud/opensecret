@@ -181,11 +181,25 @@ diesel-migration-run-preview:
 
 ### Continuum Proxy Commands ###
 
-# Update continuum-proxy
-update-continuum-proxy:
-    containerID=$({{container}} create --platform linux/arm64 ghcr.io/edgelesssys/privatemode/privatemode-proxy:v1.28.0@sha256:6d83bc7b260fe08e0923ca2f02600a664c6f7c5df75021e1008fa908e2fa9329) && \
-    {{container}} cp "${containerID}":/bin/privatemode-proxy ./continuum-proxy && \
-    {{container}} rm "${containerID}"
+# Update continuum-proxy submodule to a specific version
+update-continuum-proxy-version version:
+    cd privatemode-public && git fetch --tags && git checkout {{version}}
+
+# Build continuum-proxy from source using Nix (produces statically linked binary)
+build-continuum-proxy:
+    nix build ./privatemode-public#privatemode-proxy.bin -o continuum-proxy-build
+    chmod u+w continuum-proxy || true
+    cp continuum-proxy-build/bin/privatemode-proxy continuum-proxy
+    chmod +x continuum-proxy
+    rm continuum-proxy-build
+    @echo "Built continuum-proxy:"
+    @file continuum-proxy
+    @./continuum-proxy --version
+
+# Update continuum-proxy to a specific version and rebuild
+update-continuum-proxy version="v1.32.0":
+    just update-continuum-proxy-version {{version}}
+    just build-continuum-proxy
 
 ### Enclave Management ###
 

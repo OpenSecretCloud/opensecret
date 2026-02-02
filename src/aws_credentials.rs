@@ -3,8 +3,35 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::error;
 use vsock::{VsockAddr, VsockStream};
+
+pub(crate) const PARENT_CID: u32 = 3;
+pub(crate) const CREDENTIAL_REQUESTER_PORT: u32 = 8003;
+pub(crate) const MAX_VSOCK_RESPONSE_BYTES: u64 = 256 * 1024;
+
+pub(crate) fn set_vsock_timeouts(
+    stream: &VsockStream,
+    timeout: Duration,
+) -> Result<(), AwsCredentialError> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    Ok(())
+}
+
+pub(crate) fn read_vsock_response_string_limited(
+    stream: &mut VsockStream,
+    max_bytes: u64,
+) -> Result<String, AwsCredentialError> {
+    let mut limited = (&mut *stream).take(max_bytes.saturating_add(1));
+    let mut response = String::new();
+    limited.read_to_string(&mut response)?;
+
+    if limited.limit() == 0 {
+        return Err(AwsCredentialError::ResponseTooLarge { max_bytes });
+    }
+
+    Ok(response)
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AwsCredentials {
@@ -63,6 +90,9 @@ pub enum AwsCredentialError {
 
     #[error("Timed out waiting for credentials")]
     Timeout,
+
+    #[error("VSOCK response exceeded {max_bytes} bytes")]
+    ResponseTooLarge { max_bytes: u64 },
 
     #[error("Ping timed out after {0:?}")]
     PingTimeout(Duration),
@@ -123,12 +153,13 @@ impl AwsCredentialManager {
     ) -> Result<(Option<u64>, u64), AwsCredentialError> {
         let start = Instant::now();
 
-        let handle = tokio::task::spawn_blocking(|| {
-            let cid = 3;
-            let port = 8003;
+        let handle = tokio::task::spawn_blocking(move || {
+            let cid = PARENT_CID;
+            let port = CREDENTIAL_REQUESTER_PORT;
 
             let sock_addr = VsockAddr::new(cid, port);
             let mut stream = VsockStream::connect(&sock_addr)?;
+            set_vsock_timeouts(&stream, timeout)?;
 
             let request = EnclaveRequest {
                 request_type: "ping".to_string(),
@@ -137,8 +168,8 @@ impl AwsCredentialManager {
             let request_json = serde_json::to_string(&request)?;
             stream.write_all(request_json.as_bytes())?;
 
-            let mut response = String::new();
-            stream.read_to_string(&mut response)?;
+            let response =
+                read_vsock_response_string_limited(&mut stream, MAX_VSOCK_RESPONSE_BYTES)?;
 
             let parent_response: ParentResponse = serde_json::from_str(&response)?;
             match parent_response.response_type.as_str() {
@@ -190,11 +221,12 @@ impl AwsCredentialManager {
     }
 
     async fn fetch_credentials_from_vsock() -> Result<AwsCredentials, AwsCredentialError> {
-        let cid = 3;
-        let port = 8003;
+        let cid = PARENT_CID;
+        let port = CREDENTIAL_REQUESTER_PORT;
 
         let sock_addr = VsockAddr::new(cid, port);
         let mut stream = VsockStream::connect(&sock_addr)?;
+        set_vsock_timeouts(&stream, Duration::from_secs(30))?;
 
         let request = EnclaveRequest {
             request_type: "credentials".to_string(),
@@ -203,18 +235,13 @@ impl AwsCredentialManager {
         let request_json = serde_json::to_string(&request)?;
         stream.write_all(request_json.as_bytes())?;
 
-        let mut response = String::new();
-        stream.read_to_string(&mut response)?;
+        let response = read_vsock_response_string_limited(&mut stream, MAX_VSOCK_RESPONSE_BYTES)?;
 
         let parent_response: ParentResponse = serde_json::from_str(&response)?;
         if parent_response.response_type == "credentials" {
             let creds: AwsCredentials = serde_json::from_value(parent_response.response_value)?;
             Ok(creds)
         } else {
-            tracing::error!(
-                "Failed to refresh AWS credentials: {:?}",
-                AwsCredentialError::Authentication
-            );
             Err(AwsCredentialError::Authentication)
         }
     }

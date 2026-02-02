@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::error;
 use vsock::{VsockAddr, VsockStream};
@@ -30,6 +30,26 @@ pub struct ParentResponse {
     pub response_value: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ParentVsockPingStatus {
+    pub last_attempt_unix_ms: Option<u64>,
+    pub last_success_unix_ms: Option<u64>,
+    pub last_pong_unix_ms: Option<u64>,
+    pub last_rtt_ms: Option<u64>,
+    pub consecutive_failures: u32,
+    pub last_error: Option<String>,
+}
+
+pub fn unix_ms_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| Duration::from_secs(0))
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AwsCredentialError {
     #[error("IO error: {0}")]
@@ -43,18 +63,110 @@ pub enum AwsCredentialError {
 
     #[error("Timed out waiting for credentials")]
     Timeout,
+
+    #[error("Ping timed out after {0:?}")]
+    PingTimeout(Duration),
+
+    #[error("Ping failed: {0}")]
+    PingFailed(String),
+
+    #[error("Unexpected response type: {0}")]
+    UnexpectedResponseType(String),
+
+    #[error("Task join error: {0}")]
+    Join(#[from] tokio::task::JoinError),
 }
 
 #[derive(Clone, Default)]
 pub struct AwsCredentialManager {
     credentials: Arc<RwLock<Option<AwsCredentials>>>,
+    parent_vsock_ping_status: Arc<RwLock<ParentVsockPingStatus>>,
 }
 
 impl AwsCredentialManager {
     pub fn new() -> Self {
         Self {
             credentials: Arc::new(RwLock::new(None)),
+            parent_vsock_ping_status: Arc::new(RwLock::new(Default::default())),
         }
+    }
+
+    pub async fn get_parent_vsock_ping_status(&self) -> ParentVsockPingStatus {
+        self.parent_vsock_ping_status.read().await.clone()
+    }
+
+    pub async fn ping_credential_requester_and_update_status(&self, timeout: Duration) {
+        let attempt_unix_ms = unix_ms_now();
+        let res = self.ping_credential_requester(timeout).await;
+
+        let mut status = self.parent_vsock_ping_status.write().await;
+        status.last_attempt_unix_ms = Some(attempt_unix_ms);
+
+        match res {
+            Ok((pong_unix_ms, rtt_ms)) => {
+                status.last_success_unix_ms = Some(unix_ms_now());
+                status.last_pong_unix_ms = pong_unix_ms;
+                status.last_rtt_ms = Some(rtt_ms);
+                status.consecutive_failures = 0;
+                status.last_error = None;
+            }
+            Err(e) => {
+                status.consecutive_failures = status.consecutive_failures.saturating_add(1);
+                status.last_error = Some(e.to_string());
+            }
+        }
+    }
+
+    async fn ping_credential_requester(
+        &self,
+        timeout: Duration,
+    ) -> Result<(Option<u64>, u64), AwsCredentialError> {
+        let start = Instant::now();
+
+        let handle = tokio::task::spawn_blocking(|| {
+            let cid = 3;
+            let port = 8003;
+
+            let sock_addr = VsockAddr::new(cid, port);
+            let mut stream = VsockStream::connect(&sock_addr)?;
+
+            let request = EnclaveRequest {
+                request_type: "ping".to_string(),
+                key_name: None,
+            };
+            let request_json = serde_json::to_string(&request)?;
+            stream.write_all(request_json.as_bytes())?;
+
+            let mut response = String::new();
+            stream.read_to_string(&mut response)?;
+
+            let parent_response: ParentResponse = serde_json::from_str(&response)?;
+            match parent_response.response_type.as_str() {
+                "pong" => Ok(parent_response
+                    .response_value
+                    .get("unix_ms")
+                    .and_then(|v| v.as_u64())),
+                "error" => Err(AwsCredentialError::PingFailed(
+                    parent_response
+                        .response_value
+                        .as_str()
+                        .unwrap_or("unknown error")
+                        .to_string(),
+                )),
+                other => Err(AwsCredentialError::UnexpectedResponseType(
+                    other.to_string(),
+                )),
+            }
+        });
+
+        let pong_unix_ms = match tokio::time::timeout(timeout, handle).await {
+            Ok(res) => res??,
+            Err(_) => return Err(AwsCredentialError::PingTimeout(timeout)),
+        };
+
+        let rtt_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+
+        Ok((pong_unix_ms, rtt_ms))
     }
 
     pub async fn get_credentials(&self) -> Option<AwsCredentials> {

@@ -2362,6 +2362,27 @@ async fn main() -> Result<(), Error> {
                 }
             }
         });
+
+        // Spawn a task to periodically ping the parent credential requester over VSOCK.
+        // This is used for outbound-connectivity health checks.
+        let ping_manager = aws_credential_manager
+            .read()
+            .await
+            .as_ref()
+            .expect("non-local mode should have creds")
+            .clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+                ping_manager
+                    .ping_credential_requester_and_update_status(Duration::from_secs(5))
+                    .await;
+            }
+        });
     }
 
     let pg_url = if app_mode != AppMode::Local {

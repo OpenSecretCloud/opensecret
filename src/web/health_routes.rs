@@ -46,73 +46,9 @@ pub async fn health_check() -> Result<Json<HealthResponse>, (StatusCode, String)
     Ok(Json(HealthResponse::new_ok()))
 }
 
-/// Extended health check that tests outbound connectivity.
-///
-/// In Nitro mode, this uses a periodic VSOCK ping to the parent credential requester (port 8003)
-/// to detect when new outbound connections stop working.
+/// Extended health check that tests outbound connectivity via model listing
 pub async fn health_check_extended(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-) -> Result<Json<ExtendedHealthResponse>, (StatusCode, String)> {
-    use crate::AppMode;
-
-    if matches!(state.app_mode, AppMode::Local) {
-        return health_check_extended_models(state).await;
-    }
-
-    let ping_manager = state
-        .aws_credential_manager
-        .read()
-        .await
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "AWS credential manager not initialized".to_string(),
-            )
-        })?;
-
-    let ping_status = ping_manager.get_parent_vsock_ping_status().await;
-    let now_unix_ms = crate::aws_credentials::unix_ms_now();
-
-    // 30s ping interval; allow up to 90s since last success to avoid flapping.
-    let healthy = ping_status
-        .last_success_unix_ms
-        .map(|t| now_unix_ms.saturating_sub(t) <= 90_000)
-        .unwrap_or(false);
-
-    if healthy {
-        let model_check = match ping_status.last_rtt_ms {
-            Some(rtt_ms) => format!(
-                "Successfully pinged credential requester over VSOCK (rtt={}ms)",
-                rtt_ms
-            ),
-            None => "Successfully pinged credential requester over VSOCK (rtt=unknown)".to_string(),
-        };
-        Ok(Json(ExtendedHealthResponse {
-            status: "pass".to_string(),
-            version: API_VERSION.to_string(),
-            outbound_connectivity: true,
-            model_check: Some(model_check),
-            error: None,
-        }))
-    } else {
-        let last_error = ping_status
-            .last_error
-            .unwrap_or_else(|| "No successful VSOCK ping recorded".to_string());
-
-        Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "VSOCK ping to credential requester unhealthy: {}",
-                last_error
-            ),
-        ))
-    }
-}
-
-async fn health_check_extended_models(
-    state: Arc<AppState>,
 ) -> Result<Json<ExtendedHealthResponse>, (StatusCode, String)> {
     use hyper::{Body, Client};
     use hyper_tls::HttpsConnector;

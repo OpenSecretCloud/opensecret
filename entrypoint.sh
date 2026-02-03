@@ -760,7 +760,7 @@ fi
 
 # Start the opensecret
 log "Starting opensecret..."
-RUST_LOG_STYLE=never RUST_LOG=debug APP_MODE="$APP_MODE" OPENAI_API_BASE="$OPENAI_API_BASE" TINFOIL_API_BASE="$TINFOIL_API_BASE" /app/opensecret &
+RUST_LOG_STYLE=never RUST_LOG="${RUST_LOG:-debug,hyper=info}" APP_MODE="$APP_MODE" OPENAI_API_BASE="$OPENAI_API_BASE" TINFOIL_API_BASE="$TINFOIL_API_BASE" /app/opensecret &
 
 # Wait for the opensecret to start
 log "Waiting for opensecret to start"

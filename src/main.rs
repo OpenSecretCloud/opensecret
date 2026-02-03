@@ -51,7 +51,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::env;
 use std::fmt;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1679,11 +1679,12 @@ impl AppState {
 }
 
 async fn get_secret(key_name: &str) -> Result<String, Error> {
-    let cid = 3;
-    let port = 8003;
+    let cid = crate::aws_credentials::PARENT_CID;
+    let port = crate::aws_credentials::CREDENTIAL_REQUESTER_PORT;
 
     let sock_addr = VsockAddr::new(cid, port);
     let mut stream = VsockStream::connect(&sock_addr)?;
+    crate::aws_credentials::set_vsock_timeouts(&stream, Duration::from_secs(30))?;
 
     let request = EnclaveRequest {
         request_type: "SecretsManager".to_string(),
@@ -1692,8 +1693,10 @@ async fn get_secret(key_name: &str) -> Result<String, Error> {
     let request_json = serde_json::to_string(&request)?;
     stream.write_all(request_json.as_bytes())?;
 
-    let mut response = String::new();
-    stream.read_to_string(&mut response)?;
+    let response = crate::aws_credentials::read_vsock_response_string_limited(
+        &mut stream,
+        crate::aws_credentials::MAX_VSOCK_RESPONSE_BYTES,
+    )?;
 
     let parent_response: ParentResponse = serde_json::from_str(&response)?;
     if parent_response.response_type == "secret" {
@@ -2332,8 +2335,21 @@ async fn main() -> Result<(), Error> {
             }
         }
 
+        // Perform an initial ping so health checks don’t report unhealthy before the first
+        // background ping completes.
+        let manager = aws_credential_manager
+            .read()
+            .await
+            .as_ref()
+            .expect("non-local mode should have creds")
+            .clone();
+
+        manager
+            .ping_credential_requester_and_update_status(Duration::from_secs(5))
+            .await;
+
         // Spawn a task to refresh AWS credentials
-        let refresh_manager = aws_credential_manager.clone();
+        let refresh_manager = manager.clone();
         tokio::spawn(async move {
             let refresh_interval = Duration::from_secs(5 * 60 * 60); // 5 hours
             let retry_interval = Duration::from_secs(5); // 5 seconds
@@ -2341,13 +2357,7 @@ async fn main() -> Result<(), Error> {
             loop {
                 tracing::info!("Refreshing AWS credentials");
 
-                let fetch_res = refresh_manager
-                    .read()
-                    .await
-                    .as_ref()
-                    .expect("non-local mode should have creds")
-                    .fetch_credentials()
-                    .await;
+                let fetch_res = refresh_manager.fetch_credentials().await;
 
                 match fetch_res {
                     Ok(_creds) => {
@@ -2360,6 +2370,26 @@ async fn main() -> Result<(), Error> {
                         tokio::time::sleep(retry_interval).await;
                     }
                 }
+            }
+        });
+
+        // Spawn a task to periodically ping the parent credential requester over VSOCK.
+        // This is used for outbound-connectivity health checks.
+        let ping_manager = manager;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            // `interval.tick()` returns immediately on the first call; we've already performed
+            // an initial ping at startup, so consume the immediate tick to avoid a duplicate.
+            interval.tick().await;
+
+            loop {
+                interval.tick().await;
+                ping_manager
+                    .ping_credential_requester_and_update_status(Duration::from_secs(5))
+                    .await;
             }
         });
     }

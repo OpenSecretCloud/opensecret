@@ -65,6 +65,11 @@ var modelConfigs = map[string]struct {
 		Description: "Advanced thinking agent with deep multi-step reasoning and stable long-horizon tool orchestration. 1T parameters (32B active), 256K context.",
 		Active:      true,
 	},
+	"kimi-k2-5": {
+		ModelID:     "kimi-k2-5",
+		Description: "Vision-capable language model with 256K context. Supports image understanding and multimodal tasks.",
+		Active:      true,
+	},
 	"whisper-large-v3-turbo": {
 		ModelID:     "whisper-large-v3-turbo",
 		Description: "Fast and accurate speech-to-text transcription model",

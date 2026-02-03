@@ -51,7 +51,7 @@ pub async fn encrypt_with_key(encryption_key: &SecretKey, bytes: &[u8]) -> Vec<u
 }
 
 pub fn decrypt_with_key(encryption_key: &SecretKey, bytes: &[u8]) -> Result<Vec<u8>, EncryptError> {
-    tracing::debug!("Entering decrypt_with_key");
+    tracing::trace!("Entering decrypt_with_key");
 
     if bytes.len() < 12 {
         tracing::error!(
@@ -81,7 +81,7 @@ pub fn decrypt_with_key(encryption_key: &SecretKey, bytes: &[u8]) -> Result<Vec<
         EncryptError::FailedToDecrypt
     })?;
 
-    tracing::debug!("Exiting decrypt_with_key");
+    tracing::trace!("Exiting decrypt_with_key");
     Ok(result)
 }
 

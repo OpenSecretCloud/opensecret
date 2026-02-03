@@ -82,15 +82,18 @@ pub async fn health_check_extended(
         .unwrap_or(false);
 
     if healthy {
-        let rtt_ms = ping_status.last_rtt_ms.unwrap_or(0);
+        let model_check = match ping_status.last_rtt_ms {
+            Some(rtt_ms) => format!(
+                "Successfully pinged credential requester over VSOCK (rtt={}ms)",
+                rtt_ms
+            ),
+            None => "Successfully pinged credential requester over VSOCK (rtt=unknown)".to_string(),
+        };
         Ok(Json(ExtendedHealthResponse {
             status: "pass".to_string(),
             version: API_VERSION.to_string(),
             outbound_connectivity: true,
-            model_check: Some(format!(
-                "Successfully pinged credential requester over VSOCK (rtt={}ms)",
-                rtt_ms
-            )),
+            model_check: Some(model_check),
             error: None,
         }))
     } else {

@@ -2381,6 +2381,10 @@ async fn main() -> Result<(), Error> {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+            // `interval.tick()` returns immediately on the first call; we've already performed
+            // an initial ping at startup, so consume the immediate tick to avoid a duplicate.
+            interval.tick().await;
+
             loop {
                 interval.tick().await;
                 ping_manager

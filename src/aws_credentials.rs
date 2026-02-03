@@ -154,46 +154,57 @@ impl AwsCredentialManager {
         let start = Instant::now();
 
         let handle = tokio::task::spawn_blocking(move || {
-            let cid = PARENT_CID;
-            let port = CREDENTIAL_REQUESTER_PORT;
+            let res: Result<Option<u64>, AwsCredentialError> = (|| {
+                let cid = PARENT_CID;
+                let port = CREDENTIAL_REQUESTER_PORT;
 
-            let sock_addr = VsockAddr::new(cid, port);
-            let mut stream = VsockStream::connect(&sock_addr)?;
-            set_vsock_timeouts(&stream, timeout)?;
+                let sock_addr = VsockAddr::new(cid, port);
+                let mut stream = VsockStream::connect(&sock_addr)?;
+                set_vsock_timeouts(&stream, timeout)?;
 
-            let request = EnclaveRequest {
-                request_type: "ping".to_string(),
-                key_name: None,
-            };
-            let request_json = serde_json::to_string(&request)?;
-            stream.write_all(request_json.as_bytes())?;
+                let request = EnclaveRequest {
+                    request_type: "ping".to_string(),
+                    key_name: None,
+                };
+                let request_json = serde_json::to_string(&request)?;
+                stream.write_all(request_json.as_bytes())?;
 
-            let response =
-                read_vsock_response_string_limited(&mut stream, MAX_VSOCK_RESPONSE_BYTES)?;
+                let response =
+                    read_vsock_response_string_limited(&mut stream, MAX_VSOCK_RESPONSE_BYTES)?;
 
-            let parent_response: ParentResponse = serde_json::from_str(&response)?;
-            match parent_response.response_type.as_str() {
-                "pong" => Ok(parent_response
-                    .response_value
-                    .get("unix_ms")
-                    .and_then(|v| v.as_u64())),
-                "error" => Err(AwsCredentialError::PingFailed(
-                    parent_response
+                let parent_response: ParentResponse = serde_json::from_str(&response)?;
+                match parent_response.response_type.as_str() {
+                    "pong" => Ok(parent_response
                         .response_value
-                        .as_str()
-                        .unwrap_or("unknown error")
-                        .to_string(),
-                )),
-                other => Err(AwsCredentialError::UnexpectedResponseType(
-                    other.to_string(),
-                )),
+                        .get("unix_ms")
+                        .and_then(|v| v.as_u64())),
+                    "error" => Err(AwsCredentialError::PingFailed(
+                        parent_response
+                            .response_value
+                            .as_str()
+                            .unwrap_or("unknown error")
+                            .to_string(),
+                    )),
+                    other => Err(AwsCredentialError::UnexpectedResponseType(
+                        other.to_string(),
+                    )),
+                }
+            })();
+
+            match res {
+                Err(AwsCredentialError::Io(e))
+                    if matches!(e.kind(), std::io::ErrorKind::TimedOut)
+                        || matches!(e.kind(), std::io::ErrorKind::WouldBlock) =>
+                {
+                    Err(AwsCredentialError::PingTimeout(timeout))
+                }
+                other => other,
             }
         });
 
-        let pong_unix_ms = match tokio::time::timeout(timeout, handle).await {
-            Ok(res) => res??,
-            Err(_) => return Err(AwsCredentialError::PingTimeout(timeout)),
-        };
+        // We rely on VSOCK socket timeouts (set on the stream) rather than an async timeout.
+        // An async timeout does not cancel the blocking task.
+        let pong_unix_ms = handle.await??;
 
         let rtt_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
 

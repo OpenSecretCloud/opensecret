@@ -2335,18 +2335,12 @@ async fn main() -> Result<(), Error> {
             }
         }
 
-        // Perform an initial ping so health checks don’t report unhealthy before the first
-        // background ping completes.
         let manager = aws_credential_manager
             .read()
             .await
             .as_ref()
             .expect("non-local mode should have creds")
             .clone();
-
-        manager
-            .ping_credential_requester_and_update_status(Duration::from_secs(5))
-            .await;
 
         // Spawn a task to refresh AWS credentials
         let refresh_manager = manager.clone();
@@ -2370,26 +2364,6 @@ async fn main() -> Result<(), Error> {
                         tokio::time::sleep(retry_interval).await;
                     }
                 }
-            }
-        });
-
-        // Spawn a task to periodically ping the parent credential requester over VSOCK.
-        // This is used for outbound-connectivity health checks.
-        let ping_manager = manager;
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            // `interval.tick()` returns immediately on the first call; we've already performed
-            // an initial ping at startup, so consume the immediate tick to avoid a duplicate.
-            interval.tick().await;
-
-            loop {
-                interval.tick().await;
-                ping_manager
-                    .ping_credential_requester_and_update_status(Duration::from_secs(5))
-                    .await;
             }
         });
     }

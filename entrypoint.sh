@@ -7,13 +7,76 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
+# Restart-on-exit wrapper for long-running helpers started from this script.
+run_forever() {
+    local name="$1"
+    shift
+
+    local attempt=0
+    local backoff_s=1
+    local max_backoff_s=30
+
+    set +e
+    while true; do
+        attempt=$((attempt + 1))
+
+        "$@" &
+        local pid=$!
+
+        log "MONITOR started=${name} pid=${pid} attempt=${attempt}"
+
+        wait "$pid"
+        local ec=$?
+
+        log "MONITOR restarting=${name} reason=exit_code code=${ec} old_pid=${pid} attempt=${attempt} backoff_s=${backoff_s}"
+        sleep "$backoff_s"
+
+        if [ "$backoff_s" -lt "$max_backoff_s" ]; then
+            backoff_s=$((backoff_s * 2))
+            if [ "$backoff_s" -gt "$max_backoff_s" ]; then
+                backoff_s="$max_backoff_s"
+            fi
+        fi
+    done
+}
+
+# Forward stdout/stderr to parent logging over VSOCK with auto-reconnect.
+# If the VSOCK path is down, drain+drop logs to avoid blocking the enclave.
+log_forwarder() {
+    set +e
+    local backoff_s=1
+    local max_backoff_s=30
+
+    while true; do
+        local start_ts
+        start_ts="$(date +%s)"
+
+        socat - VSOCK-CONNECT:3:8011
+
+        local end_ts
+        end_ts="$(date +%s)"
+        local runtime_s=$((end_ts - start_ts))
+        if [ "$runtime_s" -ge 10 ]; then
+            backoff_s=1
+        fi
+
+        timeout "$backoff_s" cat >/dev/null || true
+        if [ "$backoff_s" -lt "$max_backoff_s" ]; then
+            backoff_s=$((backoff_s * 2))
+            if [ "$backoff_s" -gt "$max_backoff_s" ]; then
+                backoff_s="$max_backoff_s"
+            fi
+        fi
+    done
+}
+
 log "Starting entrypoint script"
 
 # Start the logging script
 log "Starting log exports"
 
-# Redirect all output to the logging script via VSOCK
-exec > >(socat - VSOCK-CONNECT:3:8011) 2>&1
+# Redirect all output to the logging script via VSOCK (with auto-reconnect)
+exec > >(log_forwarder) 2>&1
 
 # Read and set APP_MODE from file
 log "Reading /app/APP_MODE"
@@ -308,111 +371,111 @@ cat /etc/hosts
 
 # Start the traffic forwarder for the database in the background
 log "Starting database traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.1 5432 3 8001 &
+run_forever tf_db python3 /app/traffic_forwarder.py 127.0.0.1 5432 3 8001 &
 
 # Start the traffic forwarder for OpenAI API in the background
 log "Starting OpenAI API traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.1 443 3 8002 &
+run_forever tf_openai_api python3 /app/traffic_forwarder.py 127.0.0.1 443 3 8002 &
 
 # Start the traffic forwarder for Resend API in the background
 log "Starting Resend API traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.8 443 3 8010 &
+run_forever tf_resend_api python3 /app/traffic_forwarder.py 127.0.0.8 443 3 8010 &
 
 # Start the traffic forwarder for Continuum API in the background
 log "Starting Continuum API traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.2 443 3 8004 &
+run_forever tf_continuum_api python3 /app/traffic_forwarder.py 127.0.0.2 443 3 8004 &
 
 # Start the traffic forwarder for Continuum CDN in the background
 log "Starting Continuum CDN traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.3 443 3 8005 &
+run_forever tf_continuum_cdn python3 /app/traffic_forwarder.py 127.0.0.3 443 3 8005 &
 
 # Start the traffic forwarder for Continuum Secret Service in the background
 log "Starting Continuum Secret Service traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.4 443 3 8006 &
+run_forever tf_continuum_secret python3 /app/traffic_forwarder.py 127.0.0.4 443 3 8006 &
 
 # Start the traffic forwarder for Continuum Coordinator in the background
 log "Starting Continuum Coordinator traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.5 443 3 8007 &
+run_forever tf_continuum_coordinator python3 /app/traffic_forwarder.py 127.0.0.5 443 3 8007 &
 
 # Start the traffic forwarder for AMD KDS Interface in the background
 log "Starting AMD KDS Interface traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.6 443 3 8008 &
+run_forever tf_amd_kds python3 /app/traffic_forwarder.py 127.0.0.6 443 3 8008 &
 
 # Start the traffic forwarder for GitHub in the background
 log "Starting GitHub traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.9 443 3 8012 &
+run_forever tf_github python3 /app/traffic_forwarder.py 127.0.0.9 443 3 8012 &
 
 # Start the traffic forwarder for GitHub API in the background
 log "Starting GitHub API traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.10 443 3 8013 &
+run_forever tf_github_api python3 /app/traffic_forwarder.py 127.0.0.10 443 3 8013 &
 
 # Start the traffic forwarder for Google OAuth in the background
 log "Starting Google OAuth traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.11 443 3 8014 &
+run_forever tf_google_oauth python3 /app/traffic_forwarder.py 127.0.0.11 443 3 8014 &
 
 # Start the traffic forwarder for Google APIs in the background
 log "Starting Google APIs traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.12 443 3 8015 &
+run_forever tf_google_api python3 /app/traffic_forwarder.py 127.0.0.12 443 3 8015 &
 
 # Start the traffic forwarder for AWS SQS in the background
 log "Starting AWS SQS traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.13 443 3 8016 &
+run_forever tf_aws_sqs python3 /app/traffic_forwarder.py 127.0.0.13 443 3 8016 &
 
 # Start the traffic forwarder for billing service in the background
 log "Starting billing service traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.14 443 3 8017 &
+run_forever tf_billing python3 /app/traffic_forwarder.py 127.0.0.14 443 3 8017 &
 
 # Start the traffic forwarder for Apple OAuth in the background
 log "Starting Apple OAuth traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.15 443 3 8018 &
+run_forever tf_apple_oauth python3 /app/traffic_forwarder.py 127.0.0.15 443 3 8018 &
 
 # Start the traffic forwarders for Tinfoil proxy in the background
 log "Starting Tinfoil API GitHub proxy traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.16 443 3 8019 &
+run_forever tf_tinfoil_api_github_proxy python3 /app/traffic_forwarder.py 127.0.0.16 443 3 8019 &
 
 log "Starting TUF Repository CDN traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.17 443 3 8020 &
+run_forever tf_tuf_repo_cdn python3 /app/traffic_forwarder.py 127.0.0.17 443 3 8020 &
 
 log "Starting Tinfoil KDS proxy traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.19 443 3 8022 &
+run_forever tf_tinfoil_kds_proxy python3 /app/traffic_forwarder.py 127.0.0.19 443 3 8022 &
 
 log "Starting Tinfoil GitHub proxy traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.20 443 3 8023 &
+run_forever tf_tinfoil_github_proxy python3 /app/traffic_forwarder.py 127.0.0.20 443 3 8023 &
 
 log "Starting Tinfoil ATC traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.25 443 3 8021 &
+run_forever tf_tinfoil_atc python3 /app/traffic_forwarder.py 127.0.0.25 443 3 8021 &
 
 log "Starting Tinfoil Inference traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.33 443 3 8041 &
+run_forever tf_tinfoil_inference python3 /app/traffic_forwarder.py 127.0.0.33 443 3 8041 &
 
 log "Starting Tinfoil Router Inf4 traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.26 443 3 8034 &
+run_forever tf_tinfoil_router_inf4 python3 /app/traffic_forwarder.py 127.0.0.26 443 3 8034 &
 
 log "Starting Tinfoil Router Inf5 traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.27 443 3 8035 &
+run_forever tf_tinfoil_router_inf5 python3 /app/traffic_forwarder.py 127.0.0.27 443 3 8035 &
 
 log "Starting Tinfoil Router Inf6 traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.28 443 3 8036 &
+run_forever tf_tinfoil_router_inf6 python3 /app/traffic_forwarder.py 127.0.0.28 443 3 8036 &
 
 log "Starting Tinfoil Router Inf7 traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.29 443 3 8037 &
+run_forever tf_tinfoil_router_inf7 python3 /app/traffic_forwarder.py 127.0.0.29 443 3 8037 &
 
 log "Starting Tinfoil Router Inf8 traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.30 443 3 8038 &
+run_forever tf_tinfoil_router_inf8 python3 /app/traffic_forwarder.py 127.0.0.30 443 3 8038 &
 
 log "Starting Tinfoil Router Inf9 traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.31 443 3 8039 &
+run_forever tf_tinfoil_router_inf9 python3 /app/traffic_forwarder.py 127.0.0.31 443 3 8039 &
 
 log "Starting Tinfoil Router Inf10 traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.32 443 3 8040 &
+run_forever tf_tinfoil_router_inf10 python3 /app/traffic_forwarder.py 127.0.0.32 443 3 8040 &
 
 # Start the traffic forwarder for Kagi Search in the background
 log "Starting Kagi Search traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.23 443 3 8026 &
+run_forever tf_kagi_search python3 /app/traffic_forwarder.py 127.0.0.23 443 3 8026 &
 
 # Start the traffic forwarder for Brave Search in the background
 log "Starting Brave Search traffic forwarder"
-python3 /app/traffic_forwarder.py 127.0.0.24 443 3 8027 &
+run_forever tf_brave_search python3 /app/traffic_forwarder.py 127.0.0.24 443 3 8027 &
 
 # Wait for the forwarders to start
 log "Waiting for forwarders to start"
@@ -685,7 +748,7 @@ if [ "$APP_MODE" != "local" ]; then
     log "Continuum Proxy API key retrieved, decrypted, and decoded successfully"
 
     log "Starting continuum-proxy on port 8092"
-    /app/continuum-proxy --port 8092 --apiKey "$continuum_proxy_api_key" &
+    run_forever continuum_proxy /app/continuum-proxy --port 8092 --apiKey "$continuum_proxy_api_key" &
 
     # Wait for the proxy to start
     sleep 5
@@ -744,7 +807,7 @@ if [ "$APP_MODE" != "local" ]; then
 
     # Set environment variable for tinfoil-proxy and start it
     log "Starting tinfoil-proxy on port 8093"
-    TINFOIL_API_KEY="$tinfoil_proxy_api_key" TINFOIL_PROXY_PORT=8093 /app/tinfoil-proxy &
+    run_forever tinfoil_proxy env TINFOIL_API_KEY="$tinfoil_proxy_api_key" TINFOIL_PROXY_PORT=8093 /app/tinfoil-proxy &
 
     # Wait for the proxy to start
     sleep 5

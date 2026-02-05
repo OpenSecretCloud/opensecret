@@ -1271,7 +1271,10 @@ async fn proxy_transcription(
                 .await
             {
                 Ok((response, provider)) => {
-                    info!("Chunk {} transcribed successfully via {}", chunk.index, provider);
+                    info!(
+                        "Chunk {} transcribed successfully via {}",
+                        chunk.index, provider
+                    );
                     Ok((chunk.index, response, provider))
                 }
                 Err(err) => {
@@ -1285,7 +1288,8 @@ async fn proxy_transcription(
     }
 
     // Execute all futures in parallel
-    let results: Vec<Result<(usize, Value, String), String>> = futures::future::join_all(futures).await;
+    let results: Vec<Result<(usize, Value, String), String>> =
+        futures::future::join_all(futures).await;
 
     // Check if all chunks succeeded
     let mut successful_results = Vec::new();

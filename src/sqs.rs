@@ -40,6 +40,10 @@ pub struct UsageEvent {
     pub provider_name: String,
     #[serde(default)]
     pub model_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_seconds: Option<i32>,
 }
 
 #[derive(Debug, thiserror::Error)]

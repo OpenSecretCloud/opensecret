@@ -38,6 +38,28 @@ const MAX_AUDIO_SIZE: usize = 100 * 1024 * 1024;
 const REQUEST_TIMEOUT_SECS: u64 = 120; // Request timeout (generous for large non-streaming responses)
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming reads
 
+/// Estimate audio duration in seconds based on file size and content type.
+/// Uses average bitrate assumptions for common formats.
+fn estimate_audio_duration_seconds(file_size: usize, content_type: &str) -> f64 {
+    // Bytes per second for common audio formats (approximate averages)
+    let bytes_per_second: f64 = match content_type.to_lowercase().as_str() {
+        // MP3: typically 128-192kbps, use ~160kbps = 20KB/s
+        "audio/mpeg" | "audio/mp3" => 20_000.0,
+        // WAV: 44.1kHz, 16-bit stereo = 176.4KB/s
+        "audio/wav" | "audio/x-wav" | "audio/wave" => 176_400.0,
+        // OGG/Opus/WebM: typically ~96-128kbps = ~12-16KB/s, use 14KB/s
+        "audio/ogg" | "audio/opus" | "audio/webm" => 14_000.0,
+        // FLAC: lossless, roughly half of WAV = ~88KB/s
+        "audio/flac" | "audio/x-flac" => 88_000.0,
+        // AAC/M4A: similar to MP3, ~160kbps = 20KB/s
+        "audio/aac" | "audio/m4a" | "audio/mp4" | "audio/x-m4a" => 20_000.0,
+        // Default: assume MP3-like compression
+        _ => 20_000.0,
+    };
+
+    file_size as f64 / bytes_per_second
+}
+
 /// Parameters for transcription requests
 struct TranscriptionParams<'a> {
     audio_data: &'a [u8],
@@ -904,11 +926,61 @@ async fn publish_usage_event_internal(
                 is_api_request,
                 provider_name,
                 model_name,
+                event_type: None,
+                audio_seconds: None,
             };
 
             match publisher.publish_event(event).await {
                 Ok(_) => debug!("published usage event successfully"),
                 Err(e) => error!("error publishing usage event: {e}"),
+            }
+        }
+    });
+}
+
+/// Publish transcription usage event for billing
+/// Uses file size and content type to estimate audio duration
+fn publish_transcription_usage_event(
+    state: &Arc<AppState>,
+    user: &User,
+    file_size: usize,
+    content_type: &str,
+    model_name: &str,
+    provider_name: &str,
+    is_api_request: bool,
+) {
+    let estimated_seconds = estimate_audio_duration_seconds(file_size, content_type).ceil() as i32;
+
+    info!(
+        "Transcription usage for user {}: model={}, provider={}, file_size={} bytes, estimated_duration={}s",
+        user.uuid, model_name, provider_name, file_size, estimated_seconds,
+    );
+
+    // Spawn background task for SQS (no DB storage for transcription)
+    let state_clone = state.clone();
+    let user_id = user.uuid;
+    let model_name = model_name.to_string();
+    let provider_name = provider_name.to_string();
+
+    tokio::spawn(async move {
+        if let Some(publisher) = &state_clone.sqs_publisher {
+            let event = UsageEvent {
+                event_id: Uuid::new_v4(),
+                user_id,
+                input_tokens: 0,
+                output_tokens: 0,
+                estimated_cost: BigDecimal::from(0),
+                chat_time: Utc::now(),
+                is_api_request,
+                provider_name,
+                model_name,
+                event_type: Some("transcription".to_string()),
+                audio_seconds: Some(estimated_seconds),
+            };
+
+            match publisher.publish_event(event).await {
+                Ok(_) => debug!("published transcription usage event successfully"),
+                Err(e) => error!("error publishing transcription usage event: {e}"),
             }
         }
     });
@@ -956,13 +1028,14 @@ async fn proxy_models(
 }
 
 /// Helper function to send transcription request with retries to primary and fallback providers
+/// Returns (response, provider_name) on success
 async fn send_transcription_with_retries(
     client: &Client<HttpsConnector<hyper::client::HttpConnector>, HyperBody>,
     route: &crate::proxy_config::ModelRoute,
     state: &Arc<AppState>,
     model_name: &str,
     params: &TranscriptionParams<'_>,
-) -> Result<Value, String> {
+) -> Result<(Value, String), String> {
     let max_cycles = 3;
     let mut last_error = None;
 
@@ -991,7 +1064,7 @@ async fn send_transcription_with_retries(
                     route.primary.provider_name,
                     cycle + 1
                 );
-                return Ok(response);
+                return Ok((response, route.primary.provider_name.clone()));
             }
             Err(err) => {
                 error!(
@@ -1023,7 +1096,7 @@ async fn send_transcription_with_retries(
                         fallback.provider_name,
                         cycle + 1
                     );
-                    return Ok(response);
+                    return Ok((response, fallback.provider_name.clone()));
                 }
                 Err(err) => {
                     error!(
@@ -1049,7 +1122,7 @@ async fn proxy_transcription(
     _headers: HeaderMap,
     axum::Extension(session_id): axum::Extension<Uuid>,
     axum::Extension(user): axum::Extension<User>,
-    axum::Extension(_auth_method): axum::Extension<AuthMethod>,
+    axum::Extension(auth_method): axum::Extension<AuthMethod>,
     axum::Extension(transcription_request): axum::Extension<TranscriptionRequest>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
     debug!("Entering proxy_transcription function");
@@ -1197,9 +1270,9 @@ async fn proxy_transcription(
             match send_transcription_with_retries(&client, &route, &state, &model_name, &params)
                 .await
             {
-                Ok(response) => {
-                    info!("Chunk {} transcribed successfully", chunk.index);
-                    Ok((chunk.index, response))
+                Ok((response, provider)) => {
+                    info!("Chunk {} transcribed successfully via {}", chunk.index, provider);
+                    Ok((chunk.index, response, provider))
                 }
                 Err(err) => {
                     error!("Chunk {} failed: {}", chunk.index, err);
@@ -1212,13 +1285,20 @@ async fn proxy_transcription(
     }
 
     // Execute all futures in parallel
-    let results: Vec<Result<(usize, Value), String>> = futures::future::join_all(futures).await;
+    let results: Vec<Result<(usize, Value, String), String>> = futures::future::join_all(futures).await;
 
     // Check if all chunks succeeded
     let mut successful_results = Vec::new();
+    let mut successful_provider = String::new();
     for result in results {
         match result {
-            Ok(r) => successful_results.push(r),
+            Ok((index, value, provider)) => {
+                successful_results.push((index, value));
+                // Track the provider (use the first one, or could use the last)
+                if successful_provider.is_empty() {
+                    successful_provider = provider;
+                }
+            }
             Err(e) => {
                 error!("Chunk processing failed: {}", e);
                 return Err(ApiError::InternalServerError);
@@ -1265,8 +1345,16 @@ async fn proxy_transcription(
 
     debug!("Exiting proxy_transcription function");
 
-    // TODO: Add SQS-based billing events for transcription usage
-    // Should track: audio duration/size, model used, user ID, timestamp, provider
+    // Publish transcription usage for billing (runs in background)
+    publish_transcription_usage_event(
+        &state,
+        &user,
+        file_size,
+        &transcription_request.content_type,
+        &transcription_request.model,
+        &successful_provider,
+        auth_method == AuthMethod::ApiKey,
+    );
 
     // Encrypt and return the response
     encrypt_response(&state, &session_id, &response).await
@@ -1817,5 +1905,50 @@ async fn try_provider(
                 proxy_config.provider_name
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_estimate_audio_duration_mp3() {
+        // MP3 at ~20KB/s, so 1MB should be ~50 seconds
+        let one_mb = 1024 * 1024;
+        let duration = estimate_audio_duration_seconds(one_mb, "audio/mpeg");
+        assert!((duration - 52.4).abs() < 1.0); // ~52.4s for 1MB at 20KB/s
+    }
+
+    #[test]
+    fn test_estimate_audio_duration_wav() {
+        // WAV at ~176KB/s, so 1MB should be ~6 seconds
+        let one_mb = 1024 * 1024;
+        let duration = estimate_audio_duration_seconds(one_mb, "audio/wav");
+        assert!((duration - 5.9).abs() < 1.0); // ~5.9s for 1MB at 176KB/s
+    }
+
+    #[test]
+    fn test_estimate_audio_duration_ogg() {
+        // OGG at ~14KB/s, so 1MB should be ~75 seconds
+        let one_mb = 1024 * 1024;
+        let duration = estimate_audio_duration_seconds(one_mb, "audio/ogg");
+        assert!((duration - 74.9).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_estimate_audio_duration_unknown_defaults_to_mp3() {
+        let one_mb = 1024 * 1024;
+        let duration_unknown = estimate_audio_duration_seconds(one_mb, "audio/unknown");
+        let duration_mp3 = estimate_audio_duration_seconds(one_mb, "audio/mpeg");
+        assert_eq!(duration_unknown, duration_mp3);
+    }
+
+    #[test]
+    fn test_estimate_audio_duration_case_insensitive() {
+        let one_mb = 1024 * 1024;
+        let duration_lower = estimate_audio_duration_seconds(one_mb, "audio/mpeg");
+        let duration_upper = estimate_audio_duration_seconds(one_mb, "AUDIO/MPEG");
+        assert_eq!(duration_lower, duration_upper);
     }
 }

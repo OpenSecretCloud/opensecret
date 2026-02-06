@@ -134,10 +134,7 @@ impl ProxyRouter {
             routes.insert("llama-3.3-70b".to_string(), tinfoil_route.clone());
             routes.insert("llama3-3-70b".to_string(), tinfoil_route.clone());
             routes.insert("deepseek-r1-0528".to_string(), tinfoil_route.clone());
-            routes.insert("deepseek-v31-terminus".to_string(), tinfoil_route.clone());
-            routes.insert("qwen3-coder-480b".to_string(), tinfoil_route.clone());
             routes.insert("qwen3-vl-30b".to_string(), tinfoil_route.clone());
-            routes.insert("kimi-k2-thinking".to_string(), tinfoil_route.clone());
             routes.insert("kimi-k2-5".to_string(), tinfoil_route.clone());
             routes.insert("nomic-embed-text".to_string(), tinfoil_route.clone());
 
@@ -176,10 +173,7 @@ impl ProxyRouter {
                 // Tinfoil-only
                 "llama-3.3-70b",
                 "deepseek-r1-0528",
-                "deepseek-v31-terminus",
-                "qwen3-coder-480b",
                 "qwen3-vl-30b",
-                "kimi-k2-thinking",
                 "kimi-k2-5",
                 "nomic-embed-text",
             ]

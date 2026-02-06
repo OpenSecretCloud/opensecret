@@ -2,7 +2,7 @@
 -- Reasoning Items Table Migration
 -- ===========================================================
 -- Stores reasoning/chain-of-thought content from thinking models
--- (e.g., kimi-k2-thinking, deepseek-r1)
+-- (e.g., deepseek-r1)
 -- 
 -- Per OpenAI's Responses API spec, reasoning is a separate 
 -- conversation item type, similar to messages and tool_calls.

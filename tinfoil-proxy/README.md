@@ -44,7 +44,6 @@ Run the proxy:
 ## Supported Models
 
 - `deepseek-r1-0528` - High-performance reasoning model
-- `deepseek-v31-terminus` - Advanced reasoning model (V3.1 Terminus)
 - `llama3-3-70b` - Multilingual model optimized for dialogue
 - `nomic-embed-text` - Text embedding model
 

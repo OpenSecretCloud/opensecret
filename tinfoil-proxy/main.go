@@ -30,11 +30,6 @@ var modelConfigs = map[string]struct {
 		Description: "Advanced reasoning and complex problem-solving model",
 		Active:      true,
 	},
-	"deepseek-v31-terminus": {
-		ModelID:     "deepseek-v31-terminus",
-		Description: "Advanced reasoning and complex problem-solving model (V3.1 Terminus)",
-		Active:      true,
-	},
 	"llama3-3-70b": {
 		ModelID:     "llama3-3-70b",
 		Description: "Multilingual understanding, dialogue optimization",
@@ -50,19 +45,9 @@ var modelConfigs = map[string]struct {
 		Description: "Powerful reasoning, configurable reasoning effort levels, full chain-of-thought access, native agentic abilities",
 		Active:      true,
 	},
-	"qwen3-coder-480b": {
-		ModelID:     "qwen3-coder-480b",
-		Description: "Advanced coding model with 480B parameters for complex programming tasks",
-		Active:      true,
-	},
 	"qwen3-vl-30b": {
 		ModelID:     "qwen3-vl-30b",
 		Description: "A 30B-parameter vision-language model that understands images and videos. Excels at visual tasks including GUI interaction, generating code from screenshots, spatial understanding, video analysis, and OCR across 32 languages. Supports up to 256K context for processing long videos and documents.",
-		Active:      true,
-	},
-	"kimi-k2-thinking": {
-		ModelID:     "kimi-k2-thinking",
-		Description: "Advanced thinking agent with deep multi-step reasoning and stable long-horizon tool orchestration. 1T parameters (32B active), 256K context.",
 		Active:      true,
 	},
 	"kimi-k2-5": {

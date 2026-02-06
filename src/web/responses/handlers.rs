@@ -461,7 +461,7 @@ pub struct ResponseOutputTextDoneEvent {
 }
 
 /// SSE Event wrapper for response.reasoning_text.delta
-/// Used for thinking/reasoning models (e.g., kimi-k2-thinking) that emit reasoning tokens
+/// Used for thinking/reasoning models (e.g., deepseek-r1) that emit reasoning tokens
 /// TODO: Consider adding reasoning to final response output (like OpenAI's reasoning summary)
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseReasoningTextDeltaEvent {
@@ -1726,7 +1726,7 @@ async fn setup_completion_processor(
                                     trace!("Stream delta: {}", d);
                                 }
 
-                                // Extract reasoning_content for thinking models (e.g., kimi-k2-thinking)
+                                // Extract reasoning_content for thinking models (e.g., deepseek-r1)
                                 if let Some(reasoning) = delta
                                     .and_then(|d| d.get("reasoning_content"))
                                     .and_then(|c| c.as_str())

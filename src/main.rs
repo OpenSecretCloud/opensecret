@@ -19,7 +19,7 @@ use crate::web::openai_auth::validate_openai_auth;
 use crate::web::platform_login_routes;
 use crate::web::{
     conversations_routes, document_routes, health_routes_with_state, instructions_routes,
-    login_routes, oauth_routes, openai_routes, protected_routes, responses_routes,
+    login_routes, oauth_routes, openai_routes, protected_routes, rag_routes, responses_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
@@ -85,6 +85,7 @@ mod oauth;
 mod os_flags;
 mod private_key;
 mod proxy_config;
+mod rag;
 mod sqs;
 mod tokens;
 mod web;
@@ -408,6 +409,7 @@ pub struct AppState {
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
     enclave_key: Vec<u8>,
     proxy_router: Arc<ProxyRouter>,
+    rag_cache: Arc<tokio::sync::Mutex<rag::RagCache>>,
     resend_api_key: Option<String>,
     ephemeral_keys: Arc<RwLock<HashMap<String, EphemeralSecret>>>,
     session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, SessionState>>>,
@@ -726,6 +728,7 @@ impl AppStateBuilder {
             aws_credential_manager,
             enclave_key,
             proxy_router,
+            rag_cache: Arc::new(tokio::sync::Mutex::new(rag::RagCache::default())),
             resend_api_key: self.resend_api_key,
             ephemeral_keys: Arc::new(RwLock::new(HashMap::new())),
             session_states: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -2784,6 +2787,10 @@ async fn main() -> Result<(), Error> {
         )
         .merge(
             document_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            rag_routes(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
         )
         .merge(attestation_routes::router(app_state.clone()))

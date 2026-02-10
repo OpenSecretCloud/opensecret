@@ -308,6 +308,26 @@ diesel::table! {
 }
 
 diesel::table! {
+    user_embeddings (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        source_type -> Text,
+        user_message_id -> Nullable<Int8>,
+        assistant_message_id -> Nullable<Int8>,
+        conversation_id -> Nullable<Int8>,
+        vector_enc -> Bytea,
+        embedding_model -> Text,
+        vector_dim -> Int4,
+        content_enc -> Bytea,
+        metadata_enc -> Nullable<Bytea>,
+        token_count -> Int4,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     user_instructions (id) {
         id -> Int8,
         uuid -> Uuid,
@@ -391,6 +411,9 @@ diesel::joinable!(tool_calls -> responses (response_id));
 diesel::joinable!(tool_outputs -> conversations (conversation_id));
 diesel::joinable!(tool_outputs -> responses (response_id));
 diesel::joinable!(tool_outputs -> tool_calls (tool_call_fk));
+diesel::joinable!(user_embeddings -> assistant_messages (assistant_message_id));
+diesel::joinable!(user_embeddings -> conversations (conversation_id));
+diesel::joinable!(user_embeddings -> user_messages (user_message_id));
 diesel::joinable!(user_messages -> conversations (conversation_id));
 diesel::joinable!(user_messages -> responses (response_id));
 diesel::joinable!(user_oauth_connections -> oauth_providers (provider_id));
@@ -420,6 +443,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     tool_calls,
     tool_outputs,
     user_api_keys,
+    user_embeddings,
     user_instructions,
     user_kv,
     user_messages,

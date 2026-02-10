@@ -1,7 +1,10 @@
 pub mod account_deletion;
+pub mod agent_config;
+pub mod conversation_summaries;
 pub mod email_verification;
 pub mod enclave_secrets;
 pub mod invite_codes;
+pub mod memory_blocks;
 pub mod oauth;
 pub mod org_memberships;
 pub mod org_project_secrets;

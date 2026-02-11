@@ -54,10 +54,18 @@ struct AgentContext {
 }
 
 #[derive(Clone, Debug)]
-struct StepResult {
-    messages: Vec<String>,
-    tool_calls: Vec<AgentToolCall>,
-    done: bool,
+pub struct ExecutedTool {
+    pub tool_call: AgentToolCall,
+    pub result: ToolResult,
+}
+
+#[derive(Clone, Debug)]
+pub struct StepResult {
+    pub messages: Vec<String>,
+    #[allow(dead_code)]
+    pub tool_calls: Vec<AgentToolCall>,
+    pub executed_tools: Vec<ExecutedTool>,
+    pub done: bool,
 }
 
 pub struct AgentRuntime {
@@ -299,47 +307,27 @@ impl AgentRuntime {
         self.previous_step_summary = None;
     }
 
-    pub async fn process_message(
-        &mut self,
-        user_message: &str,
-    ) -> Result<(Vec<String>, Vec<AgentToolCall>), ApiError> {
+    pub fn max_steps(&self) -> usize {
+        self.max_steps
+    }
+
+    /// Prepare the runtime for a new message: validate, persist user message, compact if needed.
+    /// Call this once before driving the step loop.
+    pub async fn prepare(&mut self, user_message: &str) -> Result<(), ApiError> {
         let trimmed = user_message.trim();
         if trimmed.is_empty() {
             return Err(ApiError::BadRequest);
         }
 
-        // Clear at start of request
         self.clear_tool_results();
-
-        // Persist user message (and recall embedding)
         self.insert_user_message(trimmed).await?;
-
-        // Compaction (summary memory) if needed
         self.maybe_compact().await?;
-
-        let mut all_messages: Vec<String> = Vec::new();
-        let mut last_tool_calls: Vec<AgentToolCall> = Vec::new();
-
-        for step_num in 0..self.max_steps {
-            let result = self.step(trimmed, step_num == 0).await?;
-
-            all_messages.extend(result.messages);
-            last_tool_calls = result.tool_calls;
-
-            if result.done {
-                break;
-            }
-        }
-
-        if all_messages.is_empty() {
-            warn!("Agent produced no messages");
-            all_messages.push("I apologize, but I wasn't able to generate a response.".to_string());
-        }
-
-        Ok((all_messages, last_tool_calls))
+        Ok(())
     }
 
-    async fn step(
+    /// Execute a single step of the agent loop.
+    /// The caller (chat handler) drives the loop, persists messages, and emits SSE events.
+    pub async fn step(
         &mut self,
         user_message: &str,
         is_first_step: bool,
@@ -470,11 +458,10 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             .filter(|m| !m.is_empty())
             .collect();
 
-        // Persist assistant messages (before tool execution to preserve ordering)
-        for msg in &messages {
-            self.insert_assistant_message(msg).await?;
-        }
-
+        // Execute tools and inject results for next step.
+        // Persistence is handled by the caller (chat handler) to match Sage's
+        // "send first, store synchronously, embed async" pattern.
+        let mut executed_tools = Vec::new();
         for tool_call in &response.tool_calls {
             let result = if tool_call.name == "done" {
                 ToolResult::success("Done".to_string())
@@ -484,12 +471,13 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
                 ToolResult::error(format!("Unknown tool: {}", tool_call.name))
             };
 
-            // Inject tool result for next step
             self.inject_tool_result(tool_call, &result);
 
-            // Persist tool call + output (skip done)
             if tool_call.name != "done" {
-                self.insert_tool_call_and_output(tool_call, &result).await?;
+                executed_tools.push(ExecutedTool {
+                    tool_call: tool_call.clone(),
+                    result,
+                });
             }
         }
 
@@ -508,6 +496,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         Ok(StepResult {
             messages,
             tool_calls: response.tool_calls,
+            executed_tools,
             done,
         })
     }
@@ -730,7 +719,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         Ok(content)
     }
 
-    async fn insert_user_message(&self, text: &str) -> Result<UserMessage, ApiError> {
+    pub async fn insert_user_message(&self, text: &str) -> Result<UserMessage, ApiError> {
         let content = super::tools::normalize_user_message_content(text);
         let prompt_tokens = super::tools::count_user_message_tokens(&content);
         let content_enc = encrypt_with_key(&self.user_key, content.as_bytes()).await;
@@ -781,7 +770,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         Ok(msg)
     }
 
-    async fn insert_assistant_message(&self, text: &str) -> Result<AssistantMessage, ApiError> {
+    pub async fn insert_assistant_message(&self, text: &str) -> Result<AssistantMessage, ApiError> {
         let completion_tokens = count_tokens(text) as i32;
         let content_enc = Some(encrypt_with_key(&self.user_key, text.as_bytes()).await);
 
@@ -833,7 +822,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         Ok(msg)
     }
 
-    async fn insert_tool_call_and_output(
+    pub async fn insert_tool_call_and_output(
         &self,
         tool_call: &AgentToolCall,
         result: &ToolResult,

@@ -336,6 +336,15 @@ else
     log "Added development billing domain to /etc/hosts"
 fi
 
+# Add os-flags hostname to /etc/hosts based on APP_MODE
+if [ "$APP_MODE" = "prod" ]; then
+    echo "127.0.0.18 flags.opensecret.cloud" >> /etc/hosts
+    log "Added production os-flags domain to /etc/hosts"
+else
+    echo "127.0.0.18 flags-dev.opensecret.cloud" >> /etc/hosts
+    log "Added development os-flags domain to /etc/hosts"
+fi
+
 # Add Tinfoil proxy hostnames to /etc/hosts
 echo "127.0.0.16 api-github-proxy.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.17 tuf-repo-cdn.sigstore.dev" >> /etc/hosts
@@ -424,6 +433,10 @@ run_forever tf_aws_sqs python3 /app/traffic_forwarder.py 127.0.0.13 443 3 8016 &
 # Start the traffic forwarder for billing service in the background
 log "Starting billing service traffic forwarder"
 run_forever tf_billing python3 /app/traffic_forwarder.py 127.0.0.14 443 3 8017 &
+
+# Start the traffic forwarder for os-flags in the background
+log "Starting os-flags traffic forwarder"
+run_forever tf_os_flags python3 /app/traffic_forwarder.py 127.0.0.18 443 3 8028 &
 
 # Start the traffic forwarder for Apple OAuth in the background
 log "Starting Apple OAuth traffic forwarder"
@@ -579,6 +592,14 @@ if timeout 5 bash -c '</dev/tcp/127.0.0.14/443'; then
     log "Billing service connection successful"
 else
     log "Billing service connection failed"
+fi
+
+# Test the connection to os-flags
+log "Testing connection to os-flags:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.18/443'; then
+    log "os-flags connection successful"
+else
+    log "os-flags connection failed"
 fi
 
 # Test the connection to Apple OAuth

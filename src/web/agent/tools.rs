@@ -10,8 +10,10 @@ use crate::encrypt::{decrypt_string, encrypt_with_key};
 use crate::models::conversation_summaries::ConversationSummary;
 use crate::models::memory_blocks::{MemoryBlock, NewMemoryBlock};
 use crate::models::responses::Conversation;
+use crate::models::users::User;
 use crate::rag::{cosine_similarity, deserialize_f32_le, search_user_embeddings};
 use crate::tokens::count_tokens;
+use crate::web::openai_auth::AuthMethod;
 use crate::web::responses::MessageContentConverter;
 use crate::web::responses::{MessageContent, MessageContentPart};
 use crate::{ApiError, AppState};
@@ -434,7 +436,7 @@ impl Tool for MemoryInsertTool {
 
 pub struct ConversationSearchTool {
     state: Arc<AppState>,
-    user_id: Uuid,
+    user: Arc<User>,
     user_key: Arc<SecretKey>,
     agent_conversation_id: i64,
 }
@@ -442,13 +444,13 @@ pub struct ConversationSearchTool {
 impl ConversationSearchTool {
     pub fn new(
         state: Arc<AppState>,
-        user_id: Uuid,
+        user: Arc<User>,
         user_key: Arc<SecretKey>,
         conversation_id: i64,
     ) -> Self {
         Self {
             state,
-            user_id,
+            user,
             user_key,
             agent_conversation_id: conversation_id,
         }
@@ -461,6 +463,8 @@ impl ConversationSearchTool {
     ) -> Result<Vec<(ConversationSummary, f32, String)>, ApiError> {
         let (query_vec, _tok) = crate::web::get_embedding_vector(
             &self.state,
+            self.user.as_ref(),
+            AuthMethod::Jwt,
             crate::rag::DEFAULT_EMBEDDING_MODEL,
             query,
             Some(crate::rag::DEFAULT_EMBEDDING_DIM),
@@ -477,7 +481,7 @@ impl ConversationSearchTool {
         // Fetch latest summaries. Bound this to keep runtime predictable.
         let summaries = ConversationSummary::list_for_conversation(
             &mut conn,
-            self.user_id,
+            self.user.uuid,
             self.agent_conversation_id,
             200,
         )
@@ -540,8 +544,11 @@ impl Tool for ConversationSearchTool {
                     Err(_) => return ToolResult::error("database connection error"),
                 };
 
-                match Conversation::get_by_uuid_and_user(&mut conn, conversation_uuid, self.user_id)
-                {
+                match Conversation::get_by_uuid_and_user(
+                    &mut conn,
+                    conversation_uuid,
+                    self.user.uuid,
+                ) {
                     Ok(c) => Some(c.id),
                     Err(_) => return ToolResult::error("conversation not found"),
                 }
@@ -556,7 +563,8 @@ impl Tool for ConversationSearchTool {
         let source_types = vec![crate::rag::SOURCE_TYPE_MESSAGE.to_string()];
         match search_user_embeddings(
             &self.state,
-            self.user_id,
+            self.user.as_ref(),
+            AuthMethod::Jwt,
             &self.user_key,
             query,
             limit,
@@ -620,15 +628,15 @@ impl Tool for ConversationSearchTool {
 
 pub struct ArchivalInsertTool {
     state: Arc<AppState>,
-    user_id: Uuid,
+    user: Arc<User>,
     user_key: Arc<SecretKey>,
 }
 
 impl ArchivalInsertTool {
-    pub fn new(state: Arc<AppState>, user_id: Uuid, user_key: Arc<SecretKey>) -> Self {
+    pub fn new(state: Arc<AppState>, user: Arc<User>, user_key: Arc<SecretKey>) -> Self {
         Self {
             state,
-            user_id,
+            user,
             user_key,
         }
     }
@@ -668,7 +676,8 @@ impl Tool for ArchivalInsertTool {
 
         match crate::rag::insert_archival_embedding(
             &self.state,
-            self.user_id,
+            self.user.as_ref(),
+            AuthMethod::Jwt,
             &self.user_key,
             content,
             metadata_ref,
@@ -689,15 +698,15 @@ impl Tool for ArchivalInsertTool {
 
 pub struct ArchivalSearchTool {
     state: Arc<AppState>,
-    user_id: Uuid,
+    user: Arc<User>,
     user_key: Arc<SecretKey>,
 }
 
 impl ArchivalSearchTool {
-    pub fn new(state: Arc<AppState>, user_id: Uuid, user_key: Arc<SecretKey>) -> Self {
+    pub fn new(state: Arc<AppState>, user: Arc<User>, user_key: Arc<SecretKey>) -> Self {
         Self {
             state,
-            user_id,
+            user,
             user_key,
         }
     }
@@ -729,7 +738,8 @@ impl Tool for ArchivalSearchTool {
         let source_types = vec![crate::rag::SOURCE_TYPE_ARCHIVAL.to_string()];
         match search_user_embeddings(
             &self.state,
-            self.user_id,
+            self.user.as_ref(),
+            AuthMethod::Jwt,
             &self.user_key,
             query,
             top_k,

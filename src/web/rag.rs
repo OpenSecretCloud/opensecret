@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::models::users::User;
 use crate::rag;
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
+use crate::web::openai_auth::AuthMethod;
 use crate::web::responses::error_mapping;
 use crate::{ApiError, AppMode, AppState};
 
@@ -105,7 +106,8 @@ async fn insert_archival_embedding(
 
     let inserted = rag::insert_archival_embedding(
         &state,
-        user.uuid,
+        &user,
+        AuthMethod::Jwt,
         &user_key,
         &body.text,
         body.metadata.as_ref(),
@@ -168,7 +170,8 @@ async fn search(
 
     let results = rag::search_user_embeddings(
         &state,
-        user.uuid,
+        &user,
+        AuthMethod::Jwt,
         &user_key,
         &body.query,
         top_k,

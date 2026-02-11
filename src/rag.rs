@@ -1,6 +1,8 @@
 use crate::encrypt::{decrypt_with_key, encrypt_with_key};
 use crate::models::schema::user_embeddings;
 use crate::models::user_embeddings::NewUserEmbedding;
+use crate::models::users::User;
+use crate::web::openai_auth::AuthMethod;
 use crate::{ApiError, AppState};
 use diesel::prelude::*;
 use secp256k1::SecretKey;
@@ -285,9 +287,16 @@ fn apply_token_budget(results: Vec<RagSearchResult>, budget: i32) -> Vec<RagSear
     limited
 }
 
-async fn embed_text_via_tinfoil(state: &AppState, text: &str) -> Result<(Vec<f32>, i32), ApiError> {
+async fn embed_text_via_tinfoil(
+    state: &Arc<AppState>,
+    user: &User,
+    auth_method: AuthMethod,
+    text: &str,
+) -> Result<(Vec<f32>, i32), ApiError> {
     crate::web::get_embedding_vector(
         state,
+        user,
+        auth_method,
         DEFAULT_EMBEDDING_MODEL,
         text,
         Some(DEFAULT_EMBEDDING_DIM),
@@ -296,13 +305,15 @@ async fn embed_text_via_tinfoil(state: &AppState, text: &str) -> Result<(Vec<f32
 }
 
 pub async fn insert_archival_embedding(
-    state: &AppState,
-    user_id: Uuid,
+    state: &Arc<AppState>,
+    user: &User,
+    auth_method: AuthMethod,
     user_key: &SecretKey,
     text: &str,
     metadata: Option<&serde_json::Value>,
 ) -> Result<crate::models::user_embeddings::UserEmbedding, ApiError> {
-    let (vector, token_count) = embed_text_via_tinfoil(state, text).await?;
+    let user_id = user.uuid;
+    let (vector, token_count) = embed_text_via_tinfoil(state, user, auth_method, text).await?;
 
     let vector_bytes = serialize_f32_le(&vector);
     let vector_enc = encrypt_with_key(user_key, &vector_bytes).await;
@@ -347,20 +358,22 @@ pub async fn insert_archival_embedding(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_message_embedding(
-    state: &AppState,
-    user_id: Uuid,
+    state: &Arc<AppState>,
+    user: &User,
+    auth_method: AuthMethod,
     user_key: &SecretKey,
     text: &str,
     conversation_id: i64,
     user_message_id: Option<i64>,
     assistant_message_id: Option<i64>,
 ) -> Result<crate::models::user_embeddings::UserEmbedding, ApiError> {
+    let user_id = user.uuid;
     let text = text.trim();
     if text.is_empty() {
         return Err(ApiError::BadRequest);
     }
 
-    let (vector, token_count) = embed_text_via_tinfoil(state, text).await?;
+    let (vector, token_count) = embed_text_via_tinfoil(state, user, auth_method, text).await?;
 
     let vector_bytes = serialize_f32_le(&vector);
     let vector_enc = encrypt_with_key(user_key, &vector_bytes).await;
@@ -491,8 +504,9 @@ async fn load_all_user_embeddings(
 
 #[allow(clippy::too_many_arguments)]
 pub async fn search_user_embeddings(
-    state: &AppState,
-    user_id: Uuid,
+    state: &Arc<AppState>,
+    user: &User,
+    auth_method: AuthMethod,
     user_key: &SecretKey,
     query: &str,
     top_k: usize,
@@ -502,7 +516,10 @@ pub async fn search_user_embeddings(
 ) -> Result<Vec<RagSearchResult>, ApiError> {
     let top_k = top_k.clamp(1, 20);
 
-    let (query_vec, _query_tokens) = embed_text_via_tinfoil(state, query).await?;
+    let user_id = user.uuid;
+
+    let (query_vec, _query_tokens) =
+        embed_text_via_tinfoil(state, user, auth_method, query).await?;
 
     let cached = {
         let mut cache = state.rag_cache.lock().await;

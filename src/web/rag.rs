@@ -178,6 +178,7 @@ async fn search(
         body.max_tokens,
         body.source_types.as_deref(),
         conversation_internal_id,
+        None,
     )
     .await?;
 

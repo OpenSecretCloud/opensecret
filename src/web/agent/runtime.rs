@@ -9,7 +9,7 @@ use diesel::prelude::*;
 use crate::encrypt::{decrypt_string, encrypt_with_key};
 use crate::models::agent_config::{AgentConfig, NewAgentConfig};
 use crate::models::conversation_summaries::{ConversationSummary, NewConversationSummary};
-use crate::models::memory_blocks::{MemoryBlock, NewMemoryBlock};
+use crate::models::memory_blocks::{MemoryBlock, NewMemoryBlock, DEFAULT_BLOCK_CHAR_LIMIT};
 use crate::models::responses::{
     AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewToolCall,
     NewToolOutput, NewUserMessage, RawThreadMessage, RawThreadMessageMetadata, ToolCall,
@@ -258,7 +258,7 @@ impl AgentRuntime {
                 label: "persona".to_string(),
                 description: Some(DEFAULT_PERSONA_DESCRIPTION.to_string()),
                 value_enc,
-                char_limit: 2000,
+                char_limit: DEFAULT_BLOCK_CHAR_LIMIT,
                 read_only: false,
                 version: 1,
             };
@@ -281,7 +281,7 @@ impl AgentRuntime {
                 label: "human".to_string(),
                 description: Some(DEFAULT_HUMAN_DESCRIPTION.to_string()),
                 value_enc,
-                char_limit: 2000,
+                char_limit: DEFAULT_BLOCK_CHAR_LIMIT,
                 read_only: false,
                 version: 1,
             };

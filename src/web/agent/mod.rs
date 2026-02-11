@@ -1009,9 +1009,9 @@ async fn get_or_create_agent_config(
             user_id,
             conversation_id: None,
             enabled: true,
-            model: "deepseek-r1-0528".to_string(),
-            max_context_tokens: 100_000,
-            compaction_threshold: 0.80,
+            model: runtime::DEFAULT_MODEL.to_string(),
+            max_context_tokens: runtime::DEFAULT_CONTEXT_WINDOW,
+            compaction_threshold: runtime::DEFAULT_COMPACTION_THRESHOLD,
             system_prompt_enc: None,
             preferences_enc: None,
         };

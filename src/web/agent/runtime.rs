@@ -38,7 +38,7 @@ use super::tools::{
 const DEFAULT_PERSONA_DESCRIPTION: &str = "The persona block: Stores details about your current persona, guiding how you behave and respond. This helps you to maintain consistency and personality in your interactions.";
 const DEFAULT_HUMAN_DESCRIPTION: &str = "The human block: Stores key details about the person you are conversing with, allowing for more personalized and friend-like conversation.";
 const DEFAULT_PERSONA_VALUE: &str = "I am Sage, a helpful AI companion. I maintain long-term memory across our conversations and strive to be friendly, concise, and genuinely helpful.";
-const DEFAULT_CONTEXT_WINDOW: i32 = 100_000;
+const DEFAULT_CONTEXT_WINDOW: i32 = 256_000;
 const DEFAULT_COMPACTION_THRESHOLD: f32 = 0.80;
 const MIN_MESSAGES_IN_CONTEXT: usize = 20;
 
@@ -111,7 +111,7 @@ impl AgentRuntime {
                     user_id: user.uuid,
                     conversation_id: None,
                     enabled: true,
-                    model: "deepseek-r1-0528".to_string(),
+                    model: "kimi-k2".to_string(),
                     max_context_tokens: DEFAULT_CONTEXT_WINDOW,
                     compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
                     system_prompt_enc: None,

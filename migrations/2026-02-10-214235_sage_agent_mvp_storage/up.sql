@@ -62,7 +62,7 @@ CREATE TABLE agent_config (
     conversation_id     BIGINT REFERENCES conversations(id) ON DELETE SET NULL,
 
     enabled             BOOLEAN NOT NULL DEFAULT FALSE,
-    model               TEXT NOT NULL DEFAULT 'kimi-k2',
+    model               TEXT NOT NULL DEFAULT 'kimi-k2-5',
     max_context_tokens  INTEGER NOT NULL DEFAULT 256000,
     compaction_threshold REAL NOT NULL DEFAULT 0.80,
 

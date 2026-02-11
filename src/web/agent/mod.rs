@@ -1,14 +1,16 @@
 use axum::{
     extract::{Path, Query, State},
     middleware::from_fn_with_state,
+    response::sse::{Event, Sse},
     routing::{delete, get, post, put},
     Extension, Json, Router,
 };
 use diesel::prelude::*;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::encrypt::{decrypt_content, decrypt_string, encrypt_with_key};
@@ -24,6 +26,7 @@ use crate::web::responses::constants::{DEFAULT_PAGINATION_LIMIT, MAX_PAGINATION_
 use crate::web::responses::conversations::{
     ConversationItemListResponse, ConversationListResponse, ConversationResponse, ListItemsParams,
 };
+use crate::web::responses::handlers::encrypt_event;
 use crate::web::responses::{
     error_mapping, ConversationBuilder, ConversationItem, ConversationItemConverter,
     DeletedObjectResponse, Paginator,
@@ -40,10 +43,26 @@ struct AgentChatRequest {
     input: String,
 }
 
+// SSE event types for agent chat (message-level delivery, not token streaming)
+const EVENT_AGENT_MESSAGE: &str = "agent.message";
+const EVENT_AGENT_DONE: &str = "agent.done";
+const EVENT_AGENT_ERROR: &str = "agent.error";
+
 #[derive(Debug, Clone, Serialize)]
-struct AgentChatResponse {
+struct AgentMessageEvent {
     messages: Vec<String>,
-    tool_calls: Vec<signatures::AgentToolCall>,
+    step: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentDoneEvent {
+    total_steps: usize,
+    total_messages: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentErrorEvent {
+    error: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -195,7 +214,7 @@ async fn chat(
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
     Extension(body): Extension<AgentChatRequest>,
-) -> Result<Json<EncryptedResponse<AgentChatResponse>>, ApiError> {
+) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
     if body.input.trim().is_empty() {
         return Err(ApiError::BadRequest);
     }
@@ -206,14 +225,96 @@ async fn chat(
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
     let mut runtime = runtime::AgentRuntime::new(state.clone(), user.clone(), user_key).await?;
-    let (messages, tool_calls) = runtime.process_message(&body.input).await?;
+    runtime.prepare(&body.input).await?;
 
-    let response = AgentChatResponse {
-        messages,
-        tool_calls,
+    let input = body.input.clone();
+    let max_steps = runtime.max_steps();
+
+    let event_stream = async_stream::stream! {
+        let mut total_messages: usize = 0;
+        let mut had_error = false;
+
+        for step_num in 0..max_steps {
+            let step_result = runtime.step(&input, step_num == 0).await;
+
+            match step_result {
+                Ok(result) => {
+                    // Persist assistant messages SYNCHRONOUSLY (so next step sees them).
+                    // Embedding updates happen async inside insert_assistant_message.
+                    for msg in &result.messages {
+                        if let Err(e) = runtime.insert_assistant_message(msg).await {
+                            error!("Failed to persist assistant message: {e:?}");
+                        }
+                    }
+
+                    // Emit messages to client immediately (like Sage sending via Signal)
+                    if !result.messages.is_empty() {
+                        total_messages += result.messages.len();
+                        let event_data = AgentMessageEvent {
+                            messages: result.messages,
+                            step: step_num,
+                        };
+                        match encrypt_event(&state, &session_id, EVENT_AGENT_MESSAGE, &serde_json::to_value(&event_data).unwrap_or_default()).await {
+                            Ok(event) => yield Ok::<Event, std::convert::Infallible>(event),
+                            Err(e) => {
+                                error!("Failed to encrypt agent message event: {e:?}");
+                                yield Ok(Event::default().event(EVENT_AGENT_ERROR).data("Encryption failed"));
+                                had_error = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Persist tool calls SYNCHRONOUSLY (so next step sees them in context)
+                    for executed in &result.executed_tools {
+                        if let Err(e) = runtime.insert_tool_call_and_output(&executed.tool_call, &executed.result).await {
+                            error!("Failed to persist tool call: {e:?}");
+                        }
+                    }
+
+                    if result.done {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("Agent step {} error: {e:?}", step_num);
+                    let err_event = AgentErrorEvent {
+                        error: "Agent encountered an error processing your message.".to_string(),
+                    };
+                    match encrypt_event(&state, &session_id, EVENT_AGENT_ERROR, &serde_json::to_value(&err_event).unwrap_or_default()).await {
+                        Ok(event) => yield Ok(event),
+                        Err(_) => yield Ok(Event::default().event(EVENT_AGENT_ERROR).data("Error")),
+                    }
+                    had_error = true;
+                    break;
+                }
+            }
+        }
+
+        if !had_error && total_messages == 0 {
+            warn!("Agent produced no messages");
+            let fallback = AgentMessageEvent {
+                messages: vec!["I apologize, but I wasn't able to generate a response.".to_string()],
+                step: 0,
+            };
+            if let Ok(event) = encrypt_event(&state, &session_id, EVENT_AGENT_MESSAGE, &serde_json::to_value(&fallback).unwrap_or_default()).await {
+                yield Ok(event);
+                total_messages = 1;
+            }
+        }
+
+        // Final done event
+        let done_event = AgentDoneEvent {
+            total_steps: max_steps,
+            total_messages,
+        };
+        match encrypt_event(&state, &session_id, EVENT_AGENT_DONE, &serde_json::to_value(&done_event).unwrap_or_default()).await {
+            Ok(event) => yield Ok(event),
+            Err(_) => yield Ok(Event::default().data("[DONE]")),
+        }
     };
 
-    encrypt_response(&state, &session_id, &response).await
+    Ok(Sse::new(event_stream))
 }
 
 async fn get_config(

@@ -20,6 +20,7 @@ use crate::rag::{
     insert_message_embedding, serialize_f32_le, SOURCE_TYPE_ARCHIVAL, SOURCE_TYPE_MESSAGE,
 };
 use crate::tokens::count_tokens;
+use crate::web::openai_auth::AuthMethod;
 use crate::web::responses::{MessageContent, MessageContentConverter};
 use crate::{ApiError, AppState};
 
@@ -193,17 +194,17 @@ impl AgentRuntime {
         )));
         tools.register(Arc::new(ArchivalInsertTool::new(
             state.clone(),
-            user.uuid,
+            user.clone(),
             user_key.clone(),
         )));
         tools.register(Arc::new(ArchivalSearchTool::new(
             state.clone(),
-            user.uuid,
+            user.clone(),
             user_key.clone(),
         )));
         tools.register(Arc::new(ConversationSearchTool::new(
             state.clone(),
-            user.uuid,
+            user.clone(),
             user_key.clone(),
             conversation.id,
         )));
@@ -757,7 +758,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
 
         // Mirror Sage: store message synchronously, update embedding in background.
         let state = self.state.clone();
-        let user_id = self.user.uuid;
+        let user = self.user.clone();
         let user_key = self.user_key.clone();
         let text = text.to_string();
         let conversation_id = self.conversation.id;
@@ -766,7 +767,8 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         tokio::spawn(async move {
             let _ = insert_message_embedding(
                 &state,
-                user_id,
+                user.as_ref(),
+                AuthMethod::Jwt,
                 user_key.as_ref(),
                 &text,
                 conversation_id,
@@ -808,7 +810,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
 
         // Mirror Sage: store message synchronously, update embedding in background.
         let state = self.state.clone();
-        let user_id = self.user.uuid;
+        let user = self.user.clone();
         let user_key = self.user_key.clone();
         let text = text.to_string();
         let conversation_id = self.conversation.id;
@@ -817,7 +819,8 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         tokio::spawn(async move {
             let _ = insert_message_embedding(
                 &state,
-                user_id,
+                user.as_ref(),
+                AuthMethod::Jwt,
                 user_key.as_ref(),
                 &text,
                 conversation_id,
@@ -1004,6 +1007,8 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         // Embed summary for conversation_search over summaries
         let embedding = crate::web::get_embedding_vector(
             &self.state,
+            self.user.as_ref(),
+            AuthMethod::Jwt,
             crate::rag::DEFAULT_EMBEDDING_MODEL,
             &summary,
             Some(crate::rag::DEFAULT_EMBEDDING_DIM),

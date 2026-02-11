@@ -345,6 +345,57 @@ pub async fn insert_archival_embedding(
     Ok(inserted)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_message_embedding(
+    state: &AppState,
+    user_id: Uuid,
+    user_key: &SecretKey,
+    text: &str,
+    conversation_id: i64,
+    user_message_id: Option<i64>,
+    assistant_message_id: Option<i64>,
+) -> Result<crate::models::user_embeddings::UserEmbedding, ApiError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(ApiError::BadRequest);
+    }
+
+    let (vector, token_count) = embed_text_via_tinfoil(state, text).await?;
+
+    let vector_bytes = serialize_f32_le(&vector);
+    let vector_enc = encrypt_with_key(user_key, &vector_bytes).await;
+    let content_enc = encrypt_with_key(user_key, text.as_bytes()).await;
+
+    let mut conn = state
+        .db
+        .get_pool()
+        .get()
+        .map_err(|_| ApiError::InternalServerError)?;
+
+    let inserted = NewUserEmbedding {
+        uuid: Uuid::new_v4(),
+        user_id,
+        source_type: SOURCE_TYPE_MESSAGE.to_string(),
+        user_message_id,
+        assistant_message_id,
+        conversation_id: Some(conversation_id),
+        vector_enc,
+        embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
+        vector_dim: DEFAULT_EMBEDDING_DIM,
+        content_enc,
+        metadata_enc: None,
+        token_count,
+    }
+    .insert(&mut conn)
+    .map_err(|e| {
+        error!("Failed to insert message embedding: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    state.rag_cache.lock().await.evict_user(user_id);
+    Ok(inserted)
+}
+
 async fn load_all_user_embeddings(
     state: &AppState,
     user_id: Uuid,

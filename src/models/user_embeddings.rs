@@ -26,6 +26,7 @@ pub struct UserEmbedding {
     pub vector_dim: i32,
     pub content_enc: Vec<u8>,
     pub metadata_enc: Option<Vec<u8>>,
+    pub tags_enc: Vec<Option<String>>,
     pub token_count: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -45,6 +46,7 @@ pub struct NewUserEmbedding {
     pub vector_dim: i32,
     pub content_enc: Vec<u8>,
     pub metadata_enc: Option<Vec<u8>>,
+    pub tags_enc: Vec<Option<String>>,
     pub token_count: i32,
 }
 

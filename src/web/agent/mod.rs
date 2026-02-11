@@ -685,6 +685,7 @@ async fn memory_search(
         body.max_tokens,
         Some(&source_types),
         None,
+        None,
     )
     .await?;
 

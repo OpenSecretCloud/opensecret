@@ -371,6 +371,7 @@ diesel::table! {
         vector_dim -> Int4,
         content_enc -> Bytea,
         metadata_enc -> Nullable<Bytea>,
+        tags_enc -> Array<Nullable<Text>>,
         token_count -> Int4,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,

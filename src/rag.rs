@@ -1,14 +1,15 @@
-use crate::encrypt::{decrypt_with_key, encrypt_with_key};
+use crate::encrypt::{decrypt_with_key, encrypt_key_deterministic, encrypt_with_key};
 use crate::models::schema::user_embeddings;
 use crate::models::user_embeddings::NewUserEmbedding;
 use crate::models::users::User;
 use crate::web::openai_auth::AuthMethod;
 use crate::{ApiError, AppState};
+use base64::{engine::general_purpose::STANDARD as B64_STANDARD, Engine as _};
 use diesel::prelude::*;
 use secp256k1::SecretKey;
 use serde::Serialize;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error};
@@ -304,6 +305,49 @@ async fn embed_text_via_tinfoil(
     .await
 }
 
+fn normalize_tags<'a>(tags: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+
+    for tag in tags {
+        let normalized = tag.trim().to_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+
+    out
+}
+
+fn encrypt_tags_b64(user_key: &SecretKey, tags: &[String]) -> Vec<Option<String>> {
+    tags.iter()
+        .map(|tag| {
+            let ciphertext = encrypt_key_deterministic(user_key, tag.as_bytes());
+            Some(B64_STANDARD.encode(ciphertext))
+        })
+        .collect()
+}
+
+fn extract_tags_from_metadata(metadata: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(metadata) = metadata else {
+        return Vec::new();
+    };
+
+    let Some(tags) = metadata.get("tags") else {
+        return Vec::new();
+    };
+
+    match tags {
+        serde_json::Value::Array(arr) => normalize_tags(arr.iter().filter_map(|v| v.as_str())),
+        serde_json::Value::String(s) => normalize_tags(s.split(',')),
+        _ => Vec::new(),
+    }
+}
+
 pub async fn insert_archival_embedding(
     state: &Arc<AppState>,
     user: &User,
@@ -326,6 +370,9 @@ pub async fn insert_archival_embedding(
         None
     };
 
+    let tags = extract_tags_from_metadata(metadata);
+    let tags_enc = encrypt_tags_b64(user_key, &tags);
+
     let mut conn = state
         .db
         .get_pool()
@@ -344,6 +391,7 @@ pub async fn insert_archival_embedding(
         vector_dim: DEFAULT_EMBEDDING_DIM,
         content_enc,
         metadata_enc,
+        tags_enc,
         token_count,
     }
     .insert(&mut conn)
@@ -397,6 +445,7 @@ pub async fn insert_message_embedding(
         vector_dim: DEFAULT_EMBEDDING_DIM,
         content_enc,
         metadata_enc: None,
+        tags_enc: Vec::new(),
         token_count,
     }
     .insert(&mut conn)
@@ -502,6 +551,116 @@ async fn load_all_user_embeddings(
     Ok(Arc::new(out))
 }
 
+async fn load_user_embeddings_by_tags(
+    state: &AppState,
+    user_id: Uuid,
+    user_key: &SecretKey,
+    source_types: Option<&[String]>,
+    conversation_id: Option<i64>,
+    tags_enc_filter: &[Option<String>],
+) -> Result<Arc<Vec<CachedEmbedding>>, ApiError> {
+    let mut conn = state
+        .db
+        .get_pool()
+        .get()
+        .map_err(|_| ApiError::InternalServerError)?;
+
+    let tags_enc_filter = tags_enc_filter.to_vec();
+
+    let mut last_id: i64 = 0;
+    let mut out: Vec<CachedEmbedding> = Vec::new();
+
+    #[derive(Queryable)]
+    struct EmbeddingScanRow {
+        source_type: String,
+        conversation_id: Option<i64>,
+        vector_enc: Vec<u8>,
+        content_enc: Vec<u8>,
+        token_count: i32,
+        vector_dim: i32,
+        id: i64,
+    }
+
+    loop {
+        let mut query = user_embeddings::table
+            .filter(user_embeddings::user_id.eq(user_id))
+            .filter(user_embeddings::id.gt(last_id))
+            .filter(user_embeddings::tags_enc.overlaps_with(tags_enc_filter.clone()))
+            .into_boxed();
+
+        if let Some(source_types) = source_types {
+            query = query.filter(user_embeddings::source_type.eq_any(source_types));
+        }
+
+        if let Some(conversation_id) = conversation_id {
+            query = query.filter(user_embeddings::conversation_id.eq(Some(conversation_id)));
+        }
+
+        let rows: Vec<EmbeddingScanRow> = query
+            .order(user_embeddings::id.asc())
+            .select((
+                user_embeddings::source_type,
+                user_embeddings::conversation_id,
+                user_embeddings::vector_enc,
+                user_embeddings::content_enc,
+                user_embeddings::token_count,
+                user_embeddings::vector_dim,
+                user_embeddings::id,
+            ))
+            .limit(DB_SCAN_BATCH_SIZE)
+            .load(&mut conn)
+            .map_err(|e| {
+                error!(
+                    "Failed to load tag-filtered embeddings batch for user={} after id={}: {:?}",
+                    user_id, last_id, e
+                );
+                ApiError::InternalServerError
+            })?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        for row in rows {
+            let EmbeddingScanRow {
+                source_type,
+                conversation_id,
+                vector_enc,
+                content_enc,
+                token_count,
+                vector_dim,
+                id,
+            } = row;
+
+            let vector_bytes = decrypt_with_key(user_key, &vector_enc)
+                .map_err(|_| ApiError::InternalServerError)?;
+            let vector = deserialize_f32_le(&vector_bytes)?;
+
+            if vector.len() != vector_dim as usize {
+                debug!(
+                    "Skipping embedding id={} for user={} due to dim mismatch (expected={}, got={})",
+                    id,
+                    user_id,
+                    vector_dim,
+                    vector.len()
+                );
+                continue;
+            }
+
+            out.push(CachedEmbedding {
+                source_type,
+                conversation_id,
+                vector,
+                content_enc,
+                token_count,
+            });
+            last_id = id;
+        }
+    }
+
+    Ok(Arc::new(out))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn search_user_embeddings(
     state: &Arc<AppState>,
@@ -513,6 +672,7 @@ pub async fn search_user_embeddings(
     max_tokens: Option<i32>,
     source_types: Option<&[String]>,
     conversation_id: Option<i64>,
+    tags: Option<&[String]>,
 ) -> Result<Vec<RagSearchResult>, ApiError> {
     let top_k = top_k.clamp(1, 20);
 
@@ -521,17 +681,34 @@ pub async fn search_user_embeddings(
     let (query_vec, _query_tokens) =
         embed_text_via_tinfoil(state, user, auth_method, query).await?;
 
-    let cached = {
-        let mut cache = state.rag_cache.lock().await;
-        cache.get(user_id)
-    };
+    let tags_enc_filter = tags
+        .map(|t| normalize_tags(t.iter().map(|s| s.as_str())))
+        .filter(|t| !t.is_empty())
+        .map(|t| encrypt_tags_b64(user_key, &t));
 
-    let embeddings = if let Some(hit) = cached {
-        hit
+    let embeddings = if let Some(tags_enc_filter) = tags_enc_filter.as_ref() {
+        load_user_embeddings_by_tags(
+            state,
+            user_id,
+            user_key,
+            source_types,
+            conversation_id,
+            tags_enc_filter,
+        )
+        .await?
     } else {
-        let loaded = load_all_user_embeddings(state, user_id, user_key).await?;
-        state.rag_cache.lock().await.put(user_id, loaded.clone());
-        loaded
+        let cached = {
+            let mut cache = state.rag_cache.lock().await;
+            cache.get(user_id)
+        };
+
+        if let Some(hit) = cached {
+            hit
+        } else {
+            let loaded = load_all_user_embeddings(state, user_id, user_key).await?;
+            state.rag_cache.lock().await.put(user_id, loaded.clone());
+            loaded
+        }
     };
 
     let candidates = top_k_candidates(

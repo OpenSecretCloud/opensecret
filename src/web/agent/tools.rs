@@ -571,6 +571,7 @@ impl Tool for ConversationSearchTool {
             None,
             Some(&source_types),
             conversation_id_filter,
+            None,
         )
         .await
         {
@@ -732,8 +733,15 @@ impl Tool for ArchivalSearchTool {
         };
         let top_k: usize = args.get("top_k").and_then(|k| k.parse().ok()).unwrap_or(5);
 
-        // NOTE: Tag filtering isn't indexable because metadata is encrypted.
-        // We accept the argument for schema compatibility but don't apply it.
+        let tags = args
+            .get("tags")
+            .map(|t| {
+                t.split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|t| !t.is_empty());
 
         let source_types = vec![crate::rag::SOURCE_TYPE_ARCHIVAL.to_string()];
         match search_user_embeddings(
@@ -746,6 +754,7 @@ impl Tool for ArchivalSearchTool {
             None,
             Some(&source_types),
             None,
+            tags.as_deref(),
         )
         .await
         {

@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod attestation_routes;
 pub mod audio_utils;
 pub mod documents;
@@ -12,6 +13,7 @@ pub mod protected_routes;
 pub mod rag;
 pub mod responses;
 
+pub use agent::router as agent_routes;
 pub use documents::router as document_routes;
 pub use health_routes::router_with_state as health_routes_with_state;
 pub use login_routes::router as login_routes;

@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::encrypt::{decrypt_content, decrypt_string, encrypt_with_key};
 use crate::models::agent_config::{AgentConfig, NewAgentConfig};
-use crate::models::memory_blocks::{MemoryBlock, NewMemoryBlock};
+use crate::models::memory_blocks::{MemoryBlock, NewMemoryBlock, DEFAULT_BLOCK_CHAR_LIMIT};
 use crate::models::responses::{Conversation, NewConversation};
 use crate::models::schema::user_embeddings;
 use crate::models::users::User;
@@ -500,6 +500,31 @@ async fn update_memory_block(
         }
     }
 
+    let char_limit = body
+        .char_limit
+        .or_else(|| existing.as_ref().map(|b| b.char_limit))
+        .unwrap_or(DEFAULT_BLOCK_CHAR_LIMIT);
+
+    if char_limit <= 0 {
+        return Err(ApiError::BadRequest);
+    }
+
+    if let Some(value) = body.value.as_ref() {
+        if value.len() > char_limit as usize {
+            return Err(ApiError::BadRequest);
+        }
+    } else if body.char_limit.is_some() {
+        if let Some(b) = &existing {
+            let existing_value = decrypt_string(&user_key, Some(&b.value_enc))
+                .map_err(|_| ApiError::InternalServerError)?
+                .unwrap_or_default();
+
+            if existing_value.len() > char_limit as usize {
+                return Err(ApiError::BadRequest);
+            }
+        }
+    }
+
     let value_enc = match body.value {
         Some(value) => encrypt_with_key(&user_key, value.as_bytes()).await,
         None => match &existing {
@@ -519,10 +544,7 @@ async fn update_memory_block(
             .description
             .or_else(|| existing.as_ref().and_then(|b| b.description.clone())),
         value_enc,
-        char_limit: body
-            .char_limit
-            .or_else(|| existing.as_ref().map(|b| b.char_limit))
-            .unwrap_or(5000),
+        char_limit,
         read_only: body
             .read_only
             .or_else(|| existing.as_ref().map(|b| b.read_only))

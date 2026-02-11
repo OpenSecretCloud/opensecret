@@ -25,6 +25,9 @@ CREATE TABLE user_embeddings (
     content_enc          BYTEA NOT NULL,
     metadata_enc         BYTEA,
 
+    -- Deterministically-encrypted tags (base64) for SQL-level filtering
+    tags_enc             TEXT[] NOT NULL DEFAULT '{}',
+
     -- Plaintext metadata
     token_count          INTEGER NOT NULL,
 
@@ -60,6 +63,11 @@ CREATE INDEX idx_user_embeddings_user_created ON user_embeddings(user_id, create
 
 -- For source-type filtered searches (message vs archival)
 CREATE INDEX idx_user_embeddings_user_source ON user_embeddings(user_id, source_type);
+
+-- For tag-filtered archival searches (encrypted, per-user tokens)
+CREATE INDEX idx_user_embeddings_archival_tags_enc
+    ON user_embeddings USING GIN(tags_enc)
+    WHERE source_type = 'archival';
 
 -- For conversation-scoped searches (message recall)
 CREATE INDEX idx_user_embeddings_user_conversation ON user_embeddings(user_id, conversation_id);

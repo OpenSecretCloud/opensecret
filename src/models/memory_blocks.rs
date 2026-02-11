@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Default character limit per core memory block (mirrors Sage/Letta).
+pub const DEFAULT_BLOCK_CHAR_LIMIT: i32 = 20_000;
+
 #[derive(Error, Debug)]
 pub enum MemoryBlockError {
     #[error("Database error: {0}")]
@@ -102,7 +105,7 @@ impl NewMemoryBlock {
             label: label.into(),
             description,
             value_enc,
-            char_limit: 5000,
+            char_limit: DEFAULT_BLOCK_CHAR_LIMIT,
             read_only: false,
             version: 1,
         }

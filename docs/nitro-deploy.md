@@ -830,6 +830,55 @@ A restart should not be needed but if you need to:
 sudo systemctl restart vsock-billing-proxy.service
 ```
 
+## Vsock os-flags proxy
+Create a vsock proxy service so that enclave program can talk to the os-flags feature flag service:
+
+First configure the endpoints into their allowlist:
+
+```sh
+sudo vim /etc/nitro_enclaves/vsock-proxy.yaml
+```
+
+Add one of these lines depending on your environment:
+```
+- {address: flags-dev.opensecret.cloud, port: 443}  # for dev/preview/custom environments
+- {address: flags.opensecret.cloud, port: 443}      # for prod environment
+```
+
+Now create a service that spins this up automatically:
+
+```sh
+sudo vim /etc/systemd/system/vsock-os-flags-proxy.service
+```
+
+```
+[Unit]
+Description=Vsock os-flags Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8028 flags-dev.opensecret.cloud 443  # Change to flags.opensecret.cloud for prod
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Activate the service:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable vsock-os-flags-proxy.service
+sudo systemctl start vsock-os-flags-proxy.service
+sudo systemctl status vsock-os-flags-proxy.service
+```
+
+A restart should not be needed but if you need to:
+```sh
+sudo systemctl restart vsock-os-flags-proxy.service
+```
+
 ## Vsock Kagi Search proxy
 Create a vsock proxy service so that enclave program can talk to the Kagi Search API:
 
@@ -1604,6 +1653,50 @@ Take that encrypted base64 and insert it into the `enclave_secrets` table with k
 ```sql
 INSERT INTO enclave_secrets (key, value)
 VALUES ('brave_api_key', decode('your_base64_string', 'base64'));
+```
+
+#### os-flags API Key
+
+After the DB is initialized, we need to store the os-flags API key encrypted to the enclave KMS key.
+
+```sh
+echo -n "OS_FLAGS_API_KEY" | base64 -w 0
+```
+
+Take that output and encrypt to the KMS key, from a machine that has encrypt access to the key:
+
+```sh
+aws kms encrypt --key-id "KEY_ARN" --plaintext "BASE64_KEY" --query CiphertextBlob --output text
+```
+
+Take that encrypted base64 and insert it into the `enclave_secrets` table with key as `os_flags_api_key` and value as the base64.
+
+```sql
+INSERT INTO enclave_secrets (key, value)
+VALUES ('os_flags_api_key', decode('your_base64_string', 'base64'));
+```
+
+#### os-flags Base URL (optional)
+
+If you want to override the default os-flags base URL, store it (encrypted) under the `os_flags_base_url` key. If omitted, the server will default to:
+- `https://flags.opensecret.cloud` for prod
+- `https://flags-dev.opensecret.cloud` for non-prod
+
+```sh
+echo -n "OS_FLAGS_BASE_URL" | base64 -w 0
+```
+
+Take that output and encrypt to the KMS key, from a machine that has encrypt access to the key:
+
+```sh
+aws kms encrypt --key-id "KEY_ARN" --plaintext "BASE64_URL" --query CiphertextBlob --output text
+```
+
+Take that encrypted base64 and insert it into the `enclave_secrets` table with key as `os_flags_base_url` and value as the base64.
+
+```sql
+INSERT INTO enclave_secrets (key, value)
+VALUES ('os_flags_base_url', decode('your_base64_string', 'base64'));
 ```
 
 ## Secrets Manager

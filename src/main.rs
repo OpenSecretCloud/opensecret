@@ -82,6 +82,7 @@ mod message_signing;
 mod migrations;
 mod models;
 mod oauth;
+mod os_flags;
 mod private_key;
 mod proxy_config;
 mod sqs;
@@ -107,6 +108,8 @@ const BILLING_API_KEY_NAME: &str = "billing_api_key";
 const BILLING_SERVER_URL_NAME: &str = "billing_server_url";
 const KAGI_API_KEY_NAME: &str = "kagi_api_key";
 const BRAVE_API_KEY_NAME: &str = "brave_api_key";
+const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
+const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EnclaveRequest {
@@ -411,6 +414,7 @@ pub struct AppState {
     oauth_manager: Arc<OAuthManager>,
     sqs_publisher: Option<Arc<SqsEventPublisher>>,
     billing_client: Option<BillingClient>,
+    os_flags_client: Option<os_flags::OsFlagsClient>,
     apple_jwt_verifier: Arc<AppleJwtVerifier>,
     cancellation_broadcast: tokio::sync::broadcast::Sender<Uuid>,
     kagi_client: Option<Arc<crate::kagi::KagiClient>>,
@@ -438,6 +442,8 @@ pub struct AppStateBuilder {
     sqs_publisher: Option<Arc<SqsEventPublisher>>,
     billing_api_key: Option<String>,
     billing_server_url: Option<String>,
+    os_flags_base_url: Option<String>,
+    os_flags_api_key: Option<String>,
     kagi_api_key: Option<String>,
     brave_api_key: Option<String>,
 }
@@ -544,6 +550,16 @@ impl AppStateBuilder {
         self
     }
 
+    pub fn os_flags_base_url(mut self, os_flags_base_url: Option<String>) -> Self {
+        self.os_flags_base_url = os_flags_base_url;
+        self
+    }
+
+    pub fn os_flags_api_key(mut self, os_flags_api_key: Option<String>) -> Self {
+        self.os_flags_api_key = os_flags_api_key;
+        self
+    }
+
     pub fn kagi_api_key(mut self, kagi_api_key: Option<String>) -> Self {
         self.kagi_api_key = kagi_api_key;
         self
@@ -638,6 +654,18 @@ impl AppStateBuilder {
             None
         };
 
+        let os_flags_client = if let Some(base_url) = self.os_flags_base_url {
+            tracing::debug!("os-flags client is configured.");
+            Some(
+                os_flags::OsFlagsClient::new(base_url, self.os_flags_api_key).map_err(|e| {
+                    Error::BuilderError(format!("Failed to initialize os-flags client: {e}"))
+                })?,
+            )
+        } else {
+            tracing::debug!("os-flags client not configured");
+            None
+        };
+
         // Initialize the AppleJwtVerifier
         let apple_jwt_verifier = Arc::new(AppleJwtVerifier::new());
 
@@ -704,6 +732,7 @@ impl AppStateBuilder {
             oauth_manager,
             sqs_publisher,
             billing_client,
+            os_flags_client,
             apple_jwt_verifier,
             cancellation_broadcast: cancellation_tx,
             kagi_client,
@@ -713,6 +742,27 @@ impl AppStateBuilder {
 }
 
 impl AppState {
+    pub fn os_flags(&self) -> Option<&os_flags::OsFlagsClient> {
+        self.os_flags_client.as_ref()
+    }
+
+    pub async fn is_feature_enabled(&self, user_uuid: Uuid, flag_key: &str) -> bool {
+        let Some(client) = &self.os_flags_client else {
+            return false;
+        };
+
+        match client.is_enabled(user_uuid, flag_key).await {
+            Ok(enabled) => enabled,
+            Err(e) => {
+                warn!(
+                    "os-flags check failed (user_uuid={}, flag_key={}): {}",
+                    user_uuid, flag_key, e
+                );
+                false
+            }
+        }
+    }
+
     async fn register_user(&self, creds: RegisterCredentials) -> Result<User, Error> {
         // Get project by client_id
         let project = self
@@ -1869,6 +1919,13 @@ fn is_default_openai_domain(domain: &str) -> bool {
     domain.contains("openai.com")
 }
 
+fn default_os_flags_base_url(app_mode: &AppMode) -> String {
+    match app_mode {
+        AppMode::Prod => "https://flags.opensecret.cloud".to_string(),
+        _ => "https://flags-dev.opensecret.cloud".to_string(),
+    }
+}
+
 async fn retrieve_resend_api_key(
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
     db: Arc<dyn DBConnection + Send + Sync>,
@@ -2197,6 +2254,82 @@ async fn retrieve_billing_server_url(
             .map(Some)
     } else {
         tracing::info!("Billing server URL not found in the database");
+        Ok(None)
+    }
+}
+
+async fn retrieve_os_flags_api_key(
+    aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
+    db: Arc<dyn DBConnection + Send + Sync>,
+) -> Result<Option<String>, Error> {
+    let creds = aws_credential_manager
+        .read()
+        .await
+        .clone()
+        .expect("non-local mode should have creds")
+        .get_credentials()
+        .await
+        .expect("non-local mode should have creds");
+
+    let existing_key = db.get_enclave_secret_by_key(OS_FLAGS_API_KEY_NAME)?;
+
+    if let Some(ref encrypted_key) = existing_key {
+        let base64_encrypted_key = general_purpose::STANDARD.encode(&encrypted_key.value);
+
+        debug!("trying to decrypt base64 encrypted os-flags API key");
+
+        let decrypted_bytes = decrypt_with_kms(
+            &creds.region,
+            &creds.access_key_id,
+            &creds.secret_access_key,
+            &creds.token,
+            &base64_encrypted_key,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        String::from_utf8(decrypted_bytes)
+            .map_err(|e| Error::EncryptionError(format!("Failed to decode UTF-8: {}", e)))
+            .map(Some)
+    } else {
+        tracing::info!("os-flags API key not found in the database");
+        Ok(None)
+    }
+}
+
+async fn retrieve_os_flags_base_url(
+    aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
+    db: Arc<dyn DBConnection + Send + Sync>,
+) -> Result<Option<String>, Error> {
+    let creds = aws_credential_manager
+        .read()
+        .await
+        .clone()
+        .expect("non-local mode should have creds")
+        .get_credentials()
+        .await
+        .expect("non-local mode should have creds");
+
+    let existing_url = db.get_enclave_secret_by_key(OS_FLAGS_BASE_URL_NAME)?;
+
+    if let Some(ref encrypted_url) = existing_url {
+        let base64_encrypted_url = general_purpose::STANDARD.encode(&encrypted_url.value);
+
+        debug!("trying to decrypt base64 encrypted os-flags base URL");
+
+        let decrypted_bytes = decrypt_with_kms(
+            &creds.region,
+            &creds.access_key_id,
+            &creds.secret_access_key,
+            &creds.token,
+            &base64_encrypted_url,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        String::from_utf8(decrypted_bytes)
+            .map_err(|e| Error::EncryptionError(format!("Failed to decode UTF-8: {}", e)))
+            .map(Some)
+    } else {
+        tracing::info!("os-flags base URL not found in the database");
         Ok(None)
     }
 }
@@ -2562,6 +2695,28 @@ async fn main() -> Result<(), Error> {
         std::env::var("BRAVE_API_KEY").ok()
     };
 
+    let os_flags_api_key = if app_mode != AppMode::Local {
+        retrieve_os_flags_api_key(aws_credential_manager.clone(), db.clone()).await?
+    } else {
+        std::env::var("OS_FLAGS_API_KEY").ok()
+    };
+
+    let os_flags_base_url = if app_mode != AppMode::Local {
+        match retrieve_os_flags_base_url(aws_credential_manager.clone(), db.clone()).await? {
+            Some(url) => Some(url),
+            None => {
+                let default_url = default_os_flags_base_url(&app_mode);
+                tracing::info!(
+                    "os-flags base URL not configured; defaulting to {}",
+                    default_url
+                );
+                Some(default_url)
+            }
+        }
+    } else {
+        std::env::var("OS_FLAGS_BASE_URL").ok()
+    };
+
     let app_state = AppStateBuilder::default()
         .app_mode(app_mode.clone())
         .db(db)
@@ -2579,6 +2734,8 @@ async fn main() -> Result<(), Error> {
         .sqs_queue_maple_events_url(sqs_queue_maple_events_url)
         .billing_api_key(billing_api_key)
         .billing_server_url(billing_server_url)
+        .os_flags_base_url(os_flags_base_url)
+        .os_flags_api_key(os_flags_api_key)
         .kagi_api_key(kagi_api_key)
         .brave_api_key(brave_api_key)
         .build()

@@ -830,6 +830,55 @@ A restart should not be needed but if you need to:
 sudo systemctl restart vsock-billing-proxy.service
 ```
 
+## Vsock os-flags proxy
+Create a vsock proxy service so that enclave program can talk to the os-flags feature flag service:
+
+First configure the endpoints into their allowlist:
+
+```sh
+sudo vim /etc/nitro_enclaves/vsock-proxy.yaml
+```
+
+Add one of these lines depending on your environment:
+```
+- {address: flags-dev.opensecret.cloud, port: 443}  # for dev/preview/custom environments
+- {address: flags.opensecret.cloud, port: 443}      # for prod environment
+```
+
+Now create a service that spins this up automatically:
+
+```sh
+sudo vim /etc/systemd/system/vsock-os-flags-proxy.service
+```
+
+```
+[Unit]
+Description=Vsock os-flags Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8028 flags-dev.opensecret.cloud 443  # Change to flags.opensecret.cloud for prod
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Activate the service:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable vsock-os-flags-proxy.service
+sudo systemctl start vsock-os-flags-proxy.service
+sudo systemctl status vsock-os-flags-proxy.service
+```
+
+A restart should not be needed but if you need to:
+```sh
+sudo systemctl restart vsock-os-flags-proxy.service
+```
+
 ## Vsock Kagi Search proxy
 Create a vsock proxy service so that enclave program can talk to the Kagi Search API:
 

@@ -1655,6 +1655,50 @@ INSERT INTO enclave_secrets (key, value)
 VALUES ('brave_api_key', decode('your_base64_string', 'base64'));
 ```
 
+#### os-flags API Key
+
+After the DB is initialized, we need to store the os-flags API key encrypted to the enclave KMS key.
+
+```sh
+echo -n "OS_FLAGS_API_KEY" | base64 -w 0
+```
+
+Take that output and encrypt to the KMS key, from a machine that has encrypt access to the key:
+
+```sh
+aws kms encrypt --key-id "KEY_ARN" --plaintext "BASE64_KEY" --query CiphertextBlob --output text
+```
+
+Take that encrypted base64 and insert it into the `enclave_secrets` table with key as `os_flags_api_key` and value as the base64.
+
+```sql
+INSERT INTO enclave_secrets (key, value)
+VALUES ('os_flags_api_key', decode('your_base64_string', 'base64'));
+```
+
+#### os-flags Base URL (optional)
+
+If you want to override the default os-flags base URL, store it (encrypted) under the `os_flags_base_url` key. If omitted, the server will default to:
+- `https://flags.opensecret.cloud` for prod
+- `https://flags-dev.opensecret.cloud` for non-prod
+
+```sh
+echo -n "OS_FLAGS_BASE_URL" | base64 -w 0
+```
+
+Take that output and encrypt to the KMS key, from a machine that has encrypt access to the key:
+
+```sh
+aws kms encrypt --key-id "KEY_ARN" --plaintext "BASE64_URL" --query CiphertextBlob --output text
+```
+
+Take that encrypted base64 and insert it into the `enclave_secrets` table with key as `os_flags_base_url` and value as the base64.
+
+```sql
+INSERT INTO enclave_secrets (key, value)
+VALUES ('os_flags_base_url', decode('your_base64_string', 'base64'));
+```
+
 ## Secrets Manager
 
 ### Postgresql

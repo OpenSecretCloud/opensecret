@@ -228,3 +228,125 @@ fn generate_secp256k1_secret_key() -> Result<SecretKey, NearAiError> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn fixed_secret_key(last_byte: u8) -> SecretKey {
+        let mut sk = [0u8; 32];
+        sk[31] = last_byte;
+        SecretKey::from_slice(&sk).unwrap()
+    }
+
+    #[test]
+    fn test_ecies_hex_roundtrip() {
+        let secp = Secp256k1::new();
+        let recipient_sk = fixed_secret_key(2);
+        let recipient_pk = PublicKey::from_secret_key(&secp, &recipient_sk);
+
+        let plaintext = b"hello world";
+        let ciphertext_hex = encrypt_ecies_hex(plaintext, &recipient_pk).unwrap();
+        assert!(looks_like_hex_ciphertext(&ciphertext_hex));
+
+        let decrypted = decrypt_ecies_hex(&ciphertext_hex, &recipient_sk).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_prepare_e2ee_request_encrypts_string_content_only() {
+        let secp = Secp256k1::new();
+        let model_sk = fixed_secret_key(3);
+        let model_pk = PublicKey::from_secret_key(&secp, &model_sk);
+        let model_pk_uncompressed = model_pk.serialize_uncompressed();
+        let model_pubkey_hex = hex::encode(&model_pk_uncompressed[1..]);
+
+        let multimodal = json!([
+            {"type": "input_text", "text": "this is plaintext"},
+            {"type": "input_image", "image_url": "https://example.com/foo.png"}
+        ]);
+
+        let mut body = json!({
+            "model": "zai-org/GLM-5-FP8",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "user", "content": multimodal.clone()},
+                {"role": "user", "content": ""}
+            ],
+            "tools": [{"type": "function", "function": {"name": "foo", "parameters": {}}}]
+        });
+
+        let crypto = prepare_e2ee_request(&mut body, &model_pubkey_hex).unwrap();
+
+        let c0 = body["messages"][0]["content"].as_str().unwrap();
+        assert_ne!(c0, "hello");
+        assert!(looks_like_hex_ciphertext(c0));
+
+        assert_eq!(body["messages"][1]["content"], multimodal);
+        assert_eq!(body["messages"][2]["content"], "");
+
+        assert_eq!(crypto.client_public_key_hex.len(), 128);
+        assert!(crypto
+            .client_public_key_hex
+            .as_bytes()
+            .iter()
+            .all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_decrypt_chat_completion_json_in_place_decrypts_fields() {
+        let secp = Secp256k1::new();
+        let model_sk = fixed_secret_key(4);
+        let model_pk = PublicKey::from_secret_key(&secp, &model_sk);
+        let model_pk_uncompressed = model_pk.serialize_uncompressed();
+        let model_pubkey_hex = hex::encode(&model_pk_uncompressed[1..]);
+
+        let mut req = json!({
+            "model": "zai-org/GLM-5-FP8",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let crypto = prepare_e2ee_request(&mut req, &model_pubkey_hex).unwrap();
+
+        let client_pk = PublicKey::from_secret_key(&secp, &crypto.client_secret_key);
+        let enc_content = encrypt_ecies_hex(b"hi", &client_pk).unwrap();
+        let enc_reasoning = encrypt_ecies_hex(b"because", &client_pk).unwrap();
+
+        let mut resp = json!({
+            "choices": [{
+                "message": {"content": enc_content.clone(), "reasoning_content": enc_reasoning},
+                "delta": {"content": enc_content}
+            }]
+        });
+
+        decrypt_chat_completion_json_in_place(&mut resp, &crypto).unwrap();
+
+        assert_eq!(resp["choices"][0]["message"]["content"], "hi");
+        assert_eq!(
+            resp["choices"][0]["message"]["reasoning_content"],
+            "because"
+        );
+        assert_eq!(resp["choices"][0]["delta"]["content"], "hi");
+    }
+
+    #[test]
+    fn test_decrypt_rejects_non_ciphertext_strings() {
+        let secp = Secp256k1::new();
+        let model_sk = fixed_secret_key(5);
+        let model_pk = PublicKey::from_secret_key(&secp, &model_sk);
+        let model_pk_uncompressed = model_pk.serialize_uncompressed();
+        let model_pubkey_hex = hex::encode(&model_pk_uncompressed[1..]);
+
+        let mut req = json!({
+            "model": "zai-org/GLM-5-FP8",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let crypto = prepare_e2ee_request(&mut req, &model_pubkey_hex).unwrap();
+
+        let mut resp = json!({
+            "choices": [{"message": {"content": "plaintext"}}]
+        });
+
+        assert!(decrypt_chat_completion_json_in_place(&mut resp, &crypto).is_err());
+    }
+}

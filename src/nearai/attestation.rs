@@ -177,3 +177,91 @@ fn ethereum_address_from_uncompressed_pubkey_64(pubkey_64: &[u8]) -> [u8; 20] {
     let hash = Keccak256::digest(pubkey_64);
     hash[12..32].try_into().expect("slice length is 20 bytes")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use serde_json::json;
+
+    #[test]
+    fn test_verify_report_data_binding_ok_and_mismatch() {
+        let addr_bytes = [0x11u8; 20];
+        let signing_address = format!("0x{}", hex::encode(addr_bytes));
+        let nonce = [0x22u8; 32];
+
+        let mut report_data = [0u8; 64];
+        report_data[..20].copy_from_slice(&addr_bytes);
+        report_data[32..].copy_from_slice(&nonce);
+
+        assert!(verify_report_data_binding(&report_data, &signing_address, &nonce).is_ok());
+
+        let mut bad_addr = report_data;
+        bad_addr[0] ^= 0xff;
+        assert!(verify_report_data_binding(&bad_addr, &signing_address, &nonce).is_err());
+
+        let mut bad_nonce = report_data;
+        bad_nonce[63] ^= 0x01;
+        assert!(verify_report_data_binding(&bad_nonce, &signing_address, &nonce).is_err());
+    }
+
+    #[test]
+    fn test_pubkey_normalization_and_address_binding() {
+        let mut sk_bytes = [0u8; 32];
+        sk_bytes[31] = 1;
+        let sk = SecretKey::from_slice(&sk_bytes).unwrap();
+        let secp = Secp256k1::new();
+        let pk = PublicKey::from_secret_key(&secp, &sk);
+        let pk_uncompressed = pk.serialize_uncompressed();
+
+        let pk_65_hex = hex::encode(pk_uncompressed);
+        let pk_64_hex = hex::encode(&pk_uncompressed[1..]);
+
+        assert_eq!(
+            normalize_secp256k1_pubkey_hex(&pk_65_hex).unwrap(),
+            pk_64_hex
+        );
+        assert_eq!(
+            normalize_secp256k1_pubkey_hex(&pk_64_hex).unwrap(),
+            pk_64_hex
+        );
+
+        assert!(secp256k1_pubkey_from_64hex(&pk_65_hex).is_ok());
+        assert!(secp256k1_pubkey_from_64hex(&pk_64_hex).is_ok());
+
+        let derived_addr = ethereum_address_from_uncompressed_pubkey_64(&pk_uncompressed[1..]);
+        let signing_address = format!("0x{}", hex::encode(derived_addr));
+
+        let normalized = verify_signing_pubkey_matches_address(&pk_65_hex, &signing_address)
+            .expect("pubkey should match derived address");
+        assert_eq!(normalized, pk_64_hex);
+
+        let wrong_address = "0x0000000000000000000000000000000000000000";
+        assert!(verify_signing_pubkey_matches_address(&pk_65_hex, wrong_address).is_err());
+    }
+
+    #[test]
+    fn test_verify_compose_manifest_accepts_object_and_string() {
+        let app_compose = "version: '3'\nservices:\n  app:\n    image: example";
+        let tcb = json!({"app_compose": app_compose});
+
+        let info_obj = AttestationInfo {
+            tcb_info: Some(tcb.clone()),
+        };
+        let info_str = AttestationInfo {
+            tcb_info: Some(serde_json::Value::String(tcb.to_string())),
+        };
+
+        let compose_hash = Sha256::digest(app_compose.as_bytes());
+        let mut mr_config_id = [0u8; 48];
+        mr_config_id[0] = 0x01;
+        mr_config_id[1..33].copy_from_slice(&compose_hash);
+
+        assert!(verify_compose_manifest(&mr_config_id, &info_obj).is_ok());
+        assert!(verify_compose_manifest(&mr_config_id, &info_str).is_ok());
+
+        let mut bad = mr_config_id;
+        bad[1] ^= 0x01;
+        assert!(verify_compose_manifest(&bad, &info_obj).is_err());
+    }
+}

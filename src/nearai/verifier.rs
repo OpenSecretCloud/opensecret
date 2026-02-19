@@ -331,3 +331,199 @@ fn generate_nonce_bytes() -> Result<[u8; 32], NearAiError> {
         .map_err(|e| NearAiError::Crypto(format!("nonce generation failed: {e}")))?;
     Ok(nonce)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nearai::e2ee::{decrypt_chat_completion_json_in_place, prepare_e2ee_request};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn test_unconfigured_fails_fast() {
+        let v = NearAiVerifier::new("https://cloud-api.near.ai".to_string(), None);
+        let err = v
+            .get_verified_model_node("zai-org/GLM-5-FP8")
+            .await
+            .unwrap_err();
+        match err {
+            NearAiError::Unconfigured => {}
+            other => panic!("expected Unconfigured, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cached_node_round_robins_when_fresh() {
+        let v = NearAiVerifier::new(
+            "https://cloud-api.near.ai".to_string(),
+            Some("test".to_string()),
+        );
+
+        {
+            let mut cache = v.cache.write().await;
+            cache.insert(
+                "zai-org/GLM-5-FP8".to_string(),
+                VerifiedModel {
+                    nodes: vec![
+                        VerifiedModelNode {
+                            signing_public_key: "pk1".to_string(),
+                        },
+                        VerifiedModelNode {
+                            signing_public_key: "pk2".to_string(),
+                        },
+                    ],
+                    verified_at: Instant::now(),
+                },
+            );
+        }
+
+        let n1 = v
+            .get_verified_model_node("zai-org/GLM-5-FP8")
+            .await
+            .unwrap();
+        let n2 = v
+            .get_verified_model_node("zai-org/GLM-5-FP8")
+            .await
+            .unwrap();
+        assert_ne!(n1.signing_public_key, n2.signing_public_key);
+    }
+
+    #[tokio::test]
+    async fn test_try_get_fresh_cached_node_returns_none_when_stale() {
+        let v = NearAiVerifier::new(
+            "https://cloud-api.near.ai".to_string(),
+            Some("test".to_string()),
+        );
+
+        {
+            let mut cache = v.cache.write().await;
+            cache.insert(
+                "zai-org/GLM-5-FP8".to_string(),
+                VerifiedModel {
+                    nodes: vec![VerifiedModelNode {
+                        signing_public_key: "pk1".to_string(),
+                    }],
+                    verified_at: Instant::now() - (VERIFICATION_TTL + Duration::from_secs(1)),
+                },
+            );
+        }
+
+        assert!(v
+            .try_get_fresh_cached_node("zai-org/GLM-5-FP8")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_or_fetch_jwks_uses_cache_when_fresh() {
+        let v = NearAiVerifier::new(
+            "https://cloud-api.near.ai".to_string(),
+            Some("test".to_string()),
+        );
+
+        let jwks = NrasJwks {
+            keys: vec![crate::nearai::nras::NrasJwk {
+                kid: Some("kid".to_string()),
+                x: Some("x".to_string()),
+                y: Some("y".to_string()),
+            }],
+        };
+
+        {
+            let mut cache = v.jwks_cache.write().await;
+            *cache = Some(CachedJwks {
+                jwks: jwks.clone(),
+                fetched_at: Instant::now(),
+            });
+        }
+
+        let fetched = v.get_or_fetch_jwks().await.unwrap();
+        assert_eq!(fetched.keys.len(), 1);
+        assert_eq!(fetched.keys[0].kid.as_deref(), Some("kid"));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_nearai_attestation_glm5() {
+        let api_key = match std::env::var("NEAR_API_KEY") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => {
+                eprintln!("NEAR_API_KEY not set; skipping");
+                return;
+            }
+        };
+
+        let base_url = std::env::var("NEARAI_API_BASE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "https://cloud-api.near.ai".to_string());
+
+        let v = NearAiVerifier::new(base_url, Some(api_key));
+        let node = v
+            .get_verified_model_node("zai-org/GLM-5-FP8")
+            .await
+            .expect("attestation verification should succeed");
+
+        assert!(!node.signing_public_key.trim().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_nearai_chat_completion_glm5() {
+        let api_key = match std::env::var("NEAR_API_KEY") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => {
+                eprintln!("NEAR_API_KEY not set; skipping");
+                return;
+            }
+        };
+
+        let base_url = std::env::var("NEARAI_API_BASE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "https://cloud-api.near.ai".to_string());
+
+        let v = NearAiVerifier::new(base_url.clone(), Some(api_key.clone()));
+        let node = v
+            .get_verified_model_node("zai-org/GLM-5-FP8")
+            .await
+            .expect("attestation verification should succeed");
+
+        let mut body = json!({
+            "model": "zai-org/GLM-5-FP8",
+            "messages": [{"role": "user", "content": "ping"}],
+            "temperature": 0.0,
+            "max_tokens": 16
+        });
+
+        let crypto = prepare_e2ee_request(&mut body, &node.signing_public_key)
+            .expect("request encryption should succeed");
+
+        let sent = body["messages"][0]["content"].as_str().unwrap();
+        assert_ne!(sent, "ping");
+
+        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let res = client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("x-signing-algo", "ecdsa")
+            .header("x-client-pub-key", &crypto.client_public_key_hex)
+            .header("x-model-pub-key", &node.signing_public_key)
+            .json(&body)
+            .send()
+            .await
+            .expect("Near.AI request should send");
+
+        assert!(res.status().is_success(), "status={}", res.status());
+
+        let mut resp: serde_json::Value =
+            res.json().await.expect("Near.AI response should be JSON");
+        decrypt_chat_completion_json_in_place(&mut resp, &crypto)
+            .expect("Near.AI response should decrypt");
+
+        let content = resp["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+        assert!(!content.trim().is_empty());
+    }
+}

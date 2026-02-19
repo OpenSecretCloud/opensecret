@@ -4,7 +4,7 @@ use crate::nearai::attestation::{
 };
 use crate::nearai::error::NearAiError;
 use crate::nearai::models::{AttestationBaseInfo, AttestationReport};
-use crate::nearai::nras::{fetch_jwks, verify_gpu_attestation, NrasJwks, NRAS_ISSUER};
+use crate::nearai::nras::{fetch_jwks, verify_gpu_attestation, NrasJwks, NRAS_JWKS_URL};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -172,14 +172,21 @@ impl NearAiVerifier {
         .await?;
 
         let mut nodes = Vec::new();
+        let mut total_nodes = 0usize;
+        let mut ok_missing_pubkey = 0usize;
+        let mut last_error: Option<String> = None;
         for model_att in &report.model_attestations {
+            total_nodes += 1;
             match self
                 .verify_single_attestation(model_att, &nonce_bytes, &nonce_hex, true)
                 .await
             {
                 Ok(Some(node)) => nodes.push(node),
-                Ok(None) => {}
+                Ok(None) => {
+                    ok_missing_pubkey += 1;
+                }
                 Err(e) => {
+                    last_error = Some(e.to_string());
                     warn!(
                         "Near.AI model node attestation failed (model={}, signing_address={}): {}",
                         model, model_att.signing_address, e
@@ -189,9 +196,14 @@ impl NearAiVerifier {
         }
 
         if nodes.is_empty() {
-            return Err(NearAiError::Attestation(
-                "no verified model nodes available".to_string(),
-            ));
+            let mut msg = format!(
+                "no verified model nodes available (total={}, ok_missing_pubkey={})",
+                total_nodes, ok_missing_pubkey
+            );
+            if let Some(e) = last_error {
+                msg.push_str(&format!(", last_error={e}"));
+            }
+            return Err(NearAiError::Attestation(msg));
         }
 
         Ok(VerifiedModel {
@@ -312,7 +324,7 @@ impl NearAiVerifier {
         if jwks.keys.is_empty() {
             return Err(NearAiError::Jwt(format!(
                 "JWKS from {} contained no keys",
-                NRAS_ISSUER
+                NRAS_JWKS_URL
             )));
         }
 
@@ -521,9 +533,32 @@ mod tests {
         decrypt_chat_completion_json_in_place(&mut resp, &crypto)
             .expect("Near.AI response should decrypt");
 
-        let content = resp["choices"][0]["message"]["content"]
-            .as_str()
+        let message = &resp["choices"][0]["message"];
+
+        let content = message
+            .get("content")
+            .and_then(|v| v.as_str())
             .unwrap_or("");
-        assert!(!content.trim().is_empty());
+        let reasoning_content = message
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let reasoning = message
+            .get("reasoning")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if content.trim().is_empty()
+            && reasoning_content.trim().is_empty()
+            && reasoning.trim().is_empty()
+        {
+            eprintln!("Near.AI decrypted response had no textual fields: {resp}");
+        }
+
+        assert!(
+            !content.trim().is_empty()
+                || !reasoning_content.trim().is_empty()
+                || !reasoning.trim().is_empty()
+        );
     }
 }

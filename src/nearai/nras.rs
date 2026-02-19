@@ -5,7 +5,8 @@ use serde_json::Value;
 
 pub const NRAS_GPU_VERIFIER_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 pub const NRAS_JWKS_URL: &str = "https://nras.attestation.nvidia.com/.well-known/jwks.json";
-pub const NRAS_ISSUER: &str = "nras.attestation.nvidia.com";
+pub const NRAS_ISSUER_HOST: &str = "nras.attestation.nvidia.com";
+pub const NRAS_ISSUER_HTTPS: &str = "https://nras.attestation.nvidia.com";
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NrasJwks {
@@ -125,7 +126,7 @@ pub fn verify_nras_jwt(
     let key = DecodingKey::from_ec_components(x, y)?;
 
     let mut validation = Validation::new(Algorithm::ES384);
-    validation.set_issuer(&[NRAS_ISSUER]);
+    validation.set_issuer(&[NRAS_ISSUER_HOST, NRAS_ISSUER_HTTPS]);
     validation.validate_aud = false;
     validation.leeway = 60;
 
@@ -228,7 +229,7 @@ mod tests {
     #[test]
     fn test_verify_nras_jwt_kid_not_found() {
         let header = json!({"alg": "ES384", "kid": "missing"});
-        let payload = json!({"iss": NRAS_ISSUER, "exp": now_epoch_seconds() + 60});
+        let payload = json!({"iss": NRAS_ISSUER_HOST, "exp": now_epoch_seconds() + 60});
         let token = format!(
             "{}.{}.sig",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(header.to_string()),
@@ -248,7 +249,7 @@ mod tests {
         let nonce = "abcd1234";
         let now = now_epoch_seconds();
         let claims = json!({
-            "iss": NRAS_ISSUER,
+            "iss": NRAS_ISSUER_HOST,
             "exp": now + 60,
             "iat": now,
             "x-nvidia-overall-att-result": true,
@@ -264,7 +265,7 @@ mod tests {
         let nonce = "abcd1234";
         let now = now_epoch_seconds();
         let claims = json!({
-            "iss": NRAS_ISSUER,
+            "iss": NRAS_ISSUER_HOST,
             "exp": now + 60,
             "iat": now,
             "x-nvidia-overall-att-result": true,
@@ -279,7 +280,7 @@ mod tests {
     fn test_verify_nras_jwt_nonce_mismatch_fails() {
         let now = now_epoch_seconds();
         let claims = json!({
-            "iss": NRAS_ISSUER,
+            "iss": NRAS_ISSUER_HOST,
             "exp": now + 60,
             "iat": now,
             "x-nvidia-overall-att-result": true,
@@ -295,7 +296,7 @@ mod tests {
         let nonce = "abcd1234";
         let now = now_epoch_seconds();
         let claims = json!({
-            "iss": NRAS_ISSUER,
+            "iss": NRAS_ISSUER_HOST,
             "exp": now + 60,
             "iat": now,
             "x-nvidia-overall-att-result": false,

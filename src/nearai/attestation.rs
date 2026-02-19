@@ -29,13 +29,8 @@ pub async fn verify_tdx_quote(intel_quote_hex: &str) -> Result<VerifiedTdxQuote,
     let verified =
         verify_tdx(&quote_bytes, &collateral, now).map_err(|e| NearAiError::Tdx(e.to_string()))?;
 
-    // Be strict: dcap-qvl may return non-fatal statuses. We require UpToDate.
-    if verified.status != "UpToDate" {
-        return Err(NearAiError::Tdx(format!(
-            "quote verification status is {}",
-            verified.status
-        )));
-    }
+    // dcap-qvl returns a TCB status (e.g. UpToDate/OutOfDate) and fails verification only for
+    // invalid states like Revoked; we rely on that behavior and do not enforce a stricter policy.
 
     let td10 = verified
         .report

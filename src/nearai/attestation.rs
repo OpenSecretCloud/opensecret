@@ -1,0 +1,179 @@
+use crate::nearai::error::NearAiError;
+use crate::nearai::models::AttestationInfo;
+use dcap_qvl::collateral::get_collateral;
+use dcap_qvl::verify::ring::verify as verify_tdx;
+use secp256k1::PublicKey;
+use sha2::{Digest, Sha256};
+use sha3::Keccak256;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const INTEL_PCCS_URL: &str = "https://api.trustedservices.intel.com/tdx/certification/v4";
+
+pub struct VerifiedTdxQuote {
+    pub report_data: [u8; 64],
+    pub mr_config_id: [u8; 48],
+}
+
+pub async fn verify_tdx_quote(intel_quote_hex: &str) -> Result<VerifiedTdxQuote, NearAiError> {
+    let quote_bytes = hex::decode(intel_quote_hex.trim_start_matches("0x"))?;
+
+    let collateral = get_collateral(INTEL_PCCS_URL, &quote_bytes)
+        .await
+        .map_err(|e| NearAiError::Tdx(e.to_string()))?;
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| NearAiError::Tdx(e.to_string()))?
+        .as_secs();
+
+    let verified =
+        verify_tdx(&quote_bytes, &collateral, now).map_err(|e| NearAiError::Tdx(e.to_string()))?;
+
+    // Be strict: dcap-qvl may return non-fatal statuses. We require UpToDate.
+    if verified.status != "UpToDate" {
+        return Err(NearAiError::Tdx(format!(
+            "quote verification status is {}",
+            verified.status
+        )));
+    }
+
+    let td10 = verified
+        .report
+        .as_td10()
+        .ok_or_else(|| NearAiError::Tdx("expected TD10 report".to_string()))?;
+
+    Ok(VerifiedTdxQuote {
+        report_data: td10.report_data,
+        mr_config_id: td10.mr_config_id,
+    })
+}
+
+pub fn verify_report_data_binding(
+    report_data: &[u8; 64],
+    signing_address: &str,
+    request_nonce: &[u8; 32],
+) -> Result<(), NearAiError> {
+    let signing_address_bytes = parse_eth_address_bytes(signing_address)?;
+    let mut expected_addr_field = [0u8; 32];
+    expected_addr_field[..signing_address_bytes.len()].copy_from_slice(&signing_address_bytes);
+
+    if report_data[..32] != expected_addr_field {
+        return Err(NearAiError::Attestation(
+            "TDX report_data does not bind signing_address".to_string(),
+        ));
+    }
+
+    if report_data[32..] != request_nonce[..] {
+        return Err(NearAiError::Attestation(
+            "TDX report_data does not embed request_nonce".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn normalize_secp256k1_pubkey_hex(pubkey_hex: &str) -> Result<String, NearAiError> {
+    let bytes = hex::decode(pubkey_hex.trim_start_matches("0x"))?;
+    let normalized = match bytes.as_slice() {
+        [0x04, rest @ ..] if rest.len() == 64 => rest.to_vec(),
+        _ if bytes.len() == 64 => bytes,
+        _ => {
+            return Err(NearAiError::Attestation(format!(
+                "unexpected secp256k1 public key length: {}",
+                bytes.len()
+            )))
+        }
+    };
+
+    Ok(hex::encode(normalized))
+}
+
+pub fn secp256k1_pubkey_from_64hex(pubkey_hex: &str) -> Result<PublicKey, NearAiError> {
+    let key_bytes = hex::decode(pubkey_hex.trim_start_matches("0x"))?;
+    let key_65 = if key_bytes.len() == 65 {
+        key_bytes
+    } else if key_bytes.len() == 64 {
+        let mut prefixed = Vec::with_capacity(65);
+        prefixed.push(0x04);
+        prefixed.extend_from_slice(&key_bytes);
+        prefixed
+    } else {
+        return Err(NearAiError::Attestation(format!(
+            "unexpected secp256k1 public key length: {}",
+            key_bytes.len()
+        )));
+    };
+
+    Ok(PublicKey::from_slice(&key_65)?)
+}
+
+pub fn verify_signing_pubkey_matches_address(
+    signing_public_key_hex: &str,
+    signing_address: &str,
+) -> Result<String, NearAiError> {
+    let normalized_pubkey_hex = normalize_secp256k1_pubkey_hex(signing_public_key_hex)?;
+    let pubkey_bytes = hex::decode(&normalized_pubkey_hex)?;
+
+    let derived_addr = ethereum_address_from_uncompressed_pubkey_64(&pubkey_bytes);
+    let expected_addr = parse_eth_address_bytes(signing_address)?;
+
+    if derived_addr != expected_addr {
+        return Err(NearAiError::Attestation(
+            "signing_public_key does not match signing_address".to_string(),
+        ));
+    }
+
+    Ok(normalized_pubkey_hex)
+}
+
+pub fn verify_compose_manifest(
+    mr_config_id: &[u8; 48],
+    info: &AttestationInfo,
+) -> Result<(), NearAiError> {
+    let tcb_info = info
+        .tcb_info
+        .as_ref()
+        .ok_or_else(|| NearAiError::Attestation("missing info.tcb_info".to_string()))?;
+
+    let tcb_info_obj: serde_json::Value = if let Some(s) = tcb_info.as_str() {
+        serde_json::from_str(s)?
+    } else {
+        tcb_info.clone()
+    };
+
+    let app_compose = tcb_info_obj
+        .get("app_compose")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| NearAiError::Attestation("missing tcb_info.app_compose".to_string()))?;
+
+    let compose_hash = Sha256::digest(app_compose.as_bytes());
+    let expected_prefix = format!("01{}", hex::encode(compose_hash));
+    let mr_config_hex = hex::encode(mr_config_id);
+
+    if !mr_config_hex.starts_with(&expected_prefix) {
+        return Err(NearAiError::Attestation(
+            "mr_config_id does not match app_compose sha256".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn parse_eth_address_bytes(addr: &str) -> Result<[u8; 20], NearAiError> {
+    let addr = addr.trim_start_matches("0x");
+    let bytes = hex::decode(addr)?;
+    if bytes.len() != 20 {
+        return Err(NearAiError::Attestation(format!(
+            "expected 20-byte Ethereum address, got {} bytes",
+            bytes.len()
+        )));
+    }
+
+    Ok(bytes.try_into().expect("checked length is 20 bytes"))
+}
+
+fn ethereum_address_from_uncompressed_pubkey_64(pubkey_64: &[u8]) -> [u8; 20] {
+    // Ethereum address is keccak256(uncompressed_pubkey_without_prefix)[12..].
+    let hash = Keccak256::digest(pubkey_64);
+    hash[12..32].try_into().expect("slice length is 20 bytes")
+}

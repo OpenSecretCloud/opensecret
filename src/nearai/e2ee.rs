@@ -1,0 +1,230 @@
+use crate::nearai::attestation::secp256k1_pubkey_from_64hex;
+use crate::nearai::error::NearAiError;
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
+use hkdf::Hkdf;
+use secp256k1::ecdh::shared_secret_point;
+use secp256k1::{PublicKey, Secp256k1, SecretKey};
+use serde_json::Value;
+use sha2::Sha256;
+use tracing::warn;
+
+const HKDF_INFO: &[u8] = b"ecdsa_encryption";
+const MIN_CIPHERTEXT_BYTES: usize = 65 + 12 + 16;
+
+#[derive(Clone)]
+pub struct NearAiResponseCrypto {
+    pub client_public_key_hex: String,
+    client_secret_key: SecretKey,
+}
+
+impl NearAiResponseCrypto {
+    fn decrypt_field(&self, encrypted_hex: &str) -> Result<String, NearAiError> {
+        let decrypted = decrypt_ecies_hex(encrypted_hex, &self.client_secret_key)?;
+        String::from_utf8(decrypted)
+            .map_err(|e| NearAiError::Crypto(format!("invalid UTF-8 plaintext: {e}")))
+    }
+}
+
+pub fn prepare_e2ee_request(
+    body: &mut Value,
+    model_public_key_hex: &str,
+) -> Result<NearAiResponseCrypto, NearAiError> {
+    let model_pubkey = secp256k1_pubkey_from_64hex(model_public_key_hex)?;
+
+    let secp = Secp256k1::new();
+    let client_secret_key = generate_secp256k1_secret_key()?;
+    let client_pubkey = PublicKey::from_secret_key(&secp, &client_secret_key);
+    let client_pubkey_uncompressed = client_pubkey.serialize_uncompressed();
+    let client_public_key_hex = hex::encode(&client_pubkey_uncompressed[1..]); // strip 0x04
+
+    // Encrypt messages[].content (string only). Non-string content is forwarded plaintext.
+    let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return Err(NearAiError::Crypto("missing messages array".to_string()));
+    };
+
+    for msg in messages {
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        let Some(content_val) = obj.get_mut("content") else {
+            continue;
+        };
+
+        match content_val {
+            Value::String(s) => {
+                if !s.is_empty() {
+                    let plaintext = s.clone();
+                    let encrypted_hex = encrypt_ecies_hex(plaintext.as_bytes(), &model_pubkey)?;
+                    *content_val = Value::String(encrypted_hex);
+                }
+            }
+            Value::Null => {}
+            _ => {
+                // v1 limitation: multimodal content will be visible to the Near gateway.
+                warn!("Near.AI E2EE: leaving non-string messages[].content in plaintext (v1 limitation)");
+            }
+        }
+    }
+
+    if body.get("tools").is_some()
+        || body.get("tool_choice").is_some()
+        || body.get("functions").is_some()
+        || body.get("function_call").is_some()
+    {
+        // v1 limitation: tool schemas and tool-call arguments are forwarded plaintext.
+        warn!("Near.AI E2EE: leaving tool-related fields in plaintext (v1 limitation)");
+    }
+
+    Ok(NearAiResponseCrypto {
+        client_public_key_hex,
+        client_secret_key,
+    })
+}
+
+pub fn decrypt_chat_completion_json_in_place(
+    json: &mut Value,
+    crypto: &NearAiResponseCrypto,
+) -> Result<(), NearAiError> {
+    let Some(choices) = json.get_mut("choices").and_then(|v| v.as_array_mut()) else {
+        return Ok(());
+    };
+
+    for choice in choices {
+        let Some(choice_obj) = choice.as_object_mut() else {
+            continue;
+        };
+
+        if let Some(msg) = choice_obj.get_mut("message") {
+            decrypt_message_like_in_place(msg, crypto)?;
+        }
+
+        if let Some(delta) = choice_obj.get_mut("delta") {
+            decrypt_message_like_in_place(delta, crypto)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn decrypt_message_like_in_place(
+    val: &mut Value,
+    crypto: &NearAiResponseCrypto,
+) -> Result<(), NearAiError> {
+    let Some(obj) = val.as_object_mut() else {
+        return Ok(());
+    };
+
+    for field in ["content", "reasoning_content", "reasoning"] {
+        if let Some(v) = obj.get_mut(field) {
+            decrypt_string_field_in_place(v, crypto)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn decrypt_string_field_in_place(
+    val: &mut Value,
+    crypto: &NearAiResponseCrypto,
+) -> Result<(), NearAiError> {
+    match val {
+        Value::Null => Ok(()),
+        Value::String(s) => {
+            if s.is_empty() {
+                return Ok(());
+            }
+            // Strict: must be valid hex ciphertext and must decrypt.
+            if !looks_like_hex_ciphertext(s) {
+                return Err(NearAiError::Crypto(
+                    "Near.AI response field did not look like hex ciphertext".to_string(),
+                ));
+            }
+            let plaintext = crypto.decrypt_field(s)?;
+            *val = Value::String(plaintext);
+            Ok(())
+        }
+        _ => Err(NearAiError::Crypto(
+            "Near.AI response field had unexpected non-string type".to_string(),
+        )),
+    }
+}
+
+fn looks_like_hex_ciphertext(s: &str) -> bool {
+    if s.len() < (MIN_CIPHERTEXT_BYTES * 2) {
+        return false;
+    }
+    if !s.len().is_multiple_of(2) {
+        return false;
+    }
+    s.as_bytes().iter().all(|b| b.is_ascii_hexdigit())
+}
+
+fn encrypt_ecies_hex(
+    plaintext: &[u8],
+    recipient_pubkey: &PublicKey,
+) -> Result<String, NearAiError> {
+    let secp = Secp256k1::new();
+    let ephemeral_secret_key = generate_secp256k1_secret_key()?;
+    let ephemeral_pubkey = PublicKey::from_secret_key(&secp, &ephemeral_secret_key);
+    let ephemeral_pubkey_uncompressed = ephemeral_pubkey.serialize_uncompressed();
+
+    let shared_point = shared_secret_point(recipient_pubkey, &ephemeral_secret_key);
+    let shared_x = &shared_point[..32];
+
+    let hk = Hkdf::<Sha256>::new(None, shared_x);
+    let mut aes_key = [0u8; 32];
+    hk.expand(HKDF_INFO, &mut aes_key)?;
+
+    let cipher = Aes256Gcm::new_from_slice(&aes_key)?;
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::getrandom(&mut nonce_bytes)
+        .map_err(|e| NearAiError::Crypto(format!("nonce generation failed: {e}")))?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+
+    let ciphertext = cipher.encrypt(nonce, plaintext)?;
+
+    let mut out = Vec::with_capacity(
+        ephemeral_pubkey_uncompressed.len() + nonce_bytes.len() + ciphertext.len(),
+    );
+    out.extend_from_slice(&ephemeral_pubkey_uncompressed);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&ciphertext);
+    Ok(hex::encode(out))
+}
+
+fn decrypt_ecies_hex(
+    ciphertext_hex: &str,
+    recipient_secret_key: &SecretKey,
+) -> Result<Vec<u8>, NearAiError> {
+    let ciphertext = hex::decode(ciphertext_hex.trim())?;
+    if ciphertext.len() < MIN_CIPHERTEXT_BYTES {
+        return Err(NearAiError::Crypto("ciphertext too short".to_string()));
+    }
+
+    let ephemeral_pubkey = PublicKey::from_slice(&ciphertext[..65])?;
+    let nonce_bytes = &ciphertext[65..77];
+    let body = &ciphertext[77..];
+
+    let shared_point = shared_secret_point(&ephemeral_pubkey, recipient_secret_key);
+    let shared_x = &shared_point[..32];
+
+    let hk = Hkdf::<Sha256>::new(None, shared_x);
+    let mut aes_key = [0u8; 32];
+    hk.expand(HKDF_INFO, &mut aes_key)?;
+
+    let cipher = Aes256Gcm::new_from_slice(&aes_key)?;
+    let nonce = Nonce::from_slice(nonce_bytes);
+    Ok(cipher.decrypt(nonce, body)?)
+}
+
+fn generate_secp256k1_secret_key() -> Result<SecretKey, NearAiError> {
+    let mut sk_bytes = [0u8; 32];
+    loop {
+        getrandom::getrandom(&mut sk_bytes)
+            .map_err(|e| NearAiError::Crypto(format!("secret key generation failed: {e}")))?;
+        if let Ok(sk) = SecretKey::from_slice(&sk_bytes) {
+            return Ok(sk);
+        }
+    }
+}

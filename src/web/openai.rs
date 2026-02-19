@@ -1,5 +1,8 @@
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
+use crate::nearai::e2ee::{
+    decrypt_chat_completion_json_in_place, prepare_e2ee_request, NearAiResponseCrypto,
+};
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
@@ -37,6 +40,72 @@ const MAX_AUDIO_SIZE: usize = 100 * 1024 * 1024;
 // Timeout constants for provider requests
 const REQUEST_TIMEOUT_SECS: u64 = 120; // Request timeout (generous for large non-streaming responses)
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming reads
+
+#[derive(Clone)]
+struct PreparedChatRequest {
+    body_json: String,
+    extra_headers: Vec<(HeaderName, HeaderValue)>,
+    near_crypto: Option<NearAiResponseCrypto>,
+}
+
+async fn prepare_chat_request_for_provider(
+    state: &Arc<AppState>,
+    proxy_config: &ProxyConfig,
+    mut body: Value,
+) -> Result<PreparedChatRequest, ApiError> {
+    let mut extra_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
+    let mut near_crypto: Option<NearAiResponseCrypto> = None;
+
+    if proxy_config.provider_name.to_lowercase() == "nearai" {
+        let model = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .ok_or(ApiError::BadRequest)?
+            .to_string();
+
+        let node = state
+            .nearai_verifier
+            .get_verified_model_node(&model)
+            .await
+            .map_err(|e| {
+                error!("Near.AI verification failed (model={}): {}", model, e);
+                ApiError::ServiceUnavailable
+            })?;
+
+        let crypto = prepare_e2ee_request(&mut body, &node.signing_public_key).map_err(|e| {
+            error!("Near.AI request encryption failed (model={}): {}", model, e);
+            ApiError::ServiceUnavailable
+        })?;
+
+        extra_headers.push((
+            HeaderName::from_static("x-signing-algo"),
+            HeaderValue::from_static("ecdsa"),
+        ));
+        extra_headers.push((
+            HeaderName::from_static("x-client-pub-key"),
+            HeaderValue::from_str(&crypto.client_public_key_hex)
+                .map_err(|_| ApiError::InternalServerError)?,
+        ));
+        extra_headers.push((
+            HeaderName::from_static("x-model-pub-key"),
+            HeaderValue::from_str(&node.signing_public_key)
+                .map_err(|_| ApiError::InternalServerError)?,
+        ));
+
+        near_crypto = Some(crypto);
+    }
+
+    let body_json = serde_json::to_string(&body).map_err(|e| {
+        error!("Failed to serialize request body: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    Ok(PreparedChatRequest {
+        body_json,
+        extra_headers,
+        near_crypto,
+    })
+}
 
 /// Parameters for transcription requests
 struct TranscriptionParams<'a> {
@@ -441,7 +510,7 @@ pub async fn get_chat_completion_response(
     // Prepare the request to proxies
     debug!("Sending request for model: {}", model_name);
 
-    let (res, successful_provider) = {
+    let (res, successful_provider, successful_near_crypto) = {
         debug!(
             "Using route for model {}: primary={}, fallbacks={}",
             model_name,
@@ -461,11 +530,9 @@ pub async fn get_chat_completion_response(
             primary_body.insert("stream_options".to_string(), json!({"include_usage": true}));
         }
 
-        let primary_body_json =
-            serde_json::to_string(&Value::Object(primary_body)).map_err(|e| {
-                error!("Failed to serialize request body: {:?}", e);
-                ApiError::InternalServerError
-            })?;
+        let primary_prepared =
+            prepare_chat_request_for_provider(state, &route.primary, Value::Object(primary_body))
+                .await?;
 
         // Prepare fallback request if available
         let fallback_request = if let Some(fallback) = route.fallbacks.first() {
@@ -479,12 +546,10 @@ pub async fn get_chat_completion_response(
                 fallback_body.insert("stream_options".to_string(), json!({"include_usage": true}));
             }
 
-            let fallback_body_json =
-                serde_json::to_string(&Value::Object(fallback_body)).map_err(|e| {
-                    error!("Failed to serialize fallback request body: {:?}", e);
-                    ApiError::InternalServerError
-                })?;
-            Some((fallback, fallback_body_json))
+            let prepared =
+                prepare_chat_request_for_provider(state, fallback, Value::Object(fallback_body))
+                    .await?;
+            Some((fallback, prepared))
         } else {
             None
         };
@@ -494,6 +559,7 @@ pub async fn get_chat_completion_response(
         let mut last_error = None;
         let mut found_response = None;
         let mut successful_provider_name = String::new();
+        let mut successful_near_crypto: Option<NearAiResponseCrypto> = None;
 
         for cycle in 0..max_cycles {
             if cycle > 0 {
@@ -508,7 +574,15 @@ pub async fn get_chat_completion_response(
                 cycle + 1,
                 route.primary.provider_name
             );
-            match try_provider(&client, &route.primary, &primary_body_json, headers).await {
+            match try_provider(
+                &client,
+                &route.primary,
+                &primary_prepared.body_json,
+                headers,
+                &primary_prepared.extra_headers,
+            )
+            .await
+            {
                 Ok(response) => {
                     info!(
                         "Successfully got response from primary provider {} on cycle {}",
@@ -517,6 +591,7 @@ pub async fn get_chat_completion_response(
                     );
                     found_response = Some(response);
                     successful_provider_name = route.primary.provider_name.clone();
+                    successful_near_crypto = primary_prepared.near_crypto.clone();
                     break;
                 }
                 Err(err) => {
@@ -531,13 +606,21 @@ pub async fn get_chat_completion_response(
             }
 
             // Try fallback if available
-            if let Some((fallback_provider, ref fallback_body_json)) = fallback_request {
+            if let Some((fallback_provider, fallback_prepared)) = &fallback_request {
                 debug!(
                     "Cycle {}: Trying fallback provider {}",
                     cycle + 1,
                     fallback_provider.provider_name
                 );
-                match try_provider(&client, fallback_provider, fallback_body_json, headers).await {
+                match try_provider(
+                    &client,
+                    fallback_provider,
+                    &fallback_prepared.body_json,
+                    headers,
+                    &fallback_prepared.extra_headers,
+                )
+                .await
+                {
                     Ok(response) => {
                         info!(
                             "Successfully got response from fallback provider {} on cycle {}",
@@ -546,6 +629,7 @@ pub async fn get_chat_completion_response(
                         );
                         found_response = Some(response);
                         successful_provider_name = fallback_provider.provider_name.clone();
+                        successful_near_crypto = fallback_prepared.near_crypto.clone();
                         break;
                     }
                     Err(err) => {
@@ -562,7 +646,7 @@ pub async fn get_chat_completion_response(
         }
 
         match found_response {
-            Some(response) => (response, successful_provider_name),
+            Some(response) => (response, successful_provider_name, successful_near_crypto),
             None => {
                 let error_msg = if route.fallbacks.is_empty() {
                     format!(
@@ -576,6 +660,12 @@ pub async fn get_chat_completion_response(
                     )
                 };
                 error!("{}", error_msg);
+                if route.primary.provider_name.to_lowercase() == "nearai"
+                    && route.fallbacks.is_empty()
+                {
+                    return Err(ApiError::ServiceUnavailable);
+                }
+
                 return Err(ApiError::InternalServerError);
             }
         }
@@ -595,11 +685,23 @@ pub async fn get_chat_completion_response(
             ApiError::InternalServerError
         })?;
 
-        let response_json: Value = serde_json::from_str(&String::from_utf8_lossy(&body_bytes))
+        let mut response_json: Value = serde_json::from_str(&String::from_utf8_lossy(&body_bytes))
             .map_err(|e| {
                 error!("Failed to parse response JSON: {:?}", e);
                 ApiError::InternalServerError
             })?;
+
+        if successful_provider.to_lowercase() == "nearai" {
+            let Some(crypto) = successful_near_crypto.as_ref() else {
+                error!("Near.AI response missing request crypto");
+                return Err(ApiError::InternalServerError);
+            };
+
+            decrypt_chat_completion_json_in_place(&mut response_json, crypto).map_err(|e| {
+                error!("Near.AI response decryption failed: {}", e);
+                ApiError::ServiceUnavailable
+            })?;
+        }
 
         // ✅ Handle billing HERE, inside completions API
         if let Some(usage) = extract_usage(&response_json) {
@@ -637,6 +739,8 @@ pub async fn get_chat_completion_response(
     let user_clone = user.clone();
     let billing_ctx = billing_context.clone();
     let provider = successful_provider.clone();
+    let near_crypto = successful_near_crypto.clone();
+    let provider_is_near = provider.to_lowercase() == "nearai";
 
     tokio::spawn(async move {
         let mut body_stream = res.into_body().into_stream();
@@ -667,7 +771,34 @@ pub async fn get_chat_completion_response(
                                 }
 
                                 match serde_json::from_str::<Value>(&frame) {
-                                    Ok(json) => {
+                                    Ok(mut json) => {
+                                        if provider_is_near {
+                                            let Some(ref crypto) = near_crypto else {
+                                                error!("Near.AI stream missing request crypto");
+                                                let _ = tx_consumer
+                                                    .send(CompletionChunk::Error(
+                                                        "Near.AI crypto missing".to_string(),
+                                                    ))
+                                                    .await;
+                                                return;
+                                            };
+
+                                            if let Err(e) = decrypt_chat_completion_json_in_place(
+                                                &mut json, crypto,
+                                            ) {
+                                                error!(
+                                                    "Near.AI stream chunk decryption failed: {}",
+                                                    e
+                                                );
+                                                let _ = tx_consumer
+                                                    .send(CompletionChunk::Error(
+                                                        "Near.AI decrypt failed".to_string(),
+                                                    ))
+                                                    .await;
+                                                return;
+                                            }
+                                        }
+
                                         // ✅ Extract and publish billing HERE - but ONLY on final chunk
                                         // This prevents sending usage data on intermediate chunks that vLLM now includes
                                         let has_finish = has_finish_reason(&json);
@@ -1729,6 +1860,7 @@ async fn try_provider(
     proxy_config: &ProxyConfig,
     body_json: &str,
     headers: &HeaderMap,
+    extra_headers: &[(HeaderName, HeaderValue)],
 ) -> Result<hyper::Response<HyperBody>, String> {
     debug!("Making request to {}", proxy_config.provider_name);
 
@@ -1758,6 +1890,11 @@ async fn try_provider(
                 req = req.header(name, val);
             }
         }
+    }
+
+    // Add provider-specific headers
+    for (name, val) in extra_headers {
+        req = req.header(name.clone(), val.clone());
     }
 
     let req = req

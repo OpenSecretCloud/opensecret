@@ -361,6 +361,12 @@ echo "127.0.0.31 router.inf9.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.32 router.inf10.tinfoil.sh" >> /etc/hosts
 log "Added Tinfoil proxy domains to /etc/hosts"
 
+# Add Near.AI + attestation hostnames to /etc/hosts
+echo "127.0.0.34 cloud-api.near.ai" >> /etc/hosts
+echo "127.0.0.35 nras.attestation.nvidia.com" >> /etc/hosts
+echo "127.0.0.21 api.trustedservices.intel.com" >> /etc/hosts
+log "Added Near.AI, NRAS, and Intel PCS domains to /etc/hosts"
+
 # Add Kagi Search hostname to /etc/hosts
 echo "127.0.0.23 kagi.com" >> /etc/hosts
 log "Added Kagi Search domain to /etc/hosts"
@@ -460,6 +466,15 @@ run_forever tf_tinfoil_atc python3 /app/traffic_forwarder.py 127.0.0.25 443 3 80
 
 log "Starting Tinfoil Inference traffic forwarder"
 run_forever tf_tinfoil_inference python3 /app/traffic_forwarder.py 127.0.0.33 443 3 8041 &
+
+log "Starting Near.AI Cloud API traffic forwarder"
+run_forever tf_nearai_cloud_api python3 /app/traffic_forwarder.py 127.0.0.34 443 3 8042 &
+
+log "Starting NVIDIA NRAS traffic forwarder"
+run_forever tf_nras python3 /app/traffic_forwarder.py 127.0.0.35 443 3 8043 &
+
+log "Starting Intel PCS traffic forwarder"
+run_forever tf_intel_pcs python3 /app/traffic_forwarder.py 127.0.0.21 443 3 8044 &
 
 log "Starting Tinfoil Router Inf4 traffic forwarder"
 run_forever tf_tinfoil_router_inf4 python3 /app/traffic_forwarder.py 127.0.0.26 443 3 8034 &
@@ -651,6 +666,27 @@ if timeout 5 bash -c '</dev/tcp/127.0.0.33/443'; then
     log "Tinfoil Inference connection successful"
 else
     log "Tinfoil Inference connection failed"
+fi
+
+log "Testing connection to Near.AI Cloud API:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.34/443'; then
+    log "Near.AI Cloud API connection successful"
+else
+    log "Near.AI Cloud API connection failed"
+fi
+
+log "Testing connection to NVIDIA NRAS:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.35/443'; then
+    log "NVIDIA NRAS connection successful"
+else
+    log "NVIDIA NRAS connection failed"
+fi
+
+log "Testing connection to Intel PCS:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.21/443'; then
+    log "Intel PCS connection successful"
+else
+    log "Intel PCS connection failed"
 fi
 
 log "Testing connection to Tinfoil Router Inf4:"

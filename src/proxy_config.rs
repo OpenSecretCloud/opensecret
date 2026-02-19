@@ -59,6 +59,9 @@ impl ProxyRouter {
             ("whisper-large-v3", "tinfoil") => "whisper-large-v3-turbo".to_string(),
             ("whisper-large-v3-turbo", "continuum") => "whisper-large-v3".to_string(),
 
+            // Near.AI model translations
+            ("glm-5", "nearai") => "zai-org/GLM-5-FP8".to_string(),
+
             // All other models use the same name on both providers
             _ => model.to_string(),
         }
@@ -68,6 +71,8 @@ impl ProxyRouter {
         openai_base: String,
         openai_key: Option<String>,
         tinfoil_base: Option<String>,
+        nearai_base: Option<String>,
+        nearai_key: Option<String>,
     ) -> Self {
         // Default OpenAI/Continuum proxy config
         let default_proxy = ProxyConfig {
@@ -91,8 +96,15 @@ impl ProxyRouter {
             provider_name: "tinfoil".to_string(),
         });
 
+        // Near.AI proxy configuration
+        let nearai_proxy = ProxyConfig {
+            base_url: nearai_base.unwrap_or_else(|| "https://cloud-api.near.ai".to_string()),
+            api_key: nearai_key,
+            provider_name: "nearai".to_string(),
+        };
+
         // Build static routing table
-        let model_routes = Self::build_static_routes(&default_proxy, &tinfoil_proxy);
+        let model_routes = Self::build_static_routes(&default_proxy, &tinfoil_proxy, &nearai_proxy);
 
         // Build static models response
         let models_response = Self::build_models_response(&tinfoil_proxy);
@@ -109,8 +121,18 @@ impl ProxyRouter {
     fn build_static_routes(
         continuum_proxy: &ProxyConfig,
         tinfoil_proxy: &Option<ProxyConfig>,
+        nearai_proxy: &ProxyConfig,
     ) -> HashMap<String, ModelRoute> {
         let mut routes = HashMap::new();
+
+        // Near.AI-only models
+        routes.insert(
+            "glm-5".to_string(),
+            ModelRoute {
+                primary: nearai_proxy.clone(),
+                fallbacks: vec![],
+            },
+        );
 
         if let Some(tinfoil) = tinfoil_proxy {
             // Models on both providers: Tinfoil primary, Continuum fallback
@@ -176,10 +198,12 @@ impl ProxyRouter {
                 "qwen3-vl-30b",
                 "kimi-k2-5",
                 "nomic-embed-text",
+                // Near.AI-only
+                "glm-5",
             ]
         } else {
             // Without Tinfoil: only Continuum models (llama-3.3-70b not available)
-            vec!["gemma-3-27b", "gpt-oss-120b", "whisper-large-v3"]
+            vec!["gemma-3-27b", "gpt-oss-120b", "whisper-large-v3", "glm-5"]
         };
 
         let model_objects: Vec<Value> = models
@@ -233,6 +257,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             None,
             Some("http://tinfoil.example.com".to_string()),
+            None,
+            None,
         );
 
         // Llama translations
@@ -264,6 +290,12 @@ mod tests {
             router.get_model_name_for_provider("gemma-3-27b", "continuum"),
             "gemma-3-27b"
         );
+
+        // Near.AI translation
+        assert_eq!(
+            router.get_model_name_for_provider("glm-5", "nearai"),
+            "zai-org/GLM-5-FP8"
+        );
     }
 
     #[test]
@@ -272,6 +304,8 @@ mod tests {
         let router = ProxyRouter::new(
             "https://api.openai.com".to_string(),
             Some("test-key".to_string()),
+            None,
+            None,
             None,
         );
         assert_eq!(router.default_proxy.provider_name, "openai");
@@ -283,6 +317,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             Some("test-key".to_string()),
             None,
+            None,
+            None,
         );
         assert_eq!(router.default_proxy.provider_name, "continuum");
         assert_eq!(router.default_proxy.api_key, None); // Continuum doesn't use API key
@@ -292,6 +328,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             None,
             Some("http://tinfoil.example.com".to_string()),
+            None,
+            None,
         );
         assert!(router.tinfoil_proxy.is_some());
         let tinfoil = router.tinfoil_proxy.as_ref().unwrap();
@@ -303,7 +341,13 @@ mod tests {
     #[test]
     fn test_get_tinfoil_base_url() {
         // Without Tinfoil
-        let router = ProxyRouter::new("http://continuum.example.com".to_string(), None, None);
+        let router = ProxyRouter::new(
+            "http://continuum.example.com".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(router.get_tinfoil_base_url(), None);
 
         // With Tinfoil
@@ -311,6 +355,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             None,
             Some("http://tinfoil.example.com".to_string()),
+            None,
+            None,
         );
         assert_eq!(
             router.get_tinfoil_base_url(),
@@ -324,6 +370,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             None,
             Some("http://tinfoil.example.com".to_string()),
+            None,
+            None,
         );
 
         // Test llama-3.3-70b is Tinfoil-only (no Continuum fallback)
@@ -348,6 +396,13 @@ mod tests {
         // Unknown model should return None
         let unknown_route = router.get_model_route("gpt-4");
         assert!(unknown_route.is_none());
+
+        // glm-5 should route to Near.AI
+        let glm_route = router.get_model_route("glm-5");
+        assert!(glm_route.is_some());
+        let route = glm_route.unwrap();
+        assert_eq!(route.primary.provider_name, "nearai");
+        assert!(route.fallbacks.is_empty());
     }
 
     #[test]
@@ -356,6 +411,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             None,
             None, // No Tinfoil
+            None,
+            None,
         );
 
         // llama-3.3-70b should NOT be available without Tinfoil
@@ -440,6 +497,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             None,
             Some("http://tinfoil.example.com".to_string()),
+            None,
+            None,
         );
 
         // Should return static models list immediately
@@ -460,5 +519,6 @@ mod tests {
             .collect();
         assert!(model_ids.contains(&"llama-3.3-70b".to_string()));
         assert!(model_ids.contains(&"gpt-oss-120b".to_string()));
+        assert!(model_ids.contains(&"glm-5".to_string()));
     }
 }

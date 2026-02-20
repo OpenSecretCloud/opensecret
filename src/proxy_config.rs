@@ -21,12 +21,22 @@ pub struct ModelRoute {
     pub fallbacks: Vec<ProxyConfig>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProxyConfig {
     pub base_url: String,
     pub api_key: Option<String>,
     /// Provider name for logging
     pub provider_name: String,
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("provider_name", &self.provider_name)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -458,7 +468,6 @@ mod tests {
 
     #[test]
     fn test_proxy_config_debug_trait() {
-        // Test that ProxyConfig implements Debug properly
         let config = ProxyConfig {
             base_url: "http://test.com".to_string(),
             api_key: Some("secret".to_string()),
@@ -468,8 +477,8 @@ mod tests {
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("test.com"));
         assert!(debug_str.contains("test"));
-        // Should contain api_key but we're not testing the exact format
-        assert!(debug_str.contains("api_key"));
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(!debug_str.contains("secret"));
     }
 
     #[test]

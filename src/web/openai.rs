@@ -1997,10 +1997,18 @@ async fn try_provider(
 
     // Forward relevant headers from the original request
     for (key, value) in headers.iter() {
+        // Prevent clients from injecting/overriding Near.AI E2EE routing/crypto headers.
+        // We always set these internally when calling Near.AI.
+        let key_str = key.as_str();
+        let is_near_internal_header = key_str.eq_ignore_ascii_case("x-signing-algo")
+            || key_str.eq_ignore_ascii_case("x-client-pub-key")
+            || key_str.eq_ignore_ascii_case("x-model-pub-key");
+
         if key != header::HOST
             && key != header::AUTHORIZATION
             && key != header::CONTENT_LENGTH
             && key != header::CONTENT_TYPE
+            && !is_near_internal_header
         {
             if let (Ok(name), Ok(val)) = (
                 HeaderName::from_bytes(key.as_ref()),

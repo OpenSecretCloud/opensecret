@@ -133,10 +133,11 @@ pub fn verify_nras_jwt(
     let token = decode::<Value>(jwt, &key, &validation)?;
     let claims = token.claims;
 
-    let verdict = claims
-        .get("x-nvidia-overall-att-result")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    let verdict = match claims.get("x-nvidia-overall-att-result") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s.eq_ignore_ascii_case("true"),
+        _ => false,
+    };
     if !verdict {
         return Err(NearAiError::Nras(
             "NRAS attestation verdict is false".to_string(),
@@ -300,6 +301,38 @@ mod tests {
             "exp": now + 60,
             "iat": now,
             "x-nvidia-overall-att-result": false,
+            "eat_nonce": nonce
+        });
+
+        let (jwks, token) = build_jwks_and_jwt("kid1", &claims);
+        assert!(verify_nras_jwt(&token, &jwks, nonce).is_err());
+    }
+
+    #[test]
+    fn test_verify_nras_jwt_verdict_string_true_accepted() {
+        let nonce = "abcd1234";
+        let now = now_epoch_seconds();
+        let claims = json!({
+            "iss": NRAS_ISSUER_HOST,
+            "exp": now + 60,
+            "iat": now,
+            "x-nvidia-overall-att-result": "true",
+            "eat_nonce": nonce
+        });
+
+        let (jwks, token) = build_jwks_and_jwt("kid1", &claims);
+        verify_nras_jwt(&token, &jwks, nonce).unwrap();
+    }
+
+    #[test]
+    fn test_verify_nras_jwt_verdict_string_false_rejected() {
+        let nonce = "abcd1234";
+        let now = now_epoch_seconds();
+        let claims = json!({
+            "iss": NRAS_ISSUER_HOST,
+            "exp": now + 60,
+            "iat": now,
+            "x-nvidia-overall-att-result": "false",
             "eat_nonce": nonce
         });
 

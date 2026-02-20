@@ -1,4 +1,5 @@
 mod attestation;
+mod collateral;
 pub mod e2ee;
 pub mod error;
 mod models;

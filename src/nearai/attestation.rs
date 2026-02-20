@@ -1,12 +1,11 @@
 use crate::nearai::error::NearAiError;
 use crate::nearai::models::AttestationInfo;
-use dcap_qvl::collateral::get_collateral;
 use dcap_qvl::quote::{Report, TDReport10};
 use dcap_qvl::verify::ring::verify as verify_tdx;
 use secp256k1::PublicKey;
 use sha2::{Digest, Sha256};
 use sha3::Keccak256;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
 pub const INTEL_PCCS_URL: &str = "https://api.trustedservices.intel.com/tdx/certification/v4";
@@ -16,12 +15,22 @@ pub struct VerifiedTdxQuote {
     pub mr_config_id: [u8; 48],
 }
 
+fn build_collateral_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(180))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .expect("reqwest client should build")
+}
+
 pub async fn verify_tdx_quote(intel_quote_hex: &str) -> Result<VerifiedTdxQuote, NearAiError> {
     let quote_bytes = hex::decode(intel_quote_hex.trim_start_matches("0x"))?;
 
-    let collateral = get_collateral(INTEL_PCCS_URL, &quote_bytes)
-        .await
-        .map_err(|e| NearAiError::Tdx(format!("{e:#}")))?;
+    let client = build_collateral_client();
+    let collateral =
+        crate::nearai::collateral::get_collateral(&client, INTEL_PCCS_URL, &quote_bytes)
+            .await
+            .map_err(|e| NearAiError::Tdx(format!("{e:#}")))?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -1342,6 +1342,7 @@ Add these lines:
 - {address: cloud-api.near.ai, port: 443}
 - {address: nras.attestation.nvidia.com, port: 443}
 - {address: api.trustedservices.intel.com, port: 443}
+- {address: certificates.trustedservices.intel.com, port: 443}
 ```
 
 Restart the nitro vsock proxy service:
@@ -1409,6 +1410,26 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
+#### Intel Certificates (Root CA CRL)
+```sh
+sudo vim /etc/systemd/system/vsock-near-intel-certs-proxy.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Intel Certificates Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8045 certificates.trustedservices.intel.com 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
 Activate all the services:
 
 ```sh
@@ -1422,6 +1443,9 @@ sudo systemctl status vsock-near-nras-proxy.service
 sudo systemctl enable vsock-near-intel-pcs-proxy.service
 sudo systemctl start vsock-near-intel-pcs-proxy.service
 sudo systemctl status vsock-near-intel-pcs-proxy.service
+sudo systemctl enable vsock-near-intel-certs-proxy.service
+sudo systemctl start vsock-near-intel-certs-proxy.service
+sudo systemctl status vsock-near-intel-certs-proxy.service
 ```
 
 If you need to restart these services:
@@ -1429,6 +1453,7 @@ If you need to restart these services:
 sudo systemctl restart vsock-near-cloud-api-proxy.service
 sudo systemctl restart vsock-near-nras-proxy.service
 sudo systemctl restart vsock-near-intel-pcs-proxy.service
+sudo systemctl restart vsock-near-intel-certs-proxy.service
 ```
 
 ## KMS Key

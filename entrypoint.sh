@@ -365,6 +365,7 @@ log "Added Tinfoil proxy domains to /etc/hosts"
 echo "127.0.0.34 cloud-api.near.ai" >> /etc/hosts
 echo "127.0.0.35 nras.attestation.nvidia.com" >> /etc/hosts
 echo "127.0.0.21 api.trustedservices.intel.com" >> /etc/hosts
+echo "127.0.0.36 certificates.trustedservices.intel.com" >> /etc/hosts
 log "Added Near.AI, NRAS, and Intel PCS domains to /etc/hosts"
 
 # Add Kagi Search hostname to /etc/hosts
@@ -475,6 +476,9 @@ run_forever tf_nras python3 /app/traffic_forwarder.py 127.0.0.35 443 3 8043 &
 
 log "Starting Intel PCS traffic forwarder"
 run_forever tf_intel_pcs python3 /app/traffic_forwarder.py 127.0.0.21 443 3 8044 &
+
+log "Starting Intel Certificates traffic forwarder"
+run_forever tf_intel_certs python3 /app/traffic_forwarder.py 127.0.0.36 443 3 8045 &
 
 log "Starting Tinfoil Router Inf4 traffic forwarder"
 run_forever tf_tinfoil_router_inf4 python3 /app/traffic_forwarder.py 127.0.0.26 443 3 8034 &
@@ -687,6 +691,13 @@ if timeout 5 bash -c '</dev/tcp/127.0.0.21/443'; then
     log "Intel PCS connection successful"
 else
     log "Intel PCS connection failed"
+fi
+
+log "Testing connection to Intel Certificates:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.36/443'; then
+    log "Intel Certificates connection successful"
+else
+    log "Intel Certificates connection failed"
 fi
 
 log "Testing connection to Tinfoil Router Inf4:"

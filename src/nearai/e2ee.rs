@@ -100,12 +100,11 @@ pub fn prepare_e2ee_request(
                 skipped_count += 1;
             }
             _ => {
-                // Genuinely multimodal content (images, etc.) -- cannot flatten to string.
-                warn!(
-                    "Near.AI E2EE: leaving non-string messages[{}].content (role={}) in plaintext (v1 limitation)",
+                return Err(NearAiError::Crypto(format!(
+                    "messages[{}].content (role={}) contains non-text content (e.g. images). \
+                     Near.AI E2EE only supports text messages.",
                     i, role
-                );
-                skipped_count += 1;
+                )));
             }
         }
     }
@@ -349,24 +348,17 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_e2ee_request_encrypts_string_content_only() {
+    fn test_prepare_e2ee_request_encrypts_string_content() {
         let secp = Secp256k1::new();
         let model_sk = fixed_secret_key(3);
         let model_pk = PublicKey::from_secret_key(&secp, &model_sk);
         let model_pk_uncompressed = model_pk.serialize_uncompressed();
         let model_pubkey_hex = hex::encode(&model_pk_uncompressed[1..]);
 
-        // Genuinely multimodal: has an image part, so cannot be flattened
-        let multimodal = json!([
-            {"type": "input_text", "text": "this is plaintext"},
-            {"type": "input_image", "image_url": "https://example.com/foo.png"}
-        ]);
-
         let mut body = json!({
             "model": "zai-org/GLM-5-FP8",
             "messages": [
                 {"role": "user", "content": "hello"},
-                {"role": "user", "content": multimodal.clone()},
                 {"role": "user", "content": ""}
             ],
             "tools": [{"type": "function", "function": {"name": "foo", "parameters": {}}}]
@@ -378,11 +370,9 @@ mod tests {
         assert_ne!(c0, "hello");
         assert!(looks_like_hex_ciphertext(c0));
 
-        // Genuinely multimodal content stays as array (can't flatten)
-        assert_eq!(body["messages"][1]["content"], multimodal);
-        let c2 = body["messages"][2]["content"].as_str().unwrap();
-        assert_ne!(c2, "");
-        assert!(looks_like_hex_ciphertext(c2));
+        let c1 = body["messages"][1]["content"].as_str().unwrap();
+        assert_ne!(c1, "");
+        assert!(looks_like_hex_ciphertext(c1));
 
         assert_eq!(crypto.client_public_key_hex.len(), 128);
         assert!(crypto
@@ -390,6 +380,33 @@ mod tests {
             .as_bytes()
             .iter()
             .all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_prepare_e2ee_request_rejects_multimodal_content() {
+        let secp = Secp256k1::new();
+        let model_sk = fixed_secret_key(3);
+        let model_pk = PublicKey::from_secret_key(&secp, &model_sk);
+        let model_pk_uncompressed = model_pk.serialize_uncompressed();
+        let model_pubkey_hex = hex::encode(&model_pk_uncompressed[1..]);
+
+        let mut body = json!({
+            "model": "zai-org/GLM-5-FP8",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "input_text", "text": "this is plaintext"},
+                    {"type": "input_image", "image_url": "https://example.com/foo.png"}
+                ]}
+            ]
+        });
+
+        let result = prepare_e2ee_request(&mut body, &model_pubkey_hex);
+        assert!(result.is_err(), "expected error for multimodal content");
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("non-text content"),
+            "expected non-text content error, got: {msg}"
+        );
     }
 
     #[test]

@@ -63,10 +63,7 @@ async fn prepare_chat_request_for_provider(
             .ok_or(ApiError::BadRequest)?
             .to_string();
 
-        trace!(
-            "Near.AI E2EE: fetching verified node for model={}",
-            model
-        );
+        trace!("Near.AI E2EE: fetching verified node for model={}", model);
         let node = state
             .nearai_verifier
             .get_verified_model_node(&model)
@@ -552,8 +549,12 @@ pub async fn get_chat_completion_response(
             None
         } else {
             Some(
-                prepare_chat_request_for_provider(state, &route.primary, primary_body_value.clone())
-                    .await?,
+                prepare_chat_request_for_provider(
+                    state,
+                    &route.primary,
+                    primary_body_value.clone(),
+                )
+                .await?,
             )
         };
 

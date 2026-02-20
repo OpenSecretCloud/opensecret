@@ -75,7 +75,8 @@ pub fn prepare_e2ee_request(
         if let Some(flattened) = try_flatten_text_content_array(content_val) {
             trace!(
                 "Near.AI E2EE: flattened text-array content to string for messages[{}] role={}",
-                i, role
+                i,
+                role
             );
             *content_val = Value::String(flattened);
         }
@@ -213,9 +214,7 @@ fn decrypt_string_field_in_place(
             Ok(())
         }
         _ => {
-            trace!(
-                "Near.AI E2EE decrypt: unexpected non-string field type"
-            );
+            trace!("Near.AI E2EE decrypt: unexpected non-string field type");
             Err(NearAiError::Crypto(
                 "Near.AI response field had unexpected non-string type".to_string(),
             ))
@@ -431,18 +430,27 @@ mod tests {
     fn test_try_flatten_text_content_array() {
         // Single text part
         let val = json!([{"type": "text", "text": "hello"}]);
-        assert_eq!(try_flatten_text_content_array(&val), Some("hello".to_string()));
+        assert_eq!(
+            try_flatten_text_content_array(&val),
+            Some("hello".to_string())
+        );
 
         // Multiple text parts
         let val = json!([
             {"type": "text", "text": "hello"},
             {"type": "text", "text": "world"}
         ]);
-        assert_eq!(try_flatten_text_content_array(&val), Some("hello\nworld".to_string()));
+        assert_eq!(
+            try_flatten_text_content_array(&val),
+            Some("hello\nworld".to_string())
+        );
 
         // input_text type also works
         let val = json!([{"type": "input_text", "text": "hey"}]);
-        assert_eq!(try_flatten_text_content_array(&val), Some("hey".to_string()));
+        assert_eq!(
+            try_flatten_text_content_array(&val),
+            Some("hey".to_string())
+        );
 
         // Mixed with image -- not flattenable
         let val = json!([

@@ -1,6 +1,7 @@
 use crate::nearai::error::NearAiError;
 use crate::nearai::models::AttestationInfo;
 use dcap_qvl::collateral::get_collateral;
+use dcap_qvl::quote::{Report, TDReport10};
 use dcap_qvl::verify::ring::verify as verify_tdx;
 use secp256k1::PublicKey;
 use sha2::{Digest, Sha256};
@@ -32,12 +33,19 @@ pub async fn verify_tdx_quote(intel_quote_hex: &str) -> Result<VerifiedTdxQuote,
     // dcap-qvl returns a TCB status (e.g. UpToDate/OutOfDate) and fails verification only for
     // invalid states like Revoked; we rely on that behavior and do not enforce a stricter policy.
 
-    let td10 = verified
-        .report
-        .as_td10()
-        .ok_or_else(|| NearAiError::Tdx("expected TD10 report".to_string()))?;
+    extract_verified_tdx_quote(&verified.report)
+        .ok_or_else(|| NearAiError::Tdx("expected TDX TD report (TD10/TD15)".to_string()))
+}
 
-    Ok(VerifiedTdxQuote {
+fn extract_verified_tdx_quote(report: &Report) -> Option<VerifiedTdxQuote> {
+    // TD15 extends TD10. For v1 we only need TD10-common fields.
+    let td10: &TDReport10 = match report {
+        Report::TD10(td10) => td10,
+        Report::TD15(td15) => &td15.base,
+        _ => return None,
+    };
+
+    Some(VerifiedTdxQuote {
         report_data: td10.report_data,
         mr_config_id: td10.mr_config_id,
     })
@@ -176,8 +184,51 @@ fn ethereum_address_from_uncompressed_pubkey_64(pubkey_64: &[u8]) -> [u8; 20] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dcap_qvl::quote::{TDReport10, TDReport15};
     use secp256k1::{PublicKey, Secp256k1, SecretKey};
     use serde_json::json;
+
+    fn td10_with_fields(report_data: [u8; 64], mr_config_id: [u8; 48]) -> TDReport10 {
+        TDReport10 {
+            tee_tcb_svn: [0u8; 16],
+            mr_seam: [0u8; 48],
+            mr_signer_seam: [0u8; 48],
+            seam_attributes: [0u8; 8],
+            td_attributes: [0u8; 8],
+            xfam: [0u8; 8],
+            mr_td: [0u8; 48],
+            mr_config_id,
+            mr_owner: [0u8; 48],
+            mr_owner_config: [0u8; 48],
+            rt_mr0: [0u8; 48],
+            rt_mr1: [0u8; 48],
+            rt_mr2: [0u8; 48],
+            rt_mr3: [0u8; 48],
+            report_data,
+        }
+    }
+
+    #[test]
+    fn test_extract_verified_tdx_quote_supports_td10_and_td15() {
+        let report_data = [0xAAu8; 64];
+        let mr_config_id = [0xBBu8; 48];
+        let td10 = td10_with_fields(report_data, mr_config_id);
+
+        let r10 = Report::TD10(td10);
+        let extracted10 = extract_verified_tdx_quote(&r10).expect("td10 should extract");
+        assert_eq!(extracted10.report_data, report_data);
+        assert_eq!(extracted10.mr_config_id, mr_config_id);
+
+        let td15 = TDReport15 {
+            base: td10,
+            tee_tcb_svn2: [0u8; 16],
+            mr_service_td: [0u8; 48],
+        };
+        let r15 = Report::TD15(td15);
+        let extracted15 = extract_verified_tdx_quote(&r15).expect("td15 should extract");
+        assert_eq!(extracted15.report_data, report_data);
+        assert_eq!(extracted15.mr_config_id, mr_config_id);
+    }
 
     #[test]
     fn test_verify_report_data_binding_ok_and_mismatch() {

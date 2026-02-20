@@ -2,6 +2,7 @@ use crate::nearai::error::NearAiError;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::Value;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const NRAS_GPU_VERIFIER_URL: &str = "https://nras.attestation.nvidia.com/v3/attest/gpu";
 pub const NRAS_JWKS_URL: &str = "https://nras.attestation.nvidia.com/.well-known/jwks.json";
@@ -126,12 +127,35 @@ pub fn verify_nras_jwt(
     let key = DecodingKey::from_ec_components(x, y)?;
 
     let mut validation = Validation::new(Algorithm::ES384);
+    // NRAS has been observed to emit both `nras.attestation.nvidia.com` and
+    // `https://nras.attestation.nvidia.com` as `iss`.
     validation.set_issuer(&[NRAS_ISSUER_HOST, NRAS_ISSUER_HTTPS]);
     validation.validate_aud = false;
+    validation.validate_nbf = true;
     validation.leeway = 60;
 
     let token = decode::<Value>(jwt, &key, &validation)?;
     let claims = token.claims;
+
+    if let Some(iat) = claims.get("iat").and_then(|v| v.as_i64()) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| NearAiError::Jwt(format!("system time error: {e}")))?
+            .as_secs() as i64;
+        let leeway = validation.leeway as i64;
+
+        if iat > now + leeway {
+            return Err(NearAiError::Jwt(
+                "NRAS JWT iat is in the future".to_string(),
+            ));
+        }
+
+        if let Some(exp) = claims.get("exp").and_then(|v| v.as_i64()) {
+            if iat > exp + leeway {
+                return Err(NearAiError::Jwt("NRAS JWT iat is after exp".to_string()));
+            }
+        }
+    }
 
     let verdict = match claims.get("x-nvidia-overall-att-result") {
         Some(Value::Bool(b)) => *b,
@@ -338,5 +362,42 @@ mod tests {
 
         let (jwks, token) = build_jwks_and_jwt("kid1", &claims);
         assert!(verify_nras_jwt(&token, &jwks, nonce).is_err());
+    }
+
+    #[test]
+    fn test_verify_nras_jwt_nbf_in_future_fails() {
+        let nonce = "abcd1234";
+        let now = now_epoch_seconds();
+        let claims = json!({
+            "iss": NRAS_ISSUER_HOST,
+            "exp": now + 7200,
+            "iat": now,
+            "nbf": now + 3600,
+            "x-nvidia-overall-att-result": true,
+            "eat_nonce": nonce
+        });
+
+        let (jwks, token) = build_jwks_and_jwt("kid1", &claims);
+        assert!(verify_nras_jwt(&token, &jwks, nonce).is_err());
+    }
+
+    #[test]
+    fn test_verify_nras_jwt_iat_in_future_fails() {
+        let nonce = "abcd1234";
+        let now = now_epoch_seconds();
+        let claims = json!({
+            "iss": NRAS_ISSUER_HOST,
+            "exp": now + 7200,
+            "iat": now + 3600,
+            "x-nvidia-overall-att-result": true,
+            "eat_nonce": nonce
+        });
+
+        let (jwks, token) = build_jwks_and_jwt("kid1", &claims);
+        let err = verify_nras_jwt(&token, &jwks, nonce).unwrap_err();
+        match err {
+            NearAiError::Jwt(s) => assert!(s.to_lowercase().contains("iat")),
+            other => panic!("expected Jwt error, got {other:?}"),
+        }
     }
 }

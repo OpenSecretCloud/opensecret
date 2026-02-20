@@ -149,6 +149,21 @@ pub fn verify_compose_manifest(
         .and_then(|v| v.as_str())
         .ok_or_else(|| NearAiError::Attestation("missing tcb_info.app_compose".to_string()))?;
 
+    let app_compose_obj: serde_json::Value = serde_json::from_str(app_compose).map_err(|e| {
+        NearAiError::Attestation(format!("tcb_info.app_compose is not valid JSON: {e}"))
+    })?;
+    let docker_compose_file = app_compose_obj
+        .get("docker_compose_file")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            NearAiError::Attestation("tcb_info.app_compose missing docker_compose_file".to_string())
+        })?;
+    if docker_compose_file.trim().is_empty() {
+        return Err(NearAiError::Attestation(
+            "tcb_info.app_compose docker_compose_file is empty".to_string(),
+        ));
+    }
+
     let compose_hash = Sha256::digest(app_compose.as_bytes());
     let expected_prefix = format!("01{}", hex::encode(compose_hash));
     let mr_config_hex = hex::encode(mr_config_id);
@@ -288,7 +303,8 @@ mod tests {
 
     #[test]
     fn test_verify_compose_manifest_accepts_object_and_string() {
-        let app_compose = "version: '3'\nservices:\n  app:\n    image: example";
+        let docker_compose_file = "version: '3'\nservices:\n  app:\n    image: example";
+        let app_compose = json!({"docker_compose_file": docker_compose_file}).to_string();
         let tcb = json!({"app_compose": app_compose});
 
         let info_obj = AttestationInfo {

@@ -15,8 +15,10 @@ use tracing::{debug, error, info, trace, warn};
 const VERIFICATION_TTL: Duration = Duration::from_secs(10 * 60);
 const PERIODIC_REVERIFY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const JWKS_TTL: Duration = Duration::from_secs(60 * 60);
-const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_RETRY_ATTEMPTS: usize = 3;
+const HTTP_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct VerifiedModelNode {
@@ -329,29 +331,70 @@ impl NearAiVerifier {
             self.base_url.trim_end_matches('/')
         );
 
-        let mut req = self.http.get(&url).query(&[
-            ("model", model),
-            ("nonce", nonce_hex),
-            ("signing_algo", "ecdsa"),
-        ]);
+        for attempt in 1..=HTTP_RETRY_ATTEMPTS {
+            let mut req = self.http.get(&url).query(&[
+                ("model", model),
+                ("nonce", nonce_hex),
+                ("signing_algo", "ecdsa"),
+            ]);
 
-        // Attestation report may be public, but include auth when present.
-        if !api_key.trim().is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", api_key));
+            // Attestation report may be public, but include auth when present.
+            if !api_key.trim().is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", api_key));
+            }
+
+            let res = match req.send().await {
+                Ok(res) => res,
+                Err(e) => {
+                    if attempt < HTTP_RETRY_ATTEMPTS && (e.is_timeout() || e.is_connect()) {
+                        warn!(
+                            "Near.AI attestation report request failed (attempt {}/{}): {}; retrying",
+                            attempt, HTTP_RETRY_ATTEMPTS, e
+                        );
+                        tokio::time::sleep(HTTP_RETRY_BASE_DELAY * attempt as u32).await;
+                        continue;
+                    }
+                    return Err(NearAiError::Http(e));
+                }
+            };
+
+            let status = res.status();
+            let text = match res.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    if attempt < HTTP_RETRY_ATTEMPTS && (e.is_timeout() || e.is_connect()) {
+                        warn!(
+                            "Near.AI attestation report read failed (attempt {}/{}): {}; retrying",
+                            attempt, HTTP_RETRY_ATTEMPTS, e
+                        );
+                        tokio::time::sleep(HTTP_RETRY_BASE_DELAY * attempt as u32).await;
+                        continue;
+                    }
+                    return Err(NearAiError::Http(e));
+                }
+            };
+
+            if status.is_server_error() && attempt < HTTP_RETRY_ATTEMPTS {
+                warn!(
+                    "Near.AI attestation report returned {} (attempt {}/{}); retrying",
+                    status, attempt, HTTP_RETRY_ATTEMPTS
+                );
+                tokio::time::sleep(HTTP_RETRY_BASE_DELAY * attempt as u32).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                return Err(NearAiError::HttpStatus {
+                    url,
+                    status,
+                    body: text,
+                });
+            }
+
+            return Ok(serde_json::from_str(&text)?);
         }
 
-        let res = req.send().await?;
-        let status = res.status();
-        let text = res.text().await?;
-        if !status.is_success() {
-            return Err(NearAiError::HttpStatus {
-                url,
-                status,
-                body: text,
-            });
-        }
-
-        Ok(serde_json::from_str(&text)?)
+        unreachable!("attestation report retry loop exhausted without returning")
     }
 
     async fn verify_single_attestation(

@@ -83,19 +83,18 @@ pub fn prepare_e2ee_request(
 
         match content_val {
             Value::String(s) => {
-                if !s.is_empty() {
-                    let plaintext_len = s.len();
-                    let plaintext = s.clone();
-                    let encrypted_hex = encrypt_ecies_hex(plaintext.as_bytes(), &model_pubkey)?;
-                    trace!(
-                        "Near.AI E2EE: encrypted messages[{}] role={} plaintext_len={} ciphertext_hex_len={}",
-                        i, role, plaintext_len, encrypted_hex.len()
-                    );
-                    *content_val = Value::String(encrypted_hex);
-                    encrypted_count += 1;
-                } else {
-                    skipped_count += 1;
-                }
+                let plaintext_len = s.len();
+                let plaintext = s.clone();
+                let encrypted_hex = encrypt_ecies_hex(plaintext.as_bytes(), &model_pubkey)?;
+                trace!(
+                    "Near.AI E2EE: encrypted messages[{}] role={} plaintext_len={} ciphertext_hex_len={}",
+                    i,
+                    role,
+                    plaintext_len,
+                    encrypted_hex.len()
+                );
+                *content_val = Value::String(encrypted_hex);
+                encrypted_count += 1;
             }
             Value::Null => {
                 skipped_count += 1;
@@ -381,7 +380,9 @@ mod tests {
 
         // Genuinely multimodal content stays as array (can't flatten)
         assert_eq!(body["messages"][1]["content"], multimodal);
-        assert_eq!(body["messages"][2]["content"], "");
+        let c2 = body["messages"][2]["content"].as_str().unwrap();
+        assert_ne!(c2, "");
+        assert!(looks_like_hex_ciphertext(c2));
 
         assert_eq!(crypto.client_public_key_hex.len(), 128);
         assert!(crypto

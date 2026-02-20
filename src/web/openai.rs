@@ -849,6 +849,7 @@ pub async fn get_chat_completion_response(
         let mut body_stream = res.into_body().into_stream();
         let mut buffer = String::new();
         let mut usage_sent = false; // Track if we've already published usage for this stream
+        let mut stream_finished = false; // Track if we've seen finish_reason in ANY prior chunk
 
         loop {
             match timeout(
@@ -902,14 +903,18 @@ pub async fn get_chat_completion_response(
                                             }
                                         }
 
-                                        // ✅ Extract and publish billing HERE - but ONLY on final chunk
-                                        // This prevents sending usage data on intermediate chunks that vLLM now includes
-                                        let has_finish = has_finish_reason(&json);
+                                        // Track whether the stream has reached a finish_reason
+                                        // Some providers (e.g. Near.AI) send finish_reason and usage
+                                        // on separate chunks, while others (e.g. Tinfoil/vLLM) combine them.
+                                        if has_finish_reason(&json) {
+                                            stream_finished = true;
+                                        }
 
                                         if let Some(usage) = extract_usage(&json) {
-                                            // Only publish usage on final chunk (has finish_reason) with actual completion tokens
-                                            // Also ensure we only send usage once per stream
-                                            if has_finish
+                                            // Publish usage only after stream has finished (finish_reason seen
+                                            // on this or a prior chunk), with actual completion tokens,
+                                            // and only once per stream.
+                                            if stream_finished
                                                 && usage.completion_tokens > 0
                                                 && !usage_sent
                                             {
@@ -933,8 +938,8 @@ pub async fn get_chat_completion_response(
                                                 }
                                             } else {
                                                 trace!(
-                                                    "Skipping usage publish: has_finish={}, completion_tokens={}, usage_sent={}",
-                                                    has_finish, usage.completion_tokens, usage_sent
+                                                    "Skipping usage publish: stream_finished={}, completion_tokens={}, usage_sent={}",
+                                                    stream_finished, usage.completion_tokens, usage_sent
                                                 );
                                             }
                                         }

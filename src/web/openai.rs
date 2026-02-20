@@ -63,6 +63,10 @@ async fn prepare_chat_request_for_provider(
             .ok_or(ApiError::BadRequest)?
             .to_string();
 
+        trace!(
+            "Near.AI E2EE: fetching verified node for model={}",
+            model
+        );
         let node = state
             .nearai_verifier
             .get_verified_model_node(&model)
@@ -72,10 +76,22 @@ async fn prepare_chat_request_for_provider(
                 ApiError::ServiceUnavailable
             })?;
 
+        trace!(
+            "Near.AI E2EE: using model node pubkey={}... (len={})",
+            &node.signing_public_key[..node.signing_public_key.len().min(16)],
+            node.signing_public_key.len()
+        );
+
         let crypto = prepare_e2ee_request(&mut body, &node.signing_public_key).map_err(|e| {
             error!("Near.AI request encryption failed (model={}): {}", model, e);
             ApiError::ServiceUnavailable
         })?;
+
+        trace!(
+            "Near.AI E2EE: client ephemeral pubkey={}... (len={})",
+            &crypto.client_public_key_hex[..crypto.client_public_key_hex.len().min(16)],
+            crypto.client_public_key_hex.len()
+        );
 
         extra_headers.push((
             HeaderName::from_static("x-signing-algo"),
@@ -1894,8 +1910,21 @@ async fn try_provider(
 
     // Add provider-specific headers
     for (name, val) in extra_headers {
+        trace!(
+            "provider={} extra header: {}={}",
+            proxy_config.provider_name,
+            name,
+            val.to_str().unwrap_or("<non-ascii>")
+        );
         req = req.header(name.clone(), val.clone());
     }
+
+    trace!(
+        "Sending to provider={} url={}/v1/chat/completions body_len={}",
+        proxy_config.provider_name,
+        proxy_config.base_url,
+        body_json.len()
+    );
 
     let req = req
         .body(HyperBody::from(body_json.to_string()))

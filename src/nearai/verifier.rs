@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::{debug, info, trace, warn};
 
 const VERIFICATION_TTL: Duration = Duration::from_secs(10 * 60);
 const PERIODIC_REVERIFY_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -112,17 +112,33 @@ impl NearAiVerifier {
 
         // Fast path: fresh cached model.
         if let Some(node) = self.try_get_fresh_cached_node(model).await {
+            trace!(
+                "Near.AI verifier: cache hit for model={}, node_pubkey={}...",
+                model,
+                &node.signing_public_key[..node.signing_public_key.len().min(16)]
+            );
             return Ok(node);
         }
+
+        debug!(
+            "Near.AI verifier: cache miss for model={}, acquiring verify lock",
+            model
+        );
 
         // Slow path: ensure only one verification runs at a time.
         let _guard = self.verify_lock.lock().await;
 
         // Re-check after acquiring lock.
         if let Some(node) = self.try_get_fresh_cached_node(model).await {
+            trace!(
+                "Near.AI verifier: cache hit after lock for model={}, node_pubkey={}...",
+                model,
+                &node.signing_public_key[..node.signing_public_key.len().min(16)]
+            );
             return Ok(node);
         }
 
+        info!("Near.AI verifier: verifying model={}", model);
         self.verify_and_cache_model(model).await?;
 
         self.try_get_fresh_cached_node(model).await.ok_or_else(|| {
@@ -133,16 +149,38 @@ impl NearAiVerifier {
     async fn try_get_fresh_cached_node(&self, model: &str) -> Option<VerifiedModelNode> {
         let cache = self.cache.read().await;
         let verified = cache.get(model)?;
-        if verified.verified_at.elapsed() > VERIFICATION_TTL {
+        let age = verified.verified_at.elapsed();
+        if age > VERIFICATION_TTL {
+            trace!(
+                "Near.AI verifier: cached model={} is stale (age={:.0}s, ttl={:.0}s)",
+                model,
+                age.as_secs_f64(),
+                VERIFICATION_TTL.as_secs_f64()
+            );
             return None;
         }
 
         if verified.nodes.is_empty() {
+            trace!("Near.AI verifier: cached model={} has no nodes", model);
             return None;
         }
 
         let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % verified.nodes.len();
+        let node = &verified.nodes[idx];
+        trace!(
+            "Near.AI verifier: selecting node {}/{} for model={}, pubkey={}..., cache_age={:.0}s",
+            idx + 1,
+            verified.nodes.len(),
+            model,
+            &node.signing_public_key[..node.signing_public_key.len().min(16)],
+            age.as_secs_f64()
+        );
         Some(verified.nodes[idx].clone())
+    }
+
+    pub async fn invalidate_model(&self, model: &str) {
+        let mut cache = self.cache.write().await;
+        cache.remove(model);
     }
 
     async fn verify_and_cache_model(&self, model: &str) -> Result<(), NearAiError> {
@@ -204,6 +242,19 @@ impl NearAiVerifier {
                 msg.push_str(&format!(", last_error={e}"));
             }
             return Err(NearAiError::Attestation(msg));
+        }
+
+        info!(
+            "Near.AI verifier: model={} verified, {} nodes (total_attestations={}, ok_missing_pubkey={})",
+            model, nodes.len(), total_nodes, ok_missing_pubkey
+        );
+        for (i, node) in nodes.iter().enumerate() {
+            debug!(
+                "Near.AI verifier: model={} node[{}] pubkey={}...",
+                model,
+                i,
+                &node.signing_public_key[..node.signing_public_key.len().min(16)]
+            );
         }
 
         Ok(VerifiedModel {
@@ -560,5 +611,372 @@ mod tests {
                 || !reasoning_content.trim().is_empty()
                 || !reasoning.trim().is_empty()
         );
+    }
+
+    /// Test that replicates the exact app flow: serde_json::to_string serialization,
+    /// pre-serialized body (like hyper does), extra headers appended the same way try_provider does.
+    #[tokio::test]
+    #[ignore]
+    async fn live_nearai_chat_completion_hyper_flow() {
+        let api_key = match std::env::var("NEAR_API_KEY") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => {
+                eprintln!("NEAR_API_KEY not set; skipping");
+                return;
+            }
+        };
+
+        let base_url = std::env::var("NEARAI_API_BASE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "https://cloud-api.near.ai".to_string());
+
+        let v = NearAiVerifier::new(base_url.clone(), Some(api_key.clone()));
+        let node = v
+            .get_verified_model_node("zai-org/GLM-5-FP8")
+            .await
+            .expect("attestation verification should succeed");
+
+        // Build body exactly how the app does: start with user body, replace model name,
+        // add stream_options
+        let mut body_map = serde_json::Map::new();
+        body_map.insert("model".to_string(), json!("zai-org/GLM-5-FP8"));
+        body_map.insert(
+            "messages".to_string(),
+            json!([{"role": "user", "content": "ping"}]),
+        );
+        body_map.insert("max_tokens".to_string(), json!(16));
+        body_map.insert("temperature".to_string(), json!(0.0));
+        body_map.insert("stream".to_string(), json!(false));
+        // App adds stream_options when streaming or tinfoil
+        body_map.insert(
+            "stream_options".to_string(),
+            json!({"include_usage": true}),
+        );
+
+        let mut body_value = serde_json::Value::Object(body_map);
+
+        let crypto = prepare_e2ee_request(&mut body_value, &node.signing_public_key)
+            .expect("request encryption should succeed");
+
+        // App uses serde_json::to_string, NOT reqwest .json()
+        let body_json = serde_json::to_string(&body_value).unwrap();
+
+        eprintln!("body_json len={}", body_json.len());
+        eprintln!("body_json={}", body_json);
+        eprintln!("x-model-pub-key={}", node.signing_public_key);
+        eprintln!("x-client-pub-key={}", crypto.client_public_key_hex);
+
+        // Use reqwest but send pre-serialized body (like hyper does)
+        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let res = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("x-signing-algo", "ecdsa")
+            .header("x-client-pub-key", &crypto.client_public_key_hex)
+            .header("x-model-pub-key", &node.signing_public_key)
+            .body(body_json.clone())
+            .send()
+            .await
+            .expect("request should send");
+
+        let status = res.status();
+        let resp_text = res.text().await.unwrap();
+        eprintln!("status={} body={}", status, resp_text);
+
+        assert!(
+            status.is_success(),
+            "status={} body={}",
+            status,
+            resp_text
+        );
+
+        let mut resp: serde_json::Value =
+            serde_json::from_str(&resp_text).expect("response should be JSON");
+        decrypt_chat_completion_json_in_place(&mut resp, &crypto)
+            .expect("response should decrypt");
+
+        let content = resp["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+        let reasoning_content = resp["choices"][0]["message"]["reasoning_content"]
+            .as_str()
+            .unwrap_or("");
+        let reasoning = resp["choices"][0]["message"]["reasoning"]
+            .as_str()
+            .unwrap_or("");
+
+        assert!(
+            !content.trim().is_empty()
+                || !reasoning_content.trim().is_empty()
+                || !reasoning.trim().is_empty(),
+            "decrypted response should have some text"
+        );
+    }
+
+    /// Test with streaming=true (how the responses API actually calls it)
+    #[tokio::test]
+    #[ignore]
+    async fn live_nearai_chat_completion_streaming() {
+        let api_key = match std::env::var("NEAR_API_KEY") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => {
+                eprintln!("NEAR_API_KEY not set; skipping");
+                return;
+            }
+        };
+
+        let base_url = std::env::var("NEARAI_API_BASE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "https://cloud-api.near.ai".to_string());
+
+        let v = NearAiVerifier::new(base_url.clone(), Some(api_key.clone()));
+        let node = v
+            .get_verified_model_node("zai-org/GLM-5-FP8")
+            .await
+            .expect("attestation verification should succeed");
+
+        let mut body_map = serde_json::Map::new();
+        body_map.insert("model".to_string(), json!("zai-org/GLM-5-FP8"));
+        body_map.insert(
+            "messages".to_string(),
+            json!([{"role": "user", "content": "Say hello"}]),
+        );
+        body_map.insert("max_tokens".to_string(), json!(32));
+        body_map.insert("temperature".to_string(), json!(0.0));
+        body_map.insert("stream".to_string(), json!(true));
+        body_map.insert(
+            "stream_options".to_string(),
+            json!({"include_usage": true}),
+        );
+
+        let mut body_value = serde_json::Value::Object(body_map);
+
+        let crypto = prepare_e2ee_request(&mut body_value, &node.signing_public_key)
+            .expect("request encryption should succeed");
+
+        let body_json = serde_json::to_string(&body_value).unwrap();
+        eprintln!("streaming body_json len={}", body_json.len());
+
+        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let res = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("x-signing-algo", "ecdsa")
+            .header("x-client-pub-key", &crypto.client_public_key_hex)
+            .header("x-model-pub-key", &node.signing_public_key)
+            .body(body_json)
+            .send()
+            .await
+            .expect("request should send");
+
+        let status = res.status();
+        let resp_text = res.text().await.unwrap();
+        eprintln!("streaming status={}", status);
+
+        if !status.is_success() {
+            eprintln!("streaming response body={}", resp_text);
+            panic!("streaming request failed: status={} body={}", status, resp_text);
+        }
+
+        // Parse SSE chunks
+        let mut got_content = false;
+        for line in resp_text.lines() {
+            if !line.starts_with("data: ") {
+                continue;
+            }
+            let data = &line["data: ".len()..];
+            if data == "[DONE]" {
+                break;
+            }
+            let mut chunk: serde_json::Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("failed to parse SSE chunk: {} -- data: {}", e, data);
+                    continue;
+                }
+            };
+
+            if let Err(e) = decrypt_chat_completion_json_in_place(&mut chunk, &crypto) {
+                eprintln!("failed to decrypt SSE chunk: {} -- data: {}", e, data);
+                panic!("stream chunk decryption failed");
+            }
+
+            let delta = &chunk["choices"][0]["delta"];
+            let delta_content = delta.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let delta_reasoning = delta
+                .get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let delta_reasoning2 = delta
+                .get("reasoning")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !delta_content.is_empty()
+                || !delta_reasoning.is_empty()
+                || !delta_reasoning2.is_empty()
+            {
+                got_content = true;
+            }
+        }
+
+        assert!(got_content, "streaming response should have produced some decrypted content");
+    }
+
+    /// Test with multi-turn conversation (system + user messages, like the app sends)
+    #[tokio::test]
+    #[ignore]
+    async fn live_nearai_chat_completion_multi_turn() {
+        let api_key = match std::env::var("NEAR_API_KEY") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => {
+                eprintln!("NEAR_API_KEY not set; skipping");
+                return;
+            }
+        };
+
+        let base_url = std::env::var("NEARAI_API_BASE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "https://cloud-api.near.ai".to_string());
+
+        let v = NearAiVerifier::new(base_url.clone(), Some(api_key.clone()));
+        let node = v
+            .get_verified_model_node("zai-org/GLM-5-FP8")
+            .await
+            .expect("attestation verification should succeed");
+
+        let mut body = json!({
+            "model": "zai-org/GLM-5-FP8",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "What is 2+2?"},
+                {"role": "assistant", "content": "4"},
+                {"role": "user", "content": "And 3+3?"}
+            ],
+            "max_tokens": 32,
+            "temperature": 0.0,
+            "stream": false,
+            "stream_options": {"include_usage": true}
+        });
+
+        let crypto = prepare_e2ee_request(&mut body, &node.signing_public_key)
+            .expect("request encryption should succeed");
+
+        let body_json = serde_json::to_string(&body).unwrap();
+        eprintln!("multi-turn body_json len={}", body_json.len());
+
+        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let res = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("x-signing-algo", "ecdsa")
+            .header("x-client-pub-key", &crypto.client_public_key_hex)
+            .header("x-model-pub-key", &node.signing_public_key)
+            .body(body_json)
+            .send()
+            .await
+            .expect("request should send");
+
+        let status = res.status();
+        let resp_text = res.text().await.unwrap();
+        eprintln!("multi-turn status={} body={}", status, resp_text);
+
+        assert!(
+            status.is_success(),
+            "multi-turn failed: status={} body={}",
+            status,
+            resp_text
+        );
+
+        let mut resp: serde_json::Value = serde_json::from_str(&resp_text).unwrap();
+        decrypt_chat_completion_json_in_place(&mut resp, &crypto)
+            .expect("multi-turn response should decrypt");
+    }
+
+    /// Repeated requests to catch intermittent failures
+    #[tokio::test]
+    #[ignore]
+    async fn live_nearai_chat_completion_repeated() {
+        let api_key = match std::env::var("NEAR_API_KEY") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => {
+                eprintln!("NEAR_API_KEY not set; skipping");
+                return;
+            }
+        };
+
+        let base_url = std::env::var("NEARAI_API_BASE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "https://cloud-api.near.ai".to_string());
+
+        let v = NearAiVerifier::new(base_url.clone(), Some(api_key.clone()));
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+
+        for i in 0..10 {
+            // Re-fetch verified node each iteration (like the app would on separate requests)
+            let node = v
+                .get_verified_model_node("zai-org/GLM-5-FP8")
+                .await
+                .expect("attestation verification should succeed");
+
+            let mut body = json!({
+                "model": "zai-org/GLM-5-FP8",
+                "messages": [{"role": "user", "content": format!("Say the number {}", i)}],
+                "max_tokens": 16,
+                "temperature": 0.0,
+                "stream": false,
+                "stream_options": {"include_usage": true}
+            });
+
+            let crypto = prepare_e2ee_request(&mut body, &node.signing_public_key)
+                .expect("request encryption should succeed");
+
+            let body_json = serde_json::to_string(&body).unwrap();
+
+            let res = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("x-signing-algo", "ecdsa")
+                .header("x-client-pub-key", &crypto.client_public_key_hex)
+                .header("x-model-pub-key", &node.signing_public_key)
+                .body(body_json)
+                .send()
+                .await
+                .expect("request should send");
+
+            let status = res.status();
+            let resp_text = res.text().await.unwrap();
+            eprintln!(
+                "iteration {} status={} node_pubkey={}... body_preview={}",
+                i,
+                status,
+                &node.signing_public_key[..16],
+                &resp_text[..resp_text.len().min(120)]
+            );
+
+            assert!(
+                status.is_success(),
+                "iteration {} failed: status={} body={}",
+                i,
+                status,
+                resp_text
+            );
+
+            let mut resp: serde_json::Value = serde_json::from_str(&resp_text).unwrap();
+            decrypt_chat_completion_json_in_place(&mut resp, &crypto)
+                .expect("response should decrypt");
+        }
     }
 }

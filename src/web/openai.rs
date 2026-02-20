@@ -546,9 +546,16 @@ pub async fn get_chat_completion_response(
             primary_body.insert("stream_options".to_string(), json!({"include_usage": true}));
         }
 
-        let primary_prepared =
-            prepare_chat_request_for_provider(state, &route.primary, Value::Object(primary_body))
-                .await?;
+        let primary_provider_is_near = route.primary.provider_name.to_lowercase() == "nearai";
+        let primary_body_value = Value::Object(primary_body);
+        let primary_prepared_static = if primary_provider_is_near {
+            None
+        } else {
+            Some(
+                prepare_chat_request_for_provider(state, &route.primary, primary_body_value.clone())
+                    .await?,
+            )
+        };
 
         // Prepare fallback request if available
         let fallback_request = if let Some(fallback) = route.fallbacks.first() {
@@ -562,10 +569,23 @@ pub async fn get_chat_completion_response(
                 fallback_body.insert("stream_options".to_string(), json!({"include_usage": true}));
             }
 
-            let prepared =
-                prepare_chat_request_for_provider(state, fallback, Value::Object(fallback_body))
-                    .await?;
-            Some((fallback, prepared))
+            let fallback_provider_is_near = fallback.provider_name.to_lowercase() == "nearai";
+            let fallback_body_value = Value::Object(fallback_body);
+            let fallback_prepared_static = if fallback_provider_is_near {
+                None
+            } else {
+                Some(
+                    prepare_chat_request_for_provider(state, fallback, fallback_body_value.clone())
+                        .await?,
+                )
+            };
+
+            Some((
+                fallback,
+                fallback_provider_is_near,
+                fallback_body_value,
+                fallback_prepared_static,
+            ))
         } else {
             None
         };
@@ -590,72 +610,139 @@ pub async fn get_chat_completion_response(
                 cycle + 1,
                 route.primary.provider_name
             );
-            match try_provider(
-                &client,
-                &route.primary,
-                &primary_prepared.body_json,
-                headers,
-                &primary_prepared.extra_headers,
-            )
-            .await
-            {
-                Ok(response) => {
-                    info!(
-                        "Successfully got response from primary provider {} on cycle {}",
-                        route.primary.provider_name,
-                        cycle + 1
-                    );
-                    found_response = Some(response);
-                    successful_provider_name = route.primary.provider_name.clone();
-                    successful_near_crypto = primary_prepared.near_crypto.clone();
-                    break;
+            let primary_prepared = if primary_provider_is_near {
+                match prepare_chat_request_for_provider(
+                    state,
+                    &route.primary,
+                    primary_body_value.clone(),
+                )
+                .await
+                {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        error!(
+                            "Cycle {}: Failed to prepare request for primary provider {}: {}",
+                            cycle + 1,
+                            route.primary.provider_name,
+                            e
+                        );
+                        last_error = Some(e.to_string());
+                        None
+                    }
                 }
-                Err(err) => {
-                    error!(
-                        "Cycle {}: Primary provider {} failed: {:?}",
-                        cycle + 1,
-                        route.primary.provider_name,
-                        err
-                    );
-                    last_error = Some(err);
-                }
-            }
+            } else {
+                Some(
+                    primary_prepared_static
+                        .clone()
+                        .expect("non-Near.AI primary provider must be pre-prepared"),
+                )
+            };
 
-            // Try fallback if available
-            if let Some((fallback_provider, fallback_prepared)) = &fallback_request {
-                debug!(
-                    "Cycle {}: Trying fallback provider {}",
-                    cycle + 1,
-                    fallback_provider.provider_name
-                );
+            if let Some(primary_prepared) = primary_prepared {
                 match try_provider(
                     &client,
-                    fallback_provider,
-                    &fallback_prepared.body_json,
+                    &route.primary,
+                    &primary_prepared.body_json,
                     headers,
-                    &fallback_prepared.extra_headers,
+                    &primary_prepared.extra_headers,
                 )
                 .await
                 {
                     Ok(response) => {
                         info!(
-                            "Successfully got response from fallback provider {} on cycle {}",
-                            fallback_provider.provider_name,
+                            "Successfully got response from primary provider {} on cycle {}",
+                            route.primary.provider_name,
                             cycle + 1
                         );
                         found_response = Some(response);
-                        successful_provider_name = fallback_provider.provider_name.clone();
-                        successful_near_crypto = fallback_prepared.near_crypto.clone();
+                        successful_provider_name = route.primary.provider_name.clone();
+                        successful_near_crypto = primary_prepared.near_crypto.clone();
                         break;
                     }
                     Err(err) => {
                         error!(
-                            "Cycle {}: Fallback provider {} failed: {:?}",
+                            "Cycle {}: Primary provider {} failed: {:?}",
                             cycle + 1,
-                            fallback_provider.provider_name,
+                            route.primary.provider_name,
                             err
                         );
                         last_error = Some(err);
+                    }
+                }
+            }
+
+            // Try fallback if available
+            if let Some((
+                fallback_provider,
+                fallback_provider_is_near,
+                fallback_body_value,
+                fallback_prepared_static,
+            )) = &fallback_request
+            {
+                debug!(
+                    "Cycle {}: Trying fallback provider {}",
+                    cycle + 1,
+                    fallback_provider.provider_name
+                );
+
+                let fallback_prepared = if *fallback_provider_is_near {
+                    match prepare_chat_request_for_provider(
+                        state,
+                        fallback_provider,
+                        fallback_body_value.clone(),
+                    )
+                    .await
+                    {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            error!(
+                                "Cycle {}: Failed to prepare request for fallback provider {}: {}",
+                                cycle + 1,
+                                fallback_provider.provider_name,
+                                e
+                            );
+                            last_error = Some(e.to_string());
+                            None
+                        }
+                    }
+                } else {
+                    Some(
+                        fallback_prepared_static
+                            .clone()
+                            .expect("non-Near.AI fallback provider must be pre-prepared"),
+                    )
+                };
+
+                if let Some(fallback_prepared) = fallback_prepared {
+                    match try_provider(
+                        &client,
+                        fallback_provider,
+                        &fallback_prepared.body_json,
+                        headers,
+                        &fallback_prepared.extra_headers,
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            info!(
+                                "Successfully got response from fallback provider {} on cycle {}",
+                                fallback_provider.provider_name,
+                                cycle + 1
+                            );
+                            found_response = Some(response);
+                            successful_provider_name = fallback_provider.provider_name.clone();
+                            successful_near_crypto = fallback_prepared.near_crypto.clone();
+                            break;
+                        }
+                        Err(err) => {
+                            error!(
+                                "Cycle {}: Fallback provider {} failed: {:?}",
+                                cycle + 1,
+                                fallback_provider.provider_name,
+                                err
+                            );
+                            last_error = Some(err);
+                        }
                     }
                 }
             }
@@ -1504,7 +1591,8 @@ async fn send_transcription_request(
     form_data.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
 
     // Build request
-    let endpoint = format!("{}/v1/audio/transcriptions", provider.base_url);
+    let base_url = normalize_provider_base_url(&provider.base_url);
+    let endpoint = format!("{}/v1/audio/transcriptions", base_url);
     let mut req = Request::builder().method("POST").uri(&endpoint).header(
         "Content-Type",
         format!("multipart/form-data; boundary={}", boundary),
@@ -1646,7 +1734,10 @@ async fn proxy_tts(
     // Build request
     let req = Request::builder()
         .method("POST")
-        .uri(format!("{}/v1/audio/speech", proxy_config.base_url))
+        .uri(format!(
+            "{}/v1/audio/speech",
+            normalize_provider_base_url(&proxy_config.base_url)
+        ))
         .header("Content-Type", "application/json")
         .body(HyperBody::from(
             serde_json::to_string(&tts_api_request).map_err(|e| {
@@ -1780,7 +1871,10 @@ async fn proxy_embeddings(
     })?;
 
     // Build request to provider
-    let endpoint = format!("{}/v1/embeddings", route.primary.base_url);
+    let endpoint = format!(
+        "{}/v1/embeddings",
+        normalize_provider_base_url(&route.primary.base_url)
+    );
     let mut req = Request::builder()
         .method("POST")
         .uri(&endpoint)
@@ -1880,10 +1974,13 @@ async fn try_provider(
 ) -> Result<hyper::Response<HyperBody>, String> {
     debug!("Making request to {}", proxy_config.provider_name);
 
+    let base_url = normalize_provider_base_url(&proxy_config.base_url);
+    let url = format!("{}/v1/chat/completions", base_url);
+
     // Build request
     let mut req = Request::builder()
         .method("POST")
-        .uri(format!("{}/v1/chat/completions", proxy_config.base_url))
+        .uri(url.clone())
         .header("Content-Type", "application/json");
 
     if let Some(api_key) = &proxy_config.api_key {
@@ -1920,9 +2017,9 @@ async fn try_provider(
     }
 
     trace!(
-        "Sending to provider={} url={}/v1/chat/completions body_len={}",
+        "Sending to provider={} url={} body_len={}",
         proxy_config.provider_name,
-        proxy_config.base_url,
+        url,
         body_json.len()
     );
 
@@ -1984,4 +2081,10 @@ async fn try_provider(
             ))
         }
     }
+}
+
+fn normalize_provider_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    trimmed.to_string()
 }

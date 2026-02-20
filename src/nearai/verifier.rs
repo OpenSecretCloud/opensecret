@@ -7,15 +7,16 @@ use crate::nearai::models::{AttestationBaseInfo, AttestationReport};
 use crate::nearai::nras::{fetch_jwks, verify_gpu_attestation, NrasJwks, NRAS_JWKS_URL};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const VERIFICATION_TTL: Duration = Duration::from_secs(10 * 60);
 const PERIODIC_REVERIFY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const JWKS_TTL: Duration = Duration::from_secs(60 * 60);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct VerifiedModelNode {
@@ -41,13 +42,17 @@ pub struct NearAiVerifier {
     cache: RwLock<HashMap<String, VerifiedModel>>,
     verify_lock: Mutex<()>,
     jwks_cache: RwLock<Option<CachedJwks>>,
-    rr_counter: AtomicUsize,
 }
 
 impl NearAiVerifier {
     pub fn new(base_url: String, api_key: Option<String>) -> Self {
+        let base_url = normalize_base_url(&base_url);
         let http = reqwest::Client::builder()
+            .timeout(HTTP_REQUEST_TIMEOUT)
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
             .pool_idle_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(100)
+            .user_agent("opensecret/nearai-verifier")
             .build()
             .expect("reqwest client should build");
 
@@ -58,7 +63,6 @@ impl NearAiVerifier {
             cache: RwLock::new(HashMap::new()),
             verify_lock: Mutex::new(()),
             jwks_cache: RwLock::new(None),
-            rr_counter: AtomicUsize::new(0),
         }
     }
 
@@ -74,28 +78,78 @@ impl NearAiVerifier {
 
         tokio::spawn(async move {
             info!("Near.AI preflight verification starting");
+
+            let mut last_state: HashMap<String, bool> = HashMap::new();
+
             for model in &models {
-                if let Err(e) = self.verify_and_cache_model(model).await {
-                    warn!(
-                        "Near.AI preflight verification failed for model {}: {}",
-                        model, e
-                    );
-                } else {
-                    info!(
-                        "Near.AI preflight verification succeeded for model {}",
-                        model
-                    );
+                match self.verify_and_cache_model(model).await {
+                    Ok(_) => {
+                        debug!(
+                            "Near.AI preflight verification succeeded for model {}",
+                            model
+                        );
+
+                        let prev = last_state.insert(model.clone(), true);
+                        if prev != Some(true) {
+                            info!(
+                                "Near.AI verification state changed for model {}: {} -> verified",
+                                model,
+                                prev.map(|v| if v { "verified" } else { "failed" })
+                                    .unwrap_or("unknown")
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "Near.AI preflight verification failed for model {}: {}",
+                            model, e
+                        );
+
+                        let prev = last_state.insert(model.clone(), false);
+                        if prev != Some(false) {
+                            info!(
+                                "Near.AI verification state changed for model {}: {} -> failed",
+                                model,
+                                prev.map(|v| if v { "verified" } else { "failed" })
+                                    .unwrap_or("unknown")
+                            );
+                        }
+                    }
                 }
             }
 
             loop {
                 tokio::time::sleep(PERIODIC_REVERIFY_INTERVAL).await;
                 for model in &models {
-                    if let Err(e) = self.verify_and_cache_model(model).await {
-                        warn!(
-                            "Near.AI periodic re-verification failed for model {}: {}",
-                            model, e
-                        );
+                    match self.verify_and_cache_model(model).await {
+                        Ok(_) => {
+                            debug!(
+                                "Near.AI periodic re-verification succeeded for model {}",
+                                model
+                            );
+
+                            let prev = last_state.insert(model.clone(), true);
+                            if prev == Some(false) {
+                                info!(
+                                    "Near.AI verification state changed for model {}: failed -> verified",
+                                    model
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "Near.AI periodic re-verification failed for model {}: {}",
+                                model, e
+                            );
+
+                            let prev = last_state.insert(model.clone(), false);
+                            if prev == Some(true) {
+                                info!(
+                                    "Near.AI verification state changed for model {}: verified -> failed",
+                                    model
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -165,7 +219,7 @@ impl NearAiVerifier {
             return None;
         }
 
-        let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) % verified.nodes.len();
+        let idx = random_node_index(verified.nodes.len());
         let node = &verified.nodes[idx];
         trace!(
             "Near.AI verifier: selecting node {}/{} for model={}, pubkey={}..., cache_age={:.0}s",
@@ -178,6 +232,7 @@ impl NearAiVerifier {
         Some(verified.nodes[idx].clone())
     }
 
+    #[allow(dead_code)]
     pub async fn invalidate_model(&self, model: &str) {
         let mut cache = self.cache.write().await;
         cache.remove(model);
@@ -244,7 +299,7 @@ impl NearAiVerifier {
             return Err(NearAiError::Attestation(msg));
         }
 
-        info!(
+        debug!(
             "Near.AI verifier: model={} verified, {} nodes (total_attestations={}, ok_missing_pubkey={})",
             model, nodes.len(), total_nodes, ok_missing_pubkey
         );
@@ -395,6 +450,26 @@ fn generate_nonce_bytes() -> Result<[u8; 32], NearAiError> {
     Ok(nonce)
 }
 
+fn normalize_base_url(input: &str) -> String {
+    let trimmed = input.trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    trimmed.to_string()
+}
+
+fn random_node_index(len: usize) -> usize {
+    if len <= 1 {
+        return 0;
+    }
+
+    let mut bytes = [0u8; 8];
+    if getrandom::getrandom(&mut bytes).is_ok() {
+        (u64::from_le_bytes(bytes) as usize) % len
+    } else {
+        // If randomness is unavailable, fall back to the first verified node.
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,7 +490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cached_node_round_robins_when_fresh() {
+    async fn test_cached_node_selects_from_verified_nodes() {
         let v = NearAiVerifier::new(
             "https://cloud-api.near.ai".to_string(),
             Some("test".to_string()),
@@ -447,7 +522,16 @@ mod tests {
             .get_verified_model_node("zai-org/GLM-5-FP8")
             .await
             .unwrap();
-        assert_ne!(n1.signing_public_key, n2.signing_public_key);
+        assert!(
+            n1.signing_public_key == "pk1" || n1.signing_public_key == "pk2",
+            "unexpected node pubkey: {}",
+            n1.signing_public_key
+        );
+        assert!(
+            n2.signing_public_key == "pk1" || n2.signing_public_key == "pk2",
+            "unexpected node pubkey: {}",
+            n2.signing_public_key
+        );
     }
 
     #[tokio::test]
@@ -649,10 +733,7 @@ mod tests {
         body_map.insert("temperature".to_string(), json!(0.0));
         body_map.insert("stream".to_string(), json!(false));
         // App adds stream_options when streaming or tinfoil
-        body_map.insert(
-            "stream_options".to_string(),
-            json!({"include_usage": true}),
-        );
+        body_map.insert("stream_options".to_string(), json!({"include_usage": true}));
 
         let mut body_value = serde_json::Value::Object(body_map);
 
@@ -686,17 +767,11 @@ mod tests {
         let resp_text = res.text().await.unwrap();
         eprintln!("status={} body={}", status, resp_text);
 
-        assert!(
-            status.is_success(),
-            "status={} body={}",
-            status,
-            resp_text
-        );
+        assert!(status.is_success(), "status={} body={}", status, resp_text);
 
         let mut resp: serde_json::Value =
             serde_json::from_str(&resp_text).expect("response should be JSON");
-        decrypt_chat_completion_json_in_place(&mut resp, &crypto)
-            .expect("response should decrypt");
+        decrypt_chat_completion_json_in_place(&mut resp, &crypto).expect("response should decrypt");
 
         let content = resp["choices"][0]["message"]["content"]
             .as_str()
@@ -748,10 +823,7 @@ mod tests {
         body_map.insert("max_tokens".to_string(), json!(32));
         body_map.insert("temperature".to_string(), json!(0.0));
         body_map.insert("stream".to_string(), json!(true));
-        body_map.insert(
-            "stream_options".to_string(),
-            json!({"include_usage": true}),
-        );
+        body_map.insert("stream_options".to_string(), json!({"include_usage": true}));
 
         let mut body_value = serde_json::Value::Object(body_map);
 
@@ -781,7 +853,10 @@ mod tests {
 
         if !status.is_success() {
             eprintln!("streaming response body={}", resp_text);
-            panic!("streaming request failed: status={} body={}", status, resp_text);
+            panic!(
+                "streaming request failed: status={} body={}",
+                status, resp_text
+            );
         }
 
         // Parse SSE chunks
@@ -825,7 +900,10 @@ mod tests {
             }
         }
 
-        assert!(got_content, "streaming response should have produced some decrypted content");
+        assert!(
+            got_content,
+            "streaming response should have produced some decrypted content"
+        );
     }
 
     /// Test with multi-turn conversation (system + user messages, like the app sends)

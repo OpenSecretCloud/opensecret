@@ -21,7 +21,7 @@ pub async fn verify_tdx_quote(intel_quote_hex: &str) -> Result<VerifiedTdxQuote,
 
     let collateral = get_collateral(INTEL_PCCS_URL, &quote_bytes)
         .await
-        .map_err(|e| NearAiError::Tdx(e.to_string()))?;
+        .map_err(|e| NearAiError::Tdx(format!("{e:#}")))?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

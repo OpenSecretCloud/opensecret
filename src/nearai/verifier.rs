@@ -416,7 +416,7 @@ impl NearAiVerifier {
             )));
         }
 
-        let quote = verify_tdx_quote(&att.intel_quote).await?;
+        let quote = retry_verify_tdx_quote(&att.intel_quote).await?;
         verify_report_data_binding(&quote.report_data, &att.signing_address, nonce_bytes)?;
         verify_compose_manifest(&quote.mr_config_id, &att.info)?;
 
@@ -428,12 +428,13 @@ impl NearAiVerifier {
             let payload_json: Value = serde_json::from_str(payload_str)?;
             let jwks = self.get_or_fetch_jwks().await?;
             if let Err(e) =
-                verify_gpu_attestation(&self.http, &jwks, &payload_json, nonce_hex).await
+                retry_verify_gpu_attestation(&self.http, &jwks, &payload_json, nonce_hex).await
             {
                 match e {
                     NearAiError::JwtKidNotFound(_) => {
                         let jwks = self.refresh_jwks().await?;
-                        verify_gpu_attestation(&self.http, &jwks, &payload_json, nonce_hex).await?;
+                        retry_verify_gpu_attestation(&self.http, &jwks, &payload_json, nonce_hex)
+                            .await?;
                     }
                     _ => return Err(e),
                 }
@@ -484,6 +485,67 @@ impl NearAiVerifier {
         });
         Ok(jwks)
     }
+}
+
+fn is_retryable_error(e: &NearAiError) -> bool {
+    match e {
+        NearAiError::Http(re) => re.is_timeout() || re.is_connect(),
+        NearAiError::Tdx(msg) | NearAiError::Nras(msg) => {
+            let m = msg.to_lowercase();
+            m.contains("timeout")
+                || m.contains("connect")
+                || m.contains("error sending request")
+                || m.contains("connection")
+        }
+        _ => false,
+    }
+}
+
+async fn retry_verify_tdx_quote(
+    intel_quote_hex: &str,
+) -> Result<crate::nearai::attestation::VerifiedTdxQuote, NearAiError> {
+    for attempt in 1..=HTTP_RETRY_ATTEMPTS {
+        match verify_tdx_quote(intel_quote_hex).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt < HTTP_RETRY_ATTEMPTS && is_retryable_error(&e) {
+                    warn!(
+                        "TDX quote verification failed (attempt {}/{}): {}; retrying",
+                        attempt, HTTP_RETRY_ATTEMPTS, e
+                    );
+                    tokio::time::sleep(HTTP_RETRY_BASE_DELAY * attempt as u32).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    unreachable!("retry loop exhausted without returning")
+}
+
+async fn retry_verify_gpu_attestation(
+    client: &reqwest::Client,
+    jwks: &NrasJwks,
+    nvidia_payload: &Value,
+    nonce_hex: &str,
+) -> Result<(), NearAiError> {
+    for attempt in 1..=HTTP_RETRY_ATTEMPTS {
+        match verify_gpu_attestation(client, jwks, nvidia_payload, nonce_hex).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if attempt < HTTP_RETRY_ATTEMPTS && is_retryable_error(&e) {
+                    warn!(
+                        "GPU attestation verification failed (attempt {}/{}): {}; retrying",
+                        attempt, HTTP_RETRY_ATTEMPTS, e
+                    );
+                    tokio::time::sleep(HTTP_RETRY_BASE_DELAY * attempt as u32).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    unreachable!("retry loop exhausted without returning")
 }
 
 fn generate_nonce_bytes() -> Result<[u8; 32], NearAiError> {

@@ -6,7 +6,7 @@ use secp256k1::PublicKey;
 use sha2::{Digest, Sha256};
 use sha3::Keccak256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::debug;
+use tracing::{debug, warn};
 
 pub const INTEL_PCCS_URL: &str = "https://api.trustedservices.intel.com/tdx/certification/v4";
 
@@ -48,14 +48,36 @@ pub async fn verify_tdx_quote(intel_quote_hex: &str) -> Result<VerifiedTdxQuote,
         verified.advisory_ids.len()
     );
 
-    if verified.status != "UpToDate" {
+    // TCB status policy: accept statuses where the quote is cryptographically valid
+    // and the platform is genuinely running in a TDX enclave. OutOfDate and
+    // SWHardeningNeeded are common in production because cloud operators lag behind
+    // Intel's latest firmware updates. Only "Revoked" (key compromise) is fatal.
+    // We log warnings for any non-UpToDate status so we have visibility.
+    const ACCEPTED_STATUSES: &[&str] = &[
+        "UpToDate",
+        "OutOfDate",
+        "SWHardeningNeeded",
+        "ConfigurationAndSWHardeningNeeded",
+    ];
+
+    if !ACCEPTED_STATUSES.contains(&verified.status.as_str()) {
         return Err(NearAiError::Tdx(format!(
-            "TDX TCB status is not UpToDate: status={} platform_status={} qe_status={} advisories={:?}",
+            "TDX TCB status rejected: status={} platform_status={} qe_status={} advisories={:?}",
             verified.status,
             verified.platform_status.status,
             verified.qe_status.status,
             verified.advisory_ids
         )));
+    }
+
+    if verified.status != "UpToDate" {
+        warn!(
+            "Near.AI TDX TCB is not UpToDate: status={} platform_status={} qe_status={} advisories={:?}",
+            verified.status,
+            verified.platform_status.status,
+            verified.qe_status.status,
+            verified.advisory_ids
+        );
     }
 
     extract_verified_tdx_quote(&verified.report)

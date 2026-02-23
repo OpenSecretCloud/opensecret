@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 // Maximum audio file size (100MB) - sanity check, CF already limits to 50MB
@@ -523,7 +523,7 @@ pub async fn get_chat_completion_response(
     // Prepare the request to proxies
     debug!("Sending request for model: {}", model_name);
 
-    let (res, successful_provider, successful_near_crypto) = {
+    let (res, successful_provider, successful_provider_model, successful_near_crypto) = {
         debug!(
             "Using route for model {}: primary={}, fallbacks={}",
             model_name,
@@ -583,6 +583,7 @@ pub async fn get_chat_completion_response(
 
             Some((
                 fallback,
+                fallback_model_name,
                 fallback_provider_is_near,
                 fallback_body_value,
                 fallback_prepared_static,
@@ -596,6 +597,7 @@ pub async fn get_chat_completion_response(
         let mut last_error = None;
         let mut found_response = None;
         let mut successful_provider_name = String::new();
+        let mut successful_provider_model_name = String::new();
         let mut successful_near_crypto: Option<NearAiResponseCrypto> = None;
 
         for cycle in 0..max_cycles {
@@ -657,6 +659,7 @@ pub async fn get_chat_completion_response(
                         );
                         found_response = Some(response);
                         successful_provider_name = route.primary.provider_name.clone();
+                        successful_provider_model_name = primary_model_name.clone();
                         successful_near_crypto = primary_prepared.near_crypto.clone();
                         break;
                     }
@@ -675,6 +678,7 @@ pub async fn get_chat_completion_response(
             // Try fallback if available
             if let Some((
                 fallback_provider,
+                fallback_model_name,
                 fallback_provider_is_near,
                 fallback_body_value,
                 fallback_prepared_static,
@@ -732,6 +736,7 @@ pub async fn get_chat_completion_response(
                             );
                             found_response = Some(response);
                             successful_provider_name = fallback_provider.provider_name.clone();
+                            successful_provider_model_name = fallback_model_name.clone();
                             successful_near_crypto = fallback_prepared.near_crypto.clone();
                             break;
                         }
@@ -750,7 +755,7 @@ pub async fn get_chat_completion_response(
         }
 
         match found_response {
-            Some(response) => (response, successful_provider_name, successful_near_crypto),
+            Some(response) => (response, successful_provider_name, successful_provider_model_name, successful_near_crypto),
             None => {
                 let error_msg = if route.fallbacks.is_empty() {
                     format!(
@@ -803,6 +808,13 @@ pub async fn get_chat_completion_response(
 
             decrypt_chat_completion_json_in_place(&mut response_json, crypto).map_err(|e| {
                 error!("Near.AI response decryption failed: {}", e);
+                warn!(
+                    "Invalidating Near.AI model cache for {} due to decryption failure",
+                    successful_provider_model
+                );
+                let verifier = state.nearai_verifier.clone();
+                let model = successful_provider_model.clone();
+                tokio::spawn(async move { verifier.invalidate_model(&model).await });
                 ApiError::ServiceUnavailable
             })?;
         }
@@ -845,6 +857,8 @@ pub async fn get_chat_completion_response(
     let provider = successful_provider.clone();
     let near_crypto = successful_near_crypto.clone();
     let provider_is_near = provider.to_lowercase() == "nearai";
+    let nearai_verifier = state.nearai_verifier.clone();
+    let model_name_for_invalidation = successful_provider_model.clone();
 
     tokio::spawn(async move {
         let mut body_stream = res.into_body().into_stream();
@@ -895,6 +909,11 @@ pub async fn get_chat_completion_response(
                                                     "Near.AI stream chunk decryption failed: {}",
                                                     e
                                                 );
+                                                warn!(
+                                                    "Invalidating Near.AI model cache for {} due to decryption failure",
+                                                    model_name_for_invalidation
+                                                );
+                                                nearai_verifier.invalidate_model(&model_name_for_invalidation).await;
                                                 let _ = tx_consumer
                                                     .send(CompletionChunk::Error(
                                                         "Near.AI decrypt failed".to_string(),
@@ -955,17 +974,44 @@ pub async fn get_chat_completion_response(
                                         }
                                     }
                                     Err(e) => {
-                                        error!("Received non-JSON data event. Error: {:?}", e);
-                                        if tx_consumer
-                                            .send(CompletionChunk::Error(
-                                                "Invalid JSON".to_string(),
-                                            ))
-                                            .await
-                                            .is_err()
-                                        {
+                                        let trimmed = frame.trim();
+                                        if trimmed.is_empty() {
+                                            trace!("Skipping empty SSE data frame");
+                                        } else if trimmed.chars().all(|c| c == '\r' || c == '\n') {
+                                            trace!("Skipping whitespace-only SSE data frame");
+                                        } else if trimmed.starts_with("error:") {
+                                            // Provider sent a plain-text error — propagate it and stop
+                                            error!(
+                                                "Provider returned a plain-text error frame: {:?}",
+                                                &trimmed[..trimmed.len().min(500)]
+                                            );
+                                            // Invalidate cached Near.AI node so the next request
+                                            // re-verifies with a fresh key (covers key rotation).
+                                            if provider_is_near {
+                                                warn!(
+                                                    "Invalidating Near.AI model cache for {} due to provider error",
+                                                    model_name_for_invalidation
+                                                );
+                                                nearai_verifier.invalidate_model(&model_name_for_invalidation).await;
+                                            }
+                                            let _ = tx_consumer
+                                                .send(CompletionChunk::Error(trimmed.to_string()))
+                                                .await;
                                             return;
+                                        } else if e.to_string().contains("expected value") {
+                                            // Likely a keepalive, comment, or unknown non-JSON line
+                                            warn!(
+                                                "Skipping non-JSON SSE data frame (first 200 chars): {:?}",
+                                                &trimmed[..trimmed.len().min(200)]
+                                            );
+                                        } else {
+                                            error!(
+                                                "Failed to parse SSE data frame as JSON: {} — frame (first 200 chars): {:?}",
+                                                e,
+                                                &trimmed[..trimmed.len().min(200)]
+                                            );
                                         }
-                                        break;
+                                        // Don't break the stream — skip this frame and continue
                                     }
                                 }
                             }
@@ -1071,6 +1117,10 @@ fn extract_sse_frame(buffer: &mut String) -> Option<String> {
 
             // Return data content if it's a data frame, otherwise keep looking
             if let Some(data) = frame.strip_prefix("data: ") {
+                // Skip empty data payloads (e.g. keepalive frames like "data: \n\n")
+                if data.trim().is_empty() {
+                    continue;
+                }
                 return Some(data.to_string());
             }
             // Skip non-data frames (comments, etc.) and continue looking

@@ -234,7 +234,6 @@ impl NearAiVerifier {
         Some(verified.nodes[idx].clone())
     }
 
-    #[allow(dead_code)]
     pub async fn invalidate_model(&self, model: &str) {
         let mut cache = self.cache.write().await;
         cache.remove(model);

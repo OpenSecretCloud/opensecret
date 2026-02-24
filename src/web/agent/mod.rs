@@ -30,7 +30,7 @@ use crate::web::responses::conversations::{
 use crate::web::responses::handlers::encrypt_event;
 use crate::web::responses::{
     error_mapping, ConversationBuilder, ConversationItem, ConversationItemConverter,
-    DeletedObjectResponse, Paginator,
+    DeletedObjectResponse, MessageContent, MessageContentConverter, MessageContentPart, Paginator,
 };
 use crate::{ApiError, AppMode, AppState};
 
@@ -38,10 +38,39 @@ mod compaction;
 mod runtime;
 mod signatures;
 mod tools;
+mod vision;
 
 #[derive(Debug, Clone, Deserialize)]
 struct AgentChatRequest {
-    input: String,
+    input: MessageContent,
+}
+
+fn is_empty_message_content(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::Text(text) => text.trim().is_empty(),
+        MessageContent::Parts(parts) => parts.iter().all(|part| match part {
+            MessageContentPart::Text { text } | MessageContentPart::InputText { text } => {
+                text.trim().is_empty()
+            }
+            MessageContentPart::InputImage {
+                image_url, file_id, ..
+            } => {
+                let url_empty = image_url
+                    .as_deref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true);
+                let file_empty = file_id
+                    .as_deref()
+                    .map(|s| s.trim().is_empty())
+                    .unwrap_or(true);
+                url_empty && file_empty
+            }
+            MessageContentPart::InputFile {
+                filename,
+                file_data,
+            } => filename.trim().is_empty() && file_data.trim().is_empty(),
+        }),
+    }
 }
 
 // SSE event types for agent chat (message-level delivery, not token streaming)
@@ -238,18 +267,19 @@ async fn chat(
     Extension(user): Extension<User>,
     Extension(body): Extension<AgentChatRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
-    if body.input.trim().is_empty() {
+    MessageContentConverter::validate_content(&body.input)?;
+    let input_content = MessageContentConverter::normalize_content(body.input.clone());
+    if is_empty_message_content(&input_content) {
         return Err(ApiError::BadRequest);
     }
 
     // NOTE: We intentionally do runtime initialization *inside* the SSE stream so the client can
     // receive typing indicators immediately, even if compaction/key retrieval takes time.
-    let input = body.input.clone();
-
     let event_stream = async_stream::stream! {
         let mut max_steps: usize = 0;
         let mut total_messages: usize = 0;
         let mut had_error = false;
+        let mut input_for_agent = String::new();
 
         let mut runtime_opt: Option<runtime::AgentRuntime> = None;
         'init: {
@@ -312,18 +342,23 @@ async fn chat(
                     }
                 };
 
-            if let Err(e) = runtime.prepare(&input).await {
-                error!("Agent prepare() failed: {e:?}");
-                let err_event = AgentErrorEvent {
-                    error: "Agent encountered an error preparing your request.".to_string(),
-                };
-                match encrypt_agent_event(&state, &session_id, EVENT_AGENT_ERROR, &err_event).await
-                {
-                    Ok(event) => yield Ok(event),
-                    Err(_) => yield Ok(Event::default().event(EVENT_AGENT_ERROR).data("Error")),
+            match runtime.prepare(&input_content).await {
+                Ok(prepared) => {
+                    input_for_agent = prepared;
                 }
-                had_error = true;
-                break 'init;
+                Err(e) => {
+                    error!("Agent prepare() failed: {e:?}");
+                    let err_event = AgentErrorEvent {
+                        error: "Agent encountered an error preparing your request.".to_string(),
+                    };
+                    match encrypt_agent_event(&state, &session_id, EVENT_AGENT_ERROR, &err_event).await
+                    {
+                        Ok(event) => yield Ok(event),
+                        Err(_) => yield Ok(Event::default().event(EVENT_AGENT_ERROR).data("Error")),
+                    }
+                    had_error = true;
+                    break 'init;
+                }
             }
 
             max_steps = runtime.max_steps();
@@ -344,7 +379,7 @@ async fn chat(
                 }
             }
 
-            let step_result = runtime.step(&input, step_num == 0).await;
+            let step_result = runtime.step(&input_for_agent, step_num == 0).await;
 
             match step_result {
                 Ok(result) => {

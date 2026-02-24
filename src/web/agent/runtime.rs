@@ -21,7 +21,7 @@ use crate::rag::{
 };
 use crate::tokens::count_tokens;
 use crate::web::openai_auth::AuthMethod;
-use crate::web::responses::{MessageContent, MessageContentConverter};
+use crate::web::responses::{MessageContent, MessageContentConverter, MessageContentPart};
 use crate::{ApiError, AppState};
 
 use super::compaction::CompactionManager;
@@ -33,6 +33,7 @@ use super::tools::{
     ArchivalInsertTool, ArchivalSearchTool, ConversationSearchTool, DoneTool, MemoryAppendTool,
     MemoryInsertTool, MemoryReplaceTool, ToolRegistry, ToolResult,
 };
+use super::vision;
 
 // Mirrors Sage defaults
 const DEFAULT_PERSONA_DESCRIPTION: &str = "The persona block: Stores details about your current persona, guiding how you behave and respond. This helps you to maintain consistency and personality in your interactions.";
@@ -314,16 +315,118 @@ impl AgentRuntime {
 
     /// Prepare the runtime for a new message: validate, persist user message, compact if needed.
     /// Call this once before driving the step loop.
-    pub async fn prepare(&mut self, user_message: &str) -> Result<(), ApiError> {
-        let trimmed = user_message.trim();
-        if trimmed.is_empty() {
+    pub async fn prepare(&mut self, user_message: &MessageContent) -> Result<String, ApiError> {
+        MessageContentConverter::validate_content(user_message)?;
+        let normalized = MessageContentConverter::normalize_content(user_message.clone());
+
+        let user_text = MessageContentConverter::extract_text_for_token_counting(&normalized);
+        let user_text = user_text.trim().to_string();
+
+        let image_url = match &normalized {
+            MessageContent::Parts(parts) => parts.iter().find_map(|p| match p {
+                MessageContentPart::InputImage {
+                    image_url: Some(url),
+                    ..
+                } => Some(url.clone()),
+                _ => None,
+            }),
+            MessageContent::Text(_) => None,
+        };
+
+        let attachment_text = if let Some(image_url) = &image_url {
+            let recent_context = self
+                .get_recent_messages_for_vision(6)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Failed to build vision context: {e:?}");
+                    String::new()
+                });
+
+            match vision::describe_image(
+                &self.state,
+                self.user.as_ref(),
+                AuthMethod::Jwt,
+                DEFAULT_MODEL,
+                image_url,
+                &user_text,
+                &recent_context,
+            )
+            .await
+            {
+                Ok(desc) => Some(desc),
+                Err(e) => {
+                    warn!("Vision pre-processing failed: {e:?}");
+                    Some("[Could not describe image]".to_string())
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut parts: Vec<String> = Vec::new();
+        if !user_text.is_empty() {
+            parts.push(user_text);
+        }
+        if let Some(att) = attachment_text.as_ref().filter(|s| !s.trim().is_empty()) {
+            parts.push(format!("[Uploaded Image: {}]", att.trim()));
+        }
+
+        let embed_text = parts.join("\n\n");
+        if embed_text.trim().is_empty() {
             return Err(ApiError::BadRequest);
         }
 
         self.clear_tool_results();
-        self.insert_user_message(trimmed).await?;
+        self.insert_user_message(normalized, attachment_text, &embed_text)
+            .await?;
         self.maybe_compact().await?;
-        Ok(())
+        Ok(embed_text)
+    }
+
+    async fn get_recent_messages_for_vision(&self, limit: usize) -> Result<String, ApiError> {
+        if limit == 0 {
+            return Ok(String::new());
+        }
+
+        let mut conn = self
+            .state
+            .db
+            .get_pool()
+            .get()
+            .map_err(|_| ApiError::InternalServerError)?;
+
+        // Load more than needed in case tool calls/outputs are interleaved.
+        let fetch_limit = (limit as i64).saturating_mul(10).max(limit as i64);
+        let mut messages = RawThreadMessage::get_conversation_context(
+            &mut conn,
+            self.conversation.id,
+            fetch_limit,
+            None,
+            "desc",
+        )
+        .map_err(|e| {
+            error!("Failed to load recent messages for vision: {e:?}");
+            ApiError::InternalServerError
+        })?;
+
+        messages.reverse();
+
+        let mut formatted_rev: Vec<String> = Vec::new();
+        for msg in messages.iter().rev() {
+            if msg.message_type != "user" && msg.message_type != "assistant" {
+                continue;
+            }
+
+            let content = self.render_raw_message(msg)?;
+            let truncated: String = content.chars().take(300).collect();
+            formatted_rev.push(format!("[{}]: {}", msg.message_type, truncated));
+            if formatted_rev.len() >= limit {
+                break;
+            }
+        }
+
+        formatted_rev.reverse();
+        Ok(formatted_rev.join("\n"))
     }
 
     /// Execute a single step of the agent loop.
@@ -681,7 +784,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             .map_err(|_| ApiError::InternalServerError)?
             .unwrap_or_default();
 
-        let content = if msg.message_type == "user" {
+        let mut content = if msg.message_type == "user" {
             let parsed: Result<MessageContent, _> = serde_json::from_str(&raw);
             match parsed {
                 Ok(c) => MessageContentConverter::extract_text_for_token_counting(&c),
@@ -707,6 +810,21 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             raw
         };
 
+        if msg.message_type == "user" {
+            let attachment_text = decrypt_string(&self.user_key, msg.attachment_text_enc.as_ref())
+                .map_err(|_| ApiError::InternalServerError)?
+                .unwrap_or_default();
+
+            if !attachment_text.trim().is_empty() {
+                let suffix = format!("[Uploaded Image: {}]", attachment_text.trim());
+                if content.trim().is_empty() {
+                    content = suffix;
+                } else {
+                    content = format!("{}\n\n{}", content.trim(), suffix);
+                }
+            }
+        }
+
         if (msg.message_type == "tool_call" || msg.message_type == "tool_output")
             && content.len() > 2000
         {
@@ -720,10 +838,35 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         Ok(content)
     }
 
-    pub async fn insert_user_message(&self, text: &str) -> Result<UserMessage, ApiError> {
-        let content = super::tools::normalize_user_message_content(text);
-        let prompt_tokens = super::tools::count_user_message_tokens(&content);
-        let content_enc = encrypt_with_key(&self.user_key, content.as_bytes()).await;
+    pub async fn insert_user_message(
+        &self,
+        content: MessageContent,
+        attachment_text: Option<String>,
+        embed_text: &str,
+    ) -> Result<UserMessage, ApiError> {
+        let embed_text = embed_text.trim();
+        if embed_text.is_empty() {
+            return Err(ApiError::BadRequest);
+        }
+
+        let normalized = MessageContentConverter::normalize_content(content);
+        let content_json = serde_json::to_string(&normalized).map_err(|e| {
+            error!("Failed to serialize user MessageContent: {e:?}");
+            ApiError::InternalServerError
+        })?;
+
+        let prompt_tokens = count_tokens(embed_text);
+        let prompt_tokens = if prompt_tokens > i32::MAX as usize {
+            i32::MAX
+        } else {
+            prompt_tokens as i32
+        };
+
+        let content_enc = encrypt_with_key(&self.user_key, content_json.as_bytes()).await;
+        let attachment_text_enc = match attachment_text.as_ref().filter(|s| !s.trim().is_empty()) {
+            Some(text) => Some(encrypt_with_key(&self.user_key, text.trim().as_bytes()).await),
+            None => None,
+        };
 
         let mut conn = self
             .state
@@ -738,6 +881,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             response_id: None,
             user_id: self.user.uuid,
             content_enc,
+            attachment_text_enc,
             prompt_tokens,
         }
         .insert(&mut conn)
@@ -750,7 +894,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         let state = self.state.clone();
         let user = self.user.clone();
         let user_key = self.user_key.clone();
-        let text = text.to_string();
+        let text = embed_text.to_string();
         let conversation_id = self.conversation.id;
         let user_message_id = Some(msg.id);
 

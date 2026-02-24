@@ -1198,6 +1198,7 @@ async fn persist_request_data(
         response_id: Some(response.id),
         user_id: user.uuid,
         content_enc: prepared.content_enc.clone(),
+        attachment_text_enc: None,
         prompt_tokens: prepared.user_message_tokens,
     };
     let user_message = state

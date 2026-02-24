@@ -464,6 +464,35 @@ The LLM call for summarization uses a fast/cheap model (e.g., `gpt-oss-120b`) to
 
 **Overall implementation status:** Partially implemented (regenerated context + compaction shipped; strict token-budget packing + cheap summarizer model not implemented yet).
 
+### 5.4 Vision / Image Handling (How Sage Does It)
+
+Sage V2 does **not** pass images through the DSRs signature/tool loop. Instead, it runs a **vision pre-processing** step that converts an image attachment into a **text description**, then injects that text into the conversation so the rest of the system stays text-only.
+
+**End-to-end flow (Sage codebase):**
+
+1. **Signal ingestion** parses `attachments[]` from `signal-cli` JSON-RPC (`crates/sage-core/src/signal.rs::parse_incoming_message`). Each attachment includes a MIME type (`contentType`) and an ID/filename (`id`).
+2. **Pre-processing trigger** in the main receive loop (`crates/sage-core/src/main.rs`) checks for the first supported image attachment (`crates/sage-core/src/vision.rs::is_supported_image`, currently `image/jpeg`, `image/png`, `image/webp`, `image/gif`).
+3. **Load image bytes** from the `signal-cli` attachments directory mounted into the Sage container (default path used by Sage: `/signal-cli-data/.local/share/signal-cli/attachments/<attachment.id>`).
+4. **Build a small “recent context” string** for the vision model (Sage calls `SageAgent::get_recent_messages_for_vision(6)` to format the last few user/assistant turns as `[role]: …` lines).
+5. **Call a vision-capable model** via an OpenAI-compatible endpoint (`crates/sage-core/src/vision.rs::describe_image`), using `MAPLE_VISION_MODEL` (defaults to `MAPLE_MODEL`):
+   - Reads the image from disk, base64-encodes it, and wraps it as `data:<mime>;base64,<...>`.
+   - Sends `POST {MAPLE_API_URL}/chat/completions` with `messages` containing:
+     - a dedicated **system prompt** (“You are an image description agent… transcribe text exactly…”) and
+     - a **user content array** with an `image_url` part plus a `text` part that includes recent conversation context + the user’s accompanying text.
+   - Uses `max_tokens=2048` and returns the model’s text description.
+6. **Inject description into the user message** as a bracketed suffix/payload (`[Uploaded Image: …]`) and pass the resulting **text-only** `user_message` into the DSRs agent step loop (`agent_guard.step(&user_message, ...)`).
+7. **Persist both the original text and the derived description**:
+   - Sage stores the original user text in `messages.content` and stores the derived description in `messages.attachment_text` (migration: `crates/sage-core/migrations/2026-02-05-000000_add_attachment_text`).
+   - It updates the message embedding asynchronously using the *combined* text (original message + injected description) so recall search can match on image content.
+8. **Render attachment descriptions in agent context**: when building `recent_conversation` for the DSRs signature, Sage appends `attachment_text` alongside the user message (`crates/sage-core/src/sage_agent.rs`, “Render attachment_text alongside user messages”).
+
+**Key implication for Maple/OpenSecret agent:** DSRs stays **text-in/text-out**; “image understanding” is an explicit **pre-step** that produces storable text (and in OpenSecret, that derived text should be encrypted at rest) that can participate in compaction, embeddings, and memory tools.
+
+**Notable Sage quirks (worth copying or fixing intentionally):**
+- Only the **first** supported image attachment is processed per inbound message.
+- On vision failure, Sage injects a placeholder description (so the agent still sees “something happened”).
+- `conversation_search` results are formatted from `messages.content` and (today) do **not** include `attachment_text`, so image-only messages can look blank in tool output even though the agent’s in-context transcript includes the description.
+
 ---
 
 ## 6. Agent Step Loop
@@ -654,7 +683,7 @@ These are intentionally deferred:
 
 - **Group/shared memory.** All memory is per-user. Shared memory blocks between users in the same project would require a new sharing model. Deferred.
 
-- **Voice/image input handling.** Sage has a vision pipeline for Signal image attachments. Maple's Responses API already handles multimodal input. The agent system inherits this capability from the shared message tables.
+- **Voice/image input handling.** Sage converts image attachments into injected text via a separate vision pre-processing call (Section 5.4). Maple’s Responses API supports multimodal input directly, but the agent runtime likely needs its own normalization path if it wants Sage-style text-only context + embeddings.
 
 - **Reminders / scheduling.** Post-MVP. Sage V2 has a working scheduler + tools (`schedule_task`, `list_schedules`, `cancel_schedule`) backed by a `scheduled_tasks` table. We can port this once the core agent loop is stable. Delivery of fired reminders will use the long-lived SSE channel (`GET /v1/agent/events`, Section 7.3).
 

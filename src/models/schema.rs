@@ -414,6 +414,7 @@ diesel::table! {
         prompt_tokens -> Int4,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        attachment_text_enc -> Nullable<Bytea>,
     }
 }
 

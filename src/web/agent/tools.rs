@@ -12,10 +12,7 @@ use crate::models::memory_blocks::{MemoryBlock, NewMemoryBlock};
 use crate::models::responses::Conversation;
 use crate::models::users::User;
 use crate::rag::{cosine_similarity, deserialize_f32_le, search_user_embeddings};
-use crate::tokens::count_tokens;
 use crate::web::openai_auth::AuthMethod;
-use crate::web::responses::MessageContentConverter;
-use crate::web::responses::{MessageContent, MessageContentPart};
 use crate::{ApiError, AppState};
 
 // ============================================================================
@@ -799,29 +796,6 @@ impl Tool for DoneTool {
 
     async fn execute(&self, _args: &HashMap<String, String>) -> ToolResult {
         ToolResult::success("Done.".to_string())
-    }
-}
-
-// ============================================================================
-// Formatting helpers
-// ============================================================================
-
-pub fn normalize_user_message_content(text: &str) -> String {
-    // Store user messages in the DB as MessageContent JSON, like Responses API.
-    // Use input_text part for compatibility with Conversations API.
-    let content = MessageContent::Parts(vec![MessageContentPart::InputText {
-        text: text.to_string(),
-    }]);
-    serde_json::to_string(&content).unwrap_or_else(|_| format!("\"{}\"", text))
-}
-
-pub fn count_user_message_tokens(content_json: &str) -> i32 {
-    let parsed: Result<MessageContent, _> = serde_json::from_str(content_json);
-    match parsed {
-        Ok(content) => count_tokens(&MessageContentConverter::extract_text_for_token_counting(
-            &content,
-        )) as i32,
-        Err(_) => count_tokens(content_json) as i32,
     }
 }
 

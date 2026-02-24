@@ -3,7 +3,7 @@
 ## Bringing Persistent Agent Memory into OpenSecret
 
 **Date:** February 2026
-**Status:** MVP implemented (Local/Dev only, non-streaming; Responses API auto-embedding + production feature flags pending)
+**Status:** MVP implemented (Local/Dev only; `/v1/agent/chat` streams message-level SSE; Responses API auto-embedding + production feature flags pending)
 **Related Docs:**
 - `potential-rag-integration-brute-force.md` -- RAG/vector storage layer (prerequisite)
 - `architecture-for-rag-integration.md` -- OpenSecret encryption and data model reference
@@ -489,10 +489,10 @@ All memory tool inputs/outputs are encrypted before storage. The tool execution 
 
 ### 7.1 New Routes (`/v1/agent/*`)
 
-**Current status (implemented 2026-02-11):** the MVP `/v1/agent/*` surface below is implemented (Local/Dev only, non-streaming).
+**Current status (implemented 2026-02-11):** the MVP `/v1/agent/*` surface below is implemented (Local/Dev only). `POST /v1/agent/chat` streams message-level SSE (not token streaming); other endpoints are encrypted JSON.
 
 ```
-POST   /v1/agent/chat                -- Send a message to the agent (step loop, non-streaming JSON)
+POST   /v1/agent/chat                -- Send a message to the agent (step loop, request-scoped SSE)
 GET    /v1/agent/config               -- Get agent settings
 PUT    /v1/agent/config               -- Update agent settings (model, system prompt, etc.)
 
@@ -507,11 +507,22 @@ DELETE /v1/agent/memory/archival/:id  -- Delete specific archival entry
 GET    /v1/agent/conversations        -- List agent conversations (reuses conversations table)
 GET    /v1/agent/conversations/:id/items -- Get conversation items (reuses existing item format)
 DELETE /v1/agent/conversations/:id    -- Delete conversation + associated summaries
+
+GET    /v1/agent/events               -- Long-lived SSE channel for proactive agent delivery + fan-out (post-MVP)
 ```
 
 ### 7.2 Chat Endpoint Detail
 
-**Current implementation (2026-02-11):** `POST /v1/agent/chat` accepts `{ "input": "..." }` (encrypted request/response like other endpoints) and returns `{ messages: string[], tool_calls: ToolCall[] }`. This endpoint is **non-streaming** in the MVP (no SSE).
+**Current implementation (2026-02-11):** `POST /v1/agent/chat` accepts `{ "input": "..." }` (encrypted request body like other endpoints) and returns request-scoped SSE (message-level events, not token streaming).
+
+Event types (payloads are JSON, encrypted per-session and base64-encoded in the `data:` field):
+
+| Event type | Meaning |
+|---|---|
+| `agent.typing` | Agent is working on step `step` |
+| `agent.message` | One or more user-visible messages for step `step` |
+| `agent.done` | Turn completed (`total_steps`, `total_messages`) |
+| `agent.error` | Turn failed (`error`) |
 
 ```
 POST /v1/agent/chat
@@ -520,16 +531,29 @@ POST /v1/agent/chat
 }
 ```
 
-Response:
+### 7.3 Proactive Agent Delivery: Long-Lived SSE Channel (Post-MVP)
 
-```json
-{
-  "messages": ["Based on our previous discussion, you mentioned wanting to use blue-green deployments."],
-  "tool_calls": []
-}
-```
+`POST /v1/agent/chat` uses request-scoped SSE: the stream opens on request, delivers step-loop events (`agent.typing`, `agent.message`, `agent.done`), and closes. This is correct for request-response interactions but insufficient for proactive agent behavior (reminders, scheduled task results, agent-initiated messages).
 
-### 7.3 Relationship to Responses API
+**Decision: long-lived SSE over WebSockets.** Three reasons specific to our architecture:
+
+1. **Encryption model fit.** The per-session encryption middleware operates on HTTP request/response cycles. SSE is still HTTP and slots in naturally. WebSockets would require rethinking per-message encryption (WS frames aren't HTTP responses, so `encrypt_event` / session key lookup needs a different path).
+2. **Proxy chain simplicity.** tinfoil-proxy and continuum-proxy sit in front of the enclave via vsock. HTTP/SSE flows through standard reverse proxies. WebSocket upgrade handling through that chain adds operational complexity -- sticky sessions, connection draining, timeout tuning at every hop.
+3. **Unidirectionality is sufficient.** Proactive agent messages are server-to-client. The client already has `POST /v1/agent/chat` for the other direction.
+
+**Proposed endpoint:** `GET /v1/agent/events`
+
+The client opens this connection once and keeps it open. The server pushes **the same `agent.*` SSE events used by `/v1/agent/chat`** (`agent.typing`, `agent.message`, `agent.done`, `agent.error`) whenever the agent produces output outside of an active chat request.
+
+**Resilience requirements:**
+- **At-least-once delivery.** Clients MUST dedupe by SSE event `id`.
+- **SSE `id` support + `Last-Event-ID` resumption.** Every non-heartbeat event MUST include an SSE `id:` field. On reconnect, clients send `Last-Event-ID` to resume from the next event.
+- **DB-backed event log (fan-out).** Events are persisted so clients that were offline can catch up on reconnect. Because this is fan-out, events are retained by TTL (e.g., 24h) rather than deleted-on-delivery.
+- **Heartbeat keepalive.** Emit SSE comment frames (e.g., `: ping\n\n`) every ~30s to prevent proxy idle timeouts.
+
+**Relationship to `POST /v1/agent/chat`:** The two channels are independent. Chat continues to use request-scoped SSE for immediate step-loop delivery. The long-lived channel handles async/proactive events only. A client that only uses chat (no proactive features) never needs to open `/v1/agent/events`.
+
+### 7.4 Relationship to Responses API
 
 The two API surfaces are independent but share storage:
 
@@ -570,7 +594,7 @@ These are intentionally deferred:
 
 - **Voice/image input handling.** Sage has a vision pipeline for Signal image attachments. Maple's Responses API already handles multimodal input. The agent system inherits this capability from the shared message tables.
 
-- **Reminders / scheduling.** Post-MVP. Sage V2 has a working scheduler + tools (`schedule_task`, `list_schedules`, `cancel_schedule`) backed by a `scheduled_tasks` table. We can port this once the core agent loop is stable.
+- **Reminders / scheduling.** Post-MVP. Sage V2 has a working scheduler + tools (`schedule_task`, `list_schedules`, `cancel_schedule`) backed by a `scheduled_tasks` table. We can port this once the core agent loop is stable. Delivery of fired reminders will use the long-lived SSE channel (`GET /v1/agent/events`, Section 7.3).
 
 - **Code sandbox execution.** Long-lead, deferred. Requires a secure execution substrate (likely isolated runtime) and careful Nitro threat modeling.
 
@@ -617,14 +641,15 @@ A suggested sequence, building on the RAG layer as the foundation:
 - **Milestone:** DSRs-based agent can have multi-turn conversations with memory tool use
 
 ### Phase 6: Agent API Surface
-- [x] Implement `/v1/agent/chat` (non-streaming)
+- [x] Implement `/v1/agent/chat` (request-scoped SSE)
 - [x] Implement remaining `/v1/agent/*` endpoints (config, memory management, conversations)
 - [x] Wire up memory block initialization + agent thread creation on opt-in
 - [x] Wire up async embedding generation after agent message creation
 - **Milestone:** Full agent API surface available
 
 ### Phase 7: Post-MVP
-- Reminders/scheduling (`scheduled_tasks` + scheduler loop + tools)
+- Long-lived SSE event channel (`GET /v1/agent/events`) -- proactive notification delivery (Section 7.3)
+- Reminders/scheduling (`scheduled_tasks` + scheduler loop + tools), delivered via the event channel
 - Monitoring/metrics + tuning
 - (Optional) agent-backed Responses API threads (Section 1.3)
 - Code sandboxes (separate major project)

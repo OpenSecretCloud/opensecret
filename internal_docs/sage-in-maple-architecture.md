@@ -10,6 +10,8 @@
 - Sage V2 Design Doc (`~/Dev/Personal/sage/docs/SAGE_V2_DESIGN.md`) -- proven prototype
 - Sage V2 Codebase (`~/Dev/Personal/sage/crates/sage-core`) -- DSRs signatures + BAML parsing + multi-step tool loop prototype
 
+**Overall implementation status:** Partially implemented (MVP shipped behind Local/Dev gating; Responses API auto-embedding + production feature flags not implemented yet).
+
 ---
 
 ## 1. Goal
@@ -28,6 +30,8 @@ The agent lives in a single long-running conversation thread. Unlike Responses A
 
 The Responses API continues to exist alongside the agent. Users can still have one-off stateless threads for quick questions. But the agent is the primary interface for users who want memory and persistence.
 
+**Implementation status:** Complete (agent_config.conversation_id is the canonical pointer to the main agent thread).
+
 ### 1.2 Cross-Thread Memory Visibility
 
 **The agent sees everything.** When the agent's `conversation_search` tool fires, it searches across all of the user's embedded messages -- both the agent's own conversation and any Responses API threads. The `user_embeddings` table indexes messages from all conversations by default.
@@ -40,6 +44,8 @@ The agent can still scope searches to its own thread via `conversation_id` filte
 
 Additionally, requests made with `store=false` should not be embedded/indexed into `user_embeddings` (per-request opt-out), even if the Responses API continues to persist messages today.
 
+**Implementation status:** Partially implemented (cross-thread search works where embeddings exist; Responses API auto-embedding + private/store=false exclusions not implemented yet).
+
 ### 1.3 Future Vision: Agent-Backed Responses API
 
 Eventually, the Responses API threads themselves could be backed by the agent's memory system. Instead of stateless threads with no memory, a Responses API thread would:
@@ -48,6 +54,8 @@ Eventually, the Responses API threads themselves could be backed by the agent's 
 - Effectively: the agent "knows" the user (from core + archival memory), but the thread is a clean slate
 
 This would give users the best of both: the lightweight feel of a new thread, with the accumulated knowledge of the persistent agent. This is a post-v1 evolution that requires proving out the agent system first -- particularly that memory blocks and search produce consistently good results without the agent's own conversation context.
+
+**Implementation status:** Not implemented yet.
 
 ### 1.4 Future: Subagents (Multi-Agent per User)
 
@@ -65,6 +73,10 @@ We also want subagents to support **configurable memory scoping**:
 
 The cleanest way to support this is to introduce an `agents` table and add an `agent_id` FK to *agent-specific* tables (Section 4.5). Shared vs isolated memory becomes a query policy (and optionally a config field) rather than a schema rewrite.
 
+**Implementation status:** Not implemented yet.
+
+**Overall implementation status:** Partially implemented (MVP main-agent model shipped; agent-backed Responses API + subagents not implemented yet).
+
 ---
 
 ## 2. Key Architectural Decision: Separate API, Shared Storage
@@ -75,6 +87,8 @@ The existing Responses API (`/v1/responses/*`, `/v1/conversations/*`, `/v1/instr
 
 The existing database tables for conversations and messages are **reused** by the agent system. The agent reads from and writes to the same `conversations`, `user_messages`, `assistant_messages`, `tool_calls`, `tool_outputs`, and `reasoning_items` tables. The encrypted content format is identical.
 
+**Implementation status:** Complete (agent reuses existing message tables and encryption format).
+
 ### What's new
 
 A new `/v1/agent/*` API surface with its own handler module (`src/web/agent/`), its own step loop, and its own context assembly logic. This API implements the Sage-style regenerated-context pattern instead of the Responses API's middle-truncation pattern.
@@ -84,6 +98,8 @@ New database tables for agent-specific concerns (detailed in Section 4):
 - `user_embeddings` -- archival memory + chat embeddings (from the RAG proposal)
 - `conversation_summaries` -- compaction artifacts
 - `agent_config` -- per-user agent settings
+
+**Implementation status:** Complete (MVP /v1/agent surface + new tables + RAG foundation implemented; Local/Dev gated).
 
 ### 2.1 Feature Flags and Rollout Safety (MVP requirement)
 
@@ -98,6 +114,8 @@ Flags should also gate sub-features independently (even if `agent_config.enabled
 - agent tool execution (memory tools, web search)
 - compaction/summarization
 - GEPA runs (optimizer execution) vs simply *consuming* an optimized instruction
+
+**Implementation status:** Not implemented yet (only Local/Dev AppMode gating today; os_flags client exists but is unused for agent rollout).
 
 ### 2.2 Conversations API Isolation (Hide the Main Agent Thread)
 
@@ -114,6 +132,10 @@ Rationale:
 - `GET /v1/conversations` filters out the agent thread before pagination.
 - `DELETE /v1/conversations` (delete-all) excludes the agent conversation via `id.ne(agent_conversation_id)`.
 - `POST /v1/conversations/batch-delete` returns `not_found` for the agent thread instead of deleting it.
+
+**Implementation status:** Complete.
+
+**Overall implementation status:** Partially implemented (API split + conversation isolation complete; feature flags not implemented yet).
 
 ---
 
@@ -136,6 +158,8 @@ This was the hardest decision. We did a column-by-column comparison between Sage
 **Nothing in Sage's message access patterns requires modifying the existing Maple message table columns.** The agent needs to *read* from those tables differently (regenerated context with memory blocks instead of middle-truncation), but the storage format is identical.
 
 **Potential future addition:** An `is_in_context` boolean or a `summary_id` FK on messages would be an optimization for fast filtering. But it's not required -- the summaries table's ranges can determine this. If needed, it would be an additive nullable column with a migration default, not a structural change.
+
+**Overall implementation status:** Complete (agent uses existing message tables via RawThreadMessage UNION queries; no message-table schema changes required).
 
 ---
 
@@ -180,6 +204,8 @@ FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 - `persona`: "I am a helpful AI assistant." (editable by agent)
 - `human`: "" (populated by agent as it learns about the user)
 
+**Implementation status:** Complete (table + models + CRUD endpoints + tools; code default char_limit=20000).
+
 ### 4.2 `user_embeddings` -- General-Purpose Embedding Store
 
 Defined in the RAG proposal. A single table that serves all embedding use cases through a `source_type` discriminator:
@@ -197,6 +223,8 @@ Key columns for the agent system: `embedding_model` (tracks which model produced
 **Future (multi-agent/subagents):** consider adding an optional `agent_id` column for `source_type='archival'` (and possibly `source_type='document'`) rows so archival/document memory can be shared or isolated per agent. Recall/message embeddings remain scoped by `conversation_id` and can still default to cross-thread search.
 
 See `potential-rag-integration-brute-force.md` for full schema and API design.
+
+**Implementation status:** Partially implemented (table + in-process search/cache + archival tags implemented; Responses API auto-embedding not implemented yet).
 
 ### 4.3 `conversation_summaries` -- Compaction Artifacts
 
@@ -242,6 +270,8 @@ CREATE INDEX idx_conversation_summaries_chain
 - `embedding_enc` instead of pgvector `embedding` column. Follows the same encrypted pattern as everything else.
 - `content_tokens` plaintext for context budgeting.
 
+**Implementation status:** Complete (compaction writes summaries + embeds them for search).
+
 ### 4.4 `agent_config` -- Per-User Agent Settings
 
 ```sql
@@ -282,6 +312,8 @@ FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 - `enabled` allows opt-in activation. Users who don't want agent features continue using the stateless Responses API.
 - `system_prompt_enc` is the base agent instruction. Equivalent to Sage's `agents.system_prompt`, but encrypted. If NULL, a default system prompt is used.
 - `preferences_enc` absorbs what Sage stores in the separate `user_preferences` table. A single encrypted JSON blob is simpler than a KV table for a small number of preferences (timezone, response style, language).
+
+**Implementation status:** Partially implemented (config + conversation_id + system_prompt implemented; preferences + robust opt-in/flags not implemented yet).
 
 ### 4.5 Future: `agents` Table + `agent_id` FKs (Multi-Agent/Subagents)
 
@@ -334,6 +366,10 @@ FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 For MVP, we can start with the simpler per-user `agent_config` model, and only introduce `agents` once subagents are in scope.
 
+**Implementation status:** Not implemented yet.
+
+**Overall implementation status:** Partially implemented (MVP agent tables shipped; multi-agent/subagent schema not implemented yet).
+
 ---
 
 ## 5. Agent Context Assembly
@@ -382,6 +418,8 @@ AgentResponse (outputs)
 [Current User Message]
 ```
 
+**Implementation status:** Complete (DSRs-style signature inputs/outputs implemented via dspy-rs + structured parsing).
+
 ### 5.2 Maple Agent Context Builder
 
 A new `src/web/agent/context_builder.rs` that replaces the Responses API's `context_builder.rs` for agent requests:
@@ -402,6 +440,8 @@ A new `src/web/agent/context_builder.rs` that replaces the Responses API's `cont
 
 In practice, if we follow the Sage V2 prototype, the "assembled prompt" is expressed as the DSRs signature inputs above (plus an instruction string), and BAML parses the structured outputs.
 
+**Implementation status:** Partially implemented (context assembly implemented in `src/web/agent/runtime.rs`; does not strictly pack messages to a token budget).
+
 ### 5.3 Compaction vs Truncation
 
 The Responses API truncates: it drops middle messages and inserts `[Previous messages truncated due to context limits]`. Information is lost.
@@ -419,6 +459,10 @@ Output:
 ```
 
 The LLM call for summarization uses a fast/cheap model (e.g., `gpt-oss-120b`) to minimize latency and cost.
+
+**Implementation status:** Partially implemented (compaction + summaries implemented; summarization currently uses the agent model, not a dedicated cheap model).
+
+**Overall implementation status:** Partially implemented (regenerated context + compaction shipped; strict token-budget packing + cheap summarizer model not implemented yet).
 
 ---
 
@@ -452,6 +496,8 @@ To maximize reliability across providers/models (and to avoid native tool callin
 
 This pattern dramatically reduces sensitivity to provider-specific tool calling bugs, while still supporting multi-step tool loops.
 
+**Implementation status:** Complete (AgentResponse + correction signatures + done tool implemented).
+
 ### 6.3 DSRs Integration in OpenSecret (Nitro-safe LLM routing)
 
 DSRs must not call providers directly. All agent LLM calls (main steps + summarization + correction) must route through OpenSecret's existing LLM pipeline (billing, auth, retries, provider routing): `web::openai::get_chat_completion_response()`.
@@ -463,6 +509,8 @@ Implementation options:
 **Current status (implemented 2026-02-10):** OpenSecret now uses a locally-patched `dspy-rs` (DSRs) with a `LMClient::Custom(CustomCompletionModel)` hook that routes completions through `get_chat_completion_response()` (see `src/web/agent/signatures.rs`). Default `temperature=0.7` and `max_tokens=32768` match the Sage prototype.
 
 **Billing note:** embedding calls used by the agent system (archival insert/search, auto-embedding of agent messages, summary embeddings) must also route through OpenSecret's billing-aware embedding pipeline (`web::get_embedding_vector()`), and must never call providers directly.
+
+**Implementation status:** Complete (DSRs LM hook routes via `get_chat_completion_response()`; embeddings route via billing-aware `get_embedding_vector()`).
 
 ### 6.1 Memory Tools
 
@@ -482,6 +530,10 @@ All memory tool inputs/outputs are encrypted before storage. The tool execution 
 **`conversation_search` visibility note:** By default, this tool searches across all of the user's embedded messages, including Responses API threads. This is intentional -- the agent should surface relevant context regardless of which API surface generated it. The tool can accept an optional `conversation_id` parameter to scope to a specific thread if needed, but the default is broad. See the RAG proposal's "Data Visibility and Isolation" section.
 
 **Archival tags (implemented 2026-02-11):** `archival_insert` supports `metadata.tags` (string or string[]). Tags are normalized (trim + lowercase), deterministically encrypted per-tag (base64) and stored in `user_embeddings.tags_enc`. `archival_search` supports a `tags` argument and applies an ANY-match SQL filter (`tags_enc && <encrypted-tags>`) backed by a partial GIN index.
+
+**Implementation status:** Partially implemented (core memory + archival + conversation_search implemented; web_search tool not implemented yet).
+
+**Overall implementation status:** Partially implemented (step loop + tool persistence implemented; web_search + other post-MVP tools pending).
 
 ---
 
@@ -511,6 +563,8 @@ DELETE /v1/agent/conversations/:id    -- Delete conversation + associated summar
 GET    /v1/agent/events               -- Long-lived SSE channel for proactive agent delivery + fan-out (post-MVP)
 ```
 
+**Implementation status:** Partially implemented (all MVP routes except `GET /v1/agent/events`; Local/Dev only).
+
 ### 7.2 Chat Endpoint Detail
 
 **Current implementation (2026-02-11):** `POST /v1/agent/chat` accepts `{ "input": "..." }` (encrypted request body like other endpoints) and returns request-scoped SSE (message-level events, not token streaming).
@@ -530,6 +584,8 @@ POST /v1/agent/chat
   "input": "What did we discuss about deployment strategies last week?"
 }
 ```
+
+**Implementation status:** Complete (request-scoped, message-level SSE with typing/message/done/error events).
 
 ### 7.3 Proactive Agent Delivery: Long-Lived SSE Channel (Post-MVP)
 
@@ -552,6 +608,8 @@ The client opens this connection once and keeps it open. The server pushes **the
 - **Heartbeat keepalive.** Emit SSE comment frames (e.g., `: ping\n\n`) every ~30s to prevent proxy idle timeouts.
 
 **Relationship to `POST /v1/agent/chat`:** The two channels are independent. Chat continues to use request-scoped SSE for immediate step-loop delivery. The long-lived channel handles async/proactive events only. A client that only uses chat (no proactive features) never needs to open `/v1/agent/events`.
+
+**Implementation status:** Not implemented yet.
 
 ### 7.4 Relationship to Responses API
 
@@ -578,6 +636,10 @@ A user can use both APIs simultaneously. The key data flow:
 - **Agent conversation visibility:** The agent conversation is stored in the shared tables, but the **main agent thread should be hidden from `/v1/conversations/*`** (Section 2.2). Clients should use `/v1/agent/conversations/*` to access agent threads.
 - **Isolation boundary:** `store=false` requests and future incognito/private threads on the Responses API will NOT be embedded. The agent cannot see them. This is the opt-out mechanism.
 
+**Implementation status:** Partially implemented (agent messages auto-embedded; Responses API auto-embedding + private/store=false exclusions not implemented yet).
+
+**Overall implementation status:** Partially implemented (MVP /v1/agent surface shipped Local/Dev; proactive events channel pending).
+
 ---
 
 ## 8. What We're Not Deciding Yet
@@ -602,6 +664,8 @@ These are intentionally deferred:
 
 - **Agent-backed Responses API threads.** The long-term vision where Responses API threads inherit agent memory (memory blocks + search) but start with a clean conversation history. Requires proving out the agent system first. See Section 1.3.
 
+**Overall implementation status:** Not implemented yet (intentionally deferred).
+
 ---
 
 ## 9. Implementation Ordering
@@ -615,6 +679,8 @@ A suggested sequence, building on the RAG layer as the foundation:
 - [ ] Wire up async embedding generation after message creation in Responses API (respect `store=false` and future `private` threads)
 - **Milestone:** Recall + archival memory storage/search exists (even before the agent loop ships)
 
+**Implementation status:** Partially implemented (RAG + /v1/rag done; Responses API auto-embedding not implemented yet).
+
 ### Phase 2: Agent Storage + Feature Flags
 - [x] Implement `memory_blocks`, `conversation_summaries`, `agent_config` tables + migrations
 - [x] Implement Diesel models for new tables
@@ -623,6 +689,8 @@ A suggested sequence, building on the RAG layer as the foundation:
 - [ ] Implement global + per-user feature flagging for `/v1/agent/*` and background jobs
 - **Milestone:** Agent storage layer exists and is tested
 
+**Implementation status:** Partially implemented (storage tables/models done; feature flags not implemented yet).
+
 ### Phase 3: Agent LLM Runtime (DSRs + BAML)
 - [x] Integrate DSRs signatures + BAML parsing (AgentResponse)
 - [x] Integrate correction signatures for parse repair
@@ -630,15 +698,21 @@ A suggested sequence, building on the RAG layer as the foundation:
 - [x] Implement summarization signatures for compaction
 - **Milestone:** Agent can reliably produce `messages[]` + `tool_calls[]` without native tool calling
 
+**Implementation status:** Complete.
+
 ### Phase 4: Agent Context Builder + Compaction
 - [x] Implement regenerated agent context builder (currently in `src/web/agent/runtime.rs`)
 - [x] Implement compaction (LLM summarization of old messages) into `conversation_summaries`
 - **Milestone:** Agent can sustain long-running conversations without truncation
 
+**Implementation status:** Complete.
+
 ### Phase 5: Memory Tools + Multi-Step Agent Loop
 - [x] Implement agent tool registry (core memory + archival + conversation search + web search)
 - [x] Implement multi-step execution loop (max steps, tool-result continuation)
 - **Milestone:** DSRs-based agent can have multi-turn conversations with memory tool use
+
+**Implementation status:** Partially implemented (memory tools + step loop done; web_search tool not implemented yet).
 
 ### Phase 6: Agent API Surface
 - [x] Implement `/v1/agent/chat` (request-scoped SSE)
@@ -647,9 +721,15 @@ A suggested sequence, building on the RAG layer as the foundation:
 - [x] Wire up async embedding generation after agent message creation
 - **Milestone:** Full agent API surface available
 
+**Implementation status:** Complete (Local/Dev only).
+
 ### Phase 7: Post-MVP
 - Long-lived SSE event channel (`GET /v1/agent/events`) -- proactive notification delivery (Section 7.3)
 - Reminders/scheduling (`scheduled_tasks` + scheduler loop + tools), delivered via the event channel
 - Monitoring/metrics + tuning
 - (Optional) agent-backed Responses API threads (Section 1.3)
 - Code sandboxes (separate major project)
+
+**Implementation status:** Not implemented yet.
+
+**Overall implementation status:** Partially implemented (Phases 1-6 mostly complete; Phase 7 items pending).

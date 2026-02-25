@@ -10,6 +10,10 @@
 .env.local
 .env.*.local
 
+# direnv
+.envrc
+.direnv/
+
 # IDE files
 .vscode/
 .idea/

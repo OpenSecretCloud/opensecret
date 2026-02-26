@@ -1,5 +1,8 @@
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
+use crate::nearai::e2ee::{
+    decrypt_chat_completion_json_in_place, prepare_e2ee_request, NearAiResponseCrypto,
+};
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
@@ -28,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 // Maximum audio file size (100MB) - sanity check, CF already limits to 50MB
@@ -37,6 +40,85 @@ const MAX_AUDIO_SIZE: usize = 100 * 1024 * 1024;
 // Timeout constants for provider requests
 const REQUEST_TIMEOUT_SECS: u64 = 120; // Request timeout (generous for large non-streaming responses)
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming reads
+
+#[derive(Clone)]
+struct PreparedChatRequest {
+    body_json: String,
+    extra_headers: Vec<(HeaderName, HeaderValue)>,
+    near_crypto: Option<NearAiResponseCrypto>,
+}
+
+async fn prepare_chat_request_for_provider(
+    state: &Arc<AppState>,
+    proxy_config: &ProxyConfig,
+    mut body: Value,
+) -> Result<PreparedChatRequest, ApiError> {
+    let mut extra_headers: Vec<(HeaderName, HeaderValue)> = Vec::new();
+    let mut near_crypto: Option<NearAiResponseCrypto> = None;
+
+    if proxy_config.provider_name.to_lowercase() == "nearai" {
+        let model = body
+            .get("model")
+            .and_then(|v| v.as_str())
+            .ok_or(ApiError::BadRequest)?
+            .to_string();
+
+        trace!("Near.AI E2EE: fetching verified node for model={}", model);
+        let node = state
+            .nearai_verifier
+            .get_verified_model_node(&model)
+            .await
+            .map_err(|e| {
+                error!("Near.AI verification failed (model={}): {}", model, e);
+                ApiError::ServiceUnavailable
+            })?;
+
+        trace!(
+            "Near.AI E2EE: using model node pubkey={}... (len={})",
+            &node.signing_public_key[..node.signing_public_key.len().min(16)],
+            node.signing_public_key.len()
+        );
+
+        let crypto = prepare_e2ee_request(&mut body, &node.signing_public_key).map_err(|e| {
+            error!("Near.AI request encryption failed (model={}): {}", model, e);
+            ApiError::ServiceUnavailable
+        })?;
+
+        trace!(
+            "Near.AI E2EE: client ephemeral pubkey={}... (len={})",
+            &crypto.client_public_key_hex[..crypto.client_public_key_hex.len().min(16)],
+            crypto.client_public_key_hex.len()
+        );
+
+        extra_headers.push((
+            HeaderName::from_static("x-signing-algo"),
+            HeaderValue::from_static("ecdsa"),
+        ));
+        extra_headers.push((
+            HeaderName::from_static("x-client-pub-key"),
+            HeaderValue::from_str(&crypto.client_public_key_hex)
+                .map_err(|_| ApiError::InternalServerError)?,
+        ));
+        extra_headers.push((
+            HeaderName::from_static("x-model-pub-key"),
+            HeaderValue::from_str(&node.signing_public_key)
+                .map_err(|_| ApiError::InternalServerError)?,
+        ));
+
+        near_crypto = Some(crypto);
+    }
+
+    let body_json = serde_json::to_string(&body).map_err(|e| {
+        error!("Failed to serialize request body: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    Ok(PreparedChatRequest {
+        body_json,
+        extra_headers,
+        near_crypto,
+    })
+}
 
 /// Parameters for transcription requests
 struct TranscriptionParams<'a> {
@@ -441,7 +523,7 @@ pub async fn get_chat_completion_response(
     // Prepare the request to proxies
     debug!("Sending request for model: {}", model_name);
 
-    let (res, successful_provider) = {
+    let (res, successful_provider, successful_provider_model, successful_near_crypto) = {
         debug!(
             "Using route for model {}: primary={}, fallbacks={}",
             model_name,
@@ -461,11 +543,20 @@ pub async fn get_chat_completion_response(
             primary_body.insert("stream_options".to_string(), json!({"include_usage": true}));
         }
 
-        let primary_body_json =
-            serde_json::to_string(&Value::Object(primary_body)).map_err(|e| {
-                error!("Failed to serialize request body: {:?}", e);
-                ApiError::InternalServerError
-            })?;
+        let primary_provider_is_near = route.primary.provider_name.to_lowercase() == "nearai";
+        let primary_body_value = Value::Object(primary_body);
+        let primary_prepared_static = if primary_provider_is_near {
+            None
+        } else {
+            Some(
+                prepare_chat_request_for_provider(
+                    state,
+                    &route.primary,
+                    primary_body_value.clone(),
+                )
+                .await?,
+            )
+        };
 
         // Prepare fallback request if available
         let fallback_request = if let Some(fallback) = route.fallbacks.first() {
@@ -479,12 +570,24 @@ pub async fn get_chat_completion_response(
                 fallback_body.insert("stream_options".to_string(), json!({"include_usage": true}));
             }
 
-            let fallback_body_json =
-                serde_json::to_string(&Value::Object(fallback_body)).map_err(|e| {
-                    error!("Failed to serialize fallback request body: {:?}", e);
-                    ApiError::InternalServerError
-                })?;
-            Some((fallback, fallback_body_json))
+            let fallback_provider_is_near = fallback.provider_name.to_lowercase() == "nearai";
+            let fallback_body_value = Value::Object(fallback_body);
+            let fallback_prepared_static = if fallback_provider_is_near {
+                None
+            } else {
+                Some(
+                    prepare_chat_request_for_provider(state, fallback, fallback_body_value.clone())
+                        .await?,
+                )
+            };
+
+            Some((
+                fallback,
+                fallback_model_name,
+                fallback_provider_is_near,
+                fallback_body_value,
+                fallback_prepared_static,
+            ))
         } else {
             None
         };
@@ -494,6 +597,8 @@ pub async fn get_chat_completion_response(
         let mut last_error = None;
         let mut found_response = None;
         let mut successful_provider_name = String::new();
+        let mut successful_provider_model_name = String::new();
+        let mut successful_near_crypto: Option<NearAiResponseCrypto> = None;
 
         for cycle in 0..max_cycles {
             if cycle > 0 {
@@ -508,61 +613,149 @@ pub async fn get_chat_completion_response(
                 cycle + 1,
                 route.primary.provider_name
             );
-            match try_provider(&client, &route.primary, &primary_body_json, headers).await {
-                Ok(response) => {
-                    info!(
-                        "Successfully got response from primary provider {} on cycle {}",
-                        route.primary.provider_name,
-                        cycle + 1
-                    );
-                    found_response = Some(response);
-                    successful_provider_name = route.primary.provider_name.clone();
-                    break;
+            let primary_prepared = if primary_provider_is_near {
+                match prepare_chat_request_for_provider(
+                    state,
+                    &route.primary,
+                    primary_body_value.clone(),
+                )
+                .await
+                {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        error!(
+                            "Cycle {}: Failed to prepare request for primary provider {}: {}",
+                            cycle + 1,
+                            route.primary.provider_name,
+                            e
+                        );
+                        last_error = Some(e.to_string());
+                        None
+                    }
                 }
-                Err(err) => {
-                    error!(
-                        "Cycle {}: Primary provider {} failed: {:?}",
-                        cycle + 1,
-                        route.primary.provider_name,
-                        err
-                    );
-                    last_error = Some(err);
-                }
-            }
+            } else {
+                Some(
+                    primary_prepared_static
+                        .clone()
+                        .expect("non-Near.AI primary provider must be pre-prepared"),
+                )
+            };
 
-            // Try fallback if available
-            if let Some((fallback_provider, ref fallback_body_json)) = fallback_request {
-                debug!(
-                    "Cycle {}: Trying fallback provider {}",
-                    cycle + 1,
-                    fallback_provider.provider_name
-                );
-                match try_provider(&client, fallback_provider, fallback_body_json, headers).await {
+            if let Some(primary_prepared) = primary_prepared {
+                match try_provider(
+                    &client,
+                    &route.primary,
+                    &primary_prepared.body_json,
+                    headers,
+                    &primary_prepared.extra_headers,
+                )
+                .await
+                {
                     Ok(response) => {
                         info!(
-                            "Successfully got response from fallback provider {} on cycle {}",
-                            fallback_provider.provider_name,
+                            "Successfully got response from primary provider {} on cycle {}",
+                            route.primary.provider_name,
                             cycle + 1
                         );
                         found_response = Some(response);
-                        successful_provider_name = fallback_provider.provider_name.clone();
+                        successful_provider_name = route.primary.provider_name.clone();
+                        successful_provider_model_name = primary_model_name.clone();
+                        successful_near_crypto = primary_prepared.near_crypto.clone();
                         break;
                     }
                     Err(err) => {
                         error!(
-                            "Cycle {}: Fallback provider {} failed: {:?}",
+                            "Cycle {}: Primary provider {} failed: {:?}",
                             cycle + 1,
-                            fallback_provider.provider_name,
+                            route.primary.provider_name,
                             err
                         );
                         last_error = Some(err);
                     }
                 }
             }
+
+            // Try fallback if available
+            if let Some((
+                fallback_provider,
+                fallback_model_name,
+                fallback_provider_is_near,
+                fallback_body_value,
+                fallback_prepared_static,
+            )) = &fallback_request
+            {
+                debug!(
+                    "Cycle {}: Trying fallback provider {}",
+                    cycle + 1,
+                    fallback_provider.provider_name
+                );
+
+                let fallback_prepared = if *fallback_provider_is_near {
+                    match prepare_chat_request_for_provider(
+                        state,
+                        fallback_provider,
+                        fallback_body_value.clone(),
+                    )
+                    .await
+                    {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            error!(
+                                "Cycle {}: Failed to prepare request for fallback provider {}: {}",
+                                cycle + 1,
+                                fallback_provider.provider_name,
+                                e
+                            );
+                            last_error = Some(e.to_string());
+                            None
+                        }
+                    }
+                } else {
+                    Some(
+                        fallback_prepared_static
+                            .clone()
+                            .expect("non-Near.AI fallback provider must be pre-prepared"),
+                    )
+                };
+
+                if let Some(fallback_prepared) = fallback_prepared {
+                    match try_provider(
+                        &client,
+                        fallback_provider,
+                        &fallback_prepared.body_json,
+                        headers,
+                        &fallback_prepared.extra_headers,
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            info!(
+                                "Successfully got response from fallback provider {} on cycle {}",
+                                fallback_provider.provider_name,
+                                cycle + 1
+                            );
+                            found_response = Some(response);
+                            successful_provider_name = fallback_provider.provider_name.clone();
+                            successful_provider_model_name = fallback_model_name.clone();
+                            successful_near_crypto = fallback_prepared.near_crypto.clone();
+                            break;
+                        }
+                        Err(err) => {
+                            error!(
+                                "Cycle {}: Fallback provider {} failed: {:?}",
+                                cycle + 1,
+                                fallback_provider.provider_name,
+                                err
+                            );
+                            last_error = Some(err);
+                        }
+                    }
+                }
+            }
         }
 
         match found_response {
-            Some(response) => (response, successful_provider_name),
+            Some(response) => (response, successful_provider_name, successful_provider_model_name, successful_near_crypto),
             None => {
                 let error_msg = if route.fallbacks.is_empty() {
                     format!(
@@ -576,6 +769,12 @@ pub async fn get_chat_completion_response(
                     )
                 };
                 error!("{}", error_msg);
+                if route.primary.provider_name.to_lowercase() == "nearai"
+                    && route.fallbacks.is_empty()
+                {
+                    return Err(ApiError::ServiceUnavailable);
+                }
+
                 return Err(ApiError::InternalServerError);
             }
         }
@@ -595,11 +794,30 @@ pub async fn get_chat_completion_response(
             ApiError::InternalServerError
         })?;
 
-        let response_json: Value = serde_json::from_str(&String::from_utf8_lossy(&body_bytes))
+        let mut response_json: Value = serde_json::from_str(&String::from_utf8_lossy(&body_bytes))
             .map_err(|e| {
                 error!("Failed to parse response JSON: {:?}", e);
                 ApiError::InternalServerError
             })?;
+
+        if successful_provider.to_lowercase() == "nearai" {
+            let Some(crypto) = successful_near_crypto.as_ref() else {
+                error!("Near.AI response missing request crypto");
+                return Err(ApiError::InternalServerError);
+            };
+
+            decrypt_chat_completion_json_in_place(&mut response_json, crypto).map_err(|e| {
+                error!("Near.AI response decryption failed: {}", e);
+                warn!(
+                    "Invalidating Near.AI model cache for {} due to decryption failure",
+                    successful_provider_model
+                );
+                let verifier = state.nearai_verifier.clone();
+                let model = successful_provider_model.clone();
+                tokio::spawn(async move { verifier.invalidate_model(&model).await });
+                ApiError::ServiceUnavailable
+            })?;
+        }
 
         // ✅ Handle billing HERE, inside completions API
         if let Some(usage) = extract_usage(&response_json) {
@@ -637,11 +855,16 @@ pub async fn get_chat_completion_response(
     let user_clone = user.clone();
     let billing_ctx = billing_context.clone();
     let provider = successful_provider.clone();
+    let near_crypto = successful_near_crypto.clone();
+    let provider_is_near = provider.to_lowercase() == "nearai";
+    let nearai_verifier = state.nearai_verifier.clone();
+    let model_name_for_invalidation = successful_provider_model.clone();
 
     tokio::spawn(async move {
         let mut body_stream = res.into_body().into_stream();
         let mut buffer = String::new();
         let mut usage_sent = false; // Track if we've already published usage for this stream
+        let mut stream_finished = false; // Track if we've seen finish_reason in ANY prior chunk
 
         loop {
             match timeout(
@@ -667,15 +890,51 @@ pub async fn get_chat_completion_response(
                                 }
 
                                 match serde_json::from_str::<Value>(&frame) {
-                                    Ok(json) => {
-                                        // ✅ Extract and publish billing HERE - but ONLY on final chunk
-                                        // This prevents sending usage data on intermediate chunks that vLLM now includes
-                                        let has_finish = has_finish_reason(&json);
+                                    Ok(mut json) => {
+                                        if provider_is_near {
+                                            let Some(ref crypto) = near_crypto else {
+                                                error!("Near.AI stream missing request crypto");
+                                                let _ = tx_consumer
+                                                    .send(CompletionChunk::Error(
+                                                        "Near.AI crypto missing".to_string(),
+                                                    ))
+                                                    .await;
+                                                return;
+                                            };
+
+                                            if let Err(e) = decrypt_chat_completion_json_in_place(
+                                                &mut json, crypto,
+                                            ) {
+                                                error!(
+                                                    "Near.AI stream chunk decryption failed: {}",
+                                                    e
+                                                );
+                                                warn!(
+                                                    "Invalidating Near.AI model cache for {} due to decryption failure",
+                                                    model_name_for_invalidation
+                                                );
+                                                nearai_verifier.invalidate_model(&model_name_for_invalidation).await;
+                                                let _ = tx_consumer
+                                                    .send(CompletionChunk::Error(
+                                                        "Near.AI decrypt failed".to_string(),
+                                                    ))
+                                                    .await;
+                                                return;
+                                            }
+                                        }
+
+                                        // Track whether the stream has reached a finish_reason
+                                        // Some providers (e.g. Near.AI) send finish_reason and usage
+                                        // on separate chunks, while others (e.g. Tinfoil/vLLM) combine them.
+                                        if has_finish_reason(&json) {
+                                            stream_finished = true;
+                                        }
 
                                         if let Some(usage) = extract_usage(&json) {
-                                            // Only publish usage on final chunk (has finish_reason) with actual completion tokens
-                                            // Also ensure we only send usage once per stream
-                                            if has_finish
+                                            // Publish usage only after stream has finished (finish_reason seen
+                                            // on this or a prior chunk), with actual completion tokens,
+                                            // and only once per stream.
+                                            if stream_finished
                                                 && usage.completion_tokens > 0
                                                 && !usage_sent
                                             {
@@ -699,8 +958,8 @@ pub async fn get_chat_completion_response(
                                                 }
                                             } else {
                                                 trace!(
-                                                    "Skipping usage publish: has_finish={}, completion_tokens={}, usage_sent={}",
-                                                    has_finish, usage.completion_tokens, usage_sent
+                                                    "Skipping usage publish: stream_finished={}, completion_tokens={}, usage_sent={}",
+                                                    stream_finished, usage.completion_tokens, usage_sent
                                                 );
                                             }
                                         }
@@ -715,17 +974,44 @@ pub async fn get_chat_completion_response(
                                         }
                                     }
                                     Err(e) => {
-                                        error!("Received non-JSON data event. Error: {:?}", e);
-                                        if tx_consumer
-                                            .send(CompletionChunk::Error(
-                                                "Invalid JSON".to_string(),
-                                            ))
-                                            .await
-                                            .is_err()
-                                        {
+                                        let trimmed = frame.trim();
+                                        if trimmed.is_empty() {
+                                            trace!("Skipping empty SSE data frame");
+                                        } else if trimmed.chars().all(|c| c == '\r' || c == '\n') {
+                                            trace!("Skipping whitespace-only SSE data frame");
+                                        } else if trimmed.starts_with("error:") {
+                                            // Provider sent a plain-text error — propagate it and stop
+                                            error!(
+                                                "Provider returned a plain-text error frame: {:?}",
+                                                &trimmed[..trimmed.len().min(500)]
+                                            );
+                                            // Invalidate cached Near.AI node so the next request
+                                            // re-verifies with a fresh key (covers key rotation).
+                                            if provider_is_near {
+                                                warn!(
+                                                    "Invalidating Near.AI model cache for {} due to provider error",
+                                                    model_name_for_invalidation
+                                                );
+                                                nearai_verifier.invalidate_model(&model_name_for_invalidation).await;
+                                            }
+                                            let _ = tx_consumer
+                                                .send(CompletionChunk::Error(trimmed.to_string()))
+                                                .await;
                                             return;
+                                        } else if e.to_string().contains("expected value") {
+                                            // Likely a keepalive, comment, or unknown non-JSON line
+                                            warn!(
+                                                "Skipping non-JSON SSE data frame (first 200 chars): {:?}",
+                                                &trimmed[..trimmed.len().min(200)]
+                                            );
+                                        } else {
+                                            error!(
+                                                "Failed to parse SSE data frame as JSON: {} — frame (first 200 chars): {:?}",
+                                                e,
+                                                &trimmed[..trimmed.len().min(200)]
+                                            );
                                         }
-                                        break;
+                                        // Don't break the stream — skip this frame and continue
                                     }
                                 }
                             }
@@ -831,6 +1117,10 @@ fn extract_sse_frame(buffer: &mut String) -> Option<String> {
 
             // Return data content if it's a data frame, otherwise keep looking
             if let Some(data) = frame.strip_prefix("data: ") {
+                // Skip empty data payloads (e.g. keepalive frames like "data: \n\n")
+                if data.trim().is_empty() {
+                    continue;
+                }
                 return Some(data.to_string());
             }
             // Skip non-data frames (comments, etc.) and continue looking
@@ -1357,7 +1647,8 @@ async fn send_transcription_request(
     form_data.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
 
     // Build request
-    let endpoint = format!("{}/v1/audio/transcriptions", provider.base_url);
+    let base_url = normalize_provider_base_url(&provider.base_url);
+    let endpoint = format!("{}/v1/audio/transcriptions", base_url);
     let mut req = Request::builder().method("POST").uri(&endpoint).header(
         "Content-Type",
         format!("multipart/form-data; boundary={}", boundary),
@@ -1499,7 +1790,10 @@ async fn proxy_tts(
     // Build request
     let req = Request::builder()
         .method("POST")
-        .uri(format!("{}/v1/audio/speech", proxy_config.base_url))
+        .uri(format!(
+            "{}/v1/audio/speech",
+            normalize_provider_base_url(&proxy_config.base_url)
+        ))
         .header("Content-Type", "application/json")
         .body(HyperBody::from(
             serde_json::to_string(&tts_api_request).map_err(|e| {
@@ -1633,7 +1927,10 @@ async fn proxy_embeddings(
     })?;
 
     // Build request to provider
-    let endpoint = format!("{}/v1/embeddings", route.primary.base_url);
+    let endpoint = format!(
+        "{}/v1/embeddings",
+        normalize_provider_base_url(&route.primary.base_url)
+    );
     let mut req = Request::builder()
         .method("POST")
         .uri(&endpoint)
@@ -1729,13 +2026,17 @@ async fn try_provider(
     proxy_config: &ProxyConfig,
     body_json: &str,
     headers: &HeaderMap,
+    extra_headers: &[(HeaderName, HeaderValue)],
 ) -> Result<hyper::Response<HyperBody>, String> {
     debug!("Making request to {}", proxy_config.provider_name);
+
+    let base_url = normalize_provider_base_url(&proxy_config.base_url);
+    let url = format!("{}/v1/chat/completions", base_url);
 
     // Build request
     let mut req = Request::builder()
         .method("POST")
-        .uri(format!("{}/v1/chat/completions", proxy_config.base_url))
+        .uri(url.clone())
         .header("Content-Type", "application/json");
 
     if let Some(api_key) = &proxy_config.api_key {
@@ -1746,10 +2047,18 @@ async fn try_provider(
 
     // Forward relevant headers from the original request
     for (key, value) in headers.iter() {
+        // Prevent clients from injecting/overriding Near.AI E2EE routing/crypto headers.
+        // We always set these internally when calling Near.AI.
+        let key_str = key.as_str();
+        let is_near_internal_header = key_str.eq_ignore_ascii_case("x-signing-algo")
+            || key_str.eq_ignore_ascii_case("x-client-pub-key")
+            || key_str.eq_ignore_ascii_case("x-model-pub-key");
+
         if key != header::HOST
             && key != header::AUTHORIZATION
             && key != header::CONTENT_LENGTH
             && key != header::CONTENT_TYPE
+            && !is_near_internal_header
         {
             if let (Ok(name), Ok(val)) = (
                 HeaderName::from_bytes(key.as_ref()),
@@ -1759,6 +2068,24 @@ async fn try_provider(
             }
         }
     }
+
+    // Add provider-specific headers
+    for (name, val) in extra_headers {
+        trace!(
+            "provider={} extra header: {}={}",
+            proxy_config.provider_name,
+            name,
+            val.to_str().unwrap_or("<non-ascii>")
+        );
+        req = req.header(name.clone(), val.clone());
+    }
+
+    trace!(
+        "Sending to provider={} url={} body_len={}",
+        proxy_config.provider_name,
+        url,
+        body_json.len()
+    );
 
     let req = req
         .body(HyperBody::from(body_json.to_string()))
@@ -1818,4 +2145,10 @@ async fn try_provider(
             ))
         }
     }
+}
+
+fn normalize_provider_base_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    trimmed.to_string()
 }

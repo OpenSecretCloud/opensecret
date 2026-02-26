@@ -28,6 +28,9 @@ pub fn model_max_ctx(model: &str) -> usize {
         ("deepseek-r1-0528", 128_000),
         // Gemma 3 27B (vision) — capped at 20k
         ("gemma-3-27b", 20_000),
+        // Near.AI
+        ("glm-5", 202_000),
+        ("zai-org/GLM-5-FP8", 202_000),
     ];
 
     LIMITS
@@ -72,6 +75,7 @@ mod tests {
         assert_eq!(model_max_ctx("llama3-3-70b"), 128_000);
         assert_eq!(model_max_ctx("gpt-oss-120b"), 128_000);
         assert_eq!(model_max_ctx("qwen3-vl-30b"), 256_000);
+        assert_eq!(model_max_ctx("glm-5"), 202_000);
     }
 
     #[test]

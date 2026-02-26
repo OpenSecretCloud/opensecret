@@ -81,6 +81,7 @@ mod kv;
 mod message_signing;
 mod migrations;
 mod models;
+mod nearai;
 mod oauth;
 mod os_flags;
 mod private_key;
@@ -95,6 +96,7 @@ use proxy_config::ProxyRouter;
 
 const ENCLAVE_KEY_NAME: &str = "enclave_key";
 const OPENAI_API_KEY_NAME: &str = "openai_api_key";
+const NEAR_API_KEY_NAME: &str = "near_api_key";
 const JWT_SECRET_KEY_NAME: &str = "jwt_secret";
 
 // General secret key names
@@ -269,6 +271,9 @@ pub enum ApiError {
     #[error("Unprocessable entity")]
     UnprocessableEntity,
 
+    #[error("Service unavailable")]
+    ServiceUnavailable,
+
     #[error("Payload too large")]
     PayloadTooLarge,
 }
@@ -295,6 +300,7 @@ impl IntoResponse for ApiError {
             ApiError::MessageExceedsContextLimit => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         };
         (
@@ -408,6 +414,7 @@ pub struct AppState {
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
     enclave_key: Vec<u8>,
     proxy_router: Arc<ProxyRouter>,
+    nearai_verifier: Arc<crate::nearai::verifier::NearAiVerifier>,
     resend_api_key: Option<String>,
     ephemeral_keys: Arc<RwLock<HashMap<String, EphemeralSecret>>>,
     session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, SessionState>>>,
@@ -430,6 +437,8 @@ pub struct AppStateBuilder {
     openai_api_key: Option<String>,
     openai_api_base: Option<String>,
     tinfoil_api_base: Option<String>,
+    nearai_api_key: Option<String>,
+    nearai_api_base: Option<String>,
     jwt_secret: Option<Vec<u8>>,
     resend_api_key: Option<String>,
     github_client_secret: Option<String>,
@@ -484,6 +493,16 @@ impl AppStateBuilder {
 
     pub fn tinfoil_api_base(mut self, tinfoil_api_base: Option<String>) -> Self {
         self.tinfoil_api_base = tinfoil_api_base;
+        self
+    }
+
+    pub fn nearai_api_key(mut self, nearai_api_key: Option<String>) -> Self {
+        self.nearai_api_key = nearai_api_key;
+        self
+    }
+
+    pub fn nearai_api_base(mut self, nearai_api_base: String) -> Self {
+        self.nearai_api_base = Some(nearai_api_base);
         self
     }
 
@@ -669,11 +688,25 @@ impl AppStateBuilder {
         // Initialize the AppleJwtVerifier
         let apple_jwt_verifier = Arc::new(AppleJwtVerifier::new());
 
+        let nearai_api_base = self
+            .nearai_api_base
+            .unwrap_or_else(|| "https://cloud-api.near.ai".to_string());
+
+        let nearai_verifier = Arc::new(crate::nearai::verifier::NearAiVerifier::new(
+            nearai_api_base.clone(),
+            self.nearai_api_key.clone(),
+        ));
+        nearai_verifier
+            .clone()
+            .spawn_periodic_verification(vec!["zai-org/GLM-5-FP8".to_string()]);
+
         // Initialize the ProxyRouter
         let proxy_router = Arc::new(ProxyRouter::new(
             openai_api_base.clone(),
             self.openai_api_key.clone(),
             self.tinfoil_api_base.clone(),
+            Some(nearai_api_base.clone()),
+            self.nearai_api_key.clone(),
         ));
 
         let (cancellation_tx, _) = tokio::sync::broadcast::channel(1024);
@@ -726,6 +759,7 @@ impl AppStateBuilder {
             aws_credential_manager,
             enclave_key,
             proxy_router,
+            nearai_verifier,
             resend_api_key: self.resend_api_key,
             ephemeral_keys: Arc::new(RwLock::new(HashMap::new())),
             session_states: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -1865,6 +1899,45 @@ async fn retrieve_openai_api_key(
     }
 }
 
+async fn retrieve_near_api_key(
+    aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
+    db: Arc<dyn DBConnection + Send + Sync>,
+) -> Result<Option<String>, Error> {
+    let creds = aws_credential_manager
+        .read()
+        .await
+        .clone()
+        .expect("non-local mode should have creds")
+        .get_credentials()
+        .await
+        .expect("non-local mode should have creds");
+
+    let existing_key = db.get_enclave_secret_by_key(NEAR_API_KEY_NAME)?;
+    let Some(ref encrypted_key) = existing_key else {
+        return Ok(None);
+    };
+
+    let base64_encrypted_key = general_purpose::STANDARD.encode(&encrypted_key.value);
+
+    let decrypted_bytes = decrypt_with_kms(
+        &creds.region,
+        &creds.access_key_id,
+        &creds.secret_access_key,
+        &creds.token,
+        &base64_encrypted_key,
+    )
+    .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+    let key = String::from_utf8(decrypted_bytes)
+        .map_err(|e| Error::EncryptionError(format!("Failed to decode UTF-8: {}", e)))?;
+
+    if key.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(key))
+    }
+}
+
 async fn get_or_create_jwt_secret(
     app_mode: &AppMode,
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
@@ -2592,6 +2665,15 @@ async fn main() -> Result<(), Error> {
     // Tinfoil API base is always from environment (like OpenAI API base)
     let tinfoil_api_base = env::var("TINFOIL_API_BASE").ok();
 
+    let nearai_api_base =
+        env::var("NEARAI_API_BASE").unwrap_or_else(|_| "https://cloud-api.near.ai".to_string());
+
+    let nearai_api_key = if app_mode != AppMode::Local {
+        retrieve_near_api_key(aws_credential_manager.clone(), db.clone()).await?
+    } else {
+        std::env::var("NEAR_API_KEY").ok()
+    };
+
     let jwt_secret = get_or_create_jwt_secret(
         &app_mode,
         aws_credential_manager.clone(),
@@ -2725,6 +2807,8 @@ async fn main() -> Result<(), Error> {
         .openai_api_key(openai_api_key)
         .openai_api_base(openai_api_base)
         .tinfoil_api_base(tinfoil_api_base)
+        .nearai_api_key(nearai_api_key)
+        .nearai_api_base(nearai_api_base)
         .jwt_secret(jwt_secret)
         .resend_api_key(resend_api_key)
         .github_client_secret(github_client_secret.clone())

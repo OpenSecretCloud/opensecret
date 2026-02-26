@@ -1328,6 +1328,134 @@ sudo systemctl restart vsock-tinfoil-router-inf9.service
 sudo systemctl restart vsock-tinfoil-router-inf10.service
 ```
 
+## Vsock Near.AI proxies
+Create vsock proxy services so that the enclave can talk to Near.AI and its attestation dependencies (NVIDIA NRAS for GPU attestation and Intel PCS for TDX DCAP collateral).
+
+First configure the endpoints into their allowlist:
+
+```sh
+sudo vim /etc/nitro_enclaves/vsock-proxy.yaml
+```
+
+Add these lines:
+```
+- {address: cloud-api.near.ai, port: 443}
+- {address: nras.attestation.nvidia.com, port: 443}
+- {address: api.trustedservices.intel.com, port: 443}
+- {address: certificates.trustedservices.intel.com, port: 443}
+```
+
+Restart the nitro vsock proxy service:
+```
+sudo systemctl restart nitro-enclaves-vsock-proxy.service
+```
+
+#### Near.AI Cloud API
+```sh
+sudo vim /etc/systemd/system/vsock-near-cloud-api-proxy.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Near.AI Cloud API Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8042 cloud-api.near.ai 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### NVIDIA NRAS (GPU Attestation)
+```sh
+sudo vim /etc/systemd/system/vsock-near-nras-proxy.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock NVIDIA NRAS Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8043 nras.attestation.nvidia.com 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Intel PCS (DCAP Collateral)
+```sh
+sudo vim /etc/systemd/system/vsock-near-intel-pcs-proxy.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Intel PCS Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8044 api.trustedservices.intel.com 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Intel Certificates (Root CA CRL)
+```sh
+sudo vim /etc/systemd/system/vsock-near-intel-certs-proxy.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Intel Certificates Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8045 certificates.trustedservices.intel.com 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Activate all the services:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable vsock-near-cloud-api-proxy.service
+sudo systemctl start vsock-near-cloud-api-proxy.service
+sudo systemctl status vsock-near-cloud-api-proxy.service
+sudo systemctl enable vsock-near-nras-proxy.service
+sudo systemctl start vsock-near-nras-proxy.service
+sudo systemctl status vsock-near-nras-proxy.service
+sudo systemctl enable vsock-near-intel-pcs-proxy.service
+sudo systemctl start vsock-near-intel-pcs-proxy.service
+sudo systemctl status vsock-near-intel-pcs-proxy.service
+sudo systemctl enable vsock-near-intel-certs-proxy.service
+sudo systemctl start vsock-near-intel-certs-proxy.service
+sudo systemctl status vsock-near-intel-certs-proxy.service
+```
+
+If you need to restart these services:
+```sh
+sudo systemctl restart vsock-near-cloud-api-proxy.service
+sudo systemctl restart vsock-near-nras-proxy.service
+sudo systemctl restart vsock-near-intel-pcs-proxy.service
+sudo systemctl restart vsock-near-intel-certs-proxy.service
+```
+
 ## KMS Key
 
 You need to create an AWS KMS key that the enclave can encrypt/decrypt things to. Name it according to your environment:
@@ -1697,6 +1825,27 @@ Take that encrypted base64 and insert it into the `enclave_secrets` table with k
 ```sql
 INSERT INTO enclave_secrets (key, value)
 VALUES ('os_flags_base_url', decode('your_base64_string', 'base64'));
+```
+
+#### Near.AI API Key
+
+After the DB is initialized, we need to store the Near.AI Cloud API key encrypted to the enclave KMS key. This key is used for authenticated requests to `cloud-api.near.ai`.
+
+```sh
+echo -n "NEAR_API_KEY" | base64 -w 0
+```
+
+Take that output and encrypt to the KMS key, from a machine that has encrypt access to the key:
+
+```sh
+aws kms encrypt --key-id "KEY_ARN" --plaintext "BASE64_KEY" --query CiphertextBlob --output text
+```
+
+Take that encrypted base64 and insert it into the `enclave_secrets` table with key as `near_api_key` and value as the base64.
+
+```sql
+INSERT INTO enclave_secrets (key, value)
+VALUES ('near_api_key', decode('your_base64_string', 'base64'));
 ```
 
 ## Secrets Manager

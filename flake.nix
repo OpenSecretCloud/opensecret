@@ -27,7 +27,7 @@
         rustToolchain = builtins.fromTOML (builtins.readFile ./rust-toolchain.toml);
         rustChannel = rustToolchain.toolchain.channel;
         rustAnalyzer = pkgs.rust-bin.stable."${rustChannel}".rust-analyzer;
-        
+
         commonInputs = [
           rust
           rustAnalyzer
@@ -62,15 +62,34 @@
           ++ pkgs.lib.optionals pkgs.stdenv.isDarwin darwinOnlyInputs;
 
         setupPostgresScript = pkgs.writeShellScript "setup-postgres" ''
-          export PGDATA=$(mktemp -d)
-          export PGSOCKETS=$(mktemp -d)
-          ${pkgs.postgresql}/bin/initdb -D $PGDATA
-          ${pkgs.postgresql}/bin/pg_ctl start -D $PGDATA -o "-h localhost -p 5432 -k $PGSOCKETS"
-          until ${pkgs.postgresql}/bin/pg_isready -h localhost -p 5432; do sleep 1; done
-          ${pkgs.postgresql}/bin/createuser -h localhost -p 5432 -s postgres
-          ${pkgs.postgresql}/bin/psql -h localhost -p 5432 -c "CREATE USER \"opensecret_user\" WITH PASSWORD 'password';" -U postgres
-          ${pkgs.postgresql}/bin/psql -h localhost -p 5432 -c "CREATE DATABASE \"opensecret\" OWNER \"opensecret_user\";" -U postgres
-          exit
+          export PGDATA="$PWD/.pgdata"
+          export PGPORT=5432
+          export PGSOCKETS="$PWD/.pgdata/sockets"
+
+          # Skip if Postgres is already running
+          if ${pkgs.postgresql}/bin/pg_isready -h localhost -p $PGPORT >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          # Initialize if needed
+          if [ ! -f "$PGDATA/PG_VERSION" ]; then
+            ${pkgs.postgresql}/bin/initdb -D "$PGDATA"
+          fi
+
+          # Ensure socket directory exists
+          mkdir -p "$PGSOCKETS"
+
+          # Start Postgres
+          ${pkgs.postgresql}/bin/pg_ctl start -D "$PGDATA" -o "-h localhost -p $PGPORT -k $PGSOCKETS" -l "$PGDATA/logfile" -w
+
+          # Wait for it to be ready
+          until ${pkgs.postgresql}/bin/pg_isready -h localhost -p $PGPORT >/dev/null 2>&1; do sleep 0.5; done
+
+          # Create user and database if they don't exist
+          ${pkgs.postgresql}/bin/psql -h localhost -p $PGPORT -tc "SELECT 1 FROM pg_roles WHERE rolname='opensecret_user'" postgres 2>/dev/null | grep -q 1 || \
+            ${pkgs.postgresql}/bin/psql -h localhost -p $PGPORT -c "CREATE USER \"opensecret_user\" WITH PASSWORD 'password';" postgres
+          ${pkgs.postgresql}/bin/psql -h localhost -p $PGPORT -tc "SELECT 1 FROM pg_database WHERE datname='opensecret'" postgres 2>/dev/null | grep -q 1 || \
+            ${pkgs.postgresql}/bin/psql -h localhost -p $PGPORT -c "CREATE DATABASE \"opensecret\" OWNER \"opensecret_user\";" postgres
         '';
 
         setupEnvScript = pkgs.writeShellScript "setup-env" ''
@@ -107,13 +126,13 @@
               ln -sf ${pkgs.jq}/bin/jq /bin/jq
               ln -sf ${pkgs.socat}/bin/socat /bin/socat
               ln -sf ${pkgs.curl}/bin/curl /bin/curl
-              
+
               # Set up CA certificates
               mkdir -p /etc/ssl/certs
               ln -sf ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt /etc/ssl/certs/ca-bundle.crt
               export SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
               export AWS_CA_BUNDLE=/etc/ssl/certs/ca-bundle.crt
-              
+
               # Copy required libraries and tools
               mkdir -p /lib
               export LD_LIBRARY_PATH="/lib:$LD_LIBRARY_PATH"
@@ -128,7 +147,7 @@
               cp -P ${pkgs.glibc}/lib/libpthread.so* /lib/
               cp -P ${pkgs.glibc}/lib/librt.so* /lib/
               cp -P ${pkgs.glibc}/lib/libm.so* /lib/
-              
+
               # Set up Python environment
               export PYTHONPATH="$(find ${pkgs.python3}/lib -name site-packages):$PYTHONPATH"
 
@@ -192,7 +211,7 @@
         mkEif = appMode: nitro.buildEif {
           name = "opensecret-eif-${appMode}";
           # The kernel image location varies by architecture
-          kernel = if arch == "aarch64" 
+          kernel = if arch == "aarch64"
             then "${customKernel}/Image"  # ARM64 uses Image
             else "${customKernel}/bzImage"; # x86_64 uses bzImage
           # Use the blob config since extracting from custom kernel is complex
@@ -212,10 +231,10 @@
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
-              let 
+              let
                 baseName = baseNameOf path;
                 parts = pkgs.lib.splitString "/" path;
-              in 
+              in
                 # Explicitly exclude .env files
                 (baseName != ".env" && baseName != ".env.sample") &&
                 (

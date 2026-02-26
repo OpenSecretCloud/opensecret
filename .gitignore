@@ -14,6 +14,9 @@
 .envrc
 .direnv/
 
+# Local Postgres data
+.pgdata/
+
 # IDE files
 .vscode/
 .idea/
@@ -49,8 +52,9 @@ __pycache__/
 tinfoil-proxy/build/
 tinfoil-proxy/*.spec
 tuf-repo-cdn.sigstore.dev.json
-# Keep the binary
+# Keep the binaries
 !tinfoil-proxy/dist/tinfoil-proxy
+!tinfoil-proxy/dist/tinfoil-proxy-x86_64
 
 thirdparty/
 

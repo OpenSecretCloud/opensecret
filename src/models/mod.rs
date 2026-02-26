@@ -1,7 +1,10 @@
 pub mod account_deletion;
+pub mod agent_config;
+pub mod conversation_summaries;
 pub mod email_verification;
 pub mod enclave_secrets;
 pub mod invite_codes;
+pub mod memory_blocks;
 pub mod oauth;
 pub mod org_memberships;
 pub mod org_project_secrets;
@@ -17,5 +20,6 @@ pub mod responses;
 pub mod schema;
 pub mod token_usage;
 pub mod user_api_keys;
+pub mod user_embeddings;
 pub mod user_kv;
 pub mod users;

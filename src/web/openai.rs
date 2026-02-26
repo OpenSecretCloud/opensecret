@@ -1558,55 +1558,10 @@ async fn proxy_tts(
     encrypt_response(&state, &session_id, &audio_response).await
 }
 
-async fn proxy_embeddings(
-    State(state): State<Arc<AppState>>,
-    _headers: HeaderMap,
-    axum::Extension(session_id): axum::Extension<Uuid>,
-    axum::Extension(user): axum::Extension<User>,
-    axum::Extension(_auth_method): axum::Extension<AuthMethod>,
-    axum::Extension(embedding_request): axum::Extension<EmbeddingRequest>,
-) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
-    debug!("Entering proxy_embeddings function");
-
-    // Check if guest user is allowed (paid guests are allowed, free guests are not)
-    if user.is_guest() {
-        if let Some(billing_client) = &state.billing_client {
-            match billing_client.is_user_paid(user.uuid).await {
-                Ok(true) => {
-                    debug!("Paid guest user allowed for embeddings: {}", user.uuid);
-                }
-                Ok(false) => {
-                    error!(
-                        "Free guest user attempted to use embeddings feature: {}",
-                        user.uuid
-                    );
-                    return Err(ApiError::Unauthorized);
-                }
-                Err(e) => {
-                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
-                    return Err(ApiError::Unauthorized);
-                }
-            }
-        } else {
-            error!(
-                "Guest user attempted to use embeddings without billing client: {}",
-                user.uuid
-            );
-            return Err(ApiError::Unauthorized);
-        }
-    }
-
-    // Validate input is not empty
-    let is_empty = match &embedding_request.input {
-        Value::String(s) => s.trim().is_empty(),
-        Value::Array(arr) => arr.is_empty(),
-        _ => true,
-    };
-    if is_empty {
-        error!("Input is empty or invalid");
-        return Err(ApiError::BadRequest);
-    }
-
+async fn request_embeddings_from_primary(
+    state: &AppState,
+    embedding_request: &EmbeddingRequest,
+) -> Result<(Value, String), ApiError> {
     // Get the model route configuration
     let route = match state.proxy_router.get_model_route(&embedding_request.model) {
         Some(r) => r,
@@ -1626,8 +1581,15 @@ async fn proxy_embeddings(
         .pool_max_idle_per_host(10)
         .build::<_, HyperBody>(https);
 
+    // Translate model name for the provider (if needed)
+    let provider_model_name = state
+        .proxy_router
+        .get_model_name_for_provider(&embedding_request.model, &route.primary.provider_name);
+    let mut provider_request = embedding_request.clone();
+    provider_request.model = provider_model_name;
+
     // Build request body
-    let request_body = serde_json::to_string(&embedding_request).map_err(|e| {
+    let request_body = serde_json::to_string(&provider_request).map_err(|e| {
         error!("Failed to serialize embedding request: {:?}", e);
         ApiError::InternalServerError
     })?;
@@ -1692,30 +1654,142 @@ async fn proxy_embeddings(
         ApiError::InternalServerError
     })?;
 
-    // Handle billing - embeddings only have prompt_tokens (no completion_tokens)
-    if let Some(usage) = response_json.get("usage") {
-        let prompt_tokens = usage
-            .get("prompt_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0) as i32;
+    Ok((response_json, route.primary.provider_name))
+}
 
-        if prompt_tokens > 0 {
-            let billing_context =
-                BillingContext::new(_auth_method, embedding_request.model.clone());
-            let embedding_usage = CompletionUsage {
-                prompt_tokens,
-                completion_tokens: 0, // Embeddings don't have completion tokens
-            };
-            publish_usage_event_internal(
-                &state,
-                &user,
-                &billing_context,
-                embedding_usage,
-                &route.primary.provider_name,
-            )
-            .await;
+async fn request_embeddings_with_billing(
+    state: &Arc<AppState>,
+    user: &User,
+    auth_method: AuthMethod,
+    embedding_request: &EmbeddingRequest,
+) -> Result<(Value, String, i32), ApiError> {
+    // Check if guest user is allowed (paid guests are allowed, free guests are not)
+    if user.is_guest() {
+        if let Some(billing_client) = &state.billing_client {
+            match billing_client.is_user_paid(user.uuid).await {
+                Ok(true) => {
+                    debug!("Paid guest user allowed for embeddings: {}", user.uuid);
+                }
+                Ok(false) => {
+                    error!(
+                        "Free guest user attempted to use embeddings feature: {}",
+                        user.uuid
+                    );
+                    return Err(ApiError::Unauthorized);
+                }
+                Err(e) => {
+                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
+                    return Err(ApiError::Unauthorized);
+                }
+            }
+        } else {
+            error!(
+                "Guest user attempted to use embeddings without billing client: {}",
+                user.uuid
+            );
+            return Err(ApiError::Unauthorized);
         }
     }
+
+    let (response_json, provider_name) =
+        request_embeddings_from_primary(state, embedding_request).await?;
+
+    let prompt_tokens: i32 = response_json
+        .get("usage")
+        .and_then(|u| u.get("prompt_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0) as i32;
+
+    // Handle billing - embeddings only have prompt_tokens (no completion_tokens)
+    if prompt_tokens > 0 {
+        let billing_context = BillingContext::new(auth_method, embedding_request.model.clone());
+        let embedding_usage = CompletionUsage {
+            prompt_tokens,
+            completion_tokens: 0,
+        };
+        publish_usage_event_internal(
+            state,
+            user,
+            &billing_context,
+            embedding_usage,
+            &provider_name,
+        )
+        .await;
+    }
+
+    Ok((response_json, provider_name, prompt_tokens))
+}
+
+pub async fn get_embedding_vector(
+    state: &Arc<AppState>,
+    user: &User,
+    auth_method: AuthMethod,
+    model: &str,
+    input: &str,
+    dimensions: Option<i32>,
+) -> Result<(Vec<f32>, i32), ApiError> {
+    let request = EmbeddingRequest {
+        input: Value::String(input.to_string()),
+        model: model.to_string(),
+        encoding_format: Some("float".to_string()),
+        dimensions,
+        user: None,
+    };
+
+    let (response_json, _provider, prompt_tokens) =
+        request_embeddings_with_billing(state, user, auth_method, &request).await?;
+
+    let embedding = response_json
+        .get("data")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|obj| obj.get("embedding"))
+        .and_then(|v| v.as_array())
+        .ok_or(ApiError::InternalServerError)?;
+
+    let mut vector: Vec<f32> = Vec::with_capacity(embedding.len());
+    for v in embedding {
+        let f = v.as_f64().ok_or(ApiError::InternalServerError)?;
+        vector.push(f as f32);
+    }
+
+    if let Some(dim) = dimensions {
+        if vector.len() != dim as usize {
+            error!(
+                "Embeddings response dim mismatch: expected={}, got={}",
+                dim,
+                vector.len()
+            );
+            return Err(ApiError::InternalServerError);
+        }
+    }
+
+    Ok((vector, prompt_tokens))
+}
+
+async fn proxy_embeddings(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(user): axum::Extension<User>,
+    axum::Extension(auth_method): axum::Extension<AuthMethod>,
+    axum::Extension(embedding_request): axum::Extension<EmbeddingRequest>,
+) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+    debug!("Entering proxy_embeddings function");
+
+    // Validate input is not empty
+    let is_empty = match &embedding_request.input {
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(arr) => arr.is_empty(),
+        _ => true,
+    };
+    if is_empty {
+        error!("Input is empty or invalid");
+        return Err(ApiError::BadRequest);
+    }
+
+    let (response_json, _provider_name, _prompt_tokens) =
+        request_embeddings_with_billing(&state, &user, auth_method, &embedding_request).await?;
 
     debug!("Exiting proxy_embeddings function");
 

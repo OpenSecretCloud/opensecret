@@ -22,6 +22,23 @@ diesel::table! {
 }
 
 diesel::table! {
+    agent_config (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        conversation_id -> Nullable<Int8>,
+        enabled -> Bool,
+        model -> Text,
+        max_context_tokens -> Int4,
+        compaction_threshold -> Float4,
+        system_prompt_enc -> Nullable<Bytea>,
+        preferences_enc -> Nullable<Bytea>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     assistant_messages (id) {
         id -> Int8,
         uuid -> Uuid,
@@ -34,6 +51,23 @@ diesel::table! {
         finish_reason -> Nullable<Text>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    conversation_summaries (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        conversation_id -> Int8,
+        from_created_at -> Timestamptz,
+        to_created_at -> Timestamptz,
+        message_count -> Int4,
+        content_enc -> Bytea,
+        content_tokens -> Int4,
+        embedding_enc -> Nullable<Bytea>,
+        previous_summary_id -> Nullable<Int8>,
+        created_at -> Timestamptz,
     }
 }
 
@@ -77,6 +111,22 @@ diesel::table! {
         role -> Text,
         used -> Bool,
         expires_at -> Timestamptz,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    memory_blocks (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        label -> Text,
+        description -> Nullable<Text>,
+        value_enc -> Bytea,
+        char_limit -> Int4,
+        read_only -> Bool,
+        version -> Int4,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
@@ -308,6 +358,27 @@ diesel::table! {
 }
 
 diesel::table! {
+    user_embeddings (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        source_type -> Text,
+        user_message_id -> Nullable<Int8>,
+        assistant_message_id -> Nullable<Int8>,
+        conversation_id -> Nullable<Int8>,
+        vector_enc -> Bytea,
+        embedding_model -> Text,
+        vector_dim -> Int4,
+        content_enc -> Bytea,
+        metadata_enc -> Nullable<Bytea>,
+        tags_enc -> Array<Nullable<Text>>,
+        token_count -> Int4,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     user_instructions (id) {
         id -> Int8,
         uuid -> Uuid,
@@ -343,6 +414,7 @@ diesel::table! {
         prompt_tokens -> Int4,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        attachment_text_enc -> Nullable<Bytea>,
     }
 }
 
@@ -375,8 +447,10 @@ diesel::table! {
     }
 }
 
+diesel::joinable!(agent_config -> conversations (conversation_id));
 diesel::joinable!(assistant_messages -> conversations (conversation_id));
 diesel::joinable!(assistant_messages -> responses (response_id));
+diesel::joinable!(conversation_summaries -> conversations (conversation_id));
 diesel::joinable!(invite_codes -> orgs (org_id));
 diesel::joinable!(org_memberships -> orgs (org_id));
 diesel::joinable!(org_project_secrets -> org_projects (project_id));
@@ -391,6 +465,9 @@ diesel::joinable!(tool_calls -> responses (response_id));
 diesel::joinable!(tool_outputs -> conversations (conversation_id));
 diesel::joinable!(tool_outputs -> responses (response_id));
 diesel::joinable!(tool_outputs -> tool_calls (tool_call_fk));
+diesel::joinable!(user_embeddings -> assistant_messages (assistant_message_id));
+diesel::joinable!(user_embeddings -> conversations (conversation_id));
+diesel::joinable!(user_embeddings -> user_messages (user_message_id));
 diesel::joinable!(user_messages -> conversations (conversation_id));
 diesel::joinable!(user_messages -> responses (response_id));
 diesel::joinable!(user_oauth_connections -> oauth_providers (provider_id));
@@ -398,11 +475,14 @@ diesel::joinable!(users -> org_projects (project_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     account_deletion_requests,
+    agent_config,
     assistant_messages,
+    conversation_summaries,
     conversations,
     email_verifications,
     enclave_secrets,
     invite_codes,
+    memory_blocks,
     oauth_providers,
     org_memberships,
     org_project_secrets,
@@ -420,6 +500,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     tool_calls,
     tool_outputs,
     user_api_keys,
+    user_embeddings,
     user_instructions,
     user_kv,
     user_messages,

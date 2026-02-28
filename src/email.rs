@@ -120,21 +120,22 @@ const WELCOME_EMAIL_HTML: &str = r#"
             margin: 0 0 16px;
         }
         .feature-grid {
-            display: block;
+            border-collapse: collapse;
+            mso-table-lspace: 0pt;
+            mso-table-rspace: 0pt;
             margin: 0 0 16px;
         }
-        .feature-item {
-            display: inline-block;
+        .feature-grid td {
             vertical-align: top;
-            width: 46%;
             padding: 8px 0;
+            width: 50%;
         }
-        .feature-item .label {
+        .feature-grid .label {
             font-size: 14px;
             font-weight: 600;
             color: #111;
         }
-        .feature-item .desc {
+        .feature-grid .desc {
             font-size: 13px;
             color: #666;
             margin-top: 2px;
@@ -221,32 +222,38 @@ const WELCOME_EMAIL_HTML: &str = r#"
             <h2>Do More with Pro</h2>
             <p>Unlock the full power of private AI. Everything is end-to-end encrypted and your data stays yours.</p>
 
-            <div class="feature-grid">
-                <div class="feature-item">
-                    <div class="label">Most Powerful Models</div>
-                    <div class="desc">Top open models, private by default</div>
-                </div>
-                <div class="feature-item">
-                    <div class="label">Web Search</div>
-                    <div class="desc">Real-time answers from the web</div>
-                </div>
-                <div class="feature-item">
-                    <div class="label">Image Analysis</div>
-                    <div class="desc">Understand photos and screenshots</div>
-                </div>
-                <div class="feature-item">
-                    <div class="label">Document Upload</div>
-                    <div class="desc">Analyze PDFs, text docs, and more</div>
-                </div>
-                <div class="feature-item">
-                    <div class="label">Voice</div>
-                    <div class="desc">Talk to Maple on mobile and desktop</div>
-                </div>
-                <div class="feature-item">
-                    <div class="label">Developer API</div>
-                    <div class="desc">OpenAI-compatible API access</div>
-                </div>
-            </div>
+            <table class="feature-grid" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                    <td>
+                        <div class="label">Most Powerful Models</div>
+                        <div class="desc">Top open models, private by default</div>
+                    </td>
+                    <td>
+                        <div class="label">Web Search</div>
+                        <div class="desc">Real-time answers from the web</div>
+                    </td>
+                </tr>
+                <tr>
+                    <td>
+                        <div class="label">Image Analysis</div>
+                        <div class="desc">Understand photos and screenshots</div>
+                    </td>
+                    <td>
+                        <div class="label">Document Upload</div>
+                        <div class="desc">Analyze PDFs, text docs, and more</div>
+                    </td>
+                </tr>
+                <tr>
+                    <td>
+                        <div class="label">Voice</div>
+                        <div class="desc">Talk to Maple on mobile and desktop</div>
+                    </td>
+                    <td>
+                        <div class="label">Developer API</div>
+                        <div class="desc">OpenAI-compatible API access</div>
+                    </td>
+                </tr>
+            </table>
 
             <div style="text-align: center;">
                 <a href="https://trymaple.ai/pricing" class="cta-button">See Plans</a>

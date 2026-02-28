@@ -29,46 +29,271 @@ const WELCOME_EMAIL_HTML: &str = r#"
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Welcome to Maple AI</title>
     <style>
-        body { font-family: ui-sans-serif,system-ui,sans-serif; }
-        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-        h1, h2, h3 { font-weight: 300; }
-        .security-features { background-color: rgba(0,0,0,0.05); padding: 15px; border-radius: 5px; margin-bottom: 20px; }
+        body {
+            font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f9fafb;
+            color: #1a1a1a;
+            -webkit-font-smoothing: antialiased;
+        }
+        .wrapper {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: #ffffff;
+        }
+        .header {
+            padding: 40px 32px 24px;
+            text-align: center;
+        }
+        .header img.logo {
+            height: 40px;
+            margin-bottom: 16px;
+        }
+        .header h1 {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            font-size: 32px;
+            font-weight: 350;
+            letter-spacing: -0.02em;
+            margin: 0;
+            color: #111;
+        }
+        .header p {
+            font-size: 16px;
+            color: #555;
+            margin: 12px 0 0;
+            line-height: 1.5;
+        }
+        .hero-image {
+            text-align: center;
+            padding: 8px 32px 24px;
+        }
+        .hero-image img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 8px;
+        }
+        .section {
+            padding: 0 32px 24px;
+        }
+        .section h2 {
+            font-size: 18px;
+            font-weight: 600;
+            margin: 0 0 8px;
+            color: #111;
+        }
+        .section p {
+            font-size: 15px;
+            color: #444;
+            line-height: 1.6;
+            margin: 0 0 12px;
+        }
+        .download-buttons {
+            text-align: center;
+            padding: 0 32px 32px;
+        }
+        .download-buttons a {
+            display: inline-block;
+            margin: 4px 6px;
+        }
+        .download-buttons img {
+            height: 44px;
+        }
+        .divider {
+            border: none;
+            border-top: 1px solid #eee;
+            margin: 0 32px;
+        }
+        .pro-section {
+            padding: 24px 32px;
+        }
+        .pro-section h2 {
+            font-size: 18px;
+            font-weight: 600;
+            margin: 0 0 12px;
+            color: #111;
+        }
+        .pro-section p {
+            font-size: 15px;
+            color: #444;
+            line-height: 1.6;
+            margin: 0 0 16px;
+        }
+        .feature-grid {
+            border-collapse: collapse;
+            mso-table-lspace: 0pt;
+            mso-table-rspace: 0pt;
+            margin: 0 0 16px;
+        }
+        .feature-grid td {
+            vertical-align: top;
+            padding: 8px 0;
+            width: 50%;
+        }
+        .feature-grid .label {
+            font-size: 14px;
+            font-weight: 600;
+            color: #111;
+        }
+        .feature-grid .desc {
+            font-size: 13px;
+            color: #666;
+            margin-top: 2px;
+        }
+        .cta-button {
+            display: inline-block;
+            padding: 12px 28px;
+            background-color: #111;
+            color: #ffffff !important;
+            text-decoration: none;
+            border-radius: 6px;
+            font-size: 15px;
+            font-weight: 500;
+        }
+        .proxy-section {
+            padding: 24px 32px;
+            background-color: #f4f4f5;
+        }
+        .proxy-section h2 {
+            font-size: 16px;
+            font-weight: 600;
+            margin: 0 0 8px;
+            color: #111;
+        }
+        .proxy-section p {
+            font-size: 14px;
+            color: #555;
+            line-height: 1.6;
+            margin: 0 0 12px;
+        }
+        .proxy-section a {
+            color: #a855f7;
+            font-weight: 600;
+        }
+        .footer {
+            padding: 24px 32px;
+            text-align: center;
+        }
+        .footer p {
+            font-size: 13px;
+            color: #999;
+            margin: 0 0 6px;
+            line-height: 1.5;
+        }
+        a {
+            color: #a855f7;
+        }
+        .footer a {
+            color: #a855f7;
+            text-decoration: none;
+        }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>Welcome to <a href="https://trymaple.ai">Maple AI</a>!</h1>
-        <p>We're thrilled to have you join us.</p>
+    <div class="wrapper">
 
-        <p><em>Just as Maple trees thrive through their discreet underground communication network of fungal hyphae, Maple AI empowers you to flourish in the digital world while maintaining your privacy.</em></p>
-
-        <h2>Your Secure, AI-Powered Second Brain</h2>
-        <p>Maple AI is designed with privacy and security at its core, helping you:</p>
-        <ul>
-            <li>Organize your thoughts</li>
-            <li>Enhance your creativity</li>
-            <li>Boost your productivity</li>
-        </ul>
-        <p>With Maple AI, you can chat with your notes, create new ideas, and connect concepts effortlessly, all while maintaining complete control over your data.</p>
-        
-        <div class="security-features">
-            <h3>Privacy: Our Core Value</h3>
-            <ul>
-                <li><strong>Confidential Compute:</strong> Secure enclaves ensure we can't see your requests.</li>
-                <li><strong>End-to-End Encryption:</strong> Your chat history is synced with a private key we can't access.</li>
-                <li><strong>Encrypted GPU:</strong> Enjoy a private 1:1 conversation with your AI companion.</li>
-            </ul>
+        <!-- Header -->
+        <div class="header">
+            <!-- PLACEHOLDER: Maple logo -->
+            <!-- <img class="logo" src="MAPLE_LOGO_URL" alt="Maple AI"> -->
+            <h1>Welcome to Maple AI</h1>
+            <p>Powerful AI that respects your privacy</p>
         </div>
 
-        <p>At OpenSecret, we believe privacy is essential for trusted conversations – not just with people, but also with AI. By prioritizing your privacy, we're creating a more secure world that puts individual needs and values at its core.</p>
+        <!-- Intro message -->
+        <div class="section">
+            <h2>Your private room is ready</h2>
+            <p>This is a personal space for you and AI to talk, without anyone listening. When your conversations are confidential, you're free to think openly, ask questions, and build the future. Say what's on your mind.</p>
+        </div>
+        <div class="download-buttons">
+            <a href="https://trymaple.ai" style="background-color: #a855f7; color: #fff; padding: 12px 28px; border-radius: 6px; text-decoration: none; font-size: 15px; font-weight: 500;">Start your first chat</a>
+        </div>
 
-        <p>We hope you enjoy using Maple AI, knowing that your sensitive discussions and data are protected at every step. Your privacy is not just a feature – it's our mission.</p>
+        <!-- Hero Image: Replace src with your hosted image URL -->
+        <div class="hero-image">
+            <img src="https://blog.trymaple.ai/content/images/size/w1600/2026/02/maple-mobile-and-desktop.jpg" alt="Maple AI on desktop and mobile" style="max-width: 100%; height: auto; border-radius: 8px;">
+        </div>
 
-        <p>Your feedback is incredibly valuable. If you encounter any issues or have suggestions, please reach out to us at <a href="mailto:support@opensecret.cloud">support@opensecret.cloud</a>.</p>
+        <!-- Download Section -->
+        <div class="section">
+            <h2>Get Maple on Every Device</h2>
+            <p>Your conversations sync securely across all your devices. Pick up right where you left off. iPhone, Android, Mac, Linux, and Web.</p>
+        </div>
+        <div class="download-buttons">
+            <a href="https://trymaple.ai/downloads" style="background-color: #111; color: #fff; padding: 12px 28px; border-radius: 6px; text-decoration: none; font-size: 15px; font-weight: 500;">Download Apps</a>
+        </div>
 
-        <p>Thank you for being an early adopter and helping us shape the future of secure, AI-powered productivity!</p>
+        <hr class="divider">
 
-        <p>Best regards,<br>The OpenSecret Team</p>
+        <!-- Pro Upsell -->
+        <div class="pro-section">
+            <h2>Do More with Pro</h2>
+            <p>Unlock the full power of private AI. Everything is end-to-end encrypted and your data stays yours.</p>
+
+            <table class="feature-grid" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                    <td>
+                        <div class="label">Most Powerful Models</div>
+                        <div class="desc">Top open models, private by default</div>
+                    </td>
+                    <td>
+                        <div class="label">Web Search</div>
+                        <div class="desc">Real-time answers from the web</div>
+                    </td>
+                </tr>
+                <tr>
+                    <td>
+                        <div class="label">Image Analysis</div>
+                        <div class="desc">Understand photos and screenshots</div>
+                    </td>
+                    <td>
+                        <div class="label">Document Upload</div>
+                        <div class="desc">Analyze PDFs, text docs, and more</div>
+                    </td>
+                </tr>
+                <tr>
+                    <td>
+                        <div class="label">Voice</div>
+                        <div class="desc">Talk to Maple on mobile and desktop</div>
+                    </td>
+                    <td>
+                        <div class="label">Developer API</div>
+                        <div class="desc">OpenAI-compatible API access</div>
+                    </td>
+                </tr>
+            </table>
+
+            <div style="text-align: center;">
+                <a href="https://trymaple.ai/pricing" class="cta-button">See Plans</a>
+            </div>
+        </div>
+
+        <hr class="divider">
+
+        <!-- Maple Proxy -->
+        <div class="proxy-section">
+            <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; mso-table-lspace: 0pt; mso-table-rspace: 0pt;">
+                <tr>
+                    <td width="48" valign="top" style="width: 48px; padding: 0;">
+                        <img src="https://blog.trymaple.ai/content/images/2026/02/maple-developer-icon.jpg" alt="Maple Proxy" width="48" height="48" style="display: block; width: 48px; height: 48px; border-radius: 8px;">
+                    </td>
+                    <td width="16" style="width: 16px; font-size: 0; line-height: 0;">&nbsp;</td>
+                    <td valign="top" style="vertical-align: top;">
+                        <h2>Build with Maple Proxy</h2>
+                        <p>Bring encrypted AI into your own tools. Maple Proxy is an OpenAI-compatible API that works with 1,000s of tools. Use it with coding assistants, automation pipelines, or your own apps.</p>
+                        <p><a href="https://blog.trymaple.ai/maple-proxy-documentation/">Read the docs &rarr;</a></p>
+                    </td>
+                </tr>
+            </table>
+        </div>
+
+        <!-- Footer -->
+        <div class="footer">
+            <img src="https://blog.trymaple.ai/content/images/2026/02/maple-app-icon-rounded-256.png" alt="Maple AI" style="width: 48px; height: 48px; border-radius: 8px; margin-bottom: 12px;">
+            <p>Questions? Reach us at <a href="mailto:support@trymaple.ai">support@trymaple.ai</a></p>
+            <p><a href="https://trymaple.ai">trymaple.ai</a></p>
+        </div>
+
     </div>
 </body>
 </html>

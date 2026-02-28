@@ -197,7 +197,16 @@ const WELCOME_EMAIL_HTML: &str = r#"
             <!-- PLACEHOLDER: Maple logo -->
             <!-- <img class="logo" src="MAPLE_LOGO_URL" alt="Maple AI"> -->
             <h1>Welcome to Maple AI</h1>
-            <p>Private, powerful AI that's ready when you are.</p>
+            <p>Powerful AI that respects your privacy</p>
+        </div>
+
+        <!-- Intro message -->
+        <div class="section">
+            <h2>Your private room is ready</h2>
+            <p>This is a personal space for you and AI to talk, without anyone listening. When your conversations are truly private, you're free to think openly, ask questions, and build the future. Say what's on your mind.</p>
+        </div>
+        <div class="download-buttons">
+            <a href="https://trymaple.ai" style="background-color: #a855f7; color: #fff; padding: 12px 28px; border-radius: 6px; text-decoration: none; font-size: 15px; font-weight: 500;">Start your first chat</a>
         </div>
 
         <!-- Hero Image: Replace src with your hosted image URL -->
@@ -211,7 +220,6 @@ const WELCOME_EMAIL_HTML: &str = r#"
             <p>Your conversations sync securely across all your devices. Pick up right where you left off. iPhone, Android, Mac, Linux, and Web.</p>
         </div>
         <div class="download-buttons">
-            <a href="https://trymaple.ai" style="background-color: #a855f7; color: #fff; padding: 12px 28px; border-radius: 6px; text-decoration: none; font-size: 15px; font-weight: 500;">Get Started on Web</a>
             <a href="https://trymaple.ai/downloads" style="background-color: #111; color: #fff; padding: 12px 28px; border-radius: 6px; text-decoration: none; font-size: 15px; font-weight: 500;">Download Apps</a>
         </div>
 

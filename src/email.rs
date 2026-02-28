@@ -256,13 +256,20 @@ const WELCOME_EMAIL_HTML: &str = r#"
         <hr class="divider">
 
         <!-- Maple Proxy -->
-        <div class="proxy-section" style="display: flex; align-items: flex-start; gap: 16px;">
-            <img src="https://blog.trymaple.ai/content/images/2026/02/maple-developer-icon.jpg" alt="Maple Proxy" style="width: 48px; height: 48px; border-radius: 8px; flex-shrink: 0;">
-            <div>
-                <h2>Build with Maple Proxy</h2>
-                <p>Bring encrypted AI into your own tools. Maple Proxy is an OpenAI-compatible API that works with 1,000s of tools. Use it with coding assistants, automation pipelines, or your own apps.</p>
-                <p><a href="https://blog.trymaple.ai/maple-proxy-documentation/">Read the docs &rarr;</a></p>
-            </div>
+        <div class="proxy-section">
+            <table width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse: collapse; mso-table-lspace: 0pt; mso-table-rspace: 0pt;">
+                <tr>
+                    <td width="48" valign="top" style="width: 48px; padding: 0;">
+                        <img src="https://blog.trymaple.ai/content/images/2026/02/maple-developer-icon.jpg" alt="Maple Proxy" width="48" height="48" style="display: block; width: 48px; height: 48px; border-radius: 8px;">
+                    </td>
+                    <td width="16" style="width: 16px; font-size: 0; line-height: 0;">&nbsp;</td>
+                    <td valign="top" style="vertical-align: top;">
+                        <h2>Build with Maple Proxy</h2>
+                        <p>Bring encrypted AI into your own tools. Maple Proxy is an OpenAI-compatible API that works with 1,000s of tools. Use it with coding assistants, automation pipelines, or your own apps.</p>
+                        <p><a href="https://blog.trymaple.ai/maple-proxy-documentation/">Read the docs &rarr;</a></p>
+                    </td>
+                </tr>
+            </table>
         </div>
 
         <!-- Footer -->

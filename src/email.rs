@@ -166,7 +166,7 @@ const WELCOME_EMAIL_HTML: &str = r#"
             margin: 0 0 12px;
         }
         .proxy-section a {
-            color: hsl(264,89%,69%);
+            color: #a855f7;
             font-weight: 600;
         }
         .footer {
@@ -180,10 +180,10 @@ const WELCOME_EMAIL_HTML: &str = r#"
             line-height: 1.5;
         }
         a {
-            color: hsl(264,89%,69%);
+            color: #a855f7;
         }
         .footer a {
-            color: hsl(264,89%,69%);
+            color: #a855f7;
             text-decoration: none;
         }
     </style>
@@ -210,7 +210,7 @@ const WELCOME_EMAIL_HTML: &str = r#"
             <p>Your conversations sync securely across all your devices. Pick up right where you left off. iPhone, Android, Mac, Linux, and Web.</p>
         </div>
         <div class="download-buttons">
-            <a href="https://trymaple.ai" style="background-color: hsl(264,89%,69%); color: #fff; padding: 12px 28px; border-radius: 6px; text-decoration: none; font-size: 15px; font-weight: 500;">Get Started on Web</a>
+            <a href="https://trymaple.ai" style="background-color: #a855f7; color: #fff; padding: 12px 28px; border-radius: 6px; text-decoration: none; font-size: 15px; font-weight: 500;">Get Started on Web</a>
             <a href="https://trymaple.ai/downloads" style="background-color: #111; color: #fff; padding: 12px 28px; border-radius: 6px; text-decoration: none; font-size: 15px; font-weight: 500;">Download Apps</a>
         </div>
 

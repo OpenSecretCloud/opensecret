@@ -978,6 +978,7 @@ dependencies = [
 [[package]]
 name = "baml-ids"
 version = "0.0.1"
+source = "git+https://github.com/OpenSecretCloud/DSRs.git?branch=main#be22bef0008bd3631ca4ebd2b873d47c0dbc5916"
 dependencies = [
  "anyhow",
  "getrandom 0.2.15",
@@ -990,6 +991,7 @@ dependencies = [
 [[package]]
 name = "baml-types"
 version = "0.1.0"
+source = "git+https://github.com/OpenSecretCloud/DSRs.git?branch=main#be22bef0008bd3631ca4ebd2b873d47c0dbc5916"
 dependencies = [
  "anyhow",
  "baml-ids",
@@ -1009,6 +1011,7 @@ dependencies = [
 [[package]]
 name = "bamltype"
 version = "0.1.0"
+source = "git+https://github.com/OpenSecretCloud/DSRs.git?branch=main#be22bef0008bd3631ca4ebd2b873d47c0dbc5916"
 dependencies = [
  "anyhow",
  "baml-types",
@@ -1026,6 +1029,7 @@ dependencies = [
 [[package]]
 name = "bamltype-derive"
 version = "0.1.0"
+source = "git+https://github.com/OpenSecretCloud/DSRs.git?branch=main#be22bef0008bd3631ca4ebd2b873d47c0dbc5916"
 dependencies = [
  "convert_case",
  "proc-macro-crate",
@@ -1297,6 +1301,7 @@ dependencies = [
 [[package]]
 name = "bstd"
 version = "0.1.0"
+source = "git+https://github.com/OpenSecretCloud/DSRs.git?branch=main#be22bef0008bd3631ca4ebd2b873d47c0dbc5916"
 dependencies = [
  "anyhow",
  "num",
@@ -1971,6 +1976,7 @@ dependencies = [
 [[package]]
 name = "dspy-rs"
 version = "0.7.3"
+source = "git+https://github.com/OpenSecretCloud/DSRs.git?branch=main#be22bef0008bd3631ca4ebd2b873d47c0dbc5916"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2006,6 +2012,7 @@ dependencies = [
 [[package]]
 name = "dsrs_macros"
 version = "0.7.2"
+source = "git+https://github.com/OpenSecretCloud/DSRs.git?branch=main#be22bef0008bd3631ca4ebd2b873d47c0dbc5916"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -3232,6 +3239,7 @@ checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
 [[package]]
 name = "internal-baml-diagnostics"
 version = "0.1.0"
+source = "git+https://github.com/OpenSecretCloud/DSRs.git?branch=main#be22bef0008bd3631ca4ebd2b873d47c0dbc5916"
 dependencies = [
  "anyhow",
  "colored",
@@ -3243,6 +3251,7 @@ dependencies = [
 [[package]]
 name = "internal-baml-jinja"
 version = "0.1.0"
+source = "git+https://github.com/OpenSecretCloud/DSRs.git?branch=main#be22bef0008bd3631ca4ebd2b873d47c0dbc5916"
 dependencies = [
  "anyhow",
  "baml-types",
@@ -3325,6 +3334,7 @@ dependencies = [
 [[package]]
 name = "jsonish"
 version = "0.1.0"
+source = "git+https://github.com/OpenSecretCloud/DSRs.git?branch=main#be22bef0008bd3631ca4ebd2b873d47c0dbc5916"
 dependencies = [
  "anyhow",
  "baml-types",

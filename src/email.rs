@@ -194,8 +194,6 @@ const WELCOME_EMAIL_HTML: &str = r#"
 
         <!-- Header -->
         <div class="header">
-            <!-- PLACEHOLDER: Maple logo -->
-            <!-- <img class="logo" src="MAPLE_LOGO_URL" alt="Maple AI"> -->
             <h1>Welcome to Maple AI</h1>
             <p>Powerful AI that respects your privacy</p>
         </div>
@@ -209,7 +207,7 @@ const WELCOME_EMAIL_HTML: &str = r#"
             <a href="https://trymaple.ai" style="background-color: #a855f7; color: #fff; padding: 12px 28px; border-radius: 6px; text-decoration: none; font-size: 15px; font-weight: 500;">Start your first chat</a>
         </div>
 
-        <!-- Hero Image: Replace src with your hosted image URL -->
+        <!-- Hero Image -->
         <div class="hero-image">
             <img src="https://blog.trymaple.ai/content/images/size/w1600/2026/02/maple-mobile-and-desktop.jpg" alt="Maple AI on desktop and mobile" style="max-width: 100%; height: auto; border-radius: 8px;">
         </div>

@@ -5,8 +5,15 @@ use crate::encrypt::decrypt_with_key;
 use crate::tokens::{count_tokens, model_max_ctx};
 use crate::DBConnection;
 use serde_json::json;
-use tracing::error;
+use tracing::{debug, error};
 use uuid::Uuid;
+
+/// Default system prompt for gpt-oss models when no user-defined system prompt is set.
+/// This model tends to produce excessive tables even for simple questions, so we
+/// instruct it to avoid tables unless the user explicitly asks for them.
+const GPT_OSS_DEFAULT_SYSTEM_PROMPT: &str =
+    "Do not format your responses as tables unless the user explicitly asks for a table. \
+    Prefer clear, concise prose or lists when presenting information.";
 
 #[derive(Debug, Clone)]
 pub struct ChatMsg {
@@ -46,6 +53,14 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
         let tok = default_instruction.prompt_tokens as usize;
         system_tokens = tok;
         Some((ROLE_SYSTEM, content, tok))
+    } else if model.starts_with("gpt-oss") {
+        // For gpt-oss models, inject a default system prompt to discourage excessive table usage
+        debug!(
+            "No user instructions set for gpt-oss model, using default anti-table system prompt"
+        );
+        let tok = count_tokens(GPT_OSS_DEFAULT_SYSTEM_PROMPT);
+        system_tokens = tok;
+        Some((ROLE_SYSTEM, GPT_OSS_DEFAULT_SYSTEM_PROMPT.to_string(), tok))
     } else {
         None
     };

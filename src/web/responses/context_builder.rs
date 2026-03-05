@@ -55,7 +55,9 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
         Some((ROLE_SYSTEM, content, tok))
     } else if model.starts_with("gpt-oss") {
         // For gpt-oss models, inject a default system prompt to discourage excessive table usage
-        debug!("No user instructions set for gpt-oss model, using default anti-table system prompt");
+        debug!(
+            "No user instructions set for gpt-oss model, using default anti-table system prompt"
+        );
         let tok = count_tokens(GPT_OSS_DEFAULT_SYSTEM_PROMPT);
         system_tokens = tok;
         Some((ROLE_SYSTEM, GPT_OSS_DEFAULT_SYSTEM_PROMPT.to_string(), tok))

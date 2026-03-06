@@ -1,5 +1,5 @@
 pub mod account_deletion;
-pub mod agent_config;
+pub mod agents;
 pub mod conversation_summaries;
 pub mod email_verification;
 pub mod enclave_secrets;

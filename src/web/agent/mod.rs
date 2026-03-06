@@ -17,6 +17,7 @@ use crate::encrypt::decrypt_string;
 use crate::models::agents::{
     Agent, AGENT_CREATED_BY_AGENT, AGENT_CREATED_BY_USER, AGENT_KIND_SUBAGENT,
 };
+use crate::models::memory_blocks::MemoryBlock;
 use crate::models::responses::Conversation;
 use crate::models::users::User;
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
@@ -372,6 +373,17 @@ fn get_item_from_conversation(
     Err(ApiError::NotFound)
 }
 
+fn delete_conversation_for_user(
+    conn: &mut diesel::PgConnection,
+    conversation_id: i64,
+    user_id: Uuid,
+) -> Result<(), ApiError> {
+    Conversation::delete_by_id_and_user(conn, conversation_id, user_id).map_err(|e| {
+        error!("Failed to delete agent conversation: {e:?}");
+        ApiError::InternalServerError
+    })
+}
+
 pub fn router(app_state: Arc<AppState>) -> Router<()> {
     // Experimental endpoints: only enabled in Local/Dev.
     if !matches!(app_state.app_mode, AppMode::Local | AppMode::Dev) {
@@ -382,6 +394,11 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
         .route(
             "/v1/agent",
             get(get_main_agent).layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/v1/agent",
+            delete(delete_main_agent)
+                .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
         )
         .route(
             "/v1/agent/items",
@@ -474,6 +491,51 @@ async fn get_main_agent_item(
     let item = get_item_from_conversation(&state, ctx.conversation.id, &ctx.user_key, item_id)?;
 
     encrypt_response(&state, &session_id, &item).await
+}
+
+async fn delete_main_agent(
+    State(state): State<Arc<AppState>>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
+    let mut conn = state
+        .db
+        .get_pool()
+        .get()
+        .map_err(|_| ApiError::InternalServerError)?;
+
+    let main_agent = Agent::get_main_for_user(&mut conn, user.uuid)
+        .map_err(|e| {
+            error!("Failed to load main agent for deletion: {e:?}");
+            ApiError::InternalServerError
+        })?
+        .ok_or(ApiError::NotFound)?;
+
+    let subagents = Agent::list_subagents_for_user(&mut conn, user.uuid).map_err(|e| {
+        error!("Failed to load subagents for main agent deletion: {e:?}");
+        ApiError::InternalServerError
+    })?;
+
+    for subagent in subagents {
+        delete_conversation_for_user(&mut conn, subagent.conversation_id, user.uuid)?;
+    }
+
+    delete_conversation_for_user(&mut conn, main_agent.conversation_id, user.uuid)?;
+
+    MemoryBlock::delete_all_for_user(&mut conn, user.uuid).map_err(|e| {
+        error!("Failed to clear agent memory blocks during main agent deletion: {e:?}");
+        ApiError::InternalServerError
+    })?;
+
+    state.rag_cache.lock().await.evict_user(user.uuid);
+
+    let response = DeletedObjectResponse {
+        id: main_agent.uuid,
+        object: "agent.main.deleted",
+        deleted: true,
+    };
+
+    encrypt_response(&state, &session_id, &response).await
 }
 
 async fn list_subagents(
@@ -948,10 +1010,7 @@ async fn delete_subagent(
         return Err(ApiError::NotFound);
     }
 
-    state
-        .db
-        .delete_conversation(agent.conversation_id, user.uuid)
-        .map_err(error_mapping::map_generic_db_error)?;
+    delete_conversation_for_user(&mut conn, agent.conversation_id, user.uuid)?;
 
     state.rag_cache.lock().await.evict_user(user.uuid);
 

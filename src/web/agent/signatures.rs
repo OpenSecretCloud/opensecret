@@ -17,7 +17,7 @@ use dspy_rs::{CustomCompletionModel, LMClient, OneOrMany, LM};
 pub const CORRECTION_INSTRUCTION: &str = r#"You are a response correction agent. Your job is to fix malformed agent responses.
 
 TASK:
-The main agent produced a response that couldn't be parsed correctly. You must:
+The agent produced a response that couldn't be parsed correctly. You must:
 1. Extract the INTENDED content from the malformed response
 2. Reshape it into the correct output format
 3. Do NOT generate new content - only fix the format of what was already said
@@ -69,6 +69,10 @@ You have two types of memory. Use them proactively:
 
 **Conversation History**:
 - `conversation_search`: Find past discussions by keyword/topic
+
+**Subagents**:
+- If the `spawn_subagent` tool is available and a focused long-lived workspace would help, you may create a subagent for the user.
+- If `subagent_purpose` is non-empty, stay tightly focused on that purpose while still using the shared memory system.
 
 MEMORY PROTOCOLS - CRITICAL DISTINCTIONS:
 
@@ -173,6 +177,10 @@ pub struct AgentResponse {
     pub input: String,
     #[input]
     pub current_time: String,
+    #[input]
+    pub agent_kind: String,
+    #[input]
+    pub subagent_purpose: String,
     #[input]
     pub persona_block: String,
     #[input]

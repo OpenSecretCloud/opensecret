@@ -22,17 +22,16 @@ diesel::table! {
 }
 
 diesel::table! {
-    agent_config (id) {
+    agents (id) {
         id -> Int8,
         uuid -> Uuid,
         user_id -> Uuid,
-        conversation_id -> Nullable<Int8>,
-        enabled -> Bool,
-        model -> Text,
-        max_context_tokens -> Int4,
-        compaction_threshold -> Float4,
-        system_prompt_enc -> Nullable<Bytea>,
-        preferences_enc -> Nullable<Bytea>,
+        conversation_id -> Int8,
+        kind -> Text,
+        parent_agent_id -> Nullable<Int8>,
+        display_name_enc -> Nullable<Bytea>,
+        purpose_enc -> Nullable<Bytea>,
+        created_by -> Text,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
@@ -122,11 +121,7 @@ diesel::table! {
         uuid -> Uuid,
         user_id -> Uuid,
         label -> Text,
-        description -> Nullable<Text>,
         value_enc -> Bytea,
-        char_limit -> Int4,
-        read_only -> Bool,
-        version -> Int4,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
@@ -447,7 +442,7 @@ diesel::table! {
     }
 }
 
-diesel::joinable!(agent_config -> conversations (conversation_id));
+diesel::joinable!(agents -> conversations (conversation_id));
 diesel::joinable!(assistant_messages -> conversations (conversation_id));
 diesel::joinable!(assistant_messages -> responses (response_id));
 diesel::joinable!(conversation_summaries -> conversations (conversation_id));
@@ -475,7 +470,7 @@ diesel::joinable!(users -> org_projects (project_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     account_deletion_requests,
-    agent_config,
+    agents,
     assistant_messages,
     conversation_summaries,
     conversations,

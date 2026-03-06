@@ -7,13 +7,20 @@ use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::encrypt::{decrypt_string, encrypt_with_key};
+use crate::models::agents::Agent;
 use crate::models::conversation_summaries::ConversationSummary;
-use crate::models::memory_blocks::{MemoryBlock, NewMemoryBlock};
+use crate::models::memory_blocks::{
+    MemoryBlock, NewMemoryBlock, MEMORY_BLOCK_LABEL_HUMAN, MEMORY_BLOCK_LABEL_PERSONA,
+};
 use crate::models::responses::Conversation;
 use crate::models::users::User;
 use crate::rag::{cosine_similarity, deserialize_f32_le, search_user_embeddings};
 use crate::web::openai_auth::AuthMethod;
 use crate::{ApiError, AppState};
+
+use super::runtime;
+
+const MAX_CORE_MEMORY_BLOCK_CHARS: usize = 20_000;
 
 // ============================================================================
 // Shared types
@@ -127,11 +134,11 @@ async fn update_block_value(
     new_value: &str,
     existing: &MemoryBlock,
 ) -> Result<(), ApiError> {
-    if existing.read_only {
+    if label != MEMORY_BLOCK_LABEL_PERSONA && label != MEMORY_BLOCK_LABEL_HUMAN {
         return Err(ApiError::BadRequest);
     }
 
-    if new_value.len() > existing.char_limit.max(0) as usize {
+    if new_value.len() > MAX_CORE_MEMORY_BLOCK_CHARS {
         return Err(ApiError::BadRequest);
     }
 
@@ -141,11 +148,7 @@ async fn update_block_value(
         uuid: existing.uuid,
         user_id,
         label: label.to_string(),
-        description: existing.description.clone(),
         value_enc,
-        char_limit: existing.char_limit,
-        read_only: existing.read_only,
-        version: existing.version,
     };
 
     let mut conn = state
@@ -769,6 +772,89 @@ impl Tool for ArchivalSearchTool {
             Err(e) => {
                 error!("archival_search failed: {e:?}");
                 ToolResult::error("Archival search failed")
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Subagent tool
+// ============================================================================
+
+pub struct SpawnSubagentTool {
+    state: Arc<AppState>,
+    user: Arc<User>,
+    user_key: Arc<SecretKey>,
+    parent_agent: Agent,
+}
+
+impl SpawnSubagentTool {
+    pub fn new(
+        state: Arc<AppState>,
+        user: Arc<User>,
+        user_key: Arc<SecretKey>,
+        parent_agent: Agent,
+    ) -> Self {
+        Self {
+            state,
+            user,
+            user_key,
+            parent_agent,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SpawnSubagentTool {
+    fn name(&self) -> &str {
+        "spawn_subagent"
+    }
+
+    fn description(&self) -> &str {
+        "Create a focused subagent chat with its own conversation history but shared memory. Use when the user would benefit from a dedicated long-lived workspace for a topic or task."
+    }
+
+    fn args_schema(&self) -> &str {
+        r#"{"purpose": "why this subagent exists", "display_name": "optional short name for the subagent"}"#
+    }
+
+    async fn execute(&self, args: &HashMap<String, String>) -> ToolResult {
+        let Some(purpose) = args.get("purpose") else {
+            return ToolResult::error("'purpose' argument required");
+        };
+
+        if purpose.trim().is_empty() {
+            return ToolResult::error("'purpose' must not be empty");
+        }
+
+        let display_name = args
+            .get("display_name")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+
+        let mut conn = match self.state.db.get_pool().get() {
+            Ok(c) => c,
+            Err(_) => return ToolResult::error("Database connection error"),
+        };
+
+        match runtime::create_subagent(
+            &mut conn,
+            &self.user_key,
+            self.user.uuid,
+            &self.parent_agent,
+            display_name,
+            purpose.trim(),
+            crate::models::agents::AGENT_CREATED_BY_AGENT,
+        )
+        .await
+        {
+            Ok((agent, conversation, resolved_display_name)) => ToolResult::success(format!(
+                "Created subagent '{}' (agent_id: {}, conversation_id: {}).",
+                resolved_display_name, agent.uuid, conversation.uuid
+            )),
+            Err(e) => {
+                error!("spawn_subagent failed: {e:?}");
+                ToolResult::error("Failed to create subagent")
             }
         }
     }

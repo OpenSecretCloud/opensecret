@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Default character limit per core memory block (mirrors Sage/Letta).
-pub const DEFAULT_BLOCK_CHAR_LIMIT: i32 = 20_000;
+pub const MEMORY_BLOCK_LABEL_PERSONA: &str = "persona";
+pub const MEMORY_BLOCK_LABEL_HUMAN: &str = "human";
 
 #[derive(Error, Debug)]
 pub enum MemoryBlockError {
@@ -21,11 +21,7 @@ pub struct MemoryBlock {
     pub uuid: Uuid,
     pub user_id: Uuid,
     pub label: String,
-    pub description: Option<String>,
     pub value_enc: Vec<u8>,
-    pub char_limit: i32,
-    pub read_only: bool,
-    pub version: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -85,29 +81,16 @@ pub struct NewMemoryBlock {
     pub uuid: Uuid,
     pub user_id: Uuid,
     pub label: String,
-    pub description: Option<String>,
     pub value_enc: Vec<u8>,
-    pub char_limit: i32,
-    pub read_only: bool,
-    pub version: i32,
 }
 
 impl NewMemoryBlock {
-    pub fn new(
-        user_id: Uuid,
-        label: impl Into<String>,
-        description: Option<String>,
-        value_enc: Vec<u8>,
-    ) -> Self {
+    pub fn new(user_id: Uuid, label: impl Into<String>, value_enc: Vec<u8>) -> Self {
         NewMemoryBlock {
             uuid: Uuid::new_v4(),
             user_id,
             label: label.into(),
-            description,
             value_enc,
-            char_limit: DEFAULT_BLOCK_CHAR_LIMIT,
-            read_only: false,
-            version: 1,
         }
     }
 
@@ -119,13 +102,7 @@ impl NewMemoryBlock {
             .values(self)
             .on_conflict((memory_blocks::user_id, memory_blocks::label))
             .do_update()
-            .set((
-                memory_blocks::description.eq(self.description.clone()),
-                memory_blocks::value_enc.eq(self.value_enc.clone()),
-                memory_blocks::char_limit.eq(self.char_limit),
-                memory_blocks::read_only.eq(self.read_only),
-                memory_blocks::version.eq(memory_blocks::version + 1),
-            ))
+            .set(memory_blocks::value_enc.eq(self.value_enc.clone()))
             .get_result::<MemoryBlock>(conn)
             .map_err(MemoryBlockError::DatabaseError)
     }

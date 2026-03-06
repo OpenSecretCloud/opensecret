@@ -1,24 +1,33 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     middleware::from_fn_with_state,
     response::sse::{Event, Sse},
-    routing::{delete, post},
+    routing::{delete, get, post},
     Extension, Json, Router,
 };
 use futures::Stream;
+use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::time::sleep;
 use tracing::{error, warn};
 use uuid::Uuid;
 
-use crate::models::agents::{Agent, AGENT_CREATED_BY_USER, AGENT_KIND_SUBAGENT};
+use crate::encrypt::decrypt_string;
+use crate::models::agents::{
+    Agent, AGENT_CREATED_BY_AGENT, AGENT_CREATED_BY_USER, AGENT_KIND_SUBAGENT,
+};
+use crate::models::responses::Conversation;
 use crate::models::users::User;
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
+use crate::web::responses::constants::{
+    DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT, OBJECT_TYPE_LIST,
+};
+use crate::web::responses::conversations::{ConversationItemListResponse, ListItemsParams};
 use crate::web::responses::handlers::encrypt_event;
 use crate::web::responses::{
-    error_mapping, DeletedObjectResponse, MessageContent, MessageContentConverter,
-    MessageContentPart,
+    error_mapping, ConversationItem, ConversationItemConverter, DeletedObjectResponse,
+    MessageContent, MessageContentConverter, MessageContentPart, Paginator,
 };
 use crate::{ApiError, AppMode, AppState};
 
@@ -43,17 +52,65 @@ struct CreateSubagentRequest {
 struct SubagentResponse {
     id: Uuid,
     object: &'static str,
+    kind: &'static str,
     conversation_id: Uuid,
     display_name: String,
     purpose: String,
     created_by: String,
     created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MainAgentResponse {
+    id: Uuid,
+    object: &'static str,
+    kind: &'static str,
+    conversation_id: Uuid,
+    display_name: &'static str,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SubagentListResponse {
+    object: &'static str,
+    data: Vec<SubagentResponse>,
+    has_more: bool,
+    first_id: Option<Uuid>,
+    last_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListSubagentsParams {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    after: Option<Uuid>,
+    #[serde(default = "default_order")]
+    order: String,
+    created_by: Option<String>,
+}
+
+struct AgentConversationContext {
+    agent: Agent,
+    conversation: Conversation,
+    user_key: SecretKey,
 }
 
 #[derive(Debug, Clone)]
 enum ChatTarget {
     Main,
     Subagent(Uuid),
+}
+
+const MAIN_AGENT_DISPLAY_NAME: &str = "Sage";
+
+fn default_limit() -> i64 {
+    DEFAULT_PAGINATION_LIMIT
+}
+
+fn default_order() -> String {
+    DEFAULT_PAGINATION_ORDER.to_string()
 }
 
 fn is_empty_message_content(content: &MessageContent) -> bool {
@@ -128,6 +185,193 @@ async fn encrypt_agent_event<T: Serialize>(
     encrypt_event(state, session_id, event_type, &value).await
 }
 
+fn build_main_agent_response(ctx: &AgentConversationContext) -> MainAgentResponse {
+    MainAgentResponse {
+        id: ctx.agent.uuid,
+        object: "agent.main",
+        kind: "main",
+        conversation_id: ctx.conversation.uuid,
+        display_name: MAIN_AGENT_DISPLAY_NAME,
+        created_at: ctx.agent.created_at.timestamp(),
+        updated_at: ctx.conversation.updated_at.timestamp(),
+    }
+}
+
+fn build_subagent_response(
+    agent: &Agent,
+    conversation: &Conversation,
+    user_key: &SecretKey,
+) -> Result<SubagentResponse, ApiError> {
+    let display_name = decrypt_string(user_key, agent.display_name_enc.as_ref())
+        .map_err(|e| {
+            error!("Failed to decrypt subagent display name: {e:?}");
+            ApiError::InternalServerError
+        })?
+        .unwrap_or_else(|| "Subagent".to_string());
+
+    let purpose = decrypt_string(user_key, agent.purpose_enc.as_ref())
+        .map_err(|e| {
+            error!("Failed to decrypt subagent purpose: {e:?}");
+            ApiError::InternalServerError
+        })?
+        .unwrap_or_default();
+
+    Ok(SubagentResponse {
+        id: agent.uuid,
+        object: "agent.subagent",
+        kind: "subagent",
+        conversation_id: conversation.uuid,
+        display_name,
+        purpose,
+        created_by: agent.created_by.clone(),
+        created_at: agent.created_at.timestamp(),
+        updated_at: conversation.updated_at.timestamp(),
+    })
+}
+
+fn validate_created_by_filter(created_by: Option<&str>) -> Result<Option<&str>, ApiError> {
+    match created_by {
+        None => Ok(None),
+        Some(AGENT_CREATED_BY_USER) => Ok(Some(AGENT_CREATED_BY_USER)),
+        Some(AGENT_CREATED_BY_AGENT) => Ok(Some(AGENT_CREATED_BY_AGENT)),
+        Some(_) => Err(ApiError::BadRequest),
+    }
+}
+
+async fn load_main_agent_context(
+    state: &Arc<AppState>,
+    user: &User,
+) -> Result<AgentConversationContext, ApiError> {
+    let user_key = state
+        .get_user_key(user.uuid, None, None)
+        .await
+        .map_err(|_| error_mapping::map_key_retrieval_error())?;
+
+    let mut conn = state
+        .db
+        .get_pool()
+        .get()
+        .map_err(|_| ApiError::InternalServerError)?;
+
+    let (agent, conversation) =
+        runtime::ensure_main_agent(state, &mut conn, &user_key, user.uuid).await?;
+
+    Ok(AgentConversationContext {
+        agent,
+        conversation,
+        user_key,
+    })
+}
+
+async fn load_subagent_context(
+    state: &Arc<AppState>,
+    user: &User,
+    agent_uuid: Uuid,
+) -> Result<AgentConversationContext, ApiError> {
+    let user_key = state
+        .get_user_key(user.uuid, None, None)
+        .await
+        .map_err(|_| error_mapping::map_key_retrieval_error())?;
+
+    let mut conn = state
+        .db
+        .get_pool()
+        .get()
+        .map_err(|_| ApiError::InternalServerError)?;
+
+    let agent = Agent::get_by_uuid_and_user(&mut conn, agent_uuid, user.uuid)
+        .map_err(|e| {
+            error!("Failed to load subagent: {e:?}");
+            ApiError::InternalServerError
+        })?
+        .ok_or(ApiError::NotFound)?;
+
+    if agent.kind != AGENT_KIND_SUBAGENT {
+        return Err(ApiError::NotFound);
+    }
+
+    let conversation =
+        Conversation::get_by_id_and_user(&mut conn, agent.conversation_id, user.uuid).map_err(
+            |e| {
+                error!("Failed to load subagent conversation: {e:?}");
+                ApiError::InternalServerError
+            },
+        )?;
+
+    Ok(AgentConversationContext {
+        agent,
+        conversation,
+        user_key,
+    })
+}
+
+fn list_items_for_conversation(
+    state: &Arc<AppState>,
+    conversation_id: i64,
+    user_key: &SecretKey,
+    params: &ListItemsParams,
+) -> Result<ConversationItemListResponse, ApiError> {
+    let limit = if params.limit <= 0 {
+        DEFAULT_PAGINATION_LIMIT
+    } else {
+        params.limit.min(MAX_PAGINATION_LIMIT)
+    };
+
+    let raw_messages = state
+        .db
+        .get_conversation_context_messages(conversation_id, limit + 1, params.after, &params.order)
+        .map_err(error_mapping::map_message_error)?;
+
+    let has_more = raw_messages.len() > limit as usize;
+    let messages_to_return = if has_more {
+        &raw_messages[..limit as usize]
+    } else {
+        &raw_messages[..]
+    };
+
+    let items = ConversationItemConverter::messages_to_items(
+        messages_to_return,
+        user_key,
+        0,
+        messages_to_return.len(),
+    )?;
+
+    let (first_id, last_id) = Paginator::get_cursor_ids(&items, |item| match item {
+        ConversationItem::Message { id, .. } => *id,
+        ConversationItem::FunctionToolCall { id, .. } => *id,
+        ConversationItem::FunctionToolCallOutput { id, .. } => *id,
+        ConversationItem::Reasoning { id, .. } => *id,
+    });
+
+    Ok(ConversationItemListResponse {
+        object: OBJECT_TYPE_LIST,
+        data: items,
+        has_more,
+        first_id,
+        last_id,
+    })
+}
+
+fn get_item_from_conversation(
+    state: &Arc<AppState>,
+    conversation_id: i64,
+    user_key: &SecretKey,
+    item_id: Uuid,
+) -> Result<ConversationItem, ApiError> {
+    let raw_messages = state
+        .db
+        .get_conversation_context_messages(conversation_id, i64::MAX, None, "asc")
+        .map_err(error_mapping::map_message_error)?;
+
+    for msg in raw_messages {
+        if msg.uuid == item_id {
+            return ConversationItemConverter::message_to_item(&msg, user_key);
+        }
+    }
+
+    Err(ApiError::NotFound)
+}
+
 pub fn router(app_state: Arc<AppState>) -> Router<()> {
     // Experimental endpoints: only enabled in Local/Dev.
     if !matches!(app_state.app_mode, AppMode::Local | AppMode::Dev) {
@@ -135,6 +379,20 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
     }
 
     Router::new()
+        .route(
+            "/v1/agent",
+            get(get_main_agent).layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/v1/agent/items",
+            get(list_main_agent_items)
+                .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/v1/agent/items/:item_id",
+            get(get_main_agent_item)
+                .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
+        )
         .route(
             "/v1/agent/chat",
             post(chat_main).layer(from_fn_with_state(
@@ -144,10 +402,18 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
         )
         .route(
             "/v1/agent/subagents",
+            get(list_subagents).layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/v1/agent/subagents",
             post(create_subagent).layer(from_fn_with_state(
                 app_state.clone(),
                 decrypt_request::<CreateSubagentRequest>,
             )),
+        )
+        .route(
+            "/v1/agent/subagents/:id",
+            get(get_subagent).layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
         )
         .route(
             "/v1/agent/subagents/:id/chat",
@@ -157,11 +423,159 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
             )),
         )
         .route(
+            "/v1/agent/subagents/:id/items",
+            get(list_subagent_items)
+                .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/v1/agent/subagents/:id/items/:item_id",
+            get(get_subagent_item)
+                .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
+        )
+        .route(
             "/v1/agent/subagents/:id",
             delete(delete_subagent)
                 .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
         )
         .with_state(app_state)
+}
+
+async fn get_main_agent(
+    State(state): State<Arc<AppState>>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+) -> Result<Json<EncryptedResponse<MainAgentResponse>>, ApiError> {
+    let ctx = load_main_agent_context(&state, &user).await?;
+    let response = build_main_agent_response(&ctx);
+
+    encrypt_response(&state, &session_id, &response).await
+}
+
+async fn list_main_agent_items(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ListItemsParams>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+) -> Result<Json<EncryptedResponse<ConversationItemListResponse>>, ApiError> {
+    let ctx = load_main_agent_context(&state, &user).await?;
+    let response =
+        list_items_for_conversation(&state, ctx.conversation.id, &ctx.user_key, &params)?;
+
+    encrypt_response(&state, &session_id, &response).await
+}
+
+async fn get_main_agent_item(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<Uuid>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
+    let ctx = load_main_agent_context(&state, &user).await?;
+    let item = get_item_from_conversation(&state, ctx.conversation.id, &ctx.user_key, item_id)?;
+
+    encrypt_response(&state, &session_id, &item).await
+}
+
+async fn list_subagents(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ListSubagentsParams>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+) -> Result<Json<EncryptedResponse<SubagentListResponse>>, ApiError> {
+    let limit = if params.limit <= 0 {
+        DEFAULT_PAGINATION_LIMIT
+    } else {
+        params.limit.min(MAX_PAGINATION_LIMIT)
+    };
+
+    let created_by_filter = validate_created_by_filter(params.created_by.as_deref())?;
+
+    let user_key = state
+        .get_user_key(user.uuid, None, None)
+        .await
+        .map_err(|_| error_mapping::map_key_retrieval_error())?;
+
+    let mut conn = state
+        .db
+        .get_pool()
+        .get()
+        .map_err(|_| ApiError::InternalServerError)?;
+
+    let subagents = Agent::list_subagents_for_user_paginated(
+        &mut conn,
+        user.uuid,
+        limit + 1,
+        params.after,
+        &params.order,
+        created_by_filter,
+    )
+    .map_err(|e| {
+        error!("Failed to list subagents: {e:?}");
+        ApiError::InternalServerError
+    })?;
+
+    let has_more = subagents.len() > limit as usize;
+    let subagents_to_return = if has_more {
+        &subagents[..limit as usize]
+    } else {
+        &subagents[..]
+    };
+
+    let data = subagents_to_return
+        .iter()
+        .map(|(agent, conversation)| build_subagent_response(agent, conversation, &user_key))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let (first_id, last_id) =
+        Paginator::get_cursor_ids(subagents_to_return, |(agent, _)| agent.uuid);
+
+    let response = SubagentListResponse {
+        object: OBJECT_TYPE_LIST,
+        data,
+        has_more,
+        first_id,
+        last_id,
+    };
+
+    encrypt_response(&state, &session_id, &response).await
+}
+
+async fn get_subagent(
+    State(state): State<Arc<AppState>>,
+    Path(agent_uuid): Path<Uuid>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+) -> Result<Json<EncryptedResponse<SubagentResponse>>, ApiError> {
+    let ctx = load_subagent_context(&state, &user, agent_uuid).await?;
+    let response = build_subagent_response(&ctx.agent, &ctx.conversation, &ctx.user_key)?;
+
+    encrypt_response(&state, &session_id, &response).await
+}
+
+async fn list_subagent_items(
+    State(state): State<Arc<AppState>>,
+    Path(agent_uuid): Path<Uuid>,
+    Query(params): Query<ListItemsParams>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+) -> Result<Json<EncryptedResponse<ConversationItemListResponse>>, ApiError> {
+    let ctx = load_subagent_context(&state, &user, agent_uuid).await?;
+    let response =
+        list_items_for_conversation(&state, ctx.conversation.id, &ctx.user_key, &params)?;
+
+    encrypt_response(&state, &session_id, &response).await
+}
+
+async fn get_subagent_item(
+    State(state): State<Arc<AppState>>,
+    Path((agent_uuid, item_id)): Path<(Uuid, Uuid)>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
+    let ctx = load_subagent_context(&state, &user, agent_uuid).await?;
+    let item = get_item_from_conversation(&state, ctx.conversation.id, &ctx.user_key, item_id)?;
+
+    encrypt_response(&state, &session_id, &item).await
 }
 
 async fn chat_main(
@@ -502,11 +916,13 @@ async fn create_subagent(
     let response = SubagentResponse {
         id: agent.uuid,
         object: "agent.subagent",
+        kind: "subagent",
         conversation_id: conversation.uuid,
         display_name,
         purpose: body.purpose.trim().to_string(),
         created_by: agent.created_by,
         created_at: agent.created_at.timestamp(),
+        updated_at: conversation.updated_at.timestamp(),
     };
 
     encrypt_response(&state, &session_id, &response).await

@@ -7,15 +7,19 @@ use uuid::Uuid;
 use diesel::prelude::*;
 
 use crate::encrypt::{decrypt_string, encrypt_with_key};
-use crate::models::agent_config::{AgentConfig, NewAgentConfig};
+use crate::models::agents::{
+    Agent, NewAgent, AGENT_CREATED_BY_USER, AGENT_KIND_MAIN, AGENT_KIND_SUBAGENT,
+};
 use crate::models::conversation_summaries::{ConversationSummary, NewConversationSummary};
-use crate::models::memory_blocks::{MemoryBlock, NewMemoryBlock, DEFAULT_BLOCK_CHAR_LIMIT};
+use crate::models::memory_blocks::{
+    MemoryBlock, NewMemoryBlock, MEMORY_BLOCK_LABEL_HUMAN, MEMORY_BLOCK_LABEL_PERSONA,
+};
 use crate::models::responses::{
     AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewToolCall,
     NewToolOutput, NewUserMessage, RawThreadMessage, RawThreadMessageMetadata, ToolCall,
     ToolOutput, UserMessage,
 };
-use crate::models::schema::{memory_blocks, user_embeddings};
+use crate::models::schema::{agents, memory_blocks, user_embeddings};
 use crate::rag::{
     insert_message_embedding, serialize_f32_le, SOURCE_TYPE_ARCHIVAL, SOURCE_TYPE_MESSAGE,
 };
@@ -31,22 +35,23 @@ use super::signatures::{
 };
 use super::tools::{
     ArchivalInsertTool, ArchivalSearchTool, ConversationSearchTool, DoneTool, MemoryAppendTool,
-    MemoryInsertTool, MemoryReplaceTool, ToolRegistry, ToolResult,
+    MemoryInsertTool, MemoryReplaceTool, SpawnSubagentTool, ToolRegistry, ToolResult,
 };
 use super::vision;
 
-// Mirrors Sage defaults
-const DEFAULT_PERSONA_DESCRIPTION: &str = "The persona block: Stores details about your current persona, guiding how you behave and respond. This helps you to maintain consistency and personality in your interactions.";
-const DEFAULT_HUMAN_DESCRIPTION: &str = "The human block: Stores key details about the person you are conversing with, allowing for more personalized and friend-like conversation.";
 const DEFAULT_PERSONA_VALUE: &str = "I am Sage, a helpful AI companion. I maintain long-term memory across our conversations and strive to be friendly, concise, and genuinely helpful.";
 pub const DEFAULT_MODEL: &str = "kimi-k2-5";
 pub const DEFAULT_CONTEXT_WINDOW: i32 = 256_000;
 pub const DEFAULT_COMPACTION_THRESHOLD: f32 = 0.80;
 const MIN_MESSAGES_IN_CONTEXT: usize = 20;
+const MAIN_AGENT_METADATA_TYPE: &str = "agent_main";
+const SUBAGENT_METADATA_TYPE: &str = "subagent";
 
 #[derive(Clone, Debug, Default)]
 struct AgentContext {
     current_time: String,
+    agent_kind: String,
+    subagent_purpose: String,
     persona_block: String,
     human_block: String,
     memory_metadata: String,
@@ -74,8 +79,9 @@ pub struct AgentRuntime {
     state: Arc<AppState>,
     user: Arc<crate::models::users::User>,
     user_key: Arc<SecretKey>,
-    agent_config: AgentConfig,
+    agent: Agent,
     conversation: Conversation,
+    subagent_purpose: String,
     system_prompt: String,
     lm: Arc<dspy_rs::LM>,
     tools: ToolRegistry,
@@ -86,8 +92,207 @@ pub struct AgentRuntime {
     max_steps: usize,
 }
 
+fn build_system_prompt(agent: &Agent, subagent_purpose: &str) -> String {
+    let mut prompt = AGENT_INSTRUCTION.to_string();
+
+    if agent.kind == AGENT_KIND_MAIN {
+        prompt.push_str(
+            "\n\nMAIN AGENT MODE:\nYou are the user's primary persistent agent and the home surface of Maple.",
+        );
+    } else {
+        prompt.push_str(
+            "\n\nSUBAGENT MODE:\nYou are operating inside a focused subagent chat. You share the user's memory with the main agent, but your recent conversation history is only this thread. Stay tightly focused on your assigned purpose and do not behave like a separate identity.",
+        );
+
+        if !subagent_purpose.trim().is_empty() {
+            prompt.push_str("\n\nSUBAGENT PURPOSE:\n");
+            prompt.push_str(subagent_purpose.trim());
+        }
+    }
+
+    prompt
+}
+
+fn derive_subagent_display_name(display_name: Option<&str>, purpose: &str) -> String {
+    if let Some(name) = display_name.map(str::trim).filter(|s| !s.is_empty()) {
+        let trimmed: String = name.chars().take(80).collect();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+
+    let mut derived = purpose
+        .split_whitespace()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if derived.is_empty() {
+        derived = "New Subagent".to_string();
+    }
+    derived.chars().take(80).collect()
+}
+
+async fn main_agent_metadata_enc(user_key: &SecretKey) -> Vec<u8> {
+    encrypt_with_key(
+        user_key,
+        json!({"type": MAIN_AGENT_METADATA_TYPE})
+            .to_string()
+            .as_bytes(),
+    )
+    .await
+}
+
+async fn subagent_metadata_enc(
+    user_key: &SecretKey,
+    agent_uuid: Uuid,
+    display_name: &str,
+    purpose: &str,
+) -> Vec<u8> {
+    encrypt_with_key(
+        user_key,
+        json!({
+            "type": SUBAGENT_METADATA_TYPE,
+            "agent_id": agent_uuid,
+            "display_name": display_name,
+            "purpose": purpose,
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .await
+}
+
+pub(crate) async fn ensure_main_agent(
+    state: &Arc<AppState>,
+    conn: &mut diesel::PgConnection,
+    user_key: &SecretKey,
+    user_id: Uuid,
+) -> Result<(Agent, Conversation), ApiError> {
+    let existing = Agent::get_main_for_user(conn, user_id).map_err(|e| {
+        error!("Failed to load main agent: {e:?}");
+        ApiError::InternalServerError
+    })?;
+
+    let (agent, conversation) = if let Some(agent) = existing {
+        match Conversation::get_by_id_and_user(conn, agent.conversation_id, user_id) {
+            Ok(conversation) => (agent, conversation),
+            Err(_) => {
+                let conversation = NewConversation {
+                    uuid: Uuid::new_v4(),
+                    user_id,
+                    metadata_enc: Some(main_agent_metadata_enc(user_key).await),
+                }
+                .insert(conn)
+                .map_err(|e| {
+                    error!("Failed to recreate main agent conversation: {e:?}");
+                    ApiError::InternalServerError
+                })?;
+
+                let agent = diesel::update(agents::table.filter(agents::id.eq(agent.id)))
+                    .set(agents::conversation_id.eq(conversation.id))
+                    .get_result::<Agent>(conn)
+                    .map_err(|e| {
+                        error!("Failed to repair main agent conversation_id: {e:?}");
+                        ApiError::InternalServerError
+                    })?;
+
+                (agent, conversation)
+            }
+        }
+    } else {
+        let conversation = NewConversation {
+            uuid: Uuid::new_v4(),
+            user_id,
+            metadata_enc: Some(main_agent_metadata_enc(user_key).await),
+        }
+        .insert(conn)
+        .map_err(|e| {
+            error!("Failed to create main agent conversation: {e:?}");
+            ApiError::InternalServerError
+        })?;
+
+        let agent = NewAgent {
+            uuid: Uuid::new_v4(),
+            user_id,
+            conversation_id: conversation.id,
+            kind: AGENT_KIND_MAIN.to_string(),
+            parent_agent_id: None,
+            display_name_enc: None,
+            purpose_enc: None,
+            created_by: AGENT_CREATED_BY_USER.to_string(),
+        }
+        .insert(conn)
+        .map_err(|e| {
+            error!("Failed to create main agent row: {e:?}");
+            ApiError::InternalServerError
+        })?;
+
+        (agent, conversation)
+    };
+
+    AgentRuntime::ensure_default_blocks(state, conn, user_key, user_id).await?;
+
+    Ok((agent, conversation))
+}
+
+pub(crate) async fn create_subagent(
+    conn: &mut diesel::PgConnection,
+    user_key: &SecretKey,
+    user_id: Uuid,
+    parent_agent: &Agent,
+    display_name: Option<&str>,
+    purpose: &str,
+    created_by: &str,
+) -> Result<(Agent, Conversation, String), ApiError> {
+    if parent_agent.kind != AGENT_KIND_MAIN {
+        return Err(ApiError::BadRequest);
+    }
+
+    let purpose = purpose.trim();
+    if purpose.is_empty() {
+        return Err(ApiError::BadRequest);
+    }
+
+    let resolved_display_name = derive_subagent_display_name(display_name, purpose);
+    let agent_uuid = Uuid::new_v4();
+
+    let conversation = NewConversation {
+        uuid: Uuid::new_v4(),
+        user_id,
+        metadata_enc: Some(
+            subagent_metadata_enc(user_key, agent_uuid, &resolved_display_name, purpose).await,
+        ),
+    }
+    .insert(conn)
+    .map_err(|e| {
+        error!("Failed to create subagent conversation: {e:?}");
+        ApiError::InternalServerError
+    })?;
+
+    let display_name_enc = Some(encrypt_with_key(user_key, resolved_display_name.as_bytes()).await);
+    let purpose_enc = Some(encrypt_with_key(user_key, purpose.as_bytes()).await);
+
+    let agent = NewAgent {
+        uuid: agent_uuid,
+        user_id,
+        conversation_id: conversation.id,
+        kind: AGENT_KIND_SUBAGENT.to_string(),
+        parent_agent_id: Some(parent_agent.id),
+        display_name_enc,
+        purpose_enc,
+        created_by: created_by.to_string(),
+    }
+    .insert(conn)
+    .map_err(|e| {
+        error!("Failed to create subagent row: {e:?}");
+        ApiError::InternalServerError
+    })?;
+
+    Ok((agent, conversation, resolved_display_name))
+}
+
 impl AgentRuntime {
-    pub async fn new(
+    pub async fn new_main(
         state: Arc<AppState>,
         user: crate::models::users::User,
         user_key: SecretKey,
@@ -101,91 +306,67 @@ impl AgentRuntime {
             .get()
             .map_err(|_| ApiError::InternalServerError)?;
 
-        // Load or create config
-        let agent_config = match AgentConfig::get_by_user_id(&mut conn, user.uuid).map_err(|e| {
-            error!("Failed to load agent config: {e:?}");
-            ApiError::InternalServerError
-        })? {
-            Some(cfg) => cfg,
-            None => {
-                let new_cfg = NewAgentConfig {
-                    uuid: Uuid::new_v4(),
-                    user_id: user.uuid,
-                    conversation_id: None,
-                    enabled: true,
-                    model: DEFAULT_MODEL.to_string(),
-                    max_context_tokens: DEFAULT_CONTEXT_WINDOW,
-                    compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
-                    system_prompt_enc: None,
-                    preferences_enc: None,
-                };
+        let (agent, conversation) =
+            ensure_main_agent(&state, &mut conn, &user_key, user.uuid).await?;
 
-                new_cfg.insert_or_update(&mut conn).map_err(|e| {
-                    error!("Failed to create agent config: {e:?}");
-                    ApiError::InternalServerError
-                })?
-            }
-        };
+        Self::from_loaded(state, user, user_key, agent, conversation).await
+    }
 
-        if !agent_config.enabled {
-            return Err(ApiError::Unauthorized);
+    pub async fn new_subagent(
+        state: Arc<AppState>,
+        user: crate::models::users::User,
+        user_key: SecretKey,
+        agent_uuid: Uuid,
+    ) -> Result<Self, ApiError> {
+        let user = Arc::new(user);
+        let user_key = Arc::new(user_key);
+
+        let mut conn = state
+            .db
+            .get_pool()
+            .get()
+            .map_err(|_| ApiError::InternalServerError)?;
+
+        let _ = ensure_main_agent(&state, &mut conn, &user_key, user.uuid).await?;
+
+        let agent = Agent::get_by_uuid_and_user(&mut conn, agent_uuid, user.uuid)
+            .map_err(|e| {
+                error!("Failed to load subagent: {e:?}");
+                ApiError::InternalServerError
+            })?
+            .ok_or(ApiError::NotFound)?;
+
+        if agent.kind != AGENT_KIND_SUBAGENT {
+            return Err(ApiError::NotFound);
         }
 
-        // Ensure conversation exists
-        let conversation = if let Some(conversation_id) = agent_config.conversation_id {
-            Conversation::get_by_id_and_user(&mut conn, conversation_id, user.uuid).map_err(
+        let conversation =
+            Conversation::get_by_id_and_user(&mut conn, agent.conversation_id, user.uuid).map_err(
                 |e| {
-                    error!("Failed to load agent conversation: {e:?}");
+                    error!("Failed to load subagent conversation: {e:?}");
                     ApiError::InternalServerError
                 },
-            )?
-        } else {
-            let metadata = json!({"type":"agent_main"});
-            let metadata_enc = encrypt_with_key(&user_key, metadata.to_string().as_bytes()).await;
+            )?;
 
-            let new_conversation = NewConversation {
-                uuid: Uuid::new_v4(),
-                user_id: user.uuid,
-                metadata_enc: Some(metadata_enc),
-            };
-            let conversation = new_conversation.insert(&mut conn).map_err(|e| {
-                error!("Failed to create agent conversation: {e:?}");
-                ApiError::InternalServerError
-            })?;
+        Self::from_loaded(state, user, user_key, agent, conversation).await
+    }
 
-            let updated_cfg = NewAgentConfig {
-                uuid: agent_config.uuid,
-                user_id: agent_config.user_id,
-                conversation_id: Some(conversation.id),
-                enabled: agent_config.enabled,
-                model: agent_config.model.clone(),
-                max_context_tokens: agent_config.max_context_tokens,
-                compaction_threshold: agent_config.compaction_threshold,
-                system_prompt_enc: agent_config.system_prompt_enc.clone(),
-                preferences_enc: agent_config.preferences_enc.clone(),
-            };
-            let _ = updated_cfg.insert_or_update(&mut conn).map_err(|e| {
-                error!("Failed to update agent config with conversation_id: {e:?}");
-                ApiError::InternalServerError
-            })?;
-
-            conversation
-        };
-
-        // Ensure default memory blocks exist
-        Self::ensure_default_blocks(&state, &mut conn, &user_key, user.uuid).await?;
-
-        // System prompt override
-        let system_prompt = match decrypt_string(&user_key, agent_config.system_prompt_enc.as_ref())
+    async fn from_loaded(
+        state: Arc<AppState>,
+        user: Arc<crate::models::users::User>,
+        user_key: Arc<SecretKey>,
+        agent: Agent,
+        conversation: Conversation,
+    ) -> Result<Self, ApiError> {
+        let subagent_purpose = decrypt_string(&user_key, agent.purpose_enc.as_ref())
             .map_err(|e| {
-                error!("Failed to decrypt system_prompt_enc: {e:?}");
+                error!("Failed to decrypt subagent purpose: {e:?}");
                 ApiError::InternalServerError
-            })? {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => AGENT_INSTRUCTION.to_string(),
-        };
+            })?
+            .unwrap_or_default();
 
-        // Tool registry
+        let system_prompt = build_system_prompt(&agent, &subagent_purpose);
+
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(MemoryReplaceTool::new(
             state.clone(),
@@ -218,14 +399,21 @@ impl AgentRuntime {
             user_key.clone(),
             conversation.id,
         )));
+        if agent.kind == AGENT_KIND_MAIN {
+            tools.register(Arc::new(SpawnSubagentTool::new(
+                state.clone(),
+                user.clone(),
+                user_key.clone(),
+                agent.clone(),
+            )));
+        }
         tools.register(Arc::new(DoneTool));
 
         let available_tools = tools.generate_description();
-
         let lm = build_lm(
             state.clone(),
             user.clone(),
-            agent_config.model.clone(),
+            DEFAULT_MODEL.to_string(),
             0.7,
             32768,
         )
@@ -235,8 +423,9 @@ impl AgentRuntime {
             state,
             user,
             user_key,
-            agent_config,
+            agent,
             conversation,
+            subagent_purpose,
             system_prompt,
             lm,
             tools,
@@ -254,8 +443,8 @@ impl AgentRuntime {
         user_key: &SecretKey,
         user_id: Uuid,
     ) -> Result<(), ApiError> {
-        let persona =
-            MemoryBlock::get_by_user_and_label(conn, user_id, "persona").map_err(|e| {
+        let persona = MemoryBlock::get_by_user_and_label(conn, user_id, MEMORY_BLOCK_LABEL_PERSONA)
+            .map_err(|e| {
                 error!("Failed to load persona block: {e:?}");
                 ApiError::InternalServerError
             })?;
@@ -265,12 +454,8 @@ impl AgentRuntime {
             let block = NewMemoryBlock {
                 uuid: Uuid::new_v4(),
                 user_id,
-                label: "persona".to_string(),
-                description: Some(DEFAULT_PERSONA_DESCRIPTION.to_string()),
+                label: MEMORY_BLOCK_LABEL_PERSONA.to_string(),
                 value_enc,
-                char_limit: DEFAULT_BLOCK_CHAR_LIMIT,
-                read_only: false,
-                version: 1,
             };
             block.insert_or_update(conn).map_err(|e| {
                 error!("Failed to create persona block: {e:?}");
@@ -278,22 +463,19 @@ impl AgentRuntime {
             })?;
         }
 
-        let human = MemoryBlock::get_by_user_and_label(conn, user_id, "human").map_err(|e| {
-            error!("Failed to load human block: {e:?}");
-            ApiError::InternalServerError
-        })?;
+        let human = MemoryBlock::get_by_user_and_label(conn, user_id, MEMORY_BLOCK_LABEL_HUMAN)
+            .map_err(|e| {
+                error!("Failed to load human block: {e:?}");
+                ApiError::InternalServerError
+            })?;
 
         if human.is_none() {
             let value_enc = encrypt_with_key(user_key, "".as_bytes()).await;
             let block = NewMemoryBlock {
                 uuid: Uuid::new_v4(),
                 user_id,
-                label: "human".to_string(),
-                description: Some(DEFAULT_HUMAN_DESCRIPTION.to_string()),
+                label: MEMORY_BLOCK_LABEL_HUMAN.to_string(),
                 value_enc,
-                char_limit: DEFAULT_BLOCK_CHAR_LIMIT,
-                read_only: false,
-                version: 1,
             };
             block.insert_or_update(conn).map_err(|e| {
                 error!("Failed to create human block: {e:?}");
@@ -527,6 +709,8 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         let input = AgentResponseInput {
             input: input_content.clone(),
             current_time: ctx.current_time,
+            agent_kind: ctx.agent_kind,
+            subagent_purpose: ctx.subagent_purpose,
             persona_block: ctx.persona_block,
             human_block: ctx.human_block,
             memory_metadata: ctx.memory_metadata,
@@ -637,6 +821,8 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
 
         let now = chrono::Utc::now();
         ctx.current_time = format!("{} UTC", now.format("%m/%d/%Y %H:%M:%S (%A)"));
+        ctx.agent_kind = self.agent.kind.clone();
+        ctx.subagent_purpose = self.subagent_purpose.clone();
 
         let mut conn = self
             .state
@@ -645,10 +831,15 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             .get()
             .map_err(|_| ApiError::InternalServerError)?;
 
-        let persona = MemoryBlock::get_by_user_and_label(&mut conn, self.user.uuid, "persona")
-            .map_err(|_| ApiError::InternalServerError)?;
-        let human = MemoryBlock::get_by_user_and_label(&mut conn, self.user.uuid, "human")
-            .map_err(|_| ApiError::InternalServerError)?;
+        let persona = MemoryBlock::get_by_user_and_label(
+            &mut conn,
+            self.user.uuid,
+            MEMORY_BLOCK_LABEL_PERSONA,
+        )
+        .map_err(|_| ApiError::InternalServerError)?;
+        let human =
+            MemoryBlock::get_by_user_and_label(&mut conn, self.user.uuid, MEMORY_BLOCK_LABEL_HUMAN)
+                .map_err(|_| ApiError::InternalServerError)?;
 
         ctx.persona_block = decrypt_string(&self.user_key, persona.as_ref().map(|b| &b.value_enc))
             .map_err(|_| ApiError::InternalServerError)?
@@ -667,7 +858,6 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         let recall_count: i64 = user_embeddings::table
             .filter(user_embeddings::user_id.eq(self.user.uuid))
             .filter(user_embeddings::source_type.eq(SOURCE_TYPE_MESSAGE))
-            .filter(user_embeddings::conversation_id.eq(Some(self.conversation.id)))
             .count()
             .get_result(&mut conn)
             .map_err(|_| ApiError::InternalServerError)?;
@@ -1080,8 +1270,8 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
 
         if !self.compaction.should_compact(
             current_tokens as usize,
-            self.agent_config.max_context_tokens as usize,
-            self.agent_config.compaction_threshold,
+            DEFAULT_CONTEXT_WINDOW as usize,
+            DEFAULT_COMPACTION_THRESHOLD,
         ) {
             return Ok(());
         }

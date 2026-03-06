@@ -3,7 +3,7 @@
 
 use crate::{
     encrypt::{decrypt_content, encrypt_with_key},
-    models::agent_config::AgentConfig,
+    models::agents::Agent,
     models::responses::NewConversation,
     models::users::User,
     web::{
@@ -78,9 +78,7 @@ impl ConversationContext {
                 .get()
                 .map_err(|_| ApiError::InternalServerError)?;
 
-            AgentConfig::get_by_user_id(&mut conn, user_uuid)
-                .map_err(|_| ApiError::InternalServerError)?
-                .and_then(|cfg| cfg.conversation_id)
+            main_agent_conversation_id(&mut conn, user_uuid)?
         };
 
         if Some(conversation.id) == agent_conversation_id {
@@ -110,6 +108,15 @@ impl ConversationContext {
         decrypt_content(&self.user_key, self.conversation.metadata_enc.as_ref())
             .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))
     }
+}
+
+fn main_agent_conversation_id(
+    conn: &mut diesel::PgConnection,
+    user_uuid: Uuid,
+) -> Result<Option<i64>, ApiError> {
+    Agent::get_main_for_user(conn, user_uuid)
+        .map_err(|_| ApiError::InternalServerError)
+        .map(|agent| agent.map(|a| a.conversation_id))
 }
 
 // ============================================================================
@@ -570,9 +577,7 @@ async fn list_conversations(
             .get()
             .map_err(|_| ApiError::InternalServerError)?;
 
-        AgentConfig::get_by_user_id(&mut conn, user.uuid)
-            .map_err(|_| ApiError::InternalServerError)?
-            .and_then(|cfg| cfg.conversation_id)
+        main_agent_conversation_id(&mut conn, user.uuid)?
     };
 
     // Fetch conversations with database-level pagination
@@ -659,9 +664,7 @@ async fn delete_all_conversations(
         .get()
         .map_err(|_| ApiError::InternalServerError)?;
 
-    let agent_conversation_id = AgentConfig::get_by_user_id(&mut conn, user.uuid)
-        .map_err(|_| ApiError::InternalServerError)?
-        .and_then(|cfg| cfg.conversation_id);
+    let agent_conversation_id = main_agent_conversation_id(&mut conn, user.uuid)?;
 
     if let Some(agent_conversation_id) = agent_conversation_id {
         use crate::models::schema::conversations::dsl::*;
@@ -719,9 +722,7 @@ async fn batch_delete_conversations(
             .get()
             .map_err(|_| ApiError::InternalServerError)?;
 
-        AgentConfig::get_by_user_id(&mut conn, user.uuid)
-            .map_err(|_| ApiError::InternalServerError)?
-            .and_then(|cfg| cfg.conversation_id)
+        main_agent_conversation_id(&mut conn, user.uuid)?
     };
 
     for conversation_id in body.ids {

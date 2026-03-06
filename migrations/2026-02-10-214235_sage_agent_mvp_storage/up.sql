@@ -8,11 +8,7 @@ CREATE TABLE memory_blocks (
     user_id     UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
 
     label       TEXT NOT NULL,
-    description TEXT,
     value_enc   BYTEA NOT NULL,
-    char_limit  INTEGER NOT NULL DEFAULT 5000,
-    read_only   BOOLEAN NOT NULL DEFAULT FALSE,
-    version     INTEGER NOT NULL DEFAULT 1,
 
     created_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -54,25 +50,40 @@ CREATE INDEX idx_conversation_summaries_user_conv
 CREATE INDEX idx_conversation_summaries_chain
     ON conversation_summaries(previous_summary_id);
 
-CREATE TABLE agent_config (
-    id                  BIGSERIAL PRIMARY KEY,
-    uuid                UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE,
-    user_id             UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE UNIQUE,
+CREATE TABLE agents (
+    id               BIGSERIAL PRIMARY KEY,
+    uuid             UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+    user_id          UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
 
-    conversation_id     BIGINT REFERENCES conversations(id) ON DELETE SET NULL,
+    conversation_id  BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    kind             TEXT NOT NULL,
+    parent_agent_id  BIGINT REFERENCES agents(id) ON DELETE SET NULL,
+    display_name_enc BYTEA,
+    purpose_enc      BYTEA,
+    created_by       TEXT NOT NULL DEFAULT 'user',
 
-    enabled             BOOLEAN NOT NULL DEFAULT FALSE,
-    model               TEXT NOT NULL DEFAULT 'kimi-k2-5',
-    max_context_tokens  INTEGER NOT NULL DEFAULT 256000,
-    compaction_threshold REAL NOT NULL DEFAULT 0.80,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-    system_prompt_enc   BYTEA,
-    preferences_enc     BYTEA,
-
-    created_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    CONSTRAINT agents_kind_check CHECK (kind IN ('main', 'subagent')),
+    CONSTRAINT agents_created_by_check CHECK (created_by IN ('user', 'agent')),
+    CONSTRAINT agents_parent_check CHECK (
+        (kind = 'main' AND parent_agent_id IS NULL)
+        OR (kind = 'subagent' AND parent_agent_id IS NOT NULL)
+    ),
+    UNIQUE(conversation_id)
 );
 
-CREATE TRIGGER update_agent_config_updated_at
-BEFORE UPDATE ON agent_config
+CREATE UNIQUE INDEX idx_agents_one_main_per_user
+    ON agents(user_id)
+    WHERE kind = 'main';
+
+CREATE INDEX idx_agents_user_kind_created
+    ON agents(user_id, kind, created_at DESC);
+
+CREATE INDEX idx_agents_parent_agent_id
+    ON agents(parent_agent_id);
+
+CREATE TRIGGER update_agents_updated_at
+BEFORE UPDATE ON agents
 FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();

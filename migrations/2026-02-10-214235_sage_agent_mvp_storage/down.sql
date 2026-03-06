@@ -1,5 +1,8 @@
-DROP TRIGGER IF EXISTS update_agent_config_updated_at ON agent_config;
-DROP TABLE IF EXISTS agent_config;
+DROP TRIGGER IF EXISTS update_agents_updated_at ON agents;
+DROP INDEX IF EXISTS idx_agents_parent_agent_id;
+DROP INDEX IF EXISTS idx_agents_user_kind_created;
+DROP INDEX IF EXISTS idx_agents_one_main_per_user;
+DROP TABLE IF EXISTS agents;
 
 DROP INDEX IF EXISTS idx_conversation_summaries_chain;
 DROP INDEX IF EXISTS idx_conversation_summaries_user_conv;

@@ -27,6 +27,10 @@
         rustToolchain = builtins.fromTOML (builtins.readFile ./rust-toolchain.toml);
         rustChannel = rustToolchain.toolchain.channel;
         rustAnalyzer = pkgs.rust-bin.stable."${rustChannel}".rust-analyzer;
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rust;
+          rustc = rust;
+        };
 
         commonInputs = [
           rust
@@ -225,7 +229,7 @@
         };
 
         # Build the main Rust package
-        opensecret = pkgs.rustPlatform.buildRustPackage {
+        opensecret = rustPlatform.buildRustPackage {
           pname = "opensecret";
           version = "0.1.0";
           src = pkgs.lib.cleanSourceWith {
@@ -248,6 +252,11 @@
           };
           cargoLock = {
             lockFile = ./Cargo.lock;
+            outputHashes = {
+              "baml-ids-0.0.1" = "sha256-wjgwOcZvZIWEAjpq0gZwtZccQ+FupudBzpxR4+udKEQ=";
+              "minijinja-2.11.0" = "sha256-i3rXVnwRBWr7ewdFteezZWOrvzW89/VaJ3Yh6Bb40ZY=";
+              "rig-core-0.26.0" = "sha256-/1C2/UTuJrre4IYNW7i1pYaOGy0dxzhLyogR+5NL1nk=";
+            };
           };
           nativeBuildInputs = [
             pkgs.pkg-config

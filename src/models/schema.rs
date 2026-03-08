@@ -128,6 +128,46 @@ diesel::table! {
 }
 
 diesel::table! {
+    notification_deliveries (id) {
+        id -> Int8,
+        event_id -> Int8,
+        push_device_id -> Int8,
+        status -> Text,
+        attempt_count -> Int4,
+        next_attempt_at -> Timestamptz,
+        lease_owner -> Nullable<Text>,
+        lease_expires_at -> Nullable<Timestamptz>,
+        provider_message_id -> Nullable<Text>,
+        provider_status_code -> Nullable<Int4>,
+        last_error -> Nullable<Text>,
+        sent_at -> Nullable<Timestamptz>,
+        invalidated_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    notification_events (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        project_id -> Int4,
+        user_id -> Uuid,
+        kind -> Text,
+        delivery_mode -> Text,
+        priority -> Text,
+        collapse_key -> Nullable<Text>,
+        fallback_title -> Text,
+        fallback_body -> Text,
+        payload_enc -> Nullable<Bytea>,
+        not_before_at -> Timestamptz,
+        expires_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+        cancelled_at -> Nullable<Timestamptz>,
+    }
+}
+
+diesel::table! {
     oauth_providers (id) {
         id -> Int4,
         #[max_length = 255]
@@ -250,6 +290,29 @@ diesel::table! {
         project_id -> Int4,
         category -> Text,
         settings -> Jsonb,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    push_devices (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        installation_id -> Uuid,
+        platform -> Text,
+        provider -> Text,
+        environment -> Text,
+        app_id -> Text,
+        push_token_enc -> Bytea,
+        push_token_hash -> Bytea,
+        notification_public_key -> Bytea,
+        key_algorithm -> Text,
+        supports_encrypted_preview -> Bool,
+        supports_background_processing -> Bool,
+        last_seen_at -> Timestamptz,
+        revoked_at -> Nullable<Timestamptz>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
     }
@@ -447,6 +510,9 @@ diesel::joinable!(assistant_messages -> conversations (conversation_id));
 diesel::joinable!(assistant_messages -> responses (response_id));
 diesel::joinable!(conversation_summaries -> conversations (conversation_id));
 diesel::joinable!(invite_codes -> orgs (org_id));
+diesel::joinable!(notification_deliveries -> notification_events (event_id));
+diesel::joinable!(notification_deliveries -> push_devices (push_device_id));
+diesel::joinable!(notification_events -> org_projects (project_id));
 diesel::joinable!(org_memberships -> orgs (org_id));
 diesel::joinable!(org_project_secrets -> org_projects (project_id));
 diesel::joinable!(org_projects -> orgs (org_id));
@@ -478,6 +544,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     enclave_secrets,
     invite_codes,
     memory_blocks,
+    notification_deliveries,
+    notification_events,
     oauth_providers,
     org_memberships,
     org_project_secrets,
@@ -489,6 +557,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     platform_password_reset_requests,
     platform_users,
     project_settings,
+    push_devices,
     reasoning_items,
     responses,
     token_usage,

@@ -9,6 +9,7 @@ use futures::Stream;
 use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc, time::Duration};
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
 use tracing::{error, warn};
 use uuid::Uuid;
@@ -20,6 +21,7 @@ use crate::models::agents::{
 use crate::models::memory_blocks::MemoryBlock;
 use crate::models::responses::Conversation;
 use crate::models::users::User;
+use crate::push::{enqueue_agent_message_notification, AgentPushTarget};
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
 use crate::web::responses::constants::{
     DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT, OBJECT_TYPE_LIST,
@@ -170,6 +172,17 @@ struct AgentDoneEvent {
 #[derive(Debug, Clone, Serialize)]
 struct AgentErrorEvent {
     error: String,
+}
+
+#[derive(Debug)]
+enum AgentClientEvent {
+    Typing(AgentTypingEvent),
+    Message {
+        payload: AgentMessageEvent,
+        delivery_ack: oneshot::Sender<()>,
+    },
+    Done(AgentDoneEvent),
+    Error(AgentErrorEvent),
 }
 
 async fn encrypt_agent_event<T: Serialize>(
@@ -693,252 +706,320 @@ async fn chat_with_target(
         return Err(ApiError::BadRequest);
     }
 
-    // NOTE: We intentionally do runtime initialization *inside* the SSE stream so the client can
-    // receive typing indicators immediately, even if compaction/key retrieval takes time.
+    let (tx, mut rx) = mpsc::channel::<AgentClientEvent>(32);
+    let worker_state = state.clone();
+    let worker_user = user.clone();
+    let worker_target = target.clone();
+
+    tokio::spawn(async move {
+        run_agent_chat_task(worker_state, worker_user, input_content, worker_target, tx).await;
+    });
+
     let event_stream = async_stream::stream! {
-        let mut max_steps: usize = 0;
-        let mut total_messages: usize = 0;
-        let mut had_error = false;
-        let mut input_for_agent = String::new();
-
-        let mut runtime_opt: Option<runtime::AgentRuntime> = None;
-        'init: {
-            // Response starts: immediately emit a typing indicator.
-            let initial_typing = AgentTypingEvent { step: 0 };
-            match encrypt_agent_event(&state, &session_id, EVENT_AGENT_TYPING, &initial_typing)
-                .await
-            {
-                Ok(event) => yield Ok::<Event, std::convert::Infallible>(event),
-                Err(e) => {
-                    error!("Failed to encrypt initial typing event: {e:?}");
-                    yield Ok(Event::default().event(EVENT_AGENT_ERROR).data("Encryption failed"));
-                    had_error = true;
-                    break 'init;
+        while let Some(client_event) = rx.recv().await {
+            let encrypted = match client_event {
+                AgentClientEvent::Typing(payload) => {
+                    encrypt_agent_event(&state, &session_id, EVENT_AGENT_TYPING, &payload).await
                 }
-            }
-
-            let user_key = match state.get_user_key(user.uuid, None, None).await {
-                Ok(k) => k,
-                Err(_) => {
-                    let err_event = AgentErrorEvent {
-                        error: "Failed to initialize agent session.".to_string(),
-                    };
-                    match encrypt_agent_event(&state, &session_id, EVENT_AGENT_ERROR, &err_event)
-                        .await
-                    {
-                        Ok(event) => yield Ok(event),
-                        Err(_) => {
-                            yield Ok(Event::default().event(EVENT_AGENT_ERROR).data("Error"))
-                        }
-                    }
-                    had_error = true;
-                    break 'init;
-                }
-            };
-
-            let runtime = match target.clone() {
-                ChatTarget::Main => {
-                    runtime::AgentRuntime::new_main(state.clone(), user.clone(), user_key).await
-                }
-                ChatTarget::Subagent(agent_uuid) => {
-                    runtime::AgentRuntime::new_subagent(
-                        state.clone(),
-                        user.clone(),
-                        user_key,
-                        agent_uuid,
+                AgentClientEvent::Message { payload, delivery_ack } => {
+                    let encrypted = encrypt_agent_event(
+                        &state,
+                        &session_id,
+                        EVENT_AGENT_MESSAGE,
+                        &payload,
                     )
-                    .await
-                }
-            };
+                    .await;
 
-            let mut runtime = match runtime {
-                Ok(r) => r,
-                Err(e) => {
-                    error!("Agent runtime initialization error: {e:?}");
-                    let err_event = AgentErrorEvent {
-                        error: "Failed to initialize agent runtime.".to_string(),
-                    };
-                    match encrypt_agent_event(&state, &session_id, EVENT_AGENT_ERROR, &err_event)
-                        .await
-                    {
-                        Ok(event) => yield Ok(event),
-                        Err(_) => {
-                            yield Ok(Event::default().event(EVENT_AGENT_ERROR).data("Error"))
+                    match encrypted {
+                        Ok(event) => {
+                            yield Ok(event);
+                            let _ = delivery_ack.send(());
+                            continue;
                         }
+                        Err(error) => Err(error),
                     }
-                    had_error = true;
-                    break 'init;
+                }
+                AgentClientEvent::Done(payload) => {
+                    encrypt_agent_event(&state, &session_id, EVENT_AGENT_DONE, &payload).await
+                }
+                AgentClientEvent::Error(payload) => {
+                    encrypt_agent_event(&state, &session_id, EVENT_AGENT_ERROR, &payload).await
                 }
             };
 
-            match runtime.prepare(&input_content).await {
-                Ok(prepared) => {
-                    input_for_agent = prepared;
-                }
+            match encrypted {
+                Ok(event) => yield Ok(event),
                 Err(e) => {
-                    error!("Agent prepare() failed: {e:?}");
-                    let err_event = AgentErrorEvent {
-                        error: "Agent encountered an error preparing your request.".to_string(),
-                    };
-                    match encrypt_agent_event(&state, &session_id, EVENT_AGENT_ERROR, &err_event).await
-                    {
-                        Ok(event) => yield Ok(event),
-                        Err(_) => yield Ok(Event::default().event(EVENT_AGENT_ERROR).data("Error")),
-                    }
-                    had_error = true;
-                    break 'init;
-                }
-            }
-
-            max_steps = runtime.max_steps();
-            runtime_opt = Some(runtime);
-        }
-
-        if let Some(mut runtime) = runtime_opt {
-            'steps: for step_num in 0..max_steps {
-            // Immediately indicate that the agent is working.
-            let typing_event = AgentTypingEvent { step: step_num };
-            match encrypt_agent_event(&state, &session_id, EVENT_AGENT_TYPING, &typing_event).await {
-                Ok(event) => yield Ok::<Event, std::convert::Infallible>(event),
-                Err(e) => {
-                    error!("Failed to encrypt agent typing event: {e:?}");
+                    error!("Failed to encrypt agent SSE event: {e:?}");
                     yield Ok(Event::default().event(EVENT_AGENT_ERROR).data("Encryption failed"));
-                    had_error = true;
-                    break 'steps;
+                    break;
                 }
             }
-
-            let step_result = runtime.step(&input_for_agent, step_num == 0).await;
-
-            match step_result {
-                Ok(result) => {
-                    let runtime::StepResult {
-                        messages,
-                        executed_tools,
-                        done,
-                        ..
-                    } = result;
-
-                    // Persist assistant messages SYNCHRONOUSLY (so next step sees them).
-                    // Embedding updates happen async inside insert_assistant_message.
-                    for msg in &messages {
-                        if let Err(e) = runtime.insert_assistant_message(msg).await {
-                            error!("Failed to persist assistant message: {e:?}");
-                        }
-                    }
-
-                    // Persist tool calls SYNCHRONOUSLY (so next step sees them in context)
-                    for executed in &executed_tools {
-                        if let Err(e) = runtime
-                            .insert_tool_call_and_output(&executed.tool_call, &executed.result)
-                            .await
-                        {
-                            error!("Failed to persist tool call: {e:?}");
-                        }
-                    }
-
-                    // Emit messages to client with optional staggered delivery.
-                    if !messages.is_empty() {
-                        total_messages += messages.len();
-                        let message_count = messages.len();
-
-                        for (idx, msg) in messages.into_iter().enumerate() {
-                            let event_data = AgentMessageEvent {
-                                messages: vec![msg],
-                                step: step_num,
-                            };
-
-                            match encrypt_agent_event(
-                                &state,
-                                &session_id,
-                                EVENT_AGENT_MESSAGE,
-                                &event_data,
-                            )
-                            .await
-                            {
-                                Ok(event) => yield Ok::<Event, std::convert::Infallible>(event),
-                                Err(e) => {
-                                    error!("Failed to encrypt agent message event: {e:?}");
-                                    yield Ok(Event::default().event(EVENT_AGENT_ERROR).data("Encryption failed"));
-                                    had_error = true;
-                                    break 'steps;
-                                }
-                            }
-
-                            if idx + 1 < message_count {
-                                let typing_event = AgentTypingEvent { step: step_num };
-                                match encrypt_agent_event(
-                                    &state,
-                                    &session_id,
-                                    EVENT_AGENT_TYPING,
-                                    &typing_event,
-                                )
-                                .await
-                                {
-                                    Ok(event) => {
-                                        yield Ok::<Event, std::convert::Infallible>(event)
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to encrypt agent typing event: {e:?}");
-                                        yield Ok(Event::default().event(EVENT_AGENT_ERROR).data("Encryption failed"));
-                                        had_error = true;
-                                        break 'steps;
-                                    }
-                                }
-
-                                sleep(Duration::from_millis(MESSAGE_STAGGER_DELAY_MS)).await;
-                            }
-                        }
-                    }
-
-                    if done {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error!("Agent step {} error: {e:?}", step_num);
-                    let err_event = AgentErrorEvent {
-                        error: "Agent encountered an error processing your message.".to_string(),
-                    };
-                    match encrypt_agent_event(&state, &session_id, EVENT_AGENT_ERROR, &err_event)
-                        .await
-                    {
-                        Ok(event) => yield Ok(event),
-                        Err(_) => yield Ok(Event::default().event(EVENT_AGENT_ERROR).data("Error")),
-                    }
-                    had_error = true;
-                    break 'steps;
-                }
-            }
-            }
-        }
-
-        if !had_error && total_messages == 0 {
-            warn!("Agent produced no messages");
-            let fallback = AgentMessageEvent {
-                messages: vec!["I apologize, but I wasn't able to generate a response.".to_string()],
-                step: 0,
-            };
-            if let Ok(event) =
-                encrypt_agent_event(&state, &session_id, EVENT_AGENT_MESSAGE, &fallback).await
-            {
-                yield Ok(event);
-                total_messages = 1;
-            }
-        }
-
-        // Final done event
-        let done_event = AgentDoneEvent {
-            total_steps: max_steps,
-            total_messages,
-        };
-        match encrypt_agent_event(&state, &session_id, EVENT_AGENT_DONE, &done_event).await {
-            Ok(event) => yield Ok(event),
-            Err(_) => yield Ok(Event::default().data("[DONE]")),
         }
     };
 
     Ok(Sse::new(event_stream))
+}
+
+async fn run_agent_chat_task(
+    state: Arc<AppState>,
+    user: User,
+    input_content: MessageContent,
+    target: ChatTarget,
+    tx: mpsc::Sender<AgentClientEvent>,
+) {
+    let mut total_messages: usize = 0;
+    let mut had_error = false;
+    let mut client_connected = true;
+    let mut first_undelivered_message: Option<(Uuid, String)> = None;
+
+    client_connected = send_agent_client_event(
+        &tx,
+        AgentClientEvent::Typing(AgentTypingEvent { step: 0 }),
+        client_connected,
+    )
+    .await;
+
+    let user_key = match state.get_user_key(user.uuid, None, None).await {
+        Ok(key) => key,
+        Err(_) => {
+            let _ = send_agent_client_event(
+                &tx,
+                AgentClientEvent::Error(AgentErrorEvent {
+                    error: "Failed to initialize agent session.".to_string(),
+                }),
+                client_connected,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let runtime = match target.clone() {
+        ChatTarget::Main => {
+            runtime::AgentRuntime::new_main(state.clone(), user.clone(), user_key).await
+        }
+        ChatTarget::Subagent(agent_uuid) => {
+            runtime::AgentRuntime::new_subagent(state.clone(), user.clone(), user_key, agent_uuid)
+                .await
+        }
+    };
+
+    let mut runtime = match runtime {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            error!("Agent runtime initialization error: {e:?}");
+            let _ = send_agent_client_event(
+                &tx,
+                AgentClientEvent::Error(AgentErrorEvent {
+                    error: "Failed to initialize agent runtime.".to_string(),
+                }),
+                client_connected,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let input_for_agent = match runtime.prepare(&input_content).await {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            error!("Agent prepare() failed: {e:?}");
+            let _ = send_agent_client_event(
+                &tx,
+                AgentClientEvent::Error(AgentErrorEvent {
+                    error: "Agent encountered an error preparing your request.".to_string(),
+                }),
+                client_connected,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let max_steps = runtime.max_steps();
+
+    'steps: for step_num in 0..max_steps {
+        client_connected = send_agent_client_event(
+            &tx,
+            AgentClientEvent::Typing(AgentTypingEvent { step: step_num }),
+            client_connected,
+        )
+        .await;
+
+        match runtime.step(&input_for_agent, step_num == 0).await {
+            Ok(result) => {
+                let runtime::StepResult {
+                    messages,
+                    executed_tools,
+                    done,
+                    ..
+                } = result;
+
+                for executed in &executed_tools {
+                    if let Err(e) = runtime
+                        .insert_tool_call_and_output(&executed.tool_call, &executed.result)
+                        .await
+                    {
+                        error!("Failed to persist tool call: {e:?}");
+                    }
+                }
+
+                if !messages.is_empty() {
+                    total_messages += messages.len();
+                    let message_count = messages.len();
+
+                    for (idx, msg) in messages.into_iter().enumerate() {
+                        let assistant_message = match runtime.insert_assistant_message(&msg).await {
+                            Ok(message) => Some(message),
+                            Err(e) => {
+                                error!("Failed to persist assistant message: {e:?}");
+                                None
+                            }
+                        };
+
+                        let delivered = send_agent_message_event(
+                            &tx,
+                            AgentMessageEvent {
+                                messages: vec![msg.clone()],
+                                step: step_num,
+                            },
+                            client_connected,
+                        )
+                        .await;
+
+                        if !delivered {
+                            client_connected = false;
+                            if let Some(assistant_message) = assistant_message {
+                                if first_undelivered_message.is_none() {
+                                    first_undelivered_message =
+                                        Some((assistant_message.uuid, msg.clone()));
+                                }
+                            }
+                        } else {
+                            client_connected = true;
+                        }
+
+                        if idx + 1 < message_count && client_connected {
+                            client_connected = send_agent_client_event(
+                                &tx,
+                                AgentClientEvent::Typing(AgentTypingEvent { step: step_num }),
+                                client_connected,
+                            )
+                            .await;
+
+                            if client_connected {
+                                sleep(Duration::from_millis(MESSAGE_STAGGER_DELAY_MS)).await;
+                            }
+                        }
+                    }
+                }
+
+                if done {
+                    break 'steps;
+                }
+            }
+            Err(e) => {
+                error!("Agent step {} error: {e:?}", step_num);
+                had_error = true;
+                let _ = send_agent_client_event(
+                    &tx,
+                    AgentClientEvent::Error(AgentErrorEvent {
+                        error: "Agent encountered an error processing your message.".to_string(),
+                    }),
+                    client_connected,
+                )
+                .await;
+                break 'steps;
+            }
+        }
+    }
+
+    if !had_error && total_messages == 0 {
+        warn!("Agent produced no messages");
+        let _ =
+            send_agent_message_event(
+                &tx,
+                AgentMessageEvent {
+                    messages: vec![
+                        "I apologize, but I wasn't able to generate a response.".to_string()
+                    ],
+                    step: 0,
+                },
+                client_connected,
+            )
+            .await;
+        total_messages = 1;
+    }
+
+    if let Some((message_id, message_text)) = first_undelivered_message {
+        enqueue_agent_push_for_disconnect(&state, &user, &target, message_id, &message_text).await;
+    }
+
+    let _ = send_agent_client_event(
+        &tx,
+        AgentClientEvent::Done(AgentDoneEvent {
+            total_steps: max_steps,
+            total_messages,
+        }),
+        client_connected,
+    )
+    .await;
+}
+
+async fn send_agent_client_event(
+    tx: &mpsc::Sender<AgentClientEvent>,
+    event: AgentClientEvent,
+    client_connected: bool,
+) -> bool {
+    if !client_connected {
+        return false;
+    }
+
+    tx.send(event).await.is_ok()
+}
+
+async fn send_agent_message_event(
+    tx: &mpsc::Sender<AgentClientEvent>,
+    payload: AgentMessageEvent,
+    client_connected: bool,
+) -> bool {
+    if !client_connected {
+        return false;
+    }
+
+    let (delivery_ack, ack_rx) = oneshot::channel();
+    if tx
+        .send(AgentClientEvent::Message {
+            payload,
+            delivery_ack,
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    ack_rx.await.is_ok()
+}
+
+async fn enqueue_agent_push_for_disconnect(
+    state: &Arc<AppState>,
+    user: &User,
+    target: &ChatTarget,
+    message_id: Uuid,
+    message_text: &str,
+) {
+    let push_target = match target {
+        ChatTarget::Main => AgentPushTarget::Main,
+        ChatTarget::Subagent(agent_uuid) => AgentPushTarget::Subagent(*agent_uuid),
+    };
+
+    if let Err(e) =
+        enqueue_agent_message_notification(state, user, push_target, message_id, message_text).await
+    {
+        error!("Failed to enqueue agent push notification after SSE disconnect: {e:?}");
+    }
 }
 
 async fn create_subagent(

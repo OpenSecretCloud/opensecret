@@ -24,10 +24,10 @@ use crate::models::platform_password_reset::{
     NewPlatformPasswordResetRequest, PlatformPasswordResetError, PlatformPasswordResetRequest,
 };
 use crate::models::platform_users::{NewPlatformUser, PlatformUser, PlatformUserError};
-use crate::models::project_settings::OAuthSettings;
 use crate::models::project_settings::{
     EmailSettings, NewProjectSetting, ProjectSetting, ProjectSettingError, SettingCategory,
 };
+use crate::models::project_settings::{OAuthSettings, PushSettings};
 use crate::models::responses::{
     AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewReasoningItem,
     NewResponse, NewToolCall, NewToolOutput, NewUserInstruction, NewUserMessage, RawThreadMessage,
@@ -388,6 +388,14 @@ pub trait DBConnection {
         &self,
         project_id: i32,
         settings: OAuthSettings,
+    ) -> Result<ProjectSetting, DBError>;
+
+    fn get_project_push_settings(&self, project_id: i32) -> Result<Option<PushSettings>, DBError>;
+
+    fn update_project_push_settings(
+        &self,
+        project_id: i32,
+        settings: PushSettings,
     ) -> Result<ProjectSetting, DBError>;
 
     // Platform email verification methods
@@ -1630,6 +1638,36 @@ impl DBConnection for PostgresConnection {
             Ok(existing)
         } else {
             // Create new settings
+            new_settings.insert(conn).map_err(DBError::from)
+        }
+    }
+
+    fn get_project_push_settings(&self, project_id: i32) -> Result<Option<PushSettings>, DBError> {
+        debug!("Getting project push settings");
+        let settings = self.get_project_settings(project_id, SettingCategory::Push)?;
+
+        match settings {
+            Some(s) => s.get_push_settings().map(Some).map_err(DBError::from),
+            None => Ok(None),
+        }
+    }
+
+    fn update_project_push_settings(
+        &self,
+        project_id: i32,
+        settings: PushSettings,
+    ) -> Result<ProjectSetting, DBError> {
+        debug!("Updating project push settings");
+        let new_settings = NewProjectSetting::new_push_settings(project_id, settings)?;
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        if let Some(mut existing) =
+            ProjectSetting::get_by_project_and_category(conn, project_id, SettingCategory::Push)?
+        {
+            existing.settings = new_settings.settings;
+            existing.update(conn)?;
+            Ok(existing)
+        } else {
             new_settings.insert(conn).map_err(DBError::from)
         }
     }

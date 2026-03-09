@@ -1077,6 +1077,59 @@ A restart should not be needed but if you need to:
 sudo systemctl restart vsock-brave-proxy.service
 ```
 
+## Vsock Chutes proxy
+Create a vsock proxy service so that the agent-only Kimi path can talk to Chutes:
+
+First configure the endpoint into its allowlist:
+
+```sh
+sudo vim /etc/nitro_enclaves/vsock-proxy.yaml
+```
+
+Add this line:
+```
+- {address: llm.chutes.ai, port: 443}
+```
+
+Restart the nitro vsock proxy service:
+```sh
+sudo systemctl restart nitro-enclaves-vsock-proxy.service
+```
+
+Now create a service that spins this up automatically:
+
+```sh
+sudo vim /etc/systemd/system/vsock-chutes-proxy.service
+```
+
+```
+[Unit]
+Description=Vsock Chutes Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8042 llm.chutes.ai 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Activate the service:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable vsock-chutes-proxy.service
+sudo systemctl start vsock-chutes-proxy.service
+sudo systemctl status vsock-chutes-proxy.service
+```
+
+If you need to restart it later:
+```sh
+sudo systemctl restart vsock-chutes-proxy.service
+```
+
 ## Vsock Tinfoil proxies
 Create vsock proxy services so that tinfoil-proxy can talk to Tinfoil services:
 
@@ -1755,6 +1808,27 @@ Take that encrypted base64 and insert it into the `enclave_secrets` table with k
 ```sql
 INSERT INTO enclave_secrets (key, value)
 VALUES ('brave_api_key', decode('your_base64_string', 'base64'));
+```
+
+#### Chutes API Key (Optional, agent-only Kimi routing)
+
+If you want the new agent runtime to use Chutes for Kimi inside Nitro, store the Chutes API key encrypted to the enclave KMS key. Regular `kimi-k2-5` traffic still stays on Tinfoil; this key only enables the temporary agent-only path.
+
+```sh
+echo -n "CHUTES_API_KEY" | base64 -w 0
+```
+
+Take that output and encrypt to the KMS key, from a machine that has encrypt access to the key:
+
+```sh
+aws kms encrypt --key-id "KEY_ARN" --plaintext "BASE64_KEY" --query CiphertextBlob --output text
+```
+
+Take that encrypted base64 and insert it into the `enclave_secrets` table with key as `chutes_api_key` and value as the base64.
+
+```sql
+INSERT INTO enclave_secrets (key, value)
+VALUES ('chutes_api_key', decode('your_base64_string', 'base64'));
 ```
 
 #### os-flags API Key

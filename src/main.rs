@@ -112,6 +112,7 @@ const BILLING_API_KEY_NAME: &str = "billing_api_key";
 const BILLING_SERVER_URL_NAME: &str = "billing_server_url";
 const KAGI_API_KEY_NAME: &str = "kagi_api_key";
 const BRAVE_API_KEY_NAME: &str = "brave_api_key";
+const CHUTES_API_KEY_NAME: &str = "chutes_api_key";
 const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
 const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
 
@@ -435,6 +436,8 @@ pub struct AppStateBuilder {
     openai_api_key: Option<String>,
     openai_api_base: Option<String>,
     tinfoil_api_base: Option<String>,
+    chutes_api_base: Option<String>,
+    chutes_api_key: Option<String>,
     jwt_secret: Option<Vec<u8>>,
     resend_api_key: Option<String>,
     github_client_secret: Option<String>,
@@ -489,6 +492,16 @@ impl AppStateBuilder {
 
     pub fn tinfoil_api_base(mut self, tinfoil_api_base: Option<String>) -> Self {
         self.tinfoil_api_base = tinfoil_api_base;
+        self
+    }
+
+    pub fn chutes_api_base(mut self, chutes_api_base: Option<String>) -> Self {
+        self.chutes_api_base = chutes_api_base;
+        self
+    }
+
+    pub fn chutes_api_key(mut self, chutes_api_key: Option<String>) -> Self {
+        self.chutes_api_key = chutes_api_key;
         self
     }
 
@@ -679,6 +692,8 @@ impl AppStateBuilder {
             openai_api_base.clone(),
             self.openai_api_key.clone(),
             self.tinfoil_api_base.clone(),
+            self.chutes_api_base.clone(),
+            self.chutes_api_key.clone(),
         ));
 
         let (cancellation_tx, _) = tokio::sync::broadcast::channel(1024);
@@ -2443,6 +2458,44 @@ async fn retrieve_brave_api_key(
     }
 }
 
+async fn retrieve_chutes_api_key(
+    aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
+    db: Arc<dyn DBConnection + Send + Sync>,
+) -> Result<Option<String>, Error> {
+    let creds = aws_credential_manager
+        .read()
+        .await
+        .clone()
+        .expect("non-local mode should have creds")
+        .get_credentials()
+        .await
+        .expect("non-local mode should have creds");
+
+    let existing_key = db.get_enclave_secret_by_key(CHUTES_API_KEY_NAME)?;
+
+    if let Some(ref encrypted_key) = existing_key {
+        let base64_encrypted_key = general_purpose::STANDARD.encode(&encrypted_key.value);
+
+        debug!("trying to decrypt base64 encrypted Chutes API key");
+
+        let decrypted_bytes = decrypt_with_kms(
+            &creds.region,
+            &creds.access_key_id,
+            &creds.secret_access_key,
+            &creds.token,
+            &base64_encrypted_key,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        String::from_utf8(decrypted_bytes)
+            .map_err(|e| Error::EncryptionError(format!("Failed to decode UTF-8: {}", e)))
+            .map(Some)
+    } else {
+        tracing::info!("Chutes API key not found in the database");
+        Ok(None)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     // Add debug logs for entrypoints and exit points
@@ -2614,8 +2667,38 @@ async fn main() -> Result<(), Error> {
         None // No API key needed if not using OpenAI's domain
     };
 
-    // Tinfoil API base is always from environment (like OpenAI API base)
-    let tinfoil_api_base = env::var("TINFOIL_API_BASE").ok();
+    let tinfoil_api_base = env::var("TINFOIL_API_BASE").ok().and_then(|base| {
+        let base = base.trim();
+        (!base.is_empty()).then(|| base.to_string())
+    });
+
+    let chutes_api_key = if app_mode != AppMode::Local {
+        retrieve_chutes_api_key(aws_credential_manager.clone(), db.clone()).await?
+    } else {
+        env::var("CHUTES_API_KEY").ok().and_then(|token| {
+            let token = token.trim();
+            (!token.is_empty()).then(|| token.to_string())
+        })
+    };
+
+    let chutes_api_base = if chutes_api_key.is_some() {
+        env::var("CHUTES_API_BASE")
+            .ok()
+            .and_then(|base| {
+                let base = base.trim();
+                (!base.is_empty()).then(|| base.to_string())
+            })
+            .or_else(|| Some("https://llm.chutes.ai".to_string()))
+    } else {
+        None
+    };
+
+    if let Some(chutes_api_base) = chutes_api_base.as_deref() {
+        tracing::info!(
+            "Agent-only Kimi provider enabled via Chutes at {}",
+            chutes_api_base
+        );
+    }
 
     let jwt_secret = get_or_create_jwt_secret(
         &app_mode,
@@ -2750,6 +2833,8 @@ async fn main() -> Result<(), Error> {
         .openai_api_key(openai_api_key)
         .openai_api_base(openai_api_base)
         .tinfoil_api_base(tinfoil_api_base)
+        .chutes_api_base(chutes_api_base)
+        .chutes_api_key(chutes_api_key)
         .jwt_secret(jwt_secret)
         .resend_api_key(resend_api_key)
         .github_client_secret(github_client_secret.clone())

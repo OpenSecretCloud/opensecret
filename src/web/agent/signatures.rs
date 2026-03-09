@@ -385,20 +385,23 @@ async fn call_agent_response_once(
 pub async fn build_lm(
     state: Arc<AppState>,
     user: Arc<crate::models::users::User>,
-    model: String,
+    request_model: String,
+    billing_model: String,
     temperature: f32,
     max_tokens: u32,
 ) -> Result<Arc<LM>, ApiError> {
-    let model_for_closure = model.clone();
+    let request_model_for_closure = request_model.clone();
+    let billing_model_for_closure = billing_model.clone();
     let completion_model = CustomCompletionModel::new(move |request: CompletionRequest| {
         let state = state.clone();
         let user = user.clone();
-        let model = model_for_closure.clone();
+        let request_model = request_model_for_closure.clone();
+        let billing_model = billing_model_for_closure.clone();
 
         Box::pin(async move {
-            let body = completion_request_to_openai_body(&model, &request)?;
+            let body = completion_request_to_openai_body(&request_model, &request)?;
             let headers = HeaderMap::new();
-            let billing_context = BillingContext::new(AuthMethod::Jwt, model.to_string());
+            let billing_context = BillingContext::new(AuthMethod::Jwt, billing_model.clone());
             let completion = get_chat_completion_response(
                 &state,
                 user.as_ref(),
@@ -441,7 +444,7 @@ pub async fn build_lm(
 
     let lm = LM::builder()
         .base_url("http://localhost".to_string())
-        .model(model)
+        .model(billing_model)
         .temperature(temperature)
         .max_tokens(max_tokens)
         .cache(false)

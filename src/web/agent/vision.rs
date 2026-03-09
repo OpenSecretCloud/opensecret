@@ -25,7 +25,8 @@ pub async fn describe_image(
     state: &Arc<AppState>,
     user: &User,
     auth_method: AuthMethod,
-    model: &str,
+    request_model: &str,
+    billing_model: &str,
     image_url: &str,
     user_message: &str,
     recent_messages: &str,
@@ -61,7 +62,7 @@ pub async fn describe_image(
     ];
 
     let body = json!({
-        "model": model,
+        "model": request_model,
         "stream": false,
         "messages": [
             { "role": "system", "content": VISION_SYSTEM_PROMPT },
@@ -70,10 +71,13 @@ pub async fn describe_image(
         "max_tokens": DEFAULT_VISION_MAX_TOKENS,
     });
 
-    debug!("Vision pre-processing: calling model {}", model);
+    debug!(
+        "Vision pre-processing: calling request model {} (billing model {})",
+        request_model, billing_model
+    );
 
     let headers = HeaderMap::new();
-    let billing_context = BillingContext::new(auth_method, model.to_string());
+    let billing_context = BillingContext::new(auth_method, billing_model.to_string());
     let completion = get_chat_completion_response(state, user, body, &headers, billing_context)
         .await
         .map_err(|e| {

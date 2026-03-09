@@ -20,6 +20,7 @@ use crate::models::responses::{
     ToolOutput, UserMessage,
 };
 use crate::models::schema::{agents, memory_blocks, user_embeddings};
+use crate::proxy_config::MODEL_KIMI_K2_5_AGENT;
 use crate::rag::{
     insert_message_embedding, serialize_f32_le, SOURCE_TYPE_ARCHIVAL, SOURCE_TYPE_MESSAGE,
 };
@@ -41,6 +42,7 @@ use super::vision;
 
 const DEFAULT_PERSONA_VALUE: &str = "I am Maple, a helpful AI companion. I maintain long-term memory across our conversations and strive to be friendly, concise, and genuinely helpful.";
 pub const DEFAULT_MODEL: &str = "kimi-k2-5";
+const AGENT_REQUEST_MODEL: &str = MODEL_KIMI_K2_5_AGENT;
 pub const DEFAULT_CONTEXT_WINDOW: i32 = 256_000;
 pub const DEFAULT_COMPACTION_THRESHOLD: f32 = 0.80;
 const MIN_MESSAGES_IN_CONTEXT: usize = 20;
@@ -413,6 +415,7 @@ impl AgentRuntime {
         let lm = build_lm(
             state.clone(),
             user.clone(),
+            AGENT_REQUEST_MODEL.to_string(),
             DEFAULT_MODEL.to_string(),
             0.7,
             32768,
@@ -528,6 +531,7 @@ impl AgentRuntime {
                 &self.state,
                 self.user.as_ref(),
                 AuthMethod::Jwt,
+                AGENT_REQUEST_MODEL,
                 DEFAULT_MODEL,
                 image_url,
                 &user_text,

@@ -367,6 +367,10 @@ echo "127.0.0.31 router.inf9.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.32 router.inf10.tinfoil.sh" >> /etc/hosts
 log "Added Tinfoil proxy domains to /etc/hosts"
 
+# Add Chutes hostname to /etc/hosts
+echo "127.0.0.35 llm.chutes.ai" >> /etc/hosts
+log "Added Chutes domain to /etc/hosts"
+
 # Add Kagi Search hostname to /etc/hosts
 echo "127.0.0.23 kagi.com" >> /etc/hosts
 log "Added Kagi Search domain to /etc/hosts"
@@ -505,6 +509,10 @@ run_forever tf_kagi_search python3 /app/traffic_forwarder.py 127.0.0.23 443 3 80
 # Start the traffic forwarder for Brave Search in the background
 log "Starting Brave Search traffic forwarder"
 run_forever tf_brave_search python3 /app/traffic_forwarder.py 127.0.0.24 443 3 8027 &
+
+# Start the traffic forwarder for Chutes in the background
+log "Starting Chutes traffic forwarder"
+run_forever tf_chutes python3 /app/traffic_forwarder.py 127.0.0.35 443 3 8042 &
 
 # Wait for the forwarders to start
 log "Waiting for forwarders to start"
@@ -732,6 +740,14 @@ if timeout 5 bash -c '</dev/tcp/127.0.0.24/443'; then
     log "Brave Search connection successful"
 else
     log "Brave Search connection failed"
+fi
+
+# Test the connection to Chutes
+log "Testing connection to Chutes:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.35/443'; then
+    log "Chutes connection successful"
+else
+    log "Chutes connection failed"
 fi
 
 # Start the continuum-proxy if we're in AWS Nitro mode

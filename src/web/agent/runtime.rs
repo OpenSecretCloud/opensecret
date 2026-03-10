@@ -39,7 +39,7 @@ use super::tools::{
 };
 use super::vision;
 
-const DEFAULT_PERSONA_VALUE: &str = "I am Sage, a helpful AI companion. I maintain long-term memory across our conversations and strive to be friendly, concise, and genuinely helpful.";
+const DEFAULT_PERSONA_VALUE: &str = "I am Maple, a helpful AI companion. I maintain long-term memory across our conversations and strive to be friendly, concise, and genuinely helpful.";
 pub const DEFAULT_MODEL: &str = "kimi-k2-5";
 pub const DEFAULT_CONTEXT_WINDOW: i32 = 256_000;
 pub const DEFAULT_COMPACTION_THRESHOLD: f32 = 0.80;
@@ -97,7 +97,7 @@ fn build_system_prompt(agent: &Agent, subagent_purpose: &str) -> String {
 
     if agent.kind == AGENT_KIND_MAIN {
         prompt.push_str(
-            "\n\nMAIN AGENT MODE:\nYou are the user's primary persistent agent and the home surface of Maple.",
+            "\n\nMAIN AGENT MODE:\nYou are the user's primary persistent agent and the home surface of Maple, Maple AI's secure and encrypted communications app.",
         );
     } else {
         prompt.push_str(
@@ -729,7 +729,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         )
         .await?;
 
-        // Unwrap nested JSON arrays (Sage compatibility)
+        // Unwrap nested JSON arrays emitted by the model.
         let messages: Vec<String> = response
             .messages
             .iter()
@@ -747,8 +747,8 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             .collect();
 
         // Execute tools and inject results for next step.
-        // Persistence is handled by the caller (chat handler) to match Sage's
-        // "send first, store synchronously, embed async" pattern.
+        // Persistence is handled by the caller (chat handler) so messages are
+        // sent first, stored synchronously, then embedded asynchronously.
         let mut executed_tools = Vec::new();
         for tool_call in &response.tool_calls {
             let result = if tool_call.name == "done" {
@@ -931,7 +931,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             }
         }
 
-        // First-time user heuristic (matches Sage)
+        // First-time user heuristic for brand-new conversations.
         let has_summary = summary.is_some();
         if messages.len() <= 1 && !has_summary {
             ctx.is_first_time_user = true;
@@ -1080,7 +1080,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             ApiError::InternalServerError
         })?;
 
-        // Mirror Sage: store message synchronously, update embedding in background.
+        // Store the message synchronously and update the embedding in background.
         let state = self.state.clone();
         let user = self.user.clone();
         let user_key = self.user_key.clone();
@@ -1132,7 +1132,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             ApiError::InternalServerError
         })?;
 
-        // Mirror Sage: store message synchronously, update embedding in background.
+        // Store the message synchronously and update the embedding in background.
         let state = self.state.clone();
         let user = self.user.clone();
         let user_key = self.user_key.clone();

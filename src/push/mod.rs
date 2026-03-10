@@ -26,8 +26,8 @@ use tokio::sync::RwLock;
 use tracing::warn;
 use uuid::Uuid;
 
-pub const AGENT_NOTIFICATION_FALLBACK_TITLE: &str = "New Sage message";
-pub const AGENT_NOTIFICATION_FALLBACK_BODY: &str = "Open Maple to view it";
+pub const AGENT_NOTIFICATION_FALLBACK_TITLE: &str = "New Maple message";
+pub const AGENT_NOTIFICATION_FALLBACK_BODY: &str = "Open Maple to view your encrypted message";
 pub const APNS_JWT_CACHE_LIFETIME_MINUTES: i64 = 50;
 pub const FCM_TOKEN_CACHE_SAFETY_MARGIN_SECONDS: i64 = 60;
 pub const PUSH_PREVIEW_BODY_MAX_BYTES: usize = 180;
@@ -352,7 +352,7 @@ pub async fn enqueue_agent_message_notification(
             preview_payload: Some(NotificationPreviewPayloadInput {
                 message_id,
                 kind: NOTIFICATION_KIND_AGENT_MESSAGE.to_string(),
-                title: "Sage".to_string(),
+                title: "Maple".to_string(),
                 body: normalize_preview_body(message_text),
                 deep_link,
                 thread_id,

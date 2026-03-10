@@ -37,6 +37,7 @@ use super::signatures::{
 use super::tools::{
     ArchivalInsertTool, ArchivalSearchTool, ConversationSearchTool, DoneTool, MemoryAppendTool,
     MemoryInsertTool, MemoryReplaceTool, SpawnSubagentTool, ToolRegistry, ToolResult,
+    WebSearchTool,
 };
 use super::vision;
 
@@ -401,6 +402,9 @@ impl AgentRuntime {
             user_key.clone(),
             conversation.id,
         )));
+        if let Some(brave_client) = state.brave_client.clone() {
+            tools.register(Arc::new(WebSearchTool::new(brave_client)));
+        }
         if agent.kind == AGENT_KIND_MAIN {
             tools.register(Arc::new(SpawnSubagentTool::new(
                 state.clone(),

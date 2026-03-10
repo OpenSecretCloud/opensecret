@@ -271,7 +271,7 @@ fn build_fcm_payload(
                 "ttl": format!("{}s", ttl_seconds),
                 "collapse_key": collapse_key,
                 "notification": {
-                    "channel_id": "sage_messages",
+                    "channel_id": "maple_messages",
                     "tag": event.uuid.to_string(),
                     "click_action": "OPEN_THREAD",
                 }

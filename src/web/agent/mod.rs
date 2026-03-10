@@ -106,7 +106,7 @@ enum ChatTarget {
     Subagent(Uuid),
 }
 
-const MAIN_AGENT_DISPLAY_NAME: &str = "Sage";
+const MAIN_AGENT_DISPLAY_NAME: &str = "Maple";
 
 fn default_limit() -> i64 {
     DEFAULT_PAGINATION_LIMIT

@@ -112,7 +112,7 @@ mod tests {
             notification_id: Uuid::new_v4(),
             message_id: Uuid::new_v4(),
             kind: "agent.message".to_string(),
-            title: "Sage".to_string(),
+            title: "Maple".to_string(),
             body: "Hello from Maple".to_string(),
             deep_link: "opensecret://agent".to_string(),
             thread_id: "agent:main".to_string(),

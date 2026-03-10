@@ -1,4 +1,4 @@
--- Sage MVP agent storage tables
+-- Maple MVP agent storage tables
 --
 -- Note: update_updated_at_column() already exists from previous migrations.
 

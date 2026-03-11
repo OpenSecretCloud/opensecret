@@ -21,31 +21,35 @@ const VISION_SYSTEM_PROMPT: &str =
         but your primary job is accurate visual description. \
         Output ONLY the description, nothing else.";
 
+pub struct VisionRequest<'a> {
+    pub auth_method: AuthMethod,
+    pub request_model: &'a str,
+    pub billing_model: &'a str,
+    pub image_url: &'a str,
+    pub user_message: &'a str,
+    pub recent_messages: &'a str,
+}
+
 pub async fn describe_image(
     state: &Arc<AppState>,
     user: &User,
-    auth_method: AuthMethod,
-    request_model: &str,
-    billing_model: &str,
-    image_url: &str,
-    user_message: &str,
-    recent_messages: &str,
+    request: VisionRequest<'_>,
 ) -> Result<String, ApiError> {
-    if image_url.trim().is_empty() {
+    if request.image_url.trim().is_empty() {
         return Err(ApiError::BadRequest);
     }
 
     let mut text_parts: Vec<String> = Vec::new();
-    if !recent_messages.trim().is_empty() {
+    if !request.recent_messages.trim().is_empty() {
         text_parts.push(format!(
             "Recent conversation for context:\n{}",
-            recent_messages.trim()
+            request.recent_messages.trim()
         ));
     }
-    if !user_message.trim().is_empty() {
+    if !request.user_message.trim().is_empty() {
         text_parts.push(format!(
             "The user sent this message alongside the image: \"{}\"",
-            user_message.trim()
+            request.user_message.trim()
         ));
     }
     text_parts.push("Describe this image in detail.".to_string());
@@ -53,7 +57,7 @@ pub async fn describe_image(
     let user_content: Vec<Value> = vec![
         json!({
             "type": "image_url",
-            "image_url": { "url": image_url }
+            "image_url": { "url": request.image_url }
         }),
         json!({
             "type": "text",
@@ -62,7 +66,7 @@ pub async fn describe_image(
     ];
 
     let body = json!({
-        "model": request_model,
+        "model": request.request_model,
         "stream": false,
         "messages": [
             { "role": "system", "content": VISION_SYSTEM_PROMPT },
@@ -73,11 +77,12 @@ pub async fn describe_image(
 
     debug!(
         "Vision pre-processing: calling request model {} (billing model {})",
-        request_model, billing_model
+        request.request_model, request.billing_model
     );
 
     let headers = HeaderMap::new();
-    let billing_context = BillingContext::new(auth_method, billing_model.to_string());
+    let billing_context =
+        BillingContext::new(request.auth_method, request.billing_model.to_string());
     let completion = get_chat_completion_response(state, user, body, &headers, billing_context)
         .await
         .map_err(|e| {

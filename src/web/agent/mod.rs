@@ -1,7 +1,11 @@
 use axum::{
     extract::{Path, Query, State},
+    http::{header, HeaderName, HeaderValue},
     middleware::from_fn_with_state,
-    response::sse::{Event, Sse},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{delete, get, post},
     Extension, Json, Router,
 };
@@ -10,7 +14,6 @@ use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::sleep;
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -149,8 +152,7 @@ const EVENT_AGENT_MESSAGE: &str = "agent.message";
 const EVENT_AGENT_TYPING: &str = "agent.typing";
 const EVENT_AGENT_DONE: &str = "agent.done";
 const EVENT_AGENT_ERROR: &str = "agent.error";
-
-const MESSAGE_STAGGER_DELAY_MS: u64 = 1_500;
+const AGENT_SSE_KEEPALIVE_INTERVAL_SECS: u64 = 15;
 
 #[derive(Debug, Clone, Serialize)]
 struct AgentMessageEvent {
@@ -197,6 +199,29 @@ async fn encrypt_agent_event<T: Serialize>(
     })?;
 
     encrypt_event(state, session_id, event_type, &value).await
+}
+
+fn agent_sse_response<S>(event_stream: S) -> Response
+where
+    S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
+{
+    let sse = Sse::new(event_stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(AGENT_SSE_KEEPALIVE_INTERVAL_SECS))
+            .text("keep-alive"),
+    );
+
+    (
+        [
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+            (
+                HeaderName::from_static("x-accel-buffering"),
+                HeaderValue::from_static("no"),
+            ),
+        ],
+        sse,
+    )
+        .into_response()
 }
 
 fn build_main_agent_response(ctx: &AgentConversationContext) -> MainAgentResponse {
@@ -658,7 +683,7 @@ async fn chat_main(
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
     Extension(body): Extension<AgentChatRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     chat_with_target(state, session_id, user, body, ChatTarget::Main).await
 }
 
@@ -668,7 +693,7 @@ async fn chat_subagent(
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
     Extension(body): Extension<AgentChatRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     let mut conn = state
         .db
         .get_pool()
@@ -699,7 +724,7 @@ async fn chat_with_target(
     user: User,
     body: AgentChatRequest,
     target: ChatTarget,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     MessageContentConverter::validate_content(&body.input)?;
     let input_content = MessageContentConverter::normalize_content(body.input.clone());
     if is_empty_message_content(&input_content) {
@@ -758,7 +783,7 @@ async fn chat_with_target(
         }
     };
 
-    Ok(Sse::new(event_stream))
+    Ok(agent_sse_response(event_stream))
 }
 
 async fn run_agent_chat_task(
@@ -867,9 +892,8 @@ async fn run_agent_chat_task(
 
                 if !messages.is_empty() {
                     total_messages += messages.len();
-                    let message_count = messages.len();
 
-                    for (idx, msg) in messages.into_iter().enumerate() {
+                    for msg in messages {
                         let assistant_message = match runtime.insert_assistant_message(&msg).await {
                             Ok(message) => Some(message),
                             Err(e) => {
@@ -898,19 +922,6 @@ async fn run_agent_chat_task(
                             }
                         } else {
                             client_connected = true;
-                        }
-
-                        if idx + 1 < message_count && client_connected {
-                            client_connected = send_agent_client_event(
-                                &tx,
-                                AgentClientEvent::Typing(AgentTypingEvent { step: step_num }),
-                                client_connected,
-                            )
-                            .await;
-
-                            if client_connected {
-                                sleep(Duration::from_millis(MESSAGE_STAGGER_DELAY_MS)).await;
-                            }
                         }
                     }
                 }

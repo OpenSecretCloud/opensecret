@@ -534,12 +534,14 @@ impl AgentRuntime {
             match vision::describe_image(
                 &self.state,
                 self.user.as_ref(),
-                AuthMethod::Jwt,
-                AGENT_REQUEST_MODEL,
-                DEFAULT_MODEL,
-                image_url,
-                &user_text,
-                &recent_context,
+                vision::VisionRequest {
+                    auth_method: AuthMethod::Jwt,
+                    request_model: AGENT_REQUEST_MODEL,
+                    billing_model: DEFAULT_MODEL,
+                    image_url,
+                    user_message: &user_text,
+                    recent_messages: &recent_context,
+                },
             )
             .await
             {

@@ -11,6 +11,8 @@ pub const MODEL_GEMMA_3_27B: &str = "gemma-3-27b";
 pub const MODEL_GPT_OSS_120B: &str = "gpt-oss-120b";
 #[allow(dead_code)]
 pub const MODEL_WHISPER_LARGE_V3: &str = "whisper-large-v3";
+#[allow(dead_code)]
+pub const MODEL_KIMI_K2_5_AGENT: &str = "kimi-k2-5-agent";
 
 /// Model routing configuration
 #[derive(Debug, Clone)]
@@ -55,6 +57,11 @@ impl ProxyRouter {
             ("llama-3.3-70b", "tinfoil") => "llama3-3-70b".to_string(),
             ("llama3-3-70b", "continuum") => "llama-3.3-70b".to_string(),
 
+            // Local Chutes override for Kimi
+            ("kimi-k2-5", "chutes") => "moonshotai/Kimi-K2.5-TEE".to_string(),
+            (MODEL_KIMI_K2_5_AGENT, "chutes") => "moonshotai/Kimi-K2.5-TEE".to_string(),
+            (MODEL_KIMI_K2_5_AGENT, "tinfoil") => "kimi-k2-5".to_string(),
+
             // Whisper translations
             ("whisper-large-v3", "tinfoil") => "whisper-large-v3-turbo".to_string(),
             ("whisper-large-v3-turbo", "continuum") => "whisper-large-v3".to_string(),
@@ -68,6 +75,8 @@ impl ProxyRouter {
         openai_base: String,
         openai_key: Option<String>,
         tinfoil_base: Option<String>,
+        kimi_base: Option<String>,
+        kimi_key: Option<String>,
     ) -> Self {
         // Default OpenAI/Continuum proxy config
         let default_proxy = ProxyConfig {
@@ -91,11 +100,24 @@ impl ProxyRouter {
             provider_name: "tinfoil".to_string(),
         });
 
+        let kimi_proxy = match (kimi_base, kimi_key) {
+            (Some(base_url), Some(api_key))
+                if !base_url.trim().is_empty() && !api_key.trim().is_empty() =>
+            {
+                Some(ProxyConfig {
+                    base_url,
+                    api_key: Some(api_key),
+                    provider_name: "chutes".to_string(),
+                })
+            }
+            _ => None,
+        };
+
         // Build static routing table
-        let model_routes = Self::build_static_routes(&default_proxy, &tinfoil_proxy);
+        let model_routes = Self::build_static_routes(&default_proxy, &tinfoil_proxy, &kimi_proxy);
 
         // Build static models response
-        let models_response = Self::build_models_response(&tinfoil_proxy);
+        let models_response = Self::build_models_response(&tinfoil_proxy, &kimi_proxy);
 
         ProxyRouter {
             model_routes,
@@ -109,6 +131,7 @@ impl ProxyRouter {
     fn build_static_routes(
         continuum_proxy: &ProxyConfig,
         tinfoil_proxy: &Option<ProxyConfig>,
+        kimi_proxy: &Option<ProxyConfig>,
     ) -> HashMap<String, ModelRoute> {
         let mut routes = HashMap::new();
 
@@ -135,8 +158,17 @@ impl ProxyRouter {
             routes.insert("llama3-3-70b".to_string(), tinfoil_route.clone());
             routes.insert("deepseek-r1-0528".to_string(), tinfoil_route.clone());
             routes.insert("qwen3-vl-30b".to_string(), tinfoil_route.clone());
-            routes.insert("kimi-k2-5".to_string(), tinfoil_route.clone());
             routes.insert("nomic-embed-text".to_string(), tinfoil_route.clone());
+            routes.insert("kimi-k2-5".to_string(), tinfoil_route.clone());
+
+            let kimi_route = match kimi_proxy {
+                Some(kimi) => ModelRoute {
+                    primary: kimi.clone(),
+                    fallbacks: vec![tinfoil.clone()],
+                },
+                None => tinfoil_route.clone(),
+            };
+            routes.insert(MODEL_KIMI_K2_5_AGENT.to_string(), kimi_route);
 
             // Continuum-only models
             let continuum_route = ModelRoute {
@@ -153,34 +185,42 @@ impl ProxyRouter {
             routes.insert("gemma-3-27b".to_string(), continuum_route.clone());
             routes.insert("gpt-oss-120b".to_string(), continuum_route.clone());
             routes.insert("whisper-large-v3".to_string(), continuum_route);
+
+            if let Some(kimi) = kimi_proxy {
+                routes.insert(
+                    MODEL_KIMI_K2_5_AGENT.to_string(),
+                    ModelRoute {
+                        primary: kimi.clone(),
+                        fallbacks: vec![],
+                    },
+                );
+            }
         }
 
         routes
     }
 
     /// Build static models response for user-facing API
-    fn build_models_response(tinfoil_proxy: &Option<ProxyConfig>) -> Value {
+    fn build_models_response(
+        tinfoil_proxy: &Option<ProxyConfig>,
+        _kimi_proxy: &Option<ProxyConfig>,
+    ) -> Value {
         let created_timestamp = 1700000000i64;
 
-        let models = if tinfoil_proxy.is_some() {
-            // With Tinfoil: show all available models using canonical names
-            vec![
-                // Models available on both (use canonical names)
-                "gpt-oss-120b",
-                "whisper-large-v3",
-                // Continuum-only
-                "gemma-3-27b",
-                // Tinfoil-only
+        let mut models = vec!["gemma-3-27b", "gpt-oss-120b", "whisper-large-v3"];
+
+        if tinfoil_proxy.is_some() {
+            models.extend([
                 "llama-3.3-70b",
                 "deepseek-r1-0528",
                 "qwen3-vl-30b",
-                "kimi-k2-5",
                 "nomic-embed-text",
-            ]
-        } else {
-            // Without Tinfoil: only Continuum models (llama-3.3-70b not available)
-            vec!["gemma-3-27b", "gpt-oss-120b", "whisper-large-v3"]
-        };
+            ]);
+        }
+
+        if tinfoil_proxy.is_some() {
+            models.push("kimi-k2-5");
+        }
 
         let model_objects: Vec<Value> = models
             .iter()
@@ -233,6 +273,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             None,
             Some("http://tinfoil.example.com".to_string()),
+            None,
+            None,
         );
 
         // Llama translations
@@ -264,6 +306,18 @@ mod tests {
             router.get_model_name_for_provider("gemma-3-27b", "continuum"),
             "gemma-3-27b"
         );
+        assert_eq!(
+            router.get_model_name_for_provider("kimi-k2-5", "chutes"),
+            "moonshotai/Kimi-K2.5-TEE"
+        );
+        assert_eq!(
+            router.get_model_name_for_provider(MODEL_KIMI_K2_5_AGENT, "chutes"),
+            "moonshotai/Kimi-K2.5-TEE"
+        );
+        assert_eq!(
+            router.get_model_name_for_provider(MODEL_KIMI_K2_5_AGENT, "tinfoil"),
+            "kimi-k2-5"
+        );
     }
 
     #[test]
@@ -272,6 +326,8 @@ mod tests {
         let router = ProxyRouter::new(
             "https://api.openai.com".to_string(),
             Some("test-key".to_string()),
+            None,
+            None,
             None,
         );
         assert_eq!(router.default_proxy.provider_name, "openai");
@@ -283,6 +339,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             Some("test-key".to_string()),
             None,
+            None,
+            None,
         );
         assert_eq!(router.default_proxy.provider_name, "continuum");
         assert_eq!(router.default_proxy.api_key, None); // Continuum doesn't use API key
@@ -292,6 +350,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             None,
             Some("http://tinfoil.example.com".to_string()),
+            None,
+            None,
         );
         assert!(router.tinfoil_proxy.is_some());
         let tinfoil = router.tinfoil_proxy.as_ref().unwrap();
@@ -303,7 +363,13 @@ mod tests {
     #[test]
     fn test_get_tinfoil_base_url() {
         // Without Tinfoil
-        let router = ProxyRouter::new("http://continuum.example.com".to_string(), None, None);
+        let router = ProxyRouter::new(
+            "http://continuum.example.com".to_string(),
+            None,
+            None,
+            None,
+            None,
+        );
         assert_eq!(router.get_tinfoil_base_url(), None);
 
         // With Tinfoil
@@ -311,6 +377,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             None,
             Some("http://tinfoil.example.com".to_string()),
+            None,
+            None,
         );
         assert_eq!(
             router.get_tinfoil_base_url(),
@@ -324,6 +392,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             None,
             Some("http://tinfoil.example.com".to_string()),
+            None,
+            None,
         );
 
         // Test llama-3.3-70b is Tinfoil-only (no Continuum fallback)
@@ -348,6 +418,12 @@ mod tests {
         // Unknown model should return None
         let unknown_route = router.get_model_route("gpt-4");
         assert!(unknown_route.is_none());
+
+        let kimi_route = router.get_model_route("kimi-k2-5").unwrap();
+        assert_eq!(kimi_route.primary.provider_name, "tinfoil");
+
+        let agent_kimi_route = router.get_model_route(MODEL_KIMI_K2_5_AGENT).unwrap();
+        assert_eq!(agent_kimi_route.primary.provider_name, "tinfoil");
     }
 
     #[test]
@@ -356,6 +432,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             None,
             None, // No Tinfoil
+            None,
+            None,
         );
 
         // llama-3.3-70b should NOT be available without Tinfoil
@@ -440,6 +518,8 @@ mod tests {
             "http://continuum.example.com".to_string(),
             None,
             Some("http://tinfoil.example.com".to_string()),
+            None,
+            None,
         );
 
         // Should return static models list immediately
@@ -460,5 +540,64 @@ mod tests {
             .collect();
         assert!(model_ids.contains(&"llama-3.3-70b".to_string()));
         assert!(model_ids.contains(&"gpt-oss-120b".to_string()));
+    }
+
+    #[test]
+    fn test_agent_kimi_uses_chutes_with_tinfoil_fallback() {
+        let router = ProxyRouter::new(
+            "http://continuum.example.com".to_string(),
+            None,
+            Some("http://tinfoil.example.com".to_string()),
+            Some("https://llm.chutes.ai".to_string()),
+            Some("test-token".to_string()),
+        );
+
+        let kimi_route = router.get_model_route("kimi-k2-5").unwrap();
+        assert_eq!(kimi_route.primary.provider_name, "tinfoil");
+
+        let agent_kimi_route = router.get_model_route(MODEL_KIMI_K2_5_AGENT).unwrap();
+        assert_eq!(agent_kimi_route.primary.provider_name, "chutes");
+        assert_eq!(
+            agent_kimi_route.primary.api_key,
+            Some("test-token".to_string())
+        );
+        assert_eq!(agent_kimi_route.fallbacks.len(), 1);
+        assert_eq!(agent_kimi_route.fallbacks[0].provider_name, "tinfoil");
+    }
+
+    #[test]
+    fn test_agent_kimi_is_available_without_tinfoil_when_chutes_is_configured() {
+        let router = ProxyRouter::new(
+            "http://continuum.example.com".to_string(),
+            None,
+            None,
+            Some("https://llm.chutes.ai".to_string()),
+            Some("test-token".to_string()),
+        );
+
+        assert!(router.get_model_route("kimi-k2-5").is_none());
+
+        let agent_kimi_route = router.get_model_route(MODEL_KIMI_K2_5_AGENT).unwrap();
+        assert_eq!(agent_kimi_route.primary.provider_name, "chutes");
+        assert!(agent_kimi_route.fallbacks.is_empty());
+
+        // Should return static models list immediately
+        let result = router.get_all_models();
+        assert!(result.is_ok());
+
+        let models = result.unwrap();
+        assert_eq!(models["object"], "list");
+
+        // Should have models in the data array
+        let data = models["data"].as_array().unwrap();
+        assert!(!data.is_empty());
+
+        // Check that canonical names are used
+        let model_ids: Vec<String> = data
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(!model_ids.contains(&"kimi-k2-5".to_string()));
+        assert!(!model_ids.contains(&"llama-3.3-70b".to_string()));
     }
 }

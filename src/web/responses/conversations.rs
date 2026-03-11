@@ -3,6 +3,7 @@
 
 use crate::{
     encrypt::{decrypt_content, encrypt_with_key},
+    models::agents::Agent,
     models::responses::NewConversation,
     models::users::User,
     web::{
@@ -69,6 +70,21 @@ impl ConversationContext {
             .get_conversation_by_uuid_and_user(conversation_id, user_uuid)
             .map_err(error_mapping::map_conversation_error)?;
 
+        // Hide the main agent conversation from the public Conversations API.
+        let agent_conversation_id = {
+            let mut conn = state
+                .db
+                .get_pool()
+                .get()
+                .map_err(|_| ApiError::InternalServerError)?;
+
+            main_agent_conversation_id(&mut conn, user_uuid)?
+        };
+
+        if Some(conversation.id) == agent_conversation_id {
+            return Err(ApiError::NotFound);
+        }
+
         // Get user's encryption key
         let user_key = state
             .get_user_key(user_uuid, None, None)
@@ -92,6 +108,15 @@ impl ConversationContext {
         decrypt_content(&self.user_key, self.conversation.metadata_enc.as_ref())
             .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))
     }
+}
+
+fn main_agent_conversation_id(
+    conn: &mut diesel::PgConnection,
+    user_uuid: Uuid,
+) -> Result<Option<i64>, ApiError> {
+    Agent::get_main_for_user(conn, user_uuid)
+        .map_err(|_| ApiError::InternalServerError)
+        .map(|agent| agent.map(|a| a.conversation_id))
 }
 
 // ============================================================================
@@ -545,11 +570,22 @@ async fn list_conversations(
         params.limit.min(MAX_PAGINATION_LIMIT)
     };
 
+    let agent_conversation_id = {
+        let mut conn = state
+            .db
+            .get_pool()
+            .get()
+            .map_err(|_| ApiError::InternalServerError)?;
+
+        main_agent_conversation_id(&mut conn, user.uuid)?
+    };
+
     // Fetch conversations with database-level pagination
     // We fetch limit + 1 to check if there are more results
     let conversations = state
         .db
-        .list_conversations(user.uuid, limit + 1, params.after, &params.order)
+        // Fetch an extra conversation since we may filter out the hidden agent thread.
+        .list_conversations(user.uuid, limit + 2, params.after, &params.order)
         .map_err(error_mapping::map_generic_db_error)?;
 
     trace!(
@@ -561,14 +597,18 @@ async fn list_conversations(
         params.order
     );
 
-    // Check if there are more results
-    let has_more = conversations.len() > limit as usize;
+    let filtered: Vec<_> = conversations
+        .into_iter()
+        .filter(|c| Some(c.id) != agent_conversation_id)
+        .collect();
 
-    // Take only the requested limit
-    let conversations_to_return = if has_more {
-        &conversations[..limit as usize]
+    // Check if there are more results
+    let has_more = filtered.len() > limit as usize;
+
+    let conversations_to_return: Vec<_> = if has_more {
+        filtered.into_iter().take(limit as usize).collect()
     } else {
-        &conversations[..]
+        filtered
     };
 
     // Get user's encryption key for decrypting metadata
@@ -595,7 +635,7 @@ async fn list_conversations(
         .collect::<Result<Vec<_>, _>>()?;
 
     // Extract cursor IDs
-    let (first_id, last_id) = Paginator::get_cursor_ids(conversations_to_return, |c| c.uuid);
+    let (first_id, last_id) = Paginator::get_cursor_ids(&conversations_to_return, |c| c.uuid);
 
     let response = ConversationListResponse {
         object: OBJECT_TYPE_LIST,
@@ -618,10 +658,31 @@ async fn delete_all_conversations(
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     debug!("Deleting all conversations for user {}", user.uuid);
 
-    state
+    let mut conn = state
         .db
-        .delete_all_conversations(user.uuid)
-        .map_err(error_mapping::map_generic_db_error)?;
+        .get_pool()
+        .get()
+        .map_err(|_| ApiError::InternalServerError)?;
+
+    let agent_conversation_id = main_agent_conversation_id(&mut conn, user.uuid)?;
+
+    if let Some(agent_conversation_id) = agent_conversation_id {
+        use crate::models::schema::conversations::dsl::*;
+        use diesel::prelude::*;
+
+        diesel::delete(
+            conversations
+                .filter(user_id.eq(user.uuid))
+                .filter(id.ne(agent_conversation_id)),
+        )
+        .execute(&mut conn)
+        .map_err(|_| ApiError::InternalServerError)?;
+    } else {
+        state
+            .db
+            .delete_all_conversations(user.uuid)
+            .map_err(error_mapping::map_generic_db_error)?;
+    }
 
     let response = json!({
         "object": OBJECT_TYPE_LIST_DELETED,
@@ -654,6 +715,16 @@ async fn batch_delete_conversations(
 
     let mut results = Vec::with_capacity(body.ids.len());
 
+    let agent_conversation_id = {
+        let mut conn = state
+            .db
+            .get_pool()
+            .get()
+            .map_err(|_| ApiError::InternalServerError)?;
+
+        main_agent_conversation_id(&mut conn, user.uuid)?
+    };
+
     for conversation_id in body.ids {
         // Try to get the conversation first to verify ownership
         match state
@@ -661,6 +732,16 @@ async fn batch_delete_conversations(
             .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
         {
             Ok(conversation) => {
+                if Some(conversation.id) == agent_conversation_id {
+                    results.push(BatchDeleteItemResult {
+                        id: conversation_id,
+                        object: constants::OBJECT_TYPE_CONVERSATION_DELETED,
+                        deleted: false,
+                        error: Some("not_found"),
+                    });
+                    continue;
+                }
+
                 // Delete the conversation
                 match state.db.delete_conversation(conversation.id, user.uuid) {
                     Ok(()) => {

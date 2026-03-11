@@ -23,6 +23,7 @@ thiserror = "1.0.63"
 async-trait = "0.1.81"
 jsonwebtoken = "9.3.0"
 jwt-compact = { version = "0.9.0-beta.1", features = ["es256k"] }
+dspy-rs = { git = "https://github.com/OpenSecretCloud/DSRs.git", branch = "main" }
 diesel = { version = "=2.2.2", features = [
     "postgres",
     "postgres_backend",
@@ -50,6 +51,8 @@ tokio-stream = "0.1"
 async-stream = "0.3"
 bytes = "1.0"
 sha2 = { version = "0.10", default-features = false }
+p256 = { version = "0.13", features = ["ecdh", "pkcs8"] }
+hkdf = "0.12"
 hex = "0.4.3"
 base64 = "0.22.1"
 vsock = "0.5.1"

@@ -60,3 +60,4 @@ thirdparty/
 
 # Internal documentation (sensitive infrastructure details)
 internal_docs/
+.factory

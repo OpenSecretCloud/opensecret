@@ -323,6 +323,12 @@ log "Added Google OAuth domains to /etc/hosts"
 echo "127.0.0.15 appleid.apple.com" >> /etc/hosts
 log "Added Apple OAuth domain to /etc/hosts"
 
+# Add push provider hostnames to /etc/hosts
+echo "127.0.0.21 api.push.apple.com" >> /etc/hosts
+echo "127.0.0.22 api.sandbox.push.apple.com" >> /etc/hosts
+echo "127.0.0.34 fcm.googleapis.com" >> /etc/hosts
+log "Added APNs and FCM domains to /etc/hosts"
+
 # Add AWS SQS hostname to /etc/hosts
 echo "127.0.0.13 sqs.us-east-2.amazonaws.com" >> /etc/hosts
 log "Added AWS SQS domain to /etc/hosts"
@@ -360,6 +366,10 @@ echo "127.0.0.30 router.inf8.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.31 router.inf9.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.32 router.inf10.tinfoil.sh" >> /etc/hosts
 log "Added Tinfoil proxy domains to /etc/hosts"
+
+# Add Chutes hostname to /etc/hosts
+echo "127.0.0.35 llm.chutes.ai" >> /etc/hosts
+log "Added Chutes domain to /etc/hosts"
 
 # Add Kagi Search hostname to /etc/hosts
 echo "127.0.0.23 kagi.com" >> /etc/hosts
@@ -442,6 +452,16 @@ run_forever tf_os_flags python3 /app/traffic_forwarder.py 127.0.0.18 443 3 8028 
 log "Starting Apple OAuth traffic forwarder"
 run_forever tf_apple_oauth python3 /app/traffic_forwarder.py 127.0.0.15 443 3 8018 &
 
+# Start the traffic forwarders for push providers in the background
+log "Starting APNs production traffic forwarder"
+run_forever tf_apns_prod python3 /app/traffic_forwarder.py 127.0.0.21 443 3 8024 &
+
+log "Starting APNs sandbox traffic forwarder"
+run_forever tf_apns_sandbox python3 /app/traffic_forwarder.py 127.0.0.22 443 3 8025 &
+
+log "Starting FCM traffic forwarder"
+run_forever tf_fcm python3 /app/traffic_forwarder.py 127.0.0.34 443 3 8029 &
+
 # Start the traffic forwarders for Tinfoil proxy in the background
 log "Starting Tinfoil API GitHub proxy traffic forwarder"
 run_forever tf_tinfoil_api_github_proxy python3 /app/traffic_forwarder.py 127.0.0.16 443 3 8019 &
@@ -489,6 +509,10 @@ run_forever tf_kagi_search python3 /app/traffic_forwarder.py 127.0.0.23 443 3 80
 # Start the traffic forwarder for Brave Search in the background
 log "Starting Brave Search traffic forwarder"
 run_forever tf_brave_search python3 /app/traffic_forwarder.py 127.0.0.24 443 3 8027 &
+
+# Start the traffic forwarder for Chutes in the background
+log "Starting Chutes traffic forwarder"
+run_forever tf_chutes python3 /app/traffic_forwarder.py 127.0.0.35 443 3 8042 &
 
 # Wait for the forwarders to start
 log "Waiting for forwarders to start"
@@ -716,6 +740,14 @@ if timeout 5 bash -c '</dev/tcp/127.0.0.24/443'; then
     log "Brave Search connection successful"
 else
     log "Brave Search connection failed"
+fi
+
+# Test the connection to Chutes
+log "Testing connection to Chutes:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.35/443'; then
+    log "Chutes connection successful"
+else
+    log "Chutes connection failed"
 fi
 
 # Start the continuum-proxy if we're in AWS Nitro mode

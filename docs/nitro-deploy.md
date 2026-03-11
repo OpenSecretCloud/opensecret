@@ -530,6 +530,108 @@ A restart of this should not be needed but if you need to:
 sudo systemctl restart vsock-apple-proxy.service
 ```
 
+## Vsock mobile push proxies
+Create vsock proxy services so that enclave program can talk to APNs and FCM:
+
+First configure the endpoints into their allowlist:
+
+```
+sudo vim /etc/nitro_enclaves/vsock-proxy.yaml
+```
+
+Add these lines:
+```
+- {address: api.push.apple.com, port: 443}
+- {address: api.sandbox.push.apple.com, port: 443}
+- {address: fcm.googleapis.com, port: 443}
+```
+
+Note: FCM OAuth token exchange reuses the existing Google OAuth proxy for `oauth2.googleapis.com` on port `8014`, so no additional oauth token proxy is needed here.
+
+These values should match the enclave-side mappings in `entrypoint.sh`:
+
+- `127.0.0.21 api.push.apple.com` -> parent port `8024`
+- `127.0.0.22 api.sandbox.push.apple.com` -> parent port `8025`
+- `127.0.0.34 fcm.googleapis.com` -> parent port `8029`
+
+Now create services that spin these up automatically:
+
+```
+sudo vim /etc/systemd/system/vsock-apns-prod-proxy.service
+```
+
+```
+[Unit]
+Description=Vsock APNs Production Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8024 api.push.apple.com 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```
+sudo vim /etc/systemd/system/vsock-apns-sandbox-proxy.service
+```
+
+```
+[Unit]
+Description=Vsock APNs Sandbox Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8025 api.sandbox.push.apple.com 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```
+sudo vim /etc/systemd/system/vsock-fcm-proxy.service
+```
+
+```
+[Unit]
+Description=Vsock FCM Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8029 fcm.googleapis.com 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Activate the services:
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable vsock-apns-prod-proxy.service
+sudo systemctl start vsock-apns-prod-proxy.service
+sudo systemctl status vsock-apns-prod-proxy.service
+sudo systemctl enable vsock-apns-sandbox-proxy.service
+sudo systemctl start vsock-apns-sandbox-proxy.service
+sudo systemctl status vsock-apns-sandbox-proxy.service
+sudo systemctl enable vsock-fcm-proxy.service
+sudo systemctl start vsock-fcm-proxy.service
+sudo systemctl status vsock-fcm-proxy.service
+```
+
+A restart of these should not be needed but if you need to:
+```
+sudo systemctl restart vsock-apns-prod-proxy.service
+sudo systemctl restart vsock-apns-sandbox-proxy.service
+sudo systemctl restart vsock-fcm-proxy.service
+```
+
 ## Vsock Resend proxy
 Create a vsock proxy service so that enclave program can talk to resend:
 
@@ -973,6 +1075,59 @@ sudo systemctl status vsock-brave-proxy.service
 A restart should not be needed but if you need to:
 ```sh
 sudo systemctl restart vsock-brave-proxy.service
+```
+
+## Vsock Chutes proxy
+Create a vsock proxy service so that the agent-only Kimi path can talk to Chutes:
+
+First configure the endpoint into its allowlist:
+
+```sh
+sudo vim /etc/nitro_enclaves/vsock-proxy.yaml
+```
+
+Add this line:
+```
+- {address: llm.chutes.ai, port: 443}
+```
+
+Restart the nitro vsock proxy service:
+```sh
+sudo systemctl restart nitro-enclaves-vsock-proxy.service
+```
+
+Now create a service that spins this up automatically:
+
+```sh
+sudo vim /etc/systemd/system/vsock-chutes-proxy.service
+```
+
+```
+[Unit]
+Description=Vsock Chutes Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8042 llm.chutes.ai 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Activate the service:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable vsock-chutes-proxy.service
+sudo systemctl start vsock-chutes-proxy.service
+sudo systemctl status vsock-chutes-proxy.service
+```
+
+If you need to restart it later:
+```sh
+sudo systemctl restart vsock-chutes-proxy.service
 ```
 
 ## Vsock Tinfoil proxies
@@ -1653,6 +1808,27 @@ Take that encrypted base64 and insert it into the `enclave_secrets` table with k
 ```sql
 INSERT INTO enclave_secrets (key, value)
 VALUES ('brave_api_key', decode('your_base64_string', 'base64'));
+```
+
+#### Chutes API Key (Optional, agent-only Kimi routing)
+
+If you want the new agent runtime to use Chutes for Kimi inside Nitro, store the Chutes API key encrypted to the enclave KMS key. Regular `kimi-k2-5` traffic still stays on Tinfoil; this key only enables the temporary agent-only path.
+
+```sh
+echo -n "CHUTES_API_KEY" | base64 -w 0
+```
+
+Take that output and encrypt to the KMS key, from a machine that has encrypt access to the key:
+
+```sh
+aws kms encrypt --key-id "KEY_ARN" --plaintext "BASE64_KEY" --query CiphertextBlob --output text
+```
+
+Take that encrypted base64 and insert it into the `enclave_secrets` table with key as `chutes_api_key` and value as the base64.
+
+```sql
+INSERT INTO enclave_secrets (key, value)
+VALUES ('chutes_api_key', decode('your_base64_string', 'base64'));
 ```
 
 #### os-flags API Key

@@ -22,6 +22,22 @@ diesel::table! {
 }
 
 diesel::table! {
+    agents (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        conversation_id -> Int8,
+        kind -> Text,
+        parent_agent_id -> Nullable<Int8>,
+        display_name_enc -> Nullable<Bytea>,
+        purpose_enc -> Nullable<Bytea>,
+        created_by -> Text,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     assistant_messages (id) {
         id -> Int8,
         uuid -> Uuid,
@@ -34,6 +50,23 @@ diesel::table! {
         finish_reason -> Nullable<Text>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    conversation_summaries (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        conversation_id -> Int8,
+        from_created_at -> Timestamptz,
+        to_created_at -> Timestamptz,
+        message_count -> Int4,
+        content_enc -> Bytea,
+        content_tokens -> Int4,
+        embedding_enc -> Nullable<Bytea>,
+        previous_summary_id -> Nullable<Int8>,
+        created_at -> Timestamptz,
     }
 }
 
@@ -79,6 +112,58 @@ diesel::table! {
         expires_at -> Timestamptz,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    memory_blocks (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        label -> Text,
+        value_enc -> Bytea,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    notification_deliveries (id) {
+        id -> Int8,
+        event_id -> Int8,
+        push_device_id -> Int8,
+        status -> Text,
+        attempt_count -> Int4,
+        next_attempt_at -> Timestamptz,
+        lease_owner -> Nullable<Text>,
+        lease_expires_at -> Nullable<Timestamptz>,
+        provider_message_id -> Nullable<Text>,
+        provider_status_code -> Nullable<Int4>,
+        last_error -> Nullable<Text>,
+        sent_at -> Nullable<Timestamptz>,
+        invalidated_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    notification_events (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        project_id -> Int4,
+        user_id -> Uuid,
+        kind -> Text,
+        delivery_mode -> Text,
+        priority -> Text,
+        collapse_key -> Nullable<Text>,
+        fallback_title -> Text,
+        fallback_body -> Text,
+        payload_enc -> Nullable<Bytea>,
+        not_before_at -> Timestamptz,
+        expires_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+        cancelled_at -> Nullable<Timestamptz>,
     }
 }
 
@@ -211,6 +296,29 @@ diesel::table! {
 }
 
 diesel::table! {
+    push_devices (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        installation_id -> Uuid,
+        platform -> Text,
+        provider -> Text,
+        environment -> Text,
+        app_id -> Text,
+        push_token_enc -> Bytea,
+        push_token_hash -> Bytea,
+        notification_public_key -> Bytea,
+        key_algorithm -> Text,
+        supports_encrypted_preview -> Bool,
+        supports_background_processing -> Bool,
+        last_seen_at -> Timestamptz,
+        revoked_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     reasoning_items (id) {
         id -> Int8,
         uuid -> Uuid,
@@ -308,6 +416,27 @@ diesel::table! {
 }
 
 diesel::table! {
+    user_embeddings (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        source_type -> Text,
+        user_message_id -> Nullable<Int8>,
+        assistant_message_id -> Nullable<Int8>,
+        conversation_id -> Nullable<Int8>,
+        vector_enc -> Bytea,
+        embedding_model -> Text,
+        vector_dim -> Int4,
+        content_enc -> Bytea,
+        metadata_enc -> Nullable<Bytea>,
+        tags_enc -> Array<Nullable<Text>>,
+        token_count -> Int4,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     user_instructions (id) {
         id -> Int8,
         uuid -> Uuid,
@@ -343,6 +472,7 @@ diesel::table! {
         prompt_tokens -> Int4,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        attachment_text_enc -> Nullable<Bytea>,
     }
 }
 
@@ -375,9 +505,14 @@ diesel::table! {
     }
 }
 
+diesel::joinable!(agents -> conversations (conversation_id));
 diesel::joinable!(assistant_messages -> conversations (conversation_id));
 diesel::joinable!(assistant_messages -> responses (response_id));
+diesel::joinable!(conversation_summaries -> conversations (conversation_id));
 diesel::joinable!(invite_codes -> orgs (org_id));
+diesel::joinable!(notification_deliveries -> notification_events (event_id));
+diesel::joinable!(notification_deliveries -> push_devices (push_device_id));
+diesel::joinable!(notification_events -> org_projects (project_id));
 diesel::joinable!(org_memberships -> orgs (org_id));
 diesel::joinable!(org_project_secrets -> org_projects (project_id));
 diesel::joinable!(org_projects -> orgs (org_id));
@@ -391,6 +526,9 @@ diesel::joinable!(tool_calls -> responses (response_id));
 diesel::joinable!(tool_outputs -> conversations (conversation_id));
 diesel::joinable!(tool_outputs -> responses (response_id));
 diesel::joinable!(tool_outputs -> tool_calls (tool_call_fk));
+diesel::joinable!(user_embeddings -> assistant_messages (assistant_message_id));
+diesel::joinable!(user_embeddings -> conversations (conversation_id));
+diesel::joinable!(user_embeddings -> user_messages (user_message_id));
 diesel::joinable!(user_messages -> conversations (conversation_id));
 diesel::joinable!(user_messages -> responses (response_id));
 diesel::joinable!(user_oauth_connections -> oauth_providers (provider_id));
@@ -398,11 +536,16 @@ diesel::joinable!(users -> org_projects (project_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     account_deletion_requests,
+    agents,
     assistant_messages,
+    conversation_summaries,
     conversations,
     email_verifications,
     enclave_secrets,
     invite_codes,
+    memory_blocks,
+    notification_deliveries,
+    notification_events,
     oauth_providers,
     org_memberships,
     org_project_secrets,
@@ -414,12 +557,14 @@ diesel::allow_tables_to_appear_in_same_query!(
     platform_password_reset_requests,
     platform_users,
     project_settings,
+    push_devices,
     reasoning_items,
     responses,
     token_usage,
     tool_calls,
     tool_outputs,
     user_api_keys,
+    user_embeddings,
     user_instructions,
     user_kv,
     user_messages,

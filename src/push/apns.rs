@@ -203,6 +203,8 @@ fn build_apns_payload(
     preview_payload: Option<&NotificationPreviewPayload>,
     send_encrypted_preview: bool,
 ) -> Result<Value, PushError> {
+    // Routing metadata is intentionally provider-visible in v1; the privacy boundary here is
+    // plaintext notification content, which stays generic unless the device decrypts os_push.
     let metadata = preview_payload.map(|payload| {
         json!({
             "notification_id": payload.notification_id.to_string(),

@@ -118,7 +118,13 @@ async fn register_push_device(
     let now = Utc::now();
     let device = conn
         .transaction::<PushDevice, PushDeviceError, _>(|conn| {
-            let existing =
+            let existing_for_user = PushDevice::get_by_installation_for_user(
+                conn,
+                user.uuid,
+                body.installation_id,
+                &body.environment,
+            )?;
+            let active_installation =
                 PushDevice::get_by_installation(conn, body.installation_id, &body.environment)?;
             let conflicting_token_owner = PushDevice::get_active_by_token_hash(
                 conn,
@@ -127,14 +133,27 @@ async fn register_push_device(
                 &token_hash,
             )?;
 
+            let already_revoked_installation_id = if let Some(active_device) = active_installation
+                .as_ref()
+                .filter(|device| device.user_id != user.uuid)
+            {
+                PushDevice::revoke_by_id(conn, active_device.id)?;
+                Some(active_device.id)
+            } else {
+                None
+            };
+
+            let mut existing = existing_for_user.filter(|device| device.revoked_at.is_none());
+
             if let Some(conflict) = conflicting_token_owner.as_ref() {
-                if existing.as_ref().map(|device| device.id) != Some(conflict.id) {
+                if existing.as_ref().map(|device| device.id) != Some(conflict.id)
+                    && already_revoked_installation_id != Some(conflict.id)
+                {
                     PushDevice::revoke_by_id(conn, conflict.id)?;
                 }
             }
 
-            if let Some(mut existing) = existing {
-                existing.user_id = user.uuid;
+            if let Some(mut existing) = existing.take() {
                 existing.platform = body.platform.clone();
                 existing.provider = body.provider.clone();
                 existing.environment = body.environment.clone();

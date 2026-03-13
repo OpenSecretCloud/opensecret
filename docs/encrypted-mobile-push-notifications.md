@@ -41,6 +41,7 @@ We want Maple / Sage to send notifications for events like:
 while ensuring that:
 
 - Apple and Google do not need plaintext notification content
+- minimal routing metadata may remain provider-visible in APNs / FCM payloads, and that is acceptable for v1
 - raw push tokens are not stored plaintext in Postgres
 - losing one device does not compromise every other device
 - the design fits the current OpenSecret enclave + project-scoped secret model
@@ -53,6 +54,7 @@ This design does **not** attempt to provide:
 
 - a double-ratchet messaging protocol
 - server blindness to the notification plaintext at creation time
+- secrecy for all push metadata, timing information, routing identifiers, or provider-visible fields
 - guaranteed hidden lock-screen content after the device itself decrypts it
 - a single cross-device shared notification private key
 
@@ -834,6 +836,7 @@ Important:
 - `mutable-content: 1` is required for the NSE to run
 - if the NSE times out, iOS shows the original generic alert
 - `os_meta` is allowed to carry minimal routing metadata (`notification_id`, `message_id`, `thread_id`, `deep_link`, `kind`), but not plaintext notification content
+- this is intentional: the privacy requirement is protecting notification **content**, not hiding all routing metadata from the push provider
 
 ### 13.4 APNs error handling
 
@@ -926,6 +929,7 @@ Notes:
 - visible text should remain generic / non-sensitive
 - FCM `data` values must be strings
 - FCM `data` is provider-visible routing metadata, so it may include fields like `notification_id`, `message_id`, `thread_id`, `deep_link`, and `kind`, but never plaintext message content
+- this is intentional in v1: the goal is to keep message content encrypted from the push provider, not to hide all metadata needed for client routing
 - reuse the same `collapse_key` only for retries of the same logical notification
 - `notification_id` is for exact dedup; `thread_id` is for grouping / clearing when the user opens the conversation
 

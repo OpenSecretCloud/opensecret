@@ -64,6 +64,8 @@ pub enum PushError {
     InvalidSecret(String),
     #[error("Provider error: {0}")]
     ProviderError(String),
+    #[error("Retryable provider error: {0}")]
+    ProviderRetryable(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +291,7 @@ pub async fn enqueue_notification(
             .map(|device| NewNotificationDelivery {
                 event_id: event.id,
                 push_device_id: device.id,
+                next_attempt_at: event.not_before_at,
             })
             .collect();
 

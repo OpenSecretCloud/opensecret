@@ -73,21 +73,8 @@ impl PushDevice {
         lookup_installation_id: Uuid,
         lookup_environment: &str,
     ) -> Result<Option<PushDevice>, PushDeviceError> {
-        push_devices::table
-            .filter(push_devices::user_id.eq(lookup_user_id))
-            .filter(push_devices::installation_id.eq(lookup_installation_id))
-            .filter(push_devices::environment.eq(lookup_environment))
-            .first::<PushDevice>(conn)
-            .optional()
-            .map_err(PushDeviceError::DatabaseError)
-    }
-
-    pub fn get_by_installation(
-        conn: &mut PgConnection,
-        lookup_installation_id: Uuid,
-        lookup_environment: &str,
-    ) -> Result<Option<PushDevice>, PushDeviceError> {
         if let Some(active_device) = push_devices::table
+            .filter(push_devices::user_id.eq(lookup_user_id))
             .filter(push_devices::installation_id.eq(lookup_installation_id))
             .filter(push_devices::environment.eq(lookup_environment))
             .filter(push_devices::revoked_at.is_null())
@@ -100,8 +87,24 @@ impl PushDevice {
         }
 
         push_devices::table
+            .filter(push_devices::user_id.eq(lookup_user_id))
             .filter(push_devices::installation_id.eq(lookup_installation_id))
             .filter(push_devices::environment.eq(lookup_environment))
+            .order(push_devices::updated_at.desc())
+            .first::<PushDevice>(conn)
+            .optional()
+            .map_err(PushDeviceError::DatabaseError)
+    }
+
+    pub fn get_by_installation(
+        conn: &mut PgConnection,
+        lookup_installation_id: Uuid,
+        lookup_environment: &str,
+    ) -> Result<Option<PushDevice>, PushDeviceError> {
+        push_devices::table
+            .filter(push_devices::installation_id.eq(lookup_installation_id))
+            .filter(push_devices::environment.eq(lookup_environment))
+            .filter(push_devices::revoked_at.is_null())
             .order(push_devices::updated_at.desc())
             .first::<PushDevice>(conn)
             .optional()

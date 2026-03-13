@@ -201,10 +201,14 @@ async fn get_fcm_access_token(
     let response_body = response.text().await.unwrap_or_default();
 
     if !response_status.is_success() {
-        return Err(PushError::ProviderError(format!(
-            "FCM OAuth failed ({}): {}",
-            response_status, response_body
-        )));
+        let error = format!("FCM OAuth failed ({}): {}", response_status, response_body);
+        return Err(
+            if response_status.as_u16() == 429 || response_status.is_server_error() {
+                PushError::ProviderRetryable(error)
+            } else {
+                PushError::ProviderError(error)
+            },
+        );
     }
 
     let token_response: FcmAccessTokenResponse = serde_json::from_str(&response_body)?;
@@ -243,6 +247,8 @@ fn build_fcm_payload(
         .clone()
         .unwrap_or_else(|| format!("notif:{}", event.uuid));
 
+    // Android v1 keeps routing metadata in plaintext FCM data fields; the privacy requirement is
+    // that message content stays generic/provider-visible while authoritative content is fetched or decrypted on-device.
     let data = if let Some(payload) = preview_payload {
         json!({
             "notification_id": payload.notification_id.to_string(),

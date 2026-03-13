@@ -124,6 +124,15 @@ async fn process_leased_delivery(
         }
     };
 
+    if device.user_id != event.user_id {
+        NotificationDelivery::mark_cancelled(
+            &mut conn,
+            delivery.id,
+            Some("device user does not match event user"),
+        )?;
+        return Ok(());
+    }
+
     if device.revoked_at.is_some() {
         NotificationDelivery::mark_cancelled(&mut conn, delivery.id, Some("device revoked"))?;
         return Ok(());
@@ -358,7 +367,8 @@ fn classify_internal_push_error(error: PushError) -> PushSendOutcome {
         PushError::ConnectionError
         | PushError::DatabaseError(_)
         | PushError::DbError(_)
-        | PushError::HttpError(_) => PushSendOutcome::Retryable {
+        | PushError::HttpError(_)
+        | PushError::ProviderRetryable(_) => PushSendOutcome::Retryable {
             provider_status_code: None,
             error: error.to_string(),
         },
@@ -373,4 +383,27 @@ fn retry_backoff_seconds(attempt_count: i32) -> i32 {
     let capped_attempt = attempt_count.clamp(1, 6);
     let seconds = 15_i64 * (1_i64 << (capped_attempt - 1));
     seconds.min(15 * 60) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_internal_push_error, retry_backoff_seconds};
+    use crate::push::{PushError, PushSendOutcome};
+
+    #[test]
+    fn classifies_retryable_provider_errors_as_retryable() {
+        match classify_internal_push_error(PushError::ProviderRetryable(
+            "temporary provider failure".to_string(),
+        )) {
+            PushSendOutcome::Retryable { .. } => {}
+            outcome => panic!("expected retryable outcome, got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_backoff_is_capped() {
+        assert_eq!(retry_backoff_seconds(1), 15);
+        assert_eq!(retry_backoff_seconds(6), 480);
+        assert_eq!(retry_backoff_seconds(10), 480);
+    }
 }

@@ -57,22 +57,27 @@ impl NotificationDelivery {
     ) -> Result<Vec<NotificationDelivery>, NotificationDeliveryError> {
         let query = r#"
             WITH candidates AS (
-                SELECT id
-                FROM notification_deliveries
-                WHERE status IN ('pending', 'retry')
-                  AND next_attempt_at <= NOW()
-                  AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
-                ORDER BY next_attempt_at ASC, id ASC
-                FOR UPDATE SKIP LOCKED
+                SELECT d.id
+                FROM notification_deliveries d
+                WHERE d.next_attempt_at <= NOW()
+                  AND (
+                        (d.status IN ('pending', 'retry')
+                         AND (d.lease_expires_at IS NULL OR d.lease_expires_at < NOW()))
+                     OR (d.status = 'leased'
+                         AND (d.lease_expires_at IS NULL OR d.lease_expires_at < NOW()))
+                  )
+                ORDER BY d.next_attempt_at ASC, d.id ASC
+                FOR UPDATE OF d SKIP LOCKED
                 LIMIT $1
             )
-            UPDATE notification_deliveries
+            UPDATE notification_deliveries d
             SET status = 'leased',
                 lease_owner = $2,
                 lease_expires_at = NOW() + ($3 * INTERVAL '1 second'),
                 updated_at = NOW()
-            WHERE id IN (SELECT id FROM candidates)
-            RETURNING *
+            FROM candidates
+            WHERE d.id = candidates.id
+            RETURNING d.*
         "#;
 
         sql_query(query)
@@ -211,6 +216,7 @@ impl NotificationDelivery {
 pub struct NewNotificationDelivery {
     pub event_id: i64,
     pub push_device_id: i64,
+    pub next_attempt_at: DateTime<Utc>,
 }
 
 impl NewNotificationDelivery {

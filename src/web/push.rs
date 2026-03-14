@@ -71,6 +71,18 @@ struct DeletedPushDeviceResponse {
     deleted: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationWriteMode {
+    ReuseExisting,
+    InsertNew,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistrationDecision {
+    write_mode: RegistrationWriteMode,
+    revoke_device_ids: Vec<i64>,
+}
+
 pub fn router(app_state: Arc<AppState>) -> Router {
     Router::new()
         .route(
@@ -133,27 +145,19 @@ async fn register_push_device(
                 &token_hash,
             )?;
 
-            let already_revoked_installation_id = if let Some(active_device) = active_installation
-                .as_ref()
-                .filter(|device| device.user_id != user.uuid)
-            {
-                PushDevice::revoke_by_id(conn, active_device.id)?;
-                Some(active_device.id)
-            } else {
-                None
-            };
+            let decision = plan_push_device_registration(
+                user.uuid,
+                existing_for_user.as_ref(),
+                active_installation.as_ref(),
+                conflicting_token_owner.as_ref(),
+            );
 
-            let mut existing = existing_for_user.filter(|device| device.revoked_at.is_none());
-
-            if let Some(conflict) = conflicting_token_owner.as_ref() {
-                if existing.as_ref().map(|device| device.id) != Some(conflict.id)
-                    && already_revoked_installation_id != Some(conflict.id)
-                {
-                    PushDevice::revoke_by_id(conn, conflict.id)?;
-                }
+            for revoke_device_id in decision.revoke_device_ids {
+                PushDevice::revoke_by_id(conn, revoke_device_id)?;
             }
 
-            if let Some(mut existing) = existing.take() {
+            if decision.write_mode == RegistrationWriteMode::ReuseExisting {
+                let mut existing = existing_for_user.expect("existing device should be present");
                 existing.platform = body.platform.clone();
                 existing.provider = body.provider.clone();
                 existing.environment = body.environment.clone();
@@ -242,6 +246,10 @@ fn validate_register_request(
     request: &RegisterPushDeviceRequest,
     public_key_bytes: &[u8],
 ) -> Result<(), ApiError> {
+    if request.installation_id.is_nil() || request.installation_id.get_version_num() != 4 {
+        return Err(ApiError::BadRequest);
+    }
+
     if request.push_token.trim().is_empty()
         || request.app_id.trim().is_empty()
         || request.notification_public_key.trim().is_empty()
@@ -284,6 +292,40 @@ fn map_push_device_error(error: PushDeviceError) -> ApiError {
     ApiError::InternalServerError
 }
 
+fn plan_push_device_registration(
+    current_user_id: Uuid,
+    existing_for_user: Option<&PushDevice>,
+    active_installation: Option<&PushDevice>,
+    conflicting_token_owner: Option<&PushDevice>,
+) -> RegistrationDecision {
+    let write_mode = if existing_for_user.is_some() {
+        RegistrationWriteMode::ReuseExisting
+    } else {
+        RegistrationWriteMode::InsertNew
+    };
+
+    let existing_device_id = existing_for_user.map(|device| device.id);
+    let mut revoke_device_ids = Vec::new();
+
+    if let Some(active_device) = active_installation {
+        if active_device.user_id != current_user_id && existing_device_id != Some(active_device.id)
+        {
+            revoke_device_ids.push(active_device.id);
+        }
+    }
+
+    if let Some(conflict) = conflicting_token_owner {
+        if existing_device_id != Some(conflict.id) && !revoke_device_ids.contains(&conflict.id) {
+            revoke_device_ids.push(conflict.id);
+        }
+    }
+
+    RegistrationDecision {
+        write_mode,
+        revoke_device_ids,
+    }
+}
+
 impl From<PushDevice> for PushDeviceResponse {
     fn from(value: PushDevice) -> Self {
         Self {
@@ -301,5 +343,134 @@ impl From<PushDevice> for PushDeviceResponse {
             created_at: value.created_at,
             updated_at: value.updated_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::engine::general_purpose;
+    use p256::pkcs8::EncodePublicKey;
+    use rand_core::OsRng;
+
+    fn sample_push_device(
+        user_id: Uuid,
+        installation_id: Uuid,
+        token_hash: Vec<u8>,
+        revoked_at: Option<DateTime<Utc>>,
+    ) -> PushDevice {
+        let now = Utc::now();
+        PushDevice {
+            id: now.timestamp_nanos_opt().expect("valid timestamp nanos"),
+            uuid: Uuid::new_v4(),
+            user_id,
+            installation_id,
+            platform: PUSH_PLATFORM_IOS.to_string(),
+            provider: PUSH_PROVIDER_APNS.to_string(),
+            environment: PUSH_ENV_PROD.to_string(),
+            app_id: "ai.trymaple.ios".to_string(),
+            push_token_enc: vec![1, 2, 3],
+            push_token_hash: token_hash,
+            notification_public_key: vec![4, 5, 6],
+            key_algorithm: PUSH_KEY_ALGORITHM_P256_ECDH_V1.to_string(),
+            supports_encrypted_preview: true,
+            supports_background_processing: true,
+            last_seen_at: now,
+            revoked_at,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn sample_register_request(installation_id: Uuid) -> RegisterPushDeviceRequest {
+        let secret_key = p256::SecretKey::random(&mut OsRng);
+        let public_key = secret_key.public_key();
+        let public_key_der = public_key
+            .to_public_key_der()
+            .expect("public key should encode");
+
+        RegisterPushDeviceRequest {
+            installation_id,
+            platform: PUSH_PLATFORM_IOS.to_string(),
+            provider: PUSH_PROVIDER_APNS.to_string(),
+            environment: PUSH_ENV_PROD.to_string(),
+            app_id: "ai.trymaple.ios".to_string(),
+            push_token: "push-token".to_string(),
+            notification_public_key: general_purpose::STANDARD.encode(public_key_der.as_bytes()),
+            key_algorithm: PUSH_KEY_ALGORITHM_P256_ECDH_V1.to_string(),
+            supports_encrypted_preview: true,
+            supports_background_processing: true,
+        }
+    }
+
+    #[test]
+    fn plan_reuses_revoked_same_user_installation() {
+        let user_id = Uuid::new_v4();
+        let installation_id = Uuid::new_v4();
+        let existing = sample_push_device(user_id, installation_id, vec![1], Some(Utc::now()));
+
+        let decision = plan_push_device_registration(user_id, Some(&existing), None, None);
+
+        assert_eq!(decision.write_mode, RegistrationWriteMode::ReuseExisting);
+        assert!(decision.revoke_device_ids.is_empty());
+    }
+
+    #[test]
+    fn plan_revokes_cross_user_installation_once() {
+        let current_user_id = Uuid::new_v4();
+        let installation_id = Uuid::new_v4();
+        let other_user_device =
+            sample_push_device(Uuid::new_v4(), installation_id, vec![1, 2, 3], None);
+
+        let decision = plan_push_device_registration(
+            current_user_id,
+            None,
+            Some(&other_user_device),
+            Some(&other_user_device),
+        );
+
+        assert_eq!(decision.write_mode, RegistrationWriteMode::InsertNew);
+        assert_eq!(decision.revoke_device_ids, vec![other_user_device.id]);
+    }
+
+    #[test]
+    fn plan_revokes_conflicting_token_owner_for_handoff() {
+        let current_user_id = Uuid::new_v4();
+        let conflicting_device =
+            sample_push_device(Uuid::new_v4(), Uuid::new_v4(), vec![9, 9, 9], None);
+
+        let decision =
+            plan_push_device_registration(current_user_id, None, None, Some(&conflicting_device));
+
+        assert_eq!(decision.write_mode, RegistrationWriteMode::InsertNew);
+        assert_eq!(decision.revoke_device_ids, vec![conflicting_device.id]);
+    }
+
+    #[test]
+    fn validate_register_request_rejects_nil_installation_id() {
+        let request = sample_register_request(Uuid::nil());
+        let public_key_bytes = general_purpose::STANDARD
+            .decode(&request.notification_public_key)
+            .expect("public key should decode");
+
+        assert!(matches!(
+            validate_register_request(&request, &public_key_bytes),
+            Err(ApiError::BadRequest)
+        ));
+    }
+
+    #[test]
+    fn validate_register_request_rejects_non_v4_installation_id() {
+        let request = sample_register_request(
+            Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").expect("uuid should parse"),
+        );
+        let public_key_bytes = general_purpose::STANDARD
+            .decode(&request.notification_public_key)
+            .expect("public key should decode");
+
+        assert!(matches!(
+            validate_register_request(&request, &public_key_bytes),
+            Err(ApiError::BadRequest)
+        ));
     }
 }

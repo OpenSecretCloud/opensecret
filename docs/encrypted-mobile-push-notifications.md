@@ -22,7 +22,7 @@ The final architectural decisions are:
 3. **Store provider configuration per project using `project_settings` + `org_project_secrets`.**
 4. **Register one notification keypair per device, not one shared key per user.**
 5. **Use a durable Postgres outbox + delivery worker, not synchronous request-path sends.**
-6. **Treat successful live Sage SSE delivery as the acknowledgement for request/response flows and skip push entirely when streaming succeeds.**
+6. **Treat successful live Sage SSE delivery as the acknowledgement for agent chat flows and skip push entirely when streaming succeeds.**
 7. **Prefer standard visible-notification behavior on Android in v1; keep Android data-only encrypted preview as an optional later enhancement.**
 
 This gives us Signal-like transport privacy for push content without pretending we are building a full Signal protocol.
@@ -220,11 +220,8 @@ This section is the implementation map for a follow-on coding agent.
   - Merge the new push router under `validate_jwt`.
   - Start the background push worker after app state initialization and migrations.
 
-- `src/web/responses/handlers.rs`
-  - Gate push enqueue on whether a live SSE response finished successfully; this is the v1 suppression signal for the normal Sage request/response flow.
-
 - `src/web/agent/mod.rs`
-  - If mobile uses the direct agent SSE endpoints, apply the same “successful SSE delivery => no push” rule there.
+  - Gate push enqueue on whether a live SSE response finished successfully; this is the v1 suppression signal for the normal Sage agent flow.
 
 - `src/web/platform/common.rs`
   - Add new secret constants and request / response types for project push settings.
@@ -358,7 +355,7 @@ Important:
 
 ### 8.1 `push_devices`
 
-One row per device installation.
+One row per active installation binding, with revoked rows retained for re-registration history and delivery auditing.
 
 ```sql
 CREATE TABLE push_devices (
@@ -386,8 +383,6 @@ CREATE TABLE push_devices (
     created_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at                      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    UNIQUE (user_id, installation_id, environment),
-    UNIQUE (provider, environment, push_token_hash),
     CHECK (
         (platform = 'ios' AND provider = 'apns') OR
         (platform = 'android' AND provider = 'fcm')
@@ -398,13 +393,24 @@ CREATE TABLE push_devices (
 
 CREATE INDEX idx_push_devices_user_active
     ON push_devices(user_id, revoked_at);
+
+CREATE UNIQUE INDEX idx_push_devices_installation_active
+    ON push_devices(installation_id, environment)
+    WHERE revoked_at IS NULL;
+
+CREATE UNIQUE INDEX idx_push_devices_token_active
+    ON push_devices(provider, environment, push_token_hash)
+    WHERE revoked_at IS NULL;
 ```
 
 Implementation notes:
 
+- `installation_id` is an app-generated UUIDv4 for one installed copy of the app; it is not an APNs or FCM identifier
+- store `installation_id` in normal app-scoped local storage so uninstall / reinstall creates a fresh installation identity
 - `push_token_enc` should be encrypted at rest with the enclave key using the same style as project secrets
 - `push_token_hash` should be `SHA-256(push_token)` raw bytes for dedupe and lookup
 - `notification_public_key` should store raw DER-encoded SPKI bytes, not a base64 string
+- keep at most one active binding per `(installation_id, environment)` and per `(provider, environment, push_token_hash)`; older rows are revoked rather than overwritten
 
 ### 8.2 `notification_events`
 
@@ -525,10 +531,10 @@ Request payload:
 
 Behavior:
 
-- upsert by `(user_id, installation_id, environment)`
-- rotate token if it changed
-- rotate public key if it changed
-- clear `revoked_at` if this is a re-registration
+- `installation_id` must be a non-nil UUIDv4 generated and stored by the app
+- if the authenticated user already has a row for that installation, update it in place and clear `revoked_at`
+- if another active row currently owns the same `installation_id` or the same push token, revoke that older binding before activating the current authenticated user
+- rotate token / public key / capabilities when they change
 - refresh `last_seen_at`
 
 #### List current user's devices
@@ -550,6 +556,31 @@ Behavior:
 - user-scoped revoke only
 - set `revoked_at`
 - optionally return the standard deleted-object response shape already used in newer APIs
+
+#### Client lifecycle expectations
+
+- first install: generate a fresh UUIDv4 `installation_id`, generate the notification keypair, fetch the APNs / FCM token, then call `POST /v1/push/devices`
+- app start, login, or token rotation: call `POST /v1/push/devices` again; the route is idempotent for the current authenticated user and installation
+- explicit logout: while the access token is still valid, call `DELETE /v1/push/devices/:id` for the current device before dropping auth
+- account switch on the same installed app: revoke the old device binding on logout, then register again after the new user logs in; if the old binding is still active, the server treats the matching installation or token as a handoff and revokes the older binding
+- uninstall / reinstall: create a new `installation_id` and notification keypair, then register as a new installation on next login; stale old rows are cleaned up by explicit revoke or later invalid-token handling
+
+#### Logout cleanup fallback
+
+The existing `/logout` request may also include an optional `push_device_id` field so the backend can best-effort revoke the current push binding during auth teardown:
+
+```json
+{
+  "refresh_token": "jwt",
+  "push_device_id": "uuid"
+}
+```
+
+Preferred client flow:
+
+1. call `DELETE /v1/push/devices/:id` while the access token is still valid
+2. call `/logout`
+3. include `push_device_id` in `/logout` as a cleanup fallback in case the device revoke races with local auth teardown
 
 ### 9.2 Platform project settings API
 
@@ -1123,7 +1154,7 @@ The exact IPs and ports can be changed, but they should use currently unused slo
 
 ## 17. Product Event Model
 
-### 17.1 Live Sage request/response flows
+### 17.1 Live Sage agent SSE flows
 
 For the common flow where the user sends a message to Sage and the client keeps an SSE stream open waiting for responses:
 
@@ -1164,8 +1195,7 @@ Likely first integrations:
 - `src/web/agent/runtime.rs`
   - subagent follow-up or background completion signals
 
-- `src/web/responses/handlers.rs`
-  - async response completion hooks
+- `src/web/agent/mod.rs`
   - live Sage SSE completion / failure handling
 
 Reminder scheduling can come later; the outbox design already supports `not_before_at`.

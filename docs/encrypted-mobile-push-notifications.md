@@ -1,9 +1,9 @@
 # Encrypted Mobile Push Notifications for Maple / OpenSecret
 
-## Implementation-Ready Backend, Enclave, and Mobile Design
+## Backend, Enclave, and Mobile Design Reference
 
 **Date:** March 2026
-**Status:** Implementation target / pre-build spec
+**Status:** Backend v1 is implemented for the Sage agent disconnect flow; broader event sources, mobile-client integrations, and some hardening remain open
 **Related Docs:**
 - `sage-in-maple-architecture.md`
 - `architecture-for-rag-integration.md`
@@ -27,16 +27,37 @@ The final architectural decisions are:
 
 This gives us Signal-like transport privacy for push content without pretending we are building a full Signal protocol.
 
+### 1.1 Current backend scope in this repo
+
+As of this revision, the backend implementation in this repo currently includes:
+
+- project-scoped push settings and secrets
+- device register / list / revoke routes plus logout cleanup fallback
+- encrypted token storage, durable notification events, and per-device delivery rows
+- direct APNs + direct FCM sender implementations
+- background delivery worker with Postgres leasing
+- successful Sage agent SSE delivery suppression plus disconnect-triggered `agent.message` enqueue
+
+The currently shipped backend scope is narrower than the full product design described later in this document:
+
+- the implemented event source in this repo is currently the Sage agent SSE disconnect path in `src/web/agent/mod.rs`
+- reminder / task-complete / account-alert sources remain follow-up work
+- iOS NSE behavior, Android client behavior, recent-ID caches, and thread cleanup live in mobile codebases rather than this backend repo
+
 ---
 
 ## 2. What Problem This Solves
 
-We want Maple / Sage to send notifications for events like:
+Longer-term Maple / Sage product goals include notifications for events like:
 
 - reminder due
 - long-running agent task complete
 - async follow-up from Sage
 - security or account alerts
+
+Current backend implementation note:
+
+- this repo currently enqueues only `agent.message` notifications for interrupted Sage agent SSE turns
 
 while ensuring that:
 
@@ -182,96 +203,77 @@ Rules:
 
 ---
 
-## 6. Existing Codebase Integration Map
+## 6. Current Codebase Integration Map
 
-This section is the implementation map for a follow-on coding agent.
+This section reflects the current backend code layout rather than the original pre-build implementation plan.
 
-### 6.1 Existing files to modify
+### 6.1 Database and model ownership
 
-#### Database and models
-
-- `migrations/<new_push_migration>/up.sql`
-  - Add `push_devices`, `notification_events`, and `notification_deliveries`.
-  - Add indexes and `updated_at` triggers matching the existing schema style.
-
-- `migrations/<new_push_migration>/down.sql`
-  - Drop the new push tables and indexes.
-
-- `src/models/mod.rs`
-  - Export the new push model modules.
-
-- `src/models/schema.rs`
-  - Regenerate via Diesel after the migration is added.
-
-- `src/models/project_settings.rs`
-  - Extend `SettingCategory` with `Push`.
-  - Add `PushSettings`, `IosPushSettings`, `AndroidPushSettings`, and related helpers.
-
-- `src/db.rs`
-  - Add trait methods and `PostgresConnection` implementations for push device CRUD, event enqueue, delivery leasing, retry, and invalidation.
-  - Mirror the existing settings / secrets patterns already used for email and OAuth.
-
-#### Web API routing
-
-- `src/web/mod.rs`
-  - Export a new `push` router module.
-
-- `src/main.rs`
-  - Merge the new push router under `validate_jwt`.
-  - Start the background push worker after app state initialization and migrations.
-
-- `src/web/agent/mod.rs`
-  - Gate push enqueue on whether a live SSE response finished successfully; this is the v1 suppression signal for the normal Sage agent flow.
-
-- `src/web/platform/common.rs`
-  - Add new secret constants and request / response types for project push settings.
-
-- `src/web/platform/project_routes.rs`
-  - Add `GET` / `PUT /platform/orgs/:org_id/projects/:project_id/settings/push`.
-  - Reuse the existing project secret endpoints for actual APNs / FCM credentials.
-
-#### Deployment / runtime
-
-- `entrypoint.sh`
-  - Add `/etc/hosts` entries and `traffic_forwarder.py` processes for APNs production, APNs sandbox, and FCM.
-
-- `docs/nitro-deploy.md`
-  - Add parent-instance `vsock-proxy` instructions for the new outbound hosts.
-  - This is a deployment follow-up, not required for compiling the backend.
-
-### 6.2 New files to add
+- `migrations/2026-03-07-120000_push_notifications_v1/{up,down}.sql`
+  - Defines `push_devices`, `notification_events`, and `notification_deliveries` plus active indexes and triggers.
 
 - `src/models/push_devices.rs`
-  - Diesel model and helper methods for device registrations.
+  - Owns device registration lookups, same-user reuse, revoke, invalidate, and active-device listing.
 
 - `src/models/notification_events.rs`
-  - Durable logical notification rows.
+  - Owns durable logical notification rows.
 
 - `src/models/notification_deliveries.rs`
-  - Per-device delivery state rows.
+  - Owns delivery insertion, leasing, retry scheduling, and final state transitions.
+
+- `src/models/project_settings.rs`
+  - Owns `PushSettings`, `IosPushSettings`, and `AndroidPushSettings`.
+
+- `src/db.rs`
+  - Currently handles project push settings read / write helpers.
+  - The main device / event / delivery CRUD surface lives in the model modules above, not in `src/db.rs`.
+
+### 6.2 Web, runtime, and routing integration
 
 - `src/web/push.rs`
-  - App-user authenticated routes like `POST /v1/push/devices`.
+  - App-user authenticated device register / list / revoke routes.
+
+- `src/web/agent/mod.rs`
+  - Sage agent SSE acknowledgement tracking plus the current disconnect-triggered `agent.message` enqueue path.
+
+- `src/web/platform/common.rs`
+  - Push secret constants and project-settings request / response types.
+
+- `src/web/platform/project_routes.rs`
+  - `GET` / `PUT /platform/orgs/:org_id/projects/:project_id/settings/push`.
+
+- `src/main.rs`
+  - Raw project secret helpers, route mounting, and background push-worker startup.
+
+### 6.3 Push delivery modules
 
 - `src/push/mod.rs`
-  - Shared types, enqueue helpers, and internal interfaces.
+  - Shared types, enqueue helpers, generated `notification_id`, automatic `notif:<notification_id>` collapse keys, and current `agent.message` defaults.
 
 - `src/push/crypto.rs`
   - P-256 ECDH + HKDF + AES-GCM envelope logic.
 
 - `src/push/apns.rs`
-  - APNs request building, JWT auth, and response handling.
+  - APNs request building, JWT auth, cache invalidation, and response handling.
 
 - `src/push/fcm.rs`
-  - FCM OAuth token exchange, request building, and response handling.
+  - FCM OAuth token exchange, payload building, cached-token invalidation, and retry classification.
 
 - `src/push/worker.rs`
   - Polling / leasing loop that sends pending deliveries.
 
-### 6.3 Codebase gotchas to preserve
+### 6.4 Deployment / runtime integration
 
-1. `src/main.rs::get_project_secret()` currently returns **base64-encoded decrypted bytes**.
-   That is fine for some existing flows, but APNs `.p8` material and FCM service account JSON are easier to consume as raw bytes or raw UTF-8. Add a raw helper rather than forcing each caller to decode a second time.
+- `entrypoint.sh`
+  - Adds `/etc/hosts` entries and `traffic_forwarder.py` processes for APNs production, APNs sandbox, and FCM.
+
+- `docs/nitro-deploy.md`
+  - Documents the parent-instance `vsock-proxy` instructions for those outbound hosts.
+
+### 6.5 Codebase gotchas to preserve
+
+1. `src/main.rs` now exposes raw project-secret helpers for PEM / JSON consumption.
+   Keep using raw bytes / raw UTF-8 for APNs `.p8` material and FCM service account JSON rather than double-decoding base64.
 
 2. `src/encrypt.rs` is useful for **at-rest encryption** but not for device ECDH push envelopes.
    Its current primitives take `secp256k1::SecretKey` and do symmetric encryption only.
@@ -279,18 +281,18 @@ This section is the implementation map for a follow-on coding agent.
 3. `src/main.rs::create_ephemeral_key()` uses **x25519** for session establishment.
    Do not overload that codepath for push notifications.
 
-4. New user-facing push APIs should live under **`/v1/push/*`**, not under the older `/protected/*` namespace.
-   That matches the newer `agent` and `responses` route style.
+4. User-facing push APIs live under **`/v1/push/*`**, not under the older `/protected/*` namespace.
+   That matches the newer route style already used elsewhere in the repo.
 
 ---
 
 ## 7. Project Configuration Model
 
-Push config should follow the same split already used elsewhere in the repo.
+Current push config follows the same split already used elsewhere in the repo.
 
 ### 7.1 Non-secret settings in `project_settings`
 
-Add a new `SettingCategory::Push` and store a JSON payload like:
+The current implementation uses `SettingCategory::Push` and stores a JSON payload like:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -334,7 +336,7 @@ Notes:
 
 ### 7.2 Secrets in `org_project_secrets`
 
-Add constants in `src/web/platform/common.rs`:
+The current implementation uses constants in `src/web/platform/common.rs`:
 
 ```rust
 pub const PROJECT_APNS_AUTH_KEY_P8: &str = "APNS_AUTH_KEY_P8";
@@ -360,20 +362,20 @@ One row per active installation binding, with revoked rows retained for re-regis
 ```sql
 CREATE TABLE push_devices (
     id                              BIGSERIAL PRIMARY KEY,
-    uuid                            UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+    uuid                            UUID NOT NULL DEFAULT uuid_generate_v4() UNIQUE,
     user_id                         UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
 
     installation_id                 UUID NOT NULL,
-    platform                        TEXT NOT NULL,
-    provider                        TEXT NOT NULL,
-    environment                     TEXT NOT NULL,
+    platform                        TEXT NOT NULL CHECK (platform IN ('ios', 'android')),
+    provider                        TEXT NOT NULL CHECK (provider IN ('apns', 'fcm')),
+    environment                     TEXT NOT NULL CHECK (environment IN ('dev', 'prod')),
     app_id                          TEXT NOT NULL,
 
     push_token_enc                  BYTEA NOT NULL,
     push_token_hash                 BYTEA NOT NULL,
 
     notification_public_key         BYTEA NOT NULL,
-    key_algorithm                   TEXT NOT NULL,
+    key_algorithm                   TEXT NOT NULL CHECK (key_algorithm IN ('p256_ecdh_v1')),
 
     supports_encrypted_preview      BOOLEAN NOT NULL DEFAULT FALSE,
     supports_background_processing  BOOLEAN NOT NULL DEFAULT FALSE,
@@ -386,9 +388,7 @@ CREATE TABLE push_devices (
     CHECK (
         (platform = 'ios' AND provider = 'apns') OR
         (platform = 'android' AND provider = 'fcm')
-    ),
-    CHECK (environment IN ('dev', 'prod')),
-    CHECK (key_algorithm = 'p256_ecdh_v1')
+    )
 );
 
 CREATE INDEX idx_push_devices_user_active
@@ -410,6 +410,7 @@ Implementation notes:
 - `push_token_enc` should be encrypted at rest with the enclave key using the same style as project secrets
 - `push_token_hash` should be `SHA-256(push_token)` raw bytes for dedupe and lookup
 - `notification_public_key` should store raw DER-encoded SPKI bytes, not a base64 string
+- route-level validation and the DB constraint both enforce valid `(platform, provider)` pairs for defense in depth
 - keep at most one active binding per `(installation_id, environment)` and per `(provider, environment, push_token_hash)`; older rows are revoked rather than overwritten
 
 ### 8.2 `notification_events`
@@ -419,7 +420,7 @@ Logical notification rows created by product code.
 ```sql
 CREATE TABLE notification_events (
     id                  BIGSERIAL PRIMARY KEY,
-    uuid                UUID NOT NULL DEFAULT gen_random_uuid() UNIQUE,
+    uuid                UUID NOT NULL DEFAULT uuid_generate_v4() UNIQUE,
     project_id          INTEGER NOT NULL REFERENCES org_projects(id) ON DELETE CASCADE,
     user_id             UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
 
@@ -441,7 +442,7 @@ CREATE TABLE notification_events (
     CHECK (priority IN ('normal', 'high'))
 );
 
-CREATE INDEX idx_notification_events_due
+CREATE INDEX idx_notification_events_user_due
     ON notification_events(user_id, not_before_at, cancelled_at);
 ```
 
@@ -504,7 +505,7 @@ Implementation notes:
 
 ### 9.1 App-user push device API
 
-Create a new router in `src/web/push.rs` and mount it in `main.rs` with `validate_jwt` plus the usual encrypted request / response middleware.
+The current router lives in `src/web/push.rs` and is mounted in `main.rs` with `validate_jwt` plus the usual encrypted request / response middleware.
 
 #### Register or rotate device
 
@@ -584,7 +585,7 @@ Preferred client flow:
 
 ### 9.2 Platform project settings API
 
-Add a new project settings endpoint in `src/web/platform/project_routes.rs`:
+The current project settings endpoints live in `src/web/platform/project_routes.rs`:
 
 ```http
 GET /platform/orgs/:org_id/projects/:project_id/settings/push
@@ -600,37 +601,39 @@ Do **not** add a dedicated secret endpoint. Reuse the existing generic project s
 
 ---
 
-## 10. DB Trait and Service Methods
+## 10. Current Backend Module Split
 
-Add the following categories of methods to `src/db.rs`.
+### 10.1 `src/db.rs` and push settings
 
-### 10.1 Push device methods
-
-- `upsert_push_device(...)`
-- `get_push_device_by_uuid_for_user(...)`
-- `list_active_push_devices_for_user(...)`
-- `revoke_push_device_for_user(...)`
-- `invalidate_push_device(...)`
-
-### 10.2 Push settings methods
+`src/db.rs` currently owns the project push settings helpers:
 
 - `get_project_push_settings(project_id)`
 - `update_project_push_settings(project_id, settings)`
 
 This mirrors the existing email / OAuth settings pattern.
 
-### 10.3 Event and delivery methods
+### 10.2 Device / event / delivery DB logic
 
-- `create_notification_event(...)`
-- `create_notification_deliveries_for_event(...)`
-- `lease_pending_notification_deliveries(limit, lease_owner, lease_ttl)`
-- `mark_notification_delivery_sent(...)`
-- `mark_notification_delivery_retry(...)`
-- `mark_notification_delivery_failed(...)`
-- `mark_notification_delivery_invalid_token(...)`
+Most push DB behavior currently lives in model modules rather than `src/db.rs`:
 
-The lease query should use a transaction plus `FOR UPDATE SKIP LOCKED` semantics so the design works across multiple workers / enclaves from day one.
-Use Postgres time (`now()`) for lease and retry timestamps instead of local enclave clock time.
+- `src/models/push_devices.rs`
+  - installation lookups, active-token lookup, revoke, invalidate, and active device listing
+- `src/models/notification_events.rs`
+  - event insertion and loading helpers
+- `src/models/notification_deliveries.rs`
+  - bulk delivery insertion, leasing, retry scheduling, and `mark_*` transitions
+
+The delivery lease query uses Postgres row locking / leasing semantics, and retry scheduling uses Postgres time rather than enclave-local clock math.
+
+### 10.3 `src/push/mod.rs` enqueue behavior
+
+`src/push/mod.rs` currently owns:
+
+- `EnqueueNotificationRequest`
+- generated canonical `notification_id`
+- automatic `collapse_key = notif:<notification_id>` generation
+- durable event creation plus per-device delivery materialization
+- the current `agent.message` enqueue policy, including the 7-day expiry currently used by that path
 
 ---
 
@@ -676,6 +679,7 @@ Rules:
 - no leader election is required
 - any enclave can resume work after another enclave crashes
 - `lease_owner`, `lease_expires_at`, `next_attempt_at`, and `status` must all live in Postgres
+- final `mark_*` delivery transitions should only succeed when the current row still belongs to that worker's `lease_owner`; stale workers should become lost-lease no-ops instead of overwriting newer results
 
 ### 11.4 Delivery semantics
 
@@ -824,8 +828,9 @@ Use:
 - `apns-topic: <bundle_id>`
 - `apns-push-type: alert`
 - `apns-priority: 10`
-- `apns-collapse-id: notif:<notification_id>` when retrying the same logical notification
+- `apns-collapse-id: notif:<notification_id>` for the current logical notification event
 
+Retries reuse that same value because `notification_id` stays stable across retries.
 Do **not** reuse one collapse ID for every message in a thread by default.
 If desired, use `aps.thread-id` for notification-center grouping separately from collapse behavior.
 
@@ -942,14 +947,20 @@ It avoids relying on background execution for every Sage message.
     },
     "data": {
       "notification_id": "<uuid>",
+      "kind": "agent.message",
       "thread_id": "agent:uuid",
       "message_id": "<uuid>",
       "deep_link": "opensecret://agent/subagent/uuid"
     },
     "android": {
       "priority": "HIGH",
-      "collapse_key": "sage:notif:<notification_id>",
-      "ttl": "300s"
+      "collapse_key": "notif:<notification_id>",
+      "ttl": "604800s",
+      "notification": {
+        "channel_id": "maple_messages",
+        "tag": "<notification_id>",
+        "click_action": "OPEN_THREAD"
+      }
     }
   }
 }
@@ -959,9 +970,12 @@ Notes:
 
 - visible text should remain generic / non-sensitive
 - FCM `data` values must be strings
+- current backend derives Android TTL from `expires_at`; when an event has no explicit expiry, the sender defaults to 7 days
+- the current `agent.message` enqueue path sets a 7-day expiry, so the common Sage-agent payload today is effectively close to `604800s`
 - FCM `data` is provider-visible routing metadata, so it may include fields like `notification_id`, `message_id`, `thread_id`, `deep_link`, and `kind`, but never plaintext message content
 - this is intentional in v1: the goal is to keep message content encrypted from the push provider, not to hide all metadata needed for client routing
-- reuse the same `collapse_key` only for retries of the same logical notification
+- current implementation auto-keys `collapse_key` to `notification_id` without the older `sage:` prefix shown in earlier drafts
+- reuse the same `collapse_key` only for the same logical notification
 - `notification_id` is for exact dedup; `thread_id` is for grouping / clearing when the user opens the conversation
 
 ### 14.4 Optional Android encrypted-preview path (deferred)
@@ -984,9 +998,13 @@ Treat these as permanent invalid-token outcomes:
 
 Treat these as retryable:
 
+- `401`
+- `403`
 - `429`
 - `500`
 - `503`
+
+For `401` / `403`, the current implementation also invalidates the cached OAuth token first so the retry can fetch a fresh credential.
 
 Persist:
 
@@ -1179,24 +1197,29 @@ pub struct EnqueueNotificationRequest {
     pub kind: String,
     pub delivery_mode: PushDeliveryMode,
     pub priority: PushPriority,
-    pub collapse_key: Option<String>,
     pub fallback_title: String,
     pub fallback_body: String,
-    pub payload: Option<NotificationPreviewPayload>,
+    pub preview_payload: Option<NotificationPreviewPayloadInput>,
     pub not_before_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
 }
 ```
 
+The current helper generates `notification_id` internally and derives `collapse_key` as `notif:<notification_id>` when the event row is created.
+
 ### 17.3 Initial event sources
 
-Likely first integrations:
+Current implemented backend source:
+
+- `src/web/agent/mod.rs`
+  - live Sage agent SSE completion / failure handling and one `agent.message` notification for an interrupted turn
+
+Future integrations:
 
 - `src/web/agent/runtime.rs`
   - subagent follow-up or background completion signals
 
-- `src/web/agent/mod.rs`
-  - live Sage SSE completion / failure handling
+- reminder scheduling, task-complete hooks, and account / security alerts
 
 Reminder scheduling can come later; the outbox design already supports `not_before_at`.
 
@@ -1210,19 +1233,18 @@ Reminder scheduling can come later; the outbox design already supports `not_befo
 
 ---
 
-## 18. Validation and Test Plan
+## 18. Validation Coverage and Remaining Test Work
 
-### 18.1 Unit tests
+### 18.1 Current unit coverage
 
-Add focused tests for:
+Current repo coverage includes focused tests for:
 
 - P-256 envelope roundtrip in `src/push/crypto.rs`
-- APNs JWT generation and refresh behavior
-- FCM service-account assertion generation and token parsing
-- push-device upsert / revoke / invalidate DB behavior
-- delivery leasing and retry transitions
+- preview normalization and enqueue-side helpers in `src/push/mod.rs`
+- retry classification and backoff behavior in `src/push/worker.rs`
+- push handoff planning and logout cleanup parsing in `src/web/push.rs` and `src/web/login_routes.rs`
 
-### 18.2 Integration tests
+### 18.2 Remaining integration tests
 
 Add route tests for:
 
@@ -1230,12 +1252,15 @@ Add route tests for:
 - `GET /v1/push/devices`
 - `DELETE /v1/push/devices/:id`
 - `GET` / `PUT` platform push settings routes
+- `/logout` push cleanup fallback
+- same-device account handoff behavior across explicit revoke + re-register flows
 
 ### 18.3 Provider client testability
 
-Do not hardcode transport base URLs so deeply that they cannot be mocked.
+APNs and FCM sender endpoints are currently hardcoded.
+For stronger provider-client tests, add test-only overrideable base URLs.
 
-The APNs and FCM sender code should allow test-only override of base URLs, making it possible to verify:
+That should make it possible to verify:
 
 - request headers
 - request body shapes
@@ -1244,52 +1269,29 @@ The APNs and FCM sender code should allow test-only override of base URLs, makin
 
 ---
 
-## 19. Implementation Order
+## 19. Suggested Remaining Implementation Order
 
-### Phase 1: Schema and project settings
+### Phase 1: Delivery hardening
 
-- add migration for push tables
-- add push model files and Diesel schema
-- add `SettingCategory::Push`
-- add project push settings routes
-- add new project secret constants
+- tighten permanent failure invalidation / quarantine behavior
+- add targeted lost-lease transition tests around the current `mark_*` behavior
+- add metrics for lost-lease and invalid-token outcomes
 
-### Phase 2: Device registry API
+### Phase 2: Provider testability and integration tests
 
-- add `src/web/push.rs`
-- add push-device DB methods
-- implement register / list / revoke routes
-- add user-scoped tests
+- add test-only APNs / FCM base URL overrides
+- add route / lease / provider-client integration coverage
 
-### Phase 3: Outbox and generic delivery
+### Phase 3: Product event source expansion
 
-- add event / delivery DB methods
-- add worker leasing loop
-- wire live Sage SSE paths so successful stream completion skips push enqueue
-- implement APNs generic delivery
-- implement standard FCM visible delivery
+- add reminder, task-complete, and account / security event hooks
+- decide which event types should ship in the current backend scope versus later phases
 
-### Phase 4: Client dedup + foreground suppression + iOS encrypted preview
+### Phase 4: Mobile client alignment and tuning
 
-- add stable `notification_id` handling end-to-end
-- add client recent-ID cache guidance and integration
-- add thread-based notification cleanup when a conversation opens
-- add `p256` + `hkdf`
-- implement per-device envelope encryption
-- add iOS encrypted preview payload / NSE rewrite
-
-### Phase 5: Android optional encrypted-preview path
-
-- keep standard visible FCM delivery as the default
-- optionally add Android data-only encrypted preview if product later decides it is worth the extra complexity
-- if enabled, implement it in `FirebaseMessagingService` with local-notification posting only after successful decrypt
-
-### Phase 6: Product integrations and hardening
-
-- connect Maple / Sage event sources
-- add collapse keys, TTL, and backoff policy tuning
-- add metrics and invalid token cleanup dashboards
-- optionally add stronger device attestation later
+- align mobile repos on recent-ID dedup, thread cleanup, and foreground suppression
+- tune TTL, collapse-key policy, and other delivery defaults once real client behavior is exercised
+- optionally add stronger device attestation later if the product needs it
 
 ---
 
@@ -1328,3 +1330,37 @@ The v1 implementation should be:
 - **stable `notification_id` plus client-side dedup / thread cleanup**
 
 This is the simplest design that still matches the current OpenSecret architecture and avoids painting us into a corner later.
+
+Current implementation note: the backend in this repo already follows this design for the Sage agent disconnect path, while broader event sources and some hardening items remain follow-up work.
+
+---
+
+## 22. Remaining Implementation Details
+
+These items are the main remaining hardening work after the current push handoff, delivery-isolation, and doc-alignment changes.
+
+### 22.1 Permanent failure hygiene
+
+- tighten device / config permanent-failure handling so obviously dead or ineligible targets are invalidated or quarantined more aggressively
+- keep the worker from repeatedly retrying rows that are no longer realistically deliverable
+- continue improving provider-specific invalid-token classification, especially for APNs / FCM permanent device failures
+
+### 22.2 Integration-level test coverage
+
+- add route-level tests for push registration, revoke, logout cleanup, and same-device account handoff
+- add leasing tests that exercise stale-worker and lost-lease behavior against the actual DB transition code
+- add provider-client tests with injectable APNs / FCM base URLs so delivery classification can be verified without real provider traffic
+
+### 22.3 Migration cleanup and consistency
+
+- clean up migration / down-migration consistency around index definitions where helpful
+
+### 22.4 Delivery policy flexibility
+
+- decide whether future callers need explicit internal enqueue control over `collapse_key`, TTL, or similar delivery-policy knobs
+- document any chosen defaults centrally so backend and client expectations stay aligned
+
+### 22.5 Scope expansion and client alignment
+
+- extend backend event sources beyond the current `agent.message` Sage disconnect path when product priorities require it
+- keep the mobile-client behavior docs aligned with what is actually implemented in the iOS / Android repos

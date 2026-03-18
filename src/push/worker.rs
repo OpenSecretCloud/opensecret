@@ -1,5 +1,7 @@
 use crate::encrypt::decrypt_with_key;
-use crate::models::notification_deliveries::NotificationDelivery;
+use crate::models::notification_deliveries::{
+    NotificationDelivery, NotificationDeliveryWriteResult,
+};
 use crate::models::notification_events::NotificationEvent;
 use crate::models::push_devices::{PushDevice, PUSH_PLATFORM_ANDROID, PUSH_PLATFORM_IOS};
 use crate::push::apns::{send_apns_notification, ApnsSendRequest};
@@ -85,6 +87,14 @@ async fn process_leased_delivery(
     transport: &PushTransport,
     delivery: NotificationDelivery,
 ) -> Result<(), PushError> {
+    let Some(lease_owner) = delivery.lease_owner.clone() else {
+        error!(
+            "leased push delivery {} is missing lease_owner; waiting for lease expiry",
+            delivery.id
+        );
+        return Ok(());
+    };
+
     let mut conn = state
         .db
         .get_pool()
@@ -93,13 +103,38 @@ async fn process_leased_delivery(
     let event = match NotificationEvent::get_by_id(&mut conn, delivery.event_id)? {
         Some(event) => event,
         None => {
-            NotificationDelivery::mark_failed(&mut conn, delivery.id, None, Some("event missing"))?;
+            if !record_delivery_transition(
+                NotificationDelivery::mark_failed(
+                    &mut conn,
+                    delivery.id,
+                    &lease_owner,
+                    None,
+                    Some("event missing"),
+                )?,
+                delivery.id,
+                &lease_owner,
+                "failed (event missing)",
+            ) {
+                return Ok(());
+            }
             return Ok(());
         }
     };
 
     if event.cancelled_at.is_some() {
-        NotificationDelivery::mark_cancelled(&mut conn, delivery.id, Some("event cancelled"))?;
+        if !record_delivery_transition(
+            NotificationDelivery::mark_cancelled(
+                &mut conn,
+                delivery.id,
+                &lease_owner,
+                Some("event cancelled"),
+            )?,
+            delivery.id,
+            &lease_owner,
+            "cancelled (event cancelled)",
+        ) {
+            return Ok(());
+        }
         return Ok(());
     }
 
@@ -107,34 +142,74 @@ async fn process_leased_delivery(
         .expires_at
         .is_some_and(|expires_at| expires_at <= Utc::now())
     {
-        NotificationDelivery::mark_cancelled(&mut conn, delivery.id, Some("event expired"))?;
+        if !record_delivery_transition(
+            NotificationDelivery::mark_cancelled(
+                &mut conn,
+                delivery.id,
+                &lease_owner,
+                Some("event expired"),
+            )?,
+            delivery.id,
+            &lease_owner,
+            "cancelled (event expired)",
+        ) {
+            return Ok(());
+        }
         return Ok(());
     }
 
     let device = match PushDevice::get_by_id(&mut conn, delivery.push_device_id)? {
         Some(device) => device,
         None => {
-            NotificationDelivery::mark_failed(
-                &mut conn,
+            if !record_delivery_transition(
+                NotificationDelivery::mark_failed(
+                    &mut conn,
+                    delivery.id,
+                    &lease_owner,
+                    None,
+                    Some("device missing"),
+                )?,
                 delivery.id,
-                None,
-                Some("device missing"),
-            )?;
+                &lease_owner,
+                "failed (device missing)",
+            ) {
+                return Ok(());
+            }
             return Ok(());
         }
     };
 
     if device.user_id != event.user_id {
-        NotificationDelivery::mark_cancelled(
-            &mut conn,
+        if !record_delivery_transition(
+            NotificationDelivery::mark_cancelled(
+                &mut conn,
+                delivery.id,
+                &lease_owner,
+                Some("device user does not match event user"),
+            )?,
             delivery.id,
-            Some("device user does not match event user"),
-        )?;
+            &lease_owner,
+            "cancelled (device user mismatch)",
+        ) {
+            return Ok(());
+        }
         return Ok(());
     }
 
     if device.revoked_at.is_some() {
-        NotificationDelivery::mark_cancelled(&mut conn, delivery.id, Some("device revoked"))?;
+        if !record_delivery_transition(
+            NotificationDelivery::mark_cancelled(
+                &mut conn,
+                delivery.id,
+                &lease_owner,
+                Some("device revoked"),
+            )?,
+            delivery.id,
+            &lease_owner,
+            "cancelled (device revoked)",
+        ) {
+            return Ok(());
+        }
         return Ok(());
     }
     drop(conn);
@@ -160,59 +235,96 @@ async fn process_leased_delivery(
             provider_message_id,
             provider_status_code,
         } => {
-            NotificationDelivery::mark_sent(
-                &mut conn,
+            record_delivery_transition(
+                NotificationDelivery::mark_sent(
+                    &mut conn,
+                    delivery.id,
+                    &lease_owner,
+                    provider_message_id.as_deref(),
+                    provider_status_code,
+                )?,
                 delivery.id,
-                provider_message_id.as_deref(),
-                provider_status_code,
-            )?;
+                &lease_owner,
+                "sent",
+            );
         }
         PushSendOutcome::Retryable {
             provider_status_code,
             error,
         } => {
             if delivery.attempt_count + 1 >= PUSH_WORKER_MAX_ATTEMPTS {
-                NotificationDelivery::mark_failed(
-                    &mut conn,
+                record_delivery_transition(
+                    NotificationDelivery::mark_failed(
+                        &mut conn,
+                        delivery.id,
+                        &lease_owner,
+                        provider_status_code,
+                        Some(&error),
+                    )?,
                     delivery.id,
-                    provider_status_code,
-                    Some(&error),
-                )?;
+                    &lease_owner,
+                    "failed (retry limit reached)",
+                );
             } else {
-                NotificationDelivery::mark_retry(
-                    &mut conn,
+                record_delivery_transition(
+                    NotificationDelivery::mark_retry(
+                        &mut conn,
+                        delivery.id,
+                        &lease_owner,
+                        provider_status_code,
+                        Some(&error),
+                        retry_backoff_seconds(delivery.attempt_count + 1),
+                    )?,
                     delivery.id,
-                    provider_status_code,
-                    Some(&error),
-                    retry_backoff_seconds(delivery.attempt_count + 1),
-                )?;
+                    &lease_owner,
+                    "retry",
+                );
             }
         }
         PushSendOutcome::InvalidToken {
             provider_status_code,
             error,
         } => {
-            conn.transaction::<(), PushError, _>(|conn| {
-                NotificationDelivery::mark_invalid_token(
+            let invalidated = conn.transaction::<bool, PushError, _>(|conn| {
+                let write_result = NotificationDelivery::mark_invalid_token(
                     conn,
                     delivery.id,
+                    &lease_owner,
                     provider_status_code,
                     Some(&error),
                 )?;
-                PushDevice::invalidate(conn, device.id)?;
-                Ok(())
+
+                if write_result.was_applied() {
+                    PushDevice::invalidate(conn, device.id)?;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             })?;
+
+            if !invalidated {
+                debug!(
+                    "push delivery {} lost lease before marking invalid_token (lease_owner={})",
+                    delivery.id, lease_owner
+                );
+            }
         }
         PushSendOutcome::Failed {
             provider_status_code,
             error,
         } => {
-            NotificationDelivery::mark_failed(
-                &mut conn,
+            record_delivery_transition(
+                NotificationDelivery::mark_failed(
+                    &mut conn,
+                    delivery.id,
+                    &lease_owner,
+                    provider_status_code,
+                    Some(&error),
+                )?,
                 delivery.id,
-                provider_status_code,
-                Some(&error),
-            )?;
+                &lease_owner,
+                "failed",
+            );
         }
     }
 
@@ -376,6 +488,23 @@ fn classify_internal_push_error(error: PushError) -> PushSendOutcome {
             provider_status_code: None,
             error: error.to_string(),
         },
+    }
+}
+
+fn record_delivery_transition(
+    write_result: NotificationDeliveryWriteResult,
+    delivery_id: i64,
+    lease_owner: &str,
+    transition: &str,
+) -> bool {
+    if write_result.was_applied() {
+        true
+    } else {
+        debug!(
+            "push delivery {} lost lease before marking {} (lease_owner={})",
+            delivery_id, transition, lease_owner
+        );
+        false
     }
 }
 

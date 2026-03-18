@@ -16,7 +16,11 @@ CREATE TABLE push_devices (
     last_seen_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     revoked_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK (
+        (platform = 'ios' AND provider = 'apns') OR
+        (platform = 'android' AND provider = 'fcm')
+    )
 );
 
 CREATE TABLE notification_events (

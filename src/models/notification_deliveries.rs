@@ -11,6 +11,26 @@ pub const NOTIFICATION_DELIVERY_STATUS_FAILED: &str = "failed";
 pub const NOTIFICATION_DELIVERY_STATUS_INVALID_TOKEN: &str = "invalid_token";
 pub const NOTIFICATION_DELIVERY_STATUS_CANCELLED: &str = "cancelled";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationDeliveryWriteResult {
+    Updated,
+    LostLease,
+}
+
+impl NotificationDeliveryWriteResult {
+    fn from_updated_rows(updated_rows: usize) -> Self {
+        if updated_rows == 0 {
+            Self::LostLease
+        } else {
+            Self::Updated
+        }
+    }
+
+    pub fn was_applied(self) -> bool {
+        matches!(self, Self::Updated)
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum NotificationDeliveryError {
     #[error("Database error: {0}")]
@@ -91,11 +111,17 @@ impl NotificationDelivery {
     pub fn mark_sent(
         conn: &mut PgConnection,
         lookup_id: i64,
+        expected_lease_owner: &str,
         provider_message_id: Option<&str>,
         provider_status_code: Option<i32>,
-    ) -> Result<(), NotificationDeliveryError> {
+    ) -> Result<NotificationDeliveryWriteResult, NotificationDeliveryError> {
         diesel::update(
-            notification_deliveries::table.filter(notification_deliveries::id.eq(lookup_id)),
+            notification_deliveries::table
+                .filter(notification_deliveries::id.eq(lookup_id))
+                .filter(notification_deliveries::status.eq("leased"))
+                .filter(
+                    notification_deliveries::lease_owner.eq(Some(expected_lease_owner.to_string())),
+                ),
         )
         .set((
             notification_deliveries::status.eq(NOTIFICATION_DELIVERY_STATUS_SENT),
@@ -109,48 +135,58 @@ impl NotificationDelivery {
             notification_deliveries::updated_at.eq(diesel::dsl::now),
         ))
         .execute(conn)
-        .map(|_| ())
+        .map(NotificationDeliveryWriteResult::from_updated_rows)
         .map_err(NotificationDeliveryError::DatabaseError)
     }
 
     pub fn mark_retry(
         conn: &mut PgConnection,
         lookup_id: i64,
+        expected_lease_owner: &str,
         provider_status_code: Option<i32>,
         last_error: Option<&str>,
         retry_after_seconds: i32,
-    ) -> Result<(), NotificationDeliveryError> {
+    ) -> Result<NotificationDeliveryWriteResult, NotificationDeliveryError> {
         let query = r#"
             UPDATE notification_deliveries
             SET status = 'retry',
                 attempt_count = attempt_count + 1,
-                provider_status_code = $2,
-                last_error = $3,
-                next_attempt_at = NOW() + ($4 * INTERVAL '1 second'),
+                provider_status_code = $3,
+                last_error = $4,
+                next_attempt_at = NOW() + ($5 * INTERVAL '1 second'),
                 lease_owner = NULL,
                 lease_expires_at = NULL,
                 updated_at = NOW()
             WHERE id = $1
+              AND lease_owner = $2
+              AND status = 'leased'
         "#;
 
         sql_query(query)
             .bind::<BigInt, _>(lookup_id)
+            .bind::<Text, _>(expected_lease_owner)
             .bind::<diesel::sql_types::Nullable<Int4>, _>(provider_status_code)
             .bind::<diesel::sql_types::Nullable<Text>, _>(last_error)
             .bind::<Int4, _>(retry_after_seconds)
             .execute(conn)
-            .map(|_| ())
+            .map(NotificationDeliveryWriteResult::from_updated_rows)
             .map_err(NotificationDeliveryError::DatabaseError)
     }
 
     pub fn mark_failed(
         conn: &mut PgConnection,
         lookup_id: i64,
+        expected_lease_owner: &str,
         provider_status_code: Option<i32>,
         last_error: Option<&str>,
-    ) -> Result<(), NotificationDeliveryError> {
+    ) -> Result<NotificationDeliveryWriteResult, NotificationDeliveryError> {
         diesel::update(
-            notification_deliveries::table.filter(notification_deliveries::id.eq(lookup_id)),
+            notification_deliveries::table
+                .filter(notification_deliveries::id.eq(lookup_id))
+                .filter(notification_deliveries::status.eq("leased"))
+                .filter(
+                    notification_deliveries::lease_owner.eq(Some(expected_lease_owner.to_string())),
+                ),
         )
         .set((
             notification_deliveries::status.eq(NOTIFICATION_DELIVERY_STATUS_FAILED),
@@ -162,18 +198,24 @@ impl NotificationDelivery {
             notification_deliveries::updated_at.eq(diesel::dsl::now),
         ))
         .execute(conn)
-        .map(|_| ())
+        .map(NotificationDeliveryWriteResult::from_updated_rows)
         .map_err(NotificationDeliveryError::DatabaseError)
     }
 
     pub fn mark_invalid_token(
         conn: &mut PgConnection,
         lookup_id: i64,
+        expected_lease_owner: &str,
         provider_status_code: Option<i32>,
         last_error: Option<&str>,
-    ) -> Result<(), NotificationDeliveryError> {
+    ) -> Result<NotificationDeliveryWriteResult, NotificationDeliveryError> {
         diesel::update(
-            notification_deliveries::table.filter(notification_deliveries::id.eq(lookup_id)),
+            notification_deliveries::table
+                .filter(notification_deliveries::id.eq(lookup_id))
+                .filter(notification_deliveries::status.eq("leased"))
+                .filter(
+                    notification_deliveries::lease_owner.eq(Some(expected_lease_owner.to_string())),
+                ),
         )
         .set((
             notification_deliveries::status.eq(NOTIFICATION_DELIVERY_STATUS_INVALID_TOKEN),
@@ -186,17 +228,23 @@ impl NotificationDelivery {
             notification_deliveries::updated_at.eq(diesel::dsl::now),
         ))
         .execute(conn)
-        .map(|_| ())
+        .map(NotificationDeliveryWriteResult::from_updated_rows)
         .map_err(NotificationDeliveryError::DatabaseError)
     }
 
     pub fn mark_cancelled(
         conn: &mut PgConnection,
         lookup_id: i64,
+        expected_lease_owner: &str,
         last_error: Option<&str>,
-    ) -> Result<(), NotificationDeliveryError> {
+    ) -> Result<NotificationDeliveryWriteResult, NotificationDeliveryError> {
         diesel::update(
-            notification_deliveries::table.filter(notification_deliveries::id.eq(lookup_id)),
+            notification_deliveries::table
+                .filter(notification_deliveries::id.eq(lookup_id))
+                .filter(notification_deliveries::status.eq("leased"))
+                .filter(
+                    notification_deliveries::lease_owner.eq(Some(expected_lease_owner.to_string())),
+                ),
         )
         .set((
             notification_deliveries::status.eq(NOTIFICATION_DELIVERY_STATUS_CANCELLED),
@@ -206,7 +254,7 @@ impl NotificationDelivery {
             notification_deliveries::updated_at.eq(diesel::dsl::now),
         ))
         .execute(conn)
-        .map(|_| ())
+        .map(NotificationDeliveryWriteResult::from_updated_rows)
         .map_err(NotificationDeliveryError::DatabaseError)
     }
 }

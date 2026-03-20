@@ -203,6 +203,7 @@ pub enum PushSendOutcome {
 #[derive(Clone)]
 pub(crate) struct PushTransport {
     pub client: reqwest::Client,
+    pub apns_client: reqwest::Client,
     pub apns_tokens: Arc<RwLock<HashMap<String, CachedApnsToken>>>,
     pub fcm_tokens: Arc<RwLock<HashMap<String, CachedFcmToken>>>,
 }
@@ -212,9 +213,14 @@ impl PushTransport {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(20))
             .build()?;
+        let apns_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .http2_prior_knowledge()
+            .build()?;
 
         Ok(Self {
             client,
+            apns_client,
             apns_tokens: Arc::new(RwLock::new(HashMap::new())),
             fcm_tokens: Arc::new(RwLock::new(HashMap::new())),
         })

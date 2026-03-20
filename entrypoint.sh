@@ -634,6 +634,28 @@ else
     log "Apple OAuth connection failed"
 fi
 
+# Test the connections to push providers
+log "Testing connection to APNs production:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.21/443'; then
+    log "APNs production connection successful"
+else
+    log "APNs production connection failed"
+fi
+
+log "Testing connection to APNs sandbox:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.22/443'; then
+    log "APNs sandbox connection successful"
+else
+    log "APNs sandbox connection failed"
+fi
+
+log "Testing connection to FCM:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.34/443'; then
+    log "FCM connection successful"
+else
+    log "FCM connection failed"
+fi
+
 # Test the connections to Tinfoil proxy services
 log "Testing connection to Tinfoil API GitHub proxy:"
 if timeout 5 bash -c '</dev/tcp/127.0.0.16/443'; then

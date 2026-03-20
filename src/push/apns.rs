@@ -56,7 +56,7 @@ pub async fn send_apns_notification(
     };
 
     let mut http_request = transport
-        .client
+        .apns_client
         .post(endpoint)
         .bearer_auth(auth_token)
         .header("apns-topic", request.ios_settings.bundle_id.as_str())

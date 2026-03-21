@@ -3,7 +3,7 @@
 ## Backend, Enclave, and Mobile Design Reference
 
 **Date:** March 2026
-**Status:** Backend v1 is implemented for the Sage agent disconnect flow; broader event sources, mobile-client integrations, and some hardening remain open
+**Status:** Backend v1 is implemented for the Sage agent disconnect flow; Maple iOS encrypted preview and Android release delivery are implemented, macOS delivery works with generic fallback while encrypted-preview parity remains follow-up work, and broader event sources plus some client hardening remain open
 **Related Docs:**
 - `sage-in-maple-architecture.md`
 - `architecture-for-rag-integration.md`
@@ -43,6 +43,13 @@ The currently shipped backend scope is narrower than the full product design des
 - the implemented event source in this repo is currently the Sage agent SSE disconnect path in `src/web/agent/mod.rs`
 - reminder / task-complete / account-alert sources remain follow-up work
 - iOS NSE behavior, Android client behavior, recent-ID caches, and thread cleanup live in mobile codebases rather than this backend repo
+
+### 1.2 Current Maple client status
+
+- **iOS release / TestFlight**: APNs registration, shared-keychain private-key access, notification toggle / revoke handling, and Notification Service Extension decryption are implemented.
+- **macOS release / TestFlight**: APNs registration and delivery are implemented with a macOS notification service target, but the currently observed user-facing behavior still falls back to the generic notification text, so encrypted-preview parity remains follow-up work.
+- **Android release**: FCM HTTP v1 registration / revoke flows, permission handling, token rotation, foreground refresh behavior, and generic visible notifications are implemented for the real release package `ai.trymaple.assistant`.
+- **Android debug (`.dev`)**: not the intended end-to-end push validation lane.
 
 ---
 
@@ -1022,9 +1029,9 @@ Persist:
 
 1. request notification permission
 2. receive APNs device token
-3. generate `P256.KeyAgreement.PrivateKey()` locally
-4. store private key in keychain / Secure Enclave-backed flow when available
-5. expose the public key in DER / SPKI form
+3. generate a dedicated P-256 notification keypair locally
+4. store the private key in shared keychain storage so both the app and Notification Service Extension can read it
+5. derive the public key in DER / SPKI form from that stored private key
 6. register with `POST /v1/push/devices`
 
 #### Storage requirements
@@ -1052,6 +1059,12 @@ The Notification Service Extension should:
 
 If the key is unavailable or decryption fails, do nothing and let iOS show the generic fallback alert.
 
+Current Maple status:
+
+- implemented in the release / TestFlight lane
+- shared key access is already wired for the main app and NSE targets
+- notification toggle / logout cleanup is implemented
+
 #### Foreground / open-thread behavior
 
 If the app is already foregrounded and showing the target Sage conversation or active response screen:
@@ -1068,16 +1081,22 @@ The NSE should not be treated as the primary “suppress if user is already look
 
 1. request notification permission on Android 13+
 2. obtain FCM registration token
-3. generate an EC keypair in Android Keystore
-4. export the public key as SPKI bytes
+3. generate a dedicated P-256 notification keypair locally
+4. export / derive the public key as SPKI bytes
 5. register with `POST /v1/push/devices`
+
+Current Maple status:
+
+- the current Android client uses Rust helper functions to generate the keypair and stores the PKCS#8 private key in `EncryptedSharedPreferences`
+- moving that private key into Android Keystore remains future hardening, but it does not change the backend contract
+- end-to-end push validation is currently intended for the release package `ai.trymaple.assistant`
 
 #### Runtime behavior
 
 - use `FirebaseMessagingService.onNewToken()` to rotate tokens
 - for v1, assume the default incoming path is a standard visible FCM notification plus `data`
-- if the app is already foregrounded and showing the target Sage conversation, update UI and do not show an extra local notification
-- when the user opens a conversation, clear notifications associated with that `thread_id`
+- if the app is already foregrounded, refresh the in-app chat state and do not show an extra local notification
+- current notification taps route back into the main Maple chat surface and trigger a refresh; thread-specific notification clearing remains follow-up work
 - if we later enable Android data-only encrypted preview, handle it in `onMessageReceived()` and only post a local notification after successful decrypt
 - use `WorkManager` for longer processing if needed
 
@@ -1102,6 +1121,8 @@ Rule:
 
 This is the client-side protection against at-least-once retries or server bugs.
 
+Current Maple status: this cache is still recommended but is not yet implemented in the mobile clients, so provider collapse keys and server-side SSE suppression remain the main duplicate controls for the current v1 scope.
+
 #### Thread grouping and cleanup
 
 Each payload should include a `thread_id` when applicable.
@@ -1111,6 +1132,8 @@ Use it to:
 - group notifications in app UI if desired
 - clear thread notifications when the user opens that thread
 - avoid leaving stale notifications around once the user has seen the conversation
+
+Current Maple status: thread-specific cleanup is not yet implemented consistently across Maple clients. That is follow-up hardening work rather than a blocker for the current disconnect-triggered v1 scope.
 
 #### Foreground suppression is defense-in-depth
 
@@ -1360,7 +1383,9 @@ These items are the main remaining hardening work after the current push handoff
 - decide whether future callers need explicit internal enqueue control over `collapse_key`, TTL, or similar delivery-policy knobs
 - document any chosen defaults centrally so backend and client expectations stay aligned
 
-### 22.5 Scope expansion and client alignment
+### 22.5 Client parity and scope expansion
 
+- finish macOS encrypted-preview parity so the macOS notification service extension rewrites the generic fallback text like iOS
+- add client-side `notification_id` dedup caches and thread cleanup where they materially improve UX
 - extend backend event sources beyond the current `agent.message` Sage disconnect path when product priorities require it
-- keep the mobile-client behavior docs aligned with what is actually implemented in the iOS / Android repos
+- keep the mobile-client behavior docs aligned with what is actually implemented in the Maple repos

@@ -48,6 +48,12 @@ struct AgentChatRequest {
     input: MessageContent,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+struct InitMainAgentRequest {
+    timezone: Option<String>,
+    locale: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct CreateSubagentRequest {
     display_name: Option<String>,
@@ -76,6 +82,13 @@ struct MainAgentResponse {
     display_name: &'static str,
     created_at: i64,
     updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct InitMainAgentResponse {
+    #[serde(flatten)]
+    agent: MainAgentResponse,
+    messages: Vec<ConversationItem>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -236,6 +249,25 @@ fn build_main_agent_response(ctx: &AgentConversationContext) -> MainAgentRespons
     }
 }
 
+fn build_init_main_agent_response(
+    ctx: &AgentConversationContext,
+    onboarding_messages: Vec<runtime::SeededOnboardingMessage>,
+) -> InitMainAgentResponse {
+    InitMainAgentResponse {
+        agent: build_main_agent_response(ctx),
+        messages: onboarding_messages
+            .into_iter()
+            .map(|message| ConversationItem::Message {
+                id: message.id,
+                status: Some("completed".to_string()),
+                role: "assistant".to_string(),
+                content: MessageContentConverter::assistant_text_to_content(message.content),
+                created_at: Some(message.created_at),
+            })
+            .collect(),
+    }
+}
+
 fn build_subagent_response(
     agent: &Agent,
     conversation: &Conversation,
@@ -293,7 +325,7 @@ async fn load_main_agent_context(
         .map_err(|_| ApiError::InternalServerError)?;
 
     let (agent, conversation) =
-        runtime::ensure_main_agent(state, &mut conn, &user_key, user.uuid).await?;
+        runtime::load_main_agent(&mut conn, user.uuid)?.ok_or(ApiError::NotFound)?;
 
     Ok(AgentConversationContext {
         agent,
@@ -439,6 +471,13 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
                 .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
         )
         .route(
+            "/v1/agent/init",
+            post(init_main_agent).layer(from_fn_with_state(
+                app_state.clone(),
+                decrypt_request::<InitMainAgentRequest>,
+            )),
+        )
+        .route(
             "/v1/agent/items",
             get(list_main_agent_items)
                 .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
@@ -502,6 +541,47 @@ async fn get_main_agent(
 ) -> Result<Json<EncryptedResponse<MainAgentResponse>>, ApiError> {
     let ctx = load_main_agent_context(&state, &user).await?;
     let response = build_main_agent_response(&ctx);
+
+    encrypt_response(&state, &session_id, &response).await
+}
+
+async fn init_main_agent(
+    State(state): State<Arc<AppState>>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+    Extension(body): Extension<InitMainAgentRequest>,
+) -> Result<Json<EncryptedResponse<InitMainAgentResponse>>, ApiError> {
+    let user_key = state
+        .get_user_key(user.uuid, None, None)
+        .await
+        .map_err(|_| error_mapping::map_key_retrieval_error())?;
+
+    let mut conn = state
+        .db
+        .get_pool()
+        .get()
+        .map_err(|_| ApiError::InternalServerError)?;
+
+    let init_result = runtime::init_main_agent(
+        &state,
+        &mut conn,
+        &user_key,
+        user.uuid,
+        &runtime::MainAgentInitOptions {
+            timezone: body.timezone,
+            locale: body.locale,
+        },
+    )
+    .await?;
+
+    let response = build_init_main_agent_response(
+        &AgentConversationContext {
+            agent: init_result.agent,
+            conversation: init_result.conversation,
+            user_key,
+        },
+        init_result.onboarding_messages,
+    );
 
     encrypt_response(&state, &session_id, &response).await
 }
@@ -684,6 +764,16 @@ async fn chat_main(
     Extension(user): Extension<User>,
     Extension(body): Extension<AgentChatRequest>,
 ) -> Result<Response, ApiError> {
+    let mut conn = state
+        .db
+        .get_pool()
+        .get()
+        .map_err(|_| ApiError::InternalServerError)?;
+
+    if runtime::load_main_agent(&mut conn, user.uuid)?.is_none() {
+        return Err(ApiError::NotFound);
+    }
+
     chat_with_target(state, session_id, user, body, ChatTarget::Main).await
 }
 
@@ -834,10 +924,15 @@ async fn run_agent_chat_task(
         Ok(runtime) => runtime,
         Err(e) => {
             error!("Agent runtime initialization error: {e:?}");
+            let error_message = if matches!(e, ApiError::NotFound) {
+                "Main agent is not initialized.".to_string()
+            } else {
+                "Failed to initialize agent runtime.".to_string()
+            };
             let _ = send_agent_client_event(
                 &tx,
                 AgentClientEvent::Error(AgentErrorEvent {
-                    error: "Failed to initialize agent runtime.".to_string(),
+                    error: error_message,
                 }),
                 client_connected,
             )
@@ -1055,7 +1150,7 @@ async fn create_subagent(
         .map_err(|_| ApiError::InternalServerError)?;
 
     let (main_agent, _) =
-        runtime::ensure_main_agent(&state, &mut conn, &user_key, user.uuid).await?;
+        runtime::load_main_agent(&mut conn, user.uuid)?.ok_or(ApiError::NotFound)?;
     let (agent, conversation, display_name) = runtime::create_subagent(
         &mut conn,
         &user_key,

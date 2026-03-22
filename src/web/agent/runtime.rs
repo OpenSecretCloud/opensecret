@@ -1,3 +1,4 @@
+use chrono_tz::Tz;
 use secp256k1::SecretKey;
 use serde_json::json;
 use std::sync::Arc;
@@ -12,14 +13,20 @@ use crate::models::agents::{
 };
 use crate::models::conversation_summaries::{ConversationSummary, NewConversationSummary};
 use crate::models::memory_blocks::{
-    MemoryBlock, NewMemoryBlock, MEMORY_BLOCK_LABEL_HUMAN, MEMORY_BLOCK_LABEL_PERSONA,
+    MemoryBlock, MEMORY_BLOCK_LABEL_HUMAN, MEMORY_BLOCK_LABEL_PERSONA,
 };
 use crate::models::responses::{
     AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewToolCall,
     NewToolOutput, NewUserMessage, RawThreadMessage, RawThreadMessageMetadata, ToolCall,
     ToolOutput, UserMessage,
 };
-use crate::models::schema::{agents, memory_blocks, user_embeddings};
+use crate::models::schema::{
+    agents, assistant_messages, memory_blocks, user_embeddings, user_messages,
+};
+use crate::models::user_preferences::{
+    NewUserPreference, UserPreference, UserPreferenceError, USER_PREFERENCE_LOCALE,
+    USER_PREFERENCE_TIMEZONE,
+};
 use crate::rag::{
     insert_message_embedding, serialize_f32_le, SOURCE_TYPE_ARCHIVAL, SOURCE_TYPE_MESSAGE,
 };
@@ -40,17 +47,24 @@ use super::tools::{
 };
 use super::vision;
 
-const DEFAULT_PERSONA_VALUE: &str = "I am Maple, a helpful AI companion. I maintain long-term memory across our conversations and strive to be friendly, concise, and genuinely helpful.";
+pub(crate) const DEFAULT_PERSONA_VALUE: &str = "I am Maple, a helpful AI companion. I maintain long-term memory across our conversations and strive to be friendly, concise, and genuinely helpful.";
 pub const DEFAULT_MODEL: &str = "kimi-k2-5";
 pub const DEFAULT_CONTEXT_WINDOW: i32 = 256_000;
 pub const DEFAULT_COMPACTION_THRESHOLD: f32 = 0.80;
 const MIN_MESSAGES_IN_CONTEXT: usize = 20;
 const MAIN_AGENT_METADATA_TYPE: &str = "agent_main";
 const SUBAGENT_METADATA_TYPE: &str = "subagent";
+const MAIN_AGENT_ONBOARDING_TURN_LIMIT: i64 = 15;
+const MAIN_AGENT_ONBOARDING_MESSAGES: [&str; 3] = [
+    "Hey, I'm Maple. 👋",
+    "Nice to meet you.",
+    "What should I call you?",
+];
 
 #[derive(Clone, Debug, Default)]
 struct AgentContext {
     current_time: String,
+    user_locale: String,
     agent_kind: String,
     subagent_purpose: String,
     persona_block: String,
@@ -58,7 +72,28 @@ struct AgentContext {
     memory_metadata: String,
     previous_context_summary: String,
     recent_conversation: String,
+    main_agent_user_message_count: i64,
     is_first_time_user: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MainAgentInitOptions {
+    pub timezone: Option<String>,
+    pub locale: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SeededOnboardingMessage {
+    pub id: Uuid,
+    pub content: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MainAgentInitResult {
+    pub agent: Agent,
+    pub conversation: Conversation,
+    pub onboarding_messages: Vec<SeededOnboardingMessage>,
 }
 
 #[derive(Clone, Debug)]
@@ -163,12 +198,229 @@ async fn subagent_metadata_enc(
     .await
 }
 
-pub(crate) async fn ensure_main_agent(
-    state: &Arc<AppState>,
+fn normalize_optional_preference(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn validate_optional_preference(
+    key: &str,
+    value: Option<&str>,
+) -> Result<Option<String>, ApiError> {
+    let Some(value) = normalize_optional_preference(value) else {
+        return Ok(None);
+    };
+
+    UserPreference::validate(key, &value).map_err(|e| match e {
+        UserPreferenceError::InvalidPreference(_) => ApiError::BadRequest,
+        UserPreferenceError::DatabaseError(_) => ApiError::InternalServerError,
+    })?;
+
+    Ok(Some(value))
+}
+
+fn onboarding_message_texts() -> &'static [&'static str; 3] {
+    &MAIN_AGENT_ONBOARDING_MESSAGES
+}
+
+fn load_user_preference(
     conn: &mut diesel::PgConnection,
     user_key: &SecretKey,
     user_id: Uuid,
-) -> Result<(Agent, Conversation), ApiError> {
+    key: &str,
+) -> Result<Option<String>, ApiError> {
+    let preference = UserPreference::get_by_user_and_key(conn, user_id, key).map_err(|e| {
+        error!("Failed to load user preference '{key}': {e:?}");
+        ApiError::InternalServerError
+    })?;
+
+    decrypt_string(
+        user_key,
+        preference.as_ref().map(|preference| &preference.value_enc),
+    )
+    .map_err(|e| {
+        error!("Failed to decrypt user preference '{key}': {e:?}");
+        ApiError::InternalServerError
+    })
+}
+
+fn load_user_timezone(
+    conn: &mut diesel::PgConnection,
+    user_key: &SecretKey,
+    user_id: Uuid,
+) -> Result<Option<Tz>, ApiError> {
+    let Some(timezone) = load_user_preference(conn, user_key, user_id, USER_PREFERENCE_TIMEZONE)?
+    else {
+        return Ok(None);
+    };
+
+    match timezone.parse::<Tz>() {
+        Ok(timezone) => Ok(Some(timezone)),
+        Err(_) => {
+            warn!("Ignoring invalid stored timezone '{timezone}' for user {user_id}");
+            Ok(None)
+        }
+    }
+}
+
+fn format_current_time(now: chrono::DateTime<chrono::Utc>, timezone: Option<&Tz>) -> String {
+    if let Some(timezone) = timezone {
+        let local_time = now.with_timezone(timezone);
+        format!(
+            "{} ({})",
+            local_time.format("%m/%d/%Y %H:%M:%S (%A)"),
+            timezone.name()
+        )
+    } else {
+        format!("{} UTC", now.format("%m/%d/%Y %H:%M:%S (%A)"))
+    }
+}
+
+fn format_message_timestamp(
+    created_at: chrono::DateTime<chrono::Utc>,
+    timezone: Option<&Tz>,
+) -> String {
+    if let Some(timezone) = timezone {
+        let local_time = created_at.with_timezone(timezone);
+        format!(
+            "{} ({})",
+            local_time.format("%m/%d/%Y %H:%M:%S"),
+            timezone.name()
+        )
+    } else {
+        format!("{} UTC", created_at.format("%m/%d/%Y %H:%M:%S"))
+    }
+}
+
+async fn upsert_user_preference(
+    conn: &mut diesel::PgConnection,
+    user_key: &SecretKey,
+    user_id: Uuid,
+    key: &str,
+    value: Option<String>,
+) -> Result<(), ApiError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+
+    let value_enc = encrypt_with_key(user_key, value.as_bytes()).await;
+    NewUserPreference::new(user_id, key, value_enc)
+        .insert_or_update(conn)
+        .map_err(|e| {
+            error!("Failed to upsert user preference '{key}': {e:?}");
+            ApiError::InternalServerError
+        })?;
+
+    Ok(())
+}
+
+async fn seed_main_agent_onboarding_messages(
+    conn: &mut diesel::PgConnection,
+    user_key: &SecretKey,
+    user_id: Uuid,
+    conversation_id: i64,
+) -> Result<Vec<SeededOnboardingMessage>, ApiError> {
+    let user_message_count: i64 = user_messages::table
+        .filter(user_messages::conversation_id.eq(conversation_id))
+        .count()
+        .get_result(conn)
+        .map_err(|e| {
+            error!("Failed to count user messages for onboarding seed: {e:?}");
+            ApiError::InternalServerError
+        })?;
+
+    let assistant_message_count: i64 = assistant_messages::table
+        .filter(assistant_messages::conversation_id.eq(conversation_id))
+        .count()
+        .get_result(conn)
+        .map_err(|e| {
+            error!("Failed to count assistant messages for onboarding seed: {e:?}");
+            ApiError::InternalServerError
+        })?;
+
+    if user_message_count > 0 || assistant_message_count > 0 {
+        return Ok(vec![]);
+    }
+
+    let mut seeded_messages = Vec::with_capacity(onboarding_message_texts().len());
+
+    for message in onboarding_message_texts() {
+        let content_enc = Some(encrypt_with_key(user_key, message.as_bytes()).await);
+        let completion_tokens = count_tokens(message) as i32;
+
+        let inserted = NewAssistantMessage {
+            uuid: Uuid::new_v4(),
+            conversation_id,
+            response_id: None,
+            user_id,
+            content_enc,
+            completion_tokens,
+            status: "completed".to_string(),
+            finish_reason: None,
+        }
+        .insert(conn)
+        .map_err(|e| {
+            error!("Failed to seed main agent onboarding message: {e:?}");
+            ApiError::InternalServerError
+        })?;
+
+        seeded_messages.push(SeededOnboardingMessage {
+            id: inserted.uuid,
+            content: message.to_string(),
+            created_at: inserted.created_at.timestamp(),
+        });
+    }
+
+    Ok(seeded_messages)
+}
+
+pub(crate) fn load_main_agent(
+    conn: &mut diesel::PgConnection,
+    user_id: Uuid,
+) -> Result<Option<(Agent, Conversation)>, ApiError> {
+    let Some(agent) = Agent::get_main_for_user(conn, user_id).map_err(|e| {
+        error!("Failed to load main agent: {e:?}");
+        ApiError::InternalServerError
+    })?
+    else {
+        return Ok(None);
+    };
+
+    let conversation = match Conversation::get_by_id_and_user(conn, agent.conversation_id, user_id)
+    {
+        Ok(conversation) => conversation,
+        Err(crate::models::responses::ResponsesError::ConversationNotFound) => {
+            warn!(
+                "Main agent {} for user {} points to missing conversation {}; treating as uninitialized",
+                agent.uuid,
+                user_id,
+                agent.conversation_id,
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            error!("Failed to load main agent conversation: {e:?}");
+            return Err(ApiError::InternalServerError);
+        }
+    };
+
+    Ok(Some((agent, conversation)))
+}
+
+pub(crate) async fn init_main_agent(
+    _state: &Arc<AppState>,
+    conn: &mut diesel::PgConnection,
+    user_key: &SecretKey,
+    user_id: Uuid,
+    init_options: &MainAgentInitOptions,
+) -> Result<MainAgentInitResult, ApiError> {
+    let timezone =
+        validate_optional_preference(USER_PREFERENCE_TIMEZONE, init_options.timezone.as_deref())?;
+    let locale =
+        validate_optional_preference(USER_PREFERENCE_LOCALE, init_options.locale.as_deref())?;
+
     let existing = Agent::get_main_for_user(conn, user_id).map_err(|e| {
         error!("Failed to load main agent: {e:?}");
         ApiError::InternalServerError
@@ -231,9 +483,16 @@ pub(crate) async fn ensure_main_agent(
         (agent, conversation)
     };
 
-    AgentRuntime::ensure_default_blocks(state, conn, user_key, user_id).await?;
+    upsert_user_preference(conn, user_key, user_id, USER_PREFERENCE_TIMEZONE, timezone).await?;
+    upsert_user_preference(conn, user_key, user_id, USER_PREFERENCE_LOCALE, locale).await?;
+    let onboarding_messages =
+        seed_main_agent_onboarding_messages(conn, user_key, user_id, conversation.id).await?;
 
-    Ok((agent, conversation))
+    Ok(MainAgentInitResult {
+        agent,
+        conversation,
+        onboarding_messages,
+    })
 }
 
 pub(crate) async fn create_subagent(
@@ -308,7 +567,7 @@ impl AgentRuntime {
             .map_err(|_| ApiError::InternalServerError)?;
 
         let (agent, conversation) =
-            ensure_main_agent(&state, &mut conn, &user_key, user.uuid).await?;
+            load_main_agent(&mut conn, user.uuid)?.ok_or(ApiError::NotFound)?;
 
         Self::from_loaded(state, user, user_key, agent, conversation).await
     }
@@ -327,8 +586,6 @@ impl AgentRuntime {
             .get_pool()
             .get()
             .map_err(|_| ApiError::InternalServerError)?;
-
-        let _ = ensure_main_agent(&state, &mut conn, &user_key, user.uuid).await?;
 
         let agent = Agent::get_by_uuid_and_user(&mut conn, agent_uuid, user.uuid)
             .map_err(|e| {
@@ -441,55 +698,6 @@ impl AgentRuntime {
         })
     }
 
-    pub(crate) async fn ensure_default_blocks(
-        _state: &Arc<AppState>,
-        conn: &mut diesel::PgConnection,
-        user_key: &SecretKey,
-        user_id: Uuid,
-    ) -> Result<(), ApiError> {
-        let persona = MemoryBlock::get_by_user_and_label(conn, user_id, MEMORY_BLOCK_LABEL_PERSONA)
-            .map_err(|e| {
-                error!("Failed to load persona block: {e:?}");
-                ApiError::InternalServerError
-            })?;
-
-        if persona.is_none() {
-            let value_enc = encrypt_with_key(user_key, DEFAULT_PERSONA_VALUE.as_bytes()).await;
-            let block = NewMemoryBlock {
-                uuid: Uuid::new_v4(),
-                user_id,
-                label: MEMORY_BLOCK_LABEL_PERSONA.to_string(),
-                value_enc,
-            };
-            block.insert_or_update(conn).map_err(|e| {
-                error!("Failed to create persona block: {e:?}");
-                ApiError::InternalServerError
-            })?;
-        }
-
-        let human = MemoryBlock::get_by_user_and_label(conn, user_id, MEMORY_BLOCK_LABEL_HUMAN)
-            .map_err(|e| {
-                error!("Failed to load human block: {e:?}");
-                ApiError::InternalServerError
-            })?;
-
-        if human.is_none() {
-            let value_enc = encrypt_with_key(user_key, "".as_bytes()).await;
-            let block = NewMemoryBlock {
-                uuid: Uuid::new_v4(),
-                user_id,
-                label: MEMORY_BLOCK_LABEL_HUMAN.to_string(),
-                value_enc,
-            };
-            block.insert_or_update(conn).map_err(|e| {
-                error!("Failed to create human block: {e:?}");
-                ApiError::InternalServerError
-            })?;
-        }
-
-        Ok(())
-    }
-
     pub fn clear_tool_results(&mut self) {
         self.current_tool_results.clear();
         self.previous_step_summary = None;
@@ -497,6 +705,35 @@ impl AgentRuntime {
 
     pub fn max_steps(&self) -> usize {
         self.max_steps
+    }
+
+    fn build_step_system_prompt(&self, ctx: &AgentContext) -> String {
+        let mut prompt = self.system_prompt.clone();
+
+        if self.agent.kind == AGENT_KIND_MAIN
+            && ctx.main_agent_user_message_count > 0
+            && ctx.main_agent_user_message_count <= MAIN_AGENT_ONBOARDING_TURN_LIMIT
+        {
+            prompt.push_str(&format!(
+                "\n\nMAIN AGENT ONBOARDING WINDOW:\nThis is still early in your relationship with the user (main-agent user message {} of {}). Be especially warm, welcoming, and natural. Focus on getting to know them gradually rather than interrogating them. Ask at most one thoughtful follow-up at a time. At a natural point early on, briefly explain who Maple is, what this app is good for, and what the user can expect from chatting here. Do that conversationally, not as a canned pitch, and do not force it into the second or third message if the moment is awkward. Prioritize learning their name, important relationships, routines, goals, preferences, and current life context when it feels natural. Save useful facts to memory proactively. Avoid transactional, overly clinical, or assistant-like phrasing. Make Maple feel like a welcoming, steady presence, not a service desk.",
+                ctx.main_agent_user_message_count,
+                MAIN_AGENT_ONBOARDING_TURN_LIMIT,
+            ));
+
+            if ctx.human_block.trim().is_empty() {
+                prompt.push_str(
+                    "\nIf you still do not know the user's name, ask what they would like to be called and store it as soon as they answer.",
+                );
+            }
+        }
+
+        if !ctx.user_locale.trim().is_empty() {
+            prompt.push_str("\n\nUSER LOCALE HINT:\nThe user's preferred locale is '");
+            prompt.push_str(ctx.user_locale.trim());
+            prompt.push_str("'. If it is natural and the user has not indicated otherwise, prefer replying in that locale/language.");
+        }
+
+        prompt
     }
 
     /// Prepare the runtime for a new message: validate, persist user message, compact if needed.
@@ -710,6 +947,8 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             }
         };
 
+        let system_prompt = self.build_step_system_prompt(&ctx);
+
         let input = AgentResponseInput {
             input: input_content.clone(),
             current_time: ctx.current_time,
@@ -726,7 +965,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
 
         let response = call_agent_response_with_retry_and_correction(
             &self.lm,
-            &self.system_prompt,
+            &system_prompt,
             &input,
             &input_content,
             &self.available_tools,
@@ -821,12 +1060,11 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
     }
 
     async fn build_context(&self) -> Result<AgentContext, ApiError> {
-        let mut ctx = AgentContext::default();
-
-        let now = chrono::Utc::now();
-        ctx.current_time = format!("{} UTC", now.format("%m/%d/%Y %H:%M:%S (%A)"));
-        ctx.agent_kind = self.agent.kind.clone();
-        ctx.subagent_purpose = self.subagent_purpose.clone();
+        let mut ctx = AgentContext {
+            agent_kind: self.agent.kind.clone(),
+            subagent_purpose: self.subagent_purpose.clone(),
+            ..AgentContext::default()
+        };
 
         let mut conn = self
             .state
@@ -834,6 +1072,18 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             .get_pool()
             .get()
             .map_err(|_| ApiError::InternalServerError)?;
+
+        let user_timezone = load_user_timezone(&mut conn, &self.user_key, self.user.uuid)?;
+        ctx.user_locale = load_user_preference(
+            &mut conn,
+            &self.user_key,
+            self.user.uuid,
+            USER_PREFERENCE_LOCALE,
+        )?
+        .unwrap_or_default();
+
+        let now = chrono::Utc::now();
+        ctx.current_time = format_current_time(now, user_timezone.as_ref());
 
         let persona = MemoryBlock::get_by_user_and_label(
             &mut conn,
@@ -847,7 +1097,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
 
         ctx.persona_block = decrypt_string(&self.user_key, persona.as_ref().map(|b| &b.value_enc))
             .map_err(|_| ApiError::InternalServerError)?
-            .unwrap_or_default();
+            .unwrap_or_else(|| DEFAULT_PERSONA_VALUE.to_string());
         ctx.human_block = decrypt_string(&self.user_key, human.as_ref().map(|b| &b.value_enc))
             .map_err(|_| ApiError::InternalServerError)?
             .unwrap_or_default();
@@ -904,6 +1154,21 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
                 .unwrap_or_default();
         }
 
+        if self.agent.kind == AGENT_KIND_MAIN {
+            ctx.main_agent_user_message_count = user_messages::table
+                .filter(user_messages::conversation_id.eq(self.conversation.id))
+                .count()
+                .get_result(&mut conn)
+                .map_err(|e| {
+                    error!("Failed to count main agent user messages: {e:?}");
+                    ApiError::InternalServerError
+                })?;
+
+            if ctx.main_agent_user_message_count <= 1 && ctx.human_block.trim().is_empty() {
+                ctx.is_first_time_user = true;
+            }
+        }
+
         let mut messages = RawThreadMessage::get_conversation_context(
             &mut conn,
             self.conversation.id,
@@ -935,12 +1200,6 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             }
         }
 
-        // First-time user heuristic for brand-new conversations.
-        let has_summary = summary.is_some();
-        if messages.len() <= 1 && !has_summary {
-            ctx.is_first_time_user = true;
-        }
-
         // Render conversation history
         let mut conversation = String::new();
         for msg in &messages {
@@ -955,7 +1214,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
                 other => other,
             };
 
-            let timestamp = format!("{} UTC", msg.created_at.format("%m/%d/%Y %H:%M:%S"));
+            let timestamp = format_message_timestamp(msg.created_at, user_timezone.as_ref());
             let content = self.render_raw_message(msg)?;
             conversation.push_str(&format!("[{} @ {}]: {}\n", role, timestamp, content));
         }

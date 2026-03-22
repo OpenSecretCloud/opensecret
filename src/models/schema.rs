@@ -492,6 +492,17 @@ diesel::table! {
 }
 
 diesel::table! {
+    user_preferences (id) {
+        id -> Int8,
+        user_id -> Uuid,
+        key -> Text,
+        value_enc -> Bytea,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     users (id) {
         id -> Int4,
         uuid -> Uuid,
@@ -569,5 +580,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     user_kv,
     user_messages,
     user_oauth_connections,
+    user_preferences,
     users,
 );

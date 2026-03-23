@@ -31,7 +31,7 @@ use crate::models::users::User;
 use crate::push::{enqueue_agent_message_notification, AgentPushTarget};
 use crate::web::openai::{get_chat_completion_response, BillingContext, CompletionChunk};
 use crate::web::openai_auth::AuthMethod;
-use crate::{ApiError, AppState};
+use crate::AppState;
 
 use super::runtime;
 use super::tools::{Tool, ToolResult};
@@ -96,7 +96,7 @@ pub(crate) fn refresh_follow_user_schedules_for_user(
     user_id: Uuid,
     timezone_name: &str,
 ) -> Result<(), AgentScheduleError> {
-    let timezone = parse_timezone_or_utc(timezone_name);
+    let timezone = parse_timezone(timezone_name)?;
     let schedules = AgentSchedule::list_active_follow_user_for_user(conn, user_id)?;
 
     if !schedules.is_empty() {
@@ -263,12 +263,22 @@ impl Tool for ScheduleTaskTool {
         {
             Ok(timezone) => timezone,
             Err(e) => {
-                error!("schedule_task failed to resolve timezone: {e:?}");
-                return ToolResult::error("Failed to resolve timezone for schedule");
+                warn!(
+                    "schedule_task could not resolve timezone for user {} agent {} (timezone_mode={}, fixed_timezone={:?}): {}",
+                    self.user.uuid,
+                    self.agent.uuid,
+                    timezone_mode,
+                    fixed_timezone,
+                    e,
+                );
+                return ToolResult::error(e);
             }
         };
 
-        let tz = parse_timezone_or_utc(&resolved_timezone);
+        let tz = match parse_timezone(&resolved_timezone) {
+            Ok(timezone) => timezone,
+            Err(e) => return ToolResult::error(e.to_string()),
+        };
         let now = Utc::now();
         let next_scheduled_for = match compute_initial_next_due(&spec, tz, now) {
             Ok(next) => next,
@@ -276,7 +286,25 @@ impl Tool for ScheduleTaskTool {
         };
 
         if next_scheduled_for <= now {
-            return ToolResult::error("Scheduled time must be in the future");
+            let requested_local = next_scheduled_for.with_timezone(&tz);
+            let now_local = now.with_timezone(&tz);
+
+            warn!(
+                "schedule_task rejected past time for user {} agent {} (timezone={}, requested_local={}, now_local={}, schedule_kind={})",
+                self.user.uuid,
+                self.agent.uuid,
+                resolved_timezone,
+                requested_local.format("%Y-%m-%d %H:%M:%S"),
+                now_local.format("%Y-%m-%d %H:%M:%S"),
+                schedule_kind,
+            );
+
+            return ToolResult::error(format!(
+                "Scheduled time must be in the future in {}. Requested {}, but current time there is {}. Check local_date/local_time and timezone settings.",
+                resolved_timezone,
+                requested_local.format("%Y-%m-%d %H:%M:%S"),
+                now_local.format("%Y-%m-%d %H:%M:%S"),
+            ));
         }
 
         let description = args
@@ -1423,22 +1451,33 @@ async fn resolve_initial_timezone_name(
     user_key: &SecretKey,
     timezone_mode: &str,
     fixed_timezone: Option<&str>,
-) -> Result<String, ApiError> {
+) -> Result<String, String> {
     if timezone_mode == SCHEDULE_TIMEZONE_MODE_FIXED {
-        return Ok(parse_timezone_or_utc(fixed_timezone.unwrap_or("UTC"))
-            .name()
-            .to_string());
+        let fixed_timezone = fixed_timezone
+            .ok_or_else(|| "'fixed_timezone' is required when timezone_mode='fixed'".to_string())?;
+
+        return parse_timezone(fixed_timezone)
+            .map(|timezone| timezone.name().to_string())
+            .map_err(|e| e.to_string());
     }
 
     let mut conn = state
         .db
         .get_pool()
         .get()
-        .map_err(|_| ApiError::InternalServerError)?;
+        .map_err(|_| "Database connection error".to_string())?;
 
     load_user_timezone_name(&mut conn, user_key, user.uuid)
-        .map(|timezone| timezone.unwrap_or_else(|| "UTC".to_string()))
-        .map_err(|_| ApiError::InternalServerError)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| {
+            "follow_user schedules require the user to have a saved timezone preference; set the timezone first or use timezone_mode='fixed' with fixed_timezone"
+                .to_string()
+        })
+        .and_then(|timezone_name| {
+            parse_timezone(&timezone_name)
+                .map(|timezone| timezone.name().to_string())
+                .map_err(|e| e.to_string())
+        })
 }
 
 fn load_user_timezone_name(
@@ -1642,6 +1681,17 @@ fn parse_timezone_or_utc(value: &str) -> Tz {
     value.parse::<Tz>().unwrap_or(chrono_tz::UTC)
 }
 
+fn parse_timezone(value: &str) -> Result<Tz, AgentScheduleError> {
+    let trimmed = value.trim();
+
+    trimmed.parse::<Tz>().map_err(|_| {
+        AgentScheduleError::InvalidSpec(format!(
+            "invalid timezone '{}'. Use an IANA timezone like 'America/Los_Angeles'",
+            trimmed
+        ))
+    })
+}
+
 fn format_local_time(value: DateTime<Utc>, timezone: Tz) -> String {
     let localized = value.with_timezone(&timezone);
     format!(
@@ -1723,6 +1773,11 @@ mod tests {
     #[test]
     fn rejects_invalid_weekday() {
         assert!(parse_weekdays_csv("noday").is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_timezone() {
+        assert!(parse_timezone("PST").is_err());
     }
 
     #[test]

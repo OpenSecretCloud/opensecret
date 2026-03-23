@@ -1,4 +1,4 @@
-# Sage-in-Maple: Agent Memory Architecture
+# Maple Agent Memory Architecture
 
 ## Main Agent + Shared-Memory Subagents
 
@@ -7,8 +7,8 @@
 **Related Docs:**
 - `potential-rag-integration-brute-force.md` -- RAG/vector storage layer
 - `architecture-for-rag-integration.md` -- OpenSecret encryption and data model reference
-- Sage V2 Design Doc (`~/Dev/Personal/sage/docs/SAGE_V2_DESIGN.md`) -- proven prototype
-- Sage V2 Codebase (`~/Dev/Personal/sage/crates/sage-core`) -- DSRs signatures + BAML parsing + multi-step tool loop prototype
+- Prototype design doc -- proven 4-tier memory architecture reference
+- Prototype agent codebase -- DSR signatures, structured parsing, and multi-step tool loop reference
 
 **Implementation note:** the current local codebase still reflects an older single-agent MVP in places. This document is now the source of truth for the rewrite.
 
@@ -16,7 +16,7 @@
 
 ## 1. Goal
 
-Bring Sage's proven 4-tier memory architecture (core, recall, archival, summary) into Maple as a first-class product experience, without breaking the existing Responses API that third-party developers already understand.
+Bring the proven 4-tier memory architecture (core, recall, archival, summary) into Maple as a first-class product experience, without breaking the existing Responses API that third-party developers already understand.
 
 The target product shape is:
 - **one main persistent agent** as the app's home surface
@@ -150,7 +150,7 @@ What becomes agent-specific:
 - `conversation_summaries`
 - agent-only tools / orchestration logic
 
-This keeps the OpenAI-compatible Responses API stable while allowing Sage-style regenerated context and memory behavior for the main agent and subagents.
+This keeps the OpenAI-compatible Responses API stable while allowing Maple-style regenerated context and memory behavior for the main agent and subagents.
 
 ### 2.2 Introduce Explicit Agent Identity Now
 
@@ -188,10 +188,10 @@ So the rule is:
 
 ### 2.5 No Backwards Compatibility in Local-Only Schema
 
-This work has not been deployed anywhere yet. We do **not** need compatibility-preserving additive migrations for the current Sage work.
+This work has not been deployed anywhere yet. We do **not** need compatibility-preserving additive migrations for the current Maple work.
 
 So for the rewrite:
-- edit the existing local-only Sage migrations directly
+- edit the existing local-only Maple migrations directly
 - replace `agent_config` with `agents`
 - simplify `memory_blocks` now instead of carrying legacy fields forward
 - move code-owned defaults out of SQL and into Rust/config
@@ -221,7 +221,7 @@ Those initial onboarding messages should be **server-authored and persisted as r
 
 This decision does not change.
 
-**Maple's split message tables are still the right storage layer** for Sage-style agents. The main difference is no longer “one persistent agent thread per user”; it is now “one persistent thread per agent identity.”
+**Maple's split message tables are still the right storage layer** for Maple-style agents. The main difference is no longer “one persistent agent thread per user”; it is now “one persistent thread per agent identity.”
 
 | Operation | Agent requirement | Maple storage choice |
 |---|---|---|
@@ -570,7 +570,7 @@ Each agent thread owns its own summary chain. Main agent compaction and subagent
 
 No architectural change is needed here.
 
-The Sage-style approach still fits:
+The Maple-style approach still fits:
 - preprocess image input into text
 - inject the derived text into the conversation flow
 - persist the derived text so it can be embedded and recalled later
@@ -665,7 +665,7 @@ These may exist temporarily as local debugging surfaces, but they should not be 
 - manual memory block CRUD endpoints
 - manual archival insert/delete endpoints for normal product usage
 
-The product intent is **agent-managed memory**, not “settings panels for the user to tune Sage.”
+The product intent is **agent-managed memory**, not “settings panels for the user to tune Maple.”
 
 ### 7.3 Conversation List Integration
 
@@ -751,7 +751,7 @@ The important v1 decision is already made: **subagents share memory and search, 
 
 ## 10. Implementation Ordering
 
-Because this is still local-only, we should update the existing Sage docs and schema directly instead of preserving the old MVP shape.
+Because this is still local-only, we should update the existing Maple docs and schema directly instead of preserving the old MVP shape.
 
 ### Phase 1: RAG Foundation
 - Keep `user_embeddings`

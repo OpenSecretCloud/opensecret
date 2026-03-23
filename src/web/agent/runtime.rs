@@ -36,6 +36,9 @@ use crate::web::responses::{MessageContent, MessageContentConverter, MessageCont
 use crate::{ApiError, AppState};
 
 use super::compaction::CompactionManager;
+use super::schedules::{
+    refresh_follow_user_schedules_for_user, CancelScheduleTool, ListSchedulesTool, ScheduleTaskTool,
+};
 use super::signatures::{
     build_lm, call_agent_response_with_retry_and_correction, AgentResponseInput, AgentToolCall,
     AGENT_INSTRUCTION,
@@ -312,6 +315,13 @@ async fn upsert_user_preference(
             error!("Failed to upsert user preference '{key}': {e:?}");
             ApiError::InternalServerError
         })?;
+
+    if key == USER_PREFERENCE_TIMEZONE {
+        refresh_follow_user_schedules_for_user(conn, user_id, &value).map_err(|e| {
+            error!("Failed to refresh follow-user schedules for timezone update: {e:?}");
+            ApiError::InternalServerError
+        })?;
+    }
 
     Ok(())
 }
@@ -660,6 +670,22 @@ impl AgentRuntime {
         if let Some(brave_client) = state.brave_client.clone() {
             tools.register(Arc::new(WebSearchTool::new(brave_client)));
         }
+        tools.register(Arc::new(ScheduleTaskTool::new(
+            state.clone(),
+            user.clone(),
+            user_key.clone(),
+            agent.clone(),
+        )));
+        tools.register(Arc::new(ListSchedulesTool::new(
+            state.clone(),
+            user.clone(),
+            agent.clone(),
+        )));
+        tools.register(Arc::new(CancelScheduleTool::new(
+            state.clone(),
+            user.clone(),
+            agent.clone(),
+        )));
         if agent.kind == AGENT_KIND_MAIN {
             tools.register(Arc::new(SpawnSubagentTool::new(
                 state.clone(),
@@ -1483,7 +1509,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         Ok((call, out))
     }
 
-    async fn maybe_compact(&self) -> Result<(), ApiError> {
+    pub(crate) async fn maybe_compact(&self) -> Result<(), ApiError> {
         let mut conn = self
             .state
             .db

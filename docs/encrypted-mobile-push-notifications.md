@@ -3,9 +3,9 @@
 ## Backend, Enclave, and Mobile Design Reference
 
 **Date:** March 2026
-**Status:** Backend v1 is implemented for the Sage agent disconnect flow; Maple iOS encrypted preview and Android release delivery are implemented, macOS delivery works with generic fallback while encrypted-preview parity remains follow-up work, and broader event sources plus some client hardening remain open
+**Status:** Backend v1 is implemented for the Maple agent disconnect flow; Maple iOS encrypted preview and Android release delivery are implemented, macOS delivery works with generic fallback while encrypted-preview parity remains follow-up work, and broader event sources plus some client hardening remain open
 **Related Docs:**
-- `sage-in-maple-architecture.md`
+- `maple-agent-memory-architecture.md`
 - `architecture-for-rag-integration.md`
 - `potential-rag-integration-brute-force.md`
 
@@ -22,7 +22,7 @@ The final architectural decisions are:
 3. **Store provider configuration per project using `project_settings` + `org_project_secrets`.**
 4. **Register one notification keypair per device, not one shared key per user.**
 5. **Use a durable Postgres outbox + delivery worker, not synchronous request-path sends.**
-6. **Treat successful live Sage SSE delivery as the acknowledgement for agent chat flows and skip push entirely when streaming succeeds.**
+6. **Treat successful live Maple SSE delivery as the acknowledgement for agent chat flows and skip push entirely when streaming succeeds.**
 7. **Prefer standard visible-notification behavior on Android in v1; keep Android data-only encrypted preview as an optional later enhancement.**
 
 This gives us Signal-like transport privacy for push content without pretending we are building a full Signal protocol.
@@ -36,11 +36,11 @@ As of this revision, the backend implementation in this repo currently includes:
 - encrypted token storage, durable notification events, and per-device delivery rows
 - direct APNs + direct FCM sender implementations
 - background delivery worker with Postgres leasing
-- successful Sage agent SSE delivery suppression plus disconnect-triggered `agent.message` enqueue
+- successful Maple agent SSE delivery suppression plus disconnect-triggered `agent.message` enqueue
 
 The currently shipped backend scope is narrower than the full product design described later in this document:
 
-- the implemented event source in this repo is currently the Sage agent SSE disconnect path in `src/web/agent/mod.rs`
+- the implemented event source in this repo is currently the Maple agent SSE disconnect path in `src/web/agent/mod.rs`
 - reminder / task-complete / account-alert sources remain follow-up work
 - iOS NSE behavior, Android client behavior, recent-ID caches, and thread cleanup live in mobile codebases rather than this backend repo
 
@@ -55,16 +55,16 @@ The currently shipped backend scope is narrower than the full product design des
 
 ## 2. What Problem This Solves
 
-Longer-term Maple / Sage product goals include notifications for events like:
+Longer-term Maple product goals include notifications for events like:
 
 - reminder due
 - long-running agent task complete
-- async follow-up from Sage
+- async follow-up from Maple
 - security or account alerts
 
 Current backend implementation note:
 
-- this repo currently enqueues only `agent.message` notifications for interrupted Sage agent SSE turns
+- this repo currently enqueues only `agent.message` notifications for interrupted Maple agent SSE turns
 
 while ensuring that:
 
@@ -174,11 +174,11 @@ Why:
 - push tokens are sensitive enough to encrypt at rest
 - this keeps the privacy story aligned with the rest of OpenSecret
 
-### 5.4 Successful live Sage SSE delivery suppresses push in v1
+### 5.4 Successful live Maple SSE delivery suppresses push in v1
 
-For the common “user sent a message to Sage and is waiting on an SSE stream” flow:
+For the common “user sent a message to Maple and is waiting on an SSE stream” flow:
 
-- if the final Sage response is delivered successfully over the open SSE stream, do **not** enqueue push for any device
+- if the final Maple response is delivered successfully over the open SSE stream, do **not** enqueue push for any device
 - if the SSE stream closes or errors before the final response is delivered, enqueue **exactly one** notification event for that interrupted turn
 - if the interrupted turn produced multiple assistant messages, use the **first missed assistant message** as the preview source for that one notification
 - this SSE success signal acts as the acknowledgement; no extra per-thread presence service or explicit ACK protocol is required in v1
@@ -241,7 +241,7 @@ This section reflects the current backend code layout rather than the original p
   - App-user authenticated device register / list / revoke routes.
 
 - `src/web/agent/mod.rs`
-  - Sage agent SSE acknowledgement tracking plus the current disconnect-triggered `agent.message` enqueue path.
+  - Maple agent SSE acknowledgement tracking plus the current disconnect-triggered `agent.message` enqueue path.
 
 - `src/web/platform/common.rs`
   - Push secret constants and project-settings request / response types.
@@ -788,7 +788,7 @@ Recommended envelope:
   "v": 1,
   "notification_id": "uuid",
   "message_id": "uuid",
-  "kind": "sage.reminder",
+  "kind": "maple.reminder",
   "title": "Reminder",
   "body": "Follow up on the deployment thread",
   "deep_link": "opensecret://agent/subagent/uuid",
@@ -940,7 +940,7 @@ For v1, prefer the standard messaging-app approach:
 - let the app fetch or render authoritative content after open
 
 This is the most standard and reliable path.
-It avoids relying on background execution for every Sage message.
+It avoids relying on background execution for every Maple message.
 
 ### 14.3 Standard FCM payload for v1
 
@@ -949,7 +949,7 @@ It avoids relying on background execution for every Sage message.
   "message": {
     "token": "<fcm registration token>",
     "notification": {
-      "title": "New Sage message",
+      "title": "New Maple message",
       "body": "Open Maple to view it"
     },
     "data": {
@@ -978,7 +978,7 @@ Notes:
 - visible text should remain generic / non-sensitive
 - FCM `data` values must be strings
 - current backend derives Android TTL from `expires_at`; when an event has no explicit expiry, the sender defaults to 7 days
-- the current `agent.message` enqueue path sets a 7-day expiry, so the common Sage-agent payload today is effectively close to `604800s`
+- the current `agent.message` enqueue path sets a 7-day expiry, so the common Maple-agent payload today is effectively close to `604800s`
 - FCM `data` is provider-visible routing metadata, so it may include fields like `notification_id`, `message_id`, `thread_id`, `deep_link`, and `kind`, but never plaintext message content
 - this is intentional in v1: the goal is to keep message content encrypted from the push provider, not to hide all metadata needed for client routing
 - current implementation auto-keys `collapse_key` to `notification_id` without the older `sage:` prefix shown in earlier drafts
@@ -1067,7 +1067,7 @@ Current Maple status:
 
 #### Foreground / open-thread behavior
 
-If the app is already foregrounded and showing the target Sage conversation or active response screen:
+If the app is already foregrounded and showing the target Maple conversation or active response screen:
 
 - implement `userNotificationCenter(_:willPresent:withCompletionHandler:)`
 - return `[]` to suppress banner / sound / badge presentation for that in-app event
@@ -1195,11 +1195,11 @@ The exact IPs and ports can be changed, but they should use currently unused slo
 
 ## 17. Product Event Model
 
-### 17.1 Live Sage agent SSE flows
+### 17.1 Live Maple agent SSE flows
 
-For the common flow where the user sends a message to Sage and the client keeps an SSE stream open waiting for responses:
+For the common flow where the user sends a message to Maple and the client keeps an SSE stream open waiting for responses:
 
-1. generate and stream the Sage response as normal
+1. generate and stream the Maple response as normal
 2. if the final response is successfully delivered over that SSE stream, do **not** enqueue push
 3. if the SSE stream closes or errors before final response delivery completes, enqueue exactly one notification event for that interrupted turn
 4. if multiple assistant messages were generated after the disconnect point, use the first missed assistant message as the preview source for that one notification
@@ -1235,7 +1235,7 @@ The current helper generates `notification_id` internally and derives `collapse_
 Current implemented backend source:
 
 - `src/web/agent/mod.rs`
-  - live Sage agent SSE completion / failure handling and one `agent.message` notification for an interrupted turn
+  - live Maple agent SSE completion / failure handling and one `agent.message` notification for an interrupted turn
 
 Future integrations:
 
@@ -1347,14 +1347,14 @@ The v1 implementation should be:
 - **project-scoped provider config in `project_settings` + `org_project_secrets`**
 - **per-device P-256 notification keypairs**
 - **Postgres outbox + multi-enclave delivery worker coordinated via Postgres row leases**
-- **successful live Sage SSE delivery suppresses push entirely**
+- **successful live Maple SSE delivery suppresses push entirely**
 - **iOS encrypted preview with generic fallback**
 - **Android v1 uses standard visible FCM notifications plus data, with app-open fetch and local foreground suppression**
 - **stable `notification_id` plus client-side dedup / thread cleanup**
 
 This is the simplest design that still matches the current OpenSecret architecture and avoids painting us into a corner later.
 
-Current implementation note: the backend in this repo already follows this design for the Sage agent disconnect path, while broader event sources and some hardening items remain follow-up work.
+Current implementation note: the backend in this repo already follows this design for the Maple agent disconnect path, while broader event sources and some hardening items remain follow-up work.
 
 ---
 
@@ -1387,5 +1387,5 @@ These items are the main remaining hardening work after the current push handoff
 
 - finish macOS encrypted-preview parity so the macOS notification service extension rewrites the generic fallback text like iOS
 - add client-side `notification_id` dedup caches and thread cleanup where they materially improve UX
-- extend backend event sources beyond the current `agent.message` Sage disconnect path when product priorities require it
+- extend backend event sources beyond the current `agent.message` Maple disconnect path when product priorities require it
 - keep the mobile-client behavior docs aligned with what is actually implemented in the Maple repos

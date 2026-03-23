@@ -22,6 +22,58 @@ diesel::table! {
 }
 
 diesel::table! {
+    agent_schedule_runs (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        schedule_id -> Int8,
+        user_id -> Uuid,
+        agent_id -> Int8,
+        scheduled_for -> Timestamptz,
+        stale_after_at -> Timestamptz,
+        status -> Text,
+        attempt_count -> Int4,
+        next_attempt_at -> Timestamptz,
+        lease_owner -> Nullable<Text>,
+        lease_expires_at -> Nullable<Timestamptz>,
+        started_at -> Nullable<Timestamptz>,
+        first_output_at -> Nullable<Timestamptz>,
+        first_message_id -> Nullable<Uuid>,
+        output_count -> Int4,
+        notification_enqueued_at -> Nullable<Timestamptz>,
+        completed_at -> Nullable<Timestamptz>,
+        last_error -> Nullable<Text>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    agent_schedules (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        agent_id -> Int8,
+        description -> Text,
+        instruction_enc -> Bytea,
+        schedule_kind -> Text,
+        recurrence_type -> Nullable<Text>,
+        schedule_spec -> Jsonb,
+        timezone_mode -> Text,
+        resolved_timezone -> Text,
+        fixed_timezone -> Nullable<Text>,
+        stale_after_minutes -> Int4,
+        status -> Text,
+        next_scheduled_for -> Nullable<Timestamptz>,
+        last_scheduled_for -> Nullable<Timestamptz>,
+        last_run_at -> Nullable<Timestamptz>,
+        run_count -> Int4,
+        cancelled_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     agents (id) {
         id -> Int8,
         uuid -> Uuid,
@@ -516,6 +568,9 @@ diesel::table! {
     }
 }
 
+diesel::joinable!(agent_schedule_runs -> agent_schedules (schedule_id));
+diesel::joinable!(agent_schedule_runs -> agents (agent_id));
+diesel::joinable!(agent_schedules -> agents (agent_id));
 diesel::joinable!(agents -> conversations (conversation_id));
 diesel::joinable!(assistant_messages -> conversations (conversation_id));
 diesel::joinable!(assistant_messages -> responses (response_id));
@@ -547,6 +602,8 @@ diesel::joinable!(users -> org_projects (project_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     account_deletion_requests,
+    agent_schedule_runs,
+    agent_schedules,
     agents,
     assistant_messages,
     conversation_summaries,

@@ -102,6 +102,7 @@ diesel::table! {
         finish_reason -> Nullable<Text>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        user_reaction -> Nullable<Text>,
     }
 }
 
@@ -525,6 +526,7 @@ diesel::table! {
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
         attachment_text_enc -> Nullable<Bytea>,
+        assistant_reaction -> Nullable<Text>,
     }
 }
 

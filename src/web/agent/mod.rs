@@ -14,7 +14,7 @@ use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::encrypt::decrypt_string;
@@ -22,7 +22,7 @@ use crate::models::agents::{
     Agent, AGENT_CREATED_BY_AGENT, AGENT_CREATED_BY_USER, AGENT_KIND_SUBAGENT,
 };
 use crate::models::memory_blocks::MemoryBlock;
-use crate::models::responses::Conversation;
+use crate::models::responses::{AssistantMessage, Conversation, ResponsesError};
 use crate::models::users::User;
 use crate::push::{enqueue_agent_message_notification, AgentPushTarget};
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
@@ -38,6 +38,7 @@ use crate::web::responses::{
 use crate::{ApiError, AppMode, AppState};
 
 mod compaction;
+mod reactions;
 mod runtime;
 mod schedules;
 mod signatures;
@@ -49,6 +50,11 @@ pub(crate) use schedules::start_schedule_worker;
 #[derive(Debug, Clone, Deserialize)]
 struct AgentChatRequest {
     input: MessageContent,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SetMessageReactionRequest {
+    emoji: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -125,6 +131,13 @@ enum ChatTarget {
     Subagent(Uuid),
 }
 
+fn chat_target_label(target: &ChatTarget) -> &'static str {
+    match target {
+        ChatTarget::Main => "main",
+        ChatTarget::Subagent(_) => "subagent",
+    }
+}
+
 const MAIN_AGENT_DISPLAY_NAME: &str = "Maple";
 
 fn default_limit() -> i64 {
@@ -165,6 +178,7 @@ fn is_empty_message_content(content: &MessageContent) -> bool {
 
 // SSE event types for agent chat (message-level delivery, not token streaming)
 const EVENT_AGENT_MESSAGE: &str = "agent.message";
+const EVENT_AGENT_REACTION: &str = "agent.reaction";
 const EVENT_AGENT_TYPING: &str = "agent.typing";
 const EVENT_AGENT_DONE: &str = "agent.done";
 const EVENT_AGENT_ERROR: &str = "agent.error";
@@ -172,8 +186,16 @@ const AGENT_SSE_KEEPALIVE_INTERVAL_SECS: u64 = 15;
 
 #[derive(Debug, Clone, Serialize)]
 struct AgentMessageEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_id: Option<Uuid>,
     messages: Vec<String>,
     step: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentReactionEvent {
+    item_id: Uuid,
+    emoji: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -199,6 +221,7 @@ enum AgentClientEvent {
         payload: AgentMessageEvent,
         delivery_ack: oneshot::Sender<()>,
     },
+    Reaction(AgentReactionEvent),
     Done(AgentDoneEvent),
     Error(AgentErrorEvent),
 }
@@ -265,6 +288,7 @@ fn build_init_main_agent_response(
                 status: Some("completed".to_string()),
                 role: "assistant".to_string(),
                 content: MessageContentConverter::assistant_text_to_content(message.content),
+                reaction: None,
                 created_at: Some(message.created_at),
             })
             .collect(),
@@ -446,6 +470,38 @@ fn get_item_from_conversation(
     Err(ApiError::NotFound)
 }
 
+fn set_user_reaction_for_conversation(
+    state: &Arc<AppState>,
+    conversation_id: i64,
+    user_key: &SecretKey,
+    user: &User,
+    item_id: Uuid,
+    reaction: Option<String>,
+) -> Result<ConversationItem, ApiError> {
+    let item = get_item_from_conversation(state, conversation_id, user_key, item_id)?;
+
+    match item {
+        ConversationItem::Message { role, .. } if role == "assistant" => {}
+        _ => return Err(ApiError::BadRequest),
+    }
+
+    let mut conn = state
+        .db
+        .get_pool()
+        .get()
+        .map_err(|_| ApiError::InternalServerError)?;
+
+    AssistantMessage::set_user_reaction(&mut conn, item_id, user.uuid, reaction).map_err(|e| {
+        error!("Failed to set user reaction on assistant message: {e:?}");
+        match e {
+            ResponsesError::AssistantMessageNotFound => ApiError::NotFound,
+            _ => ApiError::InternalServerError,
+        }
+    })?;
+
+    get_item_from_conversation(state, conversation_id, user_key, item_id)
+}
+
 fn delete_conversation_for_user(
     conn: &mut diesel::PgConnection,
     conversation_id: i64,
@@ -491,6 +547,15 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
                 .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
         )
         .route(
+            "/v1/agent/items/:item_id/reaction",
+            post(set_main_agent_item_reaction)
+                .delete(clear_main_agent_item_reaction)
+                .layer(from_fn_with_state(
+                    app_state.clone(),
+                    decrypt_request::<SetMessageReactionRequest>,
+                )),
+        )
+        .route(
             "/v1/agent/chat",
             post(chat_main).layer(from_fn_with_state(
                 app_state.clone(),
@@ -528,6 +593,15 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
             "/v1/agent/subagents/:id/items/:item_id",
             get(get_subagent_item)
                 .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/v1/agent/subagents/:id/items/:item_id/reaction",
+            post(set_subagent_item_reaction)
+                .delete(clear_subagent_item_reaction)
+                .layer(from_fn_with_state(
+                    app_state.clone(),
+                    decrypt_request::<SetMessageReactionRequest>,
+                )),
         )
         .route(
             "/v1/agent/subagents/:id",
@@ -610,6 +684,46 @@ async fn get_main_agent_item(
 ) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
     let ctx = load_main_agent_context(&state, &user).await?;
     let item = get_item_from_conversation(&state, ctx.conversation.id, &ctx.user_key, item_id)?;
+
+    encrypt_response(&state, &session_id, &item).await
+}
+
+async fn set_main_agent_item_reaction(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<Uuid>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+    Extension(body): Extension<SetMessageReactionRequest>,
+) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
+    let emoji = reactions::require_valid_reaction(&body.emoji)?;
+    let ctx = load_main_agent_context(&state, &user).await?;
+    let item = set_user_reaction_for_conversation(
+        &state,
+        ctx.conversation.id,
+        &ctx.user_key,
+        &user,
+        item_id,
+        Some(emoji),
+    )?;
+
+    encrypt_response(&state, &session_id, &item).await
+}
+
+async fn clear_main_agent_item_reaction(
+    State(state): State<Arc<AppState>>,
+    Path(item_id): Path<Uuid>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
+    let ctx = load_main_agent_context(&state, &user).await?;
+    let item = set_user_reaction_for_conversation(
+        &state,
+        ctx.conversation.id,
+        &ctx.user_key,
+        &user,
+        item_id,
+        None,
+    )?;
 
     encrypt_response(&state, &session_id, &item).await
 }
@@ -761,6 +875,46 @@ async fn get_subagent_item(
     encrypt_response(&state, &session_id, &item).await
 }
 
+async fn set_subagent_item_reaction(
+    State(state): State<Arc<AppState>>,
+    Path((agent_uuid, item_id)): Path<(Uuid, Uuid)>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+    Extension(body): Extension<SetMessageReactionRequest>,
+) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
+    let emoji = reactions::require_valid_reaction(&body.emoji)?;
+    let ctx = load_subagent_context(&state, &user, agent_uuid).await?;
+    let item = set_user_reaction_for_conversation(
+        &state,
+        ctx.conversation.id,
+        &ctx.user_key,
+        &user,
+        item_id,
+        Some(emoji),
+    )?;
+
+    encrypt_response(&state, &session_id, &item).await
+}
+
+async fn clear_subagent_item_reaction(
+    State(state): State<Arc<AppState>>,
+    Path((agent_uuid, item_id)): Path<(Uuid, Uuid)>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
+    let ctx = load_subagent_context(&state, &user, agent_uuid).await?;
+    let item = set_user_reaction_for_conversation(
+        &state,
+        ctx.conversation.id,
+        &ctx.user_key,
+        &user,
+        item_id,
+        None,
+    )?;
+
+    encrypt_response(&state, &session_id, &item).await
+}
+
 async fn chat_main(
     State(state): State<Arc<AppState>>,
     Extension(session_id): Extension<Uuid>,
@@ -857,6 +1011,9 @@ async fn chat_with_target(
                         Err(error) => Err(error),
                     }
                 }
+                AgentClientEvent::Reaction(payload) => {
+                    encrypt_agent_event(&state, &session_id, EVENT_AGENT_REACTION, &payload).await
+                }
                 AgentClientEvent::Done(payload) => {
                     encrypt_agent_event(&state, &session_id, EVENT_AGENT_DONE, &payload).await
                 }
@@ -886,7 +1043,19 @@ async fn run_agent_chat_task(
     target: ChatTarget,
     tx: mpsc::Sender<AgentClientEvent>,
 ) {
+    let (input_kind, input_part_count) = match &input_content {
+        MessageContent::Text(_) => ("text", 1),
+        MessageContent::Parts(parts) => ("parts", parts.len()),
+    };
+    debug!(
+        user_uuid = %user.uuid,
+        target = chat_target_label(&target),
+        input_kind,
+        input_part_count,
+        "Starting agent chat task"
+    );
     let mut total_messages: usize = 0;
+    let mut had_reaction = false;
     let mut had_error = false;
     let mut client_connected = true;
     let mut first_undelivered_message: Option<(Uuid, String)> = None;
@@ -963,6 +1132,14 @@ async fn run_agent_chat_task(
     let max_steps = runtime.max_steps();
 
     'steps: for step_num in 0..max_steps {
+        debug!(
+            user_uuid = %user.uuid,
+            target = chat_target_label(&target),
+            step_num,
+            total_messages,
+            had_reaction,
+            "Starting agent chat step"
+        );
         client_connected = send_agent_client_event(
             &tx,
             AgentClientEvent::Typing(AgentTypingEvent { step: step_num }),
@@ -974,10 +1151,26 @@ async fn run_agent_chat_task(
             Ok(result) => {
                 let runtime::StepResult {
                     messages,
+                    reply_reaction,
                     executed_tools,
                     done,
                     ..
                 } = result;
+
+                debug!(
+                    user_uuid = %user.uuid,
+                    target = chat_target_label(&target),
+                    step_num,
+                    message_count = messages.len(),
+                    executed_tool_count = executed_tools.len(),
+                    tool_names = ?executed_tools
+                        .iter()
+                        .map(|executed| executed.tool_call.name.as_str())
+                        .collect::<Vec<_>>(),
+                    has_reply_reaction = reply_reaction.is_some(),
+                    done,
+                    "Agent chat step returned"
+                );
 
                 for executed in &executed_tools {
                     if let Err(e) = runtime
@@ -985,6 +1178,29 @@ async fn run_agent_chat_task(
                         .await
                     {
                         error!("Failed to persist tool call: {e:?}");
+                    }
+                }
+
+                if let Some(reaction) = reply_reaction {
+                    match runtime
+                        .set_assistant_reaction_for_current_user_message(&reaction)
+                        .await
+                    {
+                        Ok(updated_message) => {
+                            had_reaction = true;
+                            client_connected = send_agent_client_event(
+                                &tx,
+                                AgentClientEvent::Reaction(AgentReactionEvent {
+                                    item_id: updated_message.uuid,
+                                    emoji: reaction,
+                                }),
+                                client_connected,
+                            )
+                            .await;
+                        }
+                        Err(e) => {
+                            error!("Failed to persist assistant reaction: {e:?}");
+                        }
                     }
                 }
 
@@ -1003,6 +1219,7 @@ async fn run_agent_chat_task(
                         let delivered = send_agent_message_event(
                             &tx,
                             AgentMessageEvent {
+                                message_id: assistant_message.as_ref().map(|message| message.uuid),
                                 messages: vec![msg.clone()],
                                 step: step_num,
                             },
@@ -1044,12 +1261,17 @@ async fn run_agent_chat_task(
         }
     }
 
-    if !had_error && total_messages == 0 {
-        warn!("Agent produced no messages");
+    if !had_error && total_messages == 0 && !had_reaction {
+        warn!(
+            user_uuid = %user.uuid,
+            target = chat_target_label(&target),
+            "Agent produced no messages or reactions; sending fallback response"
+        );
         let _ =
             send_agent_message_event(
                 &tx,
                 AgentMessageEvent {
+                    message_id: None,
                     messages: vec![
                         "I apologize, but I wasn't able to generate a response.".to_string()
                     ],
@@ -1074,6 +1296,16 @@ async fn run_agent_chat_task(
         client_connected,
     )
     .await;
+
+    debug!(
+        user_uuid = %user.uuid,
+        target = chat_target_label(&target),
+        total_messages,
+        had_reaction,
+        had_error,
+        client_connected,
+        "Agent chat task finished"
+    );
 }
 
 async fn send_agent_client_event(

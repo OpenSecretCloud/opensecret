@@ -643,7 +643,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_user_by_uuid(&self, uuid: Uuid) -> Result<User, DBError> {
-        debug!("Getting user by UUID");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = User::get_by_uuid(conn, uuid)?.ok_or(DBError::UserNotFound);
         if let Err(ref e) = result {
@@ -2456,7 +2455,6 @@ impl DBConnection for PostgresConnection {
         after: Option<Uuid>,
         order: &str,
     ) -> Result<Vec<RawThreadMessage>, DBError> {
-        debug!("Getting conversation context messages");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         RawThreadMessage::get_conversation_context(conn, conversation_id, limit, after, order)
             .map_err(DBError::from)

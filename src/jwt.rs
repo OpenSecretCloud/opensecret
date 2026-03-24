@@ -419,7 +419,6 @@ pub async fn validate_jwt(
     mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    tracing::debug!("Entering validate_jwt");
     let token = match req
         .headers()
         .get(header::AUTHORIZATION)
@@ -429,8 +428,6 @@ pub async fn validate_jwt(
         Some(token) => token,
         None => return ApiError::InvalidJwt.into_response(),
     };
-
-    tracing::trace!("Validating JWT");
 
     let claims = match validate_token(&token, &data, USER_ACCESS) {
         Ok(claims) => claims,
@@ -454,7 +451,6 @@ pub async fn validate_jwt(
     };
 
     req.extensions_mut().insert(user);
-    tracing::debug!("Exiting validate_jwt");
     next.run(req).await
 }
 
@@ -463,7 +459,6 @@ pub async fn validate_platform_jwt(
     mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    tracing::debug!("Entering validate_platform_jwt");
     let token = match req
         .headers()
         .get(header::AUTHORIZATION)
@@ -473,8 +468,6 @@ pub async fn validate_platform_jwt(
         Some(token) => token,
         None => return ApiError::InvalidJwt.into_response(),
     };
-
-    tracing::trace!("Validating platform JWT");
 
     let claims = match validate_token(&token, &data, PLATFORM_ACCESS) {
         Ok(claims) => claims,
@@ -498,7 +491,6 @@ pub async fn validate_platform_jwt(
     };
 
     req.extensions_mut().insert(platform_user);
-    tracing::debug!("Exiting validate_platform_jwt");
     next.run(req).await
 }
 
@@ -510,8 +502,6 @@ pub(crate) fn validate_token(
     // Try ES256K first
     let es256k = Es256k::<Sha256>::new(data.config.jwt_keys.secp.clone());
     let public_key = data.config.jwt_keys.public_key();
-
-    tracing::trace!("Attempting to validate ES256K token");
 
     // First parse the token with the correct type
     let parsed_token = match UntrustedToken::new(original_token) {
@@ -525,8 +515,6 @@ pub(crate) fn validate_token(
     // Deserialize claims first
     let token: Token<CustomClaims> = match es256k.validator(&public_key).validate(&parsed_token) {
         Ok(token) => {
-            tracing::trace!("ES256K signature validation successful");
-
             // Only validate expiration, not maturity
             let time_options = TimeOptions::default();
             if let Err(e) = token.claims().validate_expiration(&time_options) {

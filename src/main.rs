@@ -922,8 +922,6 @@ impl AppState {
         derivation_path: Option<&str>,
         seed_phrase_derivation_path: Option<&str>,
     ) -> Result<SecretKey, Error> {
-        info!("Getting user key for UUID: {}", user_uuid);
-
         if let Some(path) = derivation_path {
             debug!("Using BIP-32 derivation path: {}", path);
         }
@@ -933,13 +931,9 @@ impl AppState {
         }
 
         let user = self.get_user(user_uuid).await?;
-        debug!("User retrieved successfully");
 
         let encrypted_seed = match user.get_seed_encrypted().await {
-            Some(es) => {
-                debug!("Found existing encrypted seed for user");
-                es
-            }
+            Some(es) => es,
             None => {
                 // create seed if not already exists
                 info!(
@@ -954,7 +948,6 @@ impl AppState {
             }
         };
 
-        debug!("Decrypting user seed and deriving key");
         let user_secret_key = decrypt_user_seed_to_key(
             self.enclave_key.clone(),
             encrypted_seed,
@@ -962,7 +955,6 @@ impl AppState {
             seed_phrase_derivation_path,
         )?;
 
-        info!("Successfully derived key for user: {}", user_uuid);
         Ok(user_secret_key)
     }
 

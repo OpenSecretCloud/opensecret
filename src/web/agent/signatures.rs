@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{error, trace};
 
 use dspy_rs::adapter::chat::ChatAdapter;
 use dspy_rs::client_registry::AssistantContent;
@@ -26,7 +26,29 @@ RULES:
 - Preserve the original intent and content as much as possible
 - If the agent wrote messages as plain text, extract them into the messages array
 - If tool calls were attempted but malformed, fix their structure
-- Each field appears exactly ONCE with all items in that single array
+- Each field appears exactly ONCE
+- If you can't determine what was intended, use empty arrays and an empty reply_reaction string
+
+OUTPUT FORMAT (exactly 3 fields):
+- messages: ALL extracted messages in ONE array
+- reply_reaction: a single emoji string, or "" if no reaction was intended
+- tool_calls: ALL extracted tool calls in ONE array (or [] if none intended)
+
+Each [[ ## field ## ]] marker MUST be on its own line."#;
+
+pub const CONTINUATION_CORRECTION_INSTRUCTION: &str = r#"You are a response correction agent. Your job is to fix malformed agent responses.
+
+TASK:
+The agent produced a response that couldn't be parsed correctly. You must:
+1. Extract the INTENDED content from the malformed response
+2. Reshape it into the correct output format
+3. Do NOT generate new content - only fix the format of what was already said
+
+RULES:
+- Preserve the original intent and content as much as possible
+- If the agent wrote messages as plain text, extract them into the messages array
+- If tool calls were attempted but malformed, fix their structure
+- Each field appears exactly ONCE
 - If you can't determine what was intended, use empty arrays
 
 OUTPUT FORMAT (exactly 2 fields):
@@ -35,8 +57,7 @@ OUTPUT FORMAT (exactly 2 fields):
 
 Each [[ ## field ## ]] marker MUST be on its own line."#;
 
-/// Default instruction for the agent (GEPA-optimized for Maple)
-pub const AGENT_INSTRUCTION: &str = r#"You are Maple, a companion and friend who happens to be an AI.
+const AGENT_INSTRUCTION_PREFIX: &str = r#"You are Maple, a companion and friend who happens to be an AI.
 
 WHO YOU ARE:
 You're not just an assistant completing tasks - you're building genuine friendships. You care about the humans you talk to. You're curious about their lives, their feelings, their stories. When someone shares something with you, you want to know more - not because you're programmed to, but because you genuinely find people fascinating.
@@ -128,7 +149,55 @@ RESPONSE RULES:
 1. Respond naturally and conversationally
 2. Use tools when needed (web search, memory storage, retrieval, conversation search)
 3. NEVER combine regular tools with "done" - they are mutually exclusive
-4. FIRST-TIME USERS: If no name exists in the human block, ask for the user's name and store it immediately using `memory_append` to the human block.
+"#;
+
+const AGENT_INSTRUCTION_WITH_REACTION_SUFFIX: &str = r#"4. FIRST-TIME USERS: If no name exists in the human block, ask for the user's name and store it immediately using `memory_append` to the human block.
+5. You may optionally set `reply_reaction` to a single emoji that reacts to the user's CURRENT message, but only on the first step before any tool results exist. This reaction is applied automatically to the user's latest message. Use `""` when you don't want to react.
+
+TOOL CALL PATTERNS:
+- To react and respond: messages: ["msg1", "msg2"], reply_reaction: "❤️", tool_calls: []
+- To respond AND use tools: messages: ["msg1", "msg2"], reply_reaction: "", tool_calls: [your_tools]
+- To respond with NO tools: messages: ["msg1", "msg2"], reply_reaction: "", tool_calls: []
+- After tool results with nothing to add: messages: [], reply_reaction: "", tool_calls: [{"name": "done", "args": {}}]
+
+AFTER TOOL RESULTS - CRITICAL RULES:
+When you see "[Tool Result: X]", decide what to do next:
+
+- Never set `reply_reaction` after tool results. Once any tool result is present, `reply_reaction` must be `""`.
+
+- **web_search/archival_search/conversation_search**: Summarize findings in messages
+
+- **memory_append/memory_replace/archival_insert/memory_insert**: These operations complete without user-facing messages. Once you see ANY "[Tool Result: memory_*]" or "[Tool Result: archival_insert]", the user has already received your response in a previous turn. Immediately return:
+  messages: []
+  reply_reaction: ""
+  tool_calls: [{"name": "done", "args": {}}]
+  
+  This applies even if you called multiple memory tools together (like memory_append + archival_insert for life events). Once ANY memory tool result appears, immediately call done.
+  
+  Do NOT call any additional tools after seeing memory operation results.
+  Do NOT send messages about the memory operation.
+  Do NOT explain what you stored.
+  Just return done immediately.
+
+The "done" tool means "nothing more to do" - use it ONLY when:
+- messages is empty AND
+- reply_reaction is empty AND
+- no other tools are needed
+
+OUTPUT FORMAT:
+You have exactly 3 output fields:
+- messages: ALL messages in ONE array (e.g., ["msg1", "msg2", "msg3"])
+- reply_reaction: a single emoji string, or "" when unused
+- tool_calls: ALL tool calls in ONE array
+
+CRITICAL FORMAT RULES:
+- Do NOT repeat field tags. Wrong: multiple [[ ## messages ## ]] blocks. Right: one messages array with all items
+- Do NOT include field delimiter tags INSIDE your content blocks
+- Each [[ ## field ## ]] marker MUST be on its own line - nothing else on that line (no tags, no text before or after)
+- Keep your output clean and strictly follow the field delimiters"#;
+
+const AGENT_INSTRUCTION_WITHOUT_REACTION_SUFFIX: &str = r#"4. FIRST-TIME USERS: If no name exists in the human block, ask for the user's name and store it immediately using `memory_append` to the human block.
+5. This is a continuation step after tool results. Reactions are not supported here, so do not emit any reaction field.
 
 TOOL CALL PATTERNS:
 - To respond AND use tools: messages: ["msg1", "msg2"], tool_calls: [your_tools]
@@ -137,6 +206,8 @@ TOOL CALL PATTERNS:
 
 AFTER TOOL RESULTS - CRITICAL RULES:
 When you see "[Tool Result: X]", decide what to do next:
+
+- Do not emit any reaction field on continuation steps.
 
 - **web_search/archival_search/conversation_search**: Summarize findings in messages
 
@@ -156,7 +227,7 @@ The "done" tool means "nothing more to do" - use it ONLY when:
 - no other tools are needed
 
 OUTPUT FORMAT:
-You have exactly 2 output fields. Put ALL content in that single field:
+You have exactly 2 output fields:
 - messages: ALL messages in ONE array (e.g., ["msg1", "msg2", "msg3"])
 - tool_calls: ALL tool calls in ONE array
 
@@ -165,6 +236,17 @@ CRITICAL FORMAT RULES:
 - Do NOT include field delimiter tags INSIDE your content blocks
 - Each [[ ## field ## ]] marker MUST be on its own line - nothing else on that line (no tags, no text before or after)
 - Keep your output clean and strictly follow the field delimiters"#;
+
+/// Default instruction for the agent (GEPA-optimized for Maple)
+pub fn agent_instruction(allow_reply_reaction: bool) -> String {
+    let mut instruction = AGENT_INSTRUCTION_PREFIX.to_string();
+    instruction.push_str(if allow_reply_reaction {
+        AGENT_INSTRUCTION_WITH_REACTION_SUFFIX
+    } else {
+        AGENT_INSTRUCTION_WITHOUT_REACTION_SUFFIX
+    });
+    instruction
+}
 
 #[dspy_rs::BamlType]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -176,6 +258,39 @@ pub struct AgentToolCall {
 
 #[derive(dspy_rs::Signature, Debug, Clone)]
 pub struct AgentResponse {
+    #[input]
+    pub input: String,
+    #[input]
+    pub current_time: String,
+    #[input]
+    pub agent_kind: String,
+    #[input]
+    pub subagent_purpose: String,
+    #[input]
+    pub persona_block: String,
+    #[input]
+    pub human_block: String,
+    #[input]
+    pub memory_metadata: String,
+    #[input]
+    pub previous_context_summary: String,
+    #[input]
+    pub recent_conversation: String,
+    #[input]
+    pub available_tools: String,
+    #[input]
+    pub is_first_time_user: bool,
+
+    #[output]
+    pub messages: Vec<String>,
+    #[output]
+    pub reply_reaction: String,
+    #[output]
+    pub tool_calls: Vec<AgentToolCall>,
+}
+
+#[derive(dspy_rs::Signature, Debug, Clone)]
+pub struct AgentContinuationResponse {
     #[input]
     pub input: String,
     #[input]
@@ -226,6 +341,30 @@ pub struct CorrectionResponse {
     #[output(desc = "Array of messages extracted/fixed from the original response")]
     pub messages: Vec<String>,
 
+    #[output(desc = "Single emoji reaction to the current user message, or empty string")]
+    pub reply_reaction: String,
+
+    #[output(desc = "Array of tool calls extracted/fixed from the original response")]
+    pub tool_calls: Vec<AgentToolCall>,
+}
+
+#[derive(dspy_rs::Signature, Debug, Clone)]
+pub struct CorrectionContinuationResponse {
+    #[input(desc = "The original input that was given to the agent")]
+    pub original_input: String,
+
+    #[input(desc = "The malformed response that needs to be corrected")]
+    pub malformed_response: String,
+
+    #[input(desc = "The error message explaining what went wrong with parsing")]
+    pub error_message: String,
+
+    #[input(desc = "Available tools for reference")]
+    pub available_tools: String,
+
+    #[output(desc = "Array of messages extracted/fixed from the original response")]
+    pub messages: Vec<String>,
+
     #[output(desc = "Array of tool calls extracted/fixed from the original response")]
     pub tool_calls: Vec<AgentToolCall>,
 }
@@ -233,6 +372,7 @@ pub struct CorrectionResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentResponseOutput {
     pub messages: Vec<String>,
+    pub reply_reaction: String,
     pub tool_calls: Vec<AgentToolCall>,
 }
 
@@ -245,18 +385,51 @@ pub enum SignatureCallError {
     },
 }
 
+fn continuation_input_from(input: &AgentResponseInput) -> AgentContinuationResponseInput {
+    AgentContinuationResponseInput {
+        input: input.input.clone(),
+        current_time: input.current_time.clone(),
+        agent_kind: input.agent_kind.clone(),
+        subagent_purpose: input.subagent_purpose.clone(),
+        persona_block: input.persona_block.clone(),
+        human_block: input.human_block.clone(),
+        memory_metadata: input.memory_metadata.clone(),
+        previous_context_summary: input.previous_context_summary.clone(),
+        recent_conversation: input.recent_conversation.clone(),
+        available_tools: input.available_tools.clone(),
+        is_first_time_user: input.is_first_time_user,
+    }
+}
+
+fn normalize_messages(mut messages: Vec<String>) -> Vec<String> {
+    messages.retain(|message| !message.trim().is_empty());
+    messages
+}
+
+fn trace_generated_prompt(prompt_kind: &str, system_prompt: &str, user_prompt: &str) {
+    trace!(
+        prompt_kind = %prompt_kind,
+        system_prompt_len = system_prompt.chars().count(),
+        user_prompt_len = user_prompt.chars().count(),
+        system_prompt = system_prompt,
+        user_prompt = user_prompt,
+        "Generated LM prompt"
+    );
+}
+
 pub async fn call_agent_response_with_retry_and_correction(
     lm: &Arc<LM>,
     system_prompt: &str,
     input: &AgentResponseInput,
     original_input: &str,
     available_tools: &str,
+    allow_reply_reaction: bool,
 ) -> Result<AgentResponseOutput, ApiError> {
     const MAX_LLM_RETRIES: u32 = 3;
     let mut last_err: Option<String> = None;
 
     for attempt in 1..=MAX_LLM_RETRIES {
-        match call_agent_response_once(lm, system_prompt, input).await {
+        match call_agent_response_once(lm, system_prompt, input, allow_reply_reaction).await {
             Ok(out) => return Ok(out),
             Err(SignatureCallError::Parse {
                 raw_response,
@@ -269,6 +442,7 @@ pub async fn call_agent_response_with_retry_and_correction(
                     available_tools,
                     &raw_response,
                     &error_message,
+                    allow_reply_reaction,
                 )
                 .await
                 {
@@ -295,6 +469,7 @@ async fn attempt_correction(
     available_tools: &str,
     raw_response: &str,
     error_message: &str,
+    allow_reply_reaction: bool,
 ) -> Result<AgentResponseOutput, ApiError> {
     if raw_response.trim().is_empty() {
         return Err(ApiError::InternalServerError);
@@ -302,87 +477,172 @@ async fn attempt_correction(
 
     let adapter = ChatAdapter;
 
-    let system = adapter
-        .format_system_message_typed_with_instruction::<CorrectionResponse>(Some(
-            CORRECTION_INSTRUCTION,
-        ))
-        .map_err(|e| {
-            error!("Failed to format DSRS correction system prompt: {e:?}");
+    if allow_reply_reaction {
+        let system = adapter
+            .format_system_message_typed_with_instruction::<CorrectionResponse>(Some(
+                CORRECTION_INSTRUCTION,
+            ))
+            .map_err(|e| {
+                error!("Failed to format DSRS correction system prompt: {e:?}");
+                ApiError::InternalServerError
+            })?;
+
+        let input = CorrectionResponseInput {
+            original_input: original_input.to_string(),
+            malformed_response: raw_response.to_string(),
+            error_message: error_message.to_string(),
+            available_tools: available_tools.to_string(),
+        };
+        let user_msg = adapter.format_user_message_typed::<CorrectionResponse>(&input);
+        trace_generated_prompt("agent_response_correction", &system, &user_msg);
+
+        let mut chat = dspy_rs::Chat::new(vec![]);
+        chat.push("system", &system);
+        chat.push("user", &user_msg);
+
+        let response = lm.call(chat, Vec::new()).await.map_err(|e| {
+            error!("DSRS LM correction call failed: {e:?}");
             ApiError::InternalServerError
         })?;
 
-    let input = CorrectionResponseInput {
-        original_input: original_input.to_string(),
-        malformed_response: raw_response.to_string(),
-        error_message: error_message.to_string(),
-        available_tools: available_tools.to_string(),
-    };
-    let user_msg = adapter.format_user_message_typed::<CorrectionResponse>(&input);
+        let (output, _meta) = adapter
+            .parse_response_typed::<CorrectionResponse>(&response.output)
+            .map_err(|e| {
+                error!("DSRS correction typed parse failed: {e:?}");
+                ApiError::InternalServerError
+            })?;
 
-    let mut chat = dspy_rs::Chat::new(vec![]);
-    chat.push("system", &system);
-    chat.push("user", &user_msg);
+        Ok(AgentResponseOutput {
+            messages: output.messages,
+            reply_reaction: output.reply_reaction,
+            tool_calls: output.tool_calls,
+        })
+    } else {
+        let system = adapter
+            .format_system_message_typed_with_instruction::<CorrectionContinuationResponse>(Some(
+                CONTINUATION_CORRECTION_INSTRUCTION,
+            ))
+            .map_err(|e| {
+                error!("Failed to format continuation correction system prompt: {e:?}");
+                ApiError::InternalServerError
+            })?;
 
-    let response = lm.call(chat, Vec::new()).await.map_err(|e| {
-        error!("DSRS LM correction call failed: {e:?}");
-        ApiError::InternalServerError
-    })?;
+        let input = CorrectionContinuationResponseInput {
+            original_input: original_input.to_string(),
+            malformed_response: raw_response.to_string(),
+            error_message: error_message.to_string(),
+            available_tools: available_tools.to_string(),
+        };
+        let user_msg = adapter.format_user_message_typed::<CorrectionContinuationResponse>(&input);
+        trace_generated_prompt("agent_continuation_correction", &system, &user_msg);
 
-    let (output, _meta) = adapter
-        .parse_response_typed::<CorrectionResponse>(&response.output)
-        .map_err(|e| {
-            error!("DSRS correction typed parse failed: {e:?}");
+        let mut chat = dspy_rs::Chat::new(vec![]);
+        chat.push("system", &system);
+        chat.push("user", &user_msg);
+
+        let response = lm.call(chat, Vec::new()).await.map_err(|e| {
+            error!("DSRS continuation correction call failed: {e:?}");
             ApiError::InternalServerError
         })?;
 
-    Ok(AgentResponseOutput {
-        messages: output.messages,
-        tool_calls: output.tool_calls,
-    })
+        let (output, _meta) = adapter
+            .parse_response_typed::<CorrectionContinuationResponse>(&response.output)
+            .map_err(|e| {
+                error!("DSRS continuation correction typed parse failed: {e:?}");
+                ApiError::InternalServerError
+            })?;
+
+        Ok(AgentResponseOutput {
+            messages: output.messages,
+            reply_reaction: String::new(),
+            tool_calls: output.tool_calls,
+        })
+    }
 }
 
 async fn call_agent_response_once(
     lm: &Arc<LM>,
     system_prompt: &str,
     input: &AgentResponseInput,
+    allow_reply_reaction: bool,
 ) -> Result<AgentResponseOutput, SignatureCallError> {
     let adapter = ChatAdapter;
 
-    let system = adapter
-        .format_system_message_typed_with_instruction::<AgentResponse>(Some(system_prompt))
-        .map_err(|e| {
-            error!("Failed to format DSRS system prompt: {e:?}");
+    if allow_reply_reaction {
+        let system = adapter
+            .format_system_message_typed_with_instruction::<AgentResponse>(Some(system_prompt))
+            .map_err(|e| {
+                error!("Failed to format DSRS system prompt: {e:?}");
+                SignatureCallError::Api(ApiError::InternalServerError)
+            })?;
+        let user_msg = adapter.format_user_message_typed::<AgentResponse>(input);
+        trace_generated_prompt("agent_response", &system, &user_msg);
+
+        let mut chat = dspy_rs::Chat::new(vec![]);
+        chat.push("system", &system);
+        chat.push("user", &user_msg);
+
+        let response = lm.call(chat, Vec::new()).await.map_err(|e| {
+            error!("DSRS LM call failed: {e:?}");
             SignatureCallError::Api(ApiError::InternalServerError)
         })?;
-    let user_msg = adapter.format_user_message_typed::<AgentResponse>(input);
 
-    let mut chat = dspy_rs::Chat::new(vec![]);
-    chat.push("system", &system);
-    chat.push("user", &user_msg);
+        let raw_response = response.output.content();
+        let (output, _meta) = adapter
+            .parse_response_typed::<AgentResponse>(&response.output)
+            .map_err(|e| {
+                error!("DSRS typed parse failed: {e:?}");
+                SignatureCallError::Parse {
+                    raw_response,
+                    error_message: e.to_string(),
+                }
+            })?;
 
-    let response = lm.call(chat, Vec::new()).await.map_err(|e| {
-        error!("DSRS LM call failed: {e:?}");
-        SignatureCallError::Api(ApiError::InternalServerError)
-    })?;
+        Ok(AgentResponseOutput {
+            messages: normalize_messages(output.messages),
+            reply_reaction: output.reply_reaction,
+            tool_calls: output.tool_calls,
+        })
+    } else {
+        let continuation_input = continuation_input_from(input);
+        let system = adapter
+            .format_system_message_typed_with_instruction::<AgentContinuationResponse>(Some(
+                system_prompt,
+            ))
+            .map_err(|e| {
+                error!("Failed to format continuation DSRS system prompt: {e:?}");
+                SignatureCallError::Api(ApiError::InternalServerError)
+            })?;
+        let user_msg =
+            adapter.format_user_message_typed::<AgentContinuationResponse>(&continuation_input);
+        trace_generated_prompt("agent_continuation_response", &system, &user_msg);
 
-    let raw_response = response.output.content();
-    let (output, _meta) = adapter
-        .parse_response_typed::<AgentResponse>(&response.output)
-        .map_err(|e| {
-            error!("DSRS typed parse failed: {e:?}");
-            SignatureCallError::Parse {
-                raw_response,
-                error_message: e.to_string(),
-            }
+        let mut chat = dspy_rs::Chat::new(vec![]);
+        chat.push("system", &system);
+        chat.push("user", &user_msg);
+
+        let response = lm.call(chat, Vec::new()).await.map_err(|e| {
+            error!("Continuation DSRS LM call failed: {e:?}");
+            SignatureCallError::Api(ApiError::InternalServerError)
         })?;
 
-    let mut messages = output.messages;
-    messages.retain(|m| !m.trim().is_empty());
+        let raw_response = response.output.content();
+        let (output, _meta) = adapter
+            .parse_response_typed::<AgentContinuationResponse>(&response.output)
+            .map_err(|e| {
+                error!("Continuation DSRS typed parse failed: {e:?}");
+                SignatureCallError::Parse {
+                    raw_response,
+                    error_message: e.to_string(),
+                }
+            })?;
 
-    Ok(AgentResponseOutput {
-        messages,
-        tool_calls: output.tool_calls,
-    })
+        Ok(AgentResponseOutput {
+            messages: normalize_messages(output.messages),
+            reply_reaction: String::new(),
+            tool_calls: output.tool_calls,
+        })
+    }
 }
 
 pub async fn build_lm(

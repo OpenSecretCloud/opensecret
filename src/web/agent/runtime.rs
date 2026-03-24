@@ -45,8 +45,8 @@ use super::signatures::{
 };
 use super::tools::{
     ArchivalInsertTool, ArchivalSearchTool, ConversationSearchTool, DoneTool, MemoryAppendTool,
-    MemoryInsertTool, MemoryReplaceTool, SpawnSubagentTool, ToolRegistry, ToolResult,
-    WebSearchTool,
+    MemoryInsertTool, MemoryReplaceTool, SetPreferenceTool, SpawnSubagentTool, ToolRegistry,
+    ToolResult, WebSearchTool,
 };
 use super::vision;
 
@@ -201,7 +201,7 @@ async fn subagent_metadata_enc(
     .await
 }
 
-fn normalize_optional_preference(value: Option<&str>) -> Option<String> {
+pub(crate) fn normalize_optional_preference(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -297,7 +297,7 @@ fn format_message_timestamp(
     }
 }
 
-async fn upsert_user_preference(
+pub(crate) async fn upsert_user_preference(
     conn: &mut diesel::PgConnection,
     user_key: &SecretKey,
     user_id: Uuid,
@@ -666,6 +666,11 @@ impl AgentRuntime {
             user.clone(),
             user_key.clone(),
             conversation.id,
+        )));
+        tools.register(Arc::new(SetPreferenceTool::new(
+            state.clone(),
+            user.uuid,
+            user_key.clone(),
         )));
         if let Some(brave_client) = state.brave_client.clone() {
             tools.register(Arc::new(WebSearchTool::new(brave_client)));

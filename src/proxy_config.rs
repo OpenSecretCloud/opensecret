@@ -163,8 +163,8 @@ impl ProxyRouter {
 
             let kimi_route = match kimi_proxy {
                 Some(kimi) => ModelRoute {
-                    primary: kimi.clone(),
-                    fallbacks: vec![tinfoil.clone()],
+                    primary: tinfoil.clone(),
+                    fallbacks: vec![kimi.clone()],
                 },
                 None => tinfoil_route.clone(),
             };
@@ -543,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn test_agent_kimi_uses_chutes_with_tinfoil_fallback() {
+    fn test_agent_kimi_uses_tinfoil_with_chutes_fallback() {
         let router = ProxyRouter::new(
             "http://continuum.example.com".to_string(),
             None,
@@ -556,13 +556,14 @@ mod tests {
         assert_eq!(kimi_route.primary.provider_name, "tinfoil");
 
         let agent_kimi_route = router.get_model_route(MODEL_KIMI_K2_5_AGENT).unwrap();
-        assert_eq!(agent_kimi_route.primary.provider_name, "chutes");
+        assert_eq!(agent_kimi_route.primary.provider_name, "tinfoil");
+        assert_eq!(agent_kimi_route.primary.api_key, None);
+        assert_eq!(agent_kimi_route.fallbacks.len(), 1);
         assert_eq!(
-            agent_kimi_route.primary.api_key,
+            agent_kimi_route.fallbacks[0].api_key,
             Some("test-token".to_string())
         );
-        assert_eq!(agent_kimi_route.fallbacks.len(), 1);
-        assert_eq!(agent_kimi_route.fallbacks[0].provider_name, "tinfoil");
+        assert_eq!(agent_kimi_route.fallbacks[0].provider_name, "chutes");
     }
 
     #[test]

@@ -186,10 +186,8 @@ const AGENT_SSE_KEEPALIVE_INTERVAL_SECS: u64 = 15;
 
 #[derive(Debug, Clone, Serialize)]
 struct AgentMessageEvent {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message_id: Option<Uuid>,
-    messages: Vec<String>,
-    step: usize,
+    message_id: Uuid,
+    message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -199,15 +197,10 @@ struct AgentReactionEvent {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct AgentTypingEvent {
-    step: usize,
-}
+struct AgentTypingEvent {}
 
 #[derive(Debug, Clone, Serialize)]
-struct AgentDoneEvent {
-    total_steps: usize,
-    total_messages: usize,
-}
+struct AgentDoneEvent {}
 
 #[derive(Debug, Clone, Serialize)]
 struct AgentErrorEvent {
@@ -1062,7 +1055,7 @@ async fn run_agent_chat_task(
 
     client_connected = send_agent_client_event(
         &tx,
-        AgentClientEvent::Typing(AgentTypingEvent { step: 0 }),
+        AgentClientEvent::Typing(AgentTypingEvent {}),
         client_connected,
     )
     .await;
@@ -1140,12 +1133,6 @@ async fn run_agent_chat_task(
             had_reaction,
             "Starting agent chat step"
         );
-        client_connected = send_agent_client_event(
-            &tx,
-            AgentClientEvent::Typing(AgentTypingEvent { step: step_num }),
-            client_connected,
-        )
-        .await;
 
         match runtime.step(&input_for_agent, step_num == 0).await {
             Ok(result) => {
@@ -1205,23 +1192,32 @@ async fn run_agent_chat_task(
                 }
 
                 if !messages.is_empty() {
-                    total_messages += messages.len();
-
                     for msg in messages {
                         let assistant_message = match runtime.insert_assistant_message(&msg).await {
-                            Ok(message) => Some(message),
+                            Ok(message) => message,
                             Err(e) => {
                                 error!("Failed to persist assistant message: {e:?}");
-                                None
+                                had_error = true;
+                                let _ = send_agent_client_event(
+                                    &tx,
+                                    AgentClientEvent::Error(AgentErrorEvent {
+                                        error: "Agent encountered an error saving its response."
+                                            .to_string(),
+                                    }),
+                                    client_connected,
+                                )
+                                .await;
+                                break 'steps;
                             }
                         };
+
+                        total_messages += 1;
 
                         let delivered = send_agent_message_event(
                             &tx,
                             AgentMessageEvent {
-                                message_id: assistant_message.as_ref().map(|message| message.uuid),
-                                messages: vec![msg.clone()],
-                                step: step_num,
+                                message_id: assistant_message.uuid,
+                                message: msg.clone(),
                             },
                             client_connected,
                         )
@@ -1229,11 +1225,9 @@ async fn run_agent_chat_task(
 
                         if !delivered {
                             client_connected = false;
-                            if let Some(assistant_message) = assistant_message {
-                                if first_undelivered_message.is_none() {
-                                    first_undelivered_message =
-                                        Some((assistant_message.uuid, msg.clone()));
-                                }
+                            if first_undelivered_message.is_none() {
+                                first_undelivered_message =
+                                    Some((assistant_message.uuid, msg.clone()));
                             }
                         } else {
                             client_connected = true;
@@ -1267,35 +1261,56 @@ async fn run_agent_chat_task(
             target = chat_target_label(&target),
             "Agent produced no messages or reactions; sending fallback response"
         );
-        let _ =
-            send_agent_message_event(
-                &tx,
-                AgentMessageEvent {
-                    message_id: None,
-                    messages: vec![
-                        "I apologize, but I wasn't able to generate a response.".to_string()
-                    ],
-                    step: 0,
-                },
-                client_connected,
-            )
-            .await;
-        total_messages = 1;
+        let fallback_message = "I apologize, but I wasn't able to generate a response.".to_string();
+        match runtime.insert_assistant_message(&fallback_message).await {
+            Ok(message) => {
+                total_messages = 1;
+                let delivered = send_agent_message_event(
+                    &tx,
+                    AgentMessageEvent {
+                        message_id: message.uuid,
+                        message: fallback_message.clone(),
+                    },
+                    client_connected,
+                )
+                .await;
+
+                if !delivered {
+                    client_connected = false;
+                    if first_undelivered_message.is_none() {
+                        first_undelivered_message = Some((message.uuid, fallback_message));
+                    }
+                } else {
+                    client_connected = true;
+                }
+            }
+            Err(e) => {
+                error!("Failed to persist fallback assistant message: {e:?}");
+                had_error = true;
+                let _ = send_agent_client_event(
+                    &tx,
+                    AgentClientEvent::Error(AgentErrorEvent {
+                        error: "Agent encountered an error saving its response.".to_string(),
+                    }),
+                    client_connected,
+                )
+                .await;
+            }
+        }
     }
 
     if let Some((message_id, message_text)) = first_undelivered_message {
         enqueue_agent_push_for_disconnect(&state, &user, &target, message_id, &message_text).await;
     }
 
-    let _ = send_agent_client_event(
-        &tx,
-        AgentClientEvent::Done(AgentDoneEvent {
-            total_steps: max_steps,
-            total_messages,
-        }),
-        client_connected,
-    )
-    .await;
+    if !had_error {
+        let _ = send_agent_client_event(
+            &tx,
+            AgentClientEvent::Done(AgentDoneEvent {}),
+            client_connected,
+        )
+        .await;
+    }
 
     debug!(
         user_uuid = %user.uuid,

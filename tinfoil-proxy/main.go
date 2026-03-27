@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/openai/openai-go/v2"
 	"github.com/openai/openai-go/v2/option"
+	"github.com/openai/openai-go/v2/packages/respjson"
 	"github.com/tinfoilsh/tinfoil-go"
 )
 
@@ -66,6 +67,7 @@ var modelConfigs = map[string]struct {
 type ChatMessage struct {
 	Role             string           `json:"role,omitempty"`
 	Content          interface{}      `json:"content,omitempty"`
+	Reasoning        string           `json:"reasoning,omitempty"`
 	ReasoningContent string           `json:"reasoning_content,omitempty"` // For reasoning_content in LLM responses
 	ToolCalls        []map[string]any `json:"tool_calls,omitempty"`
 	Refusal          string           `json:"refusal,omitempty"`
@@ -283,6 +285,59 @@ func isCertificateError(err error) bool {
 		strings.Contains(errStr, "tls")
 }
 
+func extractExtraFieldString(extraFields map[string]respjson.Field, keys ...string) (string, bool) {
+	for _, key := range keys {
+		field, ok := extraFields[key]
+		if !ok || field.Raw() == "" || field.Raw() == "null" {
+			continue
+		}
+
+		var value string
+		if err := json.Unmarshal([]byte(field.Raw()), &value); err != nil {
+			log.Printf("Failed to decode %s field: %v", key, err)
+			continue
+		}
+
+		return value, true
+	}
+
+	return "", false
+}
+
+func populateReasoningFields(msg *ChatMessage, extraFields map[string]respjson.Field) {
+	if msg == nil {
+		return
+	}
+
+	if reasoning, ok := extractExtraFieldString(extraFields, "reasoning"); ok {
+		msg.Reasoning = reasoning
+	}
+	if reasoningContent, ok := extractExtraFieldString(extraFields, "reasoning_content"); ok {
+		msg.ReasoningContent = reasoningContent
+	}
+}
+
+func buildAssistantMessage(content string, msg ChatMessage) openai.ChatCompletionMessageParamUnion {
+	var assistant openai.ChatCompletionAssistantMessageParam
+	assistant.Content.OfString = openai.String(content)
+	if msg.Refusal != "" {
+		assistant.Refusal = openai.String(msg.Refusal)
+	}
+
+	extraFields := make(map[string]any)
+	if msg.Reasoning != "" {
+		extraFields["reasoning"] = msg.Reasoning
+	}
+	if msg.ReasoningContent != "" {
+		extraFields["reasoning_content"] = msg.ReasoningContent
+	}
+	if len(extraFields) > 0 {
+		assistant.SetExtraFields(extraFields)
+	}
+
+	return openai.ChatCompletionMessageParamUnion{OfAssistant: &assistant}
+}
+
 // convertToOpenAIMessage handles both string content and multimodal content arrays
 func convertToOpenAIMessage(msg ChatMessage, role string) openai.ChatCompletionMessageParamUnion {
 	// If content is a string, use the simple message constructors
@@ -291,7 +346,7 @@ func convertToOpenAIMessage(msg ChatMessage, role string) openai.ChatCompletionM
 		case "user":
 			return openai.UserMessage(contentStr)
 		case "assistant":
-			return openai.AssistantMessage(contentStr)
+			return buildAssistantMessage(contentStr, msg)
 		case "system":
 			return openai.SystemMessage(contentStr)
 		default:
@@ -338,7 +393,7 @@ func convertToOpenAIMessage(msg ChatMessage, role string) openai.ChatCompletionM
 	case "user":
 		return openai.UserMessage(string(contentJSON))
 	case "assistant":
-		return openai.AssistantMessage(string(contentJSON))
+		return buildAssistantMessage(string(contentJSON), msg)
 	case "system":
 		return openai.SystemMessage(string(contentJSON))
 	default:
@@ -605,21 +660,14 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 					streamFinished = true
 				}
 
-				// Build delta with reasoning_content from ExtraFields
+				// Build delta with reasoning from ExtraFields
 				delta := ChatMessage{
 					Role:    choice.Delta.Role,
 					Content: choice.Delta.Content,
 					Refusal: choice.Delta.Refusal,
 				}
 
-				// Extract reasoning_content from ExtraFields (SDK doesn't have this field)
-				if rcField, ok := choice.Delta.JSON.ExtraFields["reasoning_content"]; ok && rcField.Raw() != "null" {
-					// Properly unmarshal JSON string to handle escape sequences (\", \\, \n, etc.)
-					var rc string
-					if err := json.Unmarshal([]byte(rcField.Raw()), &rc); err == nil {
-						delta.ReasoningContent = rc
-					}
-				}
+				populateReasoningFields(&delta, choice.Delta.JSON.ExtraFields)
 
 				// Handle tool_calls via raw JSON since it's complex
 				if len(choice.Delta.ToolCalls) > 0 {
@@ -859,8 +907,18 @@ func (s *TinfoilProxyServer) nonStreamingChatCompletion(c *gin.Context, req Chat
 	response.Model = req.Model
 	response.Object = "chat.completion"
 
-	// Fix for finish_reason: ensure empty strings are converted to nil
+	// Restore reasoning fields from SDK extra fields and fix finish_reason values.
 	for i := range response.Choices {
+		if i < len(completion.Choices) {
+			if response.Choices[i].Message == nil {
+				response.Choices[i].Message = &ChatMessage{
+					Role:    string(completion.Choices[i].Message.Role),
+					Content: completion.Choices[i].Message.Content,
+					Refusal: completion.Choices[i].Message.Refusal,
+				}
+			}
+			populateReasoningFields(response.Choices[i].Message, completion.Choices[i].Message.JSON.ExtraFields)
+		}
 		if response.Choices[i].FinishReason != nil && *response.Choices[i].FinishReason == "" {
 			response.Choices[i].FinishReason = nil
 		}

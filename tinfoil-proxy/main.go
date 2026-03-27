@@ -319,9 +319,7 @@ func populateReasoningFields(msg *ChatMessage, extraFields map[string]respjson.F
 
 func buildAssistantMessage(content string, msg ChatMessage) openai.ChatCompletionMessageParamUnion {
 	var assistant openai.ChatCompletionAssistantMessageParam
-	if content != "" {
-		assistant.Content.OfString = openai.String(content)
-	}
+	assistant.Content.OfString = openai.String(content)
 	if msg.Refusal != "" {
 		assistant.Refusal = openai.String(msg.Refusal)
 	}

@@ -1721,15 +1721,22 @@ async fn setup_completion_processor(
                                     .and_then(|c| c.get(0))
                                     .and_then(|c| c.get("delta"));
 
-                                // Log full delta to see reasoning_content if present
+                                // Log full delta to see reasoning fields if present
                                 if let Some(d) = delta {
                                     trace!("Stream delta: {}", d);
                                 }
 
-                                // Extract reasoning_content for thinking models (e.g., deepseek-r1)
+                                // Extract reasoning for thinking models while remaining
+                                // compatible with older reasoning_content payloads.
                                 if let Some(reasoning) = delta
-                                    .and_then(|d| d.get("reasoning_content"))
-                                    .and_then(|c| c.as_str())
+                                    .and_then(|d| {
+                                        d.get("reasoning")
+                                            .and_then(|c| c.as_str())
+                                            .or_else(|| {
+                                                d.get("reasoning_content")
+                                                    .and_then(|c| c.as_str())
+                                            })
+                                    })
                                 {
                                     if !reasoning.is_empty() {
                                         // Generate UUID on first reasoning delta - this ensures SSE and DB use the same ID

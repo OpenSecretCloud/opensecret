@@ -1198,7 +1198,9 @@ async fn persist_request_data(
         response_id: Some(response.id),
         user_id: user.uuid,
         content_enc: prepared.content_enc.clone(),
+        attachment_text_enc: None,
         prompt_tokens: prepared.user_message_tokens,
+        assistant_reaction: None,
     };
     let user_message = state
         .db
@@ -1591,6 +1593,7 @@ async fn setup_completion_processor(
         completion_tokens: 0,
         status: STATUS_IN_PROGRESS.to_string(),
         finish_reason: None,
+        user_reaction: None,
     };
     state
         .db

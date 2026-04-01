@@ -32,7 +32,6 @@ pub enum EncryptError {
 }
 
 pub async fn encrypt_with_key(encryption_key: &SecretKey, bytes: &[u8]) -> Vec<u8> {
-    tracing::debug!("Entering encrypt_with_key");
     let cipher = Aes256Gcm::new_from_slice(&encryption_key.secret_bytes()).expect("should convert");
 
     // Generate a random 96-bit nonce
@@ -46,13 +45,10 @@ pub async fn encrypt_with_key(encryption_key: &SecretKey, bytes: &[u8]) -> Vec<u
     let mut encrypted = nonce.to_vec();
     encrypted.extend(ciphertext);
 
-    tracing::debug!("Exiting encrypt_with_key");
     encrypted
 }
 
 pub fn decrypt_with_key(encryption_key: &SecretKey, bytes: &[u8]) -> Result<Vec<u8>, EncryptError> {
-    tracing::trace!("Entering decrypt_with_key");
-
     if bytes.len() < 12 {
         tracing::error!(
             "Decrypt failed: Input too short (length {}), minimum 12 bytes required",
@@ -81,7 +77,6 @@ pub fn decrypt_with_key(encryption_key: &SecretKey, bytes: &[u8]) -> Result<Vec<
         EncryptError::FailedToDecrypt
     })?;
 
-    tracing::trace!("Exiting decrypt_with_key");
     Ok(result)
 }
 

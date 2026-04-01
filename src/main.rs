@@ -14,12 +14,15 @@ use crate::models::account_deletion::{AccountDeletionError, NewAccountDeletionRe
 use crate::models::password_reset::NewPasswordResetRequest;
 use crate::models::platform_password_reset::NewPlatformPasswordResetRequest;
 use crate::models::platform_users::PlatformUser;
+use crate::push::worker::start_push_worker;
 use crate::sqs::SqsEventPublisher;
+use crate::web::agent::start_schedule_worker;
 use crate::web::openai_auth::validate_openai_auth;
 use crate::web::platform_login_routes;
 use crate::web::{
-    conversations_routes, document_routes, health_routes_with_state, instructions_routes,
-    login_routes, oauth_routes, openai_routes, protected_routes, responses_routes,
+    agent_routes, conversations_routes, document_routes, health_routes_with_state,
+    instructions_routes, login_routes, oauth_routes, openai_routes, protected_routes, push_routes,
+    rag_routes, responses_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
@@ -85,6 +88,8 @@ mod oauth;
 mod os_flags;
 mod private_key;
 mod proxy_config;
+mod push;
+mod rag;
 mod sqs;
 mod tokens;
 mod web;
@@ -108,6 +113,7 @@ const BILLING_API_KEY_NAME: &str = "billing_api_key";
 const BILLING_SERVER_URL_NAME: &str = "billing_server_url";
 const KAGI_API_KEY_NAME: &str = "kagi_api_key";
 const BRAVE_API_KEY_NAME: &str = "brave_api_key";
+const CHUTES_API_KEY_NAME: &str = "chutes_api_key";
 const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
 const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
 
@@ -408,6 +414,7 @@ pub struct AppState {
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
     enclave_key: Vec<u8>,
     proxy_router: Arc<ProxyRouter>,
+    rag_cache: Arc<tokio::sync::Mutex<rag::RagCache>>,
     resend_api_key: Option<String>,
     ephemeral_keys: Arc<RwLock<HashMap<String, EphemeralSecret>>>,
     session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, SessionState>>>,
@@ -430,6 +437,8 @@ pub struct AppStateBuilder {
     openai_api_key: Option<String>,
     openai_api_base: Option<String>,
     tinfoil_api_base: Option<String>,
+    chutes_api_base: Option<String>,
+    chutes_api_key: Option<String>,
     jwt_secret: Option<Vec<u8>>,
     resend_api_key: Option<String>,
     github_client_secret: Option<String>,
@@ -484,6 +493,16 @@ impl AppStateBuilder {
 
     pub fn tinfoil_api_base(mut self, tinfoil_api_base: Option<String>) -> Self {
         self.tinfoil_api_base = tinfoil_api_base;
+        self
+    }
+
+    pub fn chutes_api_base(mut self, chutes_api_base: Option<String>) -> Self {
+        self.chutes_api_base = chutes_api_base;
+        self
+    }
+
+    pub fn chutes_api_key(mut self, chutes_api_key: Option<String>) -> Self {
+        self.chutes_api_key = chutes_api_key;
         self
     }
 
@@ -674,6 +693,8 @@ impl AppStateBuilder {
             openai_api_base.clone(),
             self.openai_api_key.clone(),
             self.tinfoil_api_base.clone(),
+            self.chutes_api_base.clone(),
+            self.chutes_api_key.clone(),
         ));
 
         let (cancellation_tx, _) = tokio::sync::broadcast::channel(1024);
@@ -726,6 +747,7 @@ impl AppStateBuilder {
             aws_credential_manager,
             enclave_key,
             proxy_router,
+            rag_cache: Arc::new(tokio::sync::Mutex::new(rag::RagCache::default())),
             resend_api_key: self.resend_api_key,
             ephemeral_keys: Arc::new(RwLock::new(HashMap::new())),
             session_states: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -900,8 +922,6 @@ impl AppState {
         derivation_path: Option<&str>,
         seed_phrase_derivation_path: Option<&str>,
     ) -> Result<SecretKey, Error> {
-        info!("Getting user key for UUID: {}", user_uuid);
-
         if let Some(path) = derivation_path {
             debug!("Using BIP-32 derivation path: {}", path);
         }
@@ -911,13 +931,9 @@ impl AppState {
         }
 
         let user = self.get_user(user_uuid).await?;
-        debug!("User retrieved successfully");
 
         let encrypted_seed = match user.get_seed_encrypted().await {
-            Some(es) => {
-                debug!("Found existing encrypted seed for user");
-                es
-            }
+            Some(es) => es,
             None => {
                 // create seed if not already exists
                 info!(
@@ -932,7 +948,6 @@ impl AppState {
             }
         };
 
-        debug!("Decrypting user seed and deriving key");
         let user_secret_key = decrypt_user_seed_to_key(
             self.enclave_key.clone(),
             encrypted_seed,
@@ -940,7 +955,6 @@ impl AppState {
             seed_phrase_derivation_path,
         )?;
 
-        info!("Successfully derived key for user: {}", user_uuid);
         Ok(user_secret_key)
     }
 
@@ -1698,7 +1712,17 @@ impl AppState {
         project_id: i32,
         key_name: &str,
     ) -> Result<Option<String>, Error> {
-        // Get the encrypted secret
+        Ok(self
+            .get_project_secret_bytes(project_id, key_name)
+            .await?
+            .map(|bytes| general_purpose::STANDARD.encode(bytes)))
+    }
+
+    pub async fn get_project_secret_bytes(
+        &self,
+        project_id: i32,
+        key_name: &str,
+    ) -> Result<Option<Vec<u8>>, Error> {
         let secret = match self
             .db
             .get_org_project_secret_by_key_name_and_project(key_name, project_id)?
@@ -1707,15 +1731,24 @@ impl AppState {
             None => return Ok(None),
         };
 
-        // Decrypt the secret using the enclave key
         let secret_key = SecretKey::from_slice(&self.enclave_key)
             .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
         let decrypted_bytes = decrypt_with_key(&secret_key, &secret.secret_enc)
             .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
-        // Always return base64 encoded bytes
-        Ok(Some(general_purpose::STANDARD.encode(&decrypted_bytes)))
+        Ok(Some(decrypted_bytes))
+    }
+
+    pub async fn get_project_secret_string(
+        &self,
+        project_id: i32,
+        key_name: &str,
+    ) -> Result<Option<String>, Error> {
+        let secret = self.get_project_secret_bytes(project_id, key_name).await?;
+        secret
+            .map(|bytes| String::from_utf8(bytes).map_err(|_| Error::SecretParsingError))
+            .transpose()
     }
 
     pub async fn get_project_resend_api_key(
@@ -2418,6 +2451,44 @@ async fn retrieve_brave_api_key(
     }
 }
 
+async fn retrieve_chutes_api_key(
+    aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
+    db: Arc<dyn DBConnection + Send + Sync>,
+) -> Result<Option<String>, Error> {
+    let creds = aws_credential_manager
+        .read()
+        .await
+        .clone()
+        .expect("non-local mode should have creds")
+        .get_credentials()
+        .await
+        .expect("non-local mode should have creds");
+
+    let existing_key = db.get_enclave_secret_by_key(CHUTES_API_KEY_NAME)?;
+
+    if let Some(ref encrypted_key) = existing_key {
+        let base64_encrypted_key = general_purpose::STANDARD.encode(&encrypted_key.value);
+
+        debug!("trying to decrypt base64 encrypted Chutes API key");
+
+        let decrypted_bytes = decrypt_with_kms(
+            &creds.region,
+            &creds.access_key_id,
+            &creds.secret_access_key,
+            &creds.token,
+            &base64_encrypted_key,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        String::from_utf8(decrypted_bytes)
+            .map_err(|e| Error::EncryptionError(format!("Failed to decode UTF-8: {}", e)))
+            .map(Some)
+    } else {
+        tracing::info!("Chutes API key not found in the database");
+        Ok(None)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     // Add debug logs for entrypoints and exit points
@@ -2589,8 +2660,38 @@ async fn main() -> Result<(), Error> {
         None // No API key needed if not using OpenAI's domain
     };
 
-    // Tinfoil API base is always from environment (like OpenAI API base)
-    let tinfoil_api_base = env::var("TINFOIL_API_BASE").ok();
+    let tinfoil_api_base = env::var("TINFOIL_API_BASE").ok().and_then(|base| {
+        let base = base.trim();
+        (!base.is_empty()).then(|| base.to_string())
+    });
+
+    let chutes_api_key = if app_mode != AppMode::Local {
+        retrieve_chutes_api_key(aws_credential_manager.clone(), db.clone()).await?
+    } else {
+        env::var("CHUTES_API_KEY").ok().and_then(|token| {
+            let token = token.trim();
+            (!token.is_empty()).then(|| token.to_string())
+        })
+    };
+
+    let chutes_api_base = if chutes_api_key.is_some() {
+        env::var("CHUTES_API_BASE")
+            .ok()
+            .and_then(|base| {
+                let base = base.trim();
+                (!base.is_empty()).then(|| base.to_string())
+            })
+            .or_else(|| Some("https://llm.chutes.ai".to_string()))
+    } else {
+        None
+    };
+
+    if let Some(chutes_api_base) = chutes_api_base.as_deref() {
+        tracing::info!(
+            "Agent-only Kimi provider enabled via Chutes at {}",
+            chutes_api_base
+        );
+    }
 
     let jwt_secret = get_or_create_jwt_secret(
         &app_mode,
@@ -2725,6 +2826,8 @@ async fn main() -> Result<(), Error> {
         .openai_api_key(openai_api_key)
         .openai_api_base(openai_api_base)
         .tinfoil_api_base(tinfoil_api_base)
+        .chutes_api_base(chutes_api_base)
+        .chutes_api_key(chutes_api_key)
         .jwt_secret(jwt_secret)
         .resend_api_key(resend_api_key)
         .github_client_secret(github_client_secret.clone())
@@ -2753,6 +2856,9 @@ async fn main() -> Result<(), Error> {
         google_client_id.clone(),
     )
     .await?;
+
+    start_push_worker(app_state.clone());
+    start_schedule_worker(app_state.clone());
 
     let cors = CorsLayer::new()
         // allow all method types
@@ -2784,6 +2890,18 @@ async fn main() -> Result<(), Error> {
         )
         .merge(
             document_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            rag_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            agent_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            push_routes(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
         )
         .merge(attestation_routes::router(app_state.clone()))

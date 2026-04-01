@@ -107,10 +107,14 @@ type ChatCompletionRequest struct {
 	PromptCacheKey   *string `json:"prompt_cache_key,omitempty"`
 	SafetyIdentifier *string `json:"safety_identifier,omitempty"`
 	// Advanced parameters
-	LogitBias   map[string]int `json:"logit_bias,omitempty"`
-	Metadata    map[string]any `json:"metadata,omitempty"`
-	Modalities  []string       `json:"modalities,omitempty"`
-	ServiceTier *string        `json:"service_tier,omitempty"`
+	LogitBias           map[string]int `json:"logit_bias,omitempty"`
+	Metadata            map[string]any `json:"metadata,omitempty"`
+	Modalities          []string       `json:"modalities,omitempty"`
+	ServiceTier         *string        `json:"service_tier,omitempty"`
+	Thinking            map[string]any `json:"thinking,omitempty"`
+	IncludeReasoning    *bool          `json:"include_reasoning,omitempty"`
+	ThinkingTokenBudget *int           `json:"thinking_token_budget,omitempty"`
+	ChatTemplateKwargs  map[string]any `json:"chat_template_kwargs,omitempty"`
 }
 
 type ModelInfo struct {
@@ -338,6 +342,29 @@ func buildAssistantMessage(content string, msg ChatMessage) openai.ChatCompletio
 	return openai.ChatCompletionMessageParamUnion{OfAssistant: &assistant}
 }
 
+func buildExtraChatCompletionFields(req ChatCompletionRequest) map[string]any {
+	extraFields := make(map[string]any)
+
+	if req.Thinking != nil {
+		extraFields["thinking"] = req.Thinking
+	}
+	if req.IncludeReasoning != nil {
+		extraFields["include_reasoning"] = *req.IncludeReasoning
+	}
+	if req.ThinkingTokenBudget != nil {
+		extraFields["thinking_token_budget"] = *req.ThinkingTokenBudget
+	}
+	if req.ChatTemplateKwargs != nil {
+		extraFields["chat_template_kwargs"] = req.ChatTemplateKwargs
+	}
+
+	if len(extraFields) == 0 {
+		return nil
+	}
+
+	return extraFields
+}
+
 // convertToOpenAIMessage handles both string content and multimodal content arrays
 func convertToOpenAIMessage(msg ChatMessage, role string) openai.ChatCompletionMessageParamUnion {
 	// If content is a string, use the simple message constructors
@@ -548,6 +575,9 @@ func (s *TinfoilProxyServer) streamChatCompletion(c *gin.Context, req ChatComple
 	}
 	if req.ServiceTier != nil {
 		params.ServiceTier = openai.ChatCompletionNewParamsServiceTier(*req.ServiceTier)
+	}
+	if extraFields := buildExtraChatCompletionFields(req); len(extraFields) > 0 {
+		params.SetExtraFields(extraFields)
 	}
 
 	// Create context for cancellation
@@ -877,6 +907,9 @@ func (s *TinfoilProxyServer) nonStreamingChatCompletion(c *gin.Context, req Chat
 	}
 	if req.ServiceTier != nil {
 		params.ServiceTier = openai.ChatCompletionNewParamsServiceTier(*req.ServiceTier)
+	}
+	if extraFields := buildExtraChatCompletionFields(req); len(extraFields) > 0 {
+		params.SetExtraFields(extraFields)
 	}
 
 	// Create completion

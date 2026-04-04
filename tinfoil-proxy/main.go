@@ -56,6 +56,11 @@ var modelConfigs = map[string]struct {
 		Description: "Vision-capable language model with 256K context. Supports image understanding and multimodal tasks.",
 		Active:      true,
 	},
+	"gemma4-31b": {
+		ModelID:     "gemma4-31b",
+		Description: "Multimodal model with 256K context, built-in thinking, image understanding, and native function calling.",
+		Active:      true,
+	},
 	"whisper-large-v3-turbo": {
 		ModelID:     "whisper-large-v3-turbo",
 		Description: "Fast and accurate speech-to-text transcription model",

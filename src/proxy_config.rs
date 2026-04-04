@@ -136,6 +136,7 @@ impl ProxyRouter {
             routes.insert("deepseek-r1-0528".to_string(), tinfoil_route.clone());
             routes.insert("qwen3-vl-30b".to_string(), tinfoil_route.clone());
             routes.insert("kimi-k2-5".to_string(), tinfoil_route.clone());
+            routes.insert("gemma4-31b".to_string(), tinfoil_route.clone());
             routes.insert("nomic-embed-text".to_string(), tinfoil_route.clone());
 
             // Continuum-only models
@@ -175,6 +176,7 @@ impl ProxyRouter {
                 "deepseek-r1-0528",
                 "qwen3-vl-30b",
                 "kimi-k2-5",
+                "gemma4-31b",
                 "nomic-embed-text",
             ]
         } else {
@@ -264,6 +266,10 @@ mod tests {
             router.get_model_name_for_provider("gemma-3-27b", "continuum"),
             "gemma-3-27b"
         );
+        assert_eq!(
+            router.get_model_name_for_provider("gemma4-31b", "tinfoil"),
+            "gemma4-31b"
+        );
     }
 
     #[test]
@@ -337,6 +343,12 @@ mod tests {
         let tinfoil_llama_route = router.get_model_route("llama3-3-70b");
         assert!(tinfoil_llama_route.is_some());
 
+        let gemma4_route = router.get_model_route("gemma4-31b");
+        assert!(gemma4_route.is_some());
+        let route = gemma4_route.unwrap();
+        assert_eq!(route.primary.provider_name, "tinfoil");
+        assert!(route.fallbacks.is_empty());
+
         // Test gpt-oss-120b has both providers (Tinfoil primary, Continuum fallback)
         let gpt_route = router.get_model_route("gpt-oss-120b");
         assert!(gpt_route.is_some());
@@ -361,6 +373,9 @@ mod tests {
         // llama-3.3-70b should NOT be available without Tinfoil
         let llama_route = router.get_model_route("llama-3.3-70b");
         assert!(llama_route.is_none());
+
+        let gemma4_route = router.get_model_route("gemma4-31b");
+        assert!(gemma4_route.is_none());
 
         // But gemma and gpt-oss should be available on Continuum
         let gemma_route = router.get_model_route("gemma-3-27b");
@@ -459,6 +474,7 @@ mod tests {
             .map(|m| m["id"].as_str().unwrap().to_string())
             .collect();
         assert!(model_ids.contains(&"llama-3.3-70b".to_string()));
+        assert!(model_ids.contains(&"gemma4-31b".to_string()));
         assert!(model_ids.contains(&"gpt-oss-120b".to_string()));
     }
 }

@@ -3,7 +3,7 @@
 
 use crate::{
     encrypt::{decrypt_content, encrypt_with_key},
-    models::responses::NewConversation,
+    models::responses::{ConversationProjectFilter, NewConversation},
     models::users::User,
     web::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
@@ -13,7 +13,7 @@ use crate::{
                 OBJECT_TYPE_LIST, OBJECT_TYPE_LIST_DELETED,
             },
             error_mapping, ConversationBuilder, ConversationItem, ConversationItemConverter,
-            DeletedObjectResponse, MessageContent, Paginator,
+            DeletedObjectResponse, MessageContent, NullableField, Paginator,
         },
     },
     ApiError, AppState,
@@ -26,7 +26,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
@@ -105,6 +105,14 @@ pub struct CreateConversationRequest {
     #[serde(default)]
     pub metadata: Option<Value>,
 
+    /// Optional project to assign on creation
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+
+    /// Whether the conversation should be pinned
+    #[serde(default)]
+    pub pinned: Option<bool>,
+
     /// Initial items to include in the conversation
     #[serde(default)]
     pub items: Option<Vec<ConversationInputItem>>,
@@ -122,10 +130,19 @@ pub enum ConversationInputItem {
 }
 
 /// Request to update a conversation
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct UpdateConversationRequest {
-    /// Updated metadata (required per OpenAI spec)
-    pub metadata: Value,
+    /// Replaced metadata blob when present
+    #[serde(default)]
+    pub metadata: Option<Value>,
+
+    /// Project assignment update: omitted = unchanged, null = clear, UUID = assign
+    #[serde(default)]
+    pub project_id: NullableField<Uuid>,
+
+    /// Pin state update
+    #[serde(default)]
+    pub pinned: Option<bool>,
 }
 
 /// Request to create items in a conversation
@@ -141,6 +158,17 @@ pub struct CreateConversationItemsRequest {
 pub struct BatchDeleteConversationsRequest {
     /// IDs of conversations to delete
     pub ids: Vec<Uuid>,
+}
+
+/// Request to batch update conversation project assignments
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchUpdateConversationProjectRequest {
+    /// IDs of conversations to update
+    pub ids: Vec<Uuid>,
+
+    /// Target project ID. Explicit null clears project assignment; omitted is invalid.
+    #[serde(default)]
+    pub project_id: NullableField<Uuid>,
 }
 
 /// Individual result for a batch delete operation
@@ -170,6 +198,12 @@ pub struct BatchDeleteConversationsResponse {
     pub data: Vec<BatchDeleteItemResult>,
 }
 
+/// Response for batch project update operations
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchUpdateConversationProjectResponse {
+    pub success: bool,
+}
+
 /// Response for a conversation object
 #[derive(Debug, Clone, Serialize)]
 pub struct ConversationResponse {
@@ -182,8 +216,17 @@ pub struct ConversationResponse {
     /// Metadata attached to the conversation
     pub metadata: Option<Value>,
 
+    /// Assigned project ID, if any
+    pub project_id: Option<Uuid>,
+
+    /// Whether the conversation is pinned
+    pub pinned: bool,
+
     /// Unix timestamp when created
     pub created_at: i64,
+
+    /// Unix timestamp when the conversation last had chat activity
+    pub last_activity_at: i64,
 }
 
 /// Response for listing conversation items
@@ -214,6 +257,19 @@ pub struct ListConversationsParams {
     pub after: Option<Uuid>,
     #[serde(default = "default_order")]
     pub order: String,
+    pub project_id: Option<Uuid>,
+    pub unassigned_project: Option<bool>,
+    pub pinned: Option<bool>,
+}
+
+impl ListConversationsParams {
+    fn validate(&self) -> Result<(), ApiError> {
+        if self.project_id.is_some() && self.unassigned_project == Some(true) {
+            return Err(ApiError::BadRequest);
+        }
+
+        Ok(())
+    }
 }
 
 /// Query parameters for listing conversation items
@@ -236,6 +292,85 @@ fn default_limit() -> i64 {
 
 fn default_order() -> String {
     DEFAULT_PAGINATION_ORDER.to_string()
+}
+
+fn resolve_conversation_project_filter(
+    state: &AppState,
+    user_uuid: Uuid,
+    params: &ListConversationsParams,
+) -> Result<ConversationProjectFilter, ApiError> {
+    params.validate()?;
+
+    if params.unassigned_project == Some(true) {
+        return Ok(ConversationProjectFilter::Unassigned);
+    }
+
+    if let Some(project_uuid) = params.project_id {
+        let project_id = state
+            .db
+            .get_conversation_project_by_uuid_and_user(project_uuid, user_uuid)
+            .map_err(error_mapping::map_conversation_project_error)?
+            .id;
+
+        return Ok(ConversationProjectFilter::Assigned(project_id));
+    }
+
+    Ok(ConversationProjectFilter::Any)
+}
+
+fn validate_metadata(metadata: &Value) -> Result<(), ApiError> {
+    if metadata.is_object() {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest)
+    }
+}
+
+fn resolve_project_uuid(
+    state: &AppState,
+    user_uuid: Uuid,
+    project_id: Option<i64>,
+    cache: &mut HashMap<i64, Uuid>,
+) -> Result<Option<Uuid>, ApiError> {
+    let Some(project_id) = project_id else {
+        return Ok(None);
+    };
+
+    if let Some(project_uuid) = cache.get(&project_id) {
+        return Ok(Some(*project_uuid));
+    }
+
+    let project_uuid = state
+        .db
+        .get_conversation_project_by_id_and_user(project_id, user_uuid)
+        .map_err(error_mapping::map_conversation_project_error)?
+        .uuid;
+
+    cache.insert(project_id, project_uuid);
+    Ok(Some(project_uuid))
+}
+
+fn build_conversation_response(
+    state: &AppState,
+    user_uuid: Uuid,
+    conversation: &crate::models::responses::Conversation,
+    user_key: &secp256k1::SecretKey,
+    metadata: Option<Value>,
+    project_cache: &mut HashMap<i64, Uuid>,
+) -> Result<ConversationResponse, ApiError> {
+    let metadata = match metadata {
+        Some(metadata) => Some(metadata),
+        None => decrypt_content(user_key, conversation.metadata_enc.as_ref())
+            .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))?,
+    };
+
+    let project_id =
+        resolve_project_uuid(state, user_uuid, conversation.project_id, project_cache)?;
+
+    Ok(ConversationBuilder::from_conversation(conversation)
+        .metadata(metadata)
+        .project_id(project_id)
+        .build())
 }
 
 // ============================================================================
@@ -269,14 +404,23 @@ async fn create_conversation(
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
+    let project = if let Some(project_uuid) = body.project_id {
+        Some(
+            state
+                .db
+                .get_conversation_project_by_uuid_and_user(project_uuid, user.uuid)
+                .map_err(error_mapping::map_conversation_project_error)?,
+        )
+    } else {
+        None
+    };
+
     // Create the conversation
     let conversation_uuid = Uuid::new_v4();
 
     // Create metadata with title
     let mut metadata = body.metadata.clone().unwrap_or_else(|| json!({}));
-    if !metadata.is_object() {
-        return Err(ApiError::BadRequest);
-    }
+    validate_metadata(&metadata)?;
     if metadata.get("title").is_none() {
         metadata["title"] = json!("New Conversation");
     }
@@ -291,6 +435,8 @@ async fn create_conversation(
     let new_conversation = NewConversation {
         uuid: conversation_uuid,
         user_id: user.uuid,
+        project_id: project.as_ref().map(|project| project.id),
+        is_pinned: body.pinned.unwrap_or(false),
         metadata_enc,
     };
 
@@ -303,13 +449,19 @@ async fn create_conversation(
 
     trace!("Created conversation: {:?}", conversation);
 
-    // Decrypt metadata for response
-    let metadata = decrypt_content(&user_key, conversation.metadata_enc.as_ref())
-        .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))?;
+    let mut project_cache = HashMap::new();
+    if let Some(project) = project {
+        project_cache.insert(project.id, project.uuid);
+    }
 
-    let response = ConversationBuilder::from_conversation(&conversation)
-        .metadata(metadata)
-        .build();
+    let response = build_conversation_response(
+        &state,
+        user.uuid,
+        &conversation,
+        &user_key,
+        Some(metadata),
+        &mut project_cache,
+    )?;
 
     encrypt_response(&state, &session_id, &response).await
 }
@@ -327,11 +479,15 @@ async fn get_conversation(
     );
 
     let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
-    let metadata = ctx.decrypt_metadata()?;
-
-    let response = ConversationBuilder::from_conversation(&ctx.conversation)
-        .metadata(metadata)
-        .build();
+    let mut project_cache = HashMap::new();
+    let response = build_conversation_response(
+        &state,
+        user.uuid,
+        &ctx.conversation,
+        &ctx.user_key,
+        ctx.decrypt_metadata()?,
+        &mut project_cache,
+    )?;
 
     encrypt_response(&state, &session_id, &response).await
 }
@@ -349,27 +505,56 @@ async fn update_conversation(
         conversation_id, user.uuid
     );
 
+    if body.metadata.is_none() && body.project_id.is_missing() && body.pinned.is_none() {
+        return Err(ApiError::BadRequest);
+    }
+
     let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
 
-    // Encrypt the updated metadata
-    let metadata_json = serde_json::to_string(&body.metadata).map_err(|e| {
-        error!("Failed to serialize metadata: {:?}", e);
-        ApiError::InternalServerError
-    })?;
-    let metadata_enc = encrypt_with_key(&ctx.user_key, metadata_json.as_bytes()).await;
+    let metadata_enc = if let Some(metadata) = body.metadata.as_ref() {
+        validate_metadata(metadata)?;
+        let metadata_json = serde_json::to_string(metadata).map_err(|e| {
+            error!("Failed to serialize metadata: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+        Some(encrypt_with_key(&ctx.user_key, metadata_json.as_bytes()).await)
+    } else {
+        None
+    };
 
-    // Update metadata in database
-    state
+    let mut project_cache = HashMap::new();
+    let project_update = match body.project_id {
+        NullableField::Value(project_uuid) => {
+            let project = state
+                .db
+                .get_conversation_project_by_uuid_and_user(project_uuid, user.uuid)
+                .map_err(error_mapping::map_conversation_project_error)?;
+            project_cache.insert(project.id, project.uuid);
+            Some(Some(project.id))
+        }
+        NullableField::Null => Some(None),
+        NullableField::Missing => None,
+    };
+
+    let updated_conversation = state
         .db
-        .update_conversation_metadata(ctx.conversation.id, user.uuid, metadata_enc.clone())
-        .map_err(error_mapping::map_generic_db_error)?;
+        .update_conversation(
+            ctx.conversation.id,
+            user.uuid,
+            metadata_enc,
+            project_update,
+            body.pinned,
+        )
+        .map_err(error_mapping::map_conversation_error)?;
 
-    // For the response, return the decrypted metadata (already have it from body)
-    let response_metadata = Some(body.metadata.clone());
-
-    let response = ConversationBuilder::from_conversation(&ctx.conversation)
-        .metadata(response_metadata)
-        .build();
+    let response = build_conversation_response(
+        &state,
+        user.uuid,
+        &updated_conversation,
+        &ctx.user_key,
+        body.metadata.clone(),
+        &mut project_cache,
+    )?;
 
     encrypt_response(&state, &session_id, &response).await
 }
@@ -545,11 +730,20 @@ async fn list_conversations(
         params.limit.min(MAX_PAGINATION_LIMIT)
     };
 
+    let project_filter = resolve_conversation_project_filter(&state, user.uuid, &params)?;
+
     // Fetch conversations with database-level pagination
     // We fetch limit + 1 to check if there are more results
     let conversations = state
         .db
-        .list_conversations(user.uuid, limit + 1, params.after, &params.order)
+        .list_conversations(
+            user.uuid,
+            limit + 1,
+            params.after,
+            &params.order,
+            project_filter,
+            params.pinned,
+        )
         .map_err(error_mapping::map_generic_db_error)?;
 
     trace!(
@@ -577,22 +771,22 @@ async fn list_conversations(
         .await
         .map_err(|_| ApiError::InternalServerError)?;
 
+    let mut project_cache = HashMap::new();
+
     // Convert to response format
-    let data: Vec<ConversationResponse> = conversations_to_return
-        .iter()
-        .map(|conv| -> Result<ConversationResponse, ApiError> {
-            trace!("Raw conversation object: {:?}", conv);
-            trace!("Conv metadata_enc present: {}", conv.metadata_enc.is_some());
-
-            // Decrypt metadata
-            let metadata = decrypt_content(&user_key, conv.metadata_enc.as_ref())
-                .map_err(|_| error_mapping::map_decryption_error("conversation metadata"))?;
-
-            Ok(ConversationBuilder::from_conversation(conv)
-                .metadata(metadata)
-                .build())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut data = Vec::with_capacity(conversations_to_return.len());
+    for conv in conversations_to_return {
+        trace!("Raw conversation object: {:?}", conv);
+        trace!("Conv metadata_enc present: {}", conv.metadata_enc.is_some());
+        data.push(build_conversation_response(
+            &state,
+            user.uuid,
+            conv,
+            &user_key,
+            None,
+            &mut project_cache,
+        )?);
+    }
 
     // Extract cursor IDs
     let (first_id, last_id) = Paginator::get_cursor_ids(conversations_to_return, |c| c.uuid);
@@ -631,8 +825,8 @@ async fn delete_all_conversations(
     encrypt_response(&state, &session_id, &response).await
 }
 
-/// Maximum number of conversations that can be deleted in a single batch request
-const MAX_BATCH_DELETE_SIZE: usize = 20;
+/// Maximum number of conversations allowed in a single batch operation request
+const MAX_CONVERSATION_BATCH_SIZE: usize = 20;
 
 /// POST /v1/conversations/batch-delete - Delete multiple specific conversations
 async fn batch_delete_conversations(
@@ -642,7 +836,7 @@ async fn batch_delete_conversations(
     Extension(body): Extension<BatchDeleteConversationsRequest>,
 ) -> Result<Json<EncryptedResponse<BatchDeleteConversationsResponse>>, ApiError> {
     // Validate batch size
-    if body.ids.is_empty() || body.ids.len() > MAX_BATCH_DELETE_SIZE {
+    if body.ids.is_empty() || body.ids.len() > MAX_CONVERSATION_BATCH_SIZE {
         return Err(ApiError::BadRequest);
     }
 
@@ -701,6 +895,48 @@ async fn batch_delete_conversations(
     encrypt_response(&state, &session_id, &response).await
 }
 
+/// POST /v1/conversations/batch-update-project - Update project assignment for multiple conversations
+async fn batch_update_conversation_project(
+    State(state): State<Arc<AppState>>,
+    Extension(session_id): Extension<Uuid>,
+    Extension(user): Extension<User>,
+    Extension(body): Extension<BatchUpdateConversationProjectRequest>,
+) -> Result<Json<EncryptedResponse<BatchUpdateConversationProjectResponse>>, ApiError> {
+    if body.ids.is_empty() || body.ids.len() > MAX_CONVERSATION_BATCH_SIZE {
+        return Err(ApiError::BadRequest);
+    }
+
+    let (target_project_uuid, target_project_id) = match body.project_id {
+        NullableField::Value(project_uuid) => (
+            Some(project_uuid),
+            Some(
+                state
+                    .db
+                    .get_conversation_project_by_uuid_and_user(project_uuid, user.uuid)
+                    .map_err(error_mapping::map_conversation_project_error)?
+                    .id,
+            ),
+        ),
+        NullableField::Null => (None, None),
+        NullableField::Missing => return Err(ApiError::BadRequest),
+    };
+
+    debug!(
+        "Batch updating {} conversations to project {:?}",
+        body.ids.len(),
+        target_project_uuid
+    );
+
+    state
+        .db
+        .batch_update_conversation_project(&body.ids, user.uuid, target_project_id)
+        .map_err(error_mapping::map_batch_conversation_project_error)?;
+
+    let response = BatchUpdateConversationProjectResponse { success: true };
+
+    encrypt_response(&state, &session_id, &response).await
+}
+
 // ============================================================================
 // Router Configuration
 // ============================================================================
@@ -728,6 +964,13 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(batch_delete_conversations).layer(from_fn_with_state(
                 state.clone(),
                 decrypt_request::<BatchDeleteConversationsRequest>,
+            )),
+        )
+        .route(
+            "/v1/conversations/batch-update-project",
+            post(batch_update_conversation_project).layer(from_fn_with_state(
+                state.clone(),
+                decrypt_request::<BatchUpdateConversationProjectRequest>,
             )),
         )
         .route(
@@ -766,4 +1009,78 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .layer(from_fn_with_state(state.clone(), decrypt_request::<()>)),
         )
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        default_limit, default_order, BatchUpdateConversationProjectRequest,
+        ListConversationsParams, UpdateConversationRequest,
+    };
+    use crate::web::responses::NullableField;
+    use crate::ApiError;
+    use uuid::Uuid;
+
+    #[test]
+    fn update_request_distinguishes_null_from_omitted_project_id() {
+        let request: UpdateConversationRequest =
+            serde_json::from_str(r#"{"project_id":null}"#).unwrap();
+        assert!(matches!(request.project_id, NullableField::Null));
+
+        let request: UpdateConversationRequest =
+            serde_json::from_str(r#"{"project_id":"550e8400-e29b-41d4-a716-446655440000"}"#)
+                .unwrap();
+        assert!(matches!(request.project_id, NullableField::Value(_)));
+
+        let omitted: UpdateConversationRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(matches!(omitted.project_id, NullableField::Missing));
+    }
+
+    #[test]
+    fn batch_update_request_requires_explicit_project_id() {
+        let request: BatchUpdateConversationProjectRequest = serde_json::from_str(
+            r#"{"ids":["550e8400-e29b-41d4-a716-446655440000"],"project_id":null}"#,
+        )
+        .unwrap();
+        assert!(matches!(request.project_id, NullableField::Null));
+
+        let request: BatchUpdateConversationProjectRequest =
+            serde_json::from_str(
+                r#"{"ids":["550e8400-e29b-41d4-a716-446655440000"],"project_id":"550e8400-e29b-41d4-a716-446655440001"}"#,
+            )
+            .unwrap();
+        assert!(matches!(request.project_id, NullableField::Value(_)));
+
+        let omitted: BatchUpdateConversationProjectRequest =
+            serde_json::from_str(r#"{"ids":["550e8400-e29b-41d4-a716-446655440000"]}"#).unwrap();
+        assert!(matches!(omitted.project_id, NullableField::Missing));
+    }
+
+    #[test]
+    fn list_conversation_params_allow_unassigned_project_without_project_id() {
+        let params = ListConversationsParams {
+            limit: default_limit(),
+            after: None,
+            order: default_order(),
+            project_id: None,
+            unassigned_project: Some(true),
+            pinned: None,
+        };
+
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn list_conversation_params_reject_conflicting_project_filters() {
+        let params = ListConversationsParams {
+            limit: default_limit(),
+            after: None,
+            order: default_order(),
+            project_id: Some(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()),
+            unassigned_project: Some(true),
+            pinned: None,
+        };
+
+        assert!(matches!(params.validate(), Err(ApiError::BadRequest)));
+    }
 }

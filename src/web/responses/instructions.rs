@@ -89,7 +89,7 @@ impl InstructionContext {
     /// # Errors
     /// Returns ApiError if decryption fails
     fn decrypt_content(&self) -> Result<(String, String), ApiError> {
-        let name = decrypt_string(&self.user_key, Some(&self.instruction.name_enc))
+        let name = decrypt_string(&self.user_key, self.instruction.name_enc.as_ref())
             .map_err(|_| error_mapping::map_decryption_error("instruction name"))?
             .ok_or_else(|| {
                 error!("Instruction name decryption returned None");
@@ -182,7 +182,6 @@ pub struct ListInstructionsParams {
     #[serde(default = "default_limit")]
     pub limit: i64,
     pub after: Option<Uuid>,
-    pub before: Option<Uuid>,
     #[serde(default = "default_order")]
     pub order: String,
 }
@@ -288,7 +287,8 @@ async fn create_instruction(
     let new_instruction = NewUserInstruction {
         uuid: Uuid::new_v4(),
         user_id: user.uuid,
-        name_enc,
+        project_id: None,
+        name_enc: Some(name_enc),
         prompt_enc,
         prompt_tokens,
         is_default: body.is_default,
@@ -452,38 +452,19 @@ async fn list_instructions(
     } else {
         params.limit.min(MAX_PAGINATION_LIMIT)
     };
-    let order = &params.order;
-
-    // Convert UUID cursors to (updated_at, id) tuples
-    let after_cursor = if let Some(after_uuid) = params.after {
-        state
-            .db
-            .get_user_instruction_by_uuid_and_user(after_uuid, user.uuid)
-            .ok()
-            .map(|inst| (inst.updated_at, inst.id))
-    } else {
-        None
-    };
-
-    let before_cursor = if let Some(before_uuid) = params.before {
-        state
-            .db
-            .get_user_instruction_by_uuid_and_user(before_uuid, user.uuid)
-            .ok()
-            .map(|inst| (inst.updated_at, inst.id))
-    } else {
-        None
-    };
 
     // Get instructions
     let instructions = state
         .db
-        .list_user_instructions(user.uuid, limit + 1, after_cursor, before_cursor)
+        .list_user_instructions(user.uuid, limit + 1, params.after, &params.order)
         .map_err(error_mapping::map_generic_db_error)?;
 
-    // Apply pagination using centralized utilities
-    let (instructions, has_more) = Paginator::paginate(instructions, limit);
-    let instructions = Paginator::apply_order(instructions, order);
+    let has_more = instructions.len() > limit as usize;
+    let instructions_to_return = if has_more {
+        &instructions[..limit as usize]
+    } else {
+        &instructions[..]
+    };
 
     // Get user's encryption key for decrypting content
     let user_key = state
@@ -492,10 +473,10 @@ async fn list_instructions(
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
     // Convert to response format
-    let data: Vec<InstructionResponse> = instructions
+    let data: Vec<InstructionResponse> = instructions_to_return
         .iter()
         .map(|inst| -> Result<InstructionResponse, ApiError> {
-            let name = decrypt_string(&user_key, Some(&inst.name_enc))
+            let name = decrypt_string(&user_key, inst.name_enc.as_ref())
                 .map_err(|_| error_mapping::map_decryption_error("instruction name"))?
                 .ok_or_else(|| {
                     error!("Instruction name decryption returned None");
@@ -517,7 +498,7 @@ async fn list_instructions(
         .collect::<Result<Vec<_>, _>>()?;
 
     // Extract cursor IDs using centralized utility
-    let (first_id, last_id) = Paginator::get_cursor_ids(&instructions, |inst| inst.uuid);
+    let (first_id, last_id) = Paginator::get_cursor_ids(instructions_to_return, |inst| inst.uuid);
 
     let response = InstructionListResponse {
         object: OBJECT_TYPE_LIST,
@@ -608,4 +589,35 @@ pub fn router(state: Arc<AppState>) -> Router {
                 .layer(from_fn_with_state(state.clone(), decrypt_request::<()>)),
         )
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ListInstructionsParams;
+    use crate::web::responses::constants::{DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER};
+    use uuid::Uuid;
+
+    #[test]
+    fn list_params_ignore_legacy_before_cursor() {
+        let params: ListInstructionsParams =
+            serde_json::from_str(&format!(r#"{{"before":"{}"}}"#, Uuid::nil())).unwrap();
+
+        assert_eq!(params.limit, DEFAULT_PAGINATION_LIMIT);
+        assert!(params.after.is_none());
+        assert_eq!(params.order, DEFAULT_PAGINATION_ORDER);
+    }
+
+    #[test]
+    fn list_params_support_after_cursor_and_order() {
+        let after = Uuid::new_v4();
+        let params: ListInstructionsParams = serde_json::from_str(&format!(
+            r#"{{"limit":5,"after":"{}","order":"asc"}}"#,
+            after
+        ))
+        .unwrap();
+
+        assert_eq!(params.limit, 5);
+        assert_eq!(params.after, Some(after));
+        assert_eq!(params.order, "asc");
+    }
 }

@@ -1,6 +1,6 @@
 use crate::models::schema::{
-    assistant_messages, conversations, reasoning_items, responses, tool_calls, tool_outputs,
-    user_instructions, user_messages,
+    assistant_messages, conversation_projects, conversations, reasoning_items, responses,
+    tool_calls, tool_outputs, user_instructions, user_messages,
 };
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
@@ -18,6 +18,8 @@ pub enum ResponsesError {
     DatabaseError(#[from] diesel::result::Error),
     #[error("Conversation not found")]
     ConversationNotFound,
+    #[error("Conversation project not found")]
+    ConversationProjectNotFound,
     #[error("Response not found")]
     ResponseNotFound,
     #[error("User message not found")]
@@ -36,6 +38,25 @@ pub enum ResponsesError {
     ValidationError,
 }
 
+pub const MAX_CONVERSATION_PROJECTS_PER_USER: i64 = 10;
+
+pub fn validate_conversation_project_limit(
+    existing_project_count: i64,
+) -> Result<(), ResponsesError> {
+    if existing_project_count >= MAX_CONVERSATION_PROJECTS_PER_USER {
+        Err(ResponsesError::ValidationError)
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationProjectFilter {
+    Any,
+    Assigned(i64),
+    Unassigned,
+}
+
 // Response status enum matching the database enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, DbEnum)]
 #[ExistingTypePath = "crate::models::schema::sql_types::ResponseStatus"]
@@ -46,6 +67,16 @@ pub enum ResponseStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProjectInstructionUpdate {
+    Unchanged,
+    Set {
+        prompt_enc: Vec<u8>,
+        prompt_tokens: i32,
+    },
+    Clear,
 }
 
 // ============================================================================
@@ -177,6 +208,158 @@ impl NewResponse {
 }
 
 // ============================================================================
+// Conversation Projects
+// ============================================================================
+
+#[derive(Queryable, Selectable, Identifiable, Debug, Clone, Serialize, Deserialize)]
+#[diesel(table_name = conversation_projects)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct ConversationProject {
+    pub id: i64,
+    pub uuid: Uuid,
+    pub user_id: Uuid,
+    pub name_enc: Vec<u8>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Insertable, Debug)]
+#[diesel(table_name = conversation_projects)]
+pub struct NewConversationProject {
+    pub uuid: Uuid,
+    pub user_id: Uuid,
+    pub name_enc: Vec<u8>,
+}
+
+impl ConversationProject {
+    pub fn get_by_id_and_user(
+        conn: &mut PgConnection,
+        project_id: i64,
+        user_id: Uuid,
+    ) -> Result<ConversationProject, ResponsesError> {
+        conversation_projects::table
+            .filter(conversation_projects::id.eq(project_id))
+            .filter(conversation_projects::user_id.eq(user_id))
+            .first::<ConversationProject>(conn)
+            .map_err(|e| match e {
+                diesel::result::Error::NotFound => ResponsesError::ConversationProjectNotFound,
+                _ => ResponsesError::DatabaseError(e),
+            })
+    }
+
+    pub fn get_by_uuid_and_user(
+        conn: &mut PgConnection,
+        project_uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<ConversationProject, ResponsesError> {
+        conversation_projects::table
+            .filter(conversation_projects::uuid.eq(project_uuid))
+            .filter(conversation_projects::user_id.eq(user_id))
+            .first::<ConversationProject>(conn)
+            .map_err(|e| match e {
+                diesel::result::Error::NotFound => ResponsesError::ConversationProjectNotFound,
+                _ => ResponsesError::DatabaseError(e),
+            })
+    }
+
+    pub fn delete_by_id_and_user(
+        conn: &mut PgConnection,
+        project_id: i64,
+        user_id: Uuid,
+    ) -> Result<(), ResponsesError> {
+        let deleted = diesel::delete(
+            conversation_projects::table
+                .filter(conversation_projects::id.eq(project_id))
+                .filter(conversation_projects::user_id.eq(user_id)),
+        )
+        .execute(conn)?;
+
+        if deleted == 0 {
+            return Err(ResponsesError::ConversationProjectNotFound);
+        }
+
+        Ok(())
+    }
+
+    pub fn count_for_user(conn: &mut PgConnection, user_id: Uuid) -> Result<i64, ResponsesError> {
+        use diesel::dsl::count;
+
+        conversation_projects::table
+            .filter(conversation_projects::user_id.eq(user_id))
+            .select(count(conversation_projects::id))
+            .first(conn)
+            .map_err(ResponsesError::DatabaseError)
+    }
+
+    pub fn list_for_user(
+        conn: &mut PgConnection,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<Uuid>,
+        order: &str,
+    ) -> Result<Vec<ConversationProject>, ResponsesError> {
+        let mut query = conversation_projects::table
+            .filter(conversation_projects::user_id.eq(user_id))
+            .into_boxed();
+
+        if let Some(after_uuid) = after {
+            let cursor_project = conversation_projects::table
+                .filter(conversation_projects::uuid.eq(after_uuid))
+                .filter(conversation_projects::user_id.eq(user_id))
+                .select((conversation_projects::updated_at, conversation_projects::id))
+                .first::<(DateTime<Utc>, i64)>(conn)
+                .optional()?;
+
+            if let Some((updated_at, id)) = cursor_project {
+                if order == "desc" {
+                    query = query.filter(
+                        conversation_projects::updated_at.lt(updated_at).or(
+                            conversation_projects::updated_at
+                                .eq(updated_at)
+                                .and(conversation_projects::id.lt(id)),
+                        ),
+                    );
+                } else {
+                    query = query.filter(
+                        conversation_projects::updated_at.gt(updated_at).or(
+                            conversation_projects::updated_at
+                                .eq(updated_at)
+                                .and(conversation_projects::id.gt(id)),
+                        ),
+                    );
+                }
+            }
+        }
+
+        if order == "desc" {
+            query = query.order((
+                conversation_projects::updated_at.desc(),
+                conversation_projects::id.desc(),
+            ));
+        } else {
+            query = query.order((
+                conversation_projects::updated_at.asc(),
+                conversation_projects::id.asc(),
+            ));
+        }
+
+        query
+            .limit(limit)
+            .load::<ConversationProject>(conn)
+            .map_err(ResponsesError::DatabaseError)
+    }
+}
+
+impl NewConversationProject {
+    pub fn insert(&self, conn: &mut PgConnection) -> Result<ConversationProject, ResponsesError> {
+        diesel::insert_into(conversation_projects::table)
+            .values(self)
+            .get_result(conn)
+            .map_err(ResponsesError::DatabaseError)
+    }
+}
+
+// ============================================================================
 // User Instructions (System Prompts)
 // ============================================================================
 
@@ -187,12 +370,13 @@ pub struct UserInstruction {
     pub id: i64,
     pub uuid: Uuid,
     pub user_id: Uuid,
-    pub name_enc: Vec<u8>,
+    pub name_enc: Option<Vec<u8>>,
     pub prompt_enc: Vec<u8>,
     pub prompt_tokens: i32,
     pub is_default: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub project_id: Option<i64>,
 }
 
 #[derive(Insertable, Debug)]
@@ -200,7 +384,8 @@ pub struct UserInstruction {
 pub struct NewUserInstruction {
     pub uuid: Uuid,
     pub user_id: Uuid,
-    pub name_enc: Vec<u8>,
+    pub project_id: Option<i64>,
+    pub name_enc: Option<Vec<u8>>,
     pub prompt_enc: Vec<u8>,
     pub prompt_tokens: i32,
     pub is_default: bool,
@@ -220,6 +405,9 @@ pub struct Conversation {
     pub metadata_enc: Option<Vec<u8>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub project_id: Option<i64>,
+    pub is_pinned: bool,
+    pub last_activity_at: DateTime<Utc>,
 }
 
 #[derive(Insertable, Debug)]
@@ -227,7 +415,17 @@ pub struct Conversation {
 pub struct NewConversation {
     pub uuid: Uuid,
     pub user_id: Uuid,
+    pub project_id: Option<i64>,
+    pub is_pinned: bool,
     pub metadata_enc: Option<Vec<u8>>,
+}
+
+#[derive(AsChangeset, Default)]
+#[diesel(table_name = conversations)]
+struct ConversationUpdateChanges {
+    metadata_enc: Option<Vec<u8>>,
+    project_id: Option<Option<i64>>,
+    is_pinned: Option<bool>,
 }
 
 impl Conversation {
@@ -266,23 +464,121 @@ impl Conversation {
         conversation_id: i64,
         user_id: Uuid,
         metadata_enc: Vec<u8>,
-    ) -> Result<(), ResponsesError> {
+    ) -> Result<Conversation, ResponsesError> {
+        Self::update(
+            conn,
+            conversation_id,
+            user_id,
+            Some(metadata_enc),
+            None,
+            None,
+        )
+    }
+
+    pub fn update(
+        conn: &mut PgConnection,
+        conversation_id: i64,
+        user_id: Uuid,
+        metadata_enc: Option<Vec<u8>>,
+        project_id: Option<Option<i64>>,
+        is_pinned: Option<bool>,
+    ) -> Result<Conversation, ResponsesError> {
+        let changes = ConversationUpdateChanges {
+            metadata_enc,
+            project_id,
+            is_pinned,
+        };
+
+        if changes.metadata_enc.is_none()
+            && changes.project_id.is_none()
+            && changes.is_pinned.is_none()
+        {
+            return Self::get_by_id_and_user(conn, conversation_id, user_id);
+        }
+
         let updated = diesel::update(
             conversations::table
                 .filter(conversations::id.eq(conversation_id))
                 .filter(conversations::user_id.eq(user_id)),
         )
-        .set((
-            conversations::metadata_enc.eq(metadata_enc),
-            conversations::updated_at.eq(diesel::dsl::now),
-        ))
-        .execute(conn)?;
+        .set(changes)
+        .get_result::<Conversation>(conn)
+        .optional()?;
 
-        if updated == 0 {
-            return Err(ResponsesError::ConversationNotFound);
+        updated.ok_or(ResponsesError::ConversationNotFound)
+    }
+
+    pub fn batch_update_project(
+        conn: &mut PgConnection,
+        conversation_uuids: &[Uuid],
+        user_id: Uuid,
+        target_project_id: Option<i64>,
+    ) -> Result<(), ResponsesError> {
+        use diesel::Connection;
+
+        if conversation_uuids.is_empty() {
+            return Err(ResponsesError::ValidationError);
         }
 
-        Ok(())
+        let unique_ids = conversation_uuids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if unique_ids.len() != conversation_uuids.len() {
+            return Err(ResponsesError::ValidationError);
+        }
+
+        conn.transaction(|tx| {
+            if let Some(target_project_id) = target_project_id {
+                let target_project = conversation_projects::table
+                    .filter(conversation_projects::id.eq(target_project_id))
+                    .filter(conversation_projects::user_id.eq(user_id))
+                    .select(conversation_projects::id)
+                    .for_update()
+                    .first::<i64>(tx)
+                    .optional()?;
+
+                if target_project.is_none() {
+                    return Err(ResponsesError::ConversationProjectNotFound);
+                }
+            }
+
+            let existing_conversations = conversations::table
+                .filter(conversations::user_id.eq(user_id))
+                .filter(conversations::uuid.eq_any(conversation_uuids))
+                .for_update()
+                .load::<Conversation>(tx)?;
+
+            if existing_conversations.len() != conversation_uuids.len() {
+                return Err(ResponsesError::ConversationNotFound);
+            }
+
+            let source_project_id = existing_conversations
+                .first()
+                .map(|conversation| conversation.project_id)
+                .ok_or(ResponsesError::ValidationError)?;
+
+            if existing_conversations
+                .iter()
+                .any(|conversation| conversation.project_id != source_project_id)
+            {
+                return Err(ResponsesError::ValidationError);
+            }
+
+            let updated = diesel::update(
+                conversations::table
+                    .filter(conversations::user_id.eq(user_id))
+                    .filter(conversations::uuid.eq_any(conversation_uuids)),
+            )
+            .set(conversations::project_id.eq(target_project_id))
+            .execute(tx)?;
+
+            if updated != conversation_uuids.len() {
+                return Err(ResponsesError::ConversationNotFound);
+            }
+
+            Ok(())
+        })
     }
 
     pub fn delete_by_id_and_user(
@@ -315,45 +611,62 @@ impl Conversation {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn list_for_user(
         conn: &mut PgConnection,
         user_id: Uuid,
         limit: i64,
         after: Option<Uuid>,
         order: &str,
+        project_filter: ConversationProjectFilter,
+        pinned: Option<bool>,
     ) -> Result<Vec<Conversation>, ResponsesError> {
         let mut query = conversations::table
             .filter(conversations::user_id.eq(user_id))
             .into_boxed();
 
+        match project_filter {
+            ConversationProjectFilter::Any => {}
+            ConversationProjectFilter::Assigned(project_id) => {
+                query = query.filter(conversations::project_id.eq(Some(project_id)));
+            }
+            ConversationProjectFilter::Unassigned => {
+                query = query.filter(conversations::project_id.is_null());
+            }
+        }
+
+        if let Some(is_pinned) = pinned {
+            query = query.filter(conversations::is_pinned.eq(is_pinned));
+        }
+
         // If we have an after cursor, we need to find its timestamp and apply cursor-based pagination
         if let Some(after_uuid) = after {
-            // Get the cursor conversation to find its updated_at and id
+            // Get the cursor conversation to find its last_activity_at and id
             let cursor_conv = conversations::table
                 .filter(conversations::uuid.eq(after_uuid))
                 .filter(conversations::user_id.eq(user_id))
-                .select((conversations::updated_at, conversations::id))
+                .select((conversations::last_activity_at, conversations::id))
                 .first::<(DateTime<Utc>, i64)>(conn)
                 .optional()?;
 
-            if let Some((updated_at, id)) = cursor_conv {
+            if let Some((last_activity_at, id)) = cursor_conv {
                 if order == "desc" {
-                    // For desc order, get items with updated_at < cursor OR (updated_at = cursor AND id < cursor_id)
+                    // For desc order, get items with last_activity_at < cursor OR (last_activity_at = cursor AND id < cursor_id)
                     query = query.filter(
-                        conversations::updated_at
-                            .lt(updated_at)
-                            .or(conversations::updated_at
-                                .eq(updated_at)
-                                .and(conversations::id.lt(id))),
+                        conversations::last_activity_at.lt(last_activity_at).or(
+                            conversations::last_activity_at
+                                .eq(last_activity_at)
+                                .and(conversations::id.lt(id)),
+                        ),
                     );
                 } else {
-                    // For asc order, get items with updated_at > cursor OR (updated_at = cursor AND id > cursor_id)
+                    // For asc order, get items with last_activity_at > cursor OR (last_activity_at = cursor AND id > cursor_id)
                     query = query.filter(
-                        conversations::updated_at
-                            .gt(updated_at)
-                            .or(conversations::updated_at
-                                .eq(updated_at)
-                                .and(conversations::id.gt(id))),
+                        conversations::last_activity_at.gt(last_activity_at).or(
+                            conversations::last_activity_at
+                                .eq(last_activity_at)
+                                .and(conversations::id.gt(id)),
+                        ),
                     );
                 }
             }
@@ -361,9 +674,15 @@ impl Conversation {
 
         // Apply ordering
         if order == "desc" {
-            query = query.order((conversations::updated_at.desc(), conversations::id.desc()));
+            query = query.order((
+                conversations::last_activity_at.desc(),
+                conversations::id.desc(),
+            ));
         } else {
-            query = query.order((conversations::updated_at.asc(), conversations::id.asc()));
+            query = query.order((
+                conversations::last_activity_at.asc(),
+                conversations::id.asc(),
+            ));
         }
 
         query
@@ -401,6 +720,8 @@ impl NewConversation {
             let new_conversation = NewConversation {
                 uuid: conversation_uuid,
                 user_id,
+                project_id: None,
+                is_pinned: false,
                 metadata_enc,
             };
             let conversation = new_conversation.insert(tx)?;
@@ -1425,5 +1746,21 @@ impl RawThreadMessageMetadata {
         results.reverse();
 
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_conversation_project_limit, ResponsesError};
+
+    #[test]
+    fn conversation_project_limit_allows_creating_the_tenth_project() {
+        assert!(validate_conversation_project_limit(9).is_ok());
+    }
+
+    #[test]
+    fn conversation_project_limit_rejects_creating_the_eleventh_project() {
+        let error = validate_conversation_project_limit(10).unwrap_err();
+        assert!(matches!(error, ResponsesError::ValidationError));
     }
 }

@@ -24,8 +24,38 @@ pub mod error_mapping {
                 // Don't log NotFound as error - it's expected for invalid IDs
                 ApiError::NotFound
             }
+            DBError::ResponsesError(ResponsesError::ValidationError) => ApiError::BadRequest,
             _ => {
                 error!("Conversation database error: {:?}", e);
+                ApiError::InternalServerError
+            }
+        }
+    }
+
+    /// Map batch conversation project update errors to API errors
+    pub fn map_batch_conversation_project_error(e: DBError) -> ApiError {
+        match e {
+            DBError::ResponsesError(ResponsesError::ConversationNotFound)
+            | DBError::ResponsesError(ResponsesError::ConversationProjectNotFound) => {
+                ApiError::NotFound
+            }
+            DBError::ResponsesError(ResponsesError::ValidationError) => ApiError::BadRequest,
+            _ => {
+                error!("Batch conversation project database error: {:?}", e);
+                ApiError::InternalServerError
+            }
+        }
+    }
+
+    /// Map conversation-project-related database errors to API errors
+    pub fn map_conversation_project_error(e: DBError) -> ApiError {
+        match e {
+            DBError::ResponsesError(ResponsesError::ConversationProjectNotFound) => {
+                ApiError::NotFound
+            }
+            DBError::ResponsesError(ResponsesError::ValidationError) => ApiError::BadRequest,
+            _ => {
+                error!("Conversation project database error: {:?}", e);
                 ApiError::InternalServerError
             }
         }
@@ -130,9 +160,23 @@ mod tests {
     }
 
     #[test]
+    fn test_conversation_validation_error_returns_bad_request() {
+        let error = DBError::ResponsesError(ResponsesError::ValidationError);
+        let api_error = error_mapping::map_conversation_error(error);
+        assert!(matches!(api_error, ApiError::BadRequest));
+    }
+
+    #[test]
     fn test_response_not_found_returns_not_found() {
         let error = DBError::ResponsesError(ResponsesError::ResponseNotFound);
         let api_error = error_mapping::map_response_error(error);
+        assert!(matches!(api_error, ApiError::NotFound));
+    }
+
+    #[test]
+    fn test_conversation_project_not_found_returns_not_found() {
+        let error = DBError::ResponsesError(ResponsesError::ConversationProjectNotFound);
+        let api_error = error_mapping::map_conversation_project_error(error);
         assert!(matches!(api_error, ApiError::NotFound));
     }
 
@@ -147,6 +191,27 @@ mod tests {
     fn test_validation_error_returns_bad_request() {
         let error = DBError::ResponsesError(ResponsesError::ValidationError);
         let api_error = error_mapping::map_response_error(error);
+        assert!(matches!(api_error, ApiError::BadRequest));
+    }
+
+    #[test]
+    fn test_conversation_project_validation_error_returns_bad_request() {
+        let error = DBError::ResponsesError(ResponsesError::ValidationError);
+        let api_error = error_mapping::map_conversation_project_error(error);
+        assert!(matches!(api_error, ApiError::BadRequest));
+    }
+
+    #[test]
+    fn test_batch_conversation_project_not_found_returns_not_found() {
+        let error = DBError::ResponsesError(ResponsesError::ConversationProjectNotFound);
+        let api_error = error_mapping::map_batch_conversation_project_error(error);
+        assert!(matches!(api_error, ApiError::NotFound));
+    }
+
+    #[test]
+    fn test_batch_conversation_validation_error_returns_bad_request() {
+        let error = DBError::ResponsesError(ResponsesError::ValidationError);
+        let api_error = error_mapping::map_batch_conversation_project_error(error);
         assert!(matches!(api_error, ApiError::BadRequest));
     }
 }

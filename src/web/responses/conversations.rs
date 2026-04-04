@@ -895,7 +895,7 @@ async fn batch_update_conversation_project(
         return Err(ApiError::BadRequest);
     }
 
-    let (requested_project_id, target_project_id) = match body.project_id {
+    let (target_project_uuid, target_project_id) = match body.project_id {
         NullableField::Value(project_uuid) => (
             Some(project_uuid),
             Some(
@@ -911,6 +911,10 @@ async fn batch_update_conversation_project(
     };
 
     let mut results = Vec::with_capacity(body.ids.len());
+    let mut project_cache = HashMap::new();
+    if let (Some(project_uuid), Some(project_id)) = (target_project_uuid, target_project_id) {
+        project_cache.insert(project_id, project_uuid);
+    }
 
     for conversation_id in body.ids {
         match state
@@ -924,23 +928,40 @@ async fn batch_update_conversation_project(
                 Some(target_project_id),
                 None,
             ) {
-                Ok(_) => results.push(BatchUpdateConversationProjectItemResult {
-                    id: conversation_id,
-                    object: constants::OBJECT_TYPE_CONVERSATION,
-                    updated: true,
-                    project_id: requested_project_id,
-                    error: None,
-                }),
+                Ok(updated_conversation) => {
+                    let project_id = resolve_project_uuid(
+                        &state,
+                        user.uuid,
+                        updated_conversation.project_id,
+                        &mut project_cache,
+                    )?;
+
+                    results.push(BatchUpdateConversationProjectItemResult {
+                        id: conversation_id,
+                        object: constants::OBJECT_TYPE_CONVERSATION,
+                        updated: true,
+                        project_id,
+                        error: None,
+                    });
+                }
                 Err(e) => {
                     error!(
                         "Failed to update conversation project for {}: {:?}",
                         conversation_id, e
                     );
+
+                    let project_id = resolve_project_uuid(
+                        &state,
+                        user.uuid,
+                        conversation.project_id,
+                        &mut project_cache,
+                    )?;
+
                     results.push(BatchUpdateConversationProjectItemResult {
                         id: conversation_id,
                         object: constants::OBJECT_TYPE_CONVERSATION,
                         updated: false,
-                        project_id: requested_project_id,
+                        project_id,
                         error: Some("update_failed"),
                     });
                 }
@@ -949,7 +970,7 @@ async fn batch_update_conversation_project(
                 id: conversation_id,
                 object: constants::OBJECT_TYPE_CONVERSATION,
                 updated: false,
-                project_id: requested_project_id,
+                project_id: None,
                 error: Some("not_found"),
             }),
         }

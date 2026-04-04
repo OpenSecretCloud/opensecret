@@ -31,6 +31,20 @@ pub mod error_mapping {
         }
     }
 
+    /// Map conversation-project-related database errors to API errors
+    pub fn map_conversation_project_error(e: DBError) -> ApiError {
+        match e {
+            DBError::ResponsesError(ResponsesError::ConversationProjectNotFound) => {
+                ApiError::NotFound
+            }
+            DBError::ResponsesError(ResponsesError::ValidationError) => ApiError::BadRequest,
+            _ => {
+                error!("Conversation project database error: {:?}", e);
+                ApiError::InternalServerError
+            }
+        }
+    }
+
     /// Map instruction-related database errors to API errors
     ///
     /// # Arguments
@@ -137,6 +151,13 @@ mod tests {
     }
 
     #[test]
+    fn test_conversation_project_not_found_returns_not_found() {
+        let error = DBError::ResponsesError(ResponsesError::ConversationProjectNotFound);
+        let api_error = error_mapping::map_conversation_project_error(error);
+        assert!(matches!(api_error, ApiError::NotFound));
+    }
+
+    #[test]
     fn test_unauthorized_returns_unauthorized() {
         let error = DBError::ResponsesError(ResponsesError::Unauthorized);
         let api_error = error_mapping::map_response_error(error);
@@ -147,6 +168,13 @@ mod tests {
     fn test_validation_error_returns_bad_request() {
         let error = DBError::ResponsesError(ResponsesError::ValidationError);
         let api_error = error_mapping::map_response_error(error);
+        assert!(matches!(api_error, ApiError::BadRequest));
+    }
+
+    #[test]
+    fn test_conversation_project_validation_error_returns_bad_request() {
+        let error = DBError::ResponsesError(ResponsesError::ValidationError);
+        let api_error = error_mapping::map_conversation_project_error(error);
         assert!(matches!(api_error, ApiError::BadRequest));
     }
 }

@@ -6,6 +6,7 @@
 pub mod builders;
 pub mod constants;
 pub mod context_builder;
+pub mod conversation_projects;
 pub mod conversations;
 pub mod conversions;
 pub mod errors;
@@ -29,9 +30,10 @@ pub use events::{ResponseEvent, SseEventEmitter};
 pub use pagination::Paginator;
 pub use storage::storage_task;
 // REMOVED: UpstreamStreamProcessor - no longer used with centralized billing architecture
-pub use types::{DeletedObjectResponse, MessageContent, MessageContentPart};
+pub use types::{DeletedObjectResponse, MessageContent, MessageContentPart, NullableField};
 
 // Re-export routers
+pub use conversation_projects::router as conversation_projects_router;
 pub use conversations::router as conversations_router;
 pub use handlers::router as responses_router;
 pub use instructions::router as instructions_router;

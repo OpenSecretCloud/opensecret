@@ -18,6 +18,7 @@ pub use oauth_routes::router as oauth_routes;
 pub use openai::router as openai_routes;
 pub use platform::router as platform_routes;
 pub use protected_routes::router as protected_routes;
+pub use responses::conversation_projects_router as conversation_projects_routes;
 pub use responses::conversations_router as conversations_routes;
 pub use responses::instructions_router as instructions_routes;
 pub use responses::responses_router as responses_routes;

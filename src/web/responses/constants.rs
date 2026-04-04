@@ -13,6 +13,8 @@ pub const OBJECT_TYPE_RESPONSE: &str = "response";
 pub const OBJECT_TYPE_RESPONSE_DELETED: &str = "response.deleted";
 pub const OBJECT_TYPE_CONVERSATION: &str = "conversation";
 pub const OBJECT_TYPE_CONVERSATION_DELETED: &str = "conversation.deleted";
+pub const OBJECT_TYPE_CONVERSATION_PROJECT: &str = "conversation.project";
+pub const OBJECT_TYPE_CONVERSATION_PROJECT_DELETED: &str = "conversation.project.deleted";
 pub const OBJECT_TYPE_LIST: &str = "list";
 pub const OBJECT_TYPE_LIST_DELETED: &str = "list.deleted";
 

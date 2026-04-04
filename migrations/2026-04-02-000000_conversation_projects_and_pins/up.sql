@@ -44,6 +44,9 @@ ALTER TABLE user_instructions
     ADD CONSTRAINT chk_user_instructions_global_name_required
     CHECK (project_id IS NOT NULL OR name_enc IS NOT NULL);
 
+-- Conversation recency is intentionally based on user-visible chat activity only.
+-- Tool calls, tool outputs, and reasoning items are excluded so internal agent work
+-- does not reorder history/sidebar views or add unnecessary parent-row churn.
 WITH latest_activity AS (
     SELECT
         conversation_id,
@@ -52,12 +55,6 @@ WITH latest_activity AS (
         SELECT conversation_id, COALESCE(updated_at, created_at) AS activity_at FROM user_messages
         UNION ALL
         SELECT conversation_id, COALESCE(updated_at, created_at) AS activity_at FROM assistant_messages
-        UNION ALL
-        SELECT conversation_id, COALESCE(updated_at, created_at) AS activity_at FROM tool_calls
-        UNION ALL
-        SELECT conversation_id, COALESCE(updated_at, created_at) AS activity_at FROM tool_outputs
-        UNION ALL
-        SELECT conversation_id, COALESCE(updated_at, created_at) AS activity_at FROM reasoning_items
     ) activity
     GROUP BY conversation_id
 )
@@ -66,6 +63,8 @@ SET updated_at = GREATEST(conversations.updated_at, latest_activity.latest_activ
 FROM latest_activity
 WHERE conversations.id = latest_activity.conversation_id;
 
+-- Keep recency maintenance in the database so every write path stays consistent
+-- without requiring separate application-managed parent updates.
 CREATE OR REPLACE FUNCTION touch_conversation_updated_at_from_child()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -83,16 +82,4 @@ FOR EACH ROW EXECUTE FUNCTION touch_conversation_updated_at_from_child();
 
 CREATE TRIGGER touch_conversation_updated_at_from_assistant_messages
 AFTER INSERT OR UPDATE ON assistant_messages
-FOR EACH ROW EXECUTE FUNCTION touch_conversation_updated_at_from_child();
-
-CREATE TRIGGER touch_conversation_updated_at_from_tool_calls
-AFTER INSERT OR UPDATE ON tool_calls
-FOR EACH ROW EXECUTE FUNCTION touch_conversation_updated_at_from_child();
-
-CREATE TRIGGER touch_conversation_updated_at_from_tool_outputs
-AFTER INSERT OR UPDATE ON tool_outputs
-FOR EACH ROW EXECUTE FUNCTION touch_conversation_updated_at_from_child();
-
-CREATE TRIGGER touch_conversation_updated_at_from_reasoning_items
-AFTER INSERT OR UPDATE ON reasoning_items
 FOR EACH ROW EXECUTE FUNCTION touch_conversation_updated_at_from_child();

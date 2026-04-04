@@ -42,6 +42,30 @@ func TestBuildExtraChatCompletionFieldsForKimiThinkingControl(t *testing.T) {
 	}
 }
 
+func TestBuildExtraChatCompletionFieldsForGemmaThinkingMode(t *testing.T) {
+	includeReasoning := true
+
+	req := ChatCompletionRequest{
+		IncludeReasoning:   &includeReasoning,
+		ChatTemplateKwargs: map[string]any{"enable_thinking": true},
+	}
+
+	extraFields := buildExtraChatCompletionFields(req)
+	if len(extraFields) != 2 {
+		t.Fatalf("expected 2 extra fields, got %d", len(extraFields))
+	}
+
+	includeReasoningValue, ok := extraFields["include_reasoning"].(bool)
+	if !ok || !includeReasoningValue {
+		t.Fatalf("unexpected include_reasoning field: %#v", extraFields["include_reasoning"])
+	}
+
+	chatTemplateKwargs, ok := extraFields["chat_template_kwargs"].(map[string]any)
+	if !ok || chatTemplateKwargs["enable_thinking"] != true {
+		t.Fatalf("unexpected chat_template_kwargs field: %#v", extraFields["chat_template_kwargs"])
+	}
+}
+
 func TestBuildExtraChatCompletionFieldsEmpty(t *testing.T) {
 	extraFields := buildExtraChatCompletionFields(ChatCompletionRequest{})
 	if extraFields != nil {
@@ -89,5 +113,54 @@ func TestMarshalChatCompletionRequestIncludesStandardReasoningControls(t *testin
 
 	if _, ok := payload["chat_template_kwargs"]; ok {
 		t.Fatalf("did not expect chat_template_kwargs in payload: %#v", payload["chat_template_kwargs"])
+	}
+}
+
+func TestMarshalChatCompletionRequestIncludesGemmaThinkingControls(t *testing.T) {
+	includeReasoning := true
+
+	req := ChatCompletionRequest{
+		Model:              "gemma4-31b",
+		Messages:           []ChatMessage{{Role: "user", Content: "hi"}},
+		IncludeReasoning:   &includeReasoning,
+		ChatTemplateKwargs: map[string]any{"enable_thinking": true},
+	}
+
+	if extraFields := buildExtraChatCompletionFields(req); len(extraFields) != 2 {
+		t.Fatalf("expected gemma extra fields, got %#v", extraFields)
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("failed to marshal request: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("failed to unmarshal request payload: %v", err)
+	}
+
+	if payload["include_reasoning"] != true {
+		t.Fatalf("expected include_reasoning=true, got %#v", payload["include_reasoning"])
+	}
+
+	chatTemplateKwargs, ok := payload["chat_template_kwargs"].(map[string]any)
+	if !ok || chatTemplateKwargs["enable_thinking"] != true {
+		t.Fatalf("unexpected chat_template_kwargs in payload: %#v", payload["chat_template_kwargs"])
+	}
+}
+
+func TestModelConfigsIncludesGemma4_31B(t *testing.T) {
+	config, ok := modelConfigs["gemma4-31b"]
+	if !ok {
+		t.Fatal("expected gemma4-31b to be registered")
+	}
+
+	if config.ModelID != "gemma4-31b" {
+		t.Fatalf("expected model id gemma4-31b, got %q", config.ModelID)
+	}
+
+	if !config.Active {
+		t.Fatal("expected gemma4-31b to be active")
 	}
 }

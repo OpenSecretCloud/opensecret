@@ -47,6 +47,67 @@ fn default_stream() -> bool {
     true
 }
 
+fn apply_responses_model_defaults(chat_request: &mut Value, model: &str) {
+    if model != "gemma4-31b" {
+        return;
+    }
+
+    let Some(obj) = chat_request.as_object_mut() else {
+        return;
+    };
+
+    obj.insert("include_reasoning".to_string(), json!(true));
+
+    let chat_template_kwargs = obj
+        .entry("chat_template_kwargs".to_string())
+        .or_insert_with(|| json!({}));
+
+    if let Some(kwargs) = chat_template_kwargs.as_object_mut() {
+        kwargs.insert("enable_thinking".to_string(), json!(true));
+    } else {
+        *chat_template_kwargs = json!({
+            "enable_thinking": true
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_responses_model_defaults;
+    use serde_json::json;
+
+    #[test]
+    fn test_apply_responses_model_defaults_enables_gemma_thinking() {
+        let mut chat_request = json!({
+            "model": "gemma4-31b",
+            "chat_template_kwargs": {
+                "foo": "bar"
+            }
+        });
+
+        apply_responses_model_defaults(&mut chat_request, "gemma4-31b");
+
+        assert_eq!(chat_request["include_reasoning"], true);
+        assert_eq!(
+            chat_request["chat_template_kwargs"]["enable_thinking"],
+            true
+        );
+        assert_eq!(chat_request["chat_template_kwargs"]["foo"], "bar");
+    }
+
+    #[test]
+    fn test_apply_responses_model_defaults_skips_other_models() {
+        let mut chat_request = json!({
+            "model": "gpt-oss-120b"
+        });
+
+        apply_responses_model_defaults(&mut chat_request, "gpt-oss-120b");
+
+        assert!(chat_request.get("include_reasoning").is_none());
+        assert!(chat_request.get("chat_template_kwargs").is_none());
+    }
+}
+
 /// Conversation parameter - can be a string UUID or an object with id field
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -1624,7 +1685,7 @@ async fn setup_completion_processor(
     };
 
     // Build chat completion request
-    let chat_request = json!({
+    let mut chat_request = json!({
         "model": body.model,
         "messages": prompt_messages,
         "temperature": body.temperature.unwrap_or(DEFAULT_TEMPERATURE),
@@ -1633,6 +1694,7 @@ async fn setup_completion_processor(
         "stream": true,
         "stream_options": { "include_usage": true }
     });
+    apply_responses_model_defaults(&mut chat_request, &body.model);
 
     // Log the exact request we're sending to the completions API
     trace!(

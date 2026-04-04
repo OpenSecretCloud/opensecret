@@ -38,6 +38,17 @@ diesel::table! {
 }
 
 diesel::table! {
+    conversation_projects (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        name_enc -> Bytea,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     conversations (id) {
         id -> Int8,
         uuid -> Uuid,
@@ -45,6 +56,8 @@ diesel::table! {
         metadata_enc -> Nullable<Bytea>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        project_id -> Nullable<Int8>,
+        is_pinned -> Bool,
     }
 }
 
@@ -312,12 +325,13 @@ diesel::table! {
         id -> Int8,
         uuid -> Uuid,
         user_id -> Uuid,
-        name_enc -> Bytea,
+        name_enc -> Nullable<Bytea>,
         prompt_enc -> Bytea,
         prompt_tokens -> Int4,
         is_default -> Bool,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        project_id -> Nullable<Int8>,
     }
 }
 
@@ -377,6 +391,7 @@ diesel::table! {
 
 diesel::joinable!(assistant_messages -> conversations (conversation_id));
 diesel::joinable!(assistant_messages -> responses (response_id));
+diesel::joinable!(conversations -> conversation_projects (project_id));
 diesel::joinable!(invite_codes -> orgs (org_id));
 diesel::joinable!(org_memberships -> orgs (org_id));
 diesel::joinable!(org_project_secrets -> org_projects (project_id));
@@ -391,6 +406,7 @@ diesel::joinable!(tool_calls -> responses (response_id));
 diesel::joinable!(tool_outputs -> conversations (conversation_id));
 diesel::joinable!(tool_outputs -> responses (response_id));
 diesel::joinable!(tool_outputs -> tool_calls (tool_call_fk));
+diesel::joinable!(user_instructions -> conversation_projects (project_id));
 diesel::joinable!(user_messages -> conversations (conversation_id));
 diesel::joinable!(user_messages -> responses (response_id));
 diesel::joinable!(user_oauth_connections -> oauth_providers (provider_id));
@@ -399,6 +415,7 @@ diesel::joinable!(users -> org_projects (project_id));
 diesel::allow_tables_to_appear_in_same_query!(
     account_deletion_requests,
     assistant_messages,
+    conversation_projects,
     conversations,
     email_verifications,
     enclave_secrets,

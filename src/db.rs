@@ -29,10 +29,11 @@ use crate::models::project_settings::{
     EmailSettings, NewProjectSetting, ProjectSetting, ProjectSettingError, SettingCategory,
 };
 use crate::models::responses::{
-    AssistantMessage, Conversation, NewAssistantMessage, NewConversation, NewReasoningItem,
-    NewResponse, NewToolCall, NewToolOutput, NewUserInstruction, NewUserMessage, RawThreadMessage,
-    RawThreadMessageMetadata, ReasoningItem, Response, ResponseStatus, ResponsesError, ToolCall,
-    ToolOutput, UserInstruction, UserMessage,
+    validate_conversation_project_limit, AssistantMessage, Conversation, ConversationProject,
+    NewAssistantMessage, NewConversation, NewConversationProject, NewReasoningItem, NewResponse,
+    NewToolCall, NewToolOutput, NewUserInstruction, NewUserMessage, ProjectInstructionUpdate,
+    RawThreadMessage, RawThreadMessageMetadata, ReasoningItem, Response, ResponseStatus,
+    ResponsesError, ToolCall, ToolOutput, UserInstruction, UserMessage,
 };
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
 use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
@@ -462,6 +463,10 @@ pub trait DBConnection {
         &self,
         new_conversation: NewConversation,
     ) -> Result<Conversation, DBError>;
+    fn create_conversation_project(
+        &self,
+        new_project: NewConversationProject,
+    ) -> Result<ConversationProject, DBError>;
     fn get_conversation_by_id_and_user(
         &self,
         conversation_id: i64,
@@ -472,21 +477,58 @@ pub trait DBConnection {
         conversation_uuid: Uuid,
         user_id: Uuid,
     ) -> Result<Conversation, DBError>;
+    fn get_conversation_project_by_id_and_user(
+        &self,
+        project_id: i64,
+        user_id: Uuid,
+    ) -> Result<ConversationProject, DBError>;
+    fn get_conversation_project_by_uuid_and_user(
+        &self,
+        project_uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<ConversationProject, DBError>;
     fn update_conversation_metadata(
         &self,
         conversation_id: i64,
         user_id: Uuid,
         metadata_enc: Vec<u8>,
-    ) -> Result<(), DBError>;
+    ) -> Result<Conversation, DBError>;
+    fn update_conversation(
+        &self,
+        conversation_id: i64,
+        user_id: Uuid,
+        metadata_enc: Option<Vec<u8>>,
+        project_id: Option<Option<i64>>,
+        is_pinned: Option<bool>,
+    ) -> Result<Conversation, DBError>;
+    #[allow(clippy::too_many_arguments)]
     fn list_conversations(
         &self,
         user_id: Uuid,
         limit: i64,
         after: Option<Uuid>,
         order: &str,
+        project_id: Option<i64>,
+        has_project: Option<bool>,
+        pinned: Option<bool>,
     ) -> Result<Vec<Conversation>, DBError>;
+    fn list_conversation_projects(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<Uuid>,
+        order: &str,
+    ) -> Result<Vec<ConversationProject>, DBError>;
+    fn update_conversation_project(
+        &self,
+        project_id: i64,
+        user_id: Uuid,
+        name_enc: Option<Vec<u8>>,
+        instruction_update: ProjectInstructionUpdate,
+    ) -> Result<ConversationProject, DBError>;
     fn delete_conversation(&self, conversation_id: i64, user_id: Uuid) -> Result<(), DBError>;
     fn delete_all_conversations(&self, user_id: Uuid) -> Result<(), DBError>;
+    fn delete_conversation_project(&self, project_id: i64, user_id: Uuid) -> Result<(), DBError>;
 
     // Responses (job tracker)
     fn create_response(&self, new_response: NewResponse) -> Result<Response, DBError>;
@@ -519,6 +561,16 @@ pub trait DBConnection {
         &self,
         user_id: Uuid,
     ) -> Result<Option<UserInstruction>, DBError>;
+    fn get_project_instruction(
+        &self,
+        project_id: i64,
+        user_id: Uuid,
+    ) -> Result<Option<UserInstruction>, DBError>;
+    fn get_project_instruction_for_conversation(
+        &self,
+        conversation_id: i64,
+        user_id: Uuid,
+    ) -> Result<Option<UserInstruction>, DBError>;
     fn get_user_instruction_by_uuid_and_user(
         &self,
         uuid: Uuid,
@@ -542,8 +594,8 @@ pub trait DBConnection {
         &self,
         user_id: Uuid,
         limit: i64,
-        after: Option<(DateTime<Utc>, i64)>,
-        before: Option<(DateTime<Utc>, i64)>,
+        after: Option<Uuid>,
+        order: &str,
     ) -> Result<Vec<UserInstruction>, DBError>;
     fn set_default_user_instruction(
         &self,
@@ -1946,6 +1998,32 @@ impl DBConnection for PostgresConnection {
         new_conversation.insert(conn).map_err(DBError::from)
     }
 
+    fn create_conversation_project(
+        &self,
+        new_project: NewConversationProject,
+    ) -> Result<ConversationProject, DBError> {
+        use crate::models::schema::users;
+        use diesel::prelude::*;
+
+        debug!("Creating new conversation project");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        conn.transaction::<ConversationProject, ResponsesError, _>(|tx| {
+            users::table
+                .filter(users::uuid.eq(new_project.user_id))
+                .select(users::id)
+                .for_update()
+                .first::<i32>(tx)?;
+
+            let existing_project_count =
+                ConversationProject::count_for_user(tx, new_project.user_id)?;
+            validate_conversation_project_limit(existing_project_count)?;
+
+            new_project.insert(tx)
+        })
+        .map_err(DBError::from)
+    }
+
     fn get_conversation_by_id_and_user(
         &self,
         conversation_id: i64,
@@ -1966,16 +2044,102 @@ impl DBConnection for PostgresConnection {
         Conversation::get_by_uuid_and_user(conn, conversation_uuid, user_id).map_err(DBError::from)
     }
 
+    fn get_conversation_project_by_id_and_user(
+        &self,
+        project_id: i64,
+        user_id: Uuid,
+    ) -> Result<ConversationProject, DBError> {
+        debug!("Getting conversation project by ID and user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        ConversationProject::get_by_id_and_user(conn, project_id, user_id).map_err(DBError::from)
+    }
+
+    fn get_conversation_project_by_uuid_and_user(
+        &self,
+        project_uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<ConversationProject, DBError> {
+        debug!("Getting conversation project by UUID and user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        ConversationProject::get_by_uuid_and_user(conn, project_uuid, user_id)
+            .map_err(DBError::from)
+    }
+
     fn update_conversation_metadata(
         &self,
         conversation_id: i64,
         user_id: Uuid,
         metadata_enc: Vec<u8>,
-    ) -> Result<(), DBError> {
+    ) -> Result<Conversation, DBError> {
         debug!("Updating conversation metadata");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Conversation::update_metadata(conn, conversation_id, user_id, metadata_enc)
             .map_err(DBError::from)
+    }
+
+    fn update_conversation(
+        &self,
+        conversation_id: i64,
+        user_id: Uuid,
+        metadata_enc: Option<Vec<u8>>,
+        project_id: Option<Option<i64>>,
+        is_pinned: Option<bool>,
+    ) -> Result<Conversation, DBError> {
+        debug!("Updating conversation");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::conversations;
+        use diesel::prelude::*;
+
+        conn.transaction(|tx| {
+            let target = conversations::table
+                .filter(conversations::id.eq(conversation_id))
+                .filter(conversations::user_id.eq(user_id));
+
+            let exists = target
+                .select(conversations::id)
+                .first::<i64>(tx)
+                .optional()?;
+
+            if exists.is_none() {
+                return Err(diesel::result::Error::NotFound);
+            }
+
+            if let Some(metadata_enc) = metadata_enc {
+                diesel::update(target)
+                    .set((
+                        conversations::metadata_enc.eq(metadata_enc),
+                        conversations::updated_at.eq(diesel::dsl::now),
+                    ))
+                    .execute(tx)?;
+            }
+
+            if let Some(project_id) = project_id {
+                diesel::update(target)
+                    .set((
+                        conversations::project_id.eq(project_id),
+                        conversations::updated_at.eq(diesel::dsl::now),
+                    ))
+                    .execute(tx)?;
+            }
+
+            if let Some(is_pinned) = is_pinned {
+                diesel::update(target)
+                    .set((
+                        conversations::is_pinned.eq(is_pinned),
+                        conversations::updated_at.eq(diesel::dsl::now),
+                    ))
+                    .execute(tx)?;
+            }
+
+            target.first::<Conversation>(tx)
+        })
+        .map_err(|e| match e {
+            diesel::result::Error::NotFound => {
+                DBError::ResponsesError(ResponsesError::ConversationNotFound)
+            }
+            _ => DBError::ResponsesError(ResponsesError::DatabaseError(e)),
+        })
     }
 
     fn list_conversations(
@@ -1984,10 +2148,139 @@ impl DBConnection for PostgresConnection {
         limit: i64,
         after: Option<Uuid>,
         order: &str,
+        project_id: Option<i64>,
+        has_project: Option<bool>,
+        pinned: Option<bool>,
     ) -> Result<Vec<Conversation>, DBError> {
         debug!("Listing conversations for user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        Conversation::list_for_user(conn, user_id, limit, after, order).map_err(DBError::from)
+        Conversation::list_for_user(
+            conn,
+            user_id,
+            limit,
+            after,
+            order,
+            project_id,
+            has_project,
+            pinned,
+        )
+        .map_err(DBError::from)
+    }
+
+    fn list_conversation_projects(
+        &self,
+        user_id: Uuid,
+        limit: i64,
+        after: Option<Uuid>,
+        order: &str,
+    ) -> Result<Vec<ConversationProject>, DBError> {
+        debug!("Listing conversation projects for user");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        ConversationProject::list_for_user(conn, user_id, limit, after, order)
+            .map_err(DBError::from)
+    }
+
+    fn update_conversation_project(
+        &self,
+        project_id: i64,
+        user_id: Uuid,
+        name_enc: Option<Vec<u8>>,
+        instruction_update: ProjectInstructionUpdate,
+    ) -> Result<ConversationProject, DBError> {
+        debug!("Updating conversation project");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::{conversation_projects, user_instructions};
+        use diesel::prelude::*;
+
+        conn.transaction(|tx| {
+            let target = conversation_projects::table
+                .filter(conversation_projects::id.eq(project_id))
+                .filter(conversation_projects::user_id.eq(user_id));
+
+            let existing_project = target
+                .first::<ConversationProject>(tx)
+                .optional()?
+                .ok_or(diesel::result::Error::NotFound)?;
+
+            if let Some(name_enc) = name_enc {
+                diesel::update(target)
+                    .set((
+                        conversation_projects::name_enc.eq(name_enc),
+                        conversation_projects::updated_at.eq(diesel::dsl::now),
+                    ))
+                    .execute(tx)?;
+            }
+
+            match instruction_update {
+                ProjectInstructionUpdate::Unchanged => {}
+                ProjectInstructionUpdate::Set {
+                    prompt_enc,
+                    prompt_tokens,
+                } => {
+                    let existing_instruction = user_instructions::table
+                        .filter(user_instructions::user_id.eq(user_id))
+                        .filter(user_instructions::project_id.eq(Some(project_id)))
+                        .first::<UserInstruction>(tx)
+                        .optional()?;
+
+                    if let Some(instruction) = existing_instruction {
+                        diesel::update(
+                            user_instructions::table
+                                .filter(user_instructions::id.eq(instruction.id)),
+                        )
+                        .set((
+                            user_instructions::prompt_enc.eq(prompt_enc),
+                            user_instructions::prompt_tokens.eq(prompt_tokens),
+                            user_instructions::is_default.eq(false),
+                            user_instructions::updated_at.eq(diesel::dsl::now),
+                        ))
+                        .execute(tx)?;
+                    } else {
+                        let new_instruction = NewUserInstruction {
+                            uuid: Uuid::new_v4(),
+                            user_id,
+                            project_id: Some(project_id),
+                            name_enc: None,
+                            prompt_enc,
+                            prompt_tokens,
+                            is_default: false,
+                        };
+
+                        diesel::insert_into(user_instructions::table)
+                            .values(&new_instruction)
+                            .execute(tx)?;
+                    }
+
+                    diesel::update(target)
+                        .set(conversation_projects::updated_at.eq(diesel::dsl::now))
+                        .execute(tx)?;
+                }
+                ProjectInstructionUpdate::Clear => {
+                    diesel::delete(
+                        user_instructions::table
+                            .filter(user_instructions::user_id.eq(user_id))
+                            .filter(user_instructions::project_id.eq(Some(project_id))),
+                    )
+                    .execute(tx)?;
+
+                    diesel::update(target)
+                        .set(conversation_projects::updated_at.eq(diesel::dsl::now))
+                        .execute(tx)?;
+                }
+            }
+
+            conversation_projects::table
+                .filter(conversation_projects::id.eq(existing_project.id))
+                .filter(conversation_projects::user_id.eq(user_id))
+                .first::<ConversationProject>(tx)
+        })
+        .map_err(|e| match e {
+            diesel::result::Error::NotFound => {
+                DBError::ResponsesError(ResponsesError::ConversationProjectNotFound)
+            }
+            _ => DBError::ResponsesError(ResponsesError::DatabaseError(e)),
+        })
     }
 
     fn delete_conversation(&self, conversation_id: i64, user_id: Uuid) -> Result<(), DBError> {
@@ -2000,6 +2293,12 @@ impl DBConnection for PostgresConnection {
         debug!("Deleting all conversations for user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Conversation::delete_all_for_user(conn, user_id).map_err(DBError::from)
+    }
+
+    fn delete_conversation_project(&self, project_id: i64, user_id: Uuid) -> Result<(), DBError> {
+        debug!("Deleting conversation project");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        ConversationProject::delete_by_id_and_user(conn, project_id, user_id).map_err(DBError::from)
     }
 
     // Responses (job tracker) implementations
@@ -2082,10 +2381,63 @@ impl DBConnection for PostgresConnection {
 
         user_instructions::table
             .filter(user_instructions::user_id.eq(user_id))
+            .filter(user_instructions::project_id.is_null())
             .filter(user_instructions::is_default.eq(true))
             .first::<UserInstruction>(conn)
             .optional()
             .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
+    }
+
+    fn get_project_instruction(
+        &self,
+        project_id: i64,
+        user_id: Uuid,
+    ) -> Result<Option<UserInstruction>, DBError> {
+        debug!("Getting project instruction for project");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::user_instructions;
+        use diesel::prelude::*;
+
+        user_instructions::table
+            .filter(user_instructions::user_id.eq(user_id))
+            .filter(user_instructions::project_id.eq(Some(project_id)))
+            .first::<UserInstruction>(conn)
+            .optional()
+            .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
+    }
+
+    fn get_project_instruction_for_conversation(
+        &self,
+        conversation_id: i64,
+        user_id: Uuid,
+    ) -> Result<Option<UserInstruction>, DBError> {
+        debug!("Getting project instruction for conversation");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        use crate::models::schema::{conversations, user_instructions};
+        use diesel::prelude::*;
+
+        let project_id = conversations::table
+            .filter(conversations::id.eq(conversation_id))
+            .filter(conversations::user_id.eq(user_id))
+            .select(conversations::project_id)
+            .first::<Option<i64>>(conn)
+            .optional()
+            .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))?
+            .ok_or(DBError::ResponsesError(
+                ResponsesError::ConversationNotFound,
+            ))?;
+
+        match project_id {
+            Some(project_id) => user_instructions::table
+                .filter(user_instructions::user_id.eq(user_id))
+                .filter(user_instructions::project_id.eq(Some(project_id)))
+                .first::<UserInstruction>(conn)
+                .optional()
+                .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e))),
+            None => Ok(None),
+        }
     }
 
     fn get_user_instruction_by_uuid_and_user(
@@ -2102,6 +2454,7 @@ impl DBConnection for PostgresConnection {
         user_instructions::table
             .filter(user_instructions::uuid.eq(uuid))
             .filter(user_instructions::user_id.eq(user_id))
+            .filter(user_instructions::project_id.is_null())
             .first::<UserInstruction>(conn)
             .map_err(|e| match e {
                 diesel::result::Error::NotFound => {
@@ -2127,6 +2480,7 @@ impl DBConnection for PostgresConnection {
                 diesel::update(
                     user_instructions::table
                         .filter(user_instructions::user_id.eq(new_instruction.user_id))
+                        .filter(user_instructions::project_id.is_null())
                         .filter(user_instructions::is_default.eq(true)),
                 )
                 .set(user_instructions::is_default.eq(false))
@@ -2161,6 +2515,7 @@ impl DBConnection for PostgresConnection {
                 diesel::update(
                     user_instructions::table
                         .filter(user_instructions::user_id.eq(user_id))
+                        .filter(user_instructions::project_id.is_null())
                         .filter(user_instructions::is_default.eq(true))
                         .filter(user_instructions::id.ne(id)),
                 )
@@ -2171,10 +2526,11 @@ impl DBConnection for PostgresConnection {
             diesel::update(
                 user_instructions::table
                     .filter(user_instructions::id.eq(id))
-                    .filter(user_instructions::user_id.eq(user_id)),
+                    .filter(user_instructions::user_id.eq(user_id))
+                    .filter(user_instructions::project_id.is_null()),
             )
             .set((
-                user_instructions::name_enc.eq(name_enc),
+                user_instructions::name_enc.eq(Some(name_enc)),
                 user_instructions::prompt_enc.eq(prompt_enc),
                 user_instructions::prompt_tokens.eq(prompt_tokens),
                 user_instructions::is_default.eq(is_default),
@@ -2195,7 +2551,8 @@ impl DBConnection for PostgresConnection {
         diesel::delete(
             user_instructions::table
                 .filter(user_instructions::id.eq(id))
-                .filter(user_instructions::user_id.eq(user_id)),
+                .filter(user_instructions::user_id.eq(user_id))
+                .filter(user_instructions::project_id.is_null()),
         )
         .execute(conn)
         .map(|rows| {
@@ -2213,8 +2570,8 @@ impl DBConnection for PostgresConnection {
         &self,
         user_id: Uuid,
         limit: i64,
-        after: Option<(DateTime<Utc>, i64)>,
-        before: Option<(DateTime<Utc>, i64)>,
+        after: Option<Uuid>,
+        order: &str,
     ) -> Result<Vec<UserInstruction>, DBError> {
         debug!("Listing user instructions");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
@@ -2224,30 +2581,52 @@ impl DBConnection for PostgresConnection {
 
         let mut query = user_instructions::table
             .filter(user_instructions::user_id.eq(user_id))
+            .filter(user_instructions::project_id.is_null())
             .into_boxed();
 
-        if let Some((updated_at, id)) = after {
-            query = query.filter(
-                user_instructions::updated_at
-                    .lt(updated_at)
-                    .or(user_instructions::updated_at
-                        .eq(updated_at)
-                        .and(user_instructions::id.lt(id))),
-            );
+        if let Some(after_uuid) = after {
+            let cursor_instruction = user_instructions::table
+                .filter(user_instructions::uuid.eq(after_uuid))
+                .filter(user_instructions::user_id.eq(user_id))
+                .filter(user_instructions::project_id.is_null())
+                .select((user_instructions::updated_at, user_instructions::id))
+                .first::<(DateTime<Utc>, i64)>(conn)
+                .optional()?;
+
+            if let Some((updated_at, id)) = cursor_instruction {
+                if order == "desc" {
+                    query = query.filter(
+                        user_instructions::updated_at.lt(updated_at).or(
+                            user_instructions::updated_at
+                                .eq(updated_at)
+                                .and(user_instructions::id.lt(id)),
+                        ),
+                    );
+                } else {
+                    query = query.filter(
+                        user_instructions::updated_at.gt(updated_at).or(
+                            user_instructions::updated_at
+                                .eq(updated_at)
+                                .and(user_instructions::id.gt(id)),
+                        ),
+                    );
+                }
+            }
         }
 
-        if let Some((updated_at, id)) = before {
-            query = query.filter(
-                user_instructions::updated_at
-                    .gt(updated_at)
-                    .or(user_instructions::updated_at
-                        .eq(updated_at)
-                        .and(user_instructions::id.gt(id))),
-            );
+        if order == "desc" {
+            query = query.order((
+                user_instructions::updated_at.desc(),
+                user_instructions::id.desc(),
+            ));
+        } else {
+            query = query.order((
+                user_instructions::updated_at.asc(),
+                user_instructions::id.asc(),
+            ));
         }
 
         query
-            .order(user_instructions::updated_at.desc())
             .limit(limit)
             .load::<UserInstruction>(conn)
             .map_err(|e| DBError::ResponsesError(ResponsesError::DatabaseError(e)))
@@ -2269,6 +2648,7 @@ impl DBConnection for PostgresConnection {
             diesel::update(
                 user_instructions::table
                     .filter(user_instructions::user_id.eq(user_id))
+                    .filter(user_instructions::project_id.is_null())
                     .filter(user_instructions::is_default.eq(true)),
             )
             .set(user_instructions::is_default.eq(false))
@@ -2278,7 +2658,8 @@ impl DBConnection for PostgresConnection {
             diesel::update(
                 user_instructions::table
                     .filter(user_instructions::id.eq(id))
-                    .filter(user_instructions::user_id.eq(user_id)),
+                    .filter(user_instructions::user_id.eq(user_id))
+                    .filter(user_instructions::project_id.is_null()),
             )
             .set((
                 user_instructions::is_default.eq(true),

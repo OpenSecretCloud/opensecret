@@ -38,6 +38,15 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
         let tok = count_tokens(instruction_text);
         system_tokens = tok;
         Some((ROLE_SYSTEM, instruction_text.to_string(), tok))
+    } else if let Ok(Some(project_instruction)) =
+        db.get_project_instruction_for_conversation(conversation_id, user_id)
+    {
+        let plain = decrypt_with_key(user_key, &project_instruction.prompt_enc)
+            .map_err(|_| crate::ApiError::InternalServerError)?;
+        let content = String::from_utf8_lossy(&plain).into_owned();
+        let tok = project_instruction.prompt_tokens as usize;
+        system_tokens = tok;
+        Some((ROLE_SYSTEM, content, tok))
     } else if let Ok(Some(default_instruction)) = db.get_default_user_instruction(user_id) {
         // Otherwise use default user instructions
         let plain = decrypt_with_key(user_key, &default_instruction.prompt_enc)

@@ -1325,7 +1325,8 @@ fn is_web_search_enabled(tools: &Option<Value>) -> bool {
 /// 4. Send ToolOutput event to streams (always, even on error)
 /// 5. Send persistence command via dedicated channel and wait for acknowledgment
 ///
-/// Tool execution is best-effort and uses fast model (gpt-oss-120b).
+/// Tool execution is best-effort: intent classification uses gpt-oss-120b and
+/// query extraction uses llama-3.3-70b.
 struct ToolChannels<'a> {
     client: &'a mpsc::Sender<StorageMessage>,
     storage: &'a mpsc::Sender<StorageMessage>,
@@ -1370,7 +1371,7 @@ async fn classify_and_execute_tools(
     let headers = HeaderMap::new();
     let billing_context = crate::web::openai::BillingContext::new(
         crate::web::openai_auth::AuthMethod::Jwt,
-        "gpt-oss-120b".to_string(),
+        prompts::INTENT_CLASSIFIER_MODEL.to_string(),
     );
 
     let intent = match get_chat_completion_response(
@@ -1431,7 +1432,7 @@ async fn classify_and_execute_tools(
         let query_request = prompts::build_query_extraction_request(prompt_messages, &user_text);
         let billing_context = crate::web::openai::BillingContext::new(
             crate::web::openai_auth::AuthMethod::Jwt,
-            "gpt-oss-120b".to_string(),
+            prompts::QUERY_EXTRACTOR_MODEL.to_string(),
         );
 
         let search_query = match get_chat_completion_response(

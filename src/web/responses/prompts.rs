@@ -5,6 +5,11 @@
 
 use serde_json::{json, Value};
 
+pub const INTENT_CLASSIFIER_MODEL: &str = "gpt-oss-120b";
+pub const INTENT_CLASSIFIER_MAX_TOKENS: i32 = 250;
+pub const QUERY_EXTRACTOR_MODEL: &str = "llama-3.3-70b";
+pub const QUERY_EXTRACTOR_MAX_TOKENS: i32 = 50;
+
 /// System prompt for intent classification
 ///
 /// This prompt instructs the LLM to classify whether a user's message requires
@@ -75,7 +80,7 @@ pub fn build_intent_classification_request(
     let user_prompt = format!("{}Current user query: {}", history_text, user_message);
 
     json!({
-        "model": "gpt-oss-120b",
+        "model": INTENT_CLASSIFIER_MODEL,
         "messages": [
             {
                 "role": "system",
@@ -87,7 +92,7 @@ pub fn build_intent_classification_request(
             }
         ],
         "temperature": 0.0,
-        "max_tokens": 250,
+        "max_tokens": INTENT_CLASSIFIER_MAX_TOKENS,
         "stream": false
     })
 }
@@ -111,7 +116,7 @@ fn extract_text_from_content(content: &Value) -> String {
 
 /// Build a chat completion request for search query extraction
 ///
-/// Uses the same fast model as classification to extract a clean search query.
+/// Uses llama-3.3-70b to extract a concise search query with a tighter output limit.
 ///
 /// # Arguments
 /// * `conversation_history` - Recent conversation messages for context
@@ -151,7 +156,7 @@ pub fn build_query_extraction_request(conversation_history: &[Value], user_messa
     let user_prompt = format!("{}Current user question: {}", history_text, user_message);
 
     json!({
-        "model": "gpt-oss-120b",
+        "model": QUERY_EXTRACTOR_MODEL,
         "messages": [
             {
                 "role": "system",
@@ -163,7 +168,7 @@ pub fn build_query_extraction_request(conversation_history: &[Value], user_messa
             }
         ],
         "temperature": 0.0,
-        "max_tokens": 250,
+        "max_tokens": QUERY_EXTRACTOR_MAX_TOKENS,
         "stream": false
     })
 }
@@ -176,7 +181,7 @@ mod tests {
     fn test_build_intent_classification_request() {
         let request = build_intent_classification_request(&[], "What's the weather?");
 
-        assert_eq!(request["model"], "gpt-oss-120b");
+        assert_eq!(request["model"], INTENT_CLASSIFIER_MODEL);
         assert_eq!(request["temperature"], 0.0);
         assert_eq!(request["stream"], false);
 
@@ -273,8 +278,8 @@ mod tests {
     fn test_build_query_extraction_request() {
         let request = build_query_extraction_request(&[], "What's the weather in New York?");
 
-        assert_eq!(request["model"], "gpt-oss-120b");
-        assert_eq!(request["max_tokens"], 250);
+        assert_eq!(request["model"], QUERY_EXTRACTOR_MODEL);
+        assert_eq!(request["max_tokens"], QUERY_EXTRACTOR_MAX_TOKENS);
 
         let messages = request["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2);

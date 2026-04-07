@@ -3,7 +3,7 @@
 //! These types are used by both the Responses API and Conversations API
 //! to represent message content in various formats.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 // ============================================================================
 // Message Content Types (Input)
@@ -59,6 +59,42 @@ pub enum MessageContent {
 
     /// Rich multimodal content with multiple parts
     Parts(Vec<MessageContentPart>),
+}
+
+/// Field wrapper for PATCH-like request bodies that need to distinguish
+/// between omitted fields, explicit nulls, and concrete values.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NullableField<T> {
+    Missing,
+    Null,
+    Value(T),
+}
+
+impl<T> Default for NullableField<T> {
+    fn default() -> Self {
+        Self::Missing
+    }
+}
+
+impl<T> NullableField<T> {
+    pub fn is_missing(&self) -> bool {
+        matches!(self, Self::Missing)
+    }
+}
+
+impl<'de, T> Deserialize<'de> for NullableField<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match Option::<T>::deserialize(deserializer)? {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        })
+    }
 }
 
 // ============================================================================
@@ -150,6 +186,15 @@ impl DeletedObjectResponse {
         Self {
             id,
             object: crate::web::responses::constants::OBJECT_TYPE_CONVERSATION_DELETED,
+            deleted: true,
+        }
+    }
+
+    /// Create a deleted conversation project response
+    pub fn conversation_project(id: uuid::Uuid) -> Self {
+        Self {
+            id,
+            object: crate::web::responses::constants::OBJECT_TYPE_CONVERSATION_PROJECT_DELETED,
             deleted: true,
         }
     }

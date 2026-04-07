@@ -249,7 +249,10 @@ impl ConversationBuilder {
                 id: conv.uuid,
                 object: OBJECT_TYPE_CONVERSATION,
                 metadata: None, // Set via .metadata()
+                project_id: None,
+                pinned: conv.is_pinned,
                 created_at: conv.created_at.timestamp(),
+                last_activity_at: conv.last_activity_at.timestamp(),
             },
         }
     }
@@ -260,6 +263,12 @@ impl ConversationBuilder {
     /// * `metadata` - Optional JSON metadata object
     pub fn metadata(mut self, metadata: Option<Value>) -> Self {
         self.conversation.metadata = metadata;
+        self
+    }
+
+    /// Set the project UUID if the conversation is assigned to a project
+    pub fn project_id(mut self, project_id: Option<Uuid>) -> Self {
+        self.conversation.project_id = project_id;
         self
     }
 

@@ -23,6 +23,7 @@ thiserror = "1.0.63"
 async-trait = "0.1.81"
 jsonwebtoken = "9.3.0"
 jwt-compact = { version = "0.9.0-beta.1", features = ["es256k"] }
+dspy-rs = { git = "https://github.com/OpenSecretCloud/DSRs.git", branch = "main" }
 diesel = { version = "=2.2.2", features = [
     "postgres",
     "postgres_backend",
@@ -34,6 +35,7 @@ diesel = { version = "=2.2.2", features = [
 ] }
 diesel-derive-enum = { version = "2.1.0", features = ["postgres"] }
 chrono = { version = "0.4.26", features = ["serde"] }
+chrono-tz = "0.10"
 dotenv = "0.15.0"
 aes-gcm = "0.10.1"
 aes-siv = "0.7"
@@ -43,13 +45,15 @@ cbc = "0.1.2"
 secp256k1 = { version = "0.29.0", features = ["rand"] }
 hyper = { version = "0.14", features = ["full"] }
 hyper-tls = "0.5.0"
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", features = ["json", "native-tls-alpn"] }
 futures = "0.3.30"
 uuid = { version = "1.10.0", features = ["v4", "serde"] }
 tokio-stream = "0.1"
 async-stream = "0.3"
 bytes = "1.0"
 sha2 = { version = "0.10", default-features = false }
+p256 = { version = "0.13", features = ["ecdh", "pkcs8"] }
+hkdf = "0.12"
 hex = "0.4.3"
 base64 = "0.22.1"
 vsock = "0.5.1"
@@ -75,3 +79,4 @@ lazy_static = "1.4.0"
 subtle = "2.6.1"
 tiktoken-rs = "0.5"
 once_cell = "1.19"
+unicode-segmentation = "1.12"

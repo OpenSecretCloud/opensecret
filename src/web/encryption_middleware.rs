@@ -46,7 +46,6 @@ pub async fn decrypt_request<T>(
 where
     T: DeserializeOwned + Send + Sync + Clone + 'static,
 {
-    tracing::debug!("Entering decrypt_request");
     let session_id = headers
         .get("x-session-id")
         .and_then(|v| v.to_str().ok())
@@ -85,8 +84,6 @@ where
 
     request.extensions_mut().insert(decrypted);
     request.extensions_mut().insert(session_id);
-
-    tracing::debug!("Exiting decrypt_request");
     Ok(next.run(request).await)
 }
 
@@ -95,12 +92,10 @@ pub async fn encrypt_response<T: Serialize>(
     session_id: &Uuid,
     response: &T,
 ) -> Result<Json<EncryptedResponse<T>>, ApiError> {
-    tracing::debug!("Entering encrypt_response");
     let response_json = serde_json::to_vec(response).map_err(|_| ApiError::InternalServerError)?;
     let encrypted_response = state
         .encrypt_session_data(session_id, &response_json)
         .await?;
-    tracing::debug!("Exiting encrypt_response");
     Ok(Json(EncryptedResponse::new(
         base64::engine::general_purpose::STANDARD.encode(encrypted_response),
     )))

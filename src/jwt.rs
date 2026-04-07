@@ -136,11 +136,19 @@ impl TokenType {
             return Err(ApiError::BadRequest);
         }
 
-        // 5. Parse the URL to ensure it's valid
-        let _url = Url::parse(aud).map_err(|e| {
-            tracing::error!("Invalid audience URL format: {}, error: {:?}", aud, e);
-            ApiError::BadRequest
-        })?;
+        // 5. Reject empty audience values
+        if aud.is_empty() {
+            tracing::error!("Audience value cannot be empty");
+            return Err(ApiError::BadRequest);
+        }
+
+        // 6. Parse as URI to ensure it's valid if it contains ':'
+        if aud.contains(':') {
+            Url::parse(aud).map_err(|e| {
+                tracing::error!("Invalid audience URI format: {}, error: {:?}", aud, e);
+                ApiError::BadRequest
+            })?;
+        }
 
         Ok(())
     }

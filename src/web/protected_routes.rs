@@ -1230,15 +1230,15 @@ pub async fn generate_third_party_token(
         user.uuid, request.audience
     );
 
-    // Validate the audience URL
+    // Validate the audience
     if let Some(audience) = request.audience.as_ref() {
-        if url::Url::parse(audience).is_err() {
-            error!("Invalid audience URL provided: {}", audience);
+        if audience.is_empty() || (audience.contains(':') && url::Url::parse(audience).is_err()) {
+            error!("Invalid audience provided: {}", audience);
             return Err(ApiError::BadRequest);
         }
     }
 
-    debug!("Audience URL validation successful");
+    debug!("Audience validation successful");
 
     let project = data.db.get_org_project_by_id(user.project_id)?;
 

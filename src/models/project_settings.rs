@@ -20,6 +20,7 @@ pub enum ProjectSettingError {
 pub enum SettingCategory {
     Email,
     OAuth,
+    Push,
 }
 
 impl SettingCategory {
@@ -27,6 +28,7 @@ impl SettingCategory {
         match self {
             SettingCategory::Email => "email",
             SettingCategory::OAuth => "oauth",
+            SettingCategory::Push => "push",
         }
     }
 }
@@ -74,6 +76,49 @@ pub struct OAuthSettings {
     pub apple_oauth_settings: Option<AppleOAuthSettings>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PushEnvironment {
+    Dev,
+    #[default]
+    Prod,
+}
+
+impl PushEnvironment {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Dev => "dev",
+            Self::Prod => "prod",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IosPushSettings {
+    pub enabled: bool,
+    pub bundle_id: String,
+    pub apns_environment: PushEnvironment,
+    pub team_id: String,
+    pub key_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AndroidPushSettings {
+    pub enabled: bool,
+    pub firebase_project_id: String,
+    pub package_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PushSettings {
+    #[serde(default)]
+    pub encrypted_preview_enabled: bool,
+    #[serde(default)]
+    pub ios: Option<IosPushSettings>,
+    #[serde(default)]
+    pub android: Option<AndroidPushSettings>,
+}
+
 #[derive(Queryable, Identifiable)]
 #[diesel(table_name = project_settings)]
 pub struct ProjectSetting {
@@ -93,6 +138,11 @@ impl ProjectSetting {
     }
 
     pub fn get_oauth_settings(&self) -> Result<OAuthSettings, ProjectSettingError> {
+        serde_json::from_value(self.settings.clone())
+            .map_err(ProjectSettingError::SerializationError)
+    }
+
+    pub fn get_push_settings(&self) -> Result<PushSettings, ProjectSettingError> {
         serde_json::from_value(self.settings.clone())
             .map_err(ProjectSettingError::SerializationError)
     }
@@ -155,6 +205,18 @@ impl NewProjectSetting {
             project_id,
             category: SettingCategory::OAuth.as_str().to_string(),
             settings: serde_json::to_value(oauth_settings)
+                .map_err(ProjectSettingError::SerializationError)?,
+        })
+    }
+
+    pub fn new_push_settings(
+        project_id: i32,
+        push_settings: PushSettings,
+    ) -> Result<Self, ProjectSettingError> {
+        Ok(Self {
+            project_id,
+            category: SettingCategory::Push.as_str().to_string(),
+            settings: serde_json::to_value(push_settings)
                 .map_err(ProjectSettingError::SerializationError)?,
         })
     }

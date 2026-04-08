@@ -26,5 +26,6 @@ pub mod token_usage;
 pub mod user_api_keys;
 pub mod user_embeddings;
 pub mod user_kv;
+pub mod user_preferences;
 pub mod user_seed_wrappings;
 pub mod users;

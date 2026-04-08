@@ -23,6 +23,7 @@ pub fn model_max_ctx(model: &str) -> usize {
         ("qwen3-vl-30b", 256_000), // Vision-language model
         ("kimi-k2-5", 256_000),    // Vision-capable model with 256K context
         ("gemma4-31b", 256_000),   // Multimodal model with 256K context
+        ("glm-5-1", 202_000),      // Long-context agentic engineering model
         // Provider-specific equivalents
         ("llama3-3-70b", 128_000), // Tinfoil alias
         // Chat models
@@ -74,6 +75,7 @@ mod tests {
         assert_eq!(model_max_ctx("gpt-oss-120b"), 128_000);
         assert_eq!(model_max_ctx("qwen3-vl-30b"), 256_000);
         assert_eq!(model_max_ctx("gemma4-31b"), 256_000);
+        assert_eq!(model_max_ctx("glm-5-1"), 202_000);
     }
 
     #[test]

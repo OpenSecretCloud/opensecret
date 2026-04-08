@@ -1853,6 +1853,7 @@ async fn persist_request_data(
         content_enc: prepared.content_enc.clone(),
         attachment_text_enc: None,
         prompt_tokens: prepared.user_message_tokens,
+        assistant_reaction: None,
     };
     let user_message = state
         .db

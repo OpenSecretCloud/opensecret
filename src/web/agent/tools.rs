@@ -14,6 +14,9 @@ use crate::models::memory_blocks::{
     MemoryBlock, NewMemoryBlock, MEMORY_BLOCK_LABEL_HUMAN, MEMORY_BLOCK_LABEL_PERSONA,
 };
 use crate::models::responses::Conversation;
+use crate::models::user_preferences::{
+    UserPreference, UserPreferenceError, USER_PREFERENCE_LOCALE, USER_PREFERENCE_TIMEZONE,
+};
 use crate::models::users::User;
 use crate::rag::{cosine_similarity, deserialize_f32_le, search_user_embeddings};
 use crate::web::openai_auth::AuthMethod;
@@ -179,6 +182,18 @@ fn default_block_value(label: &str) -> Result<&'static str, ApiError> {
         MEMORY_BLOCK_LABEL_PERSONA => Ok(runtime::DEFAULT_PERSONA_VALUE),
         MEMORY_BLOCK_LABEL_HUMAN => Ok(""),
         _ => Err(ApiError::BadRequest),
+    }
+}
+
+fn canonical_preference_key(key: &str) -> Result<&'static str, String> {
+    match key.trim() {
+        USER_PREFERENCE_TIMEZONE => Ok(USER_PREFERENCE_TIMEZONE),
+        USER_PREFERENCE_LOCALE | "language" => Ok(USER_PREFERENCE_LOCALE),
+        "" => Err("'key' must not be empty".to_string()),
+        other => Err(format!(
+            "Unsupported preference key '{}'. Known keys: 'timezone' and 'locale'.",
+            other
+        )),
     }
 }
 
@@ -819,6 +834,101 @@ impl Tool for ArchivalSearchTool {
 }
 
 // ============================================================================
+// User preference tool
+// ============================================================================
+
+pub struct SetPreferenceTool {
+    state: Arc<AppState>,
+    user_id: Uuid,
+    user_key: Arc<SecretKey>,
+}
+
+impl SetPreferenceTool {
+    pub fn new(state: Arc<AppState>, user_id: Uuid, user_key: Arc<SecretKey>) -> Self {
+        Self {
+            state,
+            user_id,
+            user_key,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for SetPreferenceTool {
+    fn name(&self) -> &str {
+        "set_preference"
+    }
+
+    fn description(&self) -> &str {
+        "Set a validated user-global preference. Known keys: 'timezone' (IANA timezone like 'America/Chicago') and 'locale' (locale/language hint like 'en' or 'en-US'). Use this only for durable preferences the user explicitly shares or asks to change."
+    }
+
+    fn args_schema(&self) -> &str {
+        r#"{"key": "preference key ('timezone' or 'locale')", "value": "preference value"}"#
+    }
+
+    async fn execute(&self, args: &HashMap<String, String>) -> ToolResult {
+        let Some(key) = args.get("key") else {
+            return ToolResult::error("'key' argument required");
+        };
+        let resolved_key = match canonical_preference_key(key) {
+            Ok(key) => key,
+            Err(err) => return ToolResult::error(err),
+        };
+
+        let Some(value) = args.get("value") else {
+            return ToolResult::error("'value' argument required");
+        };
+        let Some(value) = runtime::normalize_optional_preference(Some(value.as_str())) else {
+            return ToolResult::error("'value' must not be empty");
+        };
+
+        if let Err(err) = UserPreference::validate(resolved_key, &value) {
+            return ToolResult::error(match err {
+                UserPreferenceError::InvalidPreference(msg) => msg,
+                UserPreferenceError::DatabaseError(db_err) => {
+                    error!("set_preference validation failed unexpectedly: {db_err:?}");
+                    "Preference validation failed".to_string()
+                }
+            });
+        }
+
+        let mut conn = match self.state.db.get_pool().get() {
+            Ok(c) => c,
+            Err(_) => return ToolResult::error("Database connection error"),
+        };
+
+        match runtime::upsert_user_preference(
+            &mut conn,
+            self.user_key.as_ref(),
+            self.user_id,
+            resolved_key,
+            Some(value.clone()),
+        )
+        .await
+        {
+            Ok(()) => {
+                if resolved_key == USER_PREFERENCE_TIMEZONE {
+                    ToolResult::success(format!(
+                        "Set user preference '{}' to '{}'. Follow-user schedules now use this timezone.",
+                        resolved_key, value
+                    ))
+                } else {
+                    ToolResult::success(format!(
+                        "Set user preference '{}' to '{}'.",
+                        resolved_key, value
+                    ))
+                }
+            }
+            Err(err) => {
+                error!("set_preference failed for user {}: {err:?}", self.user_id);
+                ToolResult::error("Failed to update preference")
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Subagent tool
 // ============================================================================
 
@@ -940,5 +1050,33 @@ mod tests {
     fn insert_at_line_middle() {
         let v = "a\nc";
         assert_eq!(insert_at_line(v, "b", 1), "a\nb\nc");
+    }
+
+    #[test]
+    fn canonical_preference_key_supports_maple_keys() {
+        assert_eq!(
+            canonical_preference_key(" timezone ").unwrap(),
+            USER_PREFERENCE_TIMEZONE
+        );
+        assert_eq!(
+            canonical_preference_key("locale").unwrap(),
+            USER_PREFERENCE_LOCALE
+        );
+    }
+
+    #[test]
+    fn canonical_preference_key_maps_language_to_locale() {
+        assert_eq!(
+            canonical_preference_key("language").unwrap(),
+            USER_PREFERENCE_LOCALE
+        );
+    }
+
+    #[test]
+    fn canonical_preference_key_rejects_unknown_keys() {
+        assert_eq!(
+            canonical_preference_key("display_name").unwrap_err(),
+            "Unsupported preference key 'display_name'. Known keys: 'timezone' and 'locale'."
+        );
     }
 }

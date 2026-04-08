@@ -16,6 +16,7 @@ use crate::models::platform_password_reset::NewPlatformPasswordResetRequest;
 use crate::models::platform_users::PlatformUser;
 use crate::push::worker::start_push_worker;
 use crate::sqs::SqsEventPublisher;
+use crate::web::agent::start_schedule_worker;
 use crate::web::openai_auth::validate_openai_auth;
 use crate::web::platform_login_routes;
 use crate::web::{
@@ -2700,6 +2701,7 @@ async fn main() -> Result<(), Error> {
     .await?;
 
     start_push_worker(app_state.clone());
+    start_schedule_worker(app_state.clone());
 
     let cors = CorsLayer::new()
         // allow all method types

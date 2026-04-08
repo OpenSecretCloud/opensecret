@@ -174,30 +174,29 @@ fn insert_at_line(value: &str, content: &str, line: i32) -> String {
     new_lines.join("\n")
 }
 
+fn default_block_value(label: &str) -> Result<&'static str, ApiError> {
+    match label {
+        MEMORY_BLOCK_LABEL_PERSONA => Ok(runtime::DEFAULT_PERSONA_VALUE),
+        MEMORY_BLOCK_LABEL_HUMAN => Ok(""),
+        _ => Err(ApiError::BadRequest),
+    }
+}
+
 async fn update_block_value(
     state: &Arc<AppState>,
     user_id: Uuid,
     user_key: &SecretKey,
     label: &str,
     new_value: &str,
-    existing: &MemoryBlock,
 ) -> Result<(), ApiError> {
-    if label != MEMORY_BLOCK_LABEL_PERSONA && label != MEMORY_BLOCK_LABEL_HUMAN {
-        return Err(ApiError::BadRequest);
-    }
+    let _ = default_block_value(label)?;
 
     if new_value.len() > MAX_CORE_MEMORY_BLOCK_CHARS {
         return Err(ApiError::BadRequest);
     }
 
     let value_enc = encrypt_with_key(user_key, new_value.as_bytes()).await;
-
-    let new_block = NewMemoryBlock {
-        uuid: existing.uuid,
-        user_id,
-        label: label.to_string(),
-        value_enc,
-    };
+    let new_block = NewMemoryBlock::new(user_id, label, value_enc);
 
     let mut conn = state
         .db
@@ -260,21 +259,26 @@ impl Tool for MemoryReplaceTool {
         };
 
         let existing = match MemoryBlock::get_by_user_and_label(&mut conn, self.user_id, block) {
-            Ok(Some(b)) => b,
-            Ok(None) => return ToolResult::error(format!("Block '{}' not found", block)),
+            Ok(existing) => existing,
             Err(e) => {
                 error!("Failed to load block '{}': {e:?}", block);
                 return ToolResult::error("Failed to load memory block");
             }
         };
 
-        let value = match decrypt_string(&self.user_key, Some(&existing.value_enc)) {
-            Ok(Some(v)) => v,
-            Ok(None) => String::new(),
-            Err(e) => {
-                error!("Failed to decrypt block '{}': {e:?}", block);
-                return ToolResult::error("Failed to decrypt memory block");
-            }
+        let value = match existing {
+            Some(existing) => match decrypt_string(&self.user_key, Some(&existing.value_enc)) {
+                Ok(Some(v)) => v,
+                Ok(None) => String::new(),
+                Err(e) => {
+                    error!("Failed to decrypt block '{}': {e:?}", block);
+                    return ToolResult::error("Failed to decrypt memory block");
+                }
+            },
+            None => match default_block_value(block) {
+                Ok(default) => default.to_string(),
+                Err(_) => return ToolResult::error(format!("Block '{}' not found", block)),
+            },
         };
 
         if !value.contains(old) {
@@ -285,15 +289,8 @@ impl Tool for MemoryReplaceTool {
         }
 
         let new_value = value.replace(old, new);
-        if let Err(e) = update_block_value(
-            &self.state,
-            self.user_id,
-            &self.user_key,
-            block,
-            &new_value,
-            &existing,
-        )
-        .await
+        if let Err(e) =
+            update_block_value(&self.state, self.user_id, &self.user_key, block, &new_value).await
         {
             error!("Failed to update block '{}': {e:?}", block);
             return ToolResult::error("Failed to update memory block");
@@ -347,21 +344,26 @@ impl Tool for MemoryAppendTool {
         };
 
         let existing = match MemoryBlock::get_by_user_and_label(&mut conn, self.user_id, block) {
-            Ok(Some(b)) => b,
-            Ok(None) => return ToolResult::error(format!("Block '{}' not found", block)),
+            Ok(existing) => existing,
             Err(e) => {
                 error!("Failed to load block '{}': {e:?}", block);
                 return ToolResult::error("Failed to load memory block");
             }
         };
 
-        let value = match decrypt_string(&self.user_key, Some(&existing.value_enc)) {
-            Ok(Some(v)) => v,
-            Ok(None) => String::new(),
-            Err(e) => {
-                error!("Failed to decrypt block '{}': {e:?}", block);
-                return ToolResult::error("Failed to decrypt memory block");
-            }
+        let value = match existing {
+            Some(existing) => match decrypt_string(&self.user_key, Some(&existing.value_enc)) {
+                Ok(Some(v)) => v,
+                Ok(None) => String::new(),
+                Err(e) => {
+                    error!("Failed to decrypt block '{}': {e:?}", block);
+                    return ToolResult::error("Failed to decrypt memory block");
+                }
+            },
+            None => match default_block_value(block) {
+                Ok(default) => default.to_string(),
+                Err(_) => return ToolResult::error(format!("Block '{}' not found", block)),
+            },
         };
 
         let new_value = if value.is_empty() {
@@ -370,15 +372,8 @@ impl Tool for MemoryAppendTool {
             format!("{}\n{}", value, content)
         };
 
-        if let Err(e) = update_block_value(
-            &self.state,
-            self.user_id,
-            &self.user_key,
-            block,
-            &new_value,
-            &existing,
-        )
-        .await
+        if let Err(e) =
+            update_block_value(&self.state, self.user_id, &self.user_key, block, &new_value).await
         {
             error!("Failed to update block '{}': {e:?}", block);
             return ToolResult::error("Failed to update memory block");
@@ -433,34 +428,32 @@ impl Tool for MemoryInsertTool {
         };
 
         let existing = match MemoryBlock::get_by_user_and_label(&mut conn, self.user_id, block) {
-            Ok(Some(b)) => b,
-            Ok(None) => return ToolResult::error(format!("Block '{}' not found", block)),
+            Ok(existing) => existing,
             Err(e) => {
                 error!("Failed to load block '{}': {e:?}", block);
                 return ToolResult::error("Failed to load memory block");
             }
         };
 
-        let value = match decrypt_string(&self.user_key, Some(&existing.value_enc)) {
-            Ok(Some(v)) => v,
-            Ok(None) => String::new(),
-            Err(e) => {
-                error!("Failed to decrypt block '{}': {e:?}", block);
-                return ToolResult::error("Failed to decrypt memory block");
-            }
+        let value = match existing {
+            Some(existing) => match decrypt_string(&self.user_key, Some(&existing.value_enc)) {
+                Ok(Some(v)) => v,
+                Ok(None) => String::new(),
+                Err(e) => {
+                    error!("Failed to decrypt block '{}': {e:?}", block);
+                    return ToolResult::error("Failed to decrypt memory block");
+                }
+            },
+            None => match default_block_value(block) {
+                Ok(default) => default.to_string(),
+                Err(_) => return ToolResult::error(format!("Block '{}' not found", block)),
+            },
         };
 
         let new_value = insert_at_line(&value, content, line);
 
-        if let Err(e) = update_block_value(
-            &self.state,
-            self.user_id,
-            &self.user_key,
-            block,
-            &new_value,
-            &existing,
-        )
-        .await
+        if let Err(e) =
+            update_block_value(&self.state, self.user_id, &self.user_key, block, &new_value).await
         {
             error!("Failed to update block '{}': {e:?}", block);
             return ToolResult::error("Failed to update memory block");

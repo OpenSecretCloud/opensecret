@@ -11,6 +11,7 @@ pub const NOTIFICATION_DELIVERY_MODE_ENCRYPTED_PREVIEW: &str = "encrypted_previe
 pub const NOTIFICATION_PRIORITY_NORMAL: &str = "normal";
 pub const NOTIFICATION_PRIORITY_HIGH: &str = "high";
 pub const NOTIFICATION_SOURCE_REQUEST_CONTINUATION: &str = "request_continuation";
+pub const NOTIFICATION_SOURCE_AGENT_BACKGROUND: &str = "agent_background";
 
 #[derive(Error, Debug)]
 pub enum NotificationEventError {
@@ -38,6 +39,7 @@ pub struct NotificationEvent {
     pub cancelled_at: Option<DateTime<Utc>>,
     pub source_kind: String,
     pub source_request_id: Option<Uuid>,
+    pub background_grant_id: Option<i64>,
 }
 
 impl NotificationEvent {
@@ -81,6 +83,7 @@ pub struct NewNotificationEvent {
     pub expires_at: Option<DateTime<Utc>>,
     pub source_kind: String,
     pub source_request_id: Option<Uuid>,
+    pub background_grant_id: Option<i64>,
 }
 
 impl NewNotificationEvent {

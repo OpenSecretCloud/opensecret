@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::agent_background::{decrypt_background_grant_v1, AgentBackgroundGrantPlaintextV1};
 use crate::encrypt::{decrypt_aead_v1, derive_key, encrypt_aead_v1, CanonicalBytes, EncryptError};
+use crate::models::agent_background_grants::AgentBackgroundGrant;
 use crate::models::notification_events::NotificationEvent;
 use crate::models::push_devices::PushDevice;
 
@@ -104,7 +106,9 @@ pub struct NotificationPreviewPayloadV1 {
     pub project_id: i32,
     pub source_kind: String,
     pub source_request_id: Option<Uuid>,
+    pub background_grant_uuid: Option<Uuid>,
     pub agent_uuid: Option<Uuid>,
+    pub schedule_uuid: Option<Uuid>,
     pub delivery_mode: String,
     pub message_id: Uuid,
     pub kind: String,
@@ -116,13 +120,18 @@ pub struct NotificationPreviewPayloadV1 {
 }
 
 impl NotificationPreviewPayloadV1 {
-    pub fn matches_event(&self, event: &NotificationEvent) -> bool {
+    pub fn matches_event(
+        &self,
+        event: &NotificationEvent,
+        background_grant_uuid: Option<Uuid>,
+    ) -> bool {
         self.v == PUSH_EVENT_PAYLOAD_VERSION_V1
             && self.notification_id == event.uuid
             && self.user_uuid == event.user_id
             && self.project_id == event.project_id
             && self.source_kind == event.source_kind
             && self.source_request_id == event.source_request_id
+            && self.background_grant_uuid == background_grant_uuid
             && self.delivery_mode == event.delivery_mode
             && self.kind == event.kind
     }
@@ -183,6 +192,7 @@ pub fn encrypt_notification_preview_payload_v1(
         user_uuid: plaintext.user_uuid,
         project_id: plaintext.project_id,
         source_kind: &plaintext.source_kind,
+        background_grant_uuid: plaintext.background_grant_uuid,
         kind: &plaintext.kind,
         delivery_mode: &plaintext.delivery_mode,
         version: plaintext.v,
@@ -195,6 +205,7 @@ pub fn decrypt_notification_preview_payload_v1(
     root_key: &[u8],
     encrypted: &[u8],
     event: &NotificationEvent,
+    background_grant_uuid: Option<Uuid>,
 ) -> Result<NotificationPreviewPayloadV1, EncryptError> {
     let key = derive_key(root_key, PUSH_EVENT_PAYLOAD_AEAD_INFO)?;
     let aad = notification_payload_aad_v1(NotificationPayloadAad {
@@ -202,12 +213,29 @@ pub fn decrypt_notification_preview_payload_v1(
         user_uuid: event.user_id,
         project_id: event.project_id,
         source_kind: &event.source_kind,
+        background_grant_uuid,
         kind: &event.kind,
         delivery_mode: &event.delivery_mode,
         version: PUSH_EVENT_PAYLOAD_VERSION_V1,
     });
     let bytes = decrypt_aead_v1(&key, encrypted, &aad)?;
     serde_json::from_slice(&bytes).map_err(|_| EncryptError::BadData)
+}
+
+pub fn decrypt_background_grant_for_push(
+    root_key: &[u8],
+    grant: &AgentBackgroundGrant,
+    payload: &NotificationPreviewPayloadV1,
+) -> Result<AgentBackgroundGrantPlaintextV1, EncryptError> {
+    decrypt_background_grant_v1(
+        root_key,
+        &grant.grant_enc,
+        grant.uuid,
+        payload.user_uuid,
+        payload.project_id,
+        payload.agent_uuid.ok_or(EncryptError::BadData)?,
+        payload.schedule_uuid.ok_or(EncryptError::BadData)?,
+    )
 }
 
 struct PushDeviceAad<'a> {
@@ -241,6 +269,7 @@ struct NotificationPayloadAad<'a> {
     user_uuid: Uuid,
     project_id: i32,
     source_kind: &'a str,
+    background_grant_uuid: Option<Uuid>,
     kind: &'a str,
     delivery_mode: &'a str,
     version: i16,
@@ -252,6 +281,12 @@ fn notification_payload_aad_v1(input: NotificationPayloadAad<'_>) -> Vec<u8> {
         .append_uuid(input.user_uuid)
         .append_i32(input.project_id)
         .append_str(input.source_kind)
+        .append_str(
+            &input
+                .background_grant_uuid
+                .map(|uuid| uuid.to_string())
+                .unwrap_or_default(),
+        )
         .append_str(input.kind)
         .append_str(input.delivery_mode)
         .append_i16(input.version);

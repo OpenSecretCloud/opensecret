@@ -1018,10 +1018,11 @@ impl DBConnection for PostgresConnection {
         new_wrapping: NewUserSeedWrapping,
     ) -> Result<(), DBError> {
         use crate::models::schema::{
-            agent_schedule_runs, agent_schedules, agents, conversation_projects,
-            conversation_summaries, conversations, memory_blocks, notification_events,
-            password_reset_requests, push_devices, user_embeddings, user_instructions, user_kv,
-            user_oauth_connections, user_preferences, user_seed_wrappings, users,
+            agent_background_grants, agent_schedule_runs, agent_schedules, agents,
+            conversation_projects, conversation_summaries, conversations, memory_blocks,
+            notification_events, password_reset_requests, push_devices, user_embeddings,
+            user_instructions, user_kv, user_oauth_connections, user_preferences,
+            user_seed_wrappings, users,
         };
 
         debug!("Completing destructive password reset");
@@ -1069,6 +1070,10 @@ impl DBConnection for PostgresConnection {
                 .execute(conn)?;
             diesel::delete(
                 agent_schedule_runs::table.filter(agent_schedule_runs::user_id.eq(user_id)),
+            )
+            .execute(conn)?;
+            diesel::delete(
+                agent_background_grants::table.filter(agent_background_grants::user_id.eq(user_id)),
             )
             .execute(conn)?;
             diesel::delete(agent_schedules::table.filter(agent_schedules::user_id.eq(user_id)))

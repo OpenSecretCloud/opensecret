@@ -8,6 +8,7 @@ use uuid::Uuid;
 use diesel::prelude::*;
 
 use crate::encrypt::{decrypt_string, encrypt_with_key};
+use crate::jwt::AuthContext;
 use crate::models::agents::{
     Agent, NewAgent, AGENT_CREATED_BY_USER, AGENT_KIND_MAIN, AGENT_KIND_SUBAGENT,
 };
@@ -36,14 +37,17 @@ use crate::web::responses::{MessageContent, MessageContentConverter, MessageCont
 use crate::{ApiError, AppState};
 
 use super::compaction::CompactionManager;
+use super::schedules::{
+    refresh_follow_user_schedules_for_user, CancelScheduleTool, ListSchedulesTool, ScheduleTaskTool,
+};
 use super::signatures::{
     build_lm, call_agent_response_with_retry_and_correction, AgentResponseInput, AgentToolCall,
     AGENT_INSTRUCTION,
 };
 use super::tools::{
     ArchivalInsertTool, ArchivalSearchTool, ConversationSearchTool, DoneTool, MemoryAppendTool,
-    MemoryInsertTool, MemoryReplaceTool, SpawnSubagentTool, ToolRegistry, ToolResult,
-    WebSearchTool,
+    MemoryInsertTool, MemoryReplaceTool, SetPreferenceTool, SpawnSubagentTool, ToolRegistry,
+    ToolResult, WebSearchTool,
 };
 use super::vision;
 
@@ -198,7 +202,7 @@ async fn subagent_metadata_enc(
     .await
 }
 
-fn normalize_optional_preference(value: Option<&str>) -> Option<String> {
+pub(crate) fn normalize_optional_preference(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -294,7 +298,7 @@ fn format_message_timestamp(
     }
 }
 
-async fn upsert_user_preference(
+pub(crate) async fn upsert_user_preference(
     conn: &mut diesel::PgConnection,
     user_key: &SecretKey,
     user_id: Uuid,
@@ -312,6 +316,13 @@ async fn upsert_user_preference(
             error!("Failed to upsert user preference '{key}': {e:?}");
             ApiError::InternalServerError
         })?;
+
+    if key == USER_PREFERENCE_TIMEZONE {
+        refresh_follow_user_schedules_for_user(conn, user_id, &value).map_err(|e| {
+            error!("Failed to refresh follow-user schedules for timezone update: {e:?}");
+            ApiError::InternalServerError
+        })?;
+    }
 
     Ok(())
 }
@@ -563,6 +574,7 @@ impl AgentRuntime {
         state: Arc<AppState>,
         user: crate::models::users::User,
         user_key: SecretKey,
+        auth_context: Option<AuthContext>,
     ) -> Result<Self, ApiError> {
         let user = Arc::new(user);
         let user_key = Arc::new(user_key);
@@ -576,7 +588,7 @@ impl AgentRuntime {
         let (agent, conversation) =
             load_main_agent(&mut conn, user.uuid)?.ok_or(ApiError::NotFound)?;
 
-        Self::from_loaded(state, user, user_key, agent, conversation).await
+        Self::from_loaded(state, user, user_key, auth_context, agent, conversation).await
     }
 
     pub async fn new_subagent(
@@ -584,6 +596,7 @@ impl AgentRuntime {
         user: crate::models::users::User,
         user_key: SecretKey,
         agent_uuid: Uuid,
+        auth_context: Option<AuthContext>,
     ) -> Result<Self, ApiError> {
         let user = Arc::new(user);
         let user_key = Arc::new(user_key);
@@ -613,13 +626,14 @@ impl AgentRuntime {
                 },
             )?;
 
-        Self::from_loaded(state, user, user_key, agent, conversation).await
+        Self::from_loaded(state, user, user_key, auth_context, agent, conversation).await
     }
 
     async fn from_loaded(
         state: Arc<AppState>,
         user: Arc<crate::models::users::User>,
         user_key: Arc<SecretKey>,
+        auth_context: Option<AuthContext>,
         agent: Agent,
         conversation: Conversation,
     ) -> Result<Self, ApiError> {
@@ -664,9 +678,32 @@ impl AgentRuntime {
             user_key.clone(),
             conversation.id,
         )));
+        tools.register(Arc::new(SetPreferenceTool::new(
+            state.clone(),
+            user.uuid,
+            user_key.clone(),
+        )));
         if let Some(brave_client) = state.brave_client.clone() {
             tools.register(Arc::new(WebSearchTool::new(brave_client)));
         }
+        tools.register(Arc::new(ScheduleTaskTool::new(
+            state.clone(),
+            user.clone(),
+            user_key.clone(),
+            auth_context.clone(),
+            agent.clone(),
+        )));
+        tools.register(Arc::new(ListSchedulesTool::new(
+            state.clone(),
+            user.clone(),
+            user_key.clone(),
+            agent.clone(),
+        )));
+        tools.register(Arc::new(CancelScheduleTool::new(
+            state.clone(),
+            user.clone(),
+            agent.clone(),
+        )));
         if agent.kind == AGENT_KIND_MAIN {
             tools.register(Arc::new(SpawnSubagentTool::new(
                 state.clone(),
@@ -1494,7 +1531,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         Ok((call, out))
     }
 
-    async fn maybe_compact(&self) -> Result<(), ApiError> {
+    pub(crate) async fn maybe_compact(&self) -> Result<(), ApiError> {
         let mut conn = self
             .state
             .db

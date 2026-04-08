@@ -5,12 +5,13 @@ pub mod fcm;
 pub mod worker;
 
 use crate::db::DBError;
+use crate::models::agent_background_grants::AgentBackgroundGrant;
 use crate::models::notification_deliveries::{NewNotificationDelivery, NotificationDeliveryError};
 use crate::models::notification_events::{
     NewNotificationEvent, NotificationEvent, NotificationEventError,
     NOTIFICATION_DELIVERY_MODE_ENCRYPTED_PREVIEW, NOTIFICATION_DELIVERY_MODE_GENERIC,
     NOTIFICATION_KIND_AGENT_MESSAGE, NOTIFICATION_PRIORITY_HIGH, NOTIFICATION_PRIORITY_NORMAL,
-    NOTIFICATION_SOURCE_REQUEST_CONTINUATION,
+    NOTIFICATION_SOURCE_AGENT_BACKGROUND, NOTIFICATION_SOURCE_REQUEST_CONTINUATION,
 };
 use crate::models::project_settings::ProjectSettingError;
 use crate::models::push_devices::{PushDevice, PushDeviceError};
@@ -114,12 +115,26 @@ pub enum PushNotificationSource {
         source_request_id: Option<Uuid>,
         agent_uuid: Option<Uuid>,
     },
+    AgentBackground {
+        grant_id: i64,
+        grant_uuid: Uuid,
+        agent_uuid: Uuid,
+        schedule_uuid: Uuid,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BackgroundAgentPushSource<'a> {
+    pub grant: &'a AgentBackgroundGrant,
+    pub agent_uuid: Uuid,
+    pub schedule_uuid: Uuid,
 }
 
 impl PushNotificationSource {
     fn source_kind(&self) -> &'static str {
         match self {
             Self::RequestContinuation { .. } => NOTIFICATION_SOURCE_REQUEST_CONTINUATION,
+            Self::AgentBackground { .. } => NOTIFICATION_SOURCE_AGENT_BACKGROUND,
         }
     }
 
@@ -128,12 +143,35 @@ impl PushNotificationSource {
             Self::RequestContinuation {
                 source_request_id, ..
             } => *source_request_id,
+            Self::AgentBackground { .. } => None,
+        }
+    }
+
+    fn background_grant_id(&self) -> Option<i64> {
+        match self {
+            Self::RequestContinuation { .. } => None,
+            Self::AgentBackground { grant_id, .. } => Some(*grant_id),
+        }
+    }
+
+    fn background_grant_uuid(&self) -> Option<Uuid> {
+        match self {
+            Self::RequestContinuation { .. } => None,
+            Self::AgentBackground { grant_uuid, .. } => Some(*grant_uuid),
         }
     }
 
     fn agent_uuid(&self) -> Option<Uuid> {
         match self {
             Self::RequestContinuation { agent_uuid, .. } => *agent_uuid,
+            Self::AgentBackground { agent_uuid, .. } => Some(*agent_uuid),
+        }
+    }
+
+    fn schedule_uuid(&self) -> Option<Uuid> {
+        match self {
+            Self::RequestContinuation { .. } => None,
+            Self::AgentBackground { schedule_uuid, .. } => Some(*schedule_uuid),
         }
     }
 }
@@ -284,7 +322,9 @@ pub async fn enqueue_notification(
             project_id: request.project_id,
             source_kind: request.source.source_kind().to_string(),
             source_request_id: request.source.source_request_id(),
+            background_grant_uuid: request.source.background_grant_uuid(),
             agent_uuid: request.source.agent_uuid(),
+            schedule_uuid: request.source.schedule_uuid(),
             delivery_mode: request.delivery_mode.as_str().to_string(),
             message_id: preview_payload.message_id,
             kind: preview_payload.kind.clone(),
@@ -316,6 +356,7 @@ pub async fn enqueue_notification(
             payload_enc,
             source_kind: request.source.source_kind().to_string(),
             source_request_id: request.source.source_request_id(),
+            background_grant_id: request.source.background_grant_id(),
             not_before_at: request.not_before_at,
             expires_at: request.expires_at,
         }
@@ -404,6 +445,68 @@ pub async fn enqueue_agent_message_notification(
             source: PushNotificationSource::RequestContinuation {
                 source_request_id: None,
                 agent_uuid: source_agent_uuid,
+            },
+            not_before_at: None,
+            expires_at: Some(Utc::now() + Duration::days(7)),
+        },
+    )
+    .await
+}
+
+pub async fn enqueue_background_agent_message_notification(
+    state: &Arc<AppState>,
+    user: &User,
+    target: AgentPushTarget,
+    message_id: Uuid,
+    message_text: &str,
+    source: BackgroundAgentPushSource<'_>,
+) -> Result<Option<QueuedNotification>, PushError> {
+    if message_text.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let push_settings = state
+        .db
+        .get_project_push_settings(user.project_id)?
+        .unwrap_or_default();
+    let delivery_mode = if push_settings.encrypted_preview_enabled {
+        PushDeliveryMode::EncryptedPreview
+    } else {
+        PushDeliveryMode::Generic
+    };
+
+    let (deep_link, thread_id) = match &target {
+        AgentPushTarget::Main => ("opensecret://agent".to_string(), "agent:main".to_string()),
+        AgentPushTarget::Subagent(agent_uuid) => (
+            format!("opensecret://agent/subagent/{}", agent_uuid),
+            format!("agent:subagent:{}", agent_uuid),
+        ),
+    };
+
+    enqueue_notification(
+        state,
+        EnqueueNotificationRequest {
+            project_id: user.project_id,
+            user_id: user.uuid,
+            kind: NOTIFICATION_KIND_AGENT_MESSAGE.to_string(),
+            delivery_mode,
+            priority: PushPriority::High,
+            fallback_title: AGENT_NOTIFICATION_FALLBACK_TITLE.to_string(),
+            fallback_body: AGENT_NOTIFICATION_FALLBACK_BODY.to_string(),
+            preview_payload: Some(NotificationPreviewPayloadInput {
+                message_id,
+                kind: NOTIFICATION_KIND_AGENT_MESSAGE.to_string(),
+                title: "Maple".to_string(),
+                body: normalize_preview_body(message_text),
+                deep_link,
+                thread_id,
+                sent_at: Utc::now().timestamp(),
+            }),
+            source: PushNotificationSource::AgentBackground {
+                grant_id: source.grant.id,
+                grant_uuid: source.grant.uuid,
+                agent_uuid: source.agent_uuid,
+                schedule_uuid: source.schedule_uuid,
             },
             not_before_at: None,
             expires_at: Some(Utc::now() + Duration::days(7)),

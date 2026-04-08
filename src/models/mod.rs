@@ -1,4 +1,7 @@
 pub mod account_deletion;
+pub mod agent_background_grants;
+pub mod agent_schedule_runs;
+pub mod agent_schedules;
 pub mod agents;
 pub mod app_data_migrations;
 pub mod conversation_summaries;

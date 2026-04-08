@@ -18,6 +18,7 @@ use crate::models::platform_password_reset::NewPlatformPasswordResetRequest;
 use crate::models::platform_users::PlatformUser;
 use crate::push::worker::start_push_worker;
 use crate::sqs::SqsEventPublisher;
+use crate::web::agent::start_schedule_worker;
 use crate::web::openai_auth::validate_openai_auth;
 use crate::web::platform_login_routes;
 use crate::web::{
@@ -30,6 +31,7 @@ use crate::{attestation_routes::SessionState, web::platform_routes};
 use crate::jwt::{AuthContext, AuthMethod};
 use crate::models::user_seed_wrappings::{NewUserSeedWrapping, UserSeedWrappingError};
 use crate::seed_wrapping::{
+    agent_background_credential_lookup_hash, compute_agent_background_auth_binding,
     compute_oauth_auth_binding, compute_password_auth_binding, decrypt_seed_v1, encrypt_seed_v1,
     normalize_email_login_identifier, normalize_guest_login_identifier,
     oauth_credential_lookup_hash, password_credential_lookup_hash, password_reset_code_mac,
@@ -81,6 +83,7 @@ use vsock::{VsockAddr, VsockStream};
 use web::attestation_routes;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
+mod agent_background;
 mod apple_signin;
 mod aws_credentials;
 mod billing;
@@ -1226,6 +1229,94 @@ impl AppState {
         }
 
         Ok(())
+    }
+
+    fn new_agent_background_seed_wrapping_for_user(
+        &self,
+        user: &User,
+        grant_uuid: Uuid,
+        background_secret: &[u8; 32],
+        plaintext_seed: &[u8],
+    ) -> Result<NewUserSeedWrapping, Error> {
+        let auth_binding = compute_agent_background_auth_binding(
+            &self.enclave_key,
+            grant_uuid,
+            user.uuid,
+            user.project_id,
+            background_secret,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+        let credential_lookup_hash =
+            agent_background_credential_lookup_hash(&self.enclave_key, grant_uuid)
+                .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        let seed_enc = encrypt_seed_v1(
+            &self.enclave_key,
+            plaintext_seed,
+            user.uuid,
+            user.project_id,
+            CredentialKind::AgentBackground,
+            &auth_binding,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        Ok(NewUserSeedWrapping::new(
+            user.uuid,
+            CredentialKind::AgentBackground.as_str(),
+            credential_lookup_hash.as_bytes().to_vec(),
+            SEED_WRAP_VERSION_V1,
+            seed_enc,
+        ))
+    }
+
+    async fn get_user_key_for_agent_background_grant(
+        &self,
+        user: &User,
+        grant_plaintext: &crate::agent_background::AgentBackgroundGrantPlaintextV1,
+        seed_wrap_lookup_hash: &[u8],
+    ) -> Result<SecretKey, Error> {
+        if user.uuid != grant_plaintext.user_uuid || user.project_id != grant_plaintext.project_id {
+            return Err(Error::AuthenticationError);
+        }
+
+        let expected_lookup_hash =
+            agent_background_credential_lookup_hash(&self.enclave_key, grant_plaintext.grant_uuid)
+                .map_err(|e| Error::EncryptionError(e.to_string()))?;
+        if seed_wrap_lookup_hash != expected_lookup_hash.as_bytes() {
+            return Err(Error::AuthenticationError);
+        }
+
+        let auth_binding = compute_agent_background_auth_binding(
+            &self.enclave_key,
+            grant_plaintext.grant_uuid,
+            user.uuid,
+            user.project_id,
+            &grant_plaintext.background_secret,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        let seed_wrap = self
+            .db
+            .get_user_seed_wrapping_by_credential(
+                user.uuid,
+                CredentialKind::AgentBackground.as_str(),
+                expected_lookup_hash.as_bytes(),
+                SEED_WRAP_VERSION_V1,
+            )?
+            .ok_or(Error::AuthenticationError)?;
+
+        let plaintext_seed = decrypt_seed_v1(
+            &self.enclave_key,
+            &seed_wrap.seed_enc,
+            user.uuid,
+            user.project_id,
+            CredentialKind::AgentBackground,
+            &auth_binding,
+        )
+        .map_err(|_| Error::AuthenticationError)?;
+
+        plaintext_user_seed_to_key(&plaintext_seed, None, None)
+            .map_err(|e| Error::EncryptionError(e.to_string()))
     }
 
     async fn register_user(&self, creds: RegisterCredentials) -> Result<User, Error> {
@@ -3199,6 +3290,7 @@ async fn main() -> Result<(), Error> {
     .await?;
 
     start_push_worker(app_state.clone());
+    start_schedule_worker(app_state.clone());
 
     let cors = CorsLayer::new()
         // allow all method types

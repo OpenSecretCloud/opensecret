@@ -35,6 +35,14 @@ pub struct Agent {
 }
 
 impl Agent {
+    pub fn get_by_id(conn: &mut PgConnection, lookup_id: i64) -> Result<Option<Agent>, AgentError> {
+        agents::table
+            .filter(agents::id.eq(lookup_id))
+            .first::<Agent>(conn)
+            .optional()
+            .map_err(AgentError::DatabaseError)
+    }
+
     pub fn get_main_for_user(
         conn: &mut PgConnection,
         lookup_user_id: Uuid,

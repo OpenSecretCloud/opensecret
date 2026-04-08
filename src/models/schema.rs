@@ -22,6 +22,22 @@ diesel::table! {
 }
 
 diesel::table! {
+    agent_background_grants (id) {
+        id -> Int8,
+        uuid -> Uuid,
+        user_id -> Uuid,
+        project_id -> Int4,
+        agent_id -> Int8,
+        schedule_id -> Int8,
+        grant_enc -> Bytea,
+        seed_wrap_lookup_hash -> Bytea,
+        revoked_at -> Nullable<Timestamptz>,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     agent_schedule_runs (id) {
         id -> Int8,
         uuid -> Uuid,
@@ -53,7 +69,7 @@ diesel::table! {
         uuid -> Uuid,
         user_id -> Uuid,
         agent_id -> Int8,
-        description -> Text,
+        description_enc -> Bytea,
         instruction_enc -> Bytea,
         schedule_kind -> Text,
         recurrence_type -> Nullable<Text>,
@@ -240,6 +256,7 @@ diesel::table! {
         cancelled_at -> Nullable<Timestamptz>,
         source_kind -> Text,
         source_request_id -> Nullable<Uuid>,
+        background_grant_id -> Nullable<Int8>,
     }
 }
 
@@ -607,6 +624,9 @@ diesel::table! {
     }
 }
 
+diesel::joinable!(agent_background_grants -> agent_schedules (schedule_id));
+diesel::joinable!(agent_background_grants -> agents (agent_id));
+diesel::joinable!(agent_background_grants -> org_projects (project_id));
 diesel::joinable!(agent_schedule_runs -> agent_schedules (schedule_id));
 diesel::joinable!(agent_schedule_runs -> agents (agent_id));
 diesel::joinable!(agent_schedules -> agents (agent_id));
@@ -618,6 +638,7 @@ diesel::joinable!(conversations -> conversation_projects (project_id));
 diesel::joinable!(invite_codes -> orgs (org_id));
 diesel::joinable!(notification_deliveries -> notification_events (event_id));
 diesel::joinable!(notification_deliveries -> push_devices (push_device_id));
+diesel::joinable!(notification_events -> agent_background_grants (background_grant_id));
 diesel::joinable!(notification_events -> org_projects (project_id));
 diesel::joinable!(org_memberships -> orgs (org_id));
 diesel::joinable!(org_project_secrets -> org_projects (project_id));
@@ -643,6 +664,7 @@ diesel::joinable!(users -> org_projects (project_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     account_deletion_requests,
+    agent_background_grants,
     agent_schedule_runs,
     agent_schedules,
     agents,

@@ -40,9 +40,12 @@ use crate::{ApiError, AppMode, AppState};
 
 mod compaction;
 mod runtime;
+mod schedules;
 mod signatures;
 mod tools;
 mod vision;
+
+pub(crate) use schedules::start_schedule_worker;
 
 #[derive(Debug, Clone, Deserialize)]
 struct AgentChatRequest {
@@ -945,11 +948,23 @@ async fn run_agent_chat_task(
 
     let runtime = match target.clone() {
         ChatTarget::Main => {
-            runtime::AgentRuntime::new_main(state.clone(), user.clone(), user_key).await
+            runtime::AgentRuntime::new_main(
+                state.clone(),
+                user.clone(),
+                user_key,
+                Some(auth_context.clone()),
+            )
+            .await
         }
         ChatTarget::Subagent(agent_uuid) => {
-            runtime::AgentRuntime::new_subagent(state.clone(), user.clone(), user_key, agent_uuid)
-                .await
+            runtime::AgentRuntime::new_subagent(
+                state.clone(),
+                user.clone(),
+                user_key,
+                agent_uuid,
+                Some(auth_context.clone()),
+            )
+            .await
         }
     };
 

@@ -150,6 +150,77 @@ func TestMarshalChatCompletionRequestIncludesGemmaThinkingControls(t *testing.T)
 	}
 }
 
+func TestMarshalChatCompletionRequestIncludesGLMIncludeReasoningFalse(t *testing.T) {
+	// On the current Tinfoil/vLLM stack, forwarding include_reasoning=false
+	// suppresses GLM reasoning output.
+	includeReasoning := false
+
+	req := ChatCompletionRequest{
+		Model:            "glm-5-1",
+		Messages:         []ChatMessage{{Role: "user", Content: "hi"}},
+		IncludeReasoning: &includeReasoning,
+	}
+
+	extraFields := buildExtraChatCompletionFields(req)
+	if len(extraFields) != 1 {
+		t.Fatalf("expected 1 extra field, got %#v", extraFields)
+	}
+
+	includeReasoningValue, ok := extraFields["include_reasoning"].(bool)
+	if !ok || includeReasoningValue {
+		t.Fatalf("unexpected include_reasoning field: %#v", extraFields["include_reasoning"])
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("failed to marshal request: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("failed to unmarshal request payload: %v", err)
+	}
+
+	if payload["include_reasoning"] != false {
+		t.Fatalf("expected include_reasoning=false, got %#v", payload["include_reasoning"])
+	}
+}
+
+func TestMarshalChatCompletionRequestIncludesGLMEnableThinkingFalse(t *testing.T) {
+	// On the current Tinfoil/vLLM stack, forwarding
+	// chat_template_kwargs.enable_thinking=false suppresses GLM reasoning output.
+	req := ChatCompletionRequest{
+		Model:              "glm-5-1",
+		Messages:           []ChatMessage{{Role: "user", Content: "hi"}},
+		ChatTemplateKwargs: map[string]any{"enable_thinking": false},
+	}
+
+	extraFields := buildExtraChatCompletionFields(req)
+	if len(extraFields) != 1 {
+		t.Fatalf("expected 1 extra field, got %#v", extraFields)
+	}
+
+	chatTemplateKwargs, ok := extraFields["chat_template_kwargs"].(map[string]any)
+	if !ok || chatTemplateKwargs["enable_thinking"] != false {
+		t.Fatalf("unexpected chat_template_kwargs field: %#v", extraFields["chat_template_kwargs"])
+	}
+
+	data, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("failed to marshal request: %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("failed to unmarshal request payload: %v", err)
+	}
+
+	chatTemplateKwargs, ok = payload["chat_template_kwargs"].(map[string]any)
+	if !ok || chatTemplateKwargs["enable_thinking"] != false {
+		t.Fatalf("unexpected chat_template_kwargs in payload: %#v", payload["chat_template_kwargs"])
+	}
+}
+
 func TestModelConfigsIncludesGemma4_31B(t *testing.T) {
 	config, ok := modelConfigs["gemma4-31b"]
 	if !ok {
@@ -162,5 +233,20 @@ func TestModelConfigsIncludesGemma4_31B(t *testing.T) {
 
 	if !config.Active {
 		t.Fatal("expected gemma4-31b to be active")
+	}
+}
+
+func TestModelConfigsIncludesGLM_5_1(t *testing.T) {
+	config, ok := modelConfigs["glm-5-1"]
+	if !ok {
+		t.Fatal("expected glm-5-1 to be registered")
+	}
+
+	if config.ModelID != "glm-5-1" {
+		t.Fatalf("expected model id glm-5-1, got %q", config.ModelID)
+	}
+
+	if !config.Active {
+		t.Fatal("expected glm-5-1 to be active")
 	}
 }

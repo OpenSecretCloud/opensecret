@@ -61,6 +61,11 @@ var modelConfigs = map[string]struct {
 		Description: "Multimodal model with 256K context, built-in thinking, image understanding, and native function calling.",
 		Active:      true,
 	},
+	"glm-5-1": {
+		ModelID:     "glm-5-1",
+		Description: "Long-context agentic engineering model with strong function calling, structured outputs, and sustained reasoning. Text-only (no image support).",
+		Active:      true,
+	},
 	"whisper-large-v3-turbo": {
 		ModelID:     "whisper-large-v3-turbo",
 		Description: "Fast and accurate speech-to-text transcription model",

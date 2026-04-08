@@ -137,6 +137,7 @@ impl ProxyRouter {
             routes.insert("qwen3-vl-30b".to_string(), tinfoil_route.clone());
             routes.insert("kimi-k2-5".to_string(), tinfoil_route.clone());
             routes.insert("gemma4-31b".to_string(), tinfoil_route.clone());
+            routes.insert("glm-5-1".to_string(), tinfoil_route.clone());
             routes.insert("nomic-embed-text".to_string(), tinfoil_route.clone());
 
             // Continuum-only models
@@ -177,6 +178,7 @@ impl ProxyRouter {
                 "qwen3-vl-30b",
                 "kimi-k2-5",
                 "gemma4-31b",
+                "glm-5-1",
                 "nomic-embed-text",
             ]
         } else {
@@ -270,6 +272,10 @@ mod tests {
             router.get_model_name_for_provider("gemma4-31b", "tinfoil"),
             "gemma4-31b"
         );
+        assert_eq!(
+            router.get_model_name_for_provider("glm-5-1", "tinfoil"),
+            "glm-5-1"
+        );
     }
 
     #[test]
@@ -349,6 +355,12 @@ mod tests {
         assert_eq!(route.primary.provider_name, "tinfoil");
         assert!(route.fallbacks.is_empty());
 
+        let glm_route = router.get_model_route("glm-5-1");
+        assert!(glm_route.is_some());
+        let route = glm_route.unwrap();
+        assert_eq!(route.primary.provider_name, "tinfoil");
+        assert!(route.fallbacks.is_empty());
+
         // Test gpt-oss-120b has both providers (Tinfoil primary, Continuum fallback)
         let gpt_route = router.get_model_route("gpt-oss-120b");
         assert!(gpt_route.is_some());
@@ -376,6 +388,9 @@ mod tests {
 
         let gemma4_route = router.get_model_route("gemma4-31b");
         assert!(gemma4_route.is_none());
+
+        let glm_route = router.get_model_route("glm-5-1");
+        assert!(glm_route.is_none());
 
         // But gemma and gpt-oss should be available on Continuum
         let gemma_route = router.get_model_route("gemma-3-27b");
@@ -475,6 +490,7 @@ mod tests {
             .collect();
         assert!(model_ids.contains(&"llama-3.3-70b".to_string()));
         assert!(model_ids.contains(&"gemma4-31b".to_string()));
+        assert!(model_ids.contains(&"glm-5-1".to_string()));
         assert!(model_ids.contains(&"gpt-oss-120b".to_string()));
     }
 }

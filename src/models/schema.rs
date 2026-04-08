@@ -238,6 +238,8 @@ diesel::table! {
         expires_at -> Nullable<Timestamptz>,
         created_at -> Timestamptz,
         cancelled_at -> Nullable<Timestamptz>,
+        source_kind -> Text,
+        source_request_id -> Nullable<Uuid>,
     }
 }
 
@@ -374,14 +376,15 @@ diesel::table! {
         id -> Int8,
         uuid -> Uuid,
         user_id -> Uuid,
+        project_id -> Int4,
         installation_id -> Uuid,
         platform -> Text,
         provider -> Text,
         environment -> Text,
         app_id -> Text,
-        push_token_enc -> Bytea,
         push_token_hash -> Bytea,
-        notification_public_key -> Bytea,
+        capability_enc -> Bytea,
+        notification_public_key_hash -> Bytea,
         key_algorithm -> Text,
         supports_encrypted_preview -> Bool,
         supports_background_processing -> Bool,

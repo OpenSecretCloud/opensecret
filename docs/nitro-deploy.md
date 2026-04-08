@@ -586,6 +586,103 @@ A restart of this should not be needed but if you need to:
 sudo systemctl restart vsock-apple-proxy.service
 ```
 
+## Vsock APNs and FCM proxies
+Create vsock proxy services so that enclave program can talk to push providers:
+
+First configure the endpoints into their allowlist:
+
+```
+sudo vim /etc/nitro_enclaves/vsock-proxy.yaml
+```
+
+Add these lines:
+```
+- {address: api.push.apple.com, port: 443}
+- {address: api.sandbox.push.apple.com, port: 443}
+- {address: fcm.googleapis.com, port: 443}
+```
+
+#### APNs Production
+Now create a service that spins this up automatically:
+
+```
+sudo vim /etc/systemd/system/vsock-apns-prod-proxy.service
+```
+
+```
+[Unit]
+Description=Vsock APNs Production Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8024 api.push.apple.com 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### APNs Sandbox
+```
+sudo vim /etc/systemd/system/vsock-apns-sandbox-proxy.service
+```
+
+```
+[Unit]
+Description=Vsock APNs Sandbox Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8025 api.sandbox.push.apple.com 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### FCM
+```
+sudo vim /etc/systemd/system/vsock-fcm-proxy.service
+```
+
+```
+[Unit]
+Description=Vsock FCM Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8029 fcm.googleapis.com 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Activate services:
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable vsock-apns-prod-proxy.service
+sudo systemctl start vsock-apns-prod-proxy.service
+sudo systemctl status vsock-apns-prod-proxy.service
+sudo systemctl enable vsock-apns-sandbox-proxy.service
+sudo systemctl start vsock-apns-sandbox-proxy.service
+sudo systemctl status vsock-apns-sandbox-proxy.service
+sudo systemctl enable vsock-fcm-proxy.service
+sudo systemctl start vsock-fcm-proxy.service
+sudo systemctl status vsock-fcm-proxy.service
+```
+
+A restart of these should not be needed but if you need to:
+```
+sudo systemctl restart vsock-apns-prod-proxy.service
+sudo systemctl restart vsock-apns-sandbox-proxy.service
+sudo systemctl restart vsock-fcm-proxy.service
+```
+
 ## Vsock Resend proxy
 Create a vsock proxy service so that enclave program can talk to resend:
 

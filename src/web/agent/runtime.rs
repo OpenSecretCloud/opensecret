@@ -2,7 +2,7 @@ use chrono_tz::Tz;
 use secp256k1::SecretKey;
 use serde_json::json;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
 use diesel::prelude::*;
@@ -36,12 +36,13 @@ use crate::web::responses::{MessageContent, MessageContentConverter, MessageCont
 use crate::{ApiError, AppState};
 
 use super::compaction::CompactionManager;
+use super::reactions::{has_meaningful_reaction_candidate, normalize_optional_reaction};
 use super::schedules::{
     refresh_follow_user_schedules_for_user, CancelScheduleTool, ListSchedulesTool, ScheduleTaskTool,
 };
 use super::signatures::{
-    build_lm, call_agent_response_with_retry_and_correction, AgentResponseInput, AgentToolCall,
-    AGENT_INSTRUCTION,
+    agent_instruction, build_lm, call_agent_response_with_retry_and_correction, AgentResponseInput,
+    AgentToolCall,
 };
 use super::tools::{
     ArchivalInsertTool, ArchivalSearchTool, ConversationSearchTool, DoneTool, MemoryAppendTool,
@@ -108,6 +109,7 @@ pub struct ExecutedTool {
 #[derive(Clone, Debug)]
 pub struct StepResult {
     pub messages: Vec<String>,
+    pub reply_reaction: Option<String>,
     #[allow(dead_code)]
     pub tool_calls: Vec<AgentToolCall>,
     pub executed_tools: Vec<ExecutedTool>,
@@ -121,18 +123,58 @@ pub struct AgentRuntime {
     agent: Agent,
     conversation: Conversation,
     subagent_purpose: String,
-    system_prompt: String,
     lm: Arc<dspy_rs::LM>,
     tools: ToolRegistry,
     available_tools: String,
     compaction: CompactionManager,
     current_tool_results: Vec<String>,
     previous_step_summary: Option<(Vec<String>, Vec<String>)>,
+    current_user_message_uuid: Option<Uuid>,
     max_steps: usize,
 }
 
-fn build_system_prompt(agent: &Agent, subagent_purpose: &str) -> String {
-    let mut prompt = AGENT_INSTRUCTION.to_string();
+fn normalize_reply_reaction_for_step(
+    raw_reply_reaction: &str,
+    has_active_user_message: bool,
+    is_first_step: bool,
+) -> Option<String> {
+    if !has_active_user_message || !is_first_step {
+        return None;
+    }
+
+    normalize_optional_reaction(Some(raw_reply_reaction))
+}
+
+fn log_preview(value: &str, max_chars: usize) -> String {
+    let normalized = value.replace('\n', "\\n");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+
+    let preview: String = normalized.chars().take(max_chars).collect();
+    format!("{preview}…")
+}
+
+fn tool_call_names(tool_calls: &[AgentToolCall]) -> Vec<&str> {
+    tool_calls
+        .iter()
+        .map(|tool_call| tool_call.name.as_str())
+        .collect()
+}
+
+fn message_previews(messages: &[String], max_preview_chars: usize) -> Vec<String> {
+    messages
+        .iter()
+        .map(|message| log_preview(message, max_preview_chars))
+        .collect()
+}
+
+fn build_system_prompt(
+    agent: &Agent,
+    subagent_purpose: &str,
+    allow_reply_reaction: bool,
+) -> String {
+    let mut prompt = agent_instruction(allow_reply_reaction);
 
     if agent.kind == AGENT_KIND_MAIN {
         prompt.push_str(
@@ -369,6 +411,8 @@ async fn seed_main_agent_onboarding_messages(
             completion_tokens,
             status: "completed".to_string(),
             finish_reason: None,
+            created_at: chrono::Utc::now(),
+            user_reaction: None,
         }
         .insert(conn)
         .map_err(|e| {
@@ -639,8 +683,6 @@ impl AgentRuntime {
             })?
             .unwrap_or_default();
 
-        let system_prompt = build_system_prompt(&agent, &subagent_purpose);
-
         let mut tools = ToolRegistry::new();
         tools.register(Arc::new(MemoryReplaceTool::new(
             state.clone(),
@@ -724,13 +766,13 @@ impl AgentRuntime {
             agent,
             conversation,
             subagent_purpose,
-            system_prompt,
             lm,
             tools,
             available_tools,
             compaction: CompactionManager::new(),
             current_tool_results: Vec::new(),
             previous_step_summary: None,
+            current_user_message_uuid: None,
             max_steps: 10,
         })
     }
@@ -738,14 +780,16 @@ impl AgentRuntime {
     pub fn clear_tool_results(&mut self) {
         self.current_tool_results.clear();
         self.previous_step_summary = None;
+        self.current_user_message_uuid = None;
     }
 
     pub fn max_steps(&self) -> usize {
         self.max_steps
     }
 
-    fn build_step_system_prompt(&self, ctx: &AgentContext) -> String {
-        let mut prompt = self.system_prompt.clone();
+    fn build_step_system_prompt(&self, ctx: &AgentContext, allow_reply_reaction: bool) -> String {
+        let mut prompt =
+            build_system_prompt(&self.agent, &self.subagent_purpose, allow_reply_reaction);
 
         if self.agent.kind == AGENT_KIND_MAIN
             && ctx.main_agent_user_message_count > 0
@@ -837,8 +881,10 @@ impl AgentRuntime {
         }
 
         self.clear_tool_results();
-        self.insert_user_message(normalized, attachment_text, &embed_text)
+        let user_message = self
+            .insert_user_message(normalized, attachment_text, &embed_text)
             .await?;
+        self.current_user_message_uuid = Some(user_message.uuid);
         self.maybe_compact().await?;
         Ok(embed_text)
     }
@@ -900,7 +946,15 @@ impl AgentRuntime {
             self.current_tool_results.clear();
         }
 
-        debug!("Agent step (first={})", is_first_step);
+        let tool_result_count = self.current_tool_results.len();
+        debug!(
+            agent_uuid = %self.agent.uuid,
+            conversation_uuid = %self.conversation.uuid,
+            is_first_step,
+            tool_result_count,
+            user_message_len = user_message.chars().count(),
+            "Starting agent step"
+        );
 
         let ctx = self.build_context().await?;
 
@@ -984,7 +1038,17 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             }
         };
 
-        let system_prompt = self.build_step_system_prompt(&ctx);
+        trace!(
+            agent_uuid = %self.agent.uuid,
+            conversation_uuid = %self.conversation.uuid,
+            is_first_step,
+            tool_result_count,
+            input_preview = %log_preview(&input_content, 240),
+            "Agent step input content"
+        );
+
+        let allow_reply_reaction = is_first_step;
+        let system_prompt = self.build_step_system_prompt(&ctx, allow_reply_reaction);
 
         let input = AgentResponseInput {
             input: input_content.clone(),
@@ -1006,6 +1070,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             &input,
             &input_content,
             &self.available_tools,
+            allow_reply_reaction,
         )
         .await?;
 
@@ -1026,11 +1091,46 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             .filter(|m| !m.is_empty())
             .collect();
 
+        let reply_reaction = normalize_reply_reaction_for_step(
+            response.reply_reaction.as_str(),
+            self.current_user_message_uuid.is_some(),
+            is_first_step,
+        );
+        if reply_reaction.is_none() && has_meaningful_reaction_candidate(&response.reply_reaction) {
+            if !is_first_step {
+                warn!(
+                    agent_uuid = %self.agent.uuid,
+                    conversation_uuid = %self.conversation.uuid,
+                    tool_result_count,
+                    "Ignoring reply_reaction after tool results"
+                );
+            } else if self.current_user_message_uuid.is_some() {
+                warn!(
+                    agent_uuid = %self.agent.uuid,
+                    conversation_uuid = %self.conversation.uuid,
+                    "Ignoring invalid reply_reaction"
+                );
+            } else {
+                warn!(
+                    agent_uuid = %self.agent.uuid,
+                    conversation_uuid = %self.conversation.uuid,
+                    "Ignoring reply_reaction without active user message"
+                );
+            }
+        }
+
         // Execute tools and inject results for next step.
         // Persistence is handled by the caller (chat handler) so messages are
         // sent first, stored synchronously, then embedded asynchronously.
         let mut executed_tools = Vec::new();
         for tool_call in &response.tool_calls {
+            debug!(
+                agent_uuid = %self.agent.uuid,
+                conversation_uuid = %self.conversation.uuid,
+                tool_name = %tool_call.name,
+                arg_keys = ?tool_call.args.keys().collect::<Vec<_>>(),
+                "Executing agent tool"
+            );
             let result = if tool_call.name == "done" {
                 ToolResult::success("Done".to_string())
             } else if let Some(tool) = self.tools.get(&tool_call.name) {
@@ -1038,6 +1138,27 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             } else {
                 ToolResult::error(format!("Unknown tool: {}", tool_call.name))
             };
+
+            debug!(
+                agent_uuid = %self.agent.uuid,
+                conversation_uuid = %self.conversation.uuid,
+                tool_name = %tool_call.name,
+                success = result.success,
+                output_len = result.output.chars().count(),
+                has_error = result.error.is_some(),
+                "Agent tool completed"
+            );
+            trace!(
+                agent_uuid = %self.agent.uuid,
+                conversation_uuid = %self.conversation.uuid,
+                tool_name = %tool_call.name,
+                output_preview = %log_preview(&result.output, 160),
+                error_preview = result
+                    .error
+                    .as_deref()
+                    .map(|error| log_preview(error, 160)),
+                "Agent tool content"
+            );
 
             self.inject_tool_result(tool_call, &result);
 
@@ -1061,8 +1182,46 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             self.previous_step_summary = Some((messages.clone(), tool_names));
         }
 
+        debug!(
+            agent_uuid = %self.agent.uuid,
+            conversation_uuid = %self.conversation.uuid,
+            is_first_step,
+            tool_result_count,
+            message_count = messages.len(),
+            tool_call_names = ?tool_call_names(&response.tool_calls),
+            executed_tool_count = executed_tools.len(),
+            has_reply_reaction = reply_reaction.is_some(),
+            done,
+            "Agent step completed"
+        );
+        trace!(
+            agent_uuid = %self.agent.uuid,
+            conversation_uuid = %self.conversation.uuid,
+            is_first_step,
+            tool_result_count,
+            message_previews = ?message_previews(&messages, 160),
+            raw_reply_reaction = %log_preview(&response.reply_reaction, 32),
+            normalized_reply_reaction = ?reply_reaction,
+            "Agent step response content"
+        );
+
+        if !is_first_step
+            && tool_result_count > 0
+            && messages.is_empty()
+            && response.tool_calls.is_empty()
+            && reply_reaction.is_none()
+        {
+            warn!(
+                agent_uuid = %self.agent.uuid,
+                conversation_uuid = %self.conversation.uuid,
+                tool_result_count,
+                "Agent returned no follow-up after tool results"
+            );
+        }
+
         Ok(StepResult {
             messages,
+            reply_reaction,
             tool_calls: response.tool_calls,
             executed_tools,
             done,
@@ -1253,7 +1412,16 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
 
             let timestamp = format_message_timestamp(msg.created_at, user_timezone.as_ref());
             let content = self.render_raw_message(msg)?;
-            conversation.push_str(&format!("[{} @ {}]: {}\n", role, timestamp, content));
+            let reaction_suffix = msg
+                .reaction
+                .as_deref()
+                .filter(|reaction| !reaction.trim().is_empty())
+                .map(|reaction| format!(" | {}", reaction))
+                .unwrap_or_default();
+            conversation.push_str(&format!(
+                "[{} @ {}{}]: {}\n",
+                role, timestamp, reaction_suffix, content
+            ));
         }
 
         ctx.recent_conversation = if conversation.trim().is_empty() {
@@ -1373,6 +1541,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             content_enc,
             attachment_text_enc,
             prompt_tokens,
+            assistant_reaction: None,
         }
         .insert(&mut conn)
         .map_err(|e| {
@@ -1426,6 +1595,7 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
             status: "completed".to_string(),
             finish_reason: None,
             created_at: chrono::Utc::now(),
+            user_reaction: None,
         }
         .insert(&mut conn)
         .map_err(|e| {
@@ -1456,6 +1626,33 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         });
 
         Ok(msg)
+    }
+
+    pub async fn set_assistant_reaction_for_current_user_message(
+        &self,
+        reaction: &str,
+    ) -> Result<UserMessage, ApiError> {
+        let Some(message_uuid) = self.current_user_message_uuid else {
+            return Err(ApiError::InternalServerError);
+        };
+
+        let mut conn = self
+            .state
+            .db
+            .get_pool()
+            .get()
+            .map_err(|_| ApiError::InternalServerError)?;
+
+        UserMessage::set_assistant_reaction(
+            &mut conn,
+            message_uuid,
+            self.user.uuid,
+            Some(reaction.to_string()),
+        )
+        .map_err(|e| {
+            error!("Failed to set assistant reaction on user message: {e:?}");
+            ApiError::InternalServerError
+        })
     }
 
     pub async fn insert_tool_call_and_output(
@@ -1677,5 +1874,28 @@ SELF-CHECK: Before ANY message, ask: "Is this new info the user hasn't seen?" If
         })?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_reply_reaction_for_step;
+
+    #[test]
+    fn reply_reaction_is_allowed_and_normalized_on_first_step() {
+        assert_eq!(
+            normalize_reply_reaction_for_step(" ❤️ ", true, true),
+            Some("❤️".to_string())
+        );
+    }
+
+    #[test]
+    fn reply_reaction_is_ignored_after_tool_results() {
+        assert_eq!(normalize_reply_reaction_for_step("❤️", true, false), None);
+    }
+
+    #[test]
+    fn reply_reaction_is_ignored_without_active_user_message() {
+        assert_eq!(normalize_reply_reaction_for_step("❤️", false, true), None);
     }
 }

@@ -2,8 +2,9 @@ use crate::User;
 use crate::{
     db::DBError,
     email::{send_hello_email, send_verification_email},
-    jwt::{validate_token, NewToken, TokenType},
+    jwt::{validate_token, CustomClaims, NewToken, TokenType},
     models::email_verification::NewEmailVerification,
+    models::push_devices::PushDevice,
 };
 use crate::{jwt::USER_REFRESH, web::encryption_middleware::EncryptedResponse};
 use crate::{
@@ -129,6 +130,8 @@ pub struct RefreshResponse {
 #[derive(Deserialize, Clone)]
 pub struct LogoutRequest {
     refresh_token: String,
+    #[serde(default)]
+    push_device_id: Option<Uuid>,
 }
 
 pub async fn login(
@@ -240,14 +243,46 @@ pub async fn logout(
     debug!("Entering logout function");
     info!("Logout request received");
     // TODO actually delete the refresh token
-    tracing::trace!(
-        "Logout request for refresh token: {}",
-        logout_request.refresh_token
-    );
+
+    if let Some((user_id, push_device_id)) = logout_push_revoke_target(
+        &logout_request,
+        validate_token(&logout_request.refresh_token, &data, USER_REFRESH),
+    ) {
+        match data.db.get_pool().get() {
+            Ok(mut conn) => {
+                if let Err(revoke_error) =
+                    PushDevice::revoke_by_uuid_and_user(&mut conn, push_device_id, user_id)
+                {
+                    error!(
+                        "Failed to revoke push device during logout cleanup: {:?}",
+                        revoke_error
+                    );
+                }
+            }
+            Err(pool_error) => {
+                error!(
+                    "Failed to get DB connection during logout push cleanup: {:?}",
+                    pool_error
+                );
+            }
+        }
+    }
+
+    tracing::trace!("Logout request received");
     let response = json!({ "message": "Logged out successfully" });
     let result = encrypt_response(&data, &session_id, &response).await;
     debug!("Exiting logout function");
     result
+}
+
+fn logout_push_revoke_target(
+    logout_request: &LogoutRequest,
+    claims: Result<CustomClaims, ApiError>,
+) -> Option<(Uuid, Uuid)> {
+    let push_device_id = logout_request.push_device_id?;
+    let claims = claims.ok()?;
+    let user_id = Uuid::parse_str(&claims.sub).ok()?;
+    Some((user_id, push_device_id))
 }
 
 pub async fn register(
@@ -512,4 +547,63 @@ pub async fn password_reset_confirm(
     let result = encrypt_response(&data, &session_id, &response).await;
     debug!("Exiting password_reset_confirm function");
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_claims(user_id: Uuid) -> CustomClaims {
+        CustomClaims {
+            sub: user_id.to_string(),
+            aud: Some(USER_REFRESH.to_string()),
+            azp: None,
+            role: None,
+        }
+    }
+
+    #[test]
+    fn logout_push_revoke_target_requires_push_device_id() {
+        let request = LogoutRequest {
+            refresh_token: "refresh-token".to_string(),
+            push_device_id: None,
+        };
+
+        assert_eq!(
+            logout_push_revoke_target(&request, Ok(sample_claims(Uuid::new_v4()))),
+            None
+        );
+    }
+
+    #[test]
+    fn logout_push_revoke_target_rejects_invalid_user_id() {
+        let push_device_id = Uuid::new_v4();
+        let request = LogoutRequest {
+            refresh_token: "refresh-token".to_string(),
+            push_device_id: Some(push_device_id),
+        };
+        let claims = CustomClaims {
+            sub: "not-a-uuid".to_string(),
+            aud: Some(USER_REFRESH.to_string()),
+            azp: None,
+            role: None,
+        };
+
+        assert_eq!(logout_push_revoke_target(&request, Ok(claims)), None);
+    }
+
+    #[test]
+    fn logout_push_revoke_target_returns_user_and_device_ids() {
+        let user_id = Uuid::new_v4();
+        let push_device_id = Uuid::new_v4();
+        let request = LogoutRequest {
+            refresh_token: "refresh-token".to_string(),
+            push_device_id: Some(push_device_id),
+        };
+
+        assert_eq!(
+            logout_push_revoke_target(&request, Ok(sample_claims(user_id))),
+            Some((user_id, push_device_id))
+        );
+    }
 }

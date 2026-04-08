@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tracing::{error, warn};
 use uuid::Uuid;
 
+use crate::brave::{BraveClient, SearchOptions};
 use crate::encrypt::{decrypt_string, encrypt_with_key};
 use crate::models::agents::Agent;
 use crate::models::conversation_summaries::ConversationSummary;
@@ -101,6 +102,53 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ============================================================================
+// Web search tool
+// ============================================================================
+
+pub struct WebSearchTool {
+    client: Arc<BraveClient>,
+}
+
+impl WebSearchTool {
+    pub fn new(client: Arc<BraveClient>) -> Self {
+        Self { client }
+    }
+}
+
+#[async_trait]
+impl Tool for WebSearchTool {
+    fn name(&self) -> &str {
+        "web_search"
+    }
+
+    fn description(&self) -> &str {
+        "Search the web with Brave for current information, news, weather, stocks, sports, and other real-time results. Use 'freshness' for time-sensitive queries and 'location' for local results."
+    }
+
+    fn args_schema(&self) -> &str {
+        r#"{"query": "search query", "count": "results (default 10)", "freshness": "pd=24h, pw=week, pm=month, py=year (optional)", "location": "city or 'city, state' for local results (optional)"}"#
+    }
+
+    async fn execute(&self, args: &HashMap<String, String>) -> ToolResult {
+        let Some(query) = args.get("query") else {
+            return ToolResult::error("'query' argument required");
+        };
+
+        let options = SearchOptions {
+            count: args.get("count").and_then(|count| count.parse().ok()),
+            freshness: args.get("freshness").cloned(),
+            location: args.get("location").cloned(),
+            timezone: None,
+        };
+
+        match self.client.search_with_options(query, Some(options)).await {
+            Ok(results) => ToolResult::success(results.format_results()),
+            Err(err) => ToolResult::error(format!("Search failed: {}", err)),
+        }
     }
 }
 

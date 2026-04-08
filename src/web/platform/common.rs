@@ -1,7 +1,9 @@
 use crate::{
     models::{
         org_memberships::OrgRole,
-        project_settings::{AppleOAuthSettings, OAuthProviderSettings},
+        project_settings::{
+            AndroidPushSettings, AppleOAuthSettings, IosPushSettings, OAuthProviderSettings,
+        },
     },
     web::platform::validation::{
         validate_alphanumeric_only, validate_alphanumeric_with_symbols, validate_secret_size,
@@ -16,6 +18,8 @@ pub const PROJECT_RESEND_API_KEY: &str = "RESEND_API_KEY";
 pub const PROJECT_GOOGLE_OAUTH_SECRET: &str = "GOOGLE_OAUTH_SECRET";
 pub const PROJECT_GITHUB_OAUTH_SECRET: &str = "GITHUB_OAUTH_SECRET";
 pub const PROJECT_APPLE_OAUTH_SECRET: &str = "APPLE_OAUTH_SECRET";
+pub const PROJECT_APNS_AUTH_KEY_P8: &str = "APNS_AUTH_KEY_P8";
+pub const PROJECT_FCM_SERVICE_ACCOUNT_JSON: &str = "FCM_SERVICE_ACCOUNT_JSON";
 pub const THIRD_PARTY_JWT_SECRET: &str = "THIRD_PARTY_JWT_SECRET";
 
 // Request Types
@@ -96,6 +100,16 @@ pub struct UpdateOAuthSettingsRequest {
     pub github_oauth_settings: Option<OAuthProviderSettings>,
     #[validate(custom(function = "validate_apple_oauth_settings"))]
     pub apple_oauth_settings: Option<AppleOAuthSettings>,
+}
+
+#[derive(Deserialize, Clone)]
+pub struct UpdatePushSettingsRequest {
+    #[serde(default)]
+    pub encrypted_preview_enabled: bool,
+    #[serde(default)]
+    pub ios: Option<IosPushSettings>,
+    #[serde(default)]
+    pub android: Option<AndroidPushSettings>,
 }
 
 // Response Types

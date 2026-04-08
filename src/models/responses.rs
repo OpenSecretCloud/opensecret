@@ -782,6 +782,8 @@ pub struct UserMessage {
     pub prompt_tokens: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub attachment_text_enc: Option<Vec<u8>>,
+    pub assistant_reaction: Option<String>,
 }
 
 #[derive(Insertable, Debug)]
@@ -984,6 +986,7 @@ pub struct AssistantMessage {
     pub finish_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub user_reaction: Option<String>,
 }
 
 #[derive(Insertable, Debug)]

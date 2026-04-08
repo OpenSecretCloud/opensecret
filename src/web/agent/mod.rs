@@ -39,9 +39,12 @@ use crate::{ApiError, AppMode, AppState};
 
 mod compaction;
 mod runtime;
+mod schedules;
 mod signatures;
 mod tools;
 mod vision;
+
+pub(crate) use schedules::start_schedule_worker;
 
 #[derive(Debug, Clone, Deserialize)]
 struct AgentChatRequest {

@@ -986,10 +986,9 @@ sudo vim /etc/nitro_enclaves/vsock-proxy.yaml
 
 Add these lines:
 ```
-- {address: api-github-proxy.tinfoil.sh, port: 443}
+- {address: github-proxy.tinfoil.sh, port: 443}
 - {address: tuf-repo-cdn.sigstore.dev, port: 443}
 - {address: kds-proxy.tinfoil.sh, port: 443}
-- {address: gh-attestation-proxy.tinfoil.sh, port: 443}
 - {address: atc.tinfoil.sh, port: 443}
 - {address: inference.tinfoil.sh, port: 443}
 - {address: router.inf4.tinfoil.sh, port: 443}
@@ -1006,7 +1005,7 @@ Restart the nitro vsock proxy service:
 sudo systemctl restart nitro-enclaves-vsock-proxy.service
 ```
 
-#### Tinfoil API GitHub Proxy
+#### Tinfoil GitHub Proxy
 ```sh
 sudo vim /etc/systemd/system/vsock-tinfoil-api-github-proxy.service
 ```
@@ -1014,12 +1013,12 @@ sudo vim /etc/systemd/system/vsock-tinfoil-api-github-proxy.service
 Add the following content:
 ```
 [Unit]
-Description=Vsock Tinfoil API GitHub Proxy Service
+Description=Vsock Tinfoil GitHub Proxy Service
 After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8019 api-github-proxy.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy 8019 github-proxy.tinfoil.sh 443
 Restart=always
 
 [Install]
@@ -1060,26 +1059,6 @@ After=network.target
 [Service]
 User=root
 ExecStart=/usr/bin/vsock-proxy 8022 kds-proxy.tinfoil.sh 443
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-#### Tinfoil GitHub Proxy
-```sh
-sudo vim /etc/systemd/system/vsock-tinfoil-github-proxy.service
-```
-
-Add the following content:
-```
-[Unit]
-Description=Vsock Tinfoil GitHub Proxy Service
-After=network.target
-
-[Service]
-User=root
-ExecStart=/usr/bin/vsock-proxy 8023 gh-attestation-proxy.tinfoil.sh 443
 Restart=always
 
 [Install]
@@ -1279,9 +1258,6 @@ sudo systemctl status vsock-tuf-repo-cdn.service
 sudo systemctl enable vsock-tinfoil-kds-proxy.service
 sudo systemctl start vsock-tinfoil-kds-proxy.service
 sudo systemctl status vsock-tinfoil-kds-proxy.service
-sudo systemctl enable vsock-tinfoil-github-proxy.service
-sudo systemctl start vsock-tinfoil-github-proxy.service
-sudo systemctl status vsock-tinfoil-github-proxy.service
 sudo systemctl enable vsock-tinfoil-atc.service
 sudo systemctl start vsock-tinfoil-atc.service
 sudo systemctl status vsock-tinfoil-atc.service
@@ -1316,7 +1292,6 @@ If you need to restart these services:
 sudo systemctl restart vsock-tinfoil-api-github-proxy.service
 sudo systemctl restart vsock-tuf-repo-cdn.service
 sudo systemctl restart vsock-tinfoil-kds-proxy.service
-sudo systemctl restart vsock-tinfoil-github-proxy.service
 sudo systemctl restart vsock-tinfoil-atc.service
 sudo systemctl restart vsock-tinfoil-inference.service
 sudo systemctl restart vsock-tinfoil-router-inf4.service

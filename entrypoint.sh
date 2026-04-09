@@ -346,10 +346,9 @@ else
 fi
 
 # Add Tinfoil proxy hostnames to /etc/hosts
-echo "127.0.0.16 api-github-proxy.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.16 github-proxy.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.17 tuf-repo-cdn.sigstore.dev" >> /etc/hosts
 echo "127.0.0.19 kds-proxy.tinfoil.sh" >> /etc/hosts
-echo "127.0.0.20 gh-attestation-proxy.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.25 atc.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.33 inference.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.26 router.inf4.tinfoil.sh" >> /etc/hosts
@@ -443,17 +442,14 @@ log "Starting Apple OAuth traffic forwarder"
 run_forever tf_apple_oauth python3 /app/traffic_forwarder.py 127.0.0.15 443 3 8018 &
 
 # Start the traffic forwarders for Tinfoil proxy in the background
-log "Starting Tinfoil API GitHub proxy traffic forwarder"
-run_forever tf_tinfoil_api_github_proxy python3 /app/traffic_forwarder.py 127.0.0.16 443 3 8019 &
+log "Starting Tinfoil GitHub proxy traffic forwarder"
+run_forever tf_tinfoil_github_proxy python3 /app/traffic_forwarder.py 127.0.0.16 443 3 8019 &
 
 log "Starting TUF Repository CDN traffic forwarder"
 run_forever tf_tuf_repo_cdn python3 /app/traffic_forwarder.py 127.0.0.17 443 3 8020 &
 
 log "Starting Tinfoil KDS proxy traffic forwarder"
 run_forever tf_tinfoil_kds_proxy python3 /app/traffic_forwarder.py 127.0.0.19 443 3 8022 &
-
-log "Starting Tinfoil GitHub proxy traffic forwarder"
-run_forever tf_tinfoil_github_proxy python3 /app/traffic_forwarder.py 127.0.0.20 443 3 8023 &
 
 log "Starting Tinfoil ATC traffic forwarder"
 run_forever tf_tinfoil_atc python3 /app/traffic_forwarder.py 127.0.0.25 443 3 8021 &
@@ -611,11 +607,11 @@ else
 fi
 
 # Test the connections to Tinfoil proxy services
-log "Testing connection to Tinfoil API GitHub proxy:"
+log "Testing connection to Tinfoil GitHub proxy:"
 if timeout 5 bash -c '</dev/tcp/127.0.0.16/443'; then
-    log "Tinfoil API GitHub proxy connection successful"
+    log "Tinfoil GitHub proxy connection successful"
 else
-    log "Tinfoil API GitHub proxy connection failed"
+    log "Tinfoil GitHub proxy connection failed"
 fi
 
 log "Testing connection to TUF Repository CDN:"
@@ -630,13 +626,6 @@ if timeout 5 bash -c '</dev/tcp/127.0.0.19/443'; then
     log "Tinfoil KDS proxy connection successful"
 else
     log "Tinfoil KDS proxy connection failed"
-fi
-
-log "Testing connection to Tinfoil GitHub proxy:"
-if timeout 5 bash -c '</dev/tcp/127.0.0.20/443'; then
-    log "Tinfoil GitHub proxy connection successful"
-else
-    log "Tinfoil GitHub proxy connection failed"
 fi
 
 log "Testing connection to Tinfoil ATC:"

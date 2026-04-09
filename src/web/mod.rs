@@ -1,6 +1,5 @@
 pub mod attestation_routes;
 pub mod audio_utils;
-pub mod documents;
 pub mod encryption_middleware;
 mod health_routes;
 pub mod login_routes;
@@ -11,7 +10,6 @@ pub mod platform;
 pub mod protected_routes;
 pub mod responses;
 
-pub use documents::router as document_routes;
 pub use health_routes::router_with_state as health_routes_with_state;
 pub use login_routes::router as login_routes;
 pub use oauth_routes::router as oauth_routes;

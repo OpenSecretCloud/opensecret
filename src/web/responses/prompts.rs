@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 pub const INTENT_CLASSIFIER_MODEL: &str = "gpt-oss-120b";
 pub const INTENT_CLASSIFIER_MAX_TOKENS: i32 = 250;
-pub const QUERY_EXTRACTOR_MODEL: &str = "llama-3.3-70b";
+pub const QUERY_EXTRACTOR_MODEL: &str = "llama3-3-70b";
 pub const QUERY_EXTRACTOR_MAX_TOKENS: i32 = 50;
 
 /// System prompt for intent classification
@@ -116,7 +116,7 @@ fn extract_text_from_content(content: &Value) -> String {
 
 /// Build a chat completion request for search query extraction
 ///
-/// Uses llama-3.3-70b to extract a concise search query with a tighter output limit.
+/// Uses llama3-3-70b to extract a concise search query with a tighter output limit.
 ///
 /// # Arguments
 /// * `conversation_history` - Recent conversation messages for context

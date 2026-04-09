@@ -17,15 +17,13 @@ pub fn count_tokens(text: &str) -> usize {
 /// Any unknown model defaults to 64k tokens.
 pub fn model_max_ctx(model: &str) -> usize {
     const LIMITS: &[(&str, usize)] = &[
-        // Canonical names
-        ("llama-3.3-70b", 128_000),
+        // Known models
+        ("llama3-3-70b", 128_000),
         ("gpt-oss-120b", 128_000),
         ("qwen3-vl-30b", 256_000), // Vision-language model
         ("kimi-k2-5", 256_000),    // Vision-capable model with 256K context
         ("gemma4-31b", 256_000),   // Multimodal model with 256K context
         ("glm-5-1", 202_000),      // Long-context agentic engineering model
-        // Provider-specific equivalents
-        ("llama3-3-70b", 128_000), // Tinfoil alias
         // Chat models
         ("deepseek-r1-0528", 128_000),
         // Gemma 3 27B (vision) — capped at 20k
@@ -69,8 +67,7 @@ mod tests {
         // Test known models
         assert_eq!(model_max_ctx("gemma-3-27b"), 20_000);
         assert_eq!(model_max_ctx("deepseek-r1-0528"), 128_000);
-        // Canonical and tinfoil aliases
-        assert_eq!(model_max_ctx("llama-3.3-70b"), 128_000);
+        // Native Tinfoil model IDs
         assert_eq!(model_max_ctx("llama3-3-70b"), 128_000);
         assert_eq!(model_max_ctx("gpt-oss-120b"), 128_000);
         assert_eq!(model_max_ctx("qwen3-vl-30b"), 256_000);

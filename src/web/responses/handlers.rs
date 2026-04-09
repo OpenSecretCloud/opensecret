@@ -823,7 +823,7 @@ async fn spawn_title_generation_task(
 
         // Build the title generation request
         let title_request = json!({
-            "model": "llama-3.3-70b",
+            "model": "llama3-3-70b",
             "messages": [
                 {
                     "role": ROLE_SYSTEM,
@@ -844,7 +844,7 @@ async fn spawn_title_generation_task(
         let headers = HeaderMap::new();
         let billing_context = crate::web::openai::BillingContext::new(
             crate::web::openai_auth::AuthMethod::Jwt,
-            "llama-3.3-70b".to_string(),
+            "llama3-3-70b".to_string(),
         );
 
         debug!("Title generation: about to call get_chat_completion_response");
@@ -1326,7 +1326,7 @@ fn is_web_search_enabled(tools: &Option<Value>) -> bool {
 /// 5. Send persistence command via dedicated channel and wait for acknowledgment
 ///
 /// Tool execution is best-effort: intent classification uses gpt-oss-120b and
-/// query extraction uses llama-3.3-70b.
+/// query extraction uses llama3-3-70b.
 struct ToolChannels<'a> {
     client: &'a mpsc::Sender<StorageMessage>,
     storage: &'a mpsc::Sender<StorageMessage>,

@@ -1,6 +1,6 @@
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
-use crate::proxy_config::ProxyConfig;
+use crate::proxy_config::{canonicalize_tinfoil_model, ProxyConfig};
 use crate::sqs::UsageEvent;
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
@@ -422,14 +422,7 @@ pub async fn get_chat_completion_response(
         })?
         .to_string();
 
-    // Get the model route configuration
-    let route = match state.proxy_router.get_model_route(&model_name) {
-        Some(r) => r,
-        None => {
-            error!("Model '{}' not found in routing table", model_name);
-            return Err(ApiError::BadRequest);
-        }
-    };
+    let proxy_config = state.proxy_router.get_completion_proxy();
 
     // Create a new hyper client with better timeout configuration
     let https = HttpsConnector::new();
@@ -442,140 +435,29 @@ pub async fn get_chat_completion_response(
     debug!("Sending request for model: {}", model_name);
 
     let (res, successful_provider) = {
-        debug!(
-            "Using route for model {}: primary={}, fallbacks={}",
-            model_name,
-            route.primary.provider_name,
-            route.fallbacks.len()
-        );
+        let mut request_body = modified_body.clone();
 
-        // Prepare request bodies for all providers
-        let primary_model_name = state
-            .proxy_router
-            .get_model_name_for_provider(&model_name, &route.primary.provider_name);
-        let mut primary_body = modified_body.clone();
-        primary_body.insert("model".to_string(), json!(primary_model_name));
+        ensure_stream_usage(&mut request_body);
 
-        // Add stream_options based on provider capabilities
-        if route.primary.provider_name.to_lowercase() == "tinfoil" || is_streaming {
-            primary_body.insert("stream_options".to_string(), json!({"include_usage": true}));
-        }
-
-        let primary_body_json =
-            serde_json::to_string(&Value::Object(primary_body)).map_err(|e| {
+        let request_body_json =
+            serde_json::to_string(&Value::Object(request_body)).map_err(|e| {
                 error!("Failed to serialize request body: {:?}", e);
                 ApiError::InternalServerError
             })?;
 
-        // Prepare fallback request if available
-        let fallback_request = if let Some(fallback) = route.fallbacks.first() {
-            let fallback_model_name = state
-                .proxy_router
-                .get_model_name_for_provider(&model_name, &fallback.provider_name);
-            let mut fallback_body = modified_body.clone();
-            fallback_body.insert("model".to_string(), json!(fallback_model_name));
-
-            if fallback.provider_name.to_lowercase() == "tinfoil" || is_streaming {
-                fallback_body.insert("stream_options".to_string(), json!({"include_usage": true}));
-            }
-
-            let fallback_body_json =
-                serde_json::to_string(&Value::Object(fallback_body)).map_err(|e| {
-                    error!("Failed to serialize fallback request body: {:?}", e);
-                    ApiError::InternalServerError
-                })?;
-            Some((fallback, fallback_body_json))
-        } else {
-            None
-        };
-
-        // Try cycling between primary and fallback up to 3 times each
-        let max_cycles = 3;
-        let mut last_error = None;
-        let mut found_response = None;
-        let mut successful_provider_name = String::new();
-
-        for cycle in 0..max_cycles {
-            if cycle > 0 {
-                let delay = cycle as u64;
-                debug!("Starting cycle {} after {}s delay", cycle + 1, delay);
-                sleep(Duration::from_secs(delay)).await;
-            }
-
-            // Try primary
-            debug!(
-                "Cycle {}: Trying primary provider {}",
-                cycle + 1,
-                route.primary.provider_name
-            );
-            match try_provider(&client, &route.primary, &primary_body_json, headers).await {
-                Ok(response) => {
-                    info!(
-                        "Successfully got response from primary provider {} on cycle {}",
-                        route.primary.provider_name,
-                        cycle + 1
-                    );
-                    found_response = Some(response);
-                    successful_provider_name = route.primary.provider_name.clone();
-                    break;
-                }
-                Err(err) => {
-                    error!(
-                        "Cycle {}: Primary provider {} failed: {:?}",
-                        cycle + 1,
-                        route.primary.provider_name,
-                        err
-                    );
-                    last_error = Some(err);
-                }
-            }
-
-            // Try fallback if available
-            if let Some((fallback_provider, ref fallback_body_json)) = fallback_request {
-                debug!(
-                    "Cycle {}: Trying fallback provider {}",
-                    cycle + 1,
-                    fallback_provider.provider_name
+        match try_provider(&client, &proxy_config, &request_body_json, headers).await {
+            Ok(response) => {
+                info!(
+                    "Successfully got response from provider {} for model {}",
+                    proxy_config.provider_name, model_name
                 );
-                match try_provider(&client, fallback_provider, fallback_body_json, headers).await {
-                    Ok(response) => {
-                        info!(
-                            "Successfully got response from fallback provider {} on cycle {}",
-                            fallback_provider.provider_name,
-                            cycle + 1
-                        );
-                        found_response = Some(response);
-                        successful_provider_name = fallback_provider.provider_name.clone();
-                        break;
-                    }
-                    Err(err) => {
-                        error!(
-                            "Cycle {}: Fallback provider {} failed: {:?}",
-                            cycle + 1,
-                            fallback_provider.provider_name,
-                            err
-                        );
-                        last_error = Some(err);
-                    }
-                }
+                (response, proxy_config.provider_name.clone())
             }
-        }
-
-        match found_response {
-            Some(response) => (response, successful_provider_name),
-            None => {
-                let error_msg = if route.fallbacks.is_empty() {
-                    format!(
-                        "OpenAI API returned non-success status: Provider {} failed after {} attempts for model {}. Last error: {:?}",
-                        route.primary.provider_name, max_cycles, model_name, last_error
-                    )
-                } else {
-                    format!(
-                        "OpenAI API returned non-success status: All providers failed after {} cycles for model {}. Last error: {:?}",
-                        max_cycles, model_name, last_error
-                    )
-                };
-                error!("{}", error_msg);
+            Err(err) => {
+                error!(
+                    "Chat completion request failed for provider {} and model {}: {}",
+                    proxy_config.provider_name, model_name, err
+                );
                 return Err(ApiError::InternalServerError);
             }
         }
@@ -595,11 +477,15 @@ pub async fn get_chat_completion_response(
             ApiError::InternalServerError
         })?;
 
-        let response_json: Value = serde_json::from_str(&String::from_utf8_lossy(&body_bytes))
+        let mut response_json: Value = serde_json::from_str(&String::from_utf8_lossy(&body_bytes))
             .map_err(|e| {
                 error!("Failed to parse response JSON: {:?}", e);
                 ApiError::InternalServerError
             })?;
+
+        if successful_provider == "tinfoil" {
+            canonicalize_response_model(&mut response_json);
+        }
 
         // ✅ Handle billing HERE, inside completions API
         if let Some(usage) = extract_usage(&response_json) {
@@ -667,15 +553,15 @@ pub async fn get_chat_completion_response(
                                 }
 
                                 match serde_json::from_str::<Value>(&frame) {
-                                    Ok(json) => {
+                                    Ok(mut json) => {
                                         // ✅ Extract and publish billing HERE - but ONLY on final chunk
                                         // This prevents sending usage data on intermediate chunks that vLLM now includes
-                                        let has_finish = has_finish_reason(&json);
+                                        let is_terminal = is_terminal_stream_chunk(&json);
 
                                         if let Some(usage) = extract_usage(&json) {
-                                            // Only publish usage on final chunk (has finish_reason) with actual completion tokens
+                                            // Only publish usage on the terminal chunk with actual completion tokens
                                             // Also ensure we only send usage once per stream
-                                            if has_finish
+                                            if is_terminal
                                                 && usage.completion_tokens > 0
                                                 && !usage_sent
                                             {
@@ -699,10 +585,14 @@ pub async fn get_chat_completion_response(
                                                 }
                                             } else {
                                                 trace!(
-                                                    "Skipping usage publish: has_finish={}, completion_tokens={}, usage_sent={}",
-                                                    has_finish, usage.completion_tokens, usage_sent
+                                                    "Skipping usage publish: is_terminal={}, completion_tokens={}, usage_sent={}",
+                                                    is_terminal, usage.completion_tokens, usage_sent
                                                 );
                                             }
+                                        }
+
+                                        if provider == "tinfoil" {
+                                            canonicalize_response_model(&mut json);
                                         }
 
                                         // Send full JSON chunk to consumer (preserves all metadata)
@@ -799,6 +689,30 @@ fn extract_usage(json: &Value) -> Option<CompletionUsage> {
     })
 }
 
+fn ensure_stream_usage(body: &mut serde_json::Map<String, Value>) {
+    let is_streaming = body
+        .get("stream")
+        .and_then(|stream| stream.as_bool())
+        .unwrap_or(false);
+
+    if !is_streaming {
+        return;
+    }
+
+    match body.entry("stream_options".to_string()) {
+        serde_json::map::Entry::Occupied(mut entry) => {
+            if let Some(options) = entry.get_mut().as_object_mut() {
+                options.insert("include_usage".to_string(), json!(true));
+            } else {
+                entry.insert(json!({ "include_usage": true }));
+            }
+        }
+        serde_json::map::Entry::Vacant(entry) => {
+            entry.insert(json!({ "include_usage": true }));
+        }
+    }
+}
+
 /// Helper to check if a streaming chunk has a finish_reason
 /// This indicates it's the final chunk in the stream
 fn has_finish_reason(json: &Value) -> bool {
@@ -813,6 +727,38 @@ fn has_finish_reason(json: &Value) -> bool {
         }
     }
     false
+}
+
+fn is_terminal_stream_chunk(json: &Value) -> bool {
+    if has_finish_reason(json) {
+        return true;
+    }
+
+    json.get("choices")
+        .and_then(|choices| choices.as_array())
+        .is_some_and(|choices| choices.is_empty())
+}
+
+fn canonicalize_response_model(json: &mut Value) {
+    if let Some(model_value) = json.get_mut("model") {
+        if let Some(model) = model_value.as_str() {
+            *model_value = json!(canonicalize_tinfoil_model(model));
+        }
+    }
+}
+
+fn canonicalize_models_response(json: &mut Value) {
+    let Some(models) = json.get_mut("data").and_then(|data| data.as_array_mut()) else {
+        return;
+    };
+
+    for model in models {
+        if let Some(model_id) = model.get_mut("id") {
+            if let Some(id) = model_id.as_str() {
+                *model_id = json!(canonicalize_tinfoil_model(id));
+            }
+        }
+    }
 }
 
 /// Helper to extract SSE frame from buffer
@@ -943,23 +889,95 @@ async fn proxy_models(
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
     debug!("Entering proxy_models function");
 
-    // Use the proxy router to get all models from all configured proxies
-    // The proxy router now handles caching internally with a 5-minute TTL
-    let models_response = state.proxy_router.get_all_models().map_err(|e| {
-        error!("Failed to fetch models from proxy router: {:?}", e);
+    let proxy_config = state.proxy_router.get_completion_proxy();
+
+    let https = HttpsConnector::new();
+    let client = Client::builder()
+        .pool_idle_timeout(Duration::from_secs(30))
+        .pool_max_idle_per_host(10)
+        .build::<_, HyperBody>(https);
+
+    let mut req = Request::builder()
+        .method("GET")
+        .uri(format!("{}/v1/models", proxy_config.base_url));
+
+    if let Some(api_key) = &proxy_config.api_key {
+        if !api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", api_key));
+        }
+    }
+
+    let req = req.body(HyperBody::empty()).map_err(|e| {
+        error!("Failed to create models request: {:?}", e);
         ApiError::InternalServerError
     })?;
 
+    let res = timeout(
+        Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        client.request(req),
+    )
+    .await
+    .map_err(|_| {
+        error!(
+            "Model listing request timed out for provider {}",
+            proxy_config.provider_name
+        );
+        ApiError::InternalServerError
+    })?
+    .map_err(|e| {
+        error!(
+            "Failed to fetch models from provider {}: {:?}",
+            proxy_config.provider_name, e
+        );
+        ApiError::InternalServerError
+    })?;
+
+    if !res.status().is_success() {
+        let status = res.status();
+        let body_bytes = to_bytes(res.into_body()).await.ok();
+        let error_msg = body_bytes
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+            .unwrap_or_else(|| status.to_string());
+        error!(
+            "Provider {} returned non-success status for models: {} - {}",
+            proxy_config.provider_name, status, error_msg
+        );
+        return Err(ApiError::InternalServerError);
+    }
+
+    let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
+        error!("Failed to read models response body: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    let mut models_response: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+        error!("Failed to parse models response: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    if proxy_config.provider_name == "tinfoil" {
+        canonicalize_models_response(&mut models_response);
+    }
+
     debug!("Exiting proxy_models function");
-    // Encrypt and return the response
     encrypt_response(&state, &session_id, &models_response).await
+}
+
+fn transcription_model_for_provider(model_name: &str, provider_name: &str) -> String {
+    match (model_name, provider_name) {
+        ("whisper-large-v3", "tinfoil") => "whisper-large-v3-turbo".to_string(),
+        ("whisper-large-v3-turbo", provider) if provider != "tinfoil" => {
+            "whisper-large-v3".to_string()
+        }
+        _ => model_name.to_string(),
+    }
 }
 
 /// Helper function to send transcription request with retries to primary and fallback providers
 async fn send_transcription_with_retries(
     client: &Client<HttpsConnector<hyper::client::HttpConnector>, HyperBody>,
-    route: &crate::proxy_config::ModelRoute,
-    state: &Arc<AppState>,
+    primary_provider: &ProxyConfig,
+    fallback_provider: Option<&ProxyConfig>,
     model_name: &str,
     params: &TranscriptionParams<'_>,
 ) -> Result<Value, String> {
@@ -973,22 +991,20 @@ async fn send_transcription_with_retries(
             sleep(Duration::from_secs(delay)).await;
         }
 
-        // Try primary
         debug!(
             "Cycle {}: Trying primary provider {} for transcription",
             cycle + 1,
-            route.primary.provider_name
+            primary_provider.provider_name
         );
 
-        let primary_model = state
-            .proxy_router
-            .get_model_name_for_provider(model_name, &route.primary.provider_name);
+        let primary_model =
+            transcription_model_for_provider(model_name, &primary_provider.provider_name);
 
-        match send_transcription_request(client, &route.primary, &primary_model, params).await {
+        match send_transcription_request(client, primary_provider, &primary_model, params).await {
             Ok(response) => {
                 info!(
                     "Successfully got transcription from primary provider {} on cycle {}",
-                    route.primary.provider_name,
+                    primary_provider.provider_name,
                     cycle + 1
                 );
                 return Ok(response);
@@ -997,30 +1013,30 @@ async fn send_transcription_with_retries(
                 error!(
                     "Cycle {}: Primary provider {} failed: {}",
                     cycle + 1,
-                    route.primary.provider_name,
+                    primary_provider.provider_name,
                     err
                 );
                 last_error = Some(err);
             }
         }
 
-        // Try fallback if available
-        if let Some(fallback) = route.fallbacks.first() {
+        if let Some(fallback_provider) = fallback_provider {
             debug!(
                 "Cycle {}: Trying fallback provider {} for transcription",
                 cycle + 1,
-                fallback.provider_name
+                fallback_provider.provider_name
             );
 
-            let fallback_model = state
-                .proxy_router
-                .get_model_name_for_provider(model_name, &fallback.provider_name);
+            let fallback_model =
+                transcription_model_for_provider(model_name, &fallback_provider.provider_name);
 
-            match send_transcription_request(client, fallback, &fallback_model, params).await {
+            match send_transcription_request(client, fallback_provider, &fallback_model, params)
+                .await
+            {
                 Ok(response) => {
                     info!(
                         "Successfully got transcription from fallback provider {} on cycle {}",
-                        fallback.provider_name,
+                        fallback_provider.provider_name,
                         cycle + 1
                     );
                     return Ok(response);
@@ -1029,7 +1045,7 @@ async fn send_transcription_with_retries(
                     error!(
                         "Cycle {}: Fallback provider {} failed: {}",
                         cycle + 1,
-                        fallback.provider_name,
+                        fallback_provider.provider_name,
                         err
                     );
                     last_error = Some(err);
@@ -1108,20 +1124,8 @@ async fn proxy_transcription(
     // Check if we need to split the audio
     let splitter = AudioSplitter::new();
 
-    // Get the model route configuration
-    let route = match state
-        .proxy_router
-        .get_model_route(&transcription_request.model)
-    {
-        Some(r) => r,
-        None => {
-            error!(
-                "Model '{}' not found in routing table",
-                transcription_request.model
-            );
-            return Err(ApiError::BadRequest);
-        }
-    };
+    let default_proxy = state.proxy_router.get_default_proxy();
+    let tinfoil_proxy = state.proxy_router.get_tinfoil_proxy();
 
     // Create a new hyper client
     let https = HttpsConnector::new();
@@ -1145,8 +1149,6 @@ async fn proxy_transcription(
 
     for chunk in chunks {
         let client = client.clone();
-        let mut route = route.clone();
-        let state = state.clone();
         let model_name = transcription_request.model.clone();
         let filename = transcription_request.filename.clone();
         let content_type = transcription_request.content_type.clone();
@@ -1154,6 +1156,8 @@ async fn proxy_transcription(
         let prompt = transcription_request.prompt.clone();
         let response_format = transcription_request.response_format.clone();
         let temperature = transcription_request.temperature;
+        let default_proxy = default_proxy.clone();
+        let tinfoil_proxy = tinfoil_proxy.clone();
 
         let future = async move {
             let chunk_size = chunk.data.len();
@@ -1162,21 +1166,25 @@ async fn proxy_transcription(
                 chunk.index, chunk_size
             );
 
-            // If chunk is over 0.5MB and primary is Tinfoil, skip Tinfoil and use fallback only
-            if chunk_size > TINFOIL_MAX_SIZE
-                && route.primary.provider_name.to_lowercase() == "tinfoil"
-            {
+            let mut primary_provider = match &tinfoil_proxy {
+                Some(proxy) => proxy.clone(),
+                None => default_proxy.clone(),
+            };
+            let mut fallback_provider = if tinfoil_proxy.is_some() {
+                Some(default_proxy.clone())
+            } else {
+                None
+            };
+
+            if chunk_size > TINFOIL_MAX_SIZE && primary_provider.provider_name == "tinfoil" {
                 info!(
                     "Chunk {} size {} bytes exceeds Tinfoil's 0.5MB limit, using fallback only",
                     chunk.index, chunk_size
                 );
 
-                // If we have a fallback (should be Continuum), use it as primary
-                if let Some(fallback) = route.fallbacks.first() {
-                    route.primary = fallback.clone();
-                    route.fallbacks.clear();
+                if let Some(fallback) = fallback_provider.take() {
+                    primary_provider = fallback;
                 } else {
-                    // No fallback available, this will fail
                     return Err(format!(
                         "Chunk {} size {} bytes exceeds Tinfoil's limit and no fallback available",
                         chunk.index, chunk_size
@@ -1194,8 +1202,14 @@ async fn proxy_transcription(
                 temperature,
             };
 
-            match send_transcription_with_retries(&client, &route, &state, &model_name, &params)
-                .await
+            match send_transcription_with_retries(
+                &client,
+                &primary_provider,
+                fallback_provider.as_ref(),
+                &model_name,
+                &params,
+            )
+            .await
             {
                 Ok(response) => {
                     info!("Chunk {} transcribed successfully", chunk.index);
@@ -1607,17 +1621,10 @@ async fn proxy_embeddings(
         return Err(ApiError::BadRequest);
     }
 
-    // Get the model route configuration
-    let route = match state.proxy_router.get_model_route(&embedding_request.model) {
-        Some(r) => r,
-        None => {
-            error!(
-                "Model '{}' not found in routing table",
-                embedding_request.model
-            );
-            return Err(ApiError::BadRequest);
-        }
-    };
+    let proxy_config = state
+        .proxy_router
+        .get_tinfoil_proxy()
+        .unwrap_or_else(|| state.proxy_router.get_default_proxy());
 
     // Create a new hyper client
     let https = HttpsConnector::new();
@@ -1633,13 +1640,13 @@ async fn proxy_embeddings(
     })?;
 
     // Build request to provider
-    let endpoint = format!("{}/v1/embeddings", route.primary.base_url);
+    let endpoint = format!("{}/v1/embeddings", proxy_config.base_url);
     let mut req = Request::builder()
         .method("POST")
         .uri(&endpoint)
         .header("Content-Type", "application/json");
 
-    if let Some(api_key) = &route.primary.api_key {
+    if let Some(api_key) = &proxy_config.api_key {
         if !api_key.is_empty() {
             req = req.header("Authorization", format!("Bearer {}", api_key));
         }
@@ -1711,7 +1718,7 @@ async fn proxy_embeddings(
                 &user,
                 &billing_context,
                 embedding_usage,
-                &route.primary.provider_name,
+                &proxy_config.provider_name,
             )
             .await;
         }

@@ -1,252 +1,141 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"io"
+	"net/http"
 	"testing"
+	"time"
 )
 
-func TestBuildExtraChatCompletionFieldsForKimiThinkingControl(t *testing.T) {
-	includeReasoning := false
-	thinkingTokenBudget := 0
+type roundTripperFunc func(*http.Request) (*http.Response, error)
 
-	req := ChatCompletionRequest{
-		Thinking:            map[string]any{"type": "disabled"},
-		IncludeReasoning:    &includeReasoning,
-		ThinkingTokenBudget: &thinkingTokenBudget,
-		ChatTemplateKwargs:  map[string]any{"thinking": false},
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestShouldSkipHeader(t *testing.T) {
+	tests := map[string]bool{
+		"Authorization":     true,
+		"Connection":        true,
+		"Content-Length":    true,
+		"Transfer-Encoding": true,
+		"Content-Type":      false,
+		"X-Test":            false,
 	}
 
-	extraFields := buildExtraChatCompletionFields(req)
-	if len(extraFields) != 4 {
-		t.Fatalf("expected 4 extra fields, got %d", len(extraFields))
-	}
-
-	thinking, ok := extraFields["thinking"].(map[string]any)
-	if !ok || thinking["type"] != "disabled" {
-		t.Fatalf("unexpected thinking field: %#v", extraFields["thinking"])
-	}
-
-	includeReasoningValue, ok := extraFields["include_reasoning"].(bool)
-	if !ok || includeReasoningValue {
-		t.Fatalf("unexpected include_reasoning field: %#v", extraFields["include_reasoning"])
-	}
-
-	thinkingTokenBudgetValue, ok := extraFields["thinking_token_budget"].(int)
-	if !ok || thinkingTokenBudgetValue != 0 {
-		t.Fatalf("unexpected thinking_token_budget field: %#v", extraFields["thinking_token_budget"])
-	}
-
-	chatTemplateKwargs, ok := extraFields["chat_template_kwargs"].(map[string]any)
-	if !ok || chatTemplateKwargs["thinking"] != false {
-		t.Fatalf("unexpected chat_template_kwargs field: %#v", extraFields["chat_template_kwargs"])
+	for header, want := range tests {
+		if got := shouldSkipHeader(header); got != want {
+			t.Fatalf("header %q: expected %v, got %v", header, want, got)
+		}
 	}
 }
 
-func TestBuildExtraChatCompletionFieldsForGemmaThinkingMode(t *testing.T) {
-	includeReasoning := true
-
-	req := ChatCompletionRequest{
-		IncludeReasoning:   &includeReasoning,
-		ChatTemplateKwargs: map[string]any{"enable_thinking": true},
+func TestCopyHeadersSkipsHopByHopAndAuthorization(t *testing.T) {
+	src := http.Header{
+		"Authorization":    []string{"Bearer secret"},
+		"Connection":       []string{"keep-alive, X-Per-Connection", "X-Another-Hop"},
+		"Content-Type":     []string{"application/json"},
+		"X-Request-Id":     []string{"abc123"},
+		"X-Per-Connection": []string{"do-not-forward"},
+		"X-Another-Hop":    []string{"also-do-not-forward"},
 	}
+	dst := http.Header{}
 
-	extraFields := buildExtraChatCompletionFields(req)
-	if len(extraFields) != 2 {
-		t.Fatalf("expected 2 extra fields, got %d", len(extraFields))
+	copyHeaders(dst, src)
+
+	if dst.Get("Authorization") != "" {
+		t.Fatal("expected authorization header to be skipped")
 	}
-
-	includeReasoningValue, ok := extraFields["include_reasoning"].(bool)
-	if !ok || !includeReasoningValue {
-		t.Fatalf("unexpected include_reasoning field: %#v", extraFields["include_reasoning"])
+	if dst.Get("Connection") != "" {
+		t.Fatal("expected connection header to be skipped")
 	}
-
-	chatTemplateKwargs, ok := extraFields["chat_template_kwargs"].(map[string]any)
-	if !ok || chatTemplateKwargs["enable_thinking"] != true {
-		t.Fatalf("unexpected chat_template_kwargs field: %#v", extraFields["chat_template_kwargs"])
+	if dst.Get("X-Per-Connection") != "" {
+		t.Fatal("expected connection-nominated header to be skipped")
+	}
+	if dst.Get("X-Another-Hop") != "" {
+		t.Fatal("expected additional connection-nominated header to be skipped")
+	}
+	if dst.Get("Content-Type") != "application/json" {
+		t.Fatalf("expected content-type to be copied, got %q", dst.Get("Content-Type"))
+	}
+	if dst.Get("X-Request-Id") != "abc123" {
+		t.Fatalf("expected x-request-id to be copied, got %q", dst.Get("X-Request-Id"))
 	}
 }
 
-func TestBuildExtraChatCompletionFieldsEmpty(t *testing.T) {
-	extraFields := buildExtraChatCompletionFields(ChatCompletionRequest{})
-	if extraFields != nil {
-		t.Fatalf("expected nil extra fields, got %#v", extraFields)
+func TestUpstreamURLPreservesQuery(t *testing.T) {
+	server := &proxyServer{enclaveHost: "enclave.example.com"}
+
+	got := server.upstreamURL("/v1/models", "limit=10&after=abc")
+	want := "https://enclave.example.com/v1/models?limit=10&after=abc"
+
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
 	}
 }
 
-func TestMarshalChatCompletionRequestIncludesStandardReasoningControls(t *testing.T) {
-	// GPT-OSS uses the standard OpenAI-style request fields for reasoning control.
-	// On the current Tinfoil/vLLM stack, callers can tune reasoning with
-	// `reasoning_effort` and `verbosity`, while Kimi's vLLM-specific no-thinking
-	// mode uses `chat_template_kwargs.thinking=false`.
-	reasoningEffort := "low"
-	verbosity := "low"
-
-	req := ChatCompletionRequest{
-		Model:              "gpt-oss-120b",
-		Messages:           []ChatMessage{{Role: "user", Content: "hi"}},
-		ReasoningEffort:    &reasoningEffort,
-		Verbosity:          &verbosity,
-		ChatTemplateKwargs: nil,
+func TestDoWithResponseStartTimeoutTimesOut(t *testing.T) {
+	client := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		}),
 	}
 
-	if extraFields := buildExtraChatCompletionFields(req); extraFields != nil {
-		t.Fatalf("expected no extra fields for standard reasoning controls, got %#v", extraFields)
-	}
-
-	data, err := json.Marshal(req)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com", nil)
 	if err != nil {
-		t.Fatalf("failed to marshal request: %v", err)
+		t.Fatalf("failed to create request: %v", err)
 	}
 
-	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err != nil {
-		t.Fatalf("failed to unmarshal request payload: %v", err)
+	start := time.Now()
+	_, err = doWithResponseStartTimeout(client, req, 10*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error")
 	}
-
-	if payload["reasoning_effort"] != "low" {
-		t.Fatalf("expected reasoning_effort=low, got %#v", payload["reasoning_effort"])
+	if err != context.DeadlineExceeded {
+		t.Fatalf("expected context deadline exceeded, got %v", err)
 	}
-
-	if payload["verbosity"] != "low" {
-		t.Fatalf("expected verbosity=low, got %#v", payload["verbosity"])
-	}
-
-	if _, ok := payload["chat_template_kwargs"]; ok {
-		t.Fatalf("did not expect chat_template_kwargs in payload: %#v", payload["chat_template_kwargs"])
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("expected timeout quickly, took %s", elapsed)
 	}
 }
 
-func TestMarshalChatCompletionRequestIncludesGemmaThinkingControls(t *testing.T) {
-	includeReasoning := true
+func TestDoWithResponseStartTimeoutAllowsLongBodyReads(t *testing.T) {
+	reader, writer := io.Pipe()
 
-	req := ChatCompletionRequest{
-		Model:              "gemma4-31b",
-		Messages:           []ChatMessage{{Role: "user", Content: "hi"}},
-		IncludeReasoning:   &includeReasoning,
-		ChatTemplateKwargs: map[string]any{"enable_thinking": true},
+	client := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{},
+				Body:       reader,
+			}, nil
+		}),
 	}
 
-	if extraFields := buildExtraChatCompletionFields(req); len(extraFields) != 2 {
-		t.Fatalf("expected gemma extra fields, got %#v", extraFields)
-	}
-
-	data, err := json.Marshal(req)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com", nil)
 	if err != nil {
-		t.Fatalf("failed to marshal request: %v", err)
+		t.Fatalf("failed to create request: %v", err)
 	}
 
-	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err != nil {
-		t.Fatalf("failed to unmarshal request payload: %v", err)
-	}
-
-	if payload["include_reasoning"] != true {
-		t.Fatalf("expected include_reasoning=true, got %#v", payload["include_reasoning"])
-	}
-
-	chatTemplateKwargs, ok := payload["chat_template_kwargs"].(map[string]any)
-	if !ok || chatTemplateKwargs["enable_thinking"] != true {
-		t.Fatalf("unexpected chat_template_kwargs in payload: %#v", payload["chat_template_kwargs"])
-	}
-}
-
-func TestMarshalChatCompletionRequestIncludesGLMIncludeReasoningFalse(t *testing.T) {
-	// On the current Tinfoil/vLLM stack, forwarding include_reasoning=false
-	// suppresses GLM reasoning output.
-	includeReasoning := false
-
-	req := ChatCompletionRequest{
-		Model:            "glm-5-1",
-		Messages:         []ChatMessage{{Role: "user", Content: "hi"}},
-		IncludeReasoning: &includeReasoning,
-	}
-
-	extraFields := buildExtraChatCompletionFields(req)
-	if len(extraFields) != 1 {
-		t.Fatalf("expected 1 extra field, got %#v", extraFields)
-	}
-
-	includeReasoningValue, ok := extraFields["include_reasoning"].(bool)
-	if !ok || includeReasoningValue {
-		t.Fatalf("unexpected include_reasoning field: %#v", extraFields["include_reasoning"])
-	}
-
-	data, err := json.Marshal(req)
+	resp, err := doWithResponseStartTimeout(client, req, 10*time.Millisecond)
 	if err != nil {
-		t.Fatalf("failed to marshal request: %v", err)
+		t.Fatalf("expected response, got %v", err)
 	}
+	defer resp.Body.Close()
 
-	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err != nil {
-		t.Fatalf("failed to unmarshal request payload: %v", err)
-	}
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		_, _ = writer.Write([]byte("ok"))
+		_ = writer.Close()
+	}()
 
-	if payload["include_reasoning"] != false {
-		t.Fatalf("expected include_reasoning=false, got %#v", payload["include_reasoning"])
-	}
-}
-
-func TestMarshalChatCompletionRequestIncludesGLMEnableThinkingFalse(t *testing.T) {
-	// On the current Tinfoil/vLLM stack, forwarding
-	// chat_template_kwargs.enable_thinking=false suppresses GLM reasoning output.
-	req := ChatCompletionRequest{
-		Model:              "glm-5-1",
-		Messages:           []ChatMessage{{Role: "user", Content: "hi"}},
-		ChatTemplateKwargs: map[string]any{"enable_thinking": false},
-	}
-
-	extraFields := buildExtraChatCompletionFields(req)
-	if len(extraFields) != 1 {
-		t.Fatalf("expected 1 extra field, got %#v", extraFields)
-	}
-
-	chatTemplateKwargs, ok := extraFields["chat_template_kwargs"].(map[string]any)
-	if !ok || chatTemplateKwargs["enable_thinking"] != false {
-		t.Fatalf("unexpected chat_template_kwargs field: %#v", extraFields["chat_template_kwargs"])
-	}
-
-	data, err := json.Marshal(req)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("failed to marshal request: %v", err)
+		t.Fatalf("failed to read body: %v", err)
 	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err != nil {
-		t.Fatalf("failed to unmarshal request payload: %v", err)
-	}
-
-	chatTemplateKwargs, ok = payload["chat_template_kwargs"].(map[string]any)
-	if !ok || chatTemplateKwargs["enable_thinking"] != false {
-		t.Fatalf("unexpected chat_template_kwargs in payload: %#v", payload["chat_template_kwargs"])
-	}
-}
-
-func TestModelConfigsIncludesGemma4_31B(t *testing.T) {
-	config, ok := modelConfigs["gemma4-31b"]
-	if !ok {
-		t.Fatal("expected gemma4-31b to be registered")
-	}
-
-	if config.ModelID != "gemma4-31b" {
-		t.Fatalf("expected model id gemma4-31b, got %q", config.ModelID)
-	}
-
-	if !config.Active {
-		t.Fatal("expected gemma4-31b to be active")
-	}
-}
-
-func TestModelConfigsIncludesGLM_5_1(t *testing.T) {
-	config, ok := modelConfigs["glm-5-1"]
-	if !ok {
-		t.Fatal("expected glm-5-1 to be registered")
-	}
-
-	if config.ModelID != "glm-5-1" {
-		t.Fatalf("expected model id glm-5-1, got %q", config.ModelID)
-	}
-
-	if !config.Active {
-		t.Fatal("expected glm-5-1 to be active")
+	if string(body) != "ok" {
+		t.Fatalf("expected body %q, got %q", "ok", string(body))
 	}
 }

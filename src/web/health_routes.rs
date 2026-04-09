@@ -64,8 +64,7 @@ pub async fn health_check_extended(
     // Try to fetch models directly from the proxy with a timeout
     let timeout_duration = Duration::from_secs(5);
 
-    // We'll test against the default proxy (Continuum)
-    let default_proxy = state.proxy_router.get_default_proxy();
+    let default_proxy = state.proxy_router.get_completion_proxy();
 
     let result = timeout(
         timeout_duration,

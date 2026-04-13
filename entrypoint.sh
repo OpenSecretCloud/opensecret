@@ -351,6 +351,14 @@ echo "127.0.0.17 tuf-repo-cdn.sigstore.dev" >> /etc/hosts
 echo "127.0.0.19 kds-proxy.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.25 atc.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.33 inference.tinfoil.sh" >> /etc/hosts
+# New Tinfoil router domains
+echo "127.0.0.34 router-0.tinfoil.dev" >> /etc/hosts
+echo "127.0.0.35 router-1.tinfoil.dev" >> /etc/hosts
+echo "127.0.0.36 router-2.tinfoil.dev" >> /etc/hosts
+echo "127.0.0.37 router-3.tinfoil.dev" >> /etc/hosts
+echo "127.0.0.38 router-4.tinfoil.dev" >> /etc/hosts
+echo "127.0.0.39 router-5.tinfoil.dev" >> /etc/hosts
+# Legacy Tinfoil router domains (deprecated upstream naming, kept during migration)
 echo "127.0.0.26 router.inf4.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.27 router.inf5.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.28 router.inf6.tinfoil.sh" >> /etc/hosts
@@ -358,7 +366,7 @@ echo "127.0.0.29 router.inf7.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.30 router.inf8.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.31 router.inf9.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.32 router.inf10.tinfoil.sh" >> /etc/hosts
-log "Added Tinfoil proxy domains to /etc/hosts"
+log "Added Tinfoil proxy domains (including legacy router domains) to /etc/hosts"
 
 # Add Kagi Search hostname to /etc/hosts
 echo "127.0.0.23 kagi.com" >> /etc/hosts
@@ -457,6 +465,25 @@ run_forever tf_tinfoil_atc python3 /app/traffic_forwarder.py 127.0.0.25 443 3 80
 log "Starting Tinfoil Inference traffic forwarder"
 run_forever tf_tinfoil_inference python3 /app/traffic_forwarder.py 127.0.0.33 443 3 8041 &
 
+log "Starting Tinfoil Router 0 traffic forwarder"
+run_forever tf_tinfoil_router_0 python3 /app/traffic_forwarder.py 127.0.0.34 443 3 8042 &
+
+log "Starting Tinfoil Router 1 traffic forwarder"
+run_forever tf_tinfoil_router_1 python3 /app/traffic_forwarder.py 127.0.0.35 443 3 8043 &
+
+log "Starting Tinfoil Router 2 traffic forwarder"
+run_forever tf_tinfoil_router_2 python3 /app/traffic_forwarder.py 127.0.0.36 443 3 8044 &
+
+log "Starting Tinfoil Router 3 traffic forwarder"
+run_forever tf_tinfoil_router_3 python3 /app/traffic_forwarder.py 127.0.0.37 443 3 8045 &
+
+log "Starting Tinfoil Router 4 traffic forwarder"
+run_forever tf_tinfoil_router_4 python3 /app/traffic_forwarder.py 127.0.0.38 443 3 8046 &
+
+log "Starting Tinfoil Router 5 traffic forwarder"
+run_forever tf_tinfoil_router_5 python3 /app/traffic_forwarder.py 127.0.0.39 443 3 8047 &
+
+# Legacy Tinfoil router endpoints (deprecated upstream naming, kept during migration)
 log "Starting Tinfoil Router Inf4 traffic forwarder"
 run_forever tf_tinfoil_router_inf4 python3 /app/traffic_forwarder.py 127.0.0.26 443 3 8034 &
 
@@ -642,6 +669,49 @@ else
     log "Tinfoil Inference connection failed"
 fi
 
+log "Testing connection to Tinfoil Router 0:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.34/443'; then
+    log "Tinfoil Router 0 connection successful"
+else
+    log "Tinfoil Router 0 connection failed"
+fi
+
+log "Testing connection to Tinfoil Router 1:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.35/443'; then
+    log "Tinfoil Router 1 connection successful"
+else
+    log "Tinfoil Router 1 connection failed"
+fi
+
+log "Testing connection to Tinfoil Router 2:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.36/443'; then
+    log "Tinfoil Router 2 connection successful"
+else
+    log "Tinfoil Router 2 connection failed"
+fi
+
+log "Testing connection to Tinfoil Router 3:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.37/443'; then
+    log "Tinfoil Router 3 connection successful"
+else
+    log "Tinfoil Router 3 connection failed"
+fi
+
+log "Testing connection to Tinfoil Router 4:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.38/443'; then
+    log "Tinfoil Router 4 connection successful"
+else
+    log "Tinfoil Router 4 connection failed"
+fi
+
+log "Testing connection to Tinfoil Router 5:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.39/443'; then
+    log "Tinfoil Router 5 connection successful"
+else
+    log "Tinfoil Router 5 connection failed"
+fi
+
+# Legacy Tinfoil router endpoints (deprecated upstream naming, kept during migration)
 log "Testing connection to Tinfoil Router Inf4:"
 if timeout 5 bash -c '</dev/tcp/127.0.0.26/443'; then
     log "Tinfoil Router Inf4 connection successful"

@@ -991,6 +991,14 @@ Add these lines:
 - {address: kds-proxy.tinfoil.sh, port: 443}
 - {address: atc.tinfoil.sh, port: 443}
 - {address: inference.tinfoil.sh, port: 443}
+# New router naming (preferred)
+- {address: router-0.tinfoil.dev, port: 443}
+- {address: router-1.tinfoil.dev, port: 443}
+- {address: router-2.tinfoil.dev, port: 443}
+- {address: router-3.tinfoil.dev, port: 443}
+- {address: router-4.tinfoil.dev, port: 443}
+- {address: router-5.tinfoil.dev, port: 443}
+# Legacy router naming (deprecated, keep during migration)
 - {address: router.inf4.tinfoil.sh, port: 443}
 - {address: router.inf5.tinfoil.sh, port: 443}
 - {address: router.inf6.tinfoil.sh, port: 443}
@@ -1004,6 +1012,8 @@ Restart the nitro vsock proxy service:
 ```
 sudo systemctl restart nitro-enclaves-vsock-proxy.service
 ```
+
+Keep both the new `router-*.tinfoil.dev` entries and the legacy `router.inf*.tinfoil.sh` entries enabled until Tinfoil finishes the cutover.
 
 #### Tinfoil GitHub Proxy
 ```sh
@@ -1105,7 +1115,129 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-#### Tinfoil Router Inf4
+#### Tinfoil Router 0
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-router-0.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Router 0 Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8042 router-0.tinfoil.dev 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil Router 1
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-router-1.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Router 1 Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8043 router-1.tinfoil.dev 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil Router 2
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-router-2.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Router 2 Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8044 router-2.tinfoil.dev 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil Router 3
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-router-3.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Router 3 Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8045 router-3.tinfoil.dev 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil Router 4
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-router-4.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Router 4 Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8046 router-4.tinfoil.dev 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Tinfoil Router 5
+```sh
+sudo vim /etc/systemd/system/vsock-tinfoil-router-5.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Tinfoil Router 5 Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8047 router-5.tinfoil.dev 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The following legacy services use the deprecated `router.inf*.tinfoil.sh` naming. Keep them enabled during migration.
+
+#### Tinfoil Router Inf4 (deprecated)
 ```sh
 sudo vim /etc/systemd/system/vsock-tinfoil-router-inf4.service
 ```
@@ -1125,7 +1257,7 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-#### Tinfoil Router Inf5
+#### Tinfoil Router Inf5 (deprecated)
 ```sh
 sudo vim /etc/systemd/system/vsock-tinfoil-router-inf5.service
 ```
@@ -1145,7 +1277,7 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-#### Tinfoil Router Inf6
+#### Tinfoil Router Inf6 (deprecated)
 ```sh
 sudo vim /etc/systemd/system/vsock-tinfoil-router-inf6.service
 ```
@@ -1165,7 +1297,7 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-#### Tinfoil Router Inf7
+#### Tinfoil Router Inf7 (deprecated)
 ```sh
 sudo vim /etc/systemd/system/vsock-tinfoil-router-inf7.service
 ```
@@ -1185,7 +1317,7 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-#### Tinfoil Router Inf8
+#### Tinfoil Router Inf8 (deprecated)
 ```sh
 sudo vim /etc/systemd/system/vsock-tinfoil-router-inf8.service
 ```
@@ -1205,7 +1337,7 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-#### Tinfoil Router Inf9
+#### Tinfoil Router Inf9 (deprecated)
 ```sh
 sudo vim /etc/systemd/system/vsock-tinfoil-router-inf9.service
 ```
@@ -1225,7 +1357,7 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-#### Tinfoil Router Inf10
+#### Tinfoil Router Inf10 (deprecated)
 ```sh
 sudo vim /etc/systemd/system/vsock-tinfoil-router-inf10.service
 ```
@@ -1245,7 +1377,7 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-Activate all the services:
+Activate all the services (including the deprecated legacy router services during migration):
 
 ```sh
 sudo systemctl daemon-reload
@@ -1264,6 +1396,24 @@ sudo systemctl status vsock-tinfoil-atc.service
 sudo systemctl enable vsock-tinfoil-inference.service
 sudo systemctl start vsock-tinfoil-inference.service
 sudo systemctl status vsock-tinfoil-inference.service
+sudo systemctl enable vsock-tinfoil-router-0.service
+sudo systemctl start vsock-tinfoil-router-0.service
+sudo systemctl status vsock-tinfoil-router-0.service
+sudo systemctl enable vsock-tinfoil-router-1.service
+sudo systemctl start vsock-tinfoil-router-1.service
+sudo systemctl status vsock-tinfoil-router-1.service
+sudo systemctl enable vsock-tinfoil-router-2.service
+sudo systemctl start vsock-tinfoil-router-2.service
+sudo systemctl status vsock-tinfoil-router-2.service
+sudo systemctl enable vsock-tinfoil-router-3.service
+sudo systemctl start vsock-tinfoil-router-3.service
+sudo systemctl status vsock-tinfoil-router-3.service
+sudo systemctl enable vsock-tinfoil-router-4.service
+sudo systemctl start vsock-tinfoil-router-4.service
+sudo systemctl status vsock-tinfoil-router-4.service
+sudo systemctl enable vsock-tinfoil-router-5.service
+sudo systemctl start vsock-tinfoil-router-5.service
+sudo systemctl status vsock-tinfoil-router-5.service
 sudo systemctl enable vsock-tinfoil-router-inf4.service
 sudo systemctl start vsock-tinfoil-router-inf4.service
 sudo systemctl status vsock-tinfoil-router-inf4.service
@@ -1294,6 +1444,12 @@ sudo systemctl restart vsock-tuf-repo-cdn.service
 sudo systemctl restart vsock-tinfoil-kds-proxy.service
 sudo systemctl restart vsock-tinfoil-atc.service
 sudo systemctl restart vsock-tinfoil-inference.service
+sudo systemctl restart vsock-tinfoil-router-0.service
+sudo systemctl restart vsock-tinfoil-router-1.service
+sudo systemctl restart vsock-tinfoil-router-2.service
+sudo systemctl restart vsock-tinfoil-router-3.service
+sudo systemctl restart vsock-tinfoil-router-4.service
+sudo systemctl restart vsock-tinfoil-router-5.service
 sudo systemctl restart vsock-tinfoil-router-inf4.service
 sudo systemctl restart vsock-tinfoil-router-inf5.service
 sudo systemctl restart vsock-tinfoil-router-inf6.service

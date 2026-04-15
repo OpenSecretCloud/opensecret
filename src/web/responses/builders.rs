@@ -149,6 +149,10 @@ impl OutputItemBuilder {
                 status: STATUS_IN_PROGRESS.to_string(),
                 role: Some(ROLE_ASSISTANT.to_string()),
                 content: Some(vec![]),
+                call_id: None,
+                name: None,
+                arguments: None,
+                output: None,
             },
         }
     }

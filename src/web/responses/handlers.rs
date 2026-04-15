@@ -5,14 +5,14 @@ use crate::{
     billing::BillingError,
     db::DBError,
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
-    models::responses::{NewAssistantMessage, NewUserMessage, ResponseStatus, ResponsesError},
+    models::responses::{NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
     tokens::{count_tokens, model_max_ctx},
     web::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
         responses::{
-            build_prompt, build_usage, constants::*, error_mapping, prompts, storage_task, tools,
+            build_prompt, build_usage, constants::*, error_mapping, storage_task, tools,
             ContentPartBuilder, DeletedObjectResponse, MessageContent, MessageContentConverter,
             MessageContentPart, OutputItemBuilder, ResponseBuilder, ResponseEvent, SseEventEmitter,
         },
@@ -33,7 +33,7 @@ use futures::Stream;
 use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
@@ -71,10 +71,172 @@ fn apply_responses_model_defaults(chat_request: &mut Value, model: &str) {
     }
 }
 
+const MAPLE_SYSTEM_PROMPT: &str = "You are Maple, a friendly, concise, and helpful assistant. Give direct answers, be honest about uncertainty, and never invent tool use, search results, or sources.";
+const MAPLE_WEB_SEARCH_PROMPT: &str = "If the web_search tool is available and the user explicitly asks you to search, look something up, verify, confirm, or check the web, call web_search before answering. Also use web_search when the answer depends on current or time-sensitive information. You may use web_search repeatedly across a single response when needed, but only one tool call at a time and never more than 15 tool calls for one user request. After each tool output, decide whether you have enough information to answer or whether another search is still needed. Prefer to stop searching and answer as soon as you have enough information. After receiving tool results, you must either call another tool or provide a final user-visible answer in assistant content. Do not end the turn with reasoning only. Do not place the final answer in reasoning. Never output raw tool call syntax.";
+
+#[derive(Debug, Clone)]
+struct ModelToolCall {
+    name: String,
+    arguments: Value,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StreamedToolCall {
+    name: Option<String>,
+    arguments: String,
+}
+
+#[derive(Debug, Clone)]
+enum AssistantTurnOutcome {
+    ToolCall(ModelToolCall),
+    Final,
+}
+
+fn should_enable_web_search_tool(state: &AppState, body: &ResponsesCreateRequest) -> bool {
+    is_tool_choice_allowed(&body.tool_choice)
+        && is_web_search_enabled(&body.tools)
+        && state.brave_client.is_some()
+}
+
+fn build_internal_system_prompt_for_now(
+    now: chrono::DateTime<Utc>,
+    web_search_enabled: bool,
+) -> String {
+    let current_utc_date = now.format("%A, %Y-%m-%d").to_string();
+    let current_date_prompt = format!(
+        "Current UTC date: {current_utc_date}. Use this as today's date for any date-sensitive reasoning."
+    );
+
+    if web_search_enabled {
+        format!("{MAPLE_SYSTEM_PROMPT}\n\n{current_date_prompt}\n\n{MAPLE_WEB_SEARCH_PROMPT}")
+    } else {
+        format!("{MAPLE_SYSTEM_PROMPT}\n\n{current_date_prompt}")
+    }
+}
+
+fn build_internal_system_prompt(web_search_enabled: bool) -> String {
+    build_internal_system_prompt_for_now(Utc::now(), web_search_enabled)
+}
+
+fn build_provider_tools(request_tools: &Option<Value>) -> Vec<Value> {
+    let registry = tools::ToolRegistry::new();
+
+    request_tools
+        .as_ref()
+        .and_then(|tools| tools.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    let tool_name = tool.get("type").and_then(|t| t.as_str())?;
+                    registry.get_tool_schema(tool_name).map(|schema| {
+                        json!({
+                            "type": "function",
+                            "function": schema,
+                        })
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn build_tool_choice_value(tool_choice: &Option<String>) -> Value {
+    match tool_choice.as_deref() {
+        Some(choice) if !choice.is_empty() => json!(choice),
+        _ => json!("auto"),
+    }
+}
+
+fn build_model_turn_request(
+    body: &ResponsesCreateRequest,
+    prompt_messages: &[Value],
+    tools_enabled: bool,
+) -> Value {
+    let mut chat_request = json!({
+        "model": body.model,
+        "messages": prompt_messages,
+        "temperature": body.temperature.unwrap_or(DEFAULT_TEMPERATURE),
+        "top_p": body.top_p.unwrap_or(DEFAULT_TOP_P),
+        "max_tokens": body.max_output_tokens,
+        "stream": true,
+        "stream_options": { "include_usage": true }
+    });
+
+    if tools_enabled {
+        let provider_tools = build_provider_tools(&body.tools);
+        if !provider_tools.is_empty() {
+            chat_request["tools"] = Value::Array(provider_tools);
+            chat_request["tool_choice"] = build_tool_choice_value(&body.tool_choice);
+            chat_request["parallel_tool_calls"] = json!(false);
+        }
+    }
+
+    apply_responses_model_defaults(&mut chat_request, &body.model);
+    chat_request
+}
+
+fn append_streamed_tool_calls(tool_calls: &mut Vec<StreamedToolCall>, tool_call_delta: &Value) {
+    let Some(tool_call_entries) = tool_call_delta.as_array() else {
+        return;
+    };
+
+    if tool_call_entries.len() > 1 {
+        warn!(
+            "Model streamed {} tool calls in one chunk; only the first call will be executed in v1",
+            tool_call_entries.len()
+        );
+    }
+
+    for tool_call in tool_call_entries {
+        let index = tool_call
+            .get("index")
+            .and_then(|index| index.as_u64())
+            .unwrap_or(0) as usize;
+
+        while tool_calls.len() <= index {
+            tool_calls.push(StreamedToolCall::default());
+        }
+
+        if let Some(function) = tool_call.get("function") {
+            if let Some(name) = function.get("name").and_then(|name| name.as_str()) {
+                tool_calls[index].name = Some(name.to_string());
+            }
+
+            if let Some(arguments) = function
+                .get("arguments")
+                .and_then(|arguments| arguments.as_str())
+            {
+                tool_calls[index].arguments.push_str(arguments);
+            }
+        }
+    }
+}
+
+fn finalize_first_model_tool_call(tool_calls: &[StreamedToolCall]) -> Option<ModelToolCall> {
+    let tool_call = tool_calls.first()?;
+    let name = tool_call.name.clone()?;
+    let arguments = serde_json::from_str(&tool_call.arguments).unwrap_or_else(|e| {
+        warn!(
+            "Failed to parse tool arguments for {} as JSON: {:?}. Using empty object.",
+            name, e
+        );
+        json!({})
+    });
+
+    Some(ModelToolCall { name, arguments })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::apply_responses_model_defaults;
+    use super::{
+        append_streamed_tool_calls, apply_responses_model_defaults,
+        build_internal_system_prompt_for_now, build_provider_tools, finalize_first_model_tool_call,
+        ClientResponseState, StreamedToolCall, MAPLE_WEB_SEARCH_PROMPT,
+    };
+    use chrono::{TimeZone, Utc};
     use serde_json::json;
+    use uuid::Uuid;
 
     #[test]
     fn test_apply_responses_model_defaults_enables_gemma_thinking() {
@@ -105,6 +267,93 @@ mod tests {
 
         assert!(chat_request.get("include_reasoning").is_none());
         assert!(chat_request.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn test_append_streamed_tool_calls_reassembles_arguments() {
+        let mut tool_calls = Vec::<StreamedToolCall>::new();
+
+        append_streamed_tool_calls(
+            &mut tool_calls,
+            &json!([{
+                "index": 0,
+                "function": {
+                    "name": "web_search",
+                    "arguments": "{\"query\":\"Don"
+                }
+            }]),
+        );
+        append_streamed_tool_calls(
+            &mut tool_calls,
+            &json!([{
+                "index": 0,
+                "function": {
+                    "arguments": "ald Trump birthday\"}"
+                }
+            }]),
+        );
+
+        let tool_call = finalize_first_model_tool_call(&tool_calls).expect("tool call");
+        assert_eq!(tool_call.name, "web_search");
+        assert_eq!(tool_call.arguments["query"], "Donald Trump birthday");
+    }
+
+    #[test]
+    fn test_build_provider_tools_filters_unknown_tools() {
+        let tools = build_provider_tools(&Some(json!([
+            { "type": "web_search" },
+            { "type": "unknown_tool" }
+        ])));
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "web_search");
+    }
+
+    #[test]
+    fn test_build_internal_system_prompt_includes_current_utc_date() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 15, 12, 0, 0)
+            .single()
+            .expect("valid UTC timestamp");
+
+        let prompt = build_internal_system_prompt_for_now(now, true);
+
+        assert!(prompt.contains("Current UTC date: Wednesday, 2026-04-15."));
+        assert!(prompt.contains(MAPLE_WEB_SEARCH_PROMPT));
+    }
+
+    #[test]
+    fn test_client_response_state_build_output_items_uses_maple_tool_types() {
+        let mut state = ClientResponseState::default();
+        let tool_call_id = Uuid::new_v4();
+        let tool_output_id = Uuid::new_v4();
+
+        state.push_tool_call(
+            tool_call_id,
+            "web_search".to_string(),
+            json!({ "query": "ufc" }),
+        );
+        state.push_tool_output(
+            tool_output_id,
+            tool_call_id,
+            "Search Results:\n\n1. Example".to_string(),
+        );
+
+        let output_items = state.build_output_items();
+        let tool_call_id_str = tool_call_id.to_string();
+
+        assert_eq!(output_items.len(), 2);
+        assert_eq!(output_items[0].output_type, "tool_call");
+        assert_eq!(
+            output_items[0].call_id.as_deref(),
+            Some(tool_call_id_str.as_str())
+        );
+        assert_eq!(output_items[1].output_type, "tool_output");
+        assert_eq!(
+            output_items[1].call_id.as_deref(),
+            Some(tool_call_id_str.as_str())
+        );
     }
 }
 
@@ -181,15 +430,15 @@ pub struct ResponsesCreateRequest {
     /// Maximum tokens for the response
     pub max_output_tokens: Option<i32>,
 
-    /// Tool choice strategy (ignored in Phase 4/5)
+    /// Tool choice strategy
     #[serde(default)]
     pub tool_choice: Option<String>,
 
-    /// Tools available for the model (ignored in Phase 4/5)
+    /// Tools available for the model
     #[serde(default)]
     pub tools: Option<Value>,
 
-    /// Enable parallel tool calls (ignored in Phase 4/5)
+    /// Enable parallel tool calls
     #[serde(default)]
     pub parallel_tool_calls: bool,
 
@@ -272,7 +521,7 @@ pub struct ResponsesCreateResponse {
     /// Tool choice setting
     pub tool_choice: String,
 
-    /// Available tools (empty array for Phase 4/5)
+    /// Available tools
     pub tools: Vec<serde_json::Value>,
 
     /// Top logprobs
@@ -339,6 +588,22 @@ pub struct OutputItem {
     /// Content array (for message type)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<ContentPart>>,
+
+    /// Tool call ID (for tool_call / tool_output types)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+
+    /// Tool/function name (for tool_call type)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    /// Tool arguments JSON (for tool_call type)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+
+    /// Tool output payload (for tool_output type)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
 
 /// Response error structure
@@ -701,6 +966,9 @@ pub struct ToolCallCreatedEvent {
     /// Sequence number for ordering
     pub sequence_number: i32,
 
+    /// Index of the corresponding output item
+    pub output_index: i32,
+
     /// Tool call ID
     pub tool_call_id: Uuid,
 
@@ -721,6 +989,9 @@ pub struct ToolOutputCreatedEvent {
     /// Sequence number for ordering
     pub sequence_number: i32,
 
+    /// Index of the corresponding output item
+    pub output_index: i32,
+
     /// Tool output ID
     pub tool_output_id: Uuid,
 
@@ -734,19 +1005,34 @@ pub struct ToolOutputCreatedEvent {
 /// Message types for the storage task
 #[derive(Debug, Clone)]
 pub enum StorageMessage {
-    ContentDelta(String),
+    MessageStarted {
+        item_id: Uuid,
+    },
+    ContentDelta {
+        item_id: Uuid,
+        delta: String,
+    },
+    MessageDone {
+        item_id: Uuid,
+        finish_reason: String,
+    },
+    ReasoningStarted {
+        item_id: Uuid,
+    },
     /// Reasoning delta with item_id to ensure SSE and DB use the same UUID
     ReasoningDelta {
         item_id: Uuid,
         delta: String,
     },
+    ReasoningDone {
+        item_id: Uuid,
+    },
     Usage {
         prompt_tokens: i32,
         completion_tokens: i32,
     },
-    Done {
+    ResponseDone {
         finish_reason: String,
-        message_id: Uuid,
     },
     Error(String),
     Cancelled,
@@ -761,8 +1047,188 @@ pub enum StorageMessage {
         tool_call_id: Uuid,
         output: String,
     },
-    /// Signal that assistant message is about to start streaming
-    AssistantMessageStarting,
+}
+
+#[derive(Debug, Clone)]
+enum StreamOutputItemRecord {
+    Message {
+        id: Uuid,
+        text: String,
+    },
+    Reasoning {
+        id: Uuid,
+        text: String,
+    },
+    ToolCall {
+        id: Uuid,
+        call_id: Uuid,
+        name: String,
+        arguments: String,
+    },
+    ToolOutput {
+        id: Uuid,
+        call_id: Uuid,
+        output: String,
+    },
+}
+
+#[derive(Default)]
+struct ClientResponseState {
+    items: Vec<StreamOutputItemRecord>,
+    indices: HashMap<Uuid, usize>,
+}
+
+impl ClientResponseState {
+    fn push_message(&mut self, item_id: Uuid) -> i32 {
+        let output_index = self.items.len();
+        self.items.push(StreamOutputItemRecord::Message {
+            id: item_id,
+            text: String::new(),
+        });
+        self.indices.insert(item_id, output_index);
+        output_index as i32
+    }
+
+    fn push_reasoning(&mut self, item_id: Uuid) -> i32 {
+        let output_index = self.items.len();
+        self.items.push(StreamOutputItemRecord::Reasoning {
+            id: item_id,
+            text: String::new(),
+        });
+        self.indices.insert(item_id, output_index);
+        output_index as i32
+    }
+
+    fn push_tool_call(&mut self, item_id: Uuid, name: String, arguments: Value) -> i32 {
+        let output_index = self.items.len();
+        let arguments = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
+        self.items.push(StreamOutputItemRecord::ToolCall {
+            id: item_id,
+            call_id: item_id,
+            name,
+            arguments,
+        });
+        self.indices.insert(item_id, output_index);
+        output_index as i32
+    }
+
+    fn push_tool_output(&mut self, item_id: Uuid, call_id: Uuid, output: String) -> i32 {
+        let output_index = self.items.len();
+        self.items.push(StreamOutputItemRecord::ToolOutput {
+            id: item_id,
+            call_id,
+            output,
+        });
+        self.indices.insert(item_id, output_index);
+        output_index as i32
+    }
+
+    fn message_output_index(&self, item_id: Uuid) -> Option<i32> {
+        self.indices.get(&item_id).map(|index| *index as i32)
+    }
+
+    fn reasoning_output_index(&self, item_id: Uuid) -> Option<i32> {
+        self.indices.get(&item_id).map(|index| *index as i32)
+    }
+
+    fn append_message_delta(&mut self, item_id: Uuid, delta: &str) -> Option<i32> {
+        let index = *self.indices.get(&item_id)?;
+        if let Some(StreamOutputItemRecord::Message { text, .. }) = self.items.get_mut(index) {
+            text.push_str(delta);
+            Some(index as i32)
+        } else {
+            None
+        }
+    }
+
+    fn append_reasoning_delta(&mut self, item_id: Uuid, delta: &str) -> Option<i32> {
+        let index = *self.indices.get(&item_id)?;
+        if let Some(StreamOutputItemRecord::Reasoning { text, .. }) = self.items.get_mut(index) {
+            text.push_str(delta);
+            Some(index as i32)
+        } else {
+            None
+        }
+    }
+
+    fn message_text(&self, item_id: Uuid) -> Option<&str> {
+        let index = *self.indices.get(&item_id)?;
+        match self.items.get(index)? {
+            StreamOutputItemRecord::Message { text, .. } => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
+    fn reasoning_text(&self, item_id: Uuid) -> Option<&str> {
+        let index = *self.indices.get(&item_id)?;
+        match self.items.get(index)? {
+            StreamOutputItemRecord::Reasoning { text, .. } => Some(text.as_str()),
+            _ => None,
+        }
+    }
+
+    fn build_output_items(&self) -> Vec<OutputItem> {
+        self.items
+            .iter()
+            .map(|item| match item {
+                StreamOutputItemRecord::Message { id, text } => OutputItem {
+                    id: id.to_string(),
+                    output_type: OUTPUT_TYPE_MESSAGE.to_string(),
+                    status: STATUS_COMPLETED.to_string(),
+                    role: Some(ROLE_ASSISTANT.to_string()),
+                    content: Some(vec![
+                        ContentPartBuilder::new_output_text(text.clone()).build()
+                    ]),
+                    call_id: None,
+                    name: None,
+                    arguments: None,
+                    output: None,
+                },
+                StreamOutputItemRecord::Reasoning { id, .. } => OutputItem {
+                    id: id.to_string(),
+                    output_type: "reasoning".to_string(),
+                    status: STATUS_COMPLETED.to_string(),
+                    role: None,
+                    content: Some(vec![]),
+                    call_id: None,
+                    name: None,
+                    arguments: None,
+                    output: None,
+                },
+                StreamOutputItemRecord::ToolCall {
+                    id,
+                    call_id,
+                    name,
+                    arguments,
+                } => OutputItem {
+                    id: id.to_string(),
+                    output_type: "tool_call".to_string(),
+                    status: STATUS_COMPLETED.to_string(),
+                    role: None,
+                    content: None,
+                    call_id: Some(call_id.to_string()),
+                    name: Some(name.clone()),
+                    arguments: Some(arguments.clone()),
+                    output: None,
+                },
+                StreamOutputItemRecord::ToolOutput {
+                    id,
+                    call_id,
+                    output,
+                } => OutputItem {
+                    id: id.to_string(),
+                    output_type: "tool_output".to_string(),
+                    status: STATUS_COMPLETED.to_string(),
+                    role: None,
+                    content: None,
+                    call_id: Some(call_id.to_string()),
+                    name: None,
+                    arguments: None,
+                    output: Some(output.clone()),
+                },
+            })
+            .collect()
+    }
 }
 
 /// Validated and prepared request data
@@ -1096,6 +1562,9 @@ async fn build_context_and_check_billing(
     user_key: &SecretKey,
     prepared: &PreparedRequest,
 ) -> Result<BuiltContext, ApiError> {
+    let internal_system_prompt =
+        build_internal_system_prompt(should_enable_web_search_tool(state.as_ref(), body));
+
     // Extract conversation ID from the required conversation parameter
     let conv_uuid = match &body.conversation {
         ConversationParam::String(id) | ConversationParam::Object { id } => *id,
@@ -1117,6 +1586,7 @@ async fn build_context_and_check_billing(
         user_key,
         &body.model,
         body.instructions.as_deref(),
+        Some(&internal_system_prompt),
     )?;
 
     // Add the NEW user message to the context (not yet persisted)
@@ -1184,12 +1654,8 @@ async fn build_context_and_check_billing(
 /// - Creates Response record (status=in_progress)
 /// - Creates user message
 ///
-/// Note: Assistant message is NOT created here - it's created later in Phase 6 (after tools).
-/// Originally, the assistant placeholder was created here, but this caused timestamp
-/// ordering issues: the assistant message would get created_at=T1 (early), then tools
-/// would execute at T2/T3, making the assistant appear BEFORE its tools in queries
-/// ordered by created_at. By creating the assistant message in Phase 6 (after tools),
-/// we ensure the correct semantic order: user → tool_call → tool_output → assistant.
+/// Note: Assistant and tool items are NOT created here - they're created later by the
+/// storage task as stream events arrive so persisted ordering matches the emitted item order.
 async fn persist_request_data(
     state: &Arc<AppState>,
     user: &User,
@@ -1266,8 +1732,8 @@ async fn persist_request_data(
         .create_user_message(new_msg)
         .map_err(error_mapping::map_generic_db_error)?;
 
-    // Capture user message timestamp for reasoning item ordering
-    // Reasoning should appear after user message but before assistant message
+    // Capture the user message timestamp so persisted response items can be assigned
+    // a single monotonic created_at sequence immediately after the user message.
     let user_message_created_at = user_message.created_at;
 
     info!(
@@ -1313,310 +1779,425 @@ fn is_web_search_enabled(tools: &Option<Value>) -> bool {
     false
 }
 
-/// Phase 5: Classify intent and execute tools (optional)
-///
-/// Classifies user intent and executes tools if needed. Runs after dual streams
-/// are created so tool events can be sent to both client and storage.
-///
-/// Flow:
-/// 1. Classify intent: chat vs web_search
-/// 2. If web_search: extract query and execute tool
-/// 3. Send ToolCall event to streams
-/// 4. Send ToolOutput event to streams (always, even on error)
-/// 5. Send persistence command via dedicated channel and wait for acknowledgment
-///
-/// Tool execution is best-effort: intent classification uses gpt-oss-120b and
-/// query extraction uses llama3-3-70b.
-struct ToolChannels<'a> {
-    client: &'a mpsc::Sender<StorageMessage>,
-    storage: &'a mpsc::Sender<StorageMessage>,
-}
-
-async fn classify_and_execute_tools(
+/// Phase 5: Let the model request tool use (optional)
+/// Persist and emit a single requested tool call, then wait for storage to
+/// confirm the tool output is durable before the next model turn is started.
+async fn execute_tool_call_and_wait(
     state: &Arc<AppState>,
-    user: &User,
-    prepared: &PreparedRequest,
     persisted: &PersistedData,
-    prompt_messages: &[Value],
-    channels: ToolChannels<'_>,
-    rx_tool_ack: tokio::sync::oneshot::Receiver<Result<(), String>>,
-) -> Result<Option<()>, ApiError> {
-    let ToolChannels {
-        client: tx_client,
-        storage: tx_storage,
-    } = channels;
-    // Extract text from user message for classification
-    let user_text =
-        MessageContentConverter::extract_text_for_token_counting(&prepared.message_content);
+    tool_call: ModelToolCall,
+    tx_client: &mpsc::Sender<StorageMessage>,
+    tx_storage: &mpsc::Sender<StorageMessage>,
+    rx_tool_ack: &mut mpsc::Receiver<Result<(), String>>,
+) -> Result<(), ApiError> {
+    let tool_call_id = Uuid::new_v4();
+    let tool_output_id = Uuid::new_v4();
 
-    trace!(
-        "Classifying user intent for message: {}",
-        user_text.chars().take(100).collect::<String>()
-    );
-    debug!(
-        "Starting intent classification with {} conversation messages",
-        prompt_messages.len()
-    );
+    let tool_call_msg = StorageMessage::ToolCall {
+        tool_call_id,
+        name: tool_call.name.clone(),
+        arguments: tool_call.arguments.clone(),
+    };
 
-    // Step 1: Classify intent using LLM with conversation history
-    let classification_request =
-        prompts::build_intent_classification_request(prompt_messages, &user_text);
+    if let Err(e) = tx_storage.send(tool_call_msg.clone()).await {
+        error!(
+            "Critical: Storage channel closed during tool_call for response {} - {:?}",
+            persisted.response.uuid, e
+        );
+        let _ = tx_client
+            .send(StorageMessage::Error(
+                "Internal storage failure - request aborted".to_string(),
+            ))
+            .await;
+        return Err(ApiError::InternalServerError);
+    }
+    if tx_client.try_send(tool_call_msg).is_err() {
+        warn!("Client channel full or closed, skipping tool_call event to client");
+    }
 
-    trace!(
-        "Intent classification request: {}",
-        serde_json::to_string_pretty(&classification_request)
-            .unwrap_or_else(|_| "failed to serialize".to_string())
-    );
-
-    let headers = HeaderMap::new();
-    let billing_context = crate::web::openai::BillingContext::new(
-        crate::web::openai_auth::AuthMethod::Jwt,
-        prompts::INTENT_CLASSIFIER_MODEL.to_string(),
-    );
-
-    let intent = match get_chat_completion_response(
-        state,
-        user,
-        classification_request,
-        &headers,
-        billing_context,
+    let tool_output = match tools::execute_tool(
+        &tool_call.name,
+        &tool_call.arguments,
+        state.brave_client.as_ref(),
     )
     .await
     {
-        Ok(mut completion) => {
-            match completion.stream.recv().await {
-                Some(crate::web::openai::CompletionChunk::FullResponse(response_json)) => {
-                    trace!(
-                        "Intent classification response: {}",
-                        serde_json::to_string_pretty(&response_json)
-                            .unwrap_or_else(|_| "failed to serialize".to_string())
-                    );
-
-                    // Extract intent from response
-                    if let Some(intent_str) = response_json
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("message"))
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        let intent = intent_str.trim().to_lowercase();
-                        debug!("Classified intent: {}", intent);
-                        intent
-                    } else {
-                        warn!(
-                            "Failed to extract intent from classifier response, defaulting to chat"
-                        );
-                        trace!("Response structure: {:?}", response_json);
-                        "chat".to_string()
-                    }
-                }
-                _ => {
-                    warn!("Unexpected classifier response format, defaulting to chat");
-                    "chat".to_string()
-                }
-            }
-        }
+        Ok(output) => output,
         Err(e) => {
-            // Best effort - if classification fails, default to chat
-            warn!("Classification failed (defaulting to chat): {:?}", e);
-            "chat".to_string()
+            warn!("Tool execution failed, including error in output: {:?}", e);
+            format!("Error: {}", e)
         }
     };
 
-    // Step 2: If intent is web_search, execute tool
-    if intent == "web_search" {
-        debug!("User message classified as web_search, executing tool");
+    let tool_output_msg = StorageMessage::ToolOutput {
+        tool_output_id,
+        tool_call_id,
+        output: tool_output,
+    };
 
-        // Extract search query with conversation history for context
-        let query_request = prompts::build_query_extraction_request(prompt_messages, &user_text);
-        let billing_context = crate::web::openai::BillingContext::new(
-            crate::web::openai_auth::AuthMethod::Jwt,
-            prompts::QUERY_EXTRACTOR_MODEL.to_string(),
+    if let Err(e) = tx_storage.send(tool_output_msg.clone()).await {
+        error!(
+            "Critical: Storage channel closed during tool_output for response {} - {:?}",
+            persisted.response.uuid, e
         );
-
-        let search_query = match get_chat_completion_response(
-            state,
-            user,
-            query_request,
-            &headers,
-            billing_context,
-        )
-        .await
-        {
-            Ok(mut completion) => match completion.stream.recv().await {
-                Some(crate::web::openai::CompletionChunk::FullResponse(response_json)) => {
-                    if let Some(query) = response_json
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("message"))
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        let query = query.trim().to_string();
-                        trace!("Extracted search query: {}", query);
-                        debug!("Search query extracted successfully");
-                        query
-                    } else {
-                        warn!("Failed to extract query, using original message");
-                        user_text.clone()
-                    }
-                }
-                _ => {
-                    warn!("Unexpected query extraction response, using original message");
-                    user_text.clone()
-                }
-            },
-            Err(e) => {
-                warn!("Query extraction failed, using original message: {:?}", e);
-                user_text.clone()
-            }
-        };
-
-        // Generate UUIDs for tool_call and tool_output
-        let tool_call_id = Uuid::new_v4();
-        let tool_output_id = Uuid::new_v4();
-
-        // Prepare tool arguments
-        let tool_arguments = json!({"query": search_query});
-
-        // Send tool_call event through both streams FIRST (before execution)
-        let tool_call_msg = StorageMessage::ToolCall {
-            tool_call_id,
-            name: "web_search".to_string(),
-            arguments: tool_arguments.clone(),
-        };
-
-        // Send to storage (critical - must succeed)
-        //
-        // IMPORTANT: Storage channel failure means the storage task has died or the
-        // channel buffer (1024) is full. This is a catastrophic systemic failure, not
-        // a normal error. If this happens:
-        // 1. Nothing will be persisted to database
-        // 2. Continuing would waste LLM API calls for unsaved data
-        // 3. Client would see tool_call.created but never get completion
-        //
-        // We abort the entire request and notify the client with response.error event.
-        // If you see this error in production, investigate immediately - it indicates
-        // serious issues with the storage task or database connection.
-        if let Err(e) = tx_storage.send(tool_call_msg.clone()).await {
-            error!(
-                "Critical: Storage channel closed during tool_call for response {} - {:?}",
-                persisted.response.uuid, e
-            );
-            // Notify client and abort - storage failure is catastrophic
-            let _ = tx_client
-                .send(StorageMessage::Error(
-                    "Internal storage failure - request aborted".to_string(),
-                ))
-                .await;
-            return Err(ApiError::InternalServerError);
-        }
-        // Send to client (best-effort)
-        if tx_client.try_send(tool_call_msg).is_err() {
-            warn!("Client channel full or closed, skipping tool_call event to client");
-        }
-
-        debug!("Sent tool_call {} to streams", tool_call_id);
-
-        // Execute web search tool (or capture error as content)
-        let tool_output =
-            match tools::execute_tool("web_search", &tool_arguments, state.brave_client.as_ref())
-                .await
-            {
-                Ok(output) => {
-                    debug!(
-                        "Tool execution successful, output length: {} chars",
-                        output.len()
-                    );
-                    output
-                }
-                Err(e) => {
-                    warn!("Tool execution failed, including error in output: {:?}", e);
-                    // Failure becomes content, not a skip!
-                    format!("Error: {}", e)
-                }
-            };
-
-        // Send tool_output event through both streams (ALWAYS sent, even on failure)
-        let tool_output_msg = StorageMessage::ToolOutput {
-            tool_output_id,
-            tool_call_id,
-            output: tool_output.clone(),
-        };
-
-        // Send to storage (critical - must succeed)
-        //
-        // IMPORTANT: Storage channel failure is catastrophic (see tool_call comment above).
-        // At this point, client has already seen tool_call.created event. If storage fails
-        // here, we have an inconsistency:
-        // - Database has tool_call record but no tool_output
-        // - Client saw tool_call.created but won't see tool_output.created
-        //
-        // We abort and send response.error so the client knows the request failed rather
-        // than hanging indefinitely waiting for completion. The database inconsistency
-        // (orphaned tool_call) is acceptable given this is a catastrophic failure scenario.
-        if let Err(e) = tx_storage.send(tool_output_msg.clone()).await {
-            error!(
-                "Critical: Storage channel closed during tool_output for response {} - {:?}",
-                persisted.response.uuid, e
-            );
-            // Notify client and abort - storage failure is catastrophic
-            let _ = tx_client
-                .send(StorageMessage::Error(
-                    "Internal storage failure - request aborted".to_string(),
-                ))
-                .await;
-            return Err(ApiError::InternalServerError);
-        }
-        // Send to client (best-effort)
-        if tx_client.try_send(tool_output_msg).is_err() {
-            warn!("Client channel full or closed, skipping tool_output event to client");
-        }
-
-        info!(
-            "Successfully sent tool_call {} and tool_output {} to streams for conversation {}",
-            tool_call_id, tool_output_id, persisted.response.conversation_id
-        );
-
-        // Wait for storage task to confirm persistence (with timeout)
-        match tokio::time::timeout(std::time::Duration::from_secs(5), rx_tool_ack).await {
-            Ok(Ok(Ok(()))) => {
-                debug!("Tools persisted successfully to database");
-                return Ok(Some(()));
-            }
-            Ok(Ok(Err(e))) => {
-                error!("Failed to persist tools to database: {}", e);
-                // Continue anyway - best effort
-                return Ok(Some(()));
-            }
-            Ok(Err(_)) => {
-                error!("Storage task dropped before sending acknowledgment");
-                return Ok(Some(()));
-            }
-            Err(_) => {
-                error!("Timeout waiting for tool persistence (5s)");
-                return Ok(Some(()));
-            }
-        }
-    } else {
-        debug!("User message classified as chat, skipping tool execution");
+        let _ = tx_client
+            .send(StorageMessage::Error(
+                "Internal storage failure - request aborted".to_string(),
+            ))
+            .await;
+        return Err(ApiError::InternalServerError);
+    }
+    if tx_client.try_send(tool_output_msg).is_err() {
+        warn!("Client channel full or closed, skipping tool_output event to client");
     }
 
-    Ok(None)
+    info!(
+        "Successfully sent tool_call {} and tool_output {} to streams for conversation {}",
+        tool_call_id, tool_output_id, persisted.response.conversation_id
+    );
+
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx_tool_ack.recv()).await {
+        Ok(Some(Ok(()))) => {
+            debug!("Tools persisted successfully to database");
+            Ok(())
+        }
+        Ok(Some(Err(e))) => {
+            error!("Failed to persist tools to database: {}", e);
+            Err(ApiError::InternalServerError)
+        }
+        Ok(None) => {
+            error!("Storage task dropped before sending tool acknowledgment");
+            Err(ApiError::InternalServerError)
+        }
+        Err(_) => {
+            error!("Timeout waiting for tool persistence (5s)");
+            Err(ApiError::InternalServerError)
+        }
+    }
 }
 
-/// Phase 6: Setup completion processor
+async fn send_storage_message(
+    tx_storage: &mpsc::Sender<StorageMessage>,
+    tx_client: &mpsc::Sender<StorageMessage>,
+    msg: StorageMessage,
+) -> Result<(), ApiError> {
+    if tx_storage.send(msg.clone()).await.is_err() {
+        error!("Storage channel closed unexpectedly");
+        return Err(ApiError::InternalServerError);
+    }
+    if tx_client.try_send(msg).is_err() {
+        warn!("Client channel full or closed");
+    }
+    Ok(())
+}
+
+fn next_assistant_message_id(next_message_id: &mut Option<Uuid>) -> Uuid {
+    next_message_id.take().unwrap_or_else(Uuid::new_v4)
+}
+
+/// Lifecycle of the reasoning item within a single assistant turn.
 ///
-/// Gets completion stream from chat API and spawns processor task.
+/// Models that emit `reasoning`/`reasoning_content` deltas must always close the
+/// reasoning block before any final assistant content or tool-call deltas are
+/// accepted, so we track the state explicitly rather than juggling several bools.
+#[derive(Debug)]
+enum ReasoningState {
+    NotStarted,
+    Active(Uuid),
+    Done,
+}
+
+impl ReasoningState {
+    fn active_id(&self) -> Option<Uuid> {
+        if let ReasoningState::Active(id) = self {
+            Some(*id)
+        } else {
+            None
+        }
+    }
+}
+
+async fn close_reasoning_if_active(
+    state: &mut ReasoningState,
+    tx_storage: &mpsc::Sender<StorageMessage>,
+    tx_client: &mpsc::Sender<StorageMessage>,
+) -> Result<(), ApiError> {
+    if let Some(reasoning_id) = state.active_id() {
+        send_storage_message(
+            tx_storage,
+            tx_client,
+            StorageMessage::ReasoningDone {
+                item_id: reasoning_id,
+            },
+        )
+        .await?;
+        *state = ReasoningState::Done;
+    }
+    Ok(())
+}
+
+async fn ensure_message_started(
+    current_message_id: &mut Option<Uuid>,
+    next_message_id: &mut Option<Uuid>,
+    tx_storage: &mpsc::Sender<StorageMessage>,
+    tx_client: &mpsc::Sender<StorageMessage>,
+) -> Result<Uuid, ApiError> {
+    if let Some(id) = *current_message_id {
+        return Ok(id);
+    }
+    let id = next_assistant_message_id(next_message_id);
+    send_storage_message(
+        tx_storage,
+        tx_client,
+        StorageMessage::MessageStarted { item_id: id },
+    )
+    .await?;
+    *current_message_id = Some(id);
+    Ok(id)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_one_assistant_turn(
+    state: &Arc<AppState>,
+    user: &User,
+    body: &ResponsesCreateRequest,
+    headers: &HeaderMap,
+    prompt_messages: &[Value],
+    tools_enabled: bool,
+    tx_client: &mpsc::Sender<StorageMessage>,
+    tx_storage: &mpsc::Sender<StorageMessage>,
+    next_message_id: &mut Option<Uuid>,
+) -> Result<AssistantTurnOutcome, ApiError> {
+    let mut chat_request = build_model_turn_request(body, prompt_messages, tools_enabled);
+
+    trace!(
+        "Chat completion request to model {}: {}",
+        body.model,
+        serde_json::to_string_pretty(&chat_request)
+            .unwrap_or_else(|_| "failed to serialize".to_string())
+    );
+
+    let billing_context = crate::web::openai::BillingContext::new(
+        crate::web::openai_auth::AuthMethod::Jwt,
+        body.model.clone(),
+    );
+
+    let mut completion =
+        get_chat_completion_response(state, user, chat_request.take(), headers, billing_context)
+            .await?;
+
+    debug!(
+        "Received completion from provider: {} (model: {})",
+        completion.metadata.provider_name, completion.metadata.model_name
+    );
+
+    let mut streamed_tool_calls = Vec::new();
+    let mut finish_reason: Option<String> = None;
+    let mut current_message_id: Option<Uuid> = None;
+    let mut reasoning = ReasoningState::NotStarted;
+    let mut saw_tool_calls = false;
+
+    while let Some(chunk) = completion.stream.recv().await {
+        match chunk {
+            crate::web::openai::CompletionChunk::StreamChunk(json) => {
+                let choice = json.get("choices").and_then(|choices| choices.get(0));
+                if let Some(reason) = choice
+                    .and_then(|choice| choice.get("finish_reason"))
+                    .and_then(|reason| reason.as_str())
+                {
+                    if !reason.is_empty() {
+                        finish_reason = Some(reason.to_string());
+                    }
+                }
+
+                let delta = choice.and_then(|choice| choice.get("delta"));
+                if let Some(d) = delta {
+                    trace!("Stream delta: {}", d);
+                }
+
+                // Reasoning delta (supports both `reasoning` and legacy `reasoning_content`).
+                if let Some(reasoning_delta) = delta.and_then(|d| {
+                    d.get("reasoning")
+                        .and_then(|c| c.as_str())
+                        .or_else(|| d.get("reasoning_content").and_then(|c| c.as_str()))
+                }) {
+                    if !reasoning_delta.is_empty() {
+                        match &reasoning {
+                            ReasoningState::Done => {
+                                warn!(
+                                    "Ignoring reasoning delta after reasoning item was already closed"
+                                );
+                            }
+                            ReasoningState::NotStarted => {
+                                let reasoning_id = Uuid::new_v4();
+                                send_storage_message(
+                                    tx_storage,
+                                    tx_client,
+                                    StorageMessage::ReasoningStarted {
+                                        item_id: reasoning_id,
+                                    },
+                                )
+                                .await?;
+                                send_storage_message(
+                                    tx_storage,
+                                    tx_client,
+                                    StorageMessage::ReasoningDelta {
+                                        item_id: reasoning_id,
+                                        delta: reasoning_delta.to_string(),
+                                    },
+                                )
+                                .await?;
+                                reasoning = ReasoningState::Active(reasoning_id);
+                            }
+                            ReasoningState::Active(reasoning_id) => {
+                                send_storage_message(
+                                    tx_storage,
+                                    tx_client,
+                                    StorageMessage::ReasoningDelta {
+                                        item_id: *reasoning_id,
+                                        delta: reasoning_delta.to_string(),
+                                    },
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                }
+
+                // Tool call deltas: close any in-flight message and reasoning, then accumulate.
+                if let Some(tool_call_delta) = delta.and_then(|d| d.get("tool_calls")) {
+                    if let Some(message_id) = current_message_id.take() {
+                        send_storage_message(
+                            tx_storage,
+                            tx_client,
+                            StorageMessage::MessageDone {
+                                item_id: message_id,
+                                finish_reason: "tool_calls".to_string(),
+                            },
+                        )
+                        .await?;
+                    }
+                    close_reasoning_if_active(&mut reasoning, tx_storage, tx_client).await?;
+
+                    saw_tool_calls = true;
+                    append_streamed_tool_calls(&mut streamed_tool_calls, tool_call_delta);
+                }
+
+                // Assistant text content. Some providers occasionally emit a trailing sliver of
+                // content after tool-call deltas; we log and skip instead of aborting the turn.
+                if let Some(content) = delta
+                    .and_then(|d| d.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    if !content.is_empty() {
+                        if saw_tool_calls {
+                            warn!(
+                                "Ignoring assistant text ({} chars) after tool call deltas had already started",
+                                content.len()
+                            );
+                        } else {
+                            close_reasoning_if_active(&mut reasoning, tx_storage, tx_client)
+                                .await?;
+
+                            let message_id = ensure_message_started(
+                                &mut current_message_id,
+                                next_message_id,
+                                tx_storage,
+                                tx_client,
+                            )
+                            .await?;
+
+                            send_storage_message(
+                                tx_storage,
+                                tx_client,
+                                StorageMessage::ContentDelta {
+                                    item_id: message_id,
+                                    delta: content.to_string(),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+            crate::web::openai::CompletionChunk::Usage(usage) => {
+                send_storage_message(
+                    tx_storage,
+                    tx_client,
+                    StorageMessage::Usage {
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                    },
+                )
+                .await?;
+            }
+            crate::web::openai::CompletionChunk::Done => {
+                close_reasoning_if_active(&mut reasoning, tx_storage, tx_client).await?;
+
+                if saw_tool_calls || finish_reason.as_deref() == Some("tool_calls") {
+                    let tool_call = finalize_first_model_tool_call(&streamed_tool_calls)
+                        .ok_or(ApiError::InternalServerError)?;
+                    return Ok(AssistantTurnOutcome::ToolCall(tool_call));
+                }
+
+                // Ensure a final message item exists even if the model emitted no content.
+                // This is rare but happens when vLLM parses a tool response into the thinking
+                // block or similar edge cases; we surface it explicitly rather than silently
+                // producing an empty row.
+                if current_message_id.is_none() {
+                    warn!(
+                        "Model produced no assistant content before Done; emitting empty message placeholder"
+                    );
+                }
+                let message_id = ensure_message_started(
+                    &mut current_message_id,
+                    next_message_id,
+                    tx_storage,
+                    tx_client,
+                )
+                .await?;
+
+                let final_finish_reason = finish_reason.unwrap_or_else(|| "stop".to_string());
+                send_storage_message(
+                    tx_storage,
+                    tx_client,
+                    StorageMessage::MessageDone {
+                        item_id: message_id,
+                        finish_reason: final_finish_reason.clone(),
+                    },
+                )
+                .await?;
+
+                send_storage_message(
+                    tx_storage,
+                    tx_client,
+                    StorageMessage::ResponseDone {
+                        finish_reason: final_finish_reason,
+                    },
+                )
+                .await?;
+                return Ok(AssistantTurnOutcome::Final);
+            }
+            crate::web::openai::CompletionChunk::Error(error_msg) => {
+                error!("Received error from completion stream: {}", error_msg);
+                return Err(ApiError::InternalServerError);
+            }
+            crate::web::openai::CompletionChunk::FullResponse(_) => {
+                error!("Received FullResponse in streaming mode");
+                return Err(ApiError::InternalServerError);
+            }
+        }
+    }
+
+    error!("Completion stream closed unexpectedly without a terminal signal");
+    Err(ApiError::InternalServerError)
+}
+
+/// Phase 6: Run the normal assistant/tool loop.
 ///
-/// Operations:
-/// - Creates placeholder assistant message (AFTER tools, so timestamp is ordered correctly)
-/// - Rebuilds prompt from DB if tools were executed (automatically includes tools)
-/// - Calls chat API with streaming enabled
-/// - Spawns processor task that converts CompletionChunks to StorageMessages
-/// - Processor feeds into dual streams (storage=critical, client=best-effort)
-/// - Listens for cancellation signals
+/// The selected model receives the full prompt with tool schemas, may call one
+/// tool at a time, sees the tool output on the next turn, and eventually emits
+/// final assistant text that is streamed to the client.
 #[allow(clippy::too_many_arguments)]
 async fn setup_completion_processor(
     state: &Arc<AppState>,
@@ -1628,268 +2209,74 @@ async fn setup_completion_processor(
     headers: &HeaderMap,
     tx_client: mpsc::Sender<StorageMessage>,
     tx_storage: mpsc::Sender<StorageMessage>,
-    tools_executed: bool,
+    mut rx_tool_ack: mpsc::Receiver<Result<(), String>>,
 ) -> Result<crate::models::responses::Response, ApiError> {
-    // Create placeholder assistant message with status='in_progress' and NULL content
-    //
-    // TIMING: This happens here in Phase 6 (not earlier in Phase 3) for two reasons:
-    // 1. Must happen AFTER tool execution (Phase 5) to get correct timestamp ordering
-    // 2. Must happen BEFORE calling completion API (below) so storage task can UPDATE it
-    //
-    // Previously, this was created in Phase 3 under the assumption it needed to exist early.
-    // However, it only needs to exist before the storage task tries to UPDATE it (when
-    // streaming completes). By creating it here, we ensure proper message ordering:
-    // user → tool_call → tool_output → assistant (this creation) → assistant content (update)
-    let placeholder_assistant = NewAssistantMessage {
-        uuid: prepared.assistant_message_id,
-        conversation_id: context.conversation.id,
-        response_id: Some(persisted.response.id),
-        user_id: user.uuid,
-        content_enc: None,
-        completion_tokens: 0,
-        status: STATUS_IN_PROGRESS.to_string(),
-        finish_reason: None,
-    };
-    state
-        .db
-        .create_assistant_message(placeholder_assistant)
-        .map_err(|e| {
-            error!("Error creating placeholder assistant message: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+    const MAX_TOOL_TURNS: usize = 15;
 
-    debug!(
-        "Created placeholder assistant message {} after tool execution",
-        prepared.assistant_message_id
-    );
+    let tools_enabled = should_enable_web_search_tool(state.as_ref(), body);
+    let internal_system_prompt = build_internal_system_prompt(tools_enabled);
+    let mut prompt_messages = Arc::as_ref(&context.prompt_messages).clone();
 
-    // If tools were executed, rebuild prompt from DB (will now include persisted tools)
-    // Otherwise use the context we built earlier
-    let prompt_messages = if tools_executed {
-        debug!("Tools were executed - rebuilding prompt from DB to include tool messages");
-        let (rebuilt_messages, _tokens) = build_prompt(
-            state.db.as_ref(),
-            context.conversation.id,
-            user.uuid,
-            &prepared.user_key,
-            &body.model,
-            body.instructions.as_deref(),
-        )?;
-        rebuilt_messages
-    } else {
-        // Clone out of Arc only when actually needed for the completion request
-        Arc::as_ref(&context.prompt_messages).clone()
-    };
-
-    // Build chat completion request
-    let mut chat_request = json!({
-        "model": body.model,
-        "messages": prompt_messages,
-        "temperature": body.temperature.unwrap_or(DEFAULT_TEMPERATURE),
-        "top_p": body.top_p.unwrap_or(DEFAULT_TOP_P),
-        "max_tokens": body.max_output_tokens,
-        "stream": true,
-        "stream_options": { "include_usage": true }
-    });
-    apply_responses_model_defaults(&mut chat_request, &body.model);
-
-    // Log the exact request we're sending to the completions API
-    trace!(
-        "Chat completion request to model {}: {}",
-        body.model,
-        serde_json::to_string_pretty(&chat_request)
-            .unwrap_or_else(|_| "failed to serialize".to_string())
-    );
-
-    // Create billing context - Responses API always uses JWT auth (not API key)
-    let billing_context = crate::web::openai::BillingContext::new(
-        crate::web::openai_auth::AuthMethod::Jwt,
-        body.model.clone(),
-    );
-
-    // Call the chat API - billing happens automatically inside!
-    let completion =
-        get_chat_completion_response(state, user, chat_request, headers, billing_context).await?;
-
-    debug!(
-        "Received completion from provider: {} (model: {})",
-        completion.metadata.provider_name, completion.metadata.model_name
-    );
-
-    // Signal that assistant message is about to start streaming
-    // CRITICAL: Must send BEFORE spawning processor to guarantee ordering
-    // (processor will immediately start sending ContentDelta messages)
-    if let Err(e) = tx_client
-        .send(StorageMessage::AssistantMessageStarting)
-        .await
-    {
-        error!("Failed to send AssistantMessageStarting signal: {:?}", e);
-        // Client channel closed - not critical, continue anyway
-    }
-
-    // Spawn stream processor task that converts CompletionChunks to StorageMessages
-    // and feeds them into the master stream channels (created in Phase 3.5)
-    let _processor_handle = {
-        let mut rx_completion = completion.stream;
-        let message_id = prepared.assistant_message_id;
-        let response_uuid = persisted.response.uuid;
-        let mut cancel_rx = state.cancellation_broadcast.subscribe();
-
-        tokio::spawn(async move {
-            trace!("Starting completion stream processor task");
-            let mut client_alive = true;
-            // Single source of truth for reasoning item UUID - generated on first reasoning delta
-            let mut reasoning_item_id: Option<Uuid> = None;
-
-            loop {
-                tokio::select! {
-                    // Check for cancellation
-                    Ok(cancelled_id) = cancel_rx.recv() => {
-                        if cancelled_id == response_uuid {
-                            debug!("Received cancellation signal for response {}", response_uuid);
-                            let _ = tx_storage.send(StorageMessage::Cancelled).await;
-                            if client_alive && tx_client.try_send(StorageMessage::Cancelled).is_err() {
-                                warn!("Client channel full or closed during cancellation, terminating client stream");
-                                #[allow(unused_assignments)]
-                                { client_alive = false; }
-                            }
-                            break;
-                        }
+    let loop_result: Result<(), ApiError> = async {
+        let mut next_message_id = Some(prepared.assistant_message_id);
+        let mut tool_turn_count = 0usize;
+        loop {
+            match stream_one_assistant_turn(
+                state,
+                user,
+                body,
+                headers,
+                &prompt_messages,
+                tools_enabled,
+                &tx_client,
+                &tx_storage,
+                &mut next_message_id,
+            )
+            .await?
+            {
+                AssistantTurnOutcome::ToolCall(tool_call) => {
+                    tool_turn_count += 1;
+                    if tool_turn_count > MAX_TOOL_TURNS {
+                        error!(
+                            "Exceeded max tool turns ({}) for response {}",
+                            MAX_TOOL_TURNS, persisted.response.uuid
+                        );
+                        return Err(ApiError::InternalServerError);
                     }
 
-                    // Process CompletionChunks from centralized billing API
-                    chunk_opt = rx_completion.recv() => {
-                        let Some(chunk) = chunk_opt else {
-                            error!("Completion stream closed unexpectedly without Done signal");
-                            // Explicitly notify storage and client of the failure
-                            let msg = StorageMessage::Error("Stream closed unexpectedly".to_string());
-                            let _ = tx_storage.send(msg.clone()).await;
-                            if client_alive && tx_client.try_send(msg).is_err() {
-                                warn!("Client channel full or closed during stream error, terminating client stream");
-                                #[allow(unused_assignments)]
-                                { client_alive = false; }
-                            }
-                            break;
-                        };
+                    execute_tool_call_and_wait(
+                        state,
+                        persisted,
+                        tool_call,
+                        &tx_client,
+                        &tx_storage,
+                        &mut rx_tool_ack,
+                    )
+                    .await?;
 
-                        match chunk {
-                            crate::web::openai::CompletionChunk::StreamChunk(json) => {
-                                // Extract delta for inspection
-                                let delta = json
-                                    .get("choices")
-                                    .and_then(|c| c.get(0))
-                                    .and_then(|c| c.get("delta"));
-
-                                // Log full delta to see reasoning fields if present
-                                if let Some(d) = delta {
-                                    trace!("Stream delta: {}", d);
-                                }
-
-                                // Extract reasoning for thinking models while remaining
-                                // compatible with older reasoning_content payloads.
-                                if let Some(reasoning) = delta
-                                    .and_then(|d| {
-                                        d.get("reasoning")
-                                            .and_then(|c| c.as_str())
-                                            .or_else(|| {
-                                                d.get("reasoning_content")
-                                                    .and_then(|c| c.as_str())
-                                            })
-                                    })
-                                {
-                                    if !reasoning.is_empty() {
-                                        // Generate UUID on first reasoning delta - this ensures SSE and DB use the same ID
-                                        let item_id = *reasoning_item_id.get_or_insert_with(Uuid::new_v4);
-
-                                        let msg = StorageMessage::ReasoningDelta {
-                                            item_id,
-                                            delta: reasoning.to_string(),
-                                        };
-                                        // Send to storage for persistence
-                                        if tx_storage.send(msg.clone()).await.is_err() {
-                                            error!("Storage channel closed unexpectedly during reasoning");
-                                            break;
-                                        }
-                                        // Send to client for streaming
-                                        if client_alive && tx_client.try_send(msg).is_err() {
-                                            warn!("Client channel full or closed during reasoning delta, terminating client stream");
-                                            client_alive = false;
-                                        }
-                                    }
-                                }
-
-                                // Extract content from the full JSON chunk (safe chaining to avoid panics)
-                                if let Some(content) = delta
-                                    .and_then(|d| d.get("content"))
-                                    .and_then(|c| c.as_str())
-                                {
-                                    // Skip empty content deltas to avoid sending unnecessary events to client
-                                    if !content.is_empty() {
-                                        let msg = StorageMessage::ContentDelta(content.to_string());
-                                        // Must send to storage (critical, can block)
-                                        if tx_storage.send(msg.clone()).await.is_err() {
-                                            error!("Storage channel closed unexpectedly");
-                                            break;
-                                        }
-                                        // Best-effort send to client (non-blocking, never blocks storage)
-                                        if client_alive && tx_client.try_send(msg).is_err() {
-                                            warn!("Client channel full or closed, terminating client stream");
-                                            client_alive = false;
-                                        }
-                                    }
-                                }
-                            }
-                            crate::web::openai::CompletionChunk::Usage(usage) => {
-                                // Billing already happened in openai.rs!
-                                // Just forward to storage for token counting
-                                let msg = StorageMessage::Usage {
-                                    prompt_tokens: usage.prompt_tokens,
-                                    completion_tokens: usage.completion_tokens,
-                                };
-                                let _ = tx_storage.send(msg.clone()).await;
-                                if client_alive && tx_client.try_send(msg).is_err() {
-                                    warn!("Client channel full or closed during usage message, terminating client stream");
-                                    client_alive = false;
-                                }
-                            }
-                            crate::web::openai::CompletionChunk::Done => {
-                                debug!("Received Done chunk from completion stream");
-                                let msg = StorageMessage::Done {
-                                    finish_reason: "stop".to_string(),
-                                    message_id,
-                                };
-                                let _ = tx_storage.send(msg.clone()).await;
-                                if client_alive && tx_client.try_send(msg).is_err() {
-                                    warn!("Client channel full or closed during done message, terminating client stream");
-                                    #[allow(unused_assignments)]
-                                    { client_alive = false; }
-                                }
-                                break;
-                            }
-                            crate::web::openai::CompletionChunk::Error(error_msg) => {
-                                error!("Received error from completion stream: {}", error_msg);
-                                let msg = StorageMessage::Error(error_msg);
-                                let _ = tx_storage.send(msg.clone()).await;
-                                if client_alive && tx_client.try_send(msg).is_err() {
-                                    warn!("Client channel full or closed during error message, terminating client stream");
-                                    #[allow(unused_assignments)]
-                                    { client_alive = false; }
-                                }
-                                break;
-                            }
-                            crate::web::openai::CompletionChunk::FullResponse(_) => {
-                                // Shouldn't happen for streaming
-                                error!("Received FullResponse in streaming mode");
-                                break;
-                            }
-                        }
-                    }
+                    let (rebuilt_messages, _tokens) = build_prompt(
+                        state.db.as_ref(),
+                        context.conversation.id,
+                        user.uuid,
+                        &prepared.user_key,
+                        &body.model,
+                        body.instructions.as_deref(),
+                        Some(&internal_system_prompt),
+                    )?;
+                    prompt_messages = rebuilt_messages;
                 }
+                AssistantTurnOutcome::Final => return Ok(()),
             }
+        }
+    }
+    .await;
 
-            debug!("Completion stream processor task completed");
-        })
-    };
+    if let Err(e) = loop_result {
+        let msg = StorageMessage::Error(format!("Streaming failed: {:?}", e));
+        let _ = tx_storage.send(msg.clone()).await;
+        let _ = tx_client.try_send(msg);
+        return Err(e);
+    }
 
     Ok(persisted.response.clone())
 }
@@ -1952,10 +2339,9 @@ async fn create_response_stream(
     let total_prompt_tokens = context.total_prompt_tokens;
     let response_id = persisted.response.id;
     let response_uuid = persisted.response.uuid;
-    // Use user_message timestamp + 1 microsecond for reasoning items to ensure proper ordering:
-    // user_message < reasoning < assistant_message
-    // Using 1 microsecond because it's the smallest safe offset - DB roundtrips always take more than this
-    let reasoning_base_timestamp =
+    // Persist all generated response items on a single monotonic timestamp sequence that
+    // begins immediately after the user message so retrieval order matches stream order.
+    let first_response_item_created_at =
         persisted.user_message_created_at + chrono::Duration::microseconds(1);
     let conversation_id = context.conversation.id;
     let user_id = user.uuid;
@@ -2002,8 +2388,8 @@ async fn create_response_stream(
         let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
         let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
 
-        // Create oneshot channel for tool persistence acknowledgment
-        let (tx_tool_ack, rx_tool_ack) = tokio::sync::oneshot::channel();
+        // Create channel for tool persistence acknowledgments (supports multiple tool loops)
+        let (tx_tool_ack, rx_tool_ack) = mpsc::channel::<Result<(), String>>(8);
 
         let _storage_handle = {
             let db = state.db.clone();
@@ -2014,11 +2400,10 @@ async fn create_response_stream(
                     Some(tx_tool_ack),
                     db,
                     response_id,
-                    reasoning_base_timestamp,
+                    first_response_item_created_at,
                     conversation_id,
                     user_id,
                     user_key,
-                    assistant_message_id,
                 )
                 .await;
             })
@@ -2047,62 +2432,8 @@ async fn create_response_stream(
             // Run phases 5-6 with cancellation support
             tokio::select! {
                 _ = async {
-                    // Phase 5: Classify intent and execute tools (if tool_choice allows it AND web_search is enabled AND Brave client available)
-                    let tools_executed = if is_tool_choice_allowed(&orchestrator_body.tool_choice)
-                        && is_web_search_enabled(&orchestrator_body.tools)
-                        && orchestrator_state.brave_client.is_some() {
-                        debug!("Orchestrator: tool_choice allows tools, web search enabled, and Brave client available, proceeding with classification");
-
-                        let prepared_for_tools = PreparedRequest {
-                            user_key,
-                            message_content: message_content.clone(),
-                            user_message_tokens: 0,
-                            content_enc: content_enc.clone(),
-                            assistant_message_id,
-                        };
-
-                        let persisted_for_tools = PersistedData {
-                            response: orchestrator_response.clone(),
-                            decrypted_metadata: orchestrator_metadata.clone(),
-                            user_message_created_at: orchestrator_user_message_created_at,
-                        };
-
-                        match classify_and_execute_tools(
-                            &orchestrator_state,
-                            &orchestrator_user,
-                            &prepared_for_tools,
-                            &persisted_for_tools,
-                            &orchestrator_prompt_messages,
-                            ToolChannels {
-                                client: &orchestrator_tx_client,
-                                storage: &orchestrator_tx_storage,
-                            },
-                            rx_tool_ack,
-                        )
-                        .await
-                        {
-                            Ok(result) => result.is_some(),
-                            Err(e) => {
-                                error!("Orchestrator: Critical error during tool execution, treating as cancellation: {:?}", e);
-
-                                // Treat critical errors (storage failure) same as cancellation
-                                // Send cancellation to both channels - storage task will handle cleanup
-                                let _ = orchestrator_tx_storage.send(StorageMessage::Cancelled).await;
-                                let _ = orchestrator_tx_client.send(StorageMessage::Cancelled).await;
-
-                                // Abort orchestrator - don't waste resources on LLM call
-                                // Storage task will update response status and assistant message
-                                return;
-                            }
-                        }
-                    } else {
-                        debug!("Orchestrator: Web search tool not enabled or Brave client not available, skipping classification");
-                        drop(rx_tool_ack);
-                        false
-                    };
-
-                    // Phase 6: Setup completion processor
-                    trace!("Orchestrator: Setting up completion processor");
+                    // Phase 5-6: Run the normal assistant/tool loop
+                    trace!("Orchestrator: Setting up assistant/tool loop");
 
                     let context_for_completion = BuiltContext {
                         conversation: orchestrator_conversation,
@@ -2134,42 +2465,15 @@ async fn create_response_stream(
                         &orchestrator_headers,
                         orchestrator_tx_client.clone(),
                         orchestrator_tx_storage.clone(),
-                        tools_executed,
+                        rx_tool_ack,
                     )
                     .await
                     {
                         Ok(_) => {
-                            trace!("Orchestrator: Completion processor setup complete");
-                            // AssistantMessageStarting is now sent from inside setup_completion_processor
-                            // to guarantee it arrives before any completion deltas
+                            trace!("Orchestrator: Assistant/tool loop completed");
                         }
                         Err(e) => {
-                            error!("Orchestrator: Failed to setup completion processor: {:?}", e);
-
-                            // Update response status to failed
-                            if let Err(db_err) = orchestrator_state.db.update_response_status(
-                                response_id,
-                                ResponseStatus::Failed,
-                                Some(Utc::now()),
-                            ) {
-                                error!("Orchestrator: Failed to update response status: {:?}", db_err);
-                            }
-
-                            // Update assistant message to incomplete
-                            if let Err(db_err) = orchestrator_state.db.update_assistant_message(
-                                assistant_message_id,
-                                None,
-                                0,
-                                STATUS_INCOMPLETE.to_string(),
-                                None,
-                            ) {
-                                error!("Orchestrator: Failed to update assistant message: {:?}", db_err);
-                            }
-
-                            // Send error to client via channel (best-effort)
-                            let _ = orchestrator_tx_client.try_send(StorageMessage::Error(
-                                format!("Failed to setup streaming: {:?}", e)
-                            ));
+                            error!("Orchestrator: Assistant/tool loop failed: {:?}", e);
                         }
                     }
                 } => {
@@ -2192,164 +2496,181 @@ async fn create_response_stream(
 
         // NOW immediately start the event loop - it will receive events from orchestrator as they happen
         trace!("Starting event loop to receive messages from background tasks");
-        let mut assistant_content = String::new();
-        let mut reasoning_content = String::new();
-        let mut reasoning_done_emitted = false;
-        let mut reasoning_item_started = false;
-        let mut message_item_started = false;
-        // Reasoning item ID comes from the message - same UUID used for SSE and DB
-        let mut reasoning_item_id: Option<Uuid> = None;
+        let mut client_state = ClientResponseState::default();
+        let mut total_prompt_tokens_used = 0i32;
         let mut total_completion_tokens = 0i32;
         while let Some(msg) = rx_client.recv().await {
             trace!("Client stream received message from upstream processor");
             match msg {
-                StorageMessage::Done { finish_reason, message_id: msg_id } => {
-                    trace!("Client stream received Done signal with finish_reason={}, message_id={}", finish_reason, msg_id);
-                    // Note: msg_id should match our pre-generated assistant_message_id
-
-                    // Calculate message output_index based on whether reasoning exists
-                    let message_output_index = if reasoning_item_started { 1 } else { 0 };
-
-                    // Fallback: emit reasoning done events if not already done (edge case)
-                    if !reasoning_done_emitted && !reasoning_content.is_empty() {
-                        if let Some(rid) = reasoning_item_id {
-                            // No need to set reasoning_done_emitted = true since we break after this block
-
-                            let reasoning_done_event = ResponseReasoningTextDoneEvent {
-                                event_type: EVENT_RESPONSE_REASONING_TEXT_DONE,
-                                sequence_number: emitter.sequence_number(),
-                                item_id: rid.to_string(),
-                                output_index: 0,
-                                content_index: 0,
-                                text: reasoning_content.clone(),
-                            };
-                            yield Ok(ResponseEvent::ReasoningTextDone(reasoning_done_event).to_sse_event(&mut emitter).await);
-
-                            let reasoning_item_done = ResponseOutputItemDoneEvent {
-                                event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
-                                sequence_number: emitter.sequence_number(),
-                                output_index: 0,
-                                item: OutputItem {
-                                    id: rid.to_string(),
-                                    output_type: "reasoning".to_string(),
-                                    status: STATUS_COMPLETED.to_string(),
-                                    role: None,
-                                    content: Some(vec![]),
-                                },
-                            };
-                            yield Ok(ResponseEvent::OutputItemDone(reasoning_item_done).to_sse_event(&mut emitter).await);
-                        }
-                    }
-
-                    // Emit message start events if not yet started (edge case: no content deltas)
-                    if !message_item_started {
-                        // No need to set message_item_started = true since we break after this block
-
-                        let output_item_added_event = ResponseOutputItemAddedEvent {
-                            event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
-                            sequence_number: emitter.sequence_number(),
-                            output_index: message_output_index,
-                            item: OutputItem {
-                                id: assistant_message_id.to_string(),
-                                output_type: OUTPUT_TYPE_MESSAGE.to_string(),
-                                status: STATUS_IN_PROGRESS.to_string(),
-                                role: Some(ROLE_ASSISTANT.to_string()),
-                                content: Some(vec![]),
-                            },
-                        };
-                        yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
-
-                        let content_part_added_event = ResponseContentPartAddedEvent {
-                            event_type: EVENT_RESPONSE_CONTENT_PART_ADDED,
-                            sequence_number: emitter.sequence_number(),
-                            item_id: assistant_message_id.to_string(),
-                            output_index: message_output_index,
-                            content_index: 0,
-                            part: ContentPart {
-                                part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
-                                annotations: vec![],
-                                logprobs: vec![],
-                                text: String::new(),
-                            },
-                        };
-                        yield Ok(ResponseEvent::ContentPartAdded(content_part_added_event).to_sse_event(&mut emitter).await);
-                    }
-
-                    // response.output_text.done
-                    let output_text_done_event = ResponseOutputTextDoneEvent {
-                        event_type: EVENT_RESPONSE_OUTPUT_TEXT_DONE,
+                StorageMessage::MessageStarted { item_id } => {
+                    let output_index = client_state.push_message(item_id);
+                    let output_item_added_event = ResponseOutputItemAddedEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
                         sequence_number: emitter.sequence_number(),
-                        item_id: assistant_message_id.to_string(),
-                        output_index: message_output_index,
-                        content_index: 0,
-                        text: assistant_content.clone(),
-                        logprobs: vec![],
+                        output_index,
+                        item: OutputItemBuilder::new_message(item_id).build(),
                     };
-                    yield Ok(ResponseEvent::OutputTextDone(output_text_done_event).to_sse_event(&mut emitter).await);
+                    yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
 
-                    // response.content_part.done
-                    let content_part_done_event = ResponseContentPartDoneEvent {
-                        event_type: EVENT_RESPONSE_CONTENT_PART_DONE,
+                    let content_part_added_event = ResponseContentPartAddedEvent {
+                        event_type: EVENT_RESPONSE_CONTENT_PART_ADDED,
                         sequence_number: emitter.sequence_number(),
-                        item_id: assistant_message_id.to_string(),
-                        output_index: message_output_index,
+                        item_id: item_id.to_string(),
+                        output_index,
                         content_index: 0,
                         part: ContentPart {
                             part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
                             annotations: vec![],
                             logprobs: vec![],
-                            text: assistant_content.clone(),
+                            text: String::new(),
                         },
                     };
-                    yield Ok(ResponseEvent::ContentPartDone(content_part_done_event).to_sse_event(&mut emitter).await);
-
-                    // response.output_item.done for message
-                    let message_content_part = ContentPart {
-                        part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
-                        annotations: vec![],
-                        logprobs: vec![],
-                        text: assistant_content.clone(),
+                    yield Ok(ResponseEvent::ContentPartAdded(content_part_added_event).to_sse_event(&mut emitter).await);
+                }
+                StorageMessage::ContentDelta { item_id, delta } => {
+                    trace!("Client stream received content delta: {}", delta);
+                    let Some(output_index) = client_state.append_message_delta(item_id, &delta) else {
+                        warn!("Received content delta for unknown message item {}", item_id);
+                        continue;
                     };
+
+                    let delta_event = ResponseOutputTextDeltaEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_TEXT_DELTA,
+                        delta,
+                        item_id: item_id.to_string(),
+                        output_index,
+                        content_index: 0,
+                        sequence_number: emitter.sequence_number(),
+                        logprobs: vec![],
+                    };
+
+                    yield Ok(ResponseEvent::OutputTextDelta(delta_event).to_sse_event(&mut emitter).await);
+                }
+                StorageMessage::MessageDone { item_id, .. } => {
+                    let Some(output_index) = client_state.message_output_index(item_id) else {
+                        warn!("Received message done for unknown item {}", item_id);
+                        continue;
+                    };
+                    let text = client_state.message_text(item_id).unwrap_or("").to_string();
+
+                    let output_text_done_event = ResponseOutputTextDoneEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_TEXT_DONE,
+                        sequence_number: emitter.sequence_number(),
+                        item_id: item_id.to_string(),
+                        output_index,
+                        content_index: 0,
+                        text: text.clone(),
+                        logprobs: vec![],
+                    };
+                    yield Ok(ResponseEvent::OutputTextDone(output_text_done_event).to_sse_event(&mut emitter).await);
+
+                    let content_part_done_event = ResponseContentPartDoneEvent {
+                        event_type: EVENT_RESPONSE_CONTENT_PART_DONE,
+                        sequence_number: emitter.sequence_number(),
+                        item_id: item_id.to_string(),
+                        output_index,
+                        content_index: 0,
+                        part: ContentPartBuilder::new_output_text(text.clone()).build(),
+                    };
+                    yield Ok(ResponseEvent::ContentPartDone(content_part_done_event).to_sse_event(&mut emitter).await);
 
                     let output_item_done_event = ResponseOutputItemDoneEvent {
                         event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
                         sequence_number: emitter.sequence_number(),
-                        output_index: message_output_index,
-                        item: OutputItem {
-                            id: assistant_message_id.to_string(),
-                            output_type: OUTPUT_TYPE_MESSAGE.to_string(),
-                            status: STATUS_COMPLETED.to_string(),
-                            role: Some(ROLE_ASSISTANT.to_string()),
-                            content: Some(vec![message_content_part]),
-                        },
+                        output_index,
+                        item: OutputItemBuilder::new_message(item_id)
+                            .status(STATUS_COMPLETED)
+                            .content(vec![ContentPartBuilder::new_output_text(text).build()])
+                            .build(),
                     };
                     yield Ok(ResponseEvent::OutputItemDone(output_item_done_event).to_sse_event(&mut emitter).await);
+                }
+                StorageMessage::ReasoningStarted { item_id } => {
+                    let output_index = client_state.push_reasoning(item_id);
+                    let reasoning_item_added = ResponseOutputItemAddedEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
+                        sequence_number: emitter.sequence_number(),
+                        output_index,
+                        item: OutputItem {
+                            id: item_id.to_string(),
+                            output_type: "reasoning".to_string(),
+                            status: STATUS_IN_PROGRESS.to_string(),
+                            role: None,
+                            content: Some(vec![]),
+                            call_id: None,
+                            name: None,
+                            arguments: None,
+                            output: None,
+                        },
+                    };
+                    yield Ok(ResponseEvent::OutputItemAdded(reasoning_item_added).to_sse_event(&mut emitter).await);
+                }
+                StorageMessage::ReasoningDelta { item_id, delta } => {
+                    trace!("Client stream received reasoning delta: {}", delta);
+                    let Some(output_index) = client_state.append_reasoning_delta(item_id, &delta) else {
+                        warn!("Received reasoning delta for unknown item {}", item_id);
+                        continue;
+                    };
 
-                    // response.completed - build output array with reasoning + message if reasoning exists
-                    let content_part = ContentPartBuilder::new_output_text(assistant_content.clone()).build();
-                    let message_item = OutputItemBuilder::new_message(assistant_message_id)
-                        .status(STATUS_COMPLETED)
-                        .content(vec![content_part])
-                        .build();
+                    let delta_event = ResponseReasoningTextDeltaEvent {
+                        event_type: EVENT_RESPONSE_REASONING_TEXT_DELTA,
+                        delta,
+                        item_id: item_id.to_string(),
+                        output_index,
+                        content_index: 0,
+                        sequence_number: emitter.sequence_number(),
+                    };
 
-                    let output_items = if let Some(rid) = reasoning_item_id {
-                        // Include reasoning item in output
-                        let reasoning_item = OutputItem {
-                            id: rid.to_string(),
+                    yield Ok(ResponseEvent::ReasoningTextDelta(delta_event).to_sse_event(&mut emitter).await);
+                }
+                StorageMessage::ReasoningDone { item_id } => {
+                    let Some(output_index) = client_state.reasoning_output_index(item_id) else {
+                        warn!("Received reasoning done for unknown item {}", item_id);
+                        continue;
+                    };
+                    let text = client_state.reasoning_text(item_id).unwrap_or("").to_string();
+
+                    let reasoning_done_event = ResponseReasoningTextDoneEvent {
+                        event_type: EVENT_RESPONSE_REASONING_TEXT_DONE,
+                        sequence_number: emitter.sequence_number(),
+                        item_id: item_id.to_string(),
+                        output_index,
+                        content_index: 0,
+                        text,
+                    };
+                    yield Ok(ResponseEvent::ReasoningTextDone(reasoning_done_event).to_sse_event(&mut emitter).await);
+
+                    let reasoning_item_done = ResponseOutputItemDoneEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
+                        sequence_number: emitter.sequence_number(),
+                        output_index,
+                        item: OutputItem {
+                            id: item_id.to_string(),
                             output_type: "reasoning".to_string(),
                             status: STATUS_COMPLETED.to_string(),
                             role: None,
                             content: Some(vec![]),
-                        };
-                        vec![reasoning_item, message_item]
-                    } else {
-                        vec![message_item]
+                            call_id: None,
+                            name: None,
+                            arguments: None,
+                            output: None,
+                        },
                     };
+                    yield Ok(ResponseEvent::OutputItemDone(reasoning_item_done).to_sse_event(&mut emitter).await);
+                }
+                StorageMessage::ResponseDone { finish_reason: _finish_reason } => {
+                    let usage = build_usage(
+                        if total_prompt_tokens_used > 0 {
+                            total_prompt_tokens_used
+                        } else {
+                            total_prompt_tokens as i32
+                        },
+                        total_completion_tokens,
+                    );
 
-                    let usage = build_usage(total_prompt_tokens as i32, total_completion_tokens);
                     let done_response = ResponseBuilder::from_response(&response_for_stream)
                         .status(STATUS_COMPLETED)
-                        .output(output_items)
+                        .output(client_state.build_output_items())
                         .usage(usage)
                         .metadata(decrypted_metadata.clone())
                         .build();
@@ -2363,143 +2684,10 @@ async fn create_response_stream(
                     yield Ok(ResponseEvent::Completed(completed_event).to_sse_event(&mut emitter).await);
                     break;
                 }
-                StorageMessage::ContentDelta(content) => {
-                    trace!("Client stream received content delta: {}", content);
-
-                    // Calculate message output_index based on whether reasoning exists
-                    let message_output_index = if reasoning_item_started { 1 } else { 0 };
-
-                    // Complete reasoning phase when first content arrives
-                    if !reasoning_done_emitted && !reasoning_content.is_empty() {
-                        if let Some(rid) = reasoning_item_id {
-                            reasoning_done_emitted = true;
-
-                            // response.reasoning_text.done
-                            let reasoning_done_event = ResponseReasoningTextDoneEvent {
-                                event_type: EVENT_RESPONSE_REASONING_TEXT_DONE,
-                                sequence_number: emitter.sequence_number(),
-                                item_id: rid.to_string(),
-                                output_index: 0,
-                                content_index: 0,
-                                text: reasoning_content.clone(),
-                            };
-                            yield Ok(ResponseEvent::ReasoningTextDone(reasoning_done_event).to_sse_event(&mut emitter).await);
-
-                            // response.output_item.done for reasoning
-                            let reasoning_item_done = ResponseOutputItemDoneEvent {
-                                event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
-                                sequence_number: emitter.sequence_number(),
-                                output_index: 0,
-                                item: OutputItem {
-                                    id: rid.to_string(),
-                                    output_type: "reasoning".to_string(),
-                                    status: STATUS_COMPLETED.to_string(),
-                                    role: None,
-                                    content: Some(vec![]), // Reasoning content is in the text field, not content array
-                                },
-                            };
-                            yield Ok(ResponseEvent::OutputItemDone(reasoning_item_done).to_sse_event(&mut emitter).await);
-                        }
-                    }
-
-                    // Emit message start events if not yet started
-                    if !message_item_started {
-                        message_item_started = true;
-
-                        // response.output_item.added for message
-                        let output_item_added_event = ResponseOutputItemAddedEvent {
-                            event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
-                            sequence_number: emitter.sequence_number(),
-                            output_index: message_output_index,
-                            item: OutputItem {
-                                id: assistant_message_id.to_string(),
-                                output_type: OUTPUT_TYPE_MESSAGE.to_string(),
-                                status: STATUS_IN_PROGRESS.to_string(),
-                                role: Some(ROLE_ASSISTANT.to_string()),
-                                content: Some(vec![]),
-                            },
-                        };
-                        yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
-
-                        // response.content_part.added
-                        let content_part_added_event = ResponseContentPartAddedEvent {
-                            event_type: EVENT_RESPONSE_CONTENT_PART_ADDED,
-                            sequence_number: emitter.sequence_number(),
-                            item_id: assistant_message_id.to_string(),
-                            output_index: message_output_index,
-                            content_index: 0,
-                            part: ContentPart {
-                                part_type: CONTENT_PART_TYPE_OUTPUT_TEXT.to_string(),
-                                annotations: vec![],
-                                logprobs: vec![],
-                                text: String::new(),
-                            },
-                        };
-                        yield Ok(ResponseEvent::ContentPartAdded(content_part_added_event).to_sse_event(&mut emitter).await);
-                    }
-
-                    assistant_content.push_str(&content);
-
-                    // Send content delta to client
-                    let delta_event = ResponseOutputTextDeltaEvent {
-                        event_type: EVENT_RESPONSE_OUTPUT_TEXT_DELTA,
-                        delta: content.clone(),
-                        item_id: assistant_message_id.to_string(),
-                        output_index: message_output_index,
-                        content_index: 0,
-                        sequence_number: emitter.sequence_number(),
-                        logprobs: vec![],
-                    };
-
-                    yield Ok(ResponseEvent::OutputTextDelta(delta_event).to_sse_event(&mut emitter).await);
-                }
-                StorageMessage::ReasoningDelta { item_id, delta: reasoning } => {
-                    trace!("Client stream received reasoning delta: {}", reasoning);
-
-                    // Store the item_id from the message (same UUID used for SSE and DB)
-                    if reasoning_item_id.is_none() {
-                        reasoning_item_id = Some(item_id);
-                    }
-                    let rid = reasoning_item_id.expect("reasoning_item_id should be set");
-
-                    // Emit reasoning item start events on first reasoning delta
-                    if !reasoning_item_started {
-                        reasoning_item_started = true;
-
-                        // response.output_item.added for reasoning (output_index: 0)
-                        let reasoning_item_added = ResponseOutputItemAddedEvent {
-                            event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
-                            sequence_number: emitter.sequence_number(),
-                            output_index: 0,
-                            item: OutputItem {
-                                id: rid.to_string(),
-                                output_type: "reasoning".to_string(),
-                                status: STATUS_IN_PROGRESS.to_string(),
-                                role: None,
-                                content: Some(vec![]),
-                            },
-                        };
-                        yield Ok(ResponseEvent::OutputItemAdded(reasoning_item_added).to_sse_event(&mut emitter).await);
-                    }
-
-                    reasoning_content.push_str(&reasoning);
-
-                    // Send reasoning delta to client
-                    let delta_event = ResponseReasoningTextDeltaEvent {
-                        event_type: EVENT_RESPONSE_REASONING_TEXT_DELTA,
-                        delta: reasoning.clone(),
-                        item_id: rid.to_string(),
-                        output_index: 0,
-                        content_index: 0,
-                        sequence_number: emitter.sequence_number(),
-                    };
-
-                    yield Ok(ResponseEvent::ReasoningTextDelta(delta_event).to_sse_event(&mut emitter).await);
-                }
-
-                StorageMessage::Usage { prompt_tokens: _, completion_tokens } => {
+                StorageMessage::Usage { prompt_tokens, completion_tokens } => {
                     trace!("Client stream received usage data");
-                    total_completion_tokens = completion_tokens;
+                    total_prompt_tokens_used += prompt_tokens;
+                    total_completion_tokens += completion_tokens;
                 }
                 StorageMessage::Cancelled => {
                     debug!("Client stream received cancellation signal");
@@ -2532,35 +2720,118 @@ async fn create_response_stream(
                 }
                 StorageMessage::ToolCall { tool_call_id, name, arguments } => {
                     debug!("Client stream received tool_call event: {} ({})", name, tool_call_id);
+                    let tool_name = name.clone();
+                    let arguments_json =
+                        serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
+                    let output_index =
+                        client_state.push_tool_call(tool_call_id, tool_name.clone(), arguments.clone());
+
+                    let output_item_added_event = ResponseOutputItemAddedEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
+                        sequence_number: emitter.sequence_number(),
+                        output_index,
+                        item: OutputItem {
+                            id: tool_call_id.to_string(),
+                            output_type: "tool_call".to_string(),
+                            status: STATUS_IN_PROGRESS.to_string(),
+                            role: None,
+                            content: None,
+                            call_id: Some(tool_call_id.to_string()),
+                            name: Some(tool_name.clone()),
+                            arguments: Some(arguments_json.clone()),
+                            output: None,
+                        },
+                    };
+
+                    yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
+
                     // Send tool_call.created event
                     let tool_call_event = ToolCallCreatedEvent {
                         event_type: EVENT_TOOL_CALL_CREATED,
                         sequence_number: emitter.sequence_number(),
+                        output_index,
                         tool_call_id,
                         name,
                         arguments,
                     };
 
                     yield Ok(ResponseEvent::ToolCallCreated(tool_call_event).to_sse_event(&mut emitter).await);
+
+                    let output_item_done_event = ResponseOutputItemDoneEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
+                        sequence_number: emitter.sequence_number(),
+                        output_index,
+                        item: OutputItem {
+                            id: tool_call_id.to_string(),
+                            output_type: "tool_call".to_string(),
+                            status: STATUS_COMPLETED.to_string(),
+                            role: None,
+                            content: None,
+                            call_id: Some(tool_call_id.to_string()),
+                            name: Some(tool_name),
+                            arguments: Some(arguments_json),
+                            output: None,
+                        },
+                    };
+
+                    yield Ok(ResponseEvent::OutputItemDone(output_item_done_event).to_sse_event(&mut emitter).await);
                 }
                 StorageMessage::ToolOutput { tool_output_id, tool_call_id, output } => {
                     debug!("Client stream received tool_output event: {}", tool_output_id);
+                    let output_index = client_state.push_tool_output(
+                        tool_output_id,
+                        tool_call_id,
+                        output.clone(),
+                    );
+                    let output_item_added_event = ResponseOutputItemAddedEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
+                        sequence_number: emitter.sequence_number(),
+                        output_index,
+                        item: OutputItem {
+                            id: tool_output_id.to_string(),
+                            output_type: "tool_output".to_string(),
+                            status: STATUS_IN_PROGRESS.to_string(),
+                            role: None,
+                            content: None,
+                            call_id: Some(tool_call_id.to_string()),
+                            name: None,
+                            arguments: None,
+                            output: Some(output.clone()),
+                        },
+                    };
+
+                    yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
+
                     // Send tool_output.created event
                     let tool_output_event = ToolOutputCreatedEvent {
                         event_type: EVENT_TOOL_OUTPUT_CREATED,
                         sequence_number: emitter.sequence_number(),
+                        output_index,
                         tool_output_id,
                         tool_call_id,
-                        output,
+                        output: output.clone(),
                     };
 
                     yield Ok(ResponseEvent::ToolOutputCreated(tool_output_event).to_sse_event(&mut emitter).await);
-                }
-                StorageMessage::AssistantMessageStarting => {
-                    // Don't emit output_item.added here - we defer it until we know if there's reasoning
-                    // This allows us to emit reasoning item at output_index 0 if present,
-                    // then message item at output_index 1 (or 0 if no reasoning)
-                    debug!("Client stream received assistant message starting signal (events deferred)");
+
+                    let output_item_done_event = ResponseOutputItemDoneEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
+                        sequence_number: emitter.sequence_number(),
+                        output_index,
+                        item: OutputItem {
+                            id: tool_output_id.to_string(),
+                            output_type: "tool_output".to_string(),
+                            status: STATUS_COMPLETED.to_string(),
+                            role: None,
+                            content: None,
+                            call_id: Some(tool_call_id.to_string()),
+                            name: None,
+                            arguments: None,
+                            output: Some(output),
+                        },
+                    };
+
+                    yield Ok(ResponseEvent::OutputItemDone(output_item_done_event).to_sse_event(&mut emitter).await);
                 }
             }
         }
@@ -2621,39 +2892,88 @@ async fn get_response(
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
-    // Build output from assistant messages only (user messages are input, not output)
-    // TODO: Add tool_call and tool_output items to output array once we implement tool support
-    // Need to determine correct OpenAI format for tool items in output array
     let mut output_items = Vec::new();
 
     for msg in &messages {
-        // Only include assistant messages in output
-        // TODO: When adding tool support, also handle msg.message_type == "tool_call" and "tool_output"
-        if msg.message_type != "assistant" {
-            continue;
-        }
+        let status = msg
+            .status
+            .clone()
+            .unwrap_or_else(|| STATUS_COMPLETED.to_string());
 
-        // Only include messages that have content
-        if let Some(content_enc) = &msg.content_enc {
-            if let Some(text) = decrypt_string(&user_key, Some(content_enc)).map_err(|e| {
-                error!("Failed to decrypt assistant message content: {:?}", e);
-                error_mapping::map_decryption_error("assistant message content")
-            })? {
-                // Build content part using builder
-                let content_part = ContentPartBuilder::new_output_text(text).build();
+        match msg.message_type.as_str() {
+            "assistant" => {
+                let text = decrypt_string(&user_key, msg.content_enc.as_ref()).map_err(|e| {
+                    error!("Failed to decrypt assistant message content: {:?}", e);
+                    error_mapping::map_decryption_error("assistant message content")
+                })?;
 
-                // Build output item using builder
-                let output_item = OutputItemBuilder::new_message(msg.uuid)
-                    .status(
-                        &msg.status
-                            .clone()
-                            .unwrap_or_else(|| STATUS_COMPLETED.to_string()),
-                    )
-                    .content(vec![content_part])
-                    .build();
-
+                let output_item = if let Some(text) = text {
+                    OutputItemBuilder::new_message(msg.uuid)
+                        .status(&status)
+                        .content(vec![ContentPartBuilder::new_output_text(text).build()])
+                        .build()
+                } else {
+                    OutputItemBuilder::new_message(msg.uuid)
+                        .status(&status)
+                        .build()
+                };
                 output_items.push(output_item);
             }
+            "tool_call" => {
+                let arguments =
+                    decrypt_string(&user_key, msg.content_enc.as_ref()).map_err(|e| {
+                        error!("Failed to decrypt tool call arguments: {:?}", e);
+                        error_mapping::map_decryption_error("tool call arguments")
+                    })?;
+
+                output_items.push(OutputItem {
+                    id: msg.uuid.to_string(),
+                    output_type: "tool_call".to_string(),
+                    status,
+                    role: None,
+                    content: None,
+                    call_id: Some(msg.tool_call_id.unwrap_or(msg.uuid).to_string()),
+                    name: Some(
+                        msg.tool_name
+                            .clone()
+                            .unwrap_or_else(|| "function".to_string()),
+                    ),
+                    arguments,
+                    output: None,
+                });
+            }
+            "tool_output" => {
+                let output = decrypt_string(&user_key, msg.content_enc.as_ref()).map_err(|e| {
+                    error!("Failed to decrypt tool output: {:?}", e);
+                    error_mapping::map_decryption_error("tool output")
+                })?;
+
+                output_items.push(OutputItem {
+                    id: msg.uuid.to_string(),
+                    output_type: "tool_output".to_string(),
+                    status,
+                    role: None,
+                    content: None,
+                    call_id: msg.tool_call_id.map(|id| id.to_string()),
+                    name: None,
+                    arguments: None,
+                    output,
+                });
+            }
+            "reasoning" => {
+                output_items.push(OutputItem {
+                    id: msg.uuid.to_string(),
+                    output_type: "reasoning".to_string(),
+                    status,
+                    role: None,
+                    content: Some(vec![]),
+                    call_id: None,
+                    name: None,
+                    arguments: None,
+                    output: None,
+                });
+            }
+            _ => {}
         }
     }
 
@@ -2662,13 +2982,17 @@ async fn get_response(
         // Sum up tokens from all messages
         let mut input_tokens = 0i32;
         let mut output_tokens = 0i32;
+        let mut reasoning_tokens = 0i32;
 
         for msg in &messages {
             if let Some(token_count) = msg.token_count {
                 match msg.message_type.as_str() {
                     "user" => input_tokens += token_count,
                     "assistant" => output_tokens += token_count,
-                    // tool_call and tool_output tokens are also considered in context
+                    "reasoning" => {
+                        output_tokens += token_count;
+                        reasoning_tokens += token_count;
+                    }
                     "tool_call" => input_tokens += token_count,
                     "tool_output" => input_tokens += token_count,
                     _ => {}
@@ -2680,9 +3004,7 @@ async fn get_response(
             input_tokens,
             input_tokens_details: InputTokenDetails { cached_tokens: 0 },
             output_tokens,
-            output_tokens_details: OutputTokenDetails {
-                reasoning_tokens: 0,
-            },
+            output_tokens_details: OutputTokenDetails { reasoning_tokens },
             total_tokens: input_tokens + output_tokens,
         })
     } else {

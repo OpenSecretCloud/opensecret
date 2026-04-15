@@ -41,10 +41,11 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
     user_key: &secp256k1::SecretKey,
     model: &str,
     override_instructions: Option<&str>,
+    internal_instructions: Option<&str>,
 ) -> Result<(Vec<serde_json::Value>, usize), crate::ApiError> {
     // 1. Get default user instructions if they exist (unless override provided)
     let mut system_tokens = 0usize;
-    let system_msg_opt = if let Some(instruction_text) = override_instructions {
+    let mut system_msg_opt = if let Some(instruction_text) = override_instructions {
         // Use override instructions if provided
         let tok = count_tokens(instruction_text);
         system_tokens = tok;
@@ -88,6 +89,16 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
             }
         }
     };
+
+    if let Some(internal_instructions) = internal_instructions {
+        let content = if let Some((_, existing_content, _)) = system_msg_opt.take() {
+            format!("{internal_instructions}\n\n{existing_content}")
+        } else {
+            internal_instructions.to_string()
+        };
+        system_tokens = count_tokens(&content);
+        system_msg_opt = Some((ROLE_SYSTEM, content, system_tokens));
+    }
 
     // 2. PASS 1: Fetch only metadata (lightweight, no content/decryption)
     let metadata = db

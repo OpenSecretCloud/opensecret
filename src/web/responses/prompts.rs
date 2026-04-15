@@ -9,6 +9,10 @@ pub const INTENT_CLASSIFIER_MODEL: &str = "gpt-oss-120b";
 pub const INTENT_CLASSIFIER_MAX_TOKENS: i32 = 250;
 pub const QUERY_EXTRACTOR_MODEL: &str = "llama3-3-70b";
 pub const QUERY_EXTRACTOR_MAX_TOKENS: i32 = 50;
+pub const WEB_SEARCH_PROMPT_DRAFTER_MODEL: &str = "llama3-3-70b";
+pub const WEB_SEARCH_PROMPT_DRAFTER_MAX_TOKENS: i32 = 120;
+pub const WEB_SEARCH_SUBAGENT_MODEL: &str = "gemma4-31b";
+pub const WEB_SEARCH_SUBAGENT_MAX_TOKENS: i32 = 1200;
 
 /// System prompt for intent classification
 ///
@@ -35,6 +39,55 @@ Examples:
 - \"Tell me about the latest SpaceX launch\" → latest SpaceX launch
 - After discussing \"iPhone 15\", user asks \"when was it released?\" → iPhone 15 release date";
 
+/// System prompt for drafting the request sent to the web search subagent.
+pub const WEB_SEARCH_PROMPT_DRAFTER_PROMPT: &str = "\
+Rewrite the user's request into a focused brief for an internal web-search subagent.
+Use the conversation history to resolve references and ambiguity.
+Return only the brief to send to the search subagent.
+The brief should state what factual information to gather and preserve any important constraints, entities, and time sensitivity.
+Do not answer the question yourself.
+Do not include citations, URLs, bullet lists, or conversational filler.";
+
+/// System prompt for the internal web search subagent
+///
+/// This prompt instructs the LLM to use web search and return a concise,
+/// grounded search report for the downstream conversational model.
+pub const WEB_SEARCH_SUBAGENT_PROMPT: &str = "\
+You are an internal web search subagent for another language model.
+Use web search to gather current, relevant, factual information that helps answer the user's latest question.
+Return a concise search report for a downstream assistant, not a direct conversational reply to the end user.
+Prioritize reliable and recent sources when the question is time-sensitive.
+Do not include a 'Sources:' section or raw URLs in the body; source links are attached separately.
+If the web results are incomplete, conflicting, or uncertain, say so briefly.";
+
+fn format_recent_conversation_history(conversation_history: &[Value]) -> String {
+    if conversation_history.is_empty() {
+        return String::new();
+    }
+
+    let formatted_messages: Vec<String> = conversation_history
+        .iter()
+        .rev()
+        .take(6)
+        .rev()
+        .filter_map(|msg| {
+            let role = msg.get("role")?.as_str()?;
+            let content = extract_text_from_content(msg.get("content")?);
+            let truncated_content: String = content.chars().take(200).collect();
+            Some(format!("{}: {}", role, truncated_content))
+        })
+        .collect();
+
+    if formatted_messages.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Conversation history:\n{}\n\n",
+            formatted_messages.join("\n")
+        )
+    }
+}
+
 /// Build a chat completion request for intent classification
 ///
 /// Uses a fast, cheap model (gpt-oss-120b) with temperature=0 for deterministic results.
@@ -49,32 +102,7 @@ pub fn build_intent_classification_request(
     conversation_history: &[Value],
     user_message: &str,
 ) -> Value {
-    // Format conversation history as text for context
-    let history_text = if !conversation_history.is_empty() {
-        let formatted_messages: Vec<String> = conversation_history
-            .iter()
-            .rev()
-            .take(6)
-            .rev()
-            .filter_map(|msg| {
-                let role = msg.get("role")?.as_str()?;
-                let content = extract_text_from_content(msg.get("content")?);
-                let truncated_content: String = content.chars().take(200).collect();
-                Some(format!("{}: {}", role, truncated_content))
-            })
-            .collect();
-
-        if formatted_messages.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "Conversation history:\n{}\n\n",
-                formatted_messages.join("\n")
-            )
-        }
-    } else {
-        String::new()
-    };
+    let history_text = format_recent_conversation_history(conversation_history);
 
     // Build single user message with history + current query
     let user_prompt = format!("{}Current user query: {}", history_text, user_message);
@@ -125,32 +153,7 @@ fn extract_text_from_content(content: &Value) -> String {
 /// # Returns
 /// A JSON request ready to be sent to `get_chat_completion_response`
 pub fn build_query_extraction_request(conversation_history: &[Value], user_message: &str) -> Value {
-    // Format conversation history as text for context
-    let history_text = if !conversation_history.is_empty() {
-        let formatted_messages: Vec<String> = conversation_history
-            .iter()
-            .rev()
-            .take(6)
-            .rev()
-            .filter_map(|msg| {
-                let role = msg.get("role")?.as_str()?;
-                let content = extract_text_from_content(msg.get("content")?);
-                let truncated_content: String = content.chars().take(200).collect();
-                Some(format!("{}: {}", role, truncated_content))
-            })
-            .collect();
-
-        if formatted_messages.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "Conversation history:\n{}\n\n",
-                formatted_messages.join("\n")
-            )
-        }
-    } else {
-        String::new()
-    };
+    let history_text = format_recent_conversation_history(conversation_history);
 
     // Build single user message with history + current query
     let user_prompt = format!("{}Current user question: {}", history_text, user_message);
@@ -169,6 +172,56 @@ pub fn build_query_extraction_request(conversation_history: &[Value], user_messa
         ],
         "temperature": 0.0,
         "max_tokens": QUERY_EXTRACTOR_MAX_TOKENS,
+        "stream": false
+    })
+}
+
+/// Build a chat completion request for drafting the web search subagent prompt.
+pub fn build_web_search_prompt_drafting_request(
+    conversation_history: &[Value],
+    user_message: &str,
+) -> Value {
+    let history_text = format_recent_conversation_history(conversation_history);
+    let user_prompt = format!("{}Current user question: {}", history_text, user_message);
+
+    json!({
+        "model": WEB_SEARCH_PROMPT_DRAFTER_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": WEB_SEARCH_PROMPT_DRAFTER_PROMPT
+            },
+            {
+                "role": "user",
+                "content": user_prompt
+            }
+        ],
+        "temperature": 0.0,
+        "max_tokens": WEB_SEARCH_PROMPT_DRAFTER_MAX_TOKENS,
+        "stream": false
+    })
+}
+
+/// Build a chat completion request for the internal web search subagent
+///
+/// Uses gemma4-31b with `web_search_options` enabled to synthesize search
+/// results that can be injected back into the main conversational model.
+pub fn build_web_search_subagent_request(subagent_prompt: &str) -> Value {
+    json!({
+        "model": WEB_SEARCH_SUBAGENT_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": WEB_SEARCH_SUBAGENT_PROMPT
+            },
+            {
+                "role": "user",
+                "content": subagent_prompt
+            }
+        ],
+        "temperature": 0.0,
+        "max_tokens": WEB_SEARCH_SUBAGENT_MAX_TOKENS,
+        "web_search_options": {},
         "stream": false
     })
 }
@@ -310,11 +363,59 @@ mod tests {
     }
 
     #[test]
+    fn test_build_web_search_prompt_drafting_request() {
+        let history = vec![
+            json!({"role": "user", "content": "Tell me about SpaceX"}),
+            json!({"role": "assistant", "content": "What would you like to know?"}),
+        ];
+
+        let request =
+            build_web_search_prompt_drafting_request(&history, "what is its latest revenue?");
+
+        assert_eq!(request["model"], WEB_SEARCH_PROMPT_DRAFTER_MODEL);
+        assert_eq!(request["max_tokens"], WEB_SEARCH_PROMPT_DRAFTER_MAX_TOKENS);
+        assert_eq!(request["stream"], false);
+
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+
+        let user_content = messages[1]["content"].as_str().unwrap();
+        assert!(user_content.contains("Conversation history:"));
+        assert!(user_content.contains("Tell me about SpaceX"));
+        assert!(user_content.contains("Current user question: what is its latest revenue?"));
+    }
+
+    #[test]
+    fn test_build_web_search_subagent_request() {
+        let request = build_web_search_subagent_request(
+            "Find SpaceX's latest annual revenue estimate and note the source of the figure.",
+        );
+
+        assert_eq!(request["model"], WEB_SEARCH_SUBAGENT_MODEL);
+        assert_eq!(request["max_tokens"], WEB_SEARCH_SUBAGENT_MAX_TOKENS);
+        assert_eq!(request["stream"], false);
+        assert_eq!(request["web_search_options"], json!({}));
+
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(
+            messages[1]["content"],
+            "Find SpaceX's latest annual revenue estimate and note the source of the figure."
+        );
+    }
+
+    #[test]
     fn test_prompts_contain_examples() {
         assert!(INTENT_CLASSIFIER_PROMPT.contains("web_search"));
         assert!(INTENT_CLASSIFIER_PROMPT.contains("chat"));
         assert!(INTENT_CLASSIFIER_PROMPT.contains("conversation history"));
 
         assert!(SEARCH_QUERY_EXTRACTOR_PROMPT.contains("Examples:"));
+        assert!(WEB_SEARCH_PROMPT_DRAFTER_PROMPT.contains("search subagent"));
+        assert!(WEB_SEARCH_SUBAGENT_PROMPT.contains("Do not include a 'Sources:' section"));
     }
 }

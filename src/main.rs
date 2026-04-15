@@ -77,7 +77,6 @@ mod db;
 mod email;
 mod encrypt;
 mod jwt;
-mod kagi;
 mod kv;
 mod message_signing;
 mod migrations;
@@ -107,7 +106,6 @@ const RESEND_API_KEY_NAME: &str = "resend_api_key";
 
 const BILLING_API_KEY_NAME: &str = "billing_api_key";
 const BILLING_SERVER_URL_NAME: &str = "billing_server_url";
-const KAGI_API_KEY_NAME: &str = "kagi_api_key";
 const BRAVE_API_KEY_NAME: &str = "brave_api_key";
 const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
 const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
@@ -418,7 +416,6 @@ pub struct AppState {
     os_flags_client: Option<os_flags::OsFlagsClient>,
     apple_jwt_verifier: Arc<AppleJwtVerifier>,
     cancellation_broadcast: tokio::sync::broadcast::Sender<Uuid>,
-    kagi_client: Option<Arc<crate::kagi::KagiClient>>,
     brave_client: Option<Arc<crate::brave::BraveClient>>,
 }
 
@@ -445,7 +442,6 @@ pub struct AppStateBuilder {
     billing_server_url: Option<String>,
     os_flags_base_url: Option<String>,
     os_flags_api_key: Option<String>,
-    kagi_api_key: Option<String>,
     brave_api_key: Option<String>,
 }
 
@@ -558,11 +554,6 @@ impl AppStateBuilder {
 
     pub fn os_flags_api_key(mut self, os_flags_api_key: Option<String>) -> Self {
         self.os_flags_api_key = os_flags_api_key;
-        self
-    }
-
-    pub fn kagi_api_key(mut self, kagi_api_key: Option<String>) -> Self {
-        self.kagi_api_key = kagi_api_key;
         self
     }
 
@@ -679,27 +670,6 @@ impl AppStateBuilder {
 
         let (cancellation_tx, _) = tokio::sync::broadcast::channel(1024);
 
-        // Initialize Kagi client if API key is provided
-        let kagi_client = if let Some(ref api_key) = self.kagi_api_key {
-            tracing::info!("Initializing Kagi client with connection pooling (max 100 idle connections, 10s timeout)");
-            match crate::kagi::KagiClient::new(api_key.clone()) {
-                Ok(client) => {
-                    tracing::debug!("Kagi client initialized successfully");
-                    Some(Arc::new(client))
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to initialize Kagi client: {:?}. Web search will be unavailable.",
-                        e
-                    );
-                    None
-                }
-            }
-        } else {
-            tracing::debug!("Kagi API key not configured, web search tool will be unavailable");
-            None
-        };
-
         let brave_client = if let Some(ref api_key) = self.brave_api_key {
             tracing::info!("Initializing Brave client with connection pooling (max 100 idle connections, 10s timeout)");
             match crate::brave::BraveClient::new(api_key.clone()) {
@@ -736,7 +706,6 @@ impl AppStateBuilder {
             os_flags_client,
             apple_jwt_verifier,
             cancellation_broadcast: cancellation_tx,
-            kagi_client,
             brave_client,
         })
     }
@@ -2335,48 +2304,6 @@ async fn retrieve_os_flags_base_url(
     }
 }
 
-async fn retrieve_kagi_api_key(
-    aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
-    db: Arc<dyn DBConnection + Send + Sync>,
-) -> Result<Option<String>, Error> {
-    let creds = aws_credential_manager
-        .read()
-        .await
-        .clone()
-        .expect("non-local mode should have creds")
-        .get_credentials()
-        .await
-        .expect("non-local mode should have creds");
-
-    // check if the key already exists in the db
-    let existing_key = db.get_enclave_secret_by_key(KAGI_API_KEY_NAME)?;
-
-    if let Some(ref encrypted_key) = existing_key {
-        // Convert the stored bytes back to base64
-        let base64_encrypted_key = general_purpose::STANDARD.encode(&encrypted_key.value);
-
-        debug!("trying to decrypt base64 encrypted Kagi API key");
-
-        // Decrypt the existing key
-        let decrypted_bytes = decrypt_with_kms(
-            &creds.region,
-            &creds.access_key_id,
-            &creds.secret_access_key,
-            &creds.token,
-            &base64_encrypted_key,
-        )
-        .map_err(|e| Error::EncryptionError(e.to_string()))?;
-
-        // Convert the decrypted bytes to a UTF-8 string
-        String::from_utf8(decrypted_bytes)
-            .map_err(|e| Error::EncryptionError(format!("Failed to decode UTF-8: {}", e)))
-            .map(Some)
-    } else {
-        tracing::info!("Kagi API key not found in the database");
-        Ok(None)
-    }
-}
-
 async fn retrieve_brave_api_key(
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
     db: Arc<dyn DBConnection + Send + Sync>,
@@ -2682,13 +2609,6 @@ async fn main() -> Result<(), Error> {
         std::env::var("BILLING_SERVER_URL").ok()
     };
 
-    let kagi_api_key = if app_mode != AppMode::Local {
-        // Get from database if in enclave mode
-        retrieve_kagi_api_key(aws_credential_manager.clone(), db.clone()).await?
-    } else {
-        std::env::var("KAGI_API_KEY").ok()
-    };
-
     let brave_api_key = if app_mode != AppMode::Local {
         // Get from database if in enclave mode
         retrieve_brave_api_key(aws_credential_manager.clone(), db.clone()).await?
@@ -2737,7 +2657,6 @@ async fn main() -> Result<(), Error> {
         .billing_server_url(billing_server_url)
         .os_flags_base_url(os_flags_base_url)
         .os_flags_api_key(os_flags_api_key)
-        .kagi_api_key(kagi_api_key)
         .brave_api_key(brave_api_key)
         .build()
         .await?;

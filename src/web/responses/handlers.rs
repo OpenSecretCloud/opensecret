@@ -1320,13 +1320,13 @@ fn is_web_search_enabled(tools: &Option<Value>) -> bool {
 ///
 /// Flow:
 /// 1. Classify intent: chat vs web_search
-/// 2. If web_search: extract query and execute tool
+/// 2. If web_search: draft the search-subagent request and execute tool
 /// 3. Send ToolCall event to streams
 /// 4. Send ToolOutput event to streams (always, even on error)
 /// 5. Send persistence command via dedicated channel and wait for acknowledgment
 ///
 /// Tool execution is best-effort: intent classification uses gpt-oss-120b and
-/// query extraction uses llama3-3-70b.
+/// web search execution prefers TinFoil web search with Brave/Kagi fallback.
 struct ToolChannels<'a> {
     client: &'a mpsc::Sender<StorageMessage>,
     storage: &'a mpsc::Sender<StorageMessage>,
@@ -1428,50 +1428,15 @@ async fn classify_and_execute_tools(
     if intent == "web_search" {
         debug!("User message classified as web_search, executing tool");
 
-        // Extract search query with conversation history for context
-        let query_request = prompts::build_query_extraction_request(prompt_messages, &user_text);
-        let billing_context = crate::web::openai::BillingContext::new(
-            crate::web::openai_auth::AuthMethod::Jwt,
-            prompts::QUERY_EXTRACTOR_MODEL.to_string(),
-        );
-
-        let search_query = match get_chat_completion_response(
+        let web_search_context = tools::WebSearchExecutionContext {
             state,
             user,
-            query_request,
-            &headers,
-            billing_context,
-        )
-        .await
-        {
-            Ok(mut completion) => match completion.stream.recv().await {
-                Some(crate::web::openai::CompletionChunk::FullResponse(response_json)) => {
-                    if let Some(query) = response_json
-                        .get("choices")
-                        .and_then(|c| c.get(0))
-                        .and_then(|c| c.get("message"))
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_str())
-                    {
-                        let query = query.trim().to_string();
-                        trace!("Extracted search query: {}", query);
-                        debug!("Search query extracted successfully");
-                        query
-                    } else {
-                        warn!("Failed to extract query, using original message");
-                        user_text.clone()
-                    }
-                }
-                _ => {
-                    warn!("Unexpected query extraction response, using original message");
-                    user_text.clone()
-                }
-            },
-            Err(e) => {
-                warn!("Query extraction failed, using original message: {:?}", e);
-                user_text.clone()
-            }
+            conversation_history: prompt_messages,
+            user_message: &user_text,
         };
+
+        let search_query = tools::prepare_web_search_query(&web_search_context).await;
+        trace!("Prepared web search query: {}", search_query);
 
         // Generate UUIDs for tool_call and tool_output
         let tool_call_id = Uuid::new_v4();
@@ -1523,6 +1488,7 @@ async fn classify_and_execute_tools(
         let tool_output = match tools::execute_tool(
             "web_search",
             &tool_arguments,
+            Some(&web_search_context),
             state.brave_client.as_ref(),
             state.kagi_client.as_ref(),
         )
@@ -2051,11 +2017,11 @@ async fn create_response_stream(
             // Run phases 5-6 with cancellation support
             tokio::select! {
                 _ = async {
-                    // Phase 5: Classify intent and execute tools (if tool_choice allows it AND web_search is enabled AND Kagi client available)
+                    // Phase 5: Classify intent and execute tools (if tool_choice allows tools, web search is enabled, and at least one search backend is available)
                     let tools_executed = if is_tool_choice_allowed(&orchestrator_body.tool_choice)
                         && is_web_search_enabled(&orchestrator_body.tools)
-                        && orchestrator_state.kagi_client.is_some() {
-                        debug!("Orchestrator: tool_choice allows tools, web search enabled, and Kagi client available, proceeding with classification");
+                        && tools::has_web_search_backend(&orchestrator_state) {
+                        debug!("Orchestrator: tool_choice allows tools, web search is enabled, and a search backend is available, proceeding with classification");
 
                         let prepared_for_tools = PreparedRequest {
                             user_key,
@@ -2100,7 +2066,7 @@ async fn create_response_stream(
                             }
                         }
                     } else {
-                        debug!("Orchestrator: Web search tool not enabled or Kagi client not available, skipping classification");
+                        debug!("Orchestrator: tool execution disabled or no search backend available, skipping classification");
                         drop(rx_tool_ack);
                         false
                     };

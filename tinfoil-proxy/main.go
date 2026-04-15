@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -19,11 +21,24 @@ import (
 var errMissingAPIKey = errors.New("TINFOIL_API_KEY environment variable is required")
 
 const upstreamResponseStartTimeout = 120 * time.Second
+const defaultWebSearchAPIBase = "https://websearch-debug.debug.tinfoil.containers.tinfoil.dev"
 
 type proxyServer struct {
-	httpClient  *http.Client
-	apiKey      string
-	enclaveHost string
+	httpClient      *http.Client
+	webSearchClient *http.Client
+	apiKey          string
+	enclaveHost     string
+	webSearchBase   *url.URL
+}
+
+type upstreamTarget struct {
+	client  *http.Client
+	baseURL url.URL
+	name    string
+}
+
+type chatCompletionEnvelope struct {
+	WebSearchOptions *json.RawMessage `json:"web_search_options"`
 }
 
 type flushWriter struct {
@@ -53,21 +68,84 @@ func newProxyServer() (*proxyServer, error) {
 	httpClient := *client.HTTPClient()
 	httpClient.Timeout = 0
 
+	webSearchBase := os.Getenv("TINFOIL_WEBSEARCH_API_BASE")
+	if webSearchBase == "" {
+		webSearchBase = defaultWebSearchAPIBase
+	}
+
+	parsedWebSearchBase, err := url.Parse(webSearchBase)
+	if err != nil {
+		return nil, err
+	}
+	if parsedWebSearchBase.Scheme == "" || parsedWebSearchBase.Host == "" {
+		return nil, errors.New("TINFOIL_WEBSEARCH_API_BASE must be an absolute URL")
+	}
+
 	return &proxyServer{
-		httpClient:  &httpClient,
-		apiKey:      apiKey,
-		enclaveHost: client.Enclave(),
+		httpClient:      &httpClient,
+		webSearchClient: &http.Client{},
+		apiKey:          apiKey,
+		enclaveHost:     client.Enclave(),
+		webSearchBase:   parsedWebSearchBase,
 	}, nil
 }
 
 func (s *proxyServer) upstreamURL(path, rawQuery string) string {
-	upstream := url.URL{
-		Scheme:   "https",
-		Host:     s.enclaveHost,
-		Path:     path,
-		RawQuery: rawQuery,
-	}
+	return buildUpstreamURL(url.URL{
+		Scheme: "https",
+		Host:   s.enclaveHost,
+	}, path, rawQuery)
+}
+
+func buildUpstreamURL(base url.URL, path, rawQuery string) string {
+	upstream := base
+	upstream.Path = joinURLPath(base.Path, path)
+	upstream.RawQuery = rawQuery
 	return upstream.String()
+}
+
+func joinURLPath(basePath, path string) string {
+	trimmedPath := strings.TrimLeft(path, "/")
+	if basePath == "" || basePath == "/" {
+		return "/" + trimmedPath
+	}
+
+	return strings.TrimRight(basePath, "/") + "/" + trimmedPath
+}
+
+func shouldUseWebSearchUpstream(body []byte) bool {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return false
+	}
+
+	var envelope chatCompletionEnvelope
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return false
+	}
+	if envelope.WebSearchOptions == nil {
+		return false
+	}
+
+	return !bytes.Equal(bytes.TrimSpace(*envelope.WebSearchOptions), []byte("null"))
+}
+
+func (s *proxyServer) resolveUpstreamTarget(path string, body []byte) upstreamTarget {
+	if path == "/v1/chat/completions" && shouldUseWebSearchUpstream(body) {
+		return upstreamTarget{
+			client:  s.webSearchClient,
+			baseURL: *s.webSearchBase,
+			name:    "websearch",
+		}
+	}
+
+	return upstreamTarget{
+		client: s.httpClient,
+		baseURL: url.URL{
+			Scheme: "https",
+			Host:   s.enclaveHost,
+		},
+		name: "enclave",
+	}
 }
 
 func shouldSkipHeader(name string) bool {
@@ -171,11 +249,25 @@ func doWithResponseStartTimeout(
 }
 
 func (s *proxyServer) proxy(c *gin.Context, path string) {
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		log.Printf("failed to read request body for %s: %v", path, err)
+		writeProxyError(c, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+
+	target := s.resolveUpstreamTarget(path, body)
+	upstreamURL := buildUpstreamURL(target.baseURL, path, c.Request.URL.RawQuery)
+
+	if target.name == "websearch" {
+		log.Printf("routing %s to experimental web search upstream %s", path, target.baseURL.Host)
+	}
+
 	req, err := http.NewRequestWithContext(
 		c.Request.Context(),
 		c.Request.Method,
-		s.upstreamURL(path, c.Request.URL.RawQuery),
-		c.Request.Body,
+		upstreamURL,
+		bytes.NewReader(body),
 	)
 	if err != nil {
 		log.Printf("failed to create upstream request for %s: %v", path, err)
@@ -185,9 +277,9 @@ func (s *proxyServer) proxy(c *gin.Context, path string) {
 
 	copyHeaders(req.Header, c.Request.Header)
 	req.Header.Set("Authorization", "Bearer "+s.apiKey)
-	req.Host = s.enclaveHost
+	req.Host = target.baseURL.Host
 
-	resp, err := doWithResponseStartTimeout(s.httpClient, req, upstreamResponseStartTimeout)
+	resp, err := doWithResponseStartTimeout(target.client, req, upstreamResponseStartTimeout)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			log.Printf("upstream response start timed out for %s after %s", path, upstreamResponseStartTimeout)

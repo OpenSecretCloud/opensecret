@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -72,6 +73,87 @@ func TestUpstreamURLPreservesQuery(t *testing.T) {
 
 	if got != want {
 		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestShouldUseWebSearchUpstream(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{
+			name: "enabled",
+			body: `{"model":"gemma4-31b","web_search_options":{}}`,
+			want: true,
+		},
+		{
+			name: "missing",
+			body: `{"model":"gemma4-31b"}`,
+			want: false,
+		},
+		{
+			name: "null",
+			body: `{"model":"gemma4-31b","web_search_options":null}`,
+			want: false,
+		},
+		{
+			name: "invalid json",
+			body: `{`,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldUseWebSearchUpstream([]byte(tt.body)); got != tt.want {
+				t.Fatalf("expected %v, got %v", tt.want, got)
+			}
+		})
+	}
+}
+
+func TestBuildUpstreamURLAppendsBasePath(t *testing.T) {
+	base, err := url.Parse("https://search.example.com/internal")
+	if err != nil {
+		t.Fatalf("failed to parse URL: %v", err)
+	}
+
+	got := buildUpstreamURL(*base, "/v1/chat/completions", "stream=false")
+	want := "https://search.example.com/internal/v1/chat/completions?stream=false"
+
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestResolveUpstreamTargetRoutesWebSearchRequests(t *testing.T) {
+	webSearchBase, err := url.Parse("https://search.example.com")
+	if err != nil {
+		t.Fatalf("failed to parse URL: %v", err)
+	}
+
+	server := &proxyServer{
+		httpClient:      &http.Client{},
+		webSearchClient: &http.Client{},
+		enclaveHost:     "enclave.example.com",
+		webSearchBase:   webSearchBase,
+	}
+
+	target := server.resolveUpstreamTarget("/v1/chat/completions", []byte(`{"web_search_options":{}}`))
+	if target.name != "websearch" {
+		t.Fatalf("expected websearch target, got %q", target.name)
+	}
+	if target.baseURL.Host != "search.example.com" {
+		t.Fatalf("expected search host, got %q", target.baseURL.Host)
+	}
+
+	target = server.resolveUpstreamTarget("/v1/chat/completions", []byte(`{"messages":[]}`))
+	if target.name != "enclave" {
+		t.Fatalf("expected enclave target, got %q", target.name)
+	}
+	if target.baseURL.Host != "enclave.example.com" {
+		t.Fatalf("expected enclave host, got %q", target.baseURL.Host)
 	}
 }
 

@@ -1520,27 +1520,23 @@ async fn classify_and_execute_tools(
         debug!("Sent tool_call {} to streams", tool_call_id);
 
         // Execute web search tool (or capture error as content)
-        let tool_output = match tools::execute_tool(
-            "web_search",
-            &tool_arguments,
-            state.brave_client.as_ref(),
-            state.kagi_client.as_ref(),
-        )
-        .await
-        {
-            Ok(output) => {
-                debug!(
-                    "Tool execution successful, output length: {} chars",
-                    output.len()
-                );
-                output
-            }
-            Err(e) => {
-                warn!("Tool execution failed, including error in output: {:?}", e);
-                // Failure becomes content, not a skip!
-                format!("Error: {}", e)
-            }
-        };
+        let tool_output =
+            match tools::execute_tool("web_search", &tool_arguments, state.brave_client.as_ref())
+                .await
+            {
+                Ok(output) => {
+                    debug!(
+                        "Tool execution successful, output length: {} chars",
+                        output.len()
+                    );
+                    output
+                }
+                Err(e) => {
+                    warn!("Tool execution failed, including error in output: {:?}", e);
+                    // Failure becomes content, not a skip!
+                    format!("Error: {}", e)
+                }
+            };
 
         // Send tool_output event through both streams (ALWAYS sent, even on failure)
         let tool_output_msg = StorageMessage::ToolOutput {
@@ -2051,11 +2047,11 @@ async fn create_response_stream(
             // Run phases 5-6 with cancellation support
             tokio::select! {
                 _ = async {
-                    // Phase 5: Classify intent and execute tools (if tool_choice allows it AND web_search is enabled AND Kagi client available)
+                    // Phase 5: Classify intent and execute tools (if tool_choice allows it AND web_search is enabled AND Brave client available)
                     let tools_executed = if is_tool_choice_allowed(&orchestrator_body.tool_choice)
                         && is_web_search_enabled(&orchestrator_body.tools)
-                        && orchestrator_state.kagi_client.is_some() {
-                        debug!("Orchestrator: tool_choice allows tools, web search enabled, and Kagi client available, proceeding with classification");
+                        && orchestrator_state.brave_client.is_some() {
+                        debug!("Orchestrator: tool_choice allows tools, web search enabled, and Brave client available, proceeding with classification");
 
                         let prepared_for_tools = PreparedRequest {
                             user_key,
@@ -2100,7 +2096,7 @@ async fn create_response_stream(
                             }
                         }
                     } else {
-                        debug!("Orchestrator: Web search tool not enabled or Kagi client not available, skipping classification");
+                        debug!("Orchestrator: Web search tool not enabled or Brave client not available, skipping classification");
                         drop(rx_tool_ack);
                         false
                     };

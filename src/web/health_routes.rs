@@ -61,14 +61,17 @@ pub async fn health_check_extended(
         .pool_idle_timeout(Duration::from_secs(15))
         .build::<_, Body>(https);
 
-    // Try to fetch models directly from the proxy with a timeout
+    // Try to fetch models directly from the tinfoil proxy with a timeout
     let timeout_duration = Duration::from_secs(5);
 
-    let default_proxy = state.proxy_router.get_completion_proxy();
+    let tinfoil_proxy = state.proxy_router.get_tinfoil_proxy().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Tinfoil proxy is not configured".to_string(),
+    ))?;
 
     let result = timeout(
         timeout_duration,
-        fetch_models_directly(&client, &default_proxy),
+        fetch_models_directly(&client, &tinfoil_proxy),
     )
     .await;
 
@@ -79,7 +82,7 @@ pub async fn health_check_extended(
             outbound_connectivity: true,
             model_check: Some(format!(
                 "Successfully fetched {} models from {}",
-                model_count, default_proxy.provider_name
+                model_count, tinfoil_proxy.provider_name
             )),
             error: None,
         })),
@@ -89,7 +92,7 @@ pub async fn health_check_extended(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
                     "Failed to fetch models from {}: {}",
-                    default_proxy.provider_name, e
+                    tinfoil_proxy.provider_name, e
                 ),
             ))
         }
@@ -99,7 +102,7 @@ pub async fn health_check_extended(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!(
                     "Model fetch from {} timed out after 5 seconds",
-                    default_proxy.provider_name
+                    tinfoil_proxy.provider_name
                 ),
             ))
         }

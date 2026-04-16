@@ -95,7 +95,7 @@ enum AssistantTurnOutcome {
 fn should_enable_web_search_tool(state: &AppState, body: &ResponsesCreateRequest) -> bool {
     is_tool_choice_allowed(&body.tool_choice)
         && is_web_search_enabled(&body.tools)
-        && state.brave_client.is_some()
+        && state.has_web_search_client()
 }
 
 fn build_internal_system_prompt_for_now(
@@ -1818,6 +1818,7 @@ async fn execute_tool_call_and_wait(
     let tool_output = match tools::execute_tool(
         &tool_call.name,
         &tool_call.arguments,
+        state.tinfoil_web_search_client.as_ref(),
         state.brave_client.as_ref(),
     )
     .await

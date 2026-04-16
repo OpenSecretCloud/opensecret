@@ -86,6 +86,7 @@ mod os_flags;
 mod private_key;
 mod proxy_config;
 mod sqs;
+mod tinfoil_websearch;
 mod tokens;
 mod web;
 
@@ -417,6 +418,7 @@ pub struct AppState {
     apple_jwt_verifier: Arc<AppleJwtVerifier>,
     cancellation_broadcast: tokio::sync::broadcast::Sender<Uuid>,
     brave_client: Option<Arc<crate::brave::BraveClient>>,
+    tinfoil_web_search_client: Option<Arc<crate::tinfoil_websearch::TinfoilWebSearchClient>>,
 }
 
 #[derive(Default)]
@@ -443,6 +445,9 @@ pub struct AppStateBuilder {
     os_flags_base_url: Option<String>,
     os_flags_api_key: Option<String>,
     brave_api_key: Option<String>,
+    tinfoil_web_search_api_base: Option<String>,
+    tinfoil_web_search_api_key: Option<String>,
+    tinfoil_web_search_allow_insecure_tls: bool,
 }
 
 impl AppStateBuilder {
@@ -559,6 +564,30 @@ impl AppStateBuilder {
 
     pub fn brave_api_key(mut self, brave_api_key: Option<String>) -> Self {
         self.brave_api_key = brave_api_key;
+        self
+    }
+
+    pub fn tinfoil_web_search_api_base(
+        mut self,
+        tinfoil_web_search_api_base: Option<String>,
+    ) -> Self {
+        self.tinfoil_web_search_api_base = tinfoil_web_search_api_base;
+        self
+    }
+
+    pub fn tinfoil_web_search_api_key(
+        mut self,
+        tinfoil_web_search_api_key: Option<String>,
+    ) -> Self {
+        self.tinfoil_web_search_api_key = tinfoil_web_search_api_key;
+        self
+    }
+
+    pub fn tinfoil_web_search_allow_insecure_tls(
+        mut self,
+        tinfoil_web_search_allow_insecure_tls: bool,
+    ) -> Self {
+        self.tinfoil_web_search_allow_insecure_tls = tinfoil_web_search_allow_insecure_tls;
         self
     }
 
@@ -690,6 +719,42 @@ impl AppStateBuilder {
             None
         };
 
+        let tinfoil_web_search_client = match (
+            self.tinfoil_web_search_api_base.as_ref(),
+            self.tinfoil_web_search_api_key.as_ref(),
+        ) {
+            (Some(base_url), Some(api_key)) => {
+                tracing::info!("Initializing Tinfoil web search client");
+                match crate::tinfoil_websearch::TinfoilWebSearchClient::new(
+                    base_url.clone(),
+                    api_key.clone(),
+                    self.tinfoil_web_search_allow_insecure_tls,
+                ) {
+                    Ok(client) => {
+                        tracing::debug!("Tinfoil web search client initialized successfully");
+                        Some(Arc::new(client))
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to initialize Tinfoil web search client: {:?}. Tinfoil-backed web search will be unavailable.",
+                            e
+                        );
+                        None
+                    }
+                }
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                tracing::warn!(
+                    "Incomplete Tinfoil web search configuration; both base URL and API key are required"
+                );
+                None
+            }
+            (None, None) => {
+                tracing::debug!("Tinfoil web search not configured");
+                None
+            }
+        };
+
         Ok(AppState {
             app_mode,
             db,
@@ -707,6 +772,7 @@ impl AppStateBuilder {
             apple_jwt_verifier,
             cancellation_broadcast: cancellation_tx,
             brave_client,
+            tinfoil_web_search_client,
         })
     }
 }
@@ -714,6 +780,10 @@ impl AppStateBuilder {
 impl AppState {
     pub fn os_flags(&self) -> Option<&os_flags::OsFlagsClient> {
         self.os_flags_client.as_ref()
+    }
+
+    pub fn has_web_search_client(&self) -> bool {
+        self.tinfoil_web_search_client.is_some() || self.brave_client.is_some()
     }
 
     pub async fn is_feature_enabled(&self, user_uuid: Uuid, flag_key: &str) -> bool {
@@ -2519,6 +2589,13 @@ async fn main() -> Result<(), Error> {
 
     // Tinfoil API base is always from environment (like OpenAI API base)
     let tinfoil_api_base = env::var("TINFOIL_API_BASE").ok();
+    let tinfoil_web_search_api_base = env::var("TINFOIL_WEB_SEARCH_API_BASE").ok();
+    let tinfoil_web_search_api_key = env::var("TINFOIL_WEB_SEARCH_API_KEY")
+        .ok()
+        .or_else(|| env::var("TINFOIL_API_KEY").ok());
+    let tinfoil_web_search_allow_insecure_tls = env::var("TINFOIL_WEB_SEARCH_ALLOW_INSECURE_TLS")
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
 
     let jwt_secret = get_or_create_jwt_secret(
         &app_mode,
@@ -2658,6 +2735,9 @@ async fn main() -> Result<(), Error> {
         .os_flags_base_url(os_flags_base_url)
         .os_flags_api_key(os_flags_api_key)
         .brave_api_key(brave_api_key)
+        .tinfoil_web_search_api_base(tinfoil_web_search_api_base)
+        .tinfoil_web_search_api_key(tinfoil_web_search_api_key)
+        .tinfoil_web_search_allow_insecure_tls(tinfoil_web_search_allow_insecure_tls)
         .build()
         .await?;
     tracing::info!("App state created, app_mode: {:?}", app_mode);

@@ -4,34 +4,69 @@
 //! architecture that can be extended for additional tools in the future.
 
 use crate::brave::{BraveClient, SearchRequest as BraveSearchRequest};
+use crate::tinfoil_websearch::TinfoilWebSearchClient;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
-/// Execute web search using Brave Search API
-///
-/// Requires a Brave client to be provided (initialized at startup with connection pooling).
+/// Execute web search using the configured backend.
 pub async fn execute_web_search(
     query: &str,
+    max_results: Option<u32>,
+    tinfoil_web_search_client: Option<&Arc<TinfoilWebSearchClient>>,
     brave_client: Option<&Arc<BraveClient>>,
 ) -> Result<String, String> {
     trace!("Executing web search for query: {}", query);
     info!("Executing web search");
 
+    if let Some(client) = tinfoil_web_search_client {
+        return execute_tinfoil_search(query, max_results, client).await;
+    }
+
     if let Some(client) = brave_client {
-        execute_brave_search(query, client).await
+        execute_brave_search(query, max_results, client).await
     } else {
         error!("No search client configured");
         Err("No search client configured".to_string())
     }
 }
 
+async fn execute_tinfoil_search(
+    query: &str,
+    max_results: Option<u32>,
+    client: &Arc<TinfoilWebSearchClient>,
+) -> Result<String, String> {
+    trace!("Executing Tinfoil web search for query: {}", query);
+
+    let result = client
+        .search(query, max_results.map(|value| value.clamp(1, 30)))
+        .await
+        .map_err(|e| {
+            error!("Tinfoil web search API error: {:?}", e);
+            format!("Search API error: {:?}", e)
+        })?;
+
+    let formatted = format_tinfoil_search_result(&result);
+    if formatted.trim().is_empty() {
+        warn!("No Tinfoil web search results found");
+        return Ok(format!("No results found for query: '{}'", query));
+    }
+
+    Ok(formatted)
+}
+
 /// Execute web search using Brave Search API
-async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<String, String> {
+async fn execute_brave_search(
+    query: &str,
+    max_results: Option<u32>,
+    client: &Arc<BraveClient>,
+) -> Result<String, String> {
     trace!("Executing Brave search for query: {}", query);
+    let result_limit = max_results.unwrap_or(5).clamp(1, 30) as usize;
 
     // Create search request with summary enabled
     let mut search_request = BraveSearchRequest::new(query.to_string());
+    search_request.count = Some(result_limit as u32);
     search_request.summary = Some(true);
 
     // Execute search
@@ -47,7 +82,7 @@ async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<
     if let Some(web) = response.web {
         if let Some(results) = web.results {
             result_text.push_str("Search Results:\n\n");
-            for (i, result) in results.iter().take(5).enumerate() {
+            for (i, result) in results.iter().take(result_limit).enumerate() {
                 result_text.push_str(&format!(
                     "{}. {}\n   URL: {}\n   {}\n\n",
                     i + 1,
@@ -74,7 +109,7 @@ async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<
         if let Some(news_results) = news.results {
             if !news_results.is_empty() {
                 result_text.push_str("\nNews:\n\n");
-                for (i, result) in news_results.iter().take(3).enumerate() {
+                for (i, result) in news_results.iter().take(result_limit.min(3)).enumerate() {
                     result_text.push_str(&format!(
                         "{}. {}\n   URL: {}\n   {}\n\n",
                         i + 1,
@@ -124,6 +159,90 @@ async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<
 
     Ok(result_text)
 }
+
+fn format_tinfoil_search_result(result: &Value) -> String {
+    let content_text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .filter(|text| !text.is_empty());
+
+    if let Some(text) = content_text {
+        return text;
+    }
+
+    let structured_content = result
+        .get("structuredContent")
+        .or_else(|| result.get("structured_content"))
+        .unwrap_or(result);
+
+    let formatted_results = structured_content
+        .get("results")
+        .and_then(Value::as_array)
+        .map(|results| format_search_results(results))
+        .filter(|text| !text.is_empty());
+
+    if let Some(text) = formatted_results {
+        return text;
+    }
+
+    if let Some(text) = structured_content.as_str() {
+        return text.to_string();
+    }
+
+    serde_json::to_string_pretty(structured_content)
+        .unwrap_or_else(|_| structured_content.to_string())
+}
+
+fn format_search_results(results: &[Value]) -> String {
+    let mut formatted = String::new();
+
+    if !results.is_empty() {
+        formatted.push_str("Search Results:\n\n");
+    }
+
+    for (index, result) in results.iter().enumerate() {
+        let title = result
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Untitled result");
+        let url = result
+            .get("url")
+            .or_else(|| result.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let snippet = [
+            "text",
+            "snippet",
+            "summary",
+            "description",
+            "content",
+            "highlights",
+        ]
+        .iter()
+        .find_map(|field| result.get(field).and_then(Value::as_str))
+        .unwrap_or("");
+
+        formatted.push_str(&format!("{}. {}\n", index + 1, title));
+        if !url.is_empty() {
+            formatted.push_str(&format!("   URL: {}\n", url));
+        }
+        if !snippet.is_empty() {
+            formatted.push_str(&format!("   {}\n", snippet));
+        }
+        formatted.push('\n');
+    }
+
+    formatted.trim().to_string()
+}
 /// Execute a tool by name with the given arguments
 ///
 /// This is the main entry point for tool execution. It routes to the appropriate
@@ -132,6 +251,7 @@ async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<
 /// # Arguments
 /// * `tool_name` - The name of the tool to execute (e.g., "web_search")
 /// * `arguments` - JSON object containing the tool's arguments
+/// * `tinfoil_web_search_client` - Optional Tinfoil web search client
 /// * `brave_client` - Optional Brave client (with connection pooling)
 ///
 /// # Returns
@@ -140,6 +260,7 @@ async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<
 pub async fn execute_tool(
     tool_name: &str,
     arguments: &Value,
+    tinfoil_web_search_client: Option<&Arc<TinfoilWebSearchClient>>,
     brave_client: Option<&Arc<BraveClient>>,
 ) -> Result<String, String> {
     trace!(
@@ -156,8 +277,12 @@ pub async fn execute_tool(
                 .get("query")
                 .and_then(|q| q.as_str())
                 .ok_or_else(|| "Missing 'query' argument for web_search".to_string())?;
+            let max_results = arguments
+                .get("max_results")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as u32);
 
-            execute_web_search(query, brave_client).await
+            execute_web_search(query, max_results, tinfoil_web_search_client, brave_client).await
         }
         _ => {
             error!("Unknown tool requested: {}", tool_name);
@@ -195,6 +320,10 @@ impl ToolRegistry {
                         "query": {
                             "type": "string",
                             "description": "The search query to execute"
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Optional maximum number of results to return"
                         }
                     },
                     "required": ["query"]
@@ -223,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_web_search_no_client() {
-        let result = execute_web_search("test query", None).await;
+        let result = execute_web_search("test query", None, None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No search client configured"));
     }
@@ -232,7 +361,7 @@ mod tests {
     async fn test_execute_tool_missing_args() {
         // Test with None client - should fail on missing args before client check
         let args = json!({});
-        let result = execute_tool("web_search", &args, None).await;
+        let result = execute_tool("web_search", &args, None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Missing 'query'"));
     }
@@ -240,9 +369,47 @@ mod tests {
     #[tokio::test]
     async fn test_execute_tool_unknown() {
         let args = json!({"query": "test"});
-        let result = execute_tool("unknown_tool", &args, None).await;
+        let result = execute_tool("unknown_tool", &args, None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown tool"));
+    }
+
+    #[test]
+    fn test_format_tinfoil_search_result_prefers_text_content() {
+        let result = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Search Results:\n\n1. Example\n   URL: https://example.com"
+                }
+            ]
+        });
+
+        assert_eq!(
+            format_tinfoil_search_result(&result),
+            "Search Results:\n\n1. Example\n   URL: https://example.com"
+        );
+    }
+
+    #[test]
+    fn test_format_tinfoil_search_result_formats_structured_results() {
+        let result = json!({
+            "structuredContent": {
+                "results": [
+                    {
+                        "title": "Example",
+                        "url": "https://example.com",
+                        "text": "Example summary"
+                    }
+                ]
+            }
+        });
+
+        let formatted = format_tinfoil_search_result(&result);
+        assert!(formatted.contains("Search Results:"));
+        assert!(formatted.contains("Example"));
+        assert!(formatted.contains("https://example.com"));
+        assert!(formatted.contains("Example summary"));
     }
 
     #[test]

@@ -756,6 +756,7 @@ impl NewConversation {
                     completion_tokens: 0,
                     status: "in_progress".to_string(),
                     finish_reason: None,
+                    created_at: Utc::now(),
                 };
                 placeholder_assistant.insert(tx)?;
             }
@@ -894,6 +895,7 @@ pub struct NewToolCall {
     pub arguments_enc: Option<Vec<u8>>,
     pub argument_tokens: i32,
     pub status: String,
+    pub created_at: DateTime<Utc>,
 }
 
 impl ToolCall {
@@ -956,6 +958,7 @@ pub struct NewToolOutput {
     pub output_tokens: i32,
     pub status: String,
     pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 impl NewToolOutput {
@@ -1000,6 +1003,7 @@ pub struct NewAssistantMessage {
     pub completion_tokens: i32,
     pub status: String,
     pub finish_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
 }
 
 impl AssistantMessage {

@@ -23,6 +23,7 @@ use super::handlers::StorageMessage;
 #[derive(Default)]
 struct PendingAssistantMessage {
     content: String,
+    created_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Default)]
@@ -43,12 +44,21 @@ fn clamp_token_count(text: &str, label: &str) -> i32 {
     }
 }
 
+fn allocate_created_at(
+    next_created_at: &mut chrono::DateTime<chrono::Utc>,
+) -> chrono::DateTime<chrono::Utc> {
+    let created_at = next_created_at.to_owned();
+    *next_created_at = created_at + chrono::Duration::microseconds(1);
+    created_at
+}
+
 fn create_assistant_message_if_missing(
     db: &Arc<dyn DBConnection + Send + Sync>,
     conversation_id: i64,
     response_id: i64,
     user_id: Uuid,
     item_id: Uuid,
+    created_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
     match db.get_assistant_message_by_uuid(item_id) {
         Ok(Some(_)) => Ok(()),
@@ -62,6 +72,7 @@ fn create_assistant_message_if_missing(
                 completion_tokens: 0,
                 status: STATUS_IN_PROGRESS.to_string(),
                 finish_reason: None,
+                created_at,
             })
             .map(|_| ())
             .map_err(|e| format!("Failed to create assistant message: {:?}", e)),
@@ -151,6 +162,7 @@ async fn persist_tool_call(
     tool_call_id: Uuid,
     name: String,
     arguments: serde_json::Value,
+    created_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
     let arguments_json = serde_json::to_string(&arguments)
         .map_err(|e| format!("Failed to serialize tool arguments: {:?}", e))?;
@@ -165,6 +177,7 @@ async fn persist_tool_call(
         arguments_enc: Some(arguments_enc),
         argument_tokens: clamp_token_count(&arguments_json, "tool arguments"),
         status: STATUS_COMPLETED.to_string(),
+        created_at,
     })
     .map(|_| ())
     .map_err(|e| format!("Failed to persist tool_call: {:?}", e))
@@ -180,6 +193,7 @@ async fn persist_tool_output(
     tool_output_id: Uuid,
     tool_call_id: Uuid,
     output: String,
+    created_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
     let tool_call_fk = db
         .get_tool_call_by_uuid(tool_call_id, user_id)
@@ -197,6 +211,7 @@ async fn persist_tool_output(
         output_tokens: clamp_token_count(&output, "tool output"),
         status: STATUS_COMPLETED.to_string(),
         error: None,
+        created_at,
     })
     .map(|_| ())
     .map_err(|e| format!("Failed to persist tool_output: {:?}", e))
@@ -246,7 +261,7 @@ pub async fn storage_task(
     tool_persist_ack: Option<mpsc::Sender<Result<(), String>>>,
     db: Arc<dyn DBConnection + Send + Sync>,
     response_id: i64,
-    reasoning_base_timestamp: chrono::DateTime<chrono::Utc>,
+    first_item_created_at: chrono::DateTime<chrono::Utc>,
     conversation_id: i64,
     user_id: Uuid,
     user_key: SecretKey,
@@ -255,19 +270,24 @@ pub async fn storage_task(
     let tool_ack = tool_persist_ack;
     let mut pending_messages: HashMap<Uuid, PendingAssistantMessage> = HashMap::new();
     let mut pending_reasoning: HashMap<Uuid, PendingReasoningItem> = HashMap::new();
-    let mut reasoning_offset_micros = 0i64;
+    let mut next_item_created_at = first_item_created_at;
 
     while let Some(msg) = rx.recv().await {
         match msg {
             StorageMessage::MessageStarted { item_id } => {
                 trace!("Storage: message started {}", item_id);
-                pending_messages.entry(item_id).or_default();
+                let pending = pending_messages.entry(item_id).or_default();
+                let created_at = pending
+                    .created_at
+                    .get_or_insert_with(|| allocate_created_at(&mut next_item_created_at))
+                    .to_owned();
                 if let Err(e) = create_assistant_message_if_missing(
                     &db,
                     conversation_id,
                     response_id,
                     user_id,
                     item_id,
+                    created_at,
                 ) {
                     error!("{}", e);
                 }
@@ -293,12 +313,16 @@ pub async fn storage_task(
                     item_id, finish_reason
                 );
                 let pending = pending_messages.remove(&item_id).unwrap_or_default();
+                let created_at = pending
+                    .created_at
+                    .unwrap_or_else(|| allocate_created_at(&mut next_item_created_at));
                 if let Err(e) = create_assistant_message_if_missing(
                     &db,
                     conversation_id,
                     response_id,
                     user_id,
                     item_id,
+                    created_at,
                 ) {
                     error!("{}", e);
                 }
@@ -318,9 +342,7 @@ pub async fn storage_task(
             StorageMessage::ReasoningStarted { item_id } => {
                 trace!("Storage: reasoning started {}", item_id);
                 pending_reasoning.entry(item_id).or_default();
-                let created_at = reasoning_base_timestamp
-                    + chrono::Duration::microseconds(reasoning_offset_micros);
-                reasoning_offset_micros += 1;
+                let created_at = allocate_created_at(&mut next_item_created_at);
                 if let Err(e) = create_reasoning_item(
                     &db,
                     conversation_id,
@@ -421,6 +443,7 @@ pub async fn storage_task(
                 arguments,
             } => {
                 trace!("Storage: persisting tool_call {}", tool_call_id);
+                let created_at = allocate_created_at(&mut next_item_created_at);
                 match persist_tool_call(
                     &db,
                     &user_key,
@@ -430,6 +453,7 @@ pub async fn storage_task(
                     tool_call_id,
                     name,
                     arguments,
+                    created_at,
                 )
                 .await
                 {
@@ -448,6 +472,7 @@ pub async fn storage_task(
                 output,
             } => {
                 trace!("Storage: persisting tool_output {}", tool_output_id);
+                let created_at = allocate_created_at(&mut next_item_created_at);
                 match persist_tool_output(
                     &db,
                     &user_key,
@@ -457,6 +482,7 @@ pub async fn storage_task(
                     tool_output_id,
                     tool_call_id,
                     output,
+                    created_at,
                 )
                 .await
                 {

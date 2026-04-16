@@ -232,10 +232,11 @@ mod tests {
     use super::{
         append_streamed_tool_calls, apply_responses_model_defaults,
         build_internal_system_prompt_for_now, build_provider_tools, finalize_first_model_tool_call,
-        StreamedToolCall, MAPLE_WEB_SEARCH_PROMPT,
+        ClientResponseState, StreamedToolCall, MAPLE_WEB_SEARCH_PROMPT,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
+    use uuid::Uuid;
 
     #[test]
     fn test_apply_responses_model_defaults_enables_gemma_thinking() {
@@ -320,6 +321,39 @@ mod tests {
 
         assert!(prompt.contains("Current UTC date: Wednesday, 2026-04-15."));
         assert!(prompt.contains(MAPLE_WEB_SEARCH_PROMPT));
+    }
+
+    #[test]
+    fn test_client_response_state_build_output_items_uses_maple_tool_types() {
+        let mut state = ClientResponseState::default();
+        let tool_call_id = Uuid::new_v4();
+        let tool_output_id = Uuid::new_v4();
+
+        state.push_tool_call(
+            tool_call_id,
+            "web_search".to_string(),
+            json!({ "query": "ufc" }),
+        );
+        state.push_tool_output(
+            tool_output_id,
+            tool_call_id,
+            "Search Results:\n\n1. Example".to_string(),
+        );
+
+        let output_items = state.build_output_items();
+        let tool_call_id_str = tool_call_id.to_string();
+
+        assert_eq!(output_items.len(), 2);
+        assert_eq!(output_items[0].output_type, "tool_call");
+        assert_eq!(
+            output_items[0].call_id.as_deref(),
+            Some(tool_call_id_str.as_str())
+        );
+        assert_eq!(output_items[1].output_type, "tool_output");
+        assert_eq!(
+            output_items[1].call_id.as_deref(),
+            Some(tool_call_id_str.as_str())
+        );
     }
 }
 
@@ -555,19 +589,19 @@ pub struct OutputItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<Vec<ContentPart>>,
 
-    /// Tool call ID (for function_call / function_call_output types)
+    /// Tool call ID (for tool_call / tool_output types)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
 
-    /// Tool/function name (for function_call type)
+    /// Tool/function name (for tool_call type)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 
-    /// Function arguments JSON (for function_call type)
+    /// Tool arguments JSON (for tool_call type)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<String>,
 
-    /// Function output payload (for function_call_output type)
+    /// Tool output payload (for tool_output type)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
 }
@@ -932,6 +966,9 @@ pub struct ToolCallCreatedEvent {
     /// Sequence number for ordering
     pub sequence_number: i32,
 
+    /// Index of the corresponding output item
+    pub output_index: i32,
+
     /// Tool call ID
     pub tool_call_id: Uuid,
 
@@ -951,6 +988,9 @@ pub struct ToolOutputCreatedEvent {
 
     /// Sequence number for ordering
     pub sequence_number: i32,
+
+    /// Index of the corresponding output item
+    pub output_index: i32,
 
     /// Tool output ID
     pub tool_output_id: Uuid,
@@ -1019,13 +1059,13 @@ enum StreamOutputItemRecord {
         id: Uuid,
         text: String,
     },
-    FunctionCall {
+    ToolCall {
         id: Uuid,
         call_id: Uuid,
         name: String,
         arguments: String,
     },
-    FunctionCallOutput {
+    ToolOutput {
         id: Uuid,
         call_id: Uuid,
         output: String,
@@ -1059,26 +1099,28 @@ impl ClientResponseState {
         output_index as i32
     }
 
-    fn push_function_call(&mut self, item_id: Uuid, name: String, arguments: Value) {
+    fn push_tool_call(&mut self, item_id: Uuid, name: String, arguments: Value) -> i32 {
         let output_index = self.items.len();
         let arguments = serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
-        self.items.push(StreamOutputItemRecord::FunctionCall {
+        self.items.push(StreamOutputItemRecord::ToolCall {
             id: item_id,
             call_id: item_id,
             name,
             arguments,
         });
         self.indices.insert(item_id, output_index);
+        output_index as i32
     }
 
-    fn push_function_call_output(&mut self, item_id: Uuid, call_id: Uuid, output: String) {
+    fn push_tool_output(&mut self, item_id: Uuid, call_id: Uuid, output: String) -> i32 {
         let output_index = self.items.len();
-        self.items.push(StreamOutputItemRecord::FunctionCallOutput {
+        self.items.push(StreamOutputItemRecord::ToolOutput {
             id: item_id,
             call_id,
             output,
         });
         self.indices.insert(item_id, output_index);
+        output_index as i32
     }
 
     fn message_output_index(&self, item_id: Uuid) -> Option<i32> {
@@ -1153,14 +1195,14 @@ impl ClientResponseState {
                     arguments: None,
                     output: None,
                 },
-                StreamOutputItemRecord::FunctionCall {
+                StreamOutputItemRecord::ToolCall {
                     id,
                     call_id,
                     name,
                     arguments,
                 } => OutputItem {
                     id: id.to_string(),
-                    output_type: "function_call".to_string(),
+                    output_type: "tool_call".to_string(),
                     status: STATUS_COMPLETED.to_string(),
                     role: None,
                     content: None,
@@ -1169,13 +1211,13 @@ impl ClientResponseState {
                     arguments: Some(arguments.clone()),
                     output: None,
                 },
-                StreamOutputItemRecord::FunctionCallOutput {
+                StreamOutputItemRecord::ToolOutput {
                     id,
                     call_id,
                     output,
                 } => OutputItem {
                     id: id.to_string(),
-                    output_type: "function_call_output".to_string(),
+                    output_type: "tool_output".to_string(),
                     status: STATUS_COMPLETED.to_string(),
                     role: None,
                     content: None,
@@ -1612,12 +1654,8 @@ async fn build_context_and_check_billing(
 /// - Creates Response record (status=in_progress)
 /// - Creates user message
 ///
-/// Note: Assistant message is NOT created here - it's created later in Phase 6 (after tools).
-/// Originally, the assistant placeholder was created here, but this caused timestamp
-/// ordering issues: the assistant message would get created_at=T1 (early), then tools
-/// would execute at T2/T3, making the assistant appear BEFORE its tools in queries
-/// ordered by created_at. By creating the assistant message in Phase 6 (after tools),
-/// we ensure the correct semantic order: user → tool_call → tool_output → assistant.
+/// Note: Assistant and tool items are NOT created here - they're created later by the
+/// storage task as stream events arrive so persisted ordering matches the emitted item order.
 async fn persist_request_data(
     state: &Arc<AppState>,
     user: &User,
@@ -1694,8 +1732,8 @@ async fn persist_request_data(
         .create_user_message(new_msg)
         .map_err(error_mapping::map_generic_db_error)?;
 
-    // Capture user message timestamp for reasoning item ordering
-    // Reasoning should appear after user message but before assistant message
+    // Capture the user message timestamp so persisted response items can be assigned
+    // a single monotonic created_at sequence immediately after the user message.
     let user_message_created_at = user_message.created_at;
 
     info!(
@@ -2264,10 +2302,9 @@ async fn create_response_stream(
     let total_prompt_tokens = context.total_prompt_tokens;
     let response_id = persisted.response.id;
     let response_uuid = persisted.response.uuid;
-    // Use user_message timestamp + 1 microsecond for reasoning items to ensure proper ordering:
-    // user_message < reasoning < assistant_message
-    // Using 1 microsecond because it's the smallest safe offset - DB roundtrips always take more than this
-    let reasoning_base_timestamp =
+    // Persist all generated response items on a single monotonic timestamp sequence that
+    // begins immediately after the user message so retrieval order matches stream order.
+    let first_response_item_created_at =
         persisted.user_message_created_at + chrono::Duration::microseconds(1);
     let conversation_id = context.conversation.id;
     let user_id = user.uuid;
@@ -2326,7 +2363,7 @@ async fn create_response_stream(
                     Some(tx_tool_ack),
                     db,
                     response_id,
-                    reasoning_base_timestamp,
+                    first_response_item_created_at,
                     conversation_id,
                     user_id,
                     user_key,
@@ -2647,35 +2684,118 @@ async fn create_response_stream(
                 }
                 StorageMessage::ToolCall { tool_call_id, name, arguments } => {
                     debug!("Client stream received tool_call event: {} ({})", name, tool_call_id);
-                    client_state.push_function_call(tool_call_id, name.clone(), arguments.clone());
+                    let tool_name = name.clone();
+                    let arguments_json =
+                        serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
+                    let output_index =
+                        client_state.push_tool_call(tool_call_id, tool_name.clone(), arguments.clone());
+
+                    let output_item_added_event = ResponseOutputItemAddedEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
+                        sequence_number: emitter.sequence_number(),
+                        output_index,
+                        item: OutputItem {
+                            id: tool_call_id.to_string(),
+                            output_type: "tool_call".to_string(),
+                            status: STATUS_IN_PROGRESS.to_string(),
+                            role: None,
+                            content: None,
+                            call_id: Some(tool_call_id.to_string()),
+                            name: Some(tool_name.clone()),
+                            arguments: Some(arguments_json.clone()),
+                            output: None,
+                        },
+                    };
+
+                    yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
+
                     // Send tool_call.created event
                     let tool_call_event = ToolCallCreatedEvent {
                         event_type: EVENT_TOOL_CALL_CREATED,
                         sequence_number: emitter.sequence_number(),
+                        output_index,
                         tool_call_id,
                         name,
                         arguments,
                     };
 
                     yield Ok(ResponseEvent::ToolCallCreated(tool_call_event).to_sse_event(&mut emitter).await);
+
+                    let output_item_done_event = ResponseOutputItemDoneEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
+                        sequence_number: emitter.sequence_number(),
+                        output_index,
+                        item: OutputItem {
+                            id: tool_call_id.to_string(),
+                            output_type: "tool_call".to_string(),
+                            status: STATUS_COMPLETED.to_string(),
+                            role: None,
+                            content: None,
+                            call_id: Some(tool_call_id.to_string()),
+                            name: Some(tool_name),
+                            arguments: Some(arguments_json),
+                            output: None,
+                        },
+                    };
+
+                    yield Ok(ResponseEvent::OutputItemDone(output_item_done_event).to_sse_event(&mut emitter).await);
                 }
                 StorageMessage::ToolOutput { tool_output_id, tool_call_id, output } => {
                     debug!("Client stream received tool_output event: {}", tool_output_id);
-                    client_state.push_function_call_output(
+                    let output_index = client_state.push_tool_output(
                         tool_output_id,
                         tool_call_id,
                         output.clone(),
                     );
+                    let output_item_added_event = ResponseOutputItemAddedEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
+                        sequence_number: emitter.sequence_number(),
+                        output_index,
+                        item: OutputItem {
+                            id: tool_output_id.to_string(),
+                            output_type: "tool_output".to_string(),
+                            status: STATUS_IN_PROGRESS.to_string(),
+                            role: None,
+                            content: None,
+                            call_id: Some(tool_call_id.to_string()),
+                            name: None,
+                            arguments: None,
+                            output: Some(output.clone()),
+                        },
+                    };
+
+                    yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
+
                     // Send tool_output.created event
                     let tool_output_event = ToolOutputCreatedEvent {
                         event_type: EVENT_TOOL_OUTPUT_CREATED,
                         sequence_number: emitter.sequence_number(),
+                        output_index,
                         tool_output_id,
                         tool_call_id,
-                        output,
+                        output: output.clone(),
                     };
 
                     yield Ok(ResponseEvent::ToolOutputCreated(tool_output_event).to_sse_event(&mut emitter).await);
+
+                    let output_item_done_event = ResponseOutputItemDoneEvent {
+                        event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
+                        sequence_number: emitter.sequence_number(),
+                        output_index,
+                        item: OutputItem {
+                            id: tool_output_id.to_string(),
+                            output_type: "tool_output".to_string(),
+                            status: STATUS_COMPLETED.to_string(),
+                            role: None,
+                            content: None,
+                            call_id: Some(tool_call_id.to_string()),
+                            name: None,
+                            arguments: None,
+                            output: Some(output),
+                        },
+                    };
+
+                    yield Ok(ResponseEvent::OutputItemDone(output_item_done_event).to_sse_event(&mut emitter).await);
                 }
             }
         }
@@ -2772,7 +2892,7 @@ async fn get_response(
 
                 output_items.push(OutputItem {
                     id: msg.uuid.to_string(),
-                    output_type: "function_call".to_string(),
+                    output_type: "tool_call".to_string(),
                     status,
                     role: None,
                     content: None,
@@ -2794,7 +2914,7 @@ async fn get_response(
 
                 output_items.push(OutputItem {
                     id: msg.uuid.to_string(),
-                    output_type: "function_call_output".to_string(),
+                    output_type: "tool_output".to_string(),
                     status,
                     role: None,
                     content: None,

@@ -4,40 +4,69 @@
 //! architecture that can be extended for additional tools in the future.
 
 use crate::brave::{BraveClient, SearchRequest as BraveSearchRequest};
-use crate::kagi::{KagiClient, SearchRequest as KagiSearchRequest};
+use crate::tinfoil_websearch::TinfoilWebSearchClient;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{debug, error, info, trace, warn};
 
-/// Execute web search using Brave or Kagi Search API
-///
-/// Prefers Brave if available, falls back to Kagi if Brave is not configured.
-/// Requires at least one client to be provided (initialized at startup with connection pooling).
+/// Execute web search using the configured backend.
 pub async fn execute_web_search(
     query: &str,
+    max_results: Option<u32>,
+    tinfoil_web_search_client: Option<&Arc<TinfoilWebSearchClient>>,
     brave_client: Option<&Arc<BraveClient>>,
-    kagi_client: Option<&Arc<KagiClient>>,
 ) -> Result<String, String> {
     trace!("Executing web search for query: {}", query);
     info!("Executing web search");
 
-    // Try Brave first, then fall back to Kagi
+    if let Some(client) = tinfoil_web_search_client {
+        return execute_tinfoil_search(query, max_results, client).await;
+    }
+
     if let Some(client) = brave_client {
-        execute_brave_search(query, client).await
-    } else if let Some(client) = kagi_client {
-        execute_kagi_search(query, client).await
+        execute_brave_search(query, max_results, client).await
     } else {
         error!("No search client configured");
         Err("No search client configured".to_string())
     }
 }
 
+async fn execute_tinfoil_search(
+    query: &str,
+    max_results: Option<u32>,
+    client: &Arc<TinfoilWebSearchClient>,
+) -> Result<String, String> {
+    trace!("Executing Tinfoil web search for query: {}", query);
+
+    let result = client
+        .search(query, max_results.map(|value| value.clamp(1, 30)))
+        .await
+        .map_err(|e| {
+            error!("Tinfoil web search API error: {:?}", e);
+            format!("Search API error: {:?}", e)
+        })?;
+
+    let formatted = format_tinfoil_search_result(&result);
+    if formatted.trim().is_empty() {
+        warn!("No Tinfoil web search results found");
+        return Ok(format!("No results found for query: '{}'", query));
+    }
+
+    Ok(formatted)
+}
+
 /// Execute web search using Brave Search API
-async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<String, String> {
+async fn execute_brave_search(
+    query: &str,
+    max_results: Option<u32>,
+    client: &Arc<BraveClient>,
+) -> Result<String, String> {
     trace!("Executing Brave search for query: {}", query);
+    let result_limit = max_results.unwrap_or(5).clamp(1, 30) as usize;
 
     // Create search request with summary enabled
     let mut search_request = BraveSearchRequest::new(query.to_string());
+    search_request.count = Some(result_limit as u32);
     search_request.summary = Some(true);
 
     // Execute search
@@ -53,7 +82,7 @@ async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<
     if let Some(web) = response.web {
         if let Some(results) = web.results {
             result_text.push_str("Search Results:\n\n");
-            for (i, result) in results.iter().take(5).enumerate() {
+            for (i, result) in results.iter().take(result_limit).enumerate() {
                 result_text.push_str(&format!(
                     "{}. {}\n   URL: {}\n   {}\n\n",
                     i + 1,
@@ -80,7 +109,7 @@ async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<
         if let Some(news_results) = news.results {
             if !news_results.is_empty() {
                 result_text.push_str("\nNews:\n\n");
-                for (i, result) in news_results.iter().take(3).enumerate() {
+                for (i, result) in news_results.iter().take(result_limit.min(3)).enumerate() {
                     result_text.push_str(&format!(
                         "{}. {}\n   URL: {}\n   {}\n\n",
                         i + 1,
@@ -131,106 +160,89 @@ async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<
     Ok(result_text)
 }
 
-/// Execute web search using Kagi Search API
-async fn execute_kagi_search(query: &str, client: &Arc<KagiClient>) -> Result<String, String> {
-    trace!("Executing Kagi search for query: {}", query);
+fn format_tinfoil_search_result(result: &Value) -> String {
+    let content_text = result
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|content| {
+            content
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .filter(|text| !text.is_empty());
 
-    // Create search request
-    let search_request = KagiSearchRequest::new(query.to_string());
-
-    // Execute search
-    let response = client.search(search_request).await.map_err(|e| {
-        error!("Kagi search API error: {:?}", e);
-        format!("Search API error: {:?}", e)
-    })?;
-
-    // Format results
-    let mut result_text = String::new();
-
-    if let Some(data) = response.data {
-        // Prioritize direct answers
-        if let Some(direct_answers) = data.direct_answer {
-            for answer in direct_answers {
-                result_text.push_str(&format!(
-                    "Direct Answer: {}\n\n",
-                    answer.snippet.unwrap_or_default()
-                ));
-            }
-        }
-
-        // Add weather information if available
-        if let Some(weather_results) = data.weather {
-            if !weather_results.is_empty() {
-                result_text.push_str("Weather:\n\n");
-                for result in weather_results.iter().take(1) {
-                    result_text.push_str(&format!(
-                        "{}\n   {}\n\n",
-                        result.title,
-                        result.snippet.as_ref().unwrap_or(&String::new())
-                    ));
-                }
-            }
-        }
-
-        // Add infobox if available (detailed entity information)
-        if let Some(infobox_results) = data.infobox {
-            if !infobox_results.is_empty() {
-                result_text.push_str("Information:\n\n");
-                for result in infobox_results.iter().take(1) {
-                    result_text.push_str(&format!(
-                        "{}\n   {}\n",
-                        result.title,
-                        result.snippet.as_ref().unwrap_or(&String::new())
-                    ));
-
-                    // Add URL if available for more details
-                    if !result.url.is_empty() {
-                        result_text.push_str(&format!("   More info: {}\n", result.url));
-                    }
-                    result_text.push('\n');
-                }
-            }
-        }
-
-        // Add search results
-        if let Some(search_results) = data.search {
-            result_text.push_str("Search Results:\n\n");
-            for (i, result) in search_results.iter().take(5).enumerate() {
-                result_text.push_str(&format!(
-                    "{}. {}\n   URL: {}\n   {}\n\n",
-                    i + 1,
-                    result.title,
-                    result.url,
-                    result.snippet.as_ref().unwrap_or(&String::new())
-                ));
-            }
-        }
-
-        // Add news results if available
-        if let Some(news_results) = data.news {
-            if !news_results.is_empty() {
-                result_text.push_str("\nNews:\n\n");
-                for (i, result) in news_results.iter().take(3).enumerate() {
-                    result_text.push_str(&format!(
-                        "{}. {}\n   URL: {}\n   {}\n\n",
-                        i + 1,
-                        result.title,
-                        result.url,
-                        result.snippet.as_ref().unwrap_or(&String::new())
-                    ));
-                }
-            }
-        }
+    if let Some(text) = content_text {
+        return text;
     }
 
-    if result_text.is_empty() {
-        warn!("No search results found");
-        return Ok(format!("No results found for query: '{}'", query));
+    let structured_content = result
+        .get("structuredContent")
+        .or_else(|| result.get("structured_content"))
+        .unwrap_or(result);
+
+    let formatted_results = structured_content
+        .get("results")
+        .and_then(Value::as_array)
+        .map(|results| format_search_results(results))
+        .filter(|text| !text.is_empty());
+
+    if let Some(text) = formatted_results {
+        return text;
     }
 
-    Ok(result_text)
+    if let Some(text) = structured_content.as_str() {
+        return text.to_string();
+    }
+
+    serde_json::to_string_pretty(structured_content)
+        .unwrap_or_else(|_| structured_content.to_string())
 }
 
+fn format_search_results(results: &[Value]) -> String {
+    let mut formatted = String::new();
+
+    if !results.is_empty() {
+        formatted.push_str("Search Results:\n\n");
+    }
+
+    for (index, result) in results.iter().enumerate() {
+        let title = result
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("Untitled result");
+        let url = result
+            .get("url")
+            .or_else(|| result.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let snippet = [
+            "text",
+            "snippet",
+            "summary",
+            "description",
+            "content",
+            "highlights",
+        ]
+        .iter()
+        .find_map(|field| result.get(field).and_then(Value::as_str))
+        .unwrap_or("");
+
+        formatted.push_str(&format!("{}. {}\n", index + 1, title));
+        if !url.is_empty() {
+            formatted.push_str(&format!("   URL: {}\n", url));
+        }
+        if !snippet.is_empty() {
+            formatted.push_str(&format!("   {}\n", snippet));
+        }
+        formatted.push('\n');
+    }
+
+    formatted.trim().to_string()
+}
 /// Execute a tool by name with the given arguments
 ///
 /// This is the main entry point for tool execution. It routes to the appropriate
@@ -239,8 +251,8 @@ async fn execute_kagi_search(query: &str, client: &Arc<KagiClient>) -> Result<St
 /// # Arguments
 /// * `tool_name` - The name of the tool to execute (e.g., "web_search")
 /// * `arguments` - JSON object containing the tool's arguments
+/// * `tinfoil_web_search_client` - Optional Tinfoil web search client
 /// * `brave_client` - Optional Brave client (with connection pooling)
-/// * `kagi_client` - Optional Kagi client (with connection pooling)
 ///
 /// # Returns
 /// * `Ok(String)` - The tool's output as a string
@@ -248,8 +260,8 @@ async fn execute_kagi_search(query: &str, client: &Arc<KagiClient>) -> Result<St
 pub async fn execute_tool(
     tool_name: &str,
     arguments: &Value,
+    tinfoil_web_search_client: Option<&Arc<TinfoilWebSearchClient>>,
     brave_client: Option<&Arc<BraveClient>>,
-    kagi_client: Option<&Arc<KagiClient>>,
 ) -> Result<String, String> {
     trace!(
         "Executing tool: {} with arguments: {}",
@@ -265,8 +277,12 @@ pub async fn execute_tool(
                 .get("query")
                 .and_then(|q| q.as_str())
                 .ok_or_else(|| "Missing 'query' argument for web_search".to_string())?;
+            let max_results = arguments
+                .get("max_results")
+                .and_then(|value| value.as_u64())
+                .map(|value| value as u32);
 
-            execute_web_search(query, brave_client, kagi_client).await
+            execute_web_search(query, max_results, tinfoil_web_search_client, brave_client).await
         }
         _ => {
             error!("Unknown tool requested: {}", tool_name);
@@ -304,6 +320,10 @@ impl ToolRegistry {
                         "query": {
                             "type": "string",
                             "description": "The search query to execute"
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "Optional maximum number of results to return"
                         }
                     },
                     "required": ["query"]
@@ -332,7 +352,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_web_search_no_client() {
-        let result = execute_web_search("test query", None, None).await;
+        let result = execute_web_search("test query", None, None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No search client configured"));
     }
@@ -352,6 +372,44 @@ mod tests {
         let result = execute_tool("unknown_tool", &args, None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown tool"));
+    }
+
+    #[test]
+    fn test_format_tinfoil_search_result_prefers_text_content() {
+        let result = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Search Results:\n\n1. Example\n   URL: https://example.com"
+                }
+            ]
+        });
+
+        assert_eq!(
+            format_tinfoil_search_result(&result),
+            "Search Results:\n\n1. Example\n   URL: https://example.com"
+        );
+    }
+
+    #[test]
+    fn test_format_tinfoil_search_result_formats_structured_results() {
+        let result = json!({
+            "structuredContent": {
+                "results": [
+                    {
+                        "title": "Example",
+                        "url": "https://example.com",
+                        "text": "Example summary"
+                    }
+                ]
+            }
+        });
+
+        let formatted = format_tinfoil_search_result(&result);
+        assert!(formatted.contains("Search Results:"));
+        assert!(formatted.contains("Example"));
+        assert!(formatted.contains("https://example.com"));
+        assert!(formatted.contains("Example summary"));
     }
 
     #[test]

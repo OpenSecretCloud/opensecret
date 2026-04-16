@@ -14,7 +14,6 @@ pub mod events;
 pub mod handlers;
 pub mod instructions;
 pub mod pagination;
-pub mod prompts;
 pub mod storage;
 pub mod tools;
 pub mod types;

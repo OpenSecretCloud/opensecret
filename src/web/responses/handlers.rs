@@ -1895,6 +1895,67 @@ fn next_assistant_message_id(next_message_id: &mut Option<Uuid>) -> Uuid {
     next_message_id.take().unwrap_or_else(Uuid::new_v4)
 }
 
+/// Lifecycle of the reasoning item within a single assistant turn.
+///
+/// Models that emit `reasoning`/`reasoning_content` deltas must always close the
+/// reasoning block before any final assistant content or tool-call deltas are
+/// accepted, so we track the state explicitly rather than juggling several bools.
+#[derive(Debug)]
+enum ReasoningState {
+    NotStarted,
+    Active(Uuid),
+    Done,
+}
+
+impl ReasoningState {
+    fn active_id(&self) -> Option<Uuid> {
+        if let ReasoningState::Active(id) = self {
+            Some(*id)
+        } else {
+            None
+        }
+    }
+}
+
+async fn close_reasoning_if_active(
+    state: &mut ReasoningState,
+    tx_storage: &mpsc::Sender<StorageMessage>,
+    tx_client: &mpsc::Sender<StorageMessage>,
+) -> Result<(), ApiError> {
+    if let Some(reasoning_id) = state.active_id() {
+        send_storage_message(
+            tx_storage,
+            tx_client,
+            StorageMessage::ReasoningDone {
+                item_id: reasoning_id,
+            },
+        )
+        .await?;
+        *state = ReasoningState::Done;
+    }
+    Ok(())
+}
+
+async fn ensure_message_started(
+    current_message_id: &mut Option<Uuid>,
+    next_message_id: &mut Option<Uuid>,
+    tx_storage: &mpsc::Sender<StorageMessage>,
+    tx_client: &mpsc::Sender<StorageMessage>,
+) -> Result<Uuid, ApiError> {
+    if let Some(id) = *current_message_id {
+        return Ok(id);
+    }
+    let id = next_assistant_message_id(next_message_id);
+    send_storage_message(
+        tx_storage,
+        tx_client,
+        StorageMessage::MessageStarted { item_id: id },
+    )
+    .await?;
+    *current_message_id = Some(id);
+    Ok(id)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn stream_one_assistant_turn(
     state: &Arc<AppState>,
@@ -1933,10 +1994,7 @@ async fn stream_one_assistant_turn(
     let mut streamed_tool_calls = Vec::new();
     let mut finish_reason: Option<String> = None;
     let mut current_message_id: Option<Uuid> = None;
-    let mut message_started = false;
-    let mut reasoning_item_id: Option<Uuid> = None;
-    let mut reasoning_started = false;
-    let mut reasoning_done = false;
+    let mut reasoning = ReasoningState::NotStarted;
     let mut saw_tool_calls = false;
 
     while let Some(chunk) = completion.stream.recv().await {
@@ -1957,19 +2015,21 @@ async fn stream_one_assistant_turn(
                     trace!("Stream delta: {}", d);
                 }
 
-                if let Some(reasoning) = delta.and_then(|d| {
+                // Reasoning delta (supports both `reasoning` and legacy `reasoning_content`).
+                if let Some(reasoning_delta) = delta.and_then(|d| {
                     d.get("reasoning")
                         .and_then(|c| c.as_str())
                         .or_else(|| d.get("reasoning_content").and_then(|c| c.as_str()))
                 }) {
-                    if !reasoning.is_empty() {
-                        if reasoning_done {
-                            warn!(
-                                "Ignoring reasoning delta after reasoning item was already closed"
-                            );
-                        } else {
-                            let reasoning_id = *reasoning_item_id.get_or_insert_with(Uuid::new_v4);
-                            if !reasoning_started {
+                    if !reasoning_delta.is_empty() {
+                        match &reasoning {
+                            ReasoningState::Done => {
+                                warn!(
+                                    "Ignoring reasoning delta after reasoning item was already closed"
+                                );
+                            }
+                            ReasoningState::NotStarted => {
+                                let reasoning_id = Uuid::new_v4();
                                 send_storage_message(
                                     tx_storage,
                                     tx_client,
@@ -1978,22 +2038,33 @@ async fn stream_one_assistant_turn(
                                     },
                                 )
                                 .await?;
-                                reasoning_started = true;
+                                send_storage_message(
+                                    tx_storage,
+                                    tx_client,
+                                    StorageMessage::ReasoningDelta {
+                                        item_id: reasoning_id,
+                                        delta: reasoning_delta.to_string(),
+                                    },
+                                )
+                                .await?;
+                                reasoning = ReasoningState::Active(reasoning_id);
                             }
-
-                            send_storage_message(
-                                tx_storage,
-                                tx_client,
-                                StorageMessage::ReasoningDelta {
-                                    item_id: reasoning_id,
-                                    delta: reasoning.to_string(),
-                                },
-                            )
-                            .await?;
+                            ReasoningState::Active(reasoning_id) => {
+                                send_storage_message(
+                                    tx_storage,
+                                    tx_client,
+                                    StorageMessage::ReasoningDelta {
+                                        item_id: *reasoning_id,
+                                        delta: reasoning_delta.to_string(),
+                                    },
+                                )
+                                .await?;
+                            }
                         }
                     }
                 }
 
+                // Tool call deltas: close any in-flight message and reasoning, then accumulate.
                 if let Some(tool_call_delta) = delta.and_then(|d| d.get("tool_calls")) {
                     if let Some(message_id) = current_message_id.take() {
                         send_storage_message(
@@ -2001,78 +2072,51 @@ async fn stream_one_assistant_turn(
                             tx_client,
                             StorageMessage::MessageDone {
                                 item_id: message_id,
-                                finish_reason: "tool_call".to_string(),
+                                finish_reason: "tool_calls".to_string(),
                             },
                         )
                         .await?;
-                        message_started = false;
                     }
-
-                    if !reasoning_done {
-                        if let Some(reasoning_id) = reasoning_item_id {
-                            send_storage_message(
-                                tx_storage,
-                                tx_client,
-                                StorageMessage::ReasoningDone {
-                                    item_id: reasoning_id,
-                                },
-                            )
-                            .await?;
-                            reasoning_done = true;
-                        }
-                    }
+                    close_reasoning_if_active(&mut reasoning, tx_storage, tx_client).await?;
 
                     saw_tool_calls = true;
                     append_streamed_tool_calls(&mut streamed_tool_calls, tool_call_delta);
                 }
 
+                // Assistant text content. Some providers occasionally emit a trailing sliver of
+                // content after tool-call deltas; we log and skip instead of aborting the turn.
                 if let Some(content) = delta
                     .and_then(|d| d.get("content"))
                     .and_then(|c| c.as_str())
                 {
                     if !content.is_empty() {
                         if saw_tool_calls {
-                            error!("Received assistant text after tool call deltas had already started");
-                            return Err(ApiError::InternalServerError);
-                        }
-
-                        if !reasoning_done {
-                            if let Some(reasoning_id) = reasoning_item_id {
-                                send_storage_message(
-                                    tx_storage,
-                                    tx_client,
-                                    StorageMessage::ReasoningDone {
-                                        item_id: reasoning_id,
-                                    },
-                                )
+                            warn!(
+                                "Ignoring assistant text ({} chars) after tool call deltas had already started",
+                                content.len()
+                            );
+                        } else {
+                            close_reasoning_if_active(&mut reasoning, tx_storage, tx_client)
                                 .await?;
-                                reasoning_done = true;
-                            }
-                        }
 
-                        let message_id = *current_message_id
-                            .get_or_insert_with(|| next_assistant_message_id(next_message_id));
-                        if !message_started {
+                            let message_id = ensure_message_started(
+                                &mut current_message_id,
+                                next_message_id,
+                                tx_storage,
+                                tx_client,
+                            )
+                            .await?;
+
                             send_storage_message(
                                 tx_storage,
                                 tx_client,
-                                StorageMessage::MessageStarted {
+                                StorageMessage::ContentDelta {
                                     item_id: message_id,
+                                    delta: content.to_string(),
                                 },
                             )
                             .await?;
-                            message_started = true;
                         }
-
-                        send_storage_message(
-                            tx_storage,
-                            tx_client,
-                            StorageMessage::ContentDelta {
-                                item_id: message_id,
-                                delta: content.to_string(),
-                            },
-                        )
-                        .await?;
                     }
                 }
             }
@@ -2088,18 +2132,7 @@ async fn stream_one_assistant_turn(
                 .await?;
             }
             crate::web::openai::CompletionChunk::Done => {
-                if !reasoning_done {
-                    if let Some(reasoning_id) = reasoning_item_id {
-                        send_storage_message(
-                            tx_storage,
-                            tx_client,
-                            StorageMessage::ReasoningDone {
-                                item_id: reasoning_id,
-                            },
-                        )
-                        .await?;
-                    }
-                }
+                close_reasoning_if_active(&mut reasoning, tx_storage, tx_client).await?;
 
                 if saw_tool_calls || finish_reason.as_deref() == Some("tool_calls") {
                     let tool_call = finalize_first_model_tool_call(&streamed_tool_calls)
@@ -2107,18 +2140,22 @@ async fn stream_one_assistant_turn(
                     return Ok(AssistantTurnOutcome::ToolCall(tool_call));
                 }
 
-                let message_id = current_message_id
-                    .unwrap_or_else(|| next_assistant_message_id(next_message_id));
+                // Ensure a final message item exists even if the model emitted no content.
+                // This is rare but happens when vLLM parses a tool response into the thinking
+                // block or similar edge cases; we surface it explicitly rather than silently
+                // producing an empty row.
                 if current_message_id.is_none() {
-                    send_storage_message(
-                        tx_storage,
-                        tx_client,
-                        StorageMessage::MessageStarted {
-                            item_id: message_id,
-                        },
-                    )
-                    .await?;
+                    warn!(
+                        "Model produced no assistant content before Done; emitting empty message placeholder"
+                    );
                 }
+                let message_id = ensure_message_started(
+                    &mut current_message_id,
+                    next_message_id,
+                    tx_storage,
+                    tx_client,
+                )
+                .await?;
 
                 let final_finish_reason = finish_reason.unwrap_or_else(|| "stop".to_string());
                 send_storage_message(
@@ -2367,7 +2404,6 @@ async fn create_response_stream(
                     conversation_id,
                     user_id,
                     user_key,
-                    assistant_message_id,
                 )
                 .await;
             })

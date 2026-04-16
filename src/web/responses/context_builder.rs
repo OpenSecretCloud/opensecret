@@ -1006,4 +1006,275 @@ mod tests {
         // First message should be the first user message
         assert_eq!(messages[0]["content"], "First message");
     }
+
+    /// Build a tool_call ChatMsg exactly as `build_prompt` would store it once
+    /// a tool call is persisted and later re-read from the database.
+    fn create_tool_call_chat_msg(
+        tool_call_id: uuid::Uuid,
+        tool_name: &str,
+        arguments_json: &str,
+        tokens: usize,
+    ) -> ChatMsg {
+        let tool_call_msg = serde_json::json!({
+            "role": "assistant",
+            "tool_calls": [{
+                "id": tool_call_id.to_string(),
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": arguments_json
+                }
+            }]
+        });
+
+        ChatMsg {
+            role: ROLE_ASSISTANT,
+            content: serde_json::to_string(&tool_call_msg).unwrap(),
+            tool_call_id: None,
+            tok: tokens,
+        }
+    }
+
+    fn create_tool_output_chat_msg(
+        tool_call_id: uuid::Uuid,
+        output: &str,
+        tokens: usize,
+    ) -> ChatMsg {
+        ChatMsg {
+            role: "tool",
+            content: output.to_string(),
+            tool_call_id: Some(tool_call_id),
+            tok: tokens,
+        }
+    }
+
+    #[test]
+    fn test_build_prompt_with_single_tool_turn() {
+        // Single agentic turn: user → tool_call → tool_output → assistant
+        let tool_call_id = uuid::Uuid::new_v4();
+        let msgs = vec![
+            create_chat_msg("user", "What's the weather in SF?", Some(8)),
+            create_tool_call_chat_msg(
+                tool_call_id,
+                "web_search",
+                "{\"query\":\"weather San Francisco\"}",
+                9,
+            ),
+            create_tool_output_chat_msg(tool_call_id, "It is 68F and sunny in SF.", 7),
+            create_chat_msg(
+                "assistant",
+                "The weather in San Francisco is 68F and sunny.",
+                Some(11),
+            ),
+        ];
+
+        let (messages, total_tokens) =
+            build_prompt_from_chat_messages(msgs, "test-model").expect("build prompt");
+
+        assert_eq!(messages.len(), 4, "all four items must be in the prompt");
+
+        // user
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "What's the weather in SF?");
+
+        // tool_call materializes as assistant + tool_calls array (no content field)
+        assert_eq!(messages[1]["role"], "assistant");
+        assert!(messages[1].get("tool_calls").is_some());
+        let tool_calls = messages[1]["tool_calls"].as_array().unwrap();
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0]["id"], tool_call_id.to_string());
+        assert_eq!(tool_calls[0]["function"]["name"], "web_search");
+        assert_eq!(
+            tool_calls[0]["function"]["arguments"],
+            "{\"query\":\"weather San Francisco\"}"
+        );
+
+        // tool_output materializes as role=tool with tool_call_id
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], tool_call_id.to_string());
+        assert_eq!(messages[2]["content"], "It is 68F and sunny in SF.");
+
+        // final assistant
+        assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(messages[3]["content"], "The weather in San Francisco is 68F and sunny.");
+
+        // Token total must be the sum of all supplied ChatMsg tokens (no double counting
+        // of the serialized tool_call JSON, no skipping of tool_output tokens).
+        assert_eq!(total_tokens, 8 + 9 + 7 + 11);
+    }
+
+    #[test]
+    fn test_build_prompt_with_multiple_tool_turns() {
+        // Two back-to-back tool turns on a single user question:
+        // user → tool_call_a → tool_output_a → tool_call_b → tool_output_b → assistant
+        let tool_call_a = uuid::Uuid::new_v4();
+        let tool_call_b = uuid::Uuid::new_v4();
+        let msgs = vec![
+            create_chat_msg("user", "Compare today's weather in SF and NYC", Some(10)),
+            create_tool_call_chat_msg(
+                tool_call_a,
+                "web_search",
+                "{\"query\":\"weather SF today\"}",
+                9,
+            ),
+            create_tool_output_chat_msg(tool_call_a, "SF: 68F sunny", 5),
+            create_tool_call_chat_msg(
+                tool_call_b,
+                "web_search",
+                "{\"query\":\"weather NYC today\"}",
+                9,
+            ),
+            create_tool_output_chat_msg(tool_call_b, "NYC: 52F cloudy", 5),
+            create_chat_msg(
+                "assistant",
+                "SF is 68F sunny, NYC is 52F cloudy.",
+                Some(12),
+            ),
+        ];
+
+        let (messages, total_tokens) =
+            build_prompt_from_chat_messages(msgs, "test-model").expect("build prompt");
+
+        assert_eq!(messages.len(), 6);
+
+        // Two distinct tool_call ids, preserved in their assistant tool_calls entries
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(
+            messages[1]["tool_calls"][0]["id"],
+            tool_call_a.to_string()
+        );
+        assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(
+            messages[3]["tool_calls"][0]["id"],
+            tool_call_b.to_string()
+        );
+
+        // Each tool_output must link back to the correct tool_call_id (FK correctness)
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], tool_call_a.to_string());
+        assert_eq!(messages[4]["role"], "tool");
+        assert_eq!(messages[4]["tool_call_id"], tool_call_b.to_string());
+
+        // Final assistant message
+        assert_eq!(messages[5]["role"], "assistant");
+        assert!(
+            messages[5].get("tool_calls").is_none(),
+            "final assistant message must not have tool_calls"
+        );
+
+        // Total prompt tokens must include every item exactly once
+        assert_eq!(total_tokens, 10 + 9 + 5 + 9 + 5 + 12);
+    }
+
+    #[test]
+    fn test_build_prompt_with_system_then_tool_turn() {
+        // System prompt + agentic turn: verify system tokens are counted and the
+        // system message is emitted first.
+        let tool_call_id = uuid::Uuid::new_v4();
+        let msgs = vec![
+            create_chat_msg("system", "You are Maple.", Some(4)),
+            create_chat_msg("user", "Who won the UFC fight last night?", Some(10)),
+            create_tool_call_chat_msg(
+                tool_call_id,
+                "web_search",
+                "{\"query\":\"UFC fight results last night\"}",
+                10,
+            ),
+            create_tool_output_chat_msg(tool_call_id, "Fighter A won by KO", 6),
+            create_chat_msg("assistant", "Fighter A won by KO last night.", Some(8)),
+        ];
+
+        let (messages, total_tokens) =
+            build_prompt_from_chat_messages(msgs, "test-model").expect("build prompt");
+
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "You are Maple.");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert!(messages[2].get("tool_calls").is_some());
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(messages[4]["role"], "assistant");
+
+        assert_eq!(total_tokens, 4 + 10 + 10 + 6 + 8);
+    }
+
+    #[test]
+    fn test_tool_turn_survives_truncation_with_last_user_intact() {
+        // A long-running agentic conversation that overflows the budget should still:
+        //   - preserve the most recent user question
+        //   - preserve the trailing tool_call/tool_output/assistant triple so the
+        //     model has enough signal to answer
+        //   - drop the oldest tool turns first (middle truncation)
+        let mut msgs = vec![create_chat_msg("user", "First question", Some(5))];
+
+        // Bloat the middle with many old tool turns
+        for i in 0..20 {
+            let id = uuid::Uuid::new_v4();
+            msgs.push(create_tool_call_chat_msg(
+                id,
+                "web_search",
+                "{\"query\":\"old\"}",
+                1000,
+            ));
+            msgs.push(create_tool_output_chat_msg(id, "old result", 1000));
+            msgs.push(create_chat_msg(
+                "assistant",
+                &format!("old answer {}", i),
+                Some(1000),
+            ));
+        }
+
+        // Recent turn that MUST survive
+        let recent_tool_id = uuid::Uuid::new_v4();
+        msgs.push(create_chat_msg("user", "Recent question", Some(5)));
+        msgs.push(create_tool_call_chat_msg(
+            recent_tool_id,
+            "web_search",
+            "{\"query\":\"recent\"}",
+            10,
+        ));
+        msgs.push(create_tool_output_chat_msg(
+            recent_tool_id,
+            "recent result",
+            10,
+        ));
+        msgs.push(create_chat_msg(
+            "assistant",
+            "Recent answer",
+            Some(10),
+        ));
+        msgs.push(create_chat_msg("user", "Final follow-up", Some(5)));
+
+        let (messages, total_tokens) =
+            build_prompt_from_chat_messages(msgs, "deepseek-r1-70b").expect("build prompt");
+
+        // Must end with the final follow-up user message
+        assert_eq!(messages.last().unwrap()["role"], "user");
+        assert_eq!(messages.last().unwrap()["content"], "Final follow-up");
+
+        // Must contain the recent tool_call + tool_output linked by tool_call_id
+        let recent_tool_output = messages
+            .iter()
+            .find(|m| {
+                m["role"] == "tool"
+                    && m["tool_call_id"].as_str() == Some(&recent_tool_id.to_string())
+            })
+            .expect("recent tool_output must survive truncation");
+        assert_eq!(recent_tool_output["content"], "recent result");
+
+        // Must contain the truncation marker
+        assert!(messages
+            .iter()
+            .any(|m| m["content"].as_str().unwrap_or("").contains("truncated")));
+
+        // Must stay inside the budget
+        let budget = 64_000 - 4096 - 500;
+        assert!(
+            total_tokens <= budget,
+            "prompt tokens {} exceed budget {}",
+            total_tokens,
+            budget
+        );
+    }
 }

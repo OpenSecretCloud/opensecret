@@ -265,7 +265,6 @@ pub async fn storage_task(
     conversation_id: i64,
     user_id: Uuid,
     user_key: SecretKey,
-    _message_id: Uuid,
 ) {
     let tool_ack = tool_persist_ack;
     let mut pending_messages: HashMap<Uuid, PendingAssistantMessage> = HashMap::new();
@@ -389,6 +388,25 @@ pub async fn storage_task(
                     "Storage: response done {} with finish_reason={}",
                     response_id, finish_reason
                 );
+                // Sender invariant: stream_one_assistant_turn always emits MessageDone /
+                // ReasoningDone before ResponseDone. If that invariant ever breaks we'd
+                // leave items as "in_progress" forever, so defensively finalize any
+                // stragglers as incomplete and log loudly so the bug is visible.
+                if !pending_messages.is_empty() || !pending_reasoning.is_empty() {
+                    error!(
+                        "ResponseDone received with {} pending message(s) and {} pending reasoning item(s); sender invariant violated -- finalizing as incomplete",
+                        pending_messages.len(),
+                        pending_reasoning.len()
+                    );
+                    mark_pending_items_incomplete(
+                        &db,
+                        &user_key,
+                        &mut pending_messages,
+                        &mut pending_reasoning,
+                        None,
+                    )
+                    .await;
+                }
                 if let Err(e) = db.update_response_status(
                     response_id,
                     ResponseStatus::Completed,

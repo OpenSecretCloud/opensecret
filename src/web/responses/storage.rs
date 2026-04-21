@@ -13,7 +13,7 @@ use crate::{
 };
 use chrono::Utc;
 use secp256k1::SecretKey;
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
@@ -366,7 +366,11 @@ pub async fn storage_task(
                     .push_str(&delta);
             }
             StorageMessage::ReasoningDone { item_id } => {
-                debug!("Storage: reasoning done {}", item_id);
+                let reasoning_finalize_started = Instant::now();
+                debug!(
+                    "Storage: finalizing reasoning item {} for response {}",
+                    item_id, response_id
+                );
                 let pending = pending_reasoning.remove(&item_id).unwrap_or_default();
                 if let Err(e) = finalize_reasoning_item(
                     &db,
@@ -377,7 +381,20 @@ pub async fn storage_task(
                 )
                 .await
                 {
-                    error!("{}", e);
+                    error!(
+                        "Failed to finalize reasoning item {} for response {} after {} ms: {}",
+                        item_id,
+                        response_id,
+                        reasoning_finalize_started.elapsed().as_millis(),
+                        e
+                    );
+                } else {
+                    debug!(
+                        "Storage: finalized reasoning item {} for response {} in {} ms",
+                        item_id,
+                        response_id,
+                        reasoning_finalize_started.elapsed().as_millis()
+                    );
                 }
             }
             StorageMessage::Usage { .. } => {
@@ -460,7 +477,12 @@ pub async fn storage_task(
                 name,
                 arguments,
             } => {
-                trace!("Storage: persisting tool_call {}", tool_call_id);
+                let tool_name = name.clone();
+                let tool_call_persist_started = Instant::now();
+                debug!(
+                    "Storage: persisting tool_call {} ({}) for response {}",
+                    tool_call_id, tool_name, response_id
+                );
                 let created_at = allocate_created_at(&mut next_item_created_at);
                 match persist_tool_call(
                     &db,
@@ -475,9 +497,22 @@ pub async fn storage_task(
                 )
                 .await
                 {
-                    Ok(()) => debug!("Persisted tool_call {}", tool_call_id),
+                    Ok(()) => debug!(
+                        "Storage: persisted tool_call {} ({}) for response {} in {} ms",
+                        tool_call_id,
+                        tool_name,
+                        response_id,
+                        tool_call_persist_started.elapsed().as_millis()
+                    ),
                     Err(e) => {
-                        error!("{}", e);
+                        error!(
+                            "Failed to persist tool_call {} ({}) for response {} after {} ms: {}",
+                            tool_call_id,
+                            tool_name,
+                            response_id,
+                            tool_call_persist_started.elapsed().as_millis(),
+                            e
+                        );
                         if let Some(ack) = &tool_ack {
                             let _ = ack.send(Err(e)).await;
                         }
@@ -489,7 +524,11 @@ pub async fn storage_task(
                 tool_call_id,
                 output,
             } => {
-                trace!("Storage: persisting tool_output {}", tool_output_id);
+                let tool_output_persist_started = Instant::now();
+                debug!(
+                    "Storage: persisting tool_output {} for tool_call {} on response {}",
+                    tool_output_id, tool_call_id, response_id
+                );
                 let created_at = allocate_created_at(&mut next_item_created_at);
                 match persist_tool_output(
                     &db,
@@ -505,13 +544,26 @@ pub async fn storage_task(
                 .await
                 {
                     Ok(()) => {
-                        debug!("Persisted tool_output {}", tool_output_id);
+                        debug!(
+                            "Storage: persisted tool_output {} for tool_call {} on response {} in {} ms",
+                            tool_output_id,
+                            tool_call_id,
+                            response_id,
+                            tool_output_persist_started.elapsed().as_millis()
+                        );
                         if let Some(ack) = &tool_ack {
                             let _ = ack.send(Ok(())).await;
                         }
                     }
                     Err(e) => {
-                        error!("{}", e);
+                        error!(
+                            "Failed to persist tool_output {} for tool_call {} on response {} after {} ms: {}",
+                            tool_output_id,
+                            tool_call_id,
+                            response_id,
+                            tool_output_persist_started.elapsed().as_millis(),
+                            e
+                        );
                         if let Some(ack) = &tool_ack {
                             let _ = ack.send(Err(e)).await;
                         }

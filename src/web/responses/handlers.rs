@@ -1792,6 +1792,12 @@ async fn execute_tool_call_and_wait(
 ) -> Result<(), ApiError> {
     let tool_call_id = Uuid::new_v4();
     let tool_output_id = Uuid::new_v4();
+    let tool_call_enqueue_started = std::time::Instant::now();
+
+    debug!(
+        "Tool loop: enqueueing tool_call {} ({}) for response {}",
+        tool_call_id, tool_call.name, persisted.response.uuid
+    );
 
     let tool_call_msg = StorageMessage::ToolCall {
         tool_call_id,
@@ -1812,8 +1818,24 @@ async fn execute_tool_call_and_wait(
         return Err(ApiError::InternalServerError);
     }
     if tx_client.try_send(tool_call_msg).is_err() {
-        warn!("Client channel full or closed, skipping tool_call event to client");
+        warn!(
+            "Client channel full or closed, skipping tool_call {} for response {}",
+            tool_call_id, persisted.response.uuid
+        );
     }
+    debug!(
+        "Tool loop: enqueued tool_call {} ({}) for response {} in {} ms",
+        tool_call_id,
+        tool_call.name,
+        persisted.response.uuid,
+        tool_call_enqueue_started.elapsed().as_millis()
+    );
+
+    let tool_execution_started = std::time::Instant::now();
+    debug!(
+        "Tool loop: starting execution for tool_call {} ({}) on response {}",
+        tool_call_id, tool_call.name, persisted.response.uuid
+    );
 
     let tool_output = match tools::execute_tool(
         &tool_call.name,
@@ -1824,10 +1846,26 @@ async fn execute_tool_call_and_wait(
     {
         Ok(output) => output,
         Err(e) => {
-            warn!("Tool execution failed, including error in output: {:?}", e);
+            warn!(
+                "Tool execution failed for tool_call {} ({}) on response {}",
+                tool_call_id, tool_call.name, persisted.response.uuid
+            );
             format!("Error: {}", e)
         }
     };
+    debug!(
+        "Tool loop: finished execution for tool_call {} ({}) on response {} in {} ms",
+        tool_call_id,
+        tool_call.name,
+        persisted.response.uuid,
+        tool_execution_started.elapsed().as_millis()
+    );
+
+    let tool_output_enqueue_started = std::time::Instant::now();
+    debug!(
+        "Tool loop: enqueueing tool_output {} for tool_call {} on response {}",
+        tool_output_id, tool_call_id, persisted.response.uuid
+    );
 
     let tool_output_msg = StorageMessage::ToolOutput {
         tool_output_id,
@@ -1848,17 +1886,34 @@ async fn execute_tool_call_and_wait(
         return Err(ApiError::InternalServerError);
     }
     if tx_client.try_send(tool_output_msg).is_err() {
-        warn!("Client channel full or closed, skipping tool_output event to client");
+        warn!(
+            "Client channel full or closed, skipping tool_output {} for tool_call {} on response {}",
+            tool_output_id, tool_call_id, persisted.response.uuid
+        );
     }
+    debug!(
+        "Tool loop: enqueued tool_output {} for tool_call {} on response {} in {} ms",
+        tool_output_id,
+        tool_call_id,
+        persisted.response.uuid,
+        tool_output_enqueue_started.elapsed().as_millis()
+    );
 
     info!(
         "Successfully sent tool_call {} and tool_output {} to streams for conversation {}",
         tool_call_id, tool_output_id, persisted.response.conversation_id
     );
 
+    let tool_ack_wait_started = std::time::Instant::now();
     match tokio::time::timeout(std::time::Duration::from_secs(5), rx_tool_ack.recv()).await {
         Ok(Some(Ok(()))) => {
-            debug!("Tools persisted successfully to database");
+            debug!(
+                "Tool loop: persistence acknowledged for tool_call {} and tool_output {} on response {} in {} ms",
+                tool_call_id,
+                tool_output_id,
+                persisted.response.uuid,
+                tool_ack_wait_started.elapsed().as_millis()
+            );
             Ok(())
         }
         Ok(Some(Err(e))) => {
@@ -1923,6 +1978,10 @@ async fn close_reasoning_if_active(
     tx_client: &mpsc::Sender<StorageMessage>,
 ) -> Result<(), ApiError> {
     if let Some(reasoning_id) = state.active_id() {
+        debug!(
+            "Assistant turn: enqueueing reasoning_done for item {}",
+            reasoning_id
+        );
         send_storage_message(
             tx_storage,
             tx_client,
@@ -2066,6 +2125,9 @@ async fn stream_one_assistant_turn(
 
                 // Tool call deltas: close any in-flight message and reasoning, then accumulate.
                 if let Some(tool_call_delta) = delta.and_then(|d| d.get("tool_calls")) {
+                    if !saw_tool_calls {
+                        debug!("Assistant turn received first tool_call delta from model stream");
+                    }
                     if let Some(message_id) = current_message_id.take() {
                         send_storage_message(
                             tx_storage,
@@ -2135,6 +2197,10 @@ async fn stream_one_assistant_turn(
                 close_reasoning_if_active(&mut reasoning, tx_storage, tx_client).await?;
 
                 if saw_tool_calls || finish_reason.as_deref() == Some("tool_calls") {
+                    debug!(
+                        "Assistant turn finalized tool_call after model stream completion (finish_reason={})",
+                        finish_reason.as_deref().unwrap_or("unknown")
+                    );
                     let tool_call = finalize_first_model_tool_call(&streamed_tool_calls)
                         .ok_or(ApiError::InternalServerError)?;
                     return Ok(AssistantTurnOutcome::ToolCall(tool_call));
@@ -2244,6 +2310,10 @@ async fn setup_completion_processor(
                         return Err(ApiError::InternalServerError);
                     }
 
+                    debug!(
+                        "Tool loop: assistant turn requested tool {} for response {}",
+                        tool_call.name, persisted.response.uuid
+                    );
                     execute_tool_call_and_wait(
                         state,
                         persisted,
@@ -2624,6 +2694,10 @@ async fn create_response_stream(
                     yield Ok(ResponseEvent::ReasoningTextDelta(delta_event).to_sse_event(&mut emitter).await);
                 }
                 StorageMessage::ReasoningDone { item_id } => {
+                    debug!(
+                        "Client stream received reasoning_done {} for response {}",
+                        item_id, response_uuid
+                    );
                     let Some(output_index) = client_state.reasoning_output_index(item_id) else {
                         warn!("Received reasoning done for unknown item {}", item_id);
                         continue;
@@ -2719,7 +2793,10 @@ async fn create_response_stream(
                     break;
                 }
                 StorageMessage::ToolCall { tool_call_id, name, arguments } => {
-                    debug!("Client stream received tool_call event: {} ({})", name, tool_call_id);
+                    debug!(
+                        "Client stream received tool_call {} ({}) for response {}",
+                        tool_call_id, name, response_uuid
+                    );
                     let tool_name = name.clone();
                     let arguments_json =
                         serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
@@ -2777,7 +2854,10 @@ async fn create_response_stream(
                     yield Ok(ResponseEvent::OutputItemDone(output_item_done_event).to_sse_event(&mut emitter).await);
                 }
                 StorageMessage::ToolOutput { tool_output_id, tool_call_id, output } => {
-                    debug!("Client stream received tool_output event: {}", tool_output_id);
+                    debug!(
+                        "Client stream received tool_output {} for tool_call {} on response {}",
+                        tool_output_id, tool_call_id, response_uuid
+                    );
                     let output_index = client_state.push_tool_output(
                         tool_output_id,
                         tool_call_id,

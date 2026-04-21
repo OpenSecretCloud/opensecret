@@ -3,10 +3,21 @@
 //! This module handles tool execution including web search, with a clean
 //! architecture that can be extended for additional tools in the future.
 
-use crate::brave::{BraveClient, SearchRequest as BraveSearchRequest};
+use crate::brave::{BraveClient, BraveError, SearchRequest as BraveSearchRequest};
 use serde_json::{json, Value};
-use std::sync::Arc;
-use tracing::{debug, error, info, trace, warn};
+use std::{sync::Arc, time::Instant};
+use tracing::{debug, error, info, warn};
+
+fn summarize_brave_error(error: &BraveError) -> String {
+    match error {
+        BraveError::Api { status, .. } => format!("api_status={status}"),
+        BraveError::Request(err) if err.is_timeout() => "request_timeout".to_string(),
+        BraveError::Request(err) if err.is_connect() => "request_connect".to_string(),
+        BraveError::Request(err) if err.is_decode() => "request_decode".to_string(),
+        BraveError::Request(err) if err.is_request() => "request_error".to_string(),
+        BraveError::Request(_) => "request_other".to_string(),
+    }
+}
 
 /// Execute web search using Brave Search API
 ///
@@ -15,20 +26,30 @@ pub async fn execute_web_search(
     query: &str,
     brave_client: Option<&Arc<BraveClient>>,
 ) -> Result<String, String> {
-    trace!("Executing web search for query: {}", query);
     info!("Executing web search");
+    let search_started = Instant::now();
+    debug!("Starting web_search tool execution");
 
-    if let Some(client) = brave_client {
+    let result = if let Some(client) = brave_client {
         execute_brave_search(query, client).await
     } else {
         error!("No search client configured");
         Err("No search client configured".to_string())
-    }
+    };
+
+    debug!(
+        "Finished web_search tool execution in {} ms with status={}",
+        search_started.elapsed().as_millis(),
+        if result.is_ok() { "ok" } else { "error" }
+    );
+
+    result
 }
 
 /// Execute web search using Brave Search API
 async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<String, String> {
-    trace!("Executing Brave search for query: {}", query);
+    let brave_search_started = Instant::now();
+    debug!("Starting Brave search request");
 
     // Create search request with summary enabled
     let mut search_request = BraveSearchRequest::new(query.to_string());
@@ -36,9 +57,16 @@ async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<
 
     // Execute search
     let response = client.search(search_request).await.map_err(|e| {
-        error!("Brave search API error: {:?}", e);
+        error!(
+            "Brave search API error during web_search ({})",
+            summarize_brave_error(&e)
+        );
         format!("Search API error: {:?}", e)
     })?;
+    debug!(
+        "Finished Brave search request in {} ms",
+        brave_search_started.elapsed().as_millis()
+    );
 
     // Format results
     let mut result_text = String::new();
@@ -94,9 +122,14 @@ async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<
 
     // Check if we have a summarizer key and fetch the summary
     if let Some(summarizer) = response.summarizer {
-        debug!("Summarizer key found, fetching summary");
+        let summarizer_started = Instant::now();
+        debug!("Starting Brave summarizer request");
         match client.summarizer(&summarizer.key).await {
             Ok(summarizer_response) => {
+                debug!(
+                    "Finished Brave summarizer request in {} ms",
+                    summarizer_started.elapsed().as_millis()
+                );
                 if let Some(summary_items) = summarizer_response.summary {
                     if !summary_items.is_empty() {
                         result_text.push_str("\n--- Search Summary ---\n\n");
@@ -117,7 +150,11 @@ async fn execute_brave_search(query: &str, client: &Arc<BraveClient>) -> Result<
             }
             Err(e) => {
                 // Best effort - log but don't fail the entire request
-                warn!("Failed to fetch summarizer content: {:?}", e);
+                warn!(
+                    "Failed to fetch Brave summarizer content after {} ms ({})",
+                    summarizer_started.elapsed().as_millis(),
+                    summarize_brave_error(&e)
+                );
             }
         }
     }
@@ -142,11 +179,6 @@ pub async fn execute_tool(
     arguments: &Value,
     brave_client: Option<&Arc<BraveClient>>,
 ) -> Result<String, String> {
-    trace!(
-        "Executing tool: {} with arguments: {}",
-        tool_name,
-        arguments
-    );
     debug!("Executing tool: {}", tool_name);
 
     match tool_name {

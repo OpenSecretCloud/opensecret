@@ -21,9 +21,12 @@ use crate::{
 };
 use axum::{
     extract::{Path, State},
-    http::HeaderMap,
+    http::{header, HeaderMap, HeaderName, HeaderValue},
     middleware::from_fn_with_state,
-    response::sse::{Event, Sse},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{delete, get, post},
     Extension, Json, Router,
 };
@@ -33,10 +36,12 @@ use futures::Stream;
 use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
+
+const RESPONSES_SSE_KEEPALIVE_INTERVAL_SECS: u64 = 1;
 
 // Default functions for serde
 fn default_store() -> bool {
@@ -2357,7 +2362,7 @@ async fn create_response_stream(
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
     Extension(body): Extension<ResponsesCreateRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+) -> Result<Response, ApiError> {
     trace!("=== ENTERING create_response_stream ===");
     trace!("User: {}", user.uuid);
     trace!("Request body: {:?}", body);
@@ -2921,7 +2926,30 @@ async fn create_response_stream(
     };
 
     trace!("Returning SSE stream");
-    Ok(Sse::new(event_stream))
+    Ok(responses_sse_response(event_stream))
+}
+
+fn responses_sse_response<S>(event_stream: S) -> Response
+where
+    S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
+{
+    let sse = Sse::new(event_stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(RESPONSES_SSE_KEEPALIVE_INTERVAL_SECS))
+            .text("keep-alive"),
+    );
+
+    (
+        [
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+            (
+                HeaderName::from_static("x-accel-buffering"),
+                HeaderValue::from_static("no"),
+            ),
+        ],
+        sse,
+    )
+        .into_response()
 }
 
 /// Helper to create encrypted SSE event

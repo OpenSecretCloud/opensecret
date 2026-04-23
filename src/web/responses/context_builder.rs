@@ -4,8 +4,9 @@ use super::constants::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_USER};
 use crate::encrypt::decrypt_with_key;
 use crate::tokens::{count_tokens, model_max_ctx};
 use crate::DBConnection;
-use serde_json::json;
-use tracing::error;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -643,7 +644,77 @@ pub fn build_prompt_from_chat_messages(
         final_msgs.push(msg);
     }
 
+    if model_uses_kimi_tool_call_ids(model) {
+        normalize_tool_call_ids_for_kimi(&mut final_msgs);
+    }
+
     Ok((final_msgs, total))
+}
+
+fn model_uses_kimi_tool_call_ids(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("kimi")
+}
+
+fn normalize_tool_call_ids_for_kimi(messages: &mut [Value]) {
+    let mut next_tool_call_index = 0usize;
+    let mut original_to_kimi_id = HashMap::<String, String>::new();
+
+    for message in messages.iter_mut() {
+        match message.get("role").and_then(Value::as_str) {
+            Some(ROLE_ASSISTANT) => {
+                let Some(tool_calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+
+                for tool_call in tool_calls.iter_mut() {
+                    let function_name = tool_call
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str);
+                    let original_id = tool_call.get("id").and_then(Value::as_str);
+
+                    let (Some(function_name), Some(original_id)) = (function_name, original_id)
+                    else {
+                        warn!(
+                            "Skipping malformed assistant tool call during Kimi ID normalization"
+                        );
+                        continue;
+                    };
+
+                    let kimi_id = format!("functions.{function_name}:{next_tool_call_index}");
+                    next_tool_call_index += 1;
+                    original_to_kimi_id.insert(original_id.to_string(), kimi_id.clone());
+
+                    if let Some(tool_call_id) = tool_call.get_mut("id") {
+                        *tool_call_id = Value::String(kimi_id);
+                    }
+                }
+            }
+            Some("tool") => {
+                let Some(original_id) = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                else {
+                    warn!("Tool message missing tool_call_id during Kimi ID normalization");
+                    continue;
+                };
+
+                if let Some(kimi_id) = original_to_kimi_id.get(&original_id) {
+                    if let Some(tool_call_id) = message.get_mut("tool_call_id") {
+                        *tool_call_id = Value::String(kimi_id.clone());
+                    }
+                } else {
+                    warn!(
+                        "Leaving unmatched tool_call_id {} unchanged during Kimi ID normalization",
+                        original_id
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1156,6 +1227,66 @@ mod tests {
         );
 
         // Total prompt tokens must include every item exactly once
+        assert_eq!(total_tokens, 10 + 9 + 5 + 9 + 5 + 12);
+    }
+
+    #[test]
+    fn test_build_prompt_normalizes_single_tool_turn_for_kimi_models() {
+        let tool_call_id = uuid::Uuid::new_v4();
+        let msgs = vec![
+            create_chat_msg("user", "What's the weather in SF?", Some(8)),
+            create_tool_call_chat_msg(
+                tool_call_id,
+                "web_search",
+                "{\"query\":\"weather San Francisco\"}",
+                9,
+            ),
+            create_tool_output_chat_msg(tool_call_id, "It is 68F and sunny in SF.", 7),
+            create_chat_msg(
+                "assistant",
+                "The weather in San Francisco is 68F and sunny.",
+                Some(11),
+            ),
+        ];
+
+        let (messages, total_tokens) =
+            build_prompt_from_chat_messages(msgs, "kimi-k2-5").expect("build prompt");
+
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "functions.web_search:0");
+        assert_eq!(messages[2]["tool_call_id"], "functions.web_search:0");
+        assert_eq!(total_tokens, 8 + 9 + 7 + 11);
+    }
+
+    #[test]
+    fn test_build_prompt_normalizes_kimi_tool_ids_globally_across_turns() {
+        let tool_call_a = uuid::Uuid::new_v4();
+        let tool_call_b = uuid::Uuid::new_v4();
+        let msgs = vec![
+            create_chat_msg("user", "Compare today's weather in SF and NYC", Some(10)),
+            create_tool_call_chat_msg(
+                tool_call_a,
+                "web_search",
+                "{\"query\":\"weather SF today\"}",
+                9,
+            ),
+            create_tool_output_chat_msg(tool_call_a, "SF: 68F sunny", 5),
+            create_tool_call_chat_msg(
+                tool_call_b,
+                "web_search",
+                "{\"query\":\"weather NYC today\"}",
+                9,
+            ),
+            create_tool_output_chat_msg(tool_call_b, "NYC: 52F cloudy", 5),
+            create_chat_msg("assistant", "SF is 68F sunny, NYC is 52F cloudy.", Some(12)),
+        ];
+
+        let (messages, total_tokens) =
+            build_prompt_from_chat_messages(msgs, "kimi-k2-6").expect("build prompt");
+
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "functions.web_search:0");
+        assert_eq!(messages[2]["tool_call_id"], "functions.web_search:0");
+        assert_eq!(messages[3]["tool_calls"][0]["id"], "functions.web_search:1");
+        assert_eq!(messages[4]["tool_call_id"], "functions.web_search:1");
         assert_eq!(total_tokens, 10 + 9 + 5 + 9 + 5 + 12);
     }
 

@@ -380,3 +380,147 @@ pub fn generate_apple_client_secret(
     debug!("Generated Apple client secret JWT successfully");
     Ok(token)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use openssl::{
+        ec::{EcGroup, EcKey},
+        nid::Nid,
+        pkey::PKey,
+        rsa::Rsa,
+    };
+
+    fn generate_test_ec_keypair_pems() -> (String, String) {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).expect("EC curve should exist");
+        let ec_key = EcKey::generate(&group).expect("EC key should generate");
+        let pkey = PKey::from_ec_key(ec_key).expect("EC key should convert to PKey");
+
+        let private_pem = String::from_utf8(
+            pkey.private_key_to_pem_pkcs8()
+                .expect("private key should serialize"),
+        )
+        .expect("private key PEM should be UTF-8");
+
+        let public_pem = String::from_utf8(
+            pkey.public_key_to_pem()
+                .expect("public key should serialize"),
+        )
+        .expect("public key PEM should be UTF-8");
+
+        (private_pem, public_pem)
+    }
+
+    fn generate_test_rsa_key_material() -> (String, String, String) {
+        let rsa = Rsa::generate(2048).expect("RSA key should generate");
+        let private_pem = String::from_utf8(
+            rsa.private_key_to_pem()
+                .expect("private key should serialize"),
+        )
+        .expect("private key PEM should be UTF-8");
+
+        let modulus = URL_SAFE_NO_PAD.encode(rsa.n().to_vec());
+        let exponent = URL_SAFE_NO_PAD.encode(rsa.e().to_vec());
+
+        (private_pem, modulus, exponent)
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TestAppleClientSecretClaims {
+        iss: String,
+        iat: i64,
+        exp: i64,
+        aud: String,
+        sub: String,
+    }
+
+    #[test]
+    fn test_generate_apple_client_secret_round_trip() {
+        let (private_key_pem, public_key_pem) = generate_test_ec_keypair_pems();
+
+        let token = generate_apple_client_secret(
+            "TEAM123456",
+            "KEY1234567",
+            &private_key_pem,
+            "com.opensecret.test",
+        )
+        .expect("should generate Apple client secret");
+
+        let header = decode_header(&token).expect("header should decode");
+        assert_eq!(header.alg, Algorithm::ES256);
+        assert_eq!(header.kid.as_deref(), Some("KEY1234567"));
+
+        let mut validation = Validation::new(Algorithm::ES256);
+        validation.set_audience(&[APPLE_ISSUER]);
+
+        let decoded = jsonwebtoken::decode::<TestAppleClientSecretClaims>(
+            &token,
+            &DecodingKey::from_ec_pem(public_key_pem.as_bytes()).expect("public key should parse"),
+            &validation,
+        )
+        .expect("token should decode");
+
+        assert_eq!(decoded.claims.iss, "TEAM123456");
+        assert_eq!(decoded.claims.aud, APPLE_ISSUER);
+        assert_eq!(decoded.claims.sub, "com.opensecret.test");
+        assert!(decoded.claims.exp > decoded.claims.iat);
+    }
+
+    #[test]
+    fn test_apple_key_rsa_components_decode_rs256_token() {
+        let (private_key_pem, modulus, exponent) = generate_test_rsa_key_material();
+
+        let claims = AppleIdTokenClaims {
+            iss: APPLE_ISSUER.to_string(),
+            sub: "apple-user-id".to_string(),
+            aud: "com.opensecret.test".to_string(),
+            exp: Utc::now().timestamp() + 3600,
+            iat: Utc::now().timestamp(),
+            email: Some("user@example.com".to_string()),
+            email_verified: Some(true),
+            is_private_email: Some(false),
+            nonce: None,
+            nonce_supported: Some(true),
+            real_user_status: Some(1),
+            auth_time: None,
+        };
+
+        let token = encode(
+            &Header::new(Algorithm::RS256),
+            &claims,
+            &EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
+                .expect("private key should parse"),
+        )
+        .expect("token should encode");
+
+        let apple_key = AppleKey {
+            kty: "RSA".to_string(),
+            kid: "rsa01".to_string(),
+            use_type: "sig".to_string(),
+            alg: "RS256".to_string(),
+            n: modulus,
+            e: exponent,
+        };
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_audience(&["com.opensecret.test"]);
+        validation.set_issuer(&[APPLE_ISSUER]);
+        validation.required_spec_claims = ["iss", "sub", "aud", "exp", "iat"]
+            .iter()
+            .map(|claim| claim.to_string())
+            .collect();
+
+        let decoded = jsonwebtoken::decode::<AppleIdTokenClaims>(
+            &token,
+            &apple_key
+                .to_decoding_key()
+                .expect("components should parse"),
+            &validation,
+        )
+        .expect("token should decode");
+
+        assert_eq!(decoded.claims.sub, "apple-user-id");
+        assert_eq!(decoded.claims.aud, "com.opensecret.test");
+    }
+}

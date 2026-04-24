@@ -569,3 +569,45 @@ pub(crate) fn validate_token(
     // Return the claims
     Ok(token.claims().custom.clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{decode as jwt_decode, DecodingKey, Validation};
+
+    #[test]
+    fn test_jsonwebtoken_hs256_round_trip() {
+        let now = Utc::now();
+        let claims = {
+            let mut claims = Claims::new(CustomClaims {
+                sub: "user-id".to_string(),
+                aud: Some("https://example.com".to_string()),
+                azp: Some(Uuid::nil().to_string()),
+                role: Some("authenticated".to_string()),
+            });
+            claims.issued_at = Some(now);
+            claims.not_before = Some(now);
+            claims.expiration = Some(now + Duration::minutes(5));
+            claims
+        };
+
+        let token = jwt_encode(
+            &JwtHeader::new(JwtAlgorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(b"super-secret"),
+        )
+        .expect("token should encode");
+
+        let mut validation = Validation::new(JwtAlgorithm::HS256);
+        validation.set_audience(&["https://example.com"]);
+
+        let decoded = jwt_decode::<Claims<CustomClaims>>(
+            &token,
+            &DecodingKey::from_secret(b"super-secret"),
+            &validation,
+        )
+        .expect("token should decode");
+
+        assert_eq!(decoded.claims.custom, claims.custom);
+    }
+}

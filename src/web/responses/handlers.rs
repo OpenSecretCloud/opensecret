@@ -2031,6 +2031,10 @@ async fn stream_one_assistant_turn(
     tx_client: &mpsc::Sender<StorageMessage>,
     tx_storage: &mpsc::Sender<StorageMessage>,
     next_message_id: &mut Option<Uuid>,
+    response_uuid: Uuid,
+    conversation_uuid: Uuid,
+    tool_turn_count: usize,
+    prompt_token_estimate: usize,
 ) -> Result<AssistantTurnOutcome, ApiError> {
     let mut chat_request = build_model_turn_request(body, prompt_messages, tools_enabled);
 
@@ -2039,6 +2043,23 @@ async fn stream_one_assistant_turn(
         body.model,
         serde_json::to_string_pretty(&chat_request)
             .unwrap_or_else(|_| "failed to serialize".to_string())
+    );
+
+    let chat_request_bytes = serde_json::to_vec(&chat_request)
+        .map(|bytes| bytes.len())
+        .unwrap_or_default();
+
+    debug!(
+        "Responses assistant turn request metadata: user_uuid={}, conversation_uuid={}, response_uuid={}, model={}, tool_turn_count={}, prompt_token_estimate={}, prompt_message_count={}, tools_enabled={}, chat_request_bytes={}",
+        user.uuid,
+        conversation_uuid,
+        response_uuid,
+        body.model,
+        tool_turn_count,
+        prompt_token_estimate,
+        prompt_messages.len(),
+        tools_enabled,
+        chat_request_bytes
     );
 
     let billing_context = crate::web::openai::BillingContext::new(
@@ -2287,6 +2308,7 @@ async fn setup_completion_processor(
     let tools_enabled = should_enable_web_search_tool(state.as_ref(), body);
     let internal_system_prompt = build_internal_system_prompt(tools_enabled);
     let mut prompt_messages = Arc::as_ref(&context.prompt_messages).clone();
+    let mut prompt_token_estimate = context.total_prompt_tokens;
 
     let loop_result: Result<(), ApiError> = async {
         let mut next_message_id = Some(prepared.assistant_message_id);
@@ -2302,6 +2324,10 @@ async fn setup_completion_processor(
                 &tx_client,
                 &tx_storage,
                 &mut next_message_id,
+                persisted.response.uuid,
+                context.conversation.uuid,
+                tool_turn_count,
+                prompt_token_estimate,
             )
             .await?
             {
@@ -2329,7 +2355,7 @@ async fn setup_completion_processor(
                     )
                     .await?;
 
-                    let (rebuilt_messages, _tokens) = build_prompt(
+                    let (rebuilt_messages, rebuilt_tokens) = build_prompt(
                         state.db.as_ref(),
                         context.conversation.id,
                         user.uuid,
@@ -2339,6 +2365,7 @@ async fn setup_completion_processor(
                         Some(&internal_system_prompt),
                     )?;
                     prompt_messages = rebuilt_messages;
+                    prompt_token_estimate = rebuilt_tokens;
                 }
                 AssistantTurnOutcome::Final => return Ok(()),
             }
@@ -2367,6 +2394,32 @@ async fn create_response_stream(
     trace!("User: {}", user.uuid);
     trace!("Request body: {:?}", body);
     trace!("Stream requested: {}", body.stream);
+    let (input_kind, input_message_count) = match &body.input {
+        InputMessage::String(_) => ("string", 1),
+        InputMessage::Messages(messages) => ("messages", messages.len()),
+    };
+    let tools_count = body
+        .tools
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or_default();
+    trace!(
+        "Request body metadata: model={}, stream={}, input_kind={}, input_message_count={}, instructions_present={}, tools_count={}, tool_choice_present={}, metadata_present={}, max_output_tokens_present={}, temperature_present={}, top_p_present={}, parallel_tool_calls={}, store={}",
+        body.model,
+        body.stream,
+        input_kind,
+        input_message_count,
+        body.instructions.is_some(),
+        tools_count,
+        body.tool_choice.is_some(),
+        body.metadata.is_some(),
+        body.max_output_tokens.is_some(),
+        body.temperature.is_some(),
+        body.top_p.is_some(),
+        body.parallel_tool_calls,
+        body.store
+    );
 
     // Phase 1: Validate and normalize input
     let prepared = validate_and_normalize_input(&state, &user, &body).await?;

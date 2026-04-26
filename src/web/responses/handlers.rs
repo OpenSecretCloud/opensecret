@@ -5,6 +5,7 @@ use crate::{
     billing::BillingError,
     db::DBError,
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
+    model_config::{model_config, ResponsesModelConfig},
     models::responses::{NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
     tokens::{count_tokens, model_max_ctx},
@@ -52,8 +53,8 @@ fn default_stream() -> bool {
     true
 }
 
-fn apply_responses_model_defaults(chat_request: &mut Value, model: &str) {
-    if model != "gemma4-31b" {
+fn apply_responses_model_defaults(chat_request: &mut Value, config: ResponsesModelConfig) {
+    if !config.include_reasoning && !config.enable_thinking {
         return;
     }
 
@@ -61,7 +62,13 @@ fn apply_responses_model_defaults(chat_request: &mut Value, model: &str) {
         return;
     };
 
-    obj.insert("include_reasoning".to_string(), json!(true));
+    if config.include_reasoning {
+        obj.insert("include_reasoning".to_string(), json!(true));
+    }
+
+    if !config.enable_thinking {
+        return;
+    }
 
     let chat_template_kwargs = obj
         .entry("chat_template_kwargs".to_string())
@@ -158,11 +165,13 @@ fn build_model_turn_request(
     prompt_messages: &[Value],
     tools_enabled: bool,
 ) -> Value {
+    let responses_config = model_config(&body.model).responses;
+    let sampling = responses_config.sampling;
     let mut chat_request = json!({
         "model": body.model,
         "messages": prompt_messages,
-        "temperature": body.temperature.unwrap_or(DEFAULT_TEMPERATURE),
-        "top_p": body.top_p.unwrap_or(DEFAULT_TOP_P),
+        "temperature": body.temperature.unwrap_or(sampling.temperature),
+        "top_p": body.top_p.unwrap_or(sampling.top_p),
         "max_tokens": body.max_output_tokens,
         "stream": true,
         "stream_options": { "include_usage": true }
@@ -177,7 +186,7 @@ fn build_model_turn_request(
         }
     }
 
-    apply_responses_model_defaults(&mut chat_request, &body.model);
+    apply_responses_model_defaults(&mut chat_request, responses_config);
     chat_request
 }
 
@@ -252,7 +261,10 @@ mod tests {
             }
         });
 
-        apply_responses_model_defaults(&mut chat_request, "gemma4-31b");
+        apply_responses_model_defaults(
+            &mut chat_request,
+            crate::model_config::model_config("gemma4-31b").responses,
+        );
 
         assert_eq!(chat_request["include_reasoning"], true);
         assert_eq!(
@@ -268,7 +280,10 @@ mod tests {
             "model": "gpt-oss-120b"
         });
 
-        apply_responses_model_defaults(&mut chat_request, "gpt-oss-120b");
+        apply_responses_model_defaults(
+            &mut chat_request,
+            crate::model_config::model_config("gpt-oss-120b").responses,
+        );
 
         assert!(chat_request.get("include_reasoning").is_none());
         assert!(chat_request.get("chat_template_kwargs").is_none());

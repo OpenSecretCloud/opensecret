@@ -1,8 +1,22 @@
 //! Central model-specific configuration.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelConfig {
     pub context_window: usize,
+    pub responses: ResponsesModelConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResponsesModelConfig {
+    pub sampling: SamplingConfig,
+    pub include_reasoning: bool,
+    pub enable_thinking: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplingConfig {
+    pub temperature: f32,
+    pub top_p: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -12,66 +26,74 @@ struct ModelConfigEntry {
 }
 
 pub const DEFAULT_CONTEXT_WINDOW: usize = 64_000;
+pub const DEFAULT_TEMPERATURE: f32 = 0.7;
+pub const DEFAULT_TOP_P: f32 = 1.0;
 
-const DEFAULT_MODEL_CONFIG: ModelConfig = ModelConfig {
-    context_window: DEFAULT_CONTEXT_WINDOW,
+const DEFAULT_SAMPLING_CONFIG: SamplingConfig = SamplingConfig {
+    temperature: DEFAULT_TEMPERATURE,
+    top_p: DEFAULT_TOP_P,
+};
+
+const DEFAULT_RESPONSES_MODEL_CONFIG: ResponsesModelConfig = ResponsesModelConfig {
+    sampling: DEFAULT_SAMPLING_CONFIG,
+    include_reasoning: false,
+    enable_thinking: false,
+};
+
+impl ModelConfig {
+    const fn new(context_window: usize) -> Self {
+        Self {
+            context_window,
+            responses: DEFAULT_RESPONSES_MODEL_CONFIG,
+        }
+    }
+
+    const fn with_responses(context_window: usize, responses: ResponsesModelConfig) -> Self {
+        Self {
+            context_window,
+            responses,
+        }
+    }
+}
+
+impl ModelConfigEntry {
+    const fn new(prefix: &'static str, context_window: usize) -> Self {
+        Self {
+            prefix,
+            config: ModelConfig::new(context_window),
+        }
+    }
+
+    const fn with_responses(
+        prefix: &'static str,
+        context_window: usize,
+        responses: ResponsesModelConfig,
+    ) -> Self {
+        Self {
+            prefix,
+            config: ModelConfig::with_responses(context_window, responses),
+        }
+    }
+}
+
+const DEFAULT_MODEL_CONFIG: ModelConfig = ModelConfig::new(DEFAULT_CONTEXT_WINDOW);
+
+const GEMMA4_RESPONSES_MODEL_CONFIG: ResponsesModelConfig = ResponsesModelConfig {
+    sampling: DEFAULT_SAMPLING_CONFIG,
+    include_reasoning: true,
+    enable_thinking: true,
 };
 
 const MODEL_CONFIGS: &[ModelConfigEntry] = &[
-    ModelConfigEntry {
-        prefix: "llama3-3-70b",
-        config: ModelConfig {
-            context_window: 128_000,
-        },
-    },
-    ModelConfigEntry {
-        prefix: "gpt-oss-120b",
-        config: ModelConfig {
-            context_window: 128_000,
-        },
-    },
-    ModelConfigEntry {
-        prefix: "qwen3-vl-30b",
-        config: ModelConfig {
-            context_window: 256_000,
-        },
-    },
-    ModelConfigEntry {
-        prefix: "kimi-k2-5",
-        config: ModelConfig {
-            context_window: 256_000,
-        },
-    },
-    ModelConfigEntry {
-        prefix: "kimi-k2-6",
-        config: ModelConfig {
-            context_window: 256_000,
-        },
-    },
-    ModelConfigEntry {
-        prefix: "gemma4-31b",
-        config: ModelConfig {
-            context_window: 256_000,
-        },
-    },
-    ModelConfigEntry {
-        prefix: "glm-5-1",
-        config: ModelConfig {
-            context_window: 202_000,
-        },
-    },
-    ModelConfigEntry {
-        prefix: "deepseek-r1-0528",
-        config: ModelConfig {
-            context_window: 128_000,
-        },
-    },
-    ModelConfigEntry {
-        prefix: "gemma-3-27b",
-        config: ModelConfig {
-            context_window: 20_000,
-        },
-    },
+    ModelConfigEntry::new("llama3-3-70b", 128_000),
+    ModelConfigEntry::new("gpt-oss-120b", 128_000),
+    ModelConfigEntry::new("qwen3-vl-30b", 256_000),
+    ModelConfigEntry::new("kimi-k2-5", 256_000),
+    ModelConfigEntry::new("kimi-k2-6", 256_000),
+    ModelConfigEntry::with_responses("gemma4-31b", 256_000, GEMMA4_RESPONSES_MODEL_CONFIG),
+    ModelConfigEntry::new("glm-5-1", 202_000),
+    ModelConfigEntry::new("deepseek-r1-0528", 128_000),
+    ModelConfigEntry::new("gemma-3-27b", 20_000),
 ];
 
 pub fn model_config(model: &str) -> ModelConfig {
@@ -101,6 +123,34 @@ mod tests {
         assert_eq!(model_context_window("kimi-k2-6"), 256_000);
         assert_eq!(model_context_window("gemma4-31b"), 256_000);
         assert_eq!(model_context_window("glm-5-1"), 202_000);
+    }
+
+    #[test]
+    fn test_known_models_use_default_sampling_config() {
+        for model in [
+            "gemma-3-27b",
+            "deepseek-r1-0528",
+            "llama3-3-70b",
+            "gpt-oss-120b",
+            "qwen3-vl-30b",
+            "kimi-k2-5",
+            "kimi-k2-6",
+            "gemma4-31b",
+            "glm-5-1",
+        ] {
+            let config = model_config(model);
+
+            assert_eq!(config.responses.sampling.temperature, DEFAULT_TEMPERATURE);
+            assert_eq!(config.responses.sampling.top_p, DEFAULT_TOP_P);
+        }
+    }
+
+    #[test]
+    fn test_gemma4_responses_config_enables_thinking() {
+        let responses_config = model_config("gemma4-31b").responses;
+
+        assert!(responses_config.include_reasoning);
+        assert!(responses_config.enable_thinking);
     }
 
     #[test]

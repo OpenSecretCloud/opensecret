@@ -245,8 +245,9 @@ fn finalize_first_model_tool_call(tool_calls: &[StreamedToolCall]) -> Option<Mod
 mod tests {
     use super::{
         append_streamed_tool_calls, apply_responses_model_defaults,
-        build_internal_system_prompt_for_now, build_provider_tools, finalize_first_model_tool_call,
-        ClientResponseState, StreamedToolCall, MAPLE_WEB_SEARCH_PROMPT,
+        build_internal_system_prompt_for_now, build_model_turn_request, build_provider_tools,
+        finalize_first_model_tool_call, ClientResponseState, ConversationParam, InputMessage,
+        ResponsesCreateRequest, StreamedToolCall, MAPLE_WEB_SEARCH_PROMPT,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -287,6 +288,47 @@ mod tests {
 
         assert!(chat_request.get("include_reasoning").is_none());
         assert!(chat_request.get("chat_template_kwargs").is_none());
+    }
+
+    fn responses_request_for_model(model: &str) -> ResponsesCreateRequest {
+        ResponsesCreateRequest {
+            model: model.to_string(),
+            input: InputMessage::String("hello".to_string()),
+            conversation: ConversationParam::String(Uuid::new_v4()),
+            instructions: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            tool_choice: None,
+            tools: None,
+            parallel_tool_calls: false,
+            store: true,
+            metadata: None,
+            stream: true,
+        }
+    }
+
+    #[test]
+    fn test_build_model_turn_request_uses_deepseek_v4_pro_sampling_defaults() {
+        let body = responses_request_for_model("deepseek-v4-pro");
+        let chat_request =
+            build_model_turn_request(&body, &[json!({"role": "user", "content": "hello"})], false);
+
+        assert_eq!(chat_request["temperature"].as_f64(), Some(1.0));
+        assert_eq!(chat_request["top_p"].as_f64(), Some(1.0));
+    }
+
+    #[test]
+    fn test_build_model_turn_request_preserves_explicit_sampling_values() {
+        let mut body = responses_request_for_model("deepseek-v4-pro");
+        body.temperature = Some(0.5);
+        body.top_p = Some(0.75);
+
+        let chat_request =
+            build_model_turn_request(&body, &[json!({"role": "user", "content": "hello"})], false);
+
+        assert_eq!(chat_request["temperature"].as_f64(), Some(0.5));
+        assert_eq!(chat_request["top_p"].as_f64(), Some(0.75));
     }
 
     #[test]

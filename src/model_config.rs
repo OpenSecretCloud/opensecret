@@ -84,6 +84,15 @@ const GEMMA4_RESPONSES_MODEL_CONFIG: ResponsesModelConfig = ResponsesModelConfig
     enable_thinking: true,
 };
 
+const DEEPSEEK_V4_PRO_RESPONSES_MODEL_CONFIG: ResponsesModelConfig = ResponsesModelConfig {
+    sampling: SamplingConfig {
+        temperature: 1.0,
+        top_p: 1.0,
+    },
+    include_reasoning: false,
+    enable_thinking: false,
+};
+
 const MODEL_CONFIGS: &[ModelConfigEntry] = &[
     ModelConfigEntry::new("llama3-3-70b", 128_000),
     ModelConfigEntry::new("gpt-oss-120b", 128_000),
@@ -92,6 +101,11 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
     ModelConfigEntry::new("kimi-k2-6", 256_000),
     ModelConfigEntry::with_responses("gemma4-31b", 256_000, GEMMA4_RESPONSES_MODEL_CONFIG),
     ModelConfigEntry::new("glm-5-1", 202_000),
+    ModelConfigEntry::with_responses(
+        "deepseek-v4-pro",
+        800_000,
+        DEEPSEEK_V4_PRO_RESPONSES_MODEL_CONFIG,
+    ),
     ModelConfigEntry::new("deepseek-r1-0528", 128_000),
     ModelConfigEntry::new("gemma-3-27b", 20_000),
 ];
@@ -123,10 +137,11 @@ mod tests {
         assert_eq!(model_context_window("kimi-k2-6"), 256_000);
         assert_eq!(model_context_window("gemma4-31b"), 256_000);
         assert_eq!(model_context_window("glm-5-1"), 202_000);
+        assert_eq!(model_context_window("deepseek-v4-pro"), 800_000);
     }
 
     #[test]
-    fn test_known_models_use_default_sampling_config() {
+    fn test_existing_models_use_default_sampling_config() {
         for model in [
             "gemma-3-27b",
             "deepseek-r1-0528",
@@ -151,6 +166,15 @@ mod tests {
 
         assert!(responses_config.include_reasoning);
         assert!(responses_config.enable_thinking);
+    }
+
+    #[test]
+    fn test_deepseek_v4_pro_responses_config() {
+        let config = model_config("deepseek-v4-pro");
+
+        assert_eq!(config.context_window, 800_000);
+        assert_eq!(config.responses.sampling.temperature, 1.0);
+        assert_eq!(config.responses.sampling.top_p, 1.0);
     }
 
     #[test]

@@ -80,6 +80,7 @@ mod jwt;
 mod kv;
 mod message_signing;
 mod migrations;
+mod model_config;
 mod models;
 mod oauth;
 mod os_flags;

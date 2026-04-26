@@ -3,6 +3,8 @@
 use once_cell::sync::Lazy;
 use tiktoken_rs::cl100k_base;
 
+use crate::model_config::model_context_window;
+
 /// Cached encoder – created once per process.
 /// No mutex needed: CoreBPE is immutable and thread-safe.
 static ENCODER: Lazy<tiktoken_rs::CoreBPE> =
@@ -13,29 +15,8 @@ pub fn count_tokens(text: &str) -> usize {
     ENCODER.encode_with_special_tokens(text).len()
 }
 
-/// Per‑model context windows (hard limits).
-/// Any unknown model defaults to 64k tokens.
 pub fn model_max_ctx(model: &str) -> usize {
-    const LIMITS: &[(&str, usize)] = &[
-        // Known models
-        ("llama3-3-70b", 128_000),
-        ("gpt-oss-120b", 128_000),
-        ("qwen3-vl-30b", 256_000), // Vision-language model
-        ("kimi-k2-5", 256_000),    // Vision-capable model with 256K context
-        ("kimi-k2-6", 256_000),    // Temporary sibling rollout alongside kimi-k2-5
-        ("gemma4-31b", 256_000),   // Multimodal model with 256K context
-        ("glm-5-1", 202_000),      // Long-context agentic engineering model
-        // Chat models
-        ("deepseek-r1-0528", 128_000),
-        // Gemma 3 27B (vision) — capped at 20k
-        ("gemma-3-27b", 20_000),
-    ];
-
-    LIMITS
-        .iter()
-        .find(|(prefix, _)| model.starts_with(*prefix))
-        .map(|(_, l)| *l)
-        .unwrap_or(64_000)
+    model_context_window(model)
 }
 
 #[cfg(test)]
@@ -76,6 +57,7 @@ mod tests {
         assert_eq!(model_max_ctx("kimi-k2-6"), 256_000);
         assert_eq!(model_max_ctx("gemma4-31b"), 256_000);
         assert_eq!(model_max_ctx("glm-5-1"), 202_000);
+        assert_eq!(model_max_ctx("deepseek-v4-pro"), 800_000);
     }
 
     #[test]
@@ -90,6 +72,7 @@ mod tests {
     #[test]
     fn test_model_max_ctx_prefix_matching() {
         // Should match by prefix
+        assert_eq!(model_max_ctx("deepseek-r1-0528-instruct"), 128_000);
         assert_eq!(model_max_ctx("deepseek-r1-70b-instruct"), 64_000);
     }
 }

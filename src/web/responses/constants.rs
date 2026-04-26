@@ -1,12 +1,10 @@
 //! Constants used throughout the Responses API
 
+pub const DEFAULT_TEMPERATURE: f32 = crate::model_config::DEFAULT_TEMPERATURE;
+
 /// Channel buffer sizes
 pub const STORAGE_CHANNEL_BUFFER: usize = 1024;
 pub const CLIENT_CHANNEL_BUFFER: usize = 1024;
-
-/// Default values
-pub const DEFAULT_TEMPERATURE: f32 = 0.7;
-pub const DEFAULT_TOP_P: f32 = 1.0;
 
 /// Response object types
 pub const OBJECT_TYPE_RESPONSE: &str = "response";

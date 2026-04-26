@@ -5,6 +5,7 @@ use crate::{
     billing::BillingError,
     db::DBError,
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
+    model_config::{model_config, ResponsesModelConfig, SamplingConfig},
     models::responses::{NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
     tokens::{count_tokens, model_max_ctx},
@@ -52,8 +53,8 @@ fn default_stream() -> bool {
     true
 }
 
-fn apply_responses_model_defaults(chat_request: &mut Value, model: &str) {
-    if model != "gemma4-31b" {
+fn apply_responses_model_defaults(chat_request: &mut Value, config: ResponsesModelConfig) {
+    if !config.include_reasoning && !config.enable_thinking {
         return;
     }
 
@@ -61,7 +62,13 @@ fn apply_responses_model_defaults(chat_request: &mut Value, model: &str) {
         return;
     };
 
-    obj.insert("include_reasoning".to_string(), json!(true));
+    if config.include_reasoning {
+        obj.insert("include_reasoning".to_string(), json!(true));
+    }
+
+    if !config.enable_thinking {
+        return;
+    }
 
     let chat_template_kwargs = obj
         .entry("chat_template_kwargs".to_string())
@@ -74,6 +81,13 @@ fn apply_responses_model_defaults(chat_request: &mut Value, model: &str) {
             "enable_thinking": true
         });
     }
+}
+
+fn resolve_responses_sampling(body: &ResponsesCreateRequest) -> SamplingConfig {
+    model_config(&body.model)
+        .responses
+        .sampling
+        .with_overrides(body.temperature, body.top_p)
 }
 
 const MAPLE_SYSTEM_PROMPT: &str = "You are Maple, a friendly, concise, and helpful assistant. Give direct answers, be honest about uncertainty, and never invent tool use, search results, or sources.";
@@ -158,11 +172,13 @@ fn build_model_turn_request(
     prompt_messages: &[Value],
     tools_enabled: bool,
 ) -> Value {
+    let responses_config = model_config(&body.model).responses;
+    let sampling = resolve_responses_sampling(body);
     let mut chat_request = json!({
         "model": body.model,
         "messages": prompt_messages,
-        "temperature": body.temperature.unwrap_or(DEFAULT_TEMPERATURE),
-        "top_p": body.top_p.unwrap_or(DEFAULT_TOP_P),
+        "temperature": body.temperature.unwrap_or(sampling.temperature),
+        "top_p": body.top_p.unwrap_or(sampling.top_p),
         "max_tokens": body.max_output_tokens,
         "stream": true,
         "stream_options": { "include_usage": true }
@@ -177,7 +193,7 @@ fn build_model_turn_request(
         }
     }
 
-    apply_responses_model_defaults(&mut chat_request, &body.model);
+    apply_responses_model_defaults(&mut chat_request, responses_config);
     chat_request
 }
 
@@ -236,8 +252,10 @@ fn finalize_first_model_tool_call(tool_calls: &[StreamedToolCall]) -> Option<Mod
 mod tests {
     use super::{
         append_streamed_tool_calls, apply_responses_model_defaults,
-        build_internal_system_prompt_for_now, build_provider_tools, finalize_first_model_tool_call,
-        ClientResponseState, StreamedToolCall, MAPLE_WEB_SEARCH_PROMPT,
+        build_internal_system_prompt_for_now, build_model_turn_request, build_provider_tools,
+        finalize_first_model_tool_call, resolve_responses_sampling, ClientResponseState,
+        ConversationParam, InputMessage, ResponsesCreateRequest, StreamedToolCall,
+        MAPLE_WEB_SEARCH_PROMPT,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -252,7 +270,10 @@ mod tests {
             }
         });
 
-        apply_responses_model_defaults(&mut chat_request, "gemma4-31b");
+        apply_responses_model_defaults(
+            &mut chat_request,
+            crate::model_config::model_config("gemma4-31b").responses,
+        );
 
         assert_eq!(chat_request["include_reasoning"], true);
         assert_eq!(
@@ -268,10 +289,66 @@ mod tests {
             "model": "gpt-oss-120b"
         });
 
-        apply_responses_model_defaults(&mut chat_request, "gpt-oss-120b");
+        apply_responses_model_defaults(
+            &mut chat_request,
+            crate::model_config::model_config("gpt-oss-120b").responses,
+        );
 
         assert!(chat_request.get("include_reasoning").is_none());
         assert!(chat_request.get("chat_template_kwargs").is_none());
+    }
+
+    fn responses_request_for_model(model: &str) -> ResponsesCreateRequest {
+        ResponsesCreateRequest {
+            model: model.to_string(),
+            input: InputMessage::String("hello".to_string()),
+            conversation: ConversationParam::String(Uuid::new_v4()),
+            instructions: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            tool_choice: None,
+            tools: None,
+            parallel_tool_calls: false,
+            store: true,
+            metadata: None,
+            stream: true,
+        }
+    }
+
+    #[test]
+    fn test_build_model_turn_request_uses_deepseek_v4_pro_sampling_defaults() {
+        let body = responses_request_for_model("deepseek-v4-pro");
+        let chat_request =
+            build_model_turn_request(&body, &[json!({"role": "user", "content": "hello"})], false);
+
+        assert_eq!(chat_request["temperature"].as_f64(), Some(1.0));
+        assert_eq!(chat_request["top_p"].as_f64(), Some(1.0));
+    }
+
+    #[test]
+    fn test_resolve_responses_sampling_uses_model_defaults() {
+        let body = responses_request_for_model("llama3-3-70b");
+        let sampling = resolve_responses_sampling(&body);
+
+        assert_eq!(
+            sampling.temperature,
+            crate::model_config::DEFAULT_TEMPERATURE
+        );
+        assert_eq!(sampling.top_p, crate::model_config::DEFAULT_TOP_P);
+    }
+
+    #[test]
+    fn test_build_model_turn_request_preserves_explicit_sampling_values() {
+        let mut body = responses_request_for_model("deepseek-v4-pro");
+        body.temperature = Some(0.5);
+        body.top_p = Some(0.75);
+
+        let chat_request =
+            build_model_turn_request(&body, &[json!({"role": "user", "content": "hello"})], false);
+
+        assert_eq!(chat_request["temperature"].as_f64(), Some(0.5));
+        assert_eq!(chat_request["top_p"].as_f64(), Some(0.75));
     }
 
     #[test]
@@ -1702,6 +1779,7 @@ async fn persist_request_data(
     } else {
         None
     };
+    let sampling = resolve_responses_sampling(body);
 
     // Create the Response (job tracker)
     let new_response = NewResponse {
@@ -1710,8 +1788,8 @@ async fn persist_request_data(
         conversation_id: conversation.id,
         status: ResponseStatus::InProgress,
         model: body.model.clone(),
-        temperature: body.temperature,
-        top_p: body.top_p,
+        temperature: Some(sampling.temperature),
+        top_p: Some(sampling.top_p),
         max_output_tokens: body.max_output_tokens,
         tool_choice: body.tool_choice.clone(),
         parallel_tool_calls: body.parallel_tool_calls,

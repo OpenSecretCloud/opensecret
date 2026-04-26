@@ -23,6 +23,7 @@ use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Body as HyperBody, Client, Request};
 use hyper_tls::HttpsConnector;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +38,324 @@ const MAX_AUDIO_SIZE: usize = 100 * 1024 * 1024;
 // Timeout constants for provider requests
 const REQUEST_TIMEOUT_SECS: u64 = 120; // Request timeout (generous for large non-streaming responses)
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming reads
+
+const LOG_PREVIEW_CHARS: usize = 20;
+
+#[derive(Clone, Default)]
+struct CompletionRequestLogMetadata {
+    body_bytes: usize,
+    top_level_keys: usize,
+    stream: Option<bool>,
+    stream_options_include_usage: Option<bool>,
+    max_tokens_present: bool,
+    max_tokens_is_null: bool,
+    max_tokens: Option<i64>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    tool_choice_kind: Option<&'static str>,
+    parallel_tool_calls: Option<bool>,
+    tools_count: usize,
+    tools_json_bytes: usize,
+    include_reasoning: Option<bool>,
+    chat_template_enable_thinking: Option<bool>,
+    messages_json_bytes: usize,
+    messages: MessageLogMetadata,
+}
+
+impl std::fmt::Debug for CompletionRequestLogMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompletionRequestLogMetadata")
+            .field("body_bytes", &self.body_bytes)
+            .field("top_level_keys", &self.top_level_keys)
+            .field("stream", &self.stream)
+            .field(
+                "stream_options_include_usage",
+                &self.stream_options_include_usage,
+            )
+            .field("max_tokens_present", &self.max_tokens_present)
+            .field("max_tokens_is_null", &self.max_tokens_is_null)
+            .field("max_tokens", &self.max_tokens)
+            .field("temperature", &self.temperature)
+            .field("top_p", &self.top_p)
+            .field("tool_choice_kind", &self.tool_choice_kind)
+            .field("parallel_tool_calls", &self.parallel_tool_calls)
+            .field("tools_count", &self.tools_count)
+            .field("tools_json_bytes", &self.tools_json_bytes)
+            .field("include_reasoning", &self.include_reasoning)
+            .field(
+                "chat_template_enable_thinking",
+                &self.chat_template_enable_thinking,
+            )
+            .field("messages_json_bytes", &self.messages_json_bytes)
+            .field("messages", &self.messages)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct MessageLogMetadata {
+    total: usize,
+    role_system: usize,
+    role_user: usize,
+    role_assistant: usize,
+    role_tool: usize,
+    role_other: usize,
+    missing_role: usize,
+    content_string: usize,
+    content_array: usize,
+    content_null: usize,
+    content_missing: usize,
+    content_other: usize,
+    empty_string_content: usize,
+    text_parts: usize,
+    image_parts: usize,
+    image_data_url_parts: usize,
+    image_remote_url_parts: usize,
+    image_other_url_parts: usize,
+    file_parts: usize,
+    unknown_parts: usize,
+    assistant_tool_call_messages: usize,
+    assistant_tool_calls: usize,
+    tool_call_args_total_bytes: usize,
+    tool_call_args_max_bytes: usize,
+    tool_calls_missing_id: usize,
+    tool_calls_duplicate_id: usize,
+    tool_calls_missing_function: usize,
+    tool_calls_missing_arguments: usize,
+    tool_messages_missing_tool_call_id: usize,
+    tool_messages_matched_tool_call_id: usize,
+    tool_messages_unmatched_tool_call_id: usize,
+    total_message_json_bytes: usize,
+    max_message_json_bytes: usize,
+    total_content_json_bytes: usize,
+    max_content_json_bytes: usize,
+}
+
+impl CompletionRequestLogMetadata {
+    fn from_body(body: &Value, body_bytes: usize) -> Self {
+        let tools = body.get("tools");
+        let messages = body.get("messages");
+
+        Self {
+            body_bytes,
+            top_level_keys: body.as_object().map(|obj| obj.len()).unwrap_or_default(),
+            stream: body.get("stream").and_then(Value::as_bool),
+            stream_options_include_usage: body
+                .get("stream_options")
+                .and_then(|opts| opts.get("include_usage"))
+                .and_then(Value::as_bool),
+            max_tokens_present: body.get("max_tokens").is_some(),
+            max_tokens_is_null: body.get("max_tokens").is_some_and(Value::is_null),
+            max_tokens: body.get("max_tokens").and_then(Value::as_i64),
+            temperature: body.get("temperature").and_then(Value::as_f64),
+            top_p: body.get("top_p").and_then(Value::as_f64),
+            tool_choice_kind: body.get("tool_choice").map(value_kind),
+            parallel_tool_calls: body.get("parallel_tool_calls").and_then(Value::as_bool),
+            tools_count: tools
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default(),
+            tools_json_bytes: tools.map(json_value_len).unwrap_or_default(),
+            include_reasoning: body.get("include_reasoning").and_then(Value::as_bool),
+            chat_template_enable_thinking: body
+                .get("chat_template_kwargs")
+                .and_then(|kwargs| kwargs.get("enable_thinking"))
+                .and_then(Value::as_bool),
+            messages_json_bytes: messages.map(json_value_len).unwrap_or_default(),
+            messages: MessageLogMetadata::from_messages(messages.and_then(Value::as_array)),
+        }
+    }
+}
+
+impl MessageLogMetadata {
+    fn from_messages(messages: Option<&Vec<Value>>) -> Self {
+        let mut metadata = Self::default();
+        let mut tool_call_ids = HashSet::new();
+        let mut tool_message_ids = Vec::new();
+
+        let Some(messages) = messages else {
+            return metadata;
+        };
+
+        metadata.total = messages.len();
+
+        for message in messages {
+            let message_json_bytes = json_value_len(message);
+            metadata.total_message_json_bytes += message_json_bytes;
+            metadata.max_message_json_bytes =
+                metadata.max_message_json_bytes.max(message_json_bytes);
+
+            match message.get("role").and_then(Value::as_str) {
+                Some("system") => metadata.role_system += 1,
+                Some("user") => metadata.role_user += 1,
+                Some("assistant") => metadata.role_assistant += 1,
+                Some("tool") => metadata.role_tool += 1,
+                Some(_) => metadata.role_other += 1,
+                None => metadata.missing_role += 1,
+            }
+
+            metadata.record_content(message.get("content"));
+            metadata.record_assistant_tool_calls(message.get("tool_calls"), &mut tool_call_ids);
+
+            if message.get("role").and_then(Value::as_str) == Some("tool") {
+                if let Some(tool_call_id) = message.get("tool_call_id").and_then(Value::as_str) {
+                    tool_message_ids.push(tool_call_id.to_string());
+                } else {
+                    metadata.tool_messages_missing_tool_call_id += 1;
+                }
+            }
+        }
+
+        for tool_message_id in tool_message_ids {
+            if tool_call_ids.contains(&tool_message_id) {
+                metadata.tool_messages_matched_tool_call_id += 1;
+            } else {
+                metadata.tool_messages_unmatched_tool_call_id += 1;
+            }
+        }
+
+        metadata
+    }
+
+    fn record_content(&mut self, content: Option<&Value>) {
+        let Some(content) = content else {
+            self.content_missing += 1;
+            return;
+        };
+
+        let content_json_bytes = json_value_len(content);
+        self.total_content_json_bytes += content_json_bytes;
+        self.max_content_json_bytes = self.max_content_json_bytes.max(content_json_bytes);
+
+        match content {
+            Value::Null => self.content_null += 1,
+            Value::String(text) => {
+                self.content_string += 1;
+                if text.is_empty() {
+                    self.empty_string_content += 1;
+                }
+            }
+            Value::Array(parts) => {
+                self.content_array += 1;
+                for part in parts {
+                    self.record_content_part(part);
+                }
+            }
+            _ => self.content_other += 1,
+        }
+    }
+
+    fn record_content_part(&mut self, part: &Value) {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") | Some("input_text") => self.text_parts += 1,
+            Some("image_url") | Some("input_image") => {
+                self.image_parts += 1;
+                match image_part_url(part) {
+                    Some(url) if url.starts_with("data:") => self.image_data_url_parts += 1,
+                    Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+                        self.image_remote_url_parts += 1;
+                    }
+                    Some(_) => self.image_other_url_parts += 1,
+                    None => self.image_other_url_parts += 1,
+                }
+            }
+            Some("file") | Some("input_file") => self.file_parts += 1,
+            _ => self.unknown_parts += 1,
+        }
+    }
+
+    fn record_assistant_tool_calls(
+        &mut self,
+        tool_calls: Option<&Value>,
+        tool_call_ids: &mut HashSet<String>,
+    ) {
+        let Some(tool_calls) = tool_calls.and_then(Value::as_array) else {
+            return;
+        };
+
+        if !tool_calls.is_empty() {
+            self.assistant_tool_call_messages += 1;
+        }
+
+        for tool_call in tool_calls {
+            self.assistant_tool_calls += 1;
+
+            match tool_call.get("id").and_then(Value::as_str) {
+                Some(id) => {
+                    if !tool_call_ids.insert(id.to_string()) {
+                        self.tool_calls_duplicate_id += 1;
+                    }
+                }
+                None => self.tool_calls_missing_id += 1,
+            }
+
+            let Some(function) = tool_call.get("function") else {
+                self.tool_calls_missing_function += 1;
+                self.tool_calls_missing_arguments += 1;
+                continue;
+            };
+
+            match function.get("arguments") {
+                Some(Value::String(arguments)) => {
+                    let argument_bytes = arguments.len();
+                    self.tool_call_args_total_bytes += argument_bytes;
+                    self.tool_call_args_max_bytes =
+                        self.tool_call_args_max_bytes.max(argument_bytes);
+                }
+                Some(arguments) => {
+                    let argument_bytes = json_value_len(arguments);
+                    self.tool_call_args_total_bytes += argument_bytes;
+                    self.tool_call_args_max_bytes =
+                        self.tool_call_args_max_bytes.max(argument_bytes);
+                }
+                None => self.tool_calls_missing_arguments += 1,
+            }
+        }
+    }
+}
+
+fn value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn json_value_len(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or_default()
+}
+
+fn image_part_url(part: &Value) -> Option<&str> {
+    part.get("image_url")
+        .and_then(|image| {
+            image
+                .get("url")
+                .and_then(Value::as_str)
+                .or_else(|| image.as_str())
+        })
+        .or_else(|| part.get("image").and_then(Value::as_str))
+}
+
+fn safe_log_preview(value: &str) -> String {
+    let mut chars = value.chars();
+    let preview = chars
+        .by_ref()
+        .take(LOG_PREVIEW_CHARS)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>();
+
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
 
 /// Parameters for transcription requests
 struct TranscriptionParams<'a> {
@@ -439,11 +758,18 @@ pub async fn get_chat_completion_response(
 
         ensure_stream_usage(&mut request_body);
 
-        let request_body_json =
-            serde_json::to_string(&Value::Object(request_body)).map_err(|e| {
-                error!("Failed to serialize request body: {:?}", e);
-                ApiError::InternalServerError
-            })?;
+        let request_body_value = Value::Object(request_body);
+        let request_body_json = serde_json::to_string(&request_body_value).map_err(|e| {
+            error!("Failed to serialize request body: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+        let request_log_metadata =
+            CompletionRequestLogMetadata::from_body(&request_body_value, request_body_json.len());
+
+        debug!(
+            "Completion request metadata before provider call: user_uuid={}, provider={}, model={}, metadata={:?}",
+            user.uuid, proxy_config.provider_name, model_name, request_log_metadata
+        );
 
         match try_provider(&client, &proxy_config, &request_body_json, headers).await {
             Ok(response) => {
@@ -454,6 +780,14 @@ pub async fn get_chat_completion_response(
                 (response, proxy_config.provider_name.clone())
             }
             Err(err) => {
+                error!(
+                    "Completion request metadata at provider failure: user_uuid={}, provider={}, model={}, error={}, metadata={:?}",
+                    user.uuid,
+                    proxy_config.provider_name,
+                    model_name,
+                    err,
+                    request_log_metadata
+                );
                 error!(
                     "Chat completion request failed for provider {} and model {}: {}",
                     proxy_config.provider_name, model_name, err
@@ -1791,10 +2125,11 @@ async fn try_provider(
                 // Try to get error body for logging
                 if let Ok(body_bytes) = to_bytes(response.into_body()).await {
                     let body_str = String::from_utf8_lossy(&body_bytes);
-                    error!("Response body: {}", body_str);
+                    let body_preview = safe_log_preview(&body_str);
+                    error!("Response body preview: {}", body_preview);
                     Err(format!(
-                        "Provider {} returned status {}: {}",
-                        proxy_config.provider_name, status, body_str
+                        "Provider {} returned status {}; body_preview={}",
+                        proxy_config.provider_name, status, body_preview
                     ))
                 } else {
                     Err(format!(

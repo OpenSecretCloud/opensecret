@@ -14,13 +14,15 @@ use crate::models::account_deletion::{AccountDeletionError, NewAccountDeletionRe
 use crate::models::password_reset::NewPasswordResetRequest;
 use crate::models::platform_password_reset::NewPlatformPasswordResetRequest;
 use crate::models::platform_users::PlatformUser;
+use crate::push::worker::start_push_worker;
 use crate::sqs::SqsEventPublisher;
+use crate::web::agent::start_schedule_worker;
 use crate::web::openai_auth::validate_openai_auth;
 use crate::web::platform_login_routes;
 use crate::web::{
-    conversation_projects_routes, conversations_routes, health_routes_with_state,
-    instructions_routes, login_routes, oauth_routes, openai_routes, protected_routes,
-    responses_routes,
+    agent_routes, conversation_projects_routes, conversations_routes, health_routes_with_state,
+    instructions_routes, login_routes, oauth_routes, openai_routes, protected_routes, push_routes,
+    rag_routes, responses_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
@@ -85,6 +87,8 @@ mod oauth;
 mod os_flags;
 mod private_key;
 mod proxy_config;
+mod push;
+mod rag;
 mod sqs;
 mod tokens;
 mod web;
@@ -407,6 +411,7 @@ pub struct AppState {
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
     enclave_key: Vec<u8>,
     proxy_router: Arc<ProxyRouter>,
+    rag_cache: Arc<tokio::sync::Mutex<rag::RagCache>>,
     resend_api_key: Option<String>,
     ephemeral_keys: Arc<RwLock<HashMap<String, EphemeralSecret>>>,
     session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, SessionState>>>,
@@ -697,6 +702,7 @@ impl AppStateBuilder {
             aws_credential_manager,
             enclave_key,
             proxy_router,
+            rag_cache: Arc::new(tokio::sync::Mutex::new(rag::RagCache::default())),
             resend_api_key: self.resend_api_key,
             ephemeral_keys: Arc::new(RwLock::new(HashMap::new())),
             session_states: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -870,8 +876,6 @@ impl AppState {
         derivation_path: Option<&str>,
         seed_phrase_derivation_path: Option<&str>,
     ) -> Result<SecretKey, Error> {
-        info!("Getting user key for UUID: {}", user_uuid);
-
         if let Some(path) = derivation_path {
             debug!("Using BIP-32 derivation path: {}", path);
         }
@@ -881,13 +885,9 @@ impl AppState {
         }
 
         let user = self.get_user(user_uuid).await?;
-        debug!("User retrieved successfully");
 
         let encrypted_seed = match user.get_seed_encrypted().await {
-            Some(es) => {
-                debug!("Found existing encrypted seed for user");
-                es
-            }
+            Some(es) => es,
             None => {
                 // create seed if not already exists
                 info!(
@@ -902,7 +902,6 @@ impl AppState {
             }
         };
 
-        debug!("Decrypting user seed and deriving key");
         let user_secret_key = decrypt_user_seed_to_key(
             self.enclave_key.clone(),
             encrypted_seed,
@@ -910,7 +909,6 @@ impl AppState {
             seed_phrase_derivation_path,
         )?;
 
-        info!("Successfully derived key for user: {}", user_uuid);
         Ok(user_secret_key)
     }
 
@@ -1668,7 +1666,17 @@ impl AppState {
         project_id: i32,
         key_name: &str,
     ) -> Result<Option<String>, Error> {
-        // Get the encrypted secret
+        Ok(self
+            .get_project_secret_bytes(project_id, key_name)
+            .await?
+            .map(|bytes| general_purpose::STANDARD.encode(bytes)))
+    }
+
+    pub async fn get_project_secret_bytes(
+        &self,
+        project_id: i32,
+        key_name: &str,
+    ) -> Result<Option<Vec<u8>>, Error> {
         let secret = match self
             .db
             .get_org_project_secret_by_key_name_and_project(key_name, project_id)?
@@ -1677,15 +1685,24 @@ impl AppState {
             None => return Ok(None),
         };
 
-        // Decrypt the secret using the enclave key
         let secret_key = SecretKey::from_slice(&self.enclave_key)
             .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
         let decrypted_bytes = decrypt_with_key(&secret_key, &secret.secret_enc)
             .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
-        // Always return base64 encoded bytes
-        Ok(Some(general_purpose::STANDARD.encode(&decrypted_bytes)))
+        Ok(Some(decrypted_bytes))
+    }
+
+    pub async fn get_project_secret_string(
+        &self,
+        project_id: i32,
+        key_name: &str,
+    ) -> Result<Option<String>, Error> {
+        let secret = self.get_project_secret_bytes(project_id, key_name).await?;
+        secret
+            .map(|bytes| String::from_utf8(bytes).map_err(|_| Error::SecretParsingError))
+            .transpose()
     }
 
     pub async fn get_project_resend_api_key(
@@ -2674,6 +2691,9 @@ async fn main() -> Result<(), Error> {
     )
     .await?;
 
+    start_push_worker(app_state.clone());
+    start_schedule_worker(app_state.clone());
+
     let cors = CorsLayer::new()
         // allow all method types
         .allow_methods(Any)
@@ -2704,6 +2724,18 @@ async fn main() -> Result<(), Error> {
         )
         .merge(
             instructions_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            rag_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            agent_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            push_routes(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
         )
         .merge(attestation_routes::router(app_state.clone()))

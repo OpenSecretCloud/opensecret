@@ -323,6 +323,12 @@ log "Added Google OAuth domains to /etc/hosts"
 echo "127.0.0.15 appleid.apple.com" >> /etc/hosts
 log "Added Apple OAuth domain to /etc/hosts"
 
+# Add push provider hostnames to /etc/hosts
+echo "127.0.0.21 api.push.apple.com" >> /etc/hosts
+echo "127.0.0.22 api.sandbox.push.apple.com" >> /etc/hosts
+echo "127.0.0.20 fcm.googleapis.com" >> /etc/hosts
+log "Added APNs and FCM domains to /etc/hosts"
+
 # Add AWS SQS hostname to /etc/hosts
 echo "127.0.0.13 sqs.us-east-2.amazonaws.com" >> /etc/hosts
 log "Added AWS SQS domain to /etc/hosts"
@@ -448,6 +454,16 @@ run_forever tf_os_flags python3 /app/traffic_forwarder.py 127.0.0.18 443 3 8028 
 # Start the traffic forwarder for Apple OAuth in the background
 log "Starting Apple OAuth traffic forwarder"
 run_forever tf_apple_oauth python3 /app/traffic_forwarder.py 127.0.0.15 443 3 8018 &
+
+# Start the traffic forwarders for push providers in the background
+log "Starting APNs production traffic forwarder"
+run_forever tf_apns_prod python3 /app/traffic_forwarder.py 127.0.0.21 443 3 8024 &
+
+log "Starting APNs sandbox traffic forwarder"
+run_forever tf_apns_sandbox python3 /app/traffic_forwarder.py 127.0.0.22 443 3 8025 &
+
+log "Starting FCM traffic forwarder"
+run_forever tf_fcm python3 /app/traffic_forwarder.py 127.0.0.20 443 3 8029 &
 
 # Start the traffic forwarders for Tinfoil proxy in the background
 log "Starting Tinfoil GitHub proxy traffic forwarder"
@@ -631,6 +647,28 @@ if timeout 5 bash -c '</dev/tcp/127.0.0.15/443'; then
     log "Apple OAuth connection successful"
 else
     log "Apple OAuth connection failed"
+fi
+
+# Test the connections to push providers
+log "Testing connection to APNs production:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.21/443'; then
+    log "APNs production connection successful"
+else
+    log "APNs production connection failed"
+fi
+
+log "Testing connection to APNs sandbox:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.22/443'; then
+    log "APNs sandbox connection successful"
+else
+    log "APNs sandbox connection failed"
+fi
+
+log "Testing connection to FCM:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.20/443'; then
+    log "FCM connection successful"
+else
+    log "FCM connection failed"
 fi
 
 # Test the connections to Tinfoil proxy services

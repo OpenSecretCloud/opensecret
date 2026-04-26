@@ -73,6 +73,7 @@ fn create_assistant_message_if_missing(
                 status: STATUS_IN_PROGRESS.to_string(),
                 finish_reason: None,
                 created_at,
+                user_reaction: None,
             })
             .map(|_| ())
             .map_err(|e| format!("Failed to create assistant message: {:?}", e)),

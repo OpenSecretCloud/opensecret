@@ -5,7 +5,7 @@ use crate::{
     billing::BillingError,
     db::DBError,
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
-    model_config::{model_config, ResponsesModelConfig},
+    model_config::{model_config, ResponsesModelConfig, SamplingConfig},
     models::responses::{NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
     tokens::{count_tokens, model_max_ctx},
@@ -81,6 +81,13 @@ fn apply_responses_model_defaults(chat_request: &mut Value, config: ResponsesMod
             "enable_thinking": true
         });
     }
+}
+
+fn resolve_responses_sampling(body: &ResponsesCreateRequest) -> SamplingConfig {
+    model_config(&body.model)
+        .responses
+        .sampling
+        .with_overrides(body.temperature, body.top_p)
 }
 
 const MAPLE_SYSTEM_PROMPT: &str = "You are Maple, a friendly, concise, and helpful assistant. Give direct answers, be honest about uncertainty, and never invent tool use, search results, or sources.";
@@ -166,7 +173,7 @@ fn build_model_turn_request(
     tools_enabled: bool,
 ) -> Value {
     let responses_config = model_config(&body.model).responses;
-    let sampling = responses_config.sampling;
+    let sampling = resolve_responses_sampling(body);
     let mut chat_request = json!({
         "model": body.model,
         "messages": prompt_messages,
@@ -246,8 +253,9 @@ mod tests {
     use super::{
         append_streamed_tool_calls, apply_responses_model_defaults,
         build_internal_system_prompt_for_now, build_model_turn_request, build_provider_tools,
-        finalize_first_model_tool_call, ClientResponseState, ConversationParam, InputMessage,
-        ResponsesCreateRequest, StreamedToolCall, MAPLE_WEB_SEARCH_PROMPT,
+        finalize_first_model_tool_call, resolve_responses_sampling, ClientResponseState,
+        ConversationParam, InputMessage, ResponsesCreateRequest, StreamedToolCall,
+        MAPLE_WEB_SEARCH_PROMPT,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -316,6 +324,18 @@ mod tests {
 
         assert_eq!(chat_request["temperature"].as_f64(), Some(1.0));
         assert_eq!(chat_request["top_p"].as_f64(), Some(1.0));
+    }
+
+    #[test]
+    fn test_resolve_responses_sampling_uses_model_defaults() {
+        let body = responses_request_for_model("llama3-3-70b");
+        let sampling = resolve_responses_sampling(&body);
+
+        assert_eq!(
+            sampling.temperature,
+            crate::model_config::DEFAULT_TEMPERATURE
+        );
+        assert_eq!(sampling.top_p, crate::model_config::DEFAULT_TOP_P);
     }
 
     #[test]
@@ -1759,6 +1779,7 @@ async fn persist_request_data(
     } else {
         None
     };
+    let sampling = resolve_responses_sampling(body);
 
     // Create the Response (job tracker)
     let new_response = NewResponse {
@@ -1767,8 +1788,8 @@ async fn persist_request_data(
         conversation_id: conversation.id,
         status: ResponseStatus::InProgress,
         model: body.model.clone(),
-        temperature: body.temperature,
-        top_p: body.top_p,
+        temperature: Some(sampling.temperature),
+        top_p: Some(sampling.top_p),
         max_output_tokens: body.max_output_tokens,
         tool_choice: body.tool_choice.clone(),
         parallel_tool_calls: body.parallel_tool_calls,

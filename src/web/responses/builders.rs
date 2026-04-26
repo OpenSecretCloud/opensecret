@@ -1,6 +1,7 @@
 //! Builder patterns for complex response structures
 
 use crate::{
+    model_config::model_config,
     models::responses::{Conversation, Response},
     web::responses::{
         constants::*,
@@ -41,6 +42,8 @@ impl ResponseBuilder {
     /// # Arguments
     /// * `response` - The database Response model to build from
     pub fn from_response(response: &Response) -> Self {
+        let sampling = model_config(&response.model).responses.sampling;
+
         Self {
             response: ResponsesCreateResponse {
                 id: response.uuid,
@@ -64,7 +67,7 @@ impl ResponseBuilder {
                 },
                 safety_identifier: None,
                 store: response.store,
-                temperature: response.temperature.unwrap_or(1.0),
+                temperature: response.temperature.unwrap_or(sampling.temperature),
                 text: TextFormat {
                     format: TextFormatSpec {
                         format_type: TEXT_FORMAT_TYPE.to_string(),
@@ -76,7 +79,7 @@ impl ResponseBuilder {
                     .unwrap_or_else(|| TOOL_CHOICE_AUTO.to_string()),
                 tools: vec![],
                 top_logprobs: 0,
-                top_p: response.top_p.unwrap_or(1.0),
+                top_p: response.top_p.unwrap_or(sampling.top_p),
                 truncation: TRUNCATION_DISABLED,
                 usage: None, // Default to None
                 user: None,
@@ -322,6 +325,18 @@ mod tests {
         assert_eq!(built.output.len(), 0);
         assert!(built.usage.is_none());
         assert!(built.metadata.is_none());
+    }
+
+    #[test]
+    fn test_builder_resolves_missing_sampling_from_model_config() {
+        let mut response = create_test_response();
+        response.temperature = None;
+        response.top_p = None;
+
+        let built = ResponseBuilder::from_response(&response).build();
+
+        assert_eq!(built.temperature, crate::model_config::DEFAULT_TEMPERATURE);
+        assert_eq!(built.top_p, crate::model_config::DEFAULT_TOP_P);
     }
 
     #[test]

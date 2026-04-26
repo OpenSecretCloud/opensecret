@@ -19,6 +19,15 @@ pub struct SamplingConfig {
     pub top_p: f32,
 }
 
+impl SamplingConfig {
+    pub fn with_overrides(self, temperature: Option<f32>, top_p: Option<f32>) -> Self {
+        Self {
+            temperature: temperature.unwrap_or(self.temperature),
+            top_p: top_p.unwrap_or(self.top_p),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ModelConfigEntry {
     prefix: &'static str,
@@ -175,6 +184,14 @@ mod tests {
         assert_eq!(config.context_window, 800_000);
         assert_eq!(config.responses.sampling.temperature, 1.0);
         assert_eq!(config.responses.sampling.top_p, 1.0);
+    }
+
+    #[test]
+    fn test_sampling_config_applies_overrides() {
+        let sampling = DEFAULT_SAMPLING_CONFIG.with_overrides(Some(0.5), None);
+
+        assert_eq!(sampling.temperature, 0.5);
+        assert_eq!(sampling.top_p, DEFAULT_TOP_P);
     }
 
     #[test]

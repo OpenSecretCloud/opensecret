@@ -594,7 +594,7 @@ pub async fn send_password_reset_confirmation_email(
             <div class="container">
                 <h1>Password Reset Confirmation</h1>
                 <p>Your {} account password has been successfully reset.</p>
-                <p>If you did not initiate this password reset, please contact us immediately at <a href="mailto:support@trymaple.ai">support@trymaple.ai</a>.</p>
+                <p>If you did not initiate this password reset, please contact our support team immediately.</p>
                 <p>For security reasons, we recommend that you:</p>
                 <ul>
                     <li>Change your password again if you suspect any unauthorized access.</li>
@@ -898,7 +898,7 @@ pub async fn send_platform_password_reset_confirmation_email(
             <div class="container">
                 <h1>Password Reset Confirmation</h1>
                 <p>Your OpenSecret Platform account password has been successfully reset.</p>
-                <p>If you did not initiate this password reset, please contact us immediately at <a href="mailto:support@trymaple.ai">support@trymaple.ai</a>.</p>
+                <p>If you did not initiate this password reset, please contact us immediately at <a href="mailto:support@opensecret.cloud">support@opensecret.cloud</a>.</p>
                 <p>For security reasons, we recommend that you:</p>
                 <ul>
                     <li>Change your password again if you suspect any unauthorized access.</li>
@@ -1040,7 +1040,7 @@ pub async fn send_account_deletion_confirmation_email(
             <div class="container">
                 <h1>Account Deletion Confirmation</h1>
                 <p>Your {} account has been successfully deleted along with all associated data.</p>
-                <p>If you did not request this account deletion, please contact us immediately at <a href="mailto:support@trymaple.ai">support@trymaple.ai</a>.</p>
+                <p>If you did not request this account deletion, please contact our support team immediately.</p>
                 <p>Thank you for your time with us. We hope to see you again in the future.</p>
                 <p>Best regards,<br>The {} Team</p>
             </div>

@@ -175,11 +175,11 @@ fn build_model_turn_request(
     prompt_messages: &[Value],
     tools_enabled: bool,
 ) -> Value {
-    let resolved_model = resolve_completion_model_id(&body.model).unwrap_or(body.model.as_str());
-    let responses_config = model_config(resolved_model).responses;
+    let config_model = resolve_completion_model_id(&body.model).unwrap_or(body.model.as_str());
+    let responses_config = model_config(config_model).responses;
     let sampling = resolve_responses_sampling(body);
     let mut chat_request = json!({
-        "model": resolved_model,
+        "model": body.model,
         "messages": prompt_messages,
         "temperature": body.temperature.unwrap_or(sampling.temperature),
         "top_p": body.top_p.unwrap_or(sampling.top_p),
@@ -356,12 +356,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_model_turn_request_resolves_auto_alias() {
+    fn test_build_model_turn_request_preserves_auto_alias_for_provider_resolution() {
         let body = responses_request_for_model(crate::model_config::AUTO_QUICK_MODEL_ID);
         let chat_request =
             build_model_turn_request(&body, &[json!({"role": "user", "content": "hello"})], false);
 
-        assert_eq!(chat_request["model"], crate::model_config::QUICK_MODEL_ID);
+        assert_eq!(
+            chat_request["model"],
+            crate::model_config::AUTO_QUICK_MODEL_ID
+        );
     }
 
     #[test]

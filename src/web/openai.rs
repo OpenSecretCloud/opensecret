@@ -752,16 +752,19 @@ pub async fn get_chat_completion_response(
             ApiError::BadRequest
         })?
         .to_string();
-    let model_name = match resolve_completion_model_id(&requested_model_name) {
-        Some(model) => model.to_string(),
-        None if proxy_config.provider_name != "tinfoil" => requested_model_name.clone(),
-        None => {
-            error!(
-                "Unsupported completion model requested: {}",
-                requested_model_name
-            );
-            return Err(ApiError::BadRequest);
+    let model_name = if proxy_config.provider_name == "tinfoil" {
+        match resolve_completion_model_id(&requested_model_name) {
+            Some(model) => model.to_string(),
+            None => {
+                error!(
+                    "Unsupported completion model requested: {}",
+                    requested_model_name
+                );
+                return Err(ApiError::BadRequest);
+            }
         }
+    } else {
+        requested_model_name.clone()
     };
 
     if requested_model_name != model_name {

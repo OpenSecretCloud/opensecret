@@ -47,8 +47,8 @@ mod tests {
     #[test]
     fn test_model_max_ctx_known_models() {
         // Test known models
-        assert_eq!(model_max_ctx("gemma-3-27b"), 20_000);
-        assert_eq!(model_max_ctx("deepseek-r1-0528"), 128_000);
+        assert_eq!(model_max_ctx("gemma-3-27b"), 256_000);
+        assert_eq!(model_max_ctx("deepseek-r1-0528"), 256_000);
         // Native Tinfoil model IDs
         assert_eq!(model_max_ctx("llama3-3-70b"), 128_000);
         assert_eq!(model_max_ctx("gpt-oss-120b"), 128_000);
@@ -58,6 +58,8 @@ mod tests {
         assert_eq!(model_max_ctx("gemma4-31b"), 256_000);
         assert_eq!(model_max_ctx("glm-5-1"), 202_000);
         assert_eq!(model_max_ctx("deepseek-v4-pro"), 800_000);
+        assert_eq!(model_max_ctx("auto:quick"), 128_000);
+        assert_eq!(model_max_ctx("auto:powerful"), 256_000);
     }
 
     #[test]

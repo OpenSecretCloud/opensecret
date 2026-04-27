@@ -5,7 +5,10 @@ use crate::{
     billing::BillingError,
     db::DBError,
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
-    model_config::{model_config, ResponsesModelConfig, SamplingConfig},
+    model_config::{
+        model_config, resolve_completion_model_id, ResponsesModelConfig, SamplingConfig,
+        AUTO_QUICK_MODEL_ID,
+    },
     models::responses::{NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
     tokens::{count_tokens, model_max_ctx},
@@ -172,10 +175,11 @@ fn build_model_turn_request(
     prompt_messages: &[Value],
     tools_enabled: bool,
 ) -> Value {
-    let responses_config = model_config(&body.model).responses;
+    let resolved_model = resolve_completion_model_id(&body.model).unwrap_or(body.model.as_str());
+    let responses_config = model_config(resolved_model).responses;
     let sampling = resolve_responses_sampling(body);
     let mut chat_request = json!({
-        "model": body.model,
+        "model": resolved_model,
         "messages": prompt_messages,
         "temperature": body.temperature.unwrap_or(sampling.temperature),
         "top_p": body.top_p.unwrap_or(sampling.top_p),
@@ -349,6 +353,15 @@ mod tests {
 
         assert_eq!(chat_request["temperature"].as_f64(), Some(0.5));
         assert_eq!(chat_request["top_p"].as_f64(), Some(0.75));
+    }
+
+    #[test]
+    fn test_build_model_turn_request_resolves_auto_alias() {
+        let body = responses_request_for_model(crate::model_config::AUTO_QUICK_MODEL_ID);
+        let chat_request =
+            build_model_turn_request(&body, &[json!({"role": "user", "content": "hello"})], false);
+
+        assert_eq!(chat_request["model"], crate::model_config::QUICK_MODEL_ID);
     }
 
     #[test]
@@ -1371,7 +1384,7 @@ async fn spawn_title_generation_task(
 
         // Build the title generation request
         let title_request = json!({
-            "model": "llama3-3-70b",
+            "model": AUTO_QUICK_MODEL_ID,
             "messages": [
                 {
                     "role": ROLE_SYSTEM,
@@ -1392,7 +1405,7 @@ async fn spawn_title_generation_task(
         let headers = HeaderMap::new();
         let billing_context = crate::web::openai::BillingContext::new(
             crate::web::openai_auth::AuthMethod::Jwt,
-            "llama3-3-70b".to_string(),
+            AUTO_QUICK_MODEL_ID.to_string(),
         );
 
         debug!("Title generation: about to call get_chat_completion_response");
@@ -2466,10 +2479,28 @@ async fn create_response_stream(
     headers: HeaderMap,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
-    Extension(body): Extension<ResponsesCreateRequest>,
+    Extension(mut body): Extension<ResponsesCreateRequest>,
 ) -> Result<Response, ApiError> {
     trace!("=== ENTERING create_response_stream ===");
     trace!("User: {}", user.uuid);
+    let requested_model = body.model.clone();
+    let completion_provider = state.proxy_router.get_completion_proxy();
+    let resolved_model = match resolve_completion_model_id(&requested_model) {
+        Some(model) => model.to_string(),
+        None if completion_provider.provider_name != "tinfoil" => requested_model.clone(),
+        None => {
+            error!("Unsupported responses model requested: {}", requested_model);
+            return Err(ApiError::BadRequest);
+        }
+    };
+    if requested_model != resolved_model {
+        debug!(
+            "Resolved responses model {} to {}",
+            requested_model, resolved_model
+        );
+        body.model = resolved_model;
+    }
+
     trace!("Request body: {:?}", body);
     trace!("Stream requested: {}", body.stream);
     let (input_kind, input_message_count) = match &body.input {

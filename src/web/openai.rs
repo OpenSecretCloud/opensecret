@@ -1,3 +1,6 @@
+use crate::model_config::{
+    model_catalog_response, openai_models_response, resolve_completion_model_id,
+};
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
 use crate::proxy_config::{canonicalize_tinfoil_model, ProxyConfig};
@@ -383,7 +386,7 @@ struct TTSRequest {
 }
 
 fn default_tts_model() -> String {
-    "kokoro".to_string()
+    "qwen3-tts".to_string()
 }
 
 fn default_tts_voice() -> String {
@@ -519,6 +522,13 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
         .route(
             "/v1/models",
             get(proxy_models).layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                decrypt_request::<()>,
+            )),
+        )
+        .route(
+            "/v1/models/catalog",
+            get(proxy_model_catalog).layer(axum::middleware::from_fn_with_state(
                 app_state.clone(),
                 decrypt_request::<()>,
             )),
@@ -708,7 +718,7 @@ pub async fn get_chat_completion_response(
     user: &User,
     body: Value,
     headers: &HeaderMap,
-    billing_context: BillingContext,
+    mut billing_context: BillingContext,
 ) -> Result<CompletionStream, ApiError> {
     debug!("Entering get_chat_completion_response with billing context");
 
@@ -717,7 +727,7 @@ pub async fn get_chat_completion_response(
         return Err(ApiError::BadRequest);
     }
 
-    let modified_body = body
+    let mut modified_body = body
         .as_object()
         .ok_or_else(|| {
             error!("Request body is not a JSON object");
@@ -732,7 +742,9 @@ pub async fn get_chat_completion_response(
         .unwrap_or(false);
 
     // Extract the model from the request - error if not specified
-    let model_name = modified_body
+    let proxy_config = state.proxy_router.get_completion_proxy();
+
+    let requested_model_name = modified_body
         .get("model")
         .and_then(|m| m.as_str())
         .ok_or_else(|| {
@@ -740,8 +752,29 @@ pub async fn get_chat_completion_response(
             ApiError::BadRequest
         })?
         .to_string();
+    let model_name = if proxy_config.provider_name == "tinfoil" {
+        match resolve_completion_model_id(&requested_model_name) {
+            Some(model) => model.to_string(),
+            None => {
+                error!(
+                    "Unsupported completion model requested: {}",
+                    requested_model_name
+                );
+                return Err(ApiError::BadRequest);
+            }
+        }
+    } else {
+        requested_model_name.clone()
+    };
 
-    let proxy_config = state.proxy_router.get_completion_proxy();
+    if requested_model_name != model_name {
+        debug!(
+            "Resolved requested model {} to provider model {}",
+            requested_model_name, model_name
+        );
+    }
+    modified_body.insert("model".to_string(), json!(model_name.clone()));
+    billing_context.model_name = model_name.clone();
 
     // Create a new hyper client with better timeout configuration
     let https = HttpsConnector::new();
@@ -1081,20 +1114,6 @@ fn canonicalize_response_model(json: &mut Value) {
     }
 }
 
-fn canonicalize_models_response(json: &mut Value) {
-    let Some(models) = json.get_mut("data").and_then(|data| data.as_array_mut()) else {
-        return;
-    };
-
-    for model in models {
-        if let Some(model_id) = model.get_mut("id") {
-            if let Some(id) = model_id.as_str() {
-                *model_id = json!(canonicalize_tinfoil_model(id));
-            }
-        }
-    }
-}
-
 /// Helper to extract SSE frame from buffer
 /// Returns the data portion of "data: <content>" frames, None if no complete frame available
 fn extract_sse_frame(buffer: &mut String) -> Option<String> {
@@ -1224,7 +1243,17 @@ async fn proxy_models(
     debug!("Entering proxy_models function");
 
     let proxy_config = state.proxy_router.get_completion_proxy();
+    let models_response = if proxy_config.provider_name == "tinfoil" {
+        openai_models_response()
+    } else {
+        fetch_provider_models(&proxy_config).await?
+    };
 
+    debug!("Exiting proxy_models function");
+    encrypt_response(&state, &session_id, &models_response).await
+}
+
+async fn fetch_provider_models(proxy_config: &ProxyConfig) -> Result<Value, ApiError> {
     let https = HttpsConnector::new();
     let client = Client::builder()
         .pool_idle_timeout(Duration::from_secs(30))
@@ -1284,17 +1313,26 @@ async fn proxy_models(
         ApiError::InternalServerError
     })?;
 
-    let mut models_response: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+    serde_json::from_slice(&body_bytes).map_err(|e| {
         error!("Failed to parse models response: {:?}", e);
         ApiError::InternalServerError
-    })?;
+    })
+}
 
-    if proxy_config.provider_name == "tinfoil" {
-        canonicalize_models_response(&mut models_response);
-    }
+async fn proxy_model_catalog(
+    State(state): State<Arc<AppState>>,
+    _headers: HeaderMap,
+    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(_user): axum::Extension<User>,
+    axum::Extension(_auth_method): axum::Extension<AuthMethod>,
+    axum::Extension(_body): axum::Extension<()>,
+) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+    debug!("Entering proxy_model_catalog function");
 
-    debug!("Exiting proxy_models function");
-    encrypt_response(&state, &session_id, &models_response).await
+    let catalog_response = model_catalog_response();
+
+    debug!("Exiting proxy_model_catalog function");
+    encrypt_response(&state, &session_id, &catalog_response).await
 }
 
 fn transcription_model_for_provider(model_name: &str, provider_name: &str) -> String {
@@ -1806,18 +1844,18 @@ async fn proxy_tts(
         return Err(ApiError::BadRequest);
     }
 
-    // Only kokoro is supported for TTS
-    if tts_request.model != "kokoro" {
+    // Only qwen3-tts is supported for TTS
+    if tts_request.model != "qwen3-tts" {
         error!(
-            "Unsupported TTS model: {}. Only 'kokoro' is supported",
+            "Unsupported TTS model: {}. Only 'qwen3-tts' is supported",
             tts_request.model
         );
         return Err(ApiError::BadRequest);
     }
 
-    // Build request for Tinfoil Kokoro
+    // Build request for Tinfoil TTS
     let tts_api_request = TTSRequest {
-        model: "kokoro".to_string(),
+        model: "qwen3-tts".to_string(),
         voice: tts_request.voice.clone(),
         input: tts_request.input.clone(),
         response_format: tts_request.response_format.clone(),

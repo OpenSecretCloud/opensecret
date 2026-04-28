@@ -7,7 +7,6 @@ use crate::{
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
     model_config::{
         model_config, resolve_completion_model_id, ResponsesModelConfig, SamplingConfig,
-        AUTO_QUICK_MODEL_ID,
     },
     models::responses::{NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
@@ -1387,7 +1386,7 @@ async fn spawn_title_generation_task(
 
         // Build the title generation request
         let title_request = json!({
-            "model": AUTO_QUICK_MODEL_ID,
+            "model": "llama3-3-70b",
             "messages": [
                 {
                     "role": ROLE_SYSTEM,
@@ -1408,7 +1407,7 @@ async fn spawn_title_generation_task(
         let headers = HeaderMap::new();
         let billing_context = crate::web::openai::BillingContext::new(
             crate::web::openai_auth::AuthMethod::Jwt,
-            AUTO_QUICK_MODEL_ID.to_string(),
+            "llama3-3-70b".to_string(),
         );
 
         debug!("Title generation: about to call get_chat_completion_response");

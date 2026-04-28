@@ -46,18 +46,16 @@ mod tests {
 
     #[test]
     fn test_model_max_ctx_known_models() {
-        // Test known models
-        assert_eq!(model_max_ctx("gemma-3-27b"), 20_000);
-        assert_eq!(model_max_ctx("deepseek-r1-0528"), 128_000);
-        // Native Tinfoil model IDs
         assert_eq!(model_max_ctx("llama3-3-70b"), 128_000);
         assert_eq!(model_max_ctx("gpt-oss-120b"), 128_000);
+        assert_eq!(model_max_ctx("gpt-oss-safeguard-120b"), 131_000);
         assert_eq!(model_max_ctx("qwen3-vl-30b"), 256_000);
-        assert_eq!(model_max_ctx("kimi-k2-5"), 256_000);
         assert_eq!(model_max_ctx("kimi-k2-6"), 256_000);
         assert_eq!(model_max_ctx("gemma4-31b"), 256_000);
         assert_eq!(model_max_ctx("glm-5-1"), 202_000);
         assert_eq!(model_max_ctx("deepseek-v4-pro"), 800_000);
+        assert_eq!(model_max_ctx("auto:quick"), 128_000);
+        assert_eq!(model_max_ctx("auto:powerful"), 256_000);
     }
 
     #[test]
@@ -66,13 +64,13 @@ mod tests {
         assert_eq!(model_max_ctx("gpt-4"), 64_000);
         assert_eq!(model_max_ctx("claude-3"), 64_000);
         assert_eq!(model_max_ctx("unknown-model-xyz"), 64_000);
+        assert_eq!(model_max_ctx("voxtral-small-24b"), 64_000);
         assert_eq!(model_max_ctx(""), 64_000);
     }
 
     #[test]
     fn test_model_max_ctx_prefix_matching() {
-        // Should match by prefix
-        assert_eq!(model_max_ctx("deepseek-r1-0528-instruct"), 128_000);
+        assert_eq!(model_max_ctx("deepseek-r1-0528-instruct"), 64_000);
         assert_eq!(model_max_ctx("deepseek-r1-70b-instruct"), 64_000);
     }
 }

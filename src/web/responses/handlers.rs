@@ -237,6 +237,12 @@ fn append_streamed_tool_calls(tool_calls: &mut Vec<StreamedToolCall>, tool_call_
     }
 }
 
+fn has_streamed_tool_call_entries(tool_call_delta: &Value) -> bool {
+    tool_call_delta
+        .as_array()
+        .is_some_and(|entries| !entries.is_empty())
+}
+
 fn finalize_first_model_tool_call(tool_calls: &[StreamedToolCall]) -> Option<ModelToolCall> {
     let tool_call = tool_calls.first()?;
     let name = tool_call.name.clone()?;
@@ -256,9 +262,9 @@ mod tests {
     use super::{
         append_streamed_tool_calls, apply_responses_model_defaults,
         build_internal_system_prompt_for_now, build_model_turn_request, build_provider_tools,
-        finalize_first_model_tool_call, resolve_responses_sampling, ClientResponseState,
-        ConversationParam, InputMessage, ResponsesCreateRequest, StreamedToolCall,
-        MAPLE_WEB_SEARCH_PROMPT,
+        finalize_first_model_tool_call, has_streamed_tool_call_entries, resolve_responses_sampling,
+        ClientResponseState, ConversationParam, InputMessage, ResponsesCreateRequest,
+        StreamedToolCall, MAPLE_WEB_SEARCH_PROMPT,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -393,6 +399,28 @@ mod tests {
         let tool_call = finalize_first_model_tool_call(&tool_calls).expect("tool call");
         assert_eq!(tool_call.name, "web_search");
         assert_eq!(tool_call.arguments["query"], "Donald Trump birthday");
+    }
+
+    #[test]
+    fn test_empty_tool_calls_delta_is_not_treated_as_tool_call() {
+        assert!(!has_streamed_tool_call_entries(&json!([])));
+        assert!(!has_streamed_tool_call_entries(&json!(null)));
+        assert!(has_streamed_tool_call_entries(&json!([{
+            "index": 0,
+            "function": {
+                "name": "web_search",
+                "arguments": "{}"
+            }
+        }])));
+    }
+
+    #[test]
+    fn test_append_streamed_tool_calls_ignores_empty_array() {
+        let mut tool_calls = Vec::<StreamedToolCall>::new();
+
+        append_streamed_tool_calls(&mut tool_calls, &json!([]));
+
+        assert!(tool_calls.is_empty());
     }
 
     #[test]
@@ -2243,7 +2271,10 @@ async fn stream_one_assistant_turn(
                 }
 
                 // Tool call deltas: close any in-flight message and reasoning, then accumulate.
-                if let Some(tool_call_delta) = delta.and_then(|d| d.get("tool_calls")) {
+                if let Some(tool_call_delta) = delta
+                    .and_then(|d| d.get("tool_calls"))
+                    .filter(|tool_call_delta| has_streamed_tool_call_entries(tool_call_delta))
+                {
                     if !saw_tool_calls {
                         debug!("Assistant turn received first tool_call delta from model stream");
                     }

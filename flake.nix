@@ -202,6 +202,8 @@
             VSOCKETS = yes;
             VIRTIO_VSOCKETS = yes;
             NSM = yes;  # Enable NSM driver for KMS operations (merged in 6.8+)
+            # Disable algif_aead, the AF_ALG AEAD interface abused by CVE-2026-31431 (Copy Fail).
+            CRYPTO_USER_API_AEAD = no;
           };
           # Ensure we catch invalid or renamed config flags at build time
           ignoreConfigErrors = false;

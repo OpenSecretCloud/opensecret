@@ -1015,6 +1015,8 @@ sudo systemctl restart nitro-enclaves-vsock-proxy.service
 
 Keep both the new `router-*.tinfoil.dev` entries and the legacy `router.inf*.tinfoil.sh` entries enabled until Tinfoil finishes the cutover.
 
+All Tinfoil `vsock-proxy` services below should use an elevated worker count. The AWS `vsock-proxy` default is 4 simultaneous connections, which is too low for long-lived streaming completions plus health checks. Start with `--num_workers 128` on production-sized instances, and keep `LimitNOFILE` high enough for the additional sockets.
+
 #### Tinfoil GitHub Proxy
 ```sh
 sudo vim /etc/systemd/system/vsock-tinfoil-api-github-proxy.service
@@ -1028,8 +1030,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8019 github-proxy.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8019 github-proxy.tinfoil.sh 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1048,8 +1051,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8020 tuf-repo-cdn.sigstore.dev 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8020 tuf-repo-cdn.sigstore.dev 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1068,8 +1072,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8022 kds-proxy.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8022 kds-proxy.tinfoil.sh 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1088,8 +1093,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8021 atc.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8021 atc.tinfoil.sh 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1108,8 +1114,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8041 inference.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8041 inference.tinfoil.sh 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1128,8 +1135,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8042 router-0.tinfoil.dev 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8042 router-0.tinfoil.dev 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1148,8 +1156,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8043 router-1.tinfoil.dev 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8043 router-1.tinfoil.dev 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1168,8 +1177,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8044 router-2.tinfoil.dev 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8044 router-2.tinfoil.dev 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1188,8 +1198,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8045 router-3.tinfoil.dev 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8045 router-3.tinfoil.dev 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1208,8 +1219,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8046 router-4.tinfoil.dev 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8046 router-4.tinfoil.dev 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1228,8 +1240,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8047 router-5.tinfoil.dev 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8047 router-5.tinfoil.dev 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1250,8 +1263,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8034 router.inf4.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8034 router.inf4.tinfoil.sh 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1270,8 +1284,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8035 router.inf5.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8035 router.inf5.tinfoil.sh 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1290,8 +1305,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8036 router.inf6.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8036 router.inf6.tinfoil.sh 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1310,8 +1326,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8037 router.inf7.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8037 router.inf7.tinfoil.sh 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1330,8 +1347,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8038 router.inf8.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8038 router.inf8.tinfoil.sh 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1350,8 +1368,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8039 router.inf9.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8039 router.inf9.tinfoil.sh 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -1370,8 +1389,9 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8040 router.inf10.tinfoil.sh 443
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8040 router.inf10.tinfoil.sh 443
 Restart=always
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

@@ -594,6 +594,8 @@ Add these lines:
 - {address: cdn.confidential.cloud, port: 443}
 - {address: api.privatemode.ai, port: 443}
 - {address: coordinator.privatemode.ai, port: 443}
+- {address: api.trustedservices.intel.com, port: 443}
+- {address: certificates.trustedservices.intel.com, port: 443}
 ```
 
 Restart the nitro vsock proxy service:
@@ -703,6 +705,46 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
+#### Intel PCS API
+```
+sudo vim /etc/systemd/system/vsock-intel-pcs-api.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Intel PCS API Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8023 api.trustedservices.intel.com 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### Intel PCS Certificates
+```
+sudo vim /etc/systemd/system/vsock-intel-pcs-certs.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock Intel PCS Certificates Proxy Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy 8024 certificates.trustedservices.intel.com 443
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
 Activate the services:
 
 ```
@@ -722,6 +764,12 @@ sudo systemctl status vsock-continuum-coordinator.service
 sudo systemctl enable vsock-amd-kds.service
 sudo systemctl start vsock-amd-kds.service
 sudo systemctl status vsock-amd-kds.service
+sudo systemctl enable vsock-intel-pcs-api.service
+sudo systemctl start vsock-intel-pcs-api.service
+sudo systemctl status vsock-intel-pcs-api.service
+sudo systemctl enable vsock-intel-pcs-certs.service
+sudo systemctl start vsock-intel-pcs-certs.service
+sudo systemctl status vsock-intel-pcs-certs.service
 ```
 
 If you need to restart these services:
@@ -731,6 +779,8 @@ sudo systemctl restart vsock-continuum-cdn.service
 sudo systemctl restart vsock-continuum-secret.service
 sudo systemctl restart vsock-continuum-coordinator.service
 sudo systemctl restart vsock-amd-kds.service
+sudo systemctl restart vsock-intel-pcs-api.service
+sudo systemctl restart vsock-intel-pcs-certs.service
 ```
 
 #### Vsock AWS SQS proxy

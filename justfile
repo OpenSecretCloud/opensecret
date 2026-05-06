@@ -197,7 +197,7 @@ build-continuum-proxy:
     @./continuum-proxy --version
 
 # Update continuum-proxy to a specific version and rebuild
-update-continuum-proxy version="v1.32.0":
+update-continuum-proxy version="v1.39.1":
     just update-continuum-proxy-version {{version}}
     just build-continuum-proxy
 

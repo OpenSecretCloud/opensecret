@@ -306,8 +306,10 @@ echo "127.0.0.3 cdn.confidential.cloud" >> /etc/hosts
 echo "127.0.0.4 secret.privatemode.ai" >> /etc/hosts
 echo "127.0.0.5 coordinator.privatemode.ai" >> /etc/hosts
 echo "127.0.0.6 kdsintf.amd.com" >> /etc/hosts
+echo "127.0.0.20 api.trustedservices.intel.com" >> /etc/hosts
+echo "127.0.0.21 certificates.trustedservices.intel.com" >> /etc/hosts
 
-log "Added privatemode.ai, confidential.cloud, and AMD domains to /etc/hosts"
+log "Added privatemode.ai, confidential.cloud, AMD, and Intel attestation domains to /etc/hosts"
 
 # Add GitHub OAuth hostnames to /etc/hosts
 echo "127.0.0.9 github.com" >> /etc/hosts
@@ -416,6 +418,14 @@ run_forever tf_continuum_coordinator python3 /app/traffic_forwarder.py 127.0.0.5
 # Start the traffic forwarder for AMD KDS Interface in the background
 log "Starting AMD KDS Interface traffic forwarder"
 run_forever tf_amd_kds python3 /app/traffic_forwarder.py 127.0.0.6 443 3 8008 &
+
+# Start the traffic forwarder for Intel PCS API in the background
+log "Starting Intel PCS API traffic forwarder"
+run_forever tf_intel_pcs_api python3 /app/traffic_forwarder.py 127.0.0.20 443 3 8023 &
+
+# Start the traffic forwarder for Intel PCS certificates in the background
+log "Starting Intel PCS certificates traffic forwarder"
+run_forever tf_intel_pcs_certs python3 /app/traffic_forwarder.py 127.0.0.21 443 3 8024 &
 
 # Start the traffic forwarder for GitHub in the background
 log "Starting GitHub traffic forwarder"
@@ -567,6 +577,20 @@ if timeout 5 bash -c '</dev/tcp/127.0.0.6/443'; then
     log "AMD KDS Interface connection successful"
 else
     log "AMD KDS Interface connection failed"
+fi
+
+log "Testing connection to Intel PCS API:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.20/443'; then
+    log "Intel PCS API connection successful"
+else
+    log "Intel PCS API connection failed"
+fi
+
+log "Testing connection to Intel PCS certificates:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.21/443'; then
+    log "Intel PCS certificates connection successful"
+else
+    log "Intel PCS certificates connection failed"
 fi
 
 # Test the connection to GitHub

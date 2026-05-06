@@ -718,7 +718,7 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8023 api.trustedservices.intel.com 443
+ExecStart=/usr/bin/vsock-proxy 8048 api.trustedservices.intel.com 443
 Restart=always
 
 [Install]
@@ -738,7 +738,7 @@ After=network.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/vsock-proxy 8024 certificates.trustedservices.intel.com 443
+ExecStart=/usr/bin/vsock-proxy 8049 certificates.trustedservices.intel.com 443
 Restart=always
 
 [Install]

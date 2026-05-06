@@ -37,29 +37,17 @@ pub fn decrypt_user_seed_to_key(
     seed_phrase_derivation_path: Option<&str>,
 ) -> Result<SecretKey, Error> {
     // If seed_phrase_derivation_path is provided, derive a child mnemonic using BIP-85
-    let (source_mnemonic, uses_bip85) = if let Some(bip85_path) = seed_phrase_derivation_path {
+    let source_mnemonic = if let Some(bip85_path) = seed_phrase_derivation_path {
         info!("Using BIP-85 derivation with path: {}", bip85_path);
-        (
-            decrypt_and_derive_bip85_mnemonic(enclave_key, encrypted_seed, bip85_path)?,
-            true,
-        )
+        decrypt_and_derive_bip85_mnemonic(enclave_key, encrypted_seed, bip85_path)?
     } else {
-        debug!("Using root mnemonic (no BIP-85 derivation)");
-        (
-            decrypt_user_seed_to_mnemonic(enclave_key, encrypted_seed)?,
-            false,
-        )
+        decrypt_user_seed_to_mnemonic(enclave_key, encrypted_seed)?
     };
 
     // Generate seed from the appropriate mnemonic (either the root or the BIP-85 derived one)
-    info!(
-        "Generating seed from {} mnemonic",
-        if uses_bip85 { "BIP-85 derived" } else { "root" }
-    );
     let seed = source_mnemonic.to_seed("");
 
     // Create extended private key from the seed
-    debug!("Creating extended private key from seed");
     let xprivkey = Xpriv::new_master(Network::Bitcoin, &seed)
         .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
@@ -74,7 +62,6 @@ pub fn decrypt_user_seed_to_key(
         debug!("Successfully derived child key using BIP-32 path");
         Ok(derived_key.private_key)
     } else {
-        debug!("Using master key (no BIP-32 derivation)");
         Ok(xprivkey.private_key)
     }
 }

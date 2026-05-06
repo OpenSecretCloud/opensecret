@@ -4,7 +4,7 @@ use crate::{
         org_project_secrets::NewOrgProjectSecret,
         org_projects::NewOrgProject,
         platform_users::PlatformUser,
-        project_settings::{EmailSettings, OAuthSettings},
+        project_settings::{EmailSettings, OAuthSettings, PushSettings},
     },
     web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
     ApiError, AppState,
@@ -27,6 +27,7 @@ use validator::Validate;
 use super::common::{
     CreateProjectRequest, CreateSecretRequest, ProjectResponse, SecretResponse,
     UpdateEmailSettingsRequest, UpdateOAuthSettingsRequest, UpdateProjectRequest,
+    UpdatePushSettingsRequest,
 };
 
 pub fn router(app_state: Arc<AppState>) -> Router {
@@ -98,6 +99,18 @@ pub fn router(app_state: Arc<AppState>) -> Router {
             put(update_oauth_settings).layer(from_fn_with_state(
                 app_state.clone(),
                 decrypt_request::<UpdateOAuthSettingsRequest>,
+            )),
+        )
+        .route(
+            "/platform/orgs/:org_id/projects/:project_id/settings/push",
+            get(get_push_settings)
+                .layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
+        )
+        .route(
+            "/platform/orgs/:org_id/projects/:project_id/settings/push",
+            put(update_push_settings).layer(from_fn_with_state(
+                app_state.clone(),
+                decrypt_request::<UpdatePushSettingsRequest>,
             )),
         )
         .with_state(app_state)
@@ -814,4 +827,125 @@ async fn update_oauth_settings(
     })?;
 
     encrypt_response(&data, &session_id, &updated_settings).await
+}
+
+async fn get_push_settings(
+    State(data): State<Arc<AppState>>,
+    Extension(platform_user): Extension<PlatformUser>,
+    Path((org_id, project_id)): Path<(Uuid, Uuid)>,
+    Extension(session_id): Extension<Uuid>,
+) -> Result<Json<EncryptedResponse<PushSettings>>, ApiError> {
+    debug!("Getting project push settings");
+
+    let org = data
+        .db
+        .get_org_by_uuid(org_id)
+        .map_err(|_| ApiError::NotFound)?;
+
+    let project = data.db.get_org_project_by_uuid(project_id).map_err(|_| {
+        error!("Project not found");
+        ApiError::NotFound
+    })?;
+
+    if project.org_id != org.id {
+        error!("Project does not belong to organization");
+        return Err(ApiError::NotFound);
+    }
+
+    let _membership = data
+        .db
+        .get_org_membership_by_platform_user_and_org(platform_user.uuid, org.id)
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    let settings = data
+        .db
+        .get_project_push_settings(project.id)?
+        .unwrap_or_default();
+
+    encrypt_response(&data, &session_id, &settings).await
+}
+
+async fn update_push_settings(
+    State(data): State<Arc<AppState>>,
+    Extension(platform_user): Extension<PlatformUser>,
+    Path((org_id, project_id)): Path<(Uuid, Uuid)>,
+    Extension(update_request): Extension<UpdatePushSettingsRequest>,
+    Extension(session_id): Extension<Uuid>,
+) -> Result<Json<EncryptedResponse<PushSettings>>, ApiError> {
+    debug!("Updating project push settings");
+
+    validate_push_settings_request(&update_request)?;
+
+    let org = data
+        .db
+        .get_org_by_uuid(org_id)
+        .map_err(|_| ApiError::NotFound)?;
+
+    let project = data.db.get_org_project_by_uuid(project_id).map_err(|_| {
+        error!("Project not found");
+        ApiError::NotFound
+    })?;
+
+    if project.org_id != org.id {
+        error!("Project does not belong to organization");
+        return Err(ApiError::NotFound);
+    }
+
+    let membership = data
+        .db
+        .get_org_membership_by_platform_user_and_org(platform_user.uuid, org.id)
+        .map_err(|_| ApiError::Unauthorized)?;
+
+    let role: OrgRole = membership.role.into();
+    if !matches!(role, OrgRole::Owner | OrgRole::Admin) {
+        return Err(ApiError::Unauthorized);
+    }
+
+    let push_settings = PushSettings {
+        encrypted_preview_enabled: update_request.encrypted_preview_enabled,
+        ios: update_request.ios,
+        android: update_request.android,
+    };
+
+    let settings = data
+        .db
+        .update_project_push_settings(project.id, push_settings)?;
+
+    let updated_settings = settings.get_push_settings().map_err(|e| {
+        error!("Failed to parse updated push settings: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    encrypt_response(&data, &session_id, &updated_settings).await
+}
+
+fn validate_push_settings_request(request: &UpdatePushSettingsRequest) -> Result<(), ApiError> {
+    if let Some(ios) = &request.ios {
+        if ios.enabled
+            && (ios.bundle_id.trim().is_empty()
+                || ios.team_id.trim().is_empty()
+                || ios.key_id.trim().is_empty())
+        {
+            return Err(ApiError::BadRequest);
+        }
+
+        if ios.bundle_id.len() > 255 || ios.team_id.len() > 32 || ios.key_id.len() > 32 {
+            return Err(ApiError::BadRequest);
+        }
+    }
+
+    if let Some(android) = &request.android {
+        if android.enabled
+            && (android.firebase_project_id.trim().is_empty()
+                || android.package_name.trim().is_empty())
+        {
+            return Err(ApiError::BadRequest);
+        }
+
+        if android.firebase_project_id.len() > 255 || android.package_name.len() > 255 {
+            return Err(ApiError::BadRequest);
+        }
+    }
+
+    Ok(())
 }

@@ -14,13 +14,7 @@ build-enclave-base:
 
 # Build Nitro binaries from enclave base image (NSM and KMS tools)
 build-nitro-bins:
-    mkdir -p nitro-bins
-    {{container}} build -t nitro-bins -f nitro-toolkit/enclave-base-image/Dockerfile --target enclave_base .
-    {{container}} create --name temp-nitro nitro-bins sh
-    {{container}} cp temp-nitro:/app/libnsm.so nitro-bins/
-    {{container}} cp temp-nitro:/app/kmstool_enclave_cli nitro-bins/
-    {{container}} rm temp-nitro
-    chmod +x nitro-bins/kmstool_enclave_cli
+    nix run .#write-nitro-bins
 
 # Build the main Docker image for local
 build-docker-local:

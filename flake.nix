@@ -280,6 +280,131 @@
           '';
         };
 
+        nitroBinsBaseImage =
+          "public.ecr.aws/amazonlinux/amazonlinux@sha256:89f64859f7faa37ae01fcaab1205a3ae3cfff3f1b98fbb8f6cf489cc9d098508";
+        nitroBinsHashes = {
+          libnsm = "032f54092d362a479dd69076a68e1344d887c14c085ff0d94065db6b19780644";
+          kmstool = "6b151442e024456e52f65e5369a3bb647093618ac516f66e06854f37ec336ade";
+        };
+        mkNitroBinsApp = { name, writeBins }: pkgs.writeShellApplication {
+          inherit name;
+          runtimeInputs = [
+            pkgs.coreutils
+            pkgs.gawk
+            pkgs.git
+            pkgs.podman
+          ];
+          text = ''
+            set -euo pipefail
+
+            machine="$(uname -m)"
+            if [[ "$machine" != "aarch64" && "$machine" != "arm64" ]]; then
+              echo "nitro-bins are ARM aarch64 artifacts; run this target on aarch64-linux" >&2
+              exit 1
+            fi
+
+            repo_root="$(git rev-parse --show-toplevel)"
+            work="$(mktemp -d)"
+            container_id=""
+            cleanup() {
+              if [[ -n "$container_id" ]]; then
+                podman rm "$container_id" >/dev/null 2>&1 || true
+              fi
+              rm -rf "$work"
+            }
+            trap cleanup EXIT
+
+            image_name="''${NITRO_BINS_IMAGE_NAME:-opensecret-nitro-bins-repro}"
+            base_image="${nitroBinsBaseImage}"
+            expected_lib="${nitroBinsHashes.libnsm}"
+            expected_kms="${nitroBinsHashes.kmstool}"
+
+            cp "$repo_root/nitro-toolkit/enclave-base-image/Dockerfile" "$work/Containerfile.in"
+            cp "$repo_root/nix/nitro-bins/nsm-api-v0.4.0.Cargo.lock" "$work/Cargo.lock"
+
+            awk -v base_image="$base_image" '
+              $0 == "ARG BASE_IMAGE=public.ecr.aws/amazonlinux/amazonlinux:minimal" {
+                print "ARG BASE_IMAGE=" base_image
+                next
+              }
+              $0 == "RUN git clone --depth 1 -b v0.4.0 https://github.com/aws/aws-nitro-enclaves-nsm-api.git" {
+                print
+                print "COPY Cargo.lock /tmp/crt-builder/aws-nitro-enclaves-nsm-api/Cargo.lock"
+                next
+              }
+              $0 == "RUN source $HOME/.cargo/env && cd aws-nitro-enclaves-nsm-api && cargo build --release --jobs $(nproc) -p nsm-lib" {
+                print "RUN source $HOME/.cargo/env && cd aws-nitro-enclaves-nsm-api && cargo build --release --locked --jobs $(nproc) -p nsm-lib"
+                next
+              }
+              { print }
+            ' "$work/Containerfile.in" > "$work/Containerfile"
+
+            echo "Building nitro-bins image from $base_image"
+            podman build --pull=always --no-cache -t "$image_name" -f "$work/Containerfile" "$work"
+
+            podman run --rm "$image_name" sha256sum /app/libnsm.so /app/kmstool_enclave_cli > "$work/hashes"
+            cat "$work/hashes"
+
+            actual_lib="$(awk '$2 == "/app/libnsm.so" { print $1 }' "$work/hashes")"
+            actual_kms="$(awk '$2 == "/app/kmstool_enclave_cli" { print $1 }' "$work/hashes")"
+
+            if [[ "$actual_lib" != "$expected_lib" || "$actual_kms" != "$expected_kms" ]]; then
+              echo "nitro-bins did not match expected hashes" >&2
+              echo "expected libnsm.so:           $expected_lib" >&2
+              echo "actual   libnsm.so:           $actual_lib" >&2
+              echo "expected kmstool_enclave_cli: $expected_kms" >&2
+              echo "actual   kmstool_enclave_cli: $actual_kms" >&2
+              exit 1
+            fi
+
+            echo "nitro-bins match expected hashes"
+
+            ${pkgs.lib.optionalString writeBins ''
+              mkdir -p "$repo_root/nitro-bins"
+              container_id="$(podman create "$image_name" sh)"
+              podman cp "$container_id:/app/libnsm.so" "$work/libnsm.so"
+              podman cp "$container_id:/app/kmstool_enclave_cli" "$work/kmstool_enclave_cli"
+              install -m 755 "$work/libnsm.so" "$repo_root/nitro-bins/libnsm.so"
+              install -m 755 "$work/kmstool_enclave_cli" "$repo_root/nitro-bins/kmstool_enclave_cli"
+
+              written_lib="$(sha256sum "$repo_root/nitro-bins/libnsm.so" | awk '{ print $1 }')"
+              written_kms="$(sha256sum "$repo_root/nitro-bins/kmstool_enclave_cli" | awk '{ print $1 }')"
+              if [[ "$written_lib" != "$expected_lib" || "$written_kms" != "$expected_kms" ]]; then
+                echo "written nitro-bins did not match expected hashes" >&2
+                exit 1
+              fi
+
+              echo "wrote verified nitro-bins to $repo_root/nitro-bins"
+            ''}
+
+            ${pkgs.lib.optionalString (!writeBins) ''
+              if [[ -f "$repo_root/nitro-bins/libnsm.so" && -f "$repo_root/nitro-bins/kmstool_enclave_cli" ]]; then
+                checked_lib="$(sha256sum "$repo_root/nitro-bins/libnsm.so" | awk '{ print $1 }')"
+                checked_kms="$(sha256sum "$repo_root/nitro-bins/kmstool_enclave_cli" | awk '{ print $1 }')"
+                if [[ "$checked_lib" != "$actual_lib" || "$checked_kms" != "$actual_kms" ]]; then
+                  echo "checked-in nitro-bins do not match reproduced binaries" >&2
+                  echo "checked-in libnsm.so:           $checked_lib" >&2
+                  echo "reproduced libnsm.so:           $actual_lib" >&2
+                  echo "checked-in kmstool_enclave_cli: $checked_kms" >&2
+                  echo "reproduced kmstool_enclave_cli: $actual_kms" >&2
+                  exit 1
+                fi
+                echo "nitro-bins match checked-in artifacts"
+              else
+                echo "checked-in nitro-bins are missing; run write-nitro-bins to regenerate them"
+              fi
+            ''}
+          '';
+        };
+        reproduceNitroBins = mkNitroBinsApp {
+          name = "reproduce-nitro-bins";
+          writeBins = false;
+        };
+        writeNitroBins = mkNitroBinsApp {
+          name = "write-nitro-bins";
+          writeBins = true;
+        };
+
         # Copy continuum-proxy from local filesystem
         continuum-proxy = pkgs.runCommand "continuum-proxy" {} ''
           mkdir -p $out/bin
@@ -303,6 +428,17 @@
           eif-dev = mkEif "dev";
           eif-prod = mkEif "prod";
           eif-preview = mkEif "preview";
+        };
+
+        apps = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          reproduce-nitro-bins = {
+            type = "app";
+            program = "${reproduceNitroBins}/bin/reproduce-nitro-bins";
+          };
+          write-nitro-bins = {
+            type = "app";
+            program = "${writeNitroBins}/bin/write-nitro-bins";
+          };
         };
 
         devShell = pkgs.mkShell {

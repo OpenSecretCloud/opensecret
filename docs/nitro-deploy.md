@@ -251,6 +251,62 @@ sudo dnf install aws-nitro-enclaves-acm -y
 
 Follow instructions for configuring [nginx](https://docs.aws.amazon.com/enclaves/latest/user/nitro-enclave-refapp.html) in the enclave.
 
+Make the proxy timeouts explicit in the nginx `location` block that forwards traffic to
+the local socat listener. The nginx defaults include 60s upstream read/send timeouts, which
+is too short for long non-streaming completions where the enclave does not send response
+bytes until the model response is complete.
+
+Example `location` block:
+
+```nginx
+location / {
+    proxy_pass http://localhost:8080;
+    proxy_http_version 1.1;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    proxy_connect_timeout 30s;
+    proxy_send_timeout 300s;
+    proxy_read_timeout 300s;
+    send_timeout 300s;
+
+    # Do not buffer SSE responses from streaming completion endpoints.
+    proxy_buffering off;
+}
+```
+
+If the existing config already has a `location /` with `proxy_pass` and forwarded headers,
+the minimal required change is to add these directives inside that block:
+
+```nginx
+proxy_connect_timeout 30s;
+proxy_send_timeout 300s;
+proxy_read_timeout 300s;
+send_timeout 300s;
+proxy_buffering off;
+```
+
+After updating nginx:
+
+```bash
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+`proxy_read_timeout` is an idle timeout between reads from the upstream server, not a total
+request duration. For non-streaming completion requests, set it above the longest expected
+time-to-first-byte from the enclave.
+
+The public API hostname is also Cloudflare-proxied in production. Cloudflare has a separate
+origin read timeout; if that expires, clients should see a Cloudflare 524 response. A
+completion request that fails at roughly 60 seconds with HTTP 504 should be checked against
+the origin nginx configuration first. For model runs that can exceed Cloudflare's current
+proxied-request timeout, prefer streaming completions or use a Cloudflare configuration that
+supports a longer proxy read timeout for the API hostname.
+
 After following the instructions, reboot the machine. And then start up this enclave program again.
 
 

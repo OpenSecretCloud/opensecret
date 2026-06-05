@@ -40,7 +40,6 @@ use uuid::Uuid;
 #[cfg(feature = "seed-wrap-translation")]
 const AEAD_SEED_WRAPPINGS_MIGRATION: &str = "aead_seed_wrappings_v1";
 
-// TODO remove migration code now that this ran successfully
 pub async fn run_migrations(
     app_state: &Arc<AppState>,
     github_client_secret: Option<String>,

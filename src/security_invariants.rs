@@ -188,6 +188,7 @@ fn seed_wrap_translation_startup_path_is_feature_gated() {
     for required_gated_item in [
         "fn migrate_aead_seed_wrappings_v1",
         "fn validate_no_duplicate_oauth_subjects_by_project",
+        "fn validate_seed_wrap_postflight_count",
         "fn upsert_password_seed_wrap",
         "fn upsert_oauth_seed_wrap",
     ] {
@@ -201,6 +202,49 @@ fn seed_wrap_translation_startup_path_is_feature_gated() {
             "`{required_gated_item}` must be feature-gated"
         );
     }
+}
+
+#[test]
+fn seed_wrap_translation_is_all_or_nothing_with_preflight_and_postflight() {
+    let migrations_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/migrations.rs");
+    let contents =
+        fs::read_to_string(&migrations_source).expect("migrations source should be readable");
+    let migration_body = extract_function_body(&contents, "fn migrate_aead_seed_wrappings_v1");
+
+    for required_pattern in [
+        "conn.transaction::<_, SeedWrapTranslationError, _>(|conn|",
+        "SELECT pg_advisory_xact_lock(hashtext($1))",
+        ".bind::<Text, _>(AEAD_SEED_WRAPPINGS_MIGRATION)",
+        "AppDataMigration::get(conn, AEAD_SEED_WRAPPINGS_MIGRATION)?",
+        "validate_no_duplicate_oauth_subjects_by_project(conn)?",
+        "users::table.order(users::id.asc()).load::<User>(conn)?",
+        ".seed_encrypted()",
+        "decrypt_with_key(&legacy_secret_key, legacy_seed_enc)?",
+        "upsert_password_seed_wrap(conn, app_state, &user, &verifier, &plaintext_seed)?",
+        "upsert_oauth_seed_wrap(",
+        "if user_wraps == 0",
+        "SeedWrapTranslationError::NoUsableCredential(user.uuid)",
+        "validate_seed_wrap_postflight_count(",
+        "NewAppDataMigration::new(AEAD_SEED_WRAPPINGS_MIGRATION).insert(conn)?",
+    ] {
+        assert!(
+            migration_body.contains(required_pattern),
+            "seed-wrap translation migration must contain `{required_pattern}`"
+        );
+    }
+
+    assert_patterns_in_order(
+        migration_body,
+        &[
+            "conn.transaction::<_, SeedWrapTranslationError, _>(|conn|",
+            "SELECT pg_advisory_xact_lock(hashtext($1))",
+            "AppDataMigration::get(conn, AEAD_SEED_WRAPPINGS_MIGRATION)?",
+            "validate_no_duplicate_oauth_subjects_by_project(conn)?",
+            "users::table.order(users::id.asc()).load::<User>(conn)?",
+            "validate_seed_wrap_postflight_count(",
+            "NewAppDataMigration::new(AEAD_SEED_WRAPPINGS_MIGRATION).insert(conn)?",
+        ],
+    );
 }
 
 #[test]
@@ -523,4 +567,15 @@ fn extract_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
     }
 
     panic!("function `{signature}` body should be balanced");
+}
+
+fn assert_patterns_in_order(source: &str, patterns: &[&str]) {
+    let mut search_offset = 0usize;
+
+    for pattern in patterns {
+        let relative_index = source[search_offset..]
+            .find(pattern)
+            .unwrap_or_else(|| panic!("expected `{pattern}` after offset {search_offset}"));
+        search_offset += relative_index + pattern.len();
+    }
 }

@@ -80,6 +80,37 @@ fn refresh_route_preserves_signed_auth_context_without_recomputing_binding() {
     }
 }
 
+#[test]
+fn legacy_token_constructor_is_only_used_for_third_party_tokens() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut findings = Vec::new();
+
+    for root in REQUEST_TIME_SCAN_ROOTS {
+        collect_pattern_matches(&manifest_dir.join(root), "NewToken::new(", &mut findings);
+    }
+
+    assert_eq!(
+        findings.len(),
+        1,
+        "expected exactly one legacy token constructor use for third-party tokens, found:\n{}",
+        findings.join("\n")
+    );
+    assert!(
+        findings[0].contains("src/web/protected_routes.rs"),
+        "legacy token constructor should only be used in protected third-party token route, found {}",
+        findings[0]
+    );
+
+    let protected_routes = manifest_dir.join("src/web/protected_routes.rs");
+    let contents =
+        fs::read_to_string(&protected_routes).expect("protected route source should be readable");
+    let third_party_body =
+        extract_function_body(&contents, "pub async fn generate_third_party_token");
+
+    assert!(third_party_body.contains("NewToken::new("));
+    assert!(third_party_body.contains("TokenType::ThirdParty"));
+}
+
 fn collect_forbidden_legacy_seed_matches(
     path: &Path,
     forbidden_patterns: &[&str],
@@ -108,6 +139,32 @@ fn collect_forbidden_legacy_seed_matches(
                     pattern
                 ));
             }
+        }
+    }
+}
+
+fn collect_pattern_matches(path: &Path, pattern: &str, findings: &mut Vec<String>) {
+    if path.is_dir() {
+        for entry in fs::read_dir(path).expect("source directory should be readable") {
+            let entry = entry.expect("source directory entry should be readable");
+            collect_pattern_matches(&entry.path(), pattern, findings);
+        }
+        return;
+    }
+
+    if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+        return;
+    }
+
+    let contents = fs::read_to_string(path).expect("source file should be readable");
+    for (line_index, line) in contents.lines().enumerate() {
+        if line.contains(pattern) {
+            findings.push(format!(
+                "{}:{} contains `{}`",
+                path.display(),
+                line_index + 1,
+                pattern
+            ));
         }
     }
 }

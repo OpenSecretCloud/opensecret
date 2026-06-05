@@ -104,6 +104,17 @@ enum SeedWrapTranslationError {
         expected_count: i64,
         actual_count: i64,
     },
+    #[error(
+        "Seed wrap postflight mismatch for user {user_uuid}, {credential_kind}: expected {expected_count}, actual {actual_count}"
+    )]
+    UserPostflightWrapCountMismatch {
+        user_uuid: Uuid,
+        credential_kind: String,
+        expected_count: i64,
+        actual_count: i64,
+    },
+    #[error("Duplicate seed wrap credential rows exist after translation")]
+    DuplicateSeedWrapCredential,
 }
 
 #[cfg(feature = "seed-wrap-translation")]
@@ -145,8 +156,27 @@ impl From<SeedWrapTranslationError> for Error {
             } => Error::EncryptionError(format!(
                 "Seed wrap postflight mismatch for {credential_kind}: expected {expected_count}, actual {actual_count}"
             )),
+            SeedWrapTranslationError::UserPostflightWrapCountMismatch {
+                user_uuid,
+                credential_kind,
+                expected_count,
+                actual_count,
+            } => Error::EncryptionError(format!(
+                "Seed wrap postflight mismatch for user {user_uuid}, {credential_kind}: expected {expected_count}, actual {actual_count}"
+            )),
+            SeedWrapTranslationError::DuplicateSeedWrapCredential => Error::EncryptionError(
+                "Duplicate seed wrap credential rows exist after translation".to_string(),
+            ),
         }
     }
+}
+
+#[cfg(feature = "seed-wrap-translation")]
+#[derive(QueryableByName)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+struct SqlCount {
+    #[diesel(sql_type = BigInt)]
+    count: i64,
 }
 
 #[cfg(feature = "seed-wrap-translation")]
@@ -198,12 +228,15 @@ fn migrate_aead_seed_wrappings_v1(app_state: &Arc<AppState>) -> Result<(), Error
                 .ok_or(SeedWrapTranslationError::MissingSeed(user.uuid))?;
             let plaintext_seed = decrypt_with_key(&legacy_secret_key, legacy_seed_enc)?;
             let mut user_wraps = 0usize;
+            let mut user_password_wraps = 0usize;
+            let mut user_oauth_wraps = 0usize;
 
             if let Some(password_enc) = user.password_enc.as_ref() {
                 let verifier_bytes = decrypt_with_key(&legacy_secret_key, password_enc)?;
                 let verifier = String::from_utf8(verifier_bytes)?;
                 upsert_password_seed_wrap(conn, app_state, &user, &verifier, &plaintext_seed)?;
                 user_wraps += 1;
+                user_password_wraps += 1;
                 expected_password_wraps += 1;
             }
 
@@ -225,12 +258,25 @@ fn migrate_aead_seed_wrappings_v1(app_state: &Arc<AppState>) -> Result<(), Error
                     &plaintext_seed,
                 )?;
                 user_wraps += 1;
+                user_oauth_wraps += 1;
                 expected_oauth_wraps += 1;
             }
 
             if user_wraps == 0 {
                 return Err(SeedWrapTranslationError::NoUsableCredential(user.uuid));
             }
+            validate_user_seed_wrap_postflight_count(
+                conn,
+                user.uuid,
+                CredentialKind::Password.as_str(),
+                user_password_wraps,
+            )?;
+            validate_user_seed_wrap_postflight_count(
+                conn,
+                user.uuid,
+                CredentialKind::OAuth.as_str(),
+                user_oauth_wraps,
+            )?;
             expected_wraps += user_wraps;
         }
 
@@ -244,6 +290,7 @@ fn migrate_aead_seed_wrappings_v1(app_state: &Arc<AppState>) -> Result<(), Error
             CredentialKind::OAuth.as_str(),
             expected_oauth_wraps,
         )?;
+        validate_no_duplicate_seed_wrap_credentials(conn)?;
 
         NewAppDataMigration::new(AEAD_SEED_WRAPPINGS_MIGRATION).insert(conn)?;
         info!(
@@ -285,6 +332,58 @@ fn validate_no_duplicate_oauth_subjects_by_project(
             project_id: duplicate.project_id,
             connection_count: duplicate.connection_count,
         });
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "seed-wrap-translation")]
+fn validate_user_seed_wrap_postflight_count(
+    conn: &mut PgConnection,
+    user_uuid: Uuid,
+    credential_kind: &str,
+    expected_count: usize,
+) -> Result<(), SeedWrapTranslationError> {
+    let actual_count = user_seed_wrappings::table
+        .filter(user_seed_wrappings::user_id.eq(user_uuid))
+        .filter(user_seed_wrappings::credential_kind.eq(credential_kind))
+        .count()
+        .get_result::<i64>(conn)?;
+    let expected_count = expected_count as i64;
+
+    if actual_count != expected_count {
+        return Err(SeedWrapTranslationError::UserPostflightWrapCountMismatch {
+            user_uuid,
+            credential_kind: credential_kind.to_string(),
+            expected_count,
+            actual_count,
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "seed-wrap-translation")]
+fn validate_no_duplicate_seed_wrap_credentials(
+    conn: &mut PgConnection,
+) -> Result<(), SeedWrapTranslationError> {
+    let duplicate_count = sql_query(
+        r#"
+        SELECT COUNT(*)::BIGINT AS count
+        FROM (
+            SELECT 1
+            FROM user_seed_wrappings
+            GROUP BY user_id, credential_kind, credential_lookup_hash, wrapping_version
+            HAVING COUNT(*) > 1
+            LIMIT 1
+        ) duplicate_groups
+        "#,
+    )
+    .get_result::<SqlCount>(conn)?
+    .count;
+
+    if duplicate_count > 0 {
+        return Err(SeedWrapTranslationError::DuplicateSeedWrapCredential);
     }
 
     Ok(())

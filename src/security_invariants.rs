@@ -217,6 +217,8 @@ fn seed_wrap_translation_startup_path_is_feature_gated() {
     for required_gated_item in [
         "fn migrate_aead_seed_wrappings_v1",
         "fn validate_no_duplicate_oauth_subjects_by_project",
+        "fn validate_user_seed_wrap_postflight_count",
+        "fn validate_no_duplicate_seed_wrap_credentials",
         "fn validate_seed_wrap_postflight_count",
         "fn upsert_password_seed_wrap",
         "fn upsert_oauth_seed_wrap",
@@ -253,7 +255,9 @@ fn seed_wrap_translation_is_all_or_nothing_with_preflight_and_postflight() {
         "upsert_oauth_seed_wrap(",
         "if user_wraps == 0",
         "SeedWrapTranslationError::NoUsableCredential(user.uuid)",
+        "validate_user_seed_wrap_postflight_count(",
         "validate_seed_wrap_postflight_count(",
+        "validate_no_duplicate_seed_wrap_credentials(conn)?",
         "NewAppDataMigration::new(AEAD_SEED_WRAPPINGS_MIGRATION).insert(conn)?",
     ] {
         assert!(
@@ -270,7 +274,9 @@ fn seed_wrap_translation_is_all_or_nothing_with_preflight_and_postflight() {
             "AppDataMigration::get(conn, AEAD_SEED_WRAPPINGS_MIGRATION)?",
             "validate_no_duplicate_oauth_subjects_by_project(conn)?",
             "users::table.order(users::id.asc()).load::<User>(conn)?",
+            "validate_user_seed_wrap_postflight_count(",
             "validate_seed_wrap_postflight_count(",
+            "validate_no_duplicate_seed_wrap_credentials(conn)?",
             "NewAppDataMigration::new(AEAD_SEED_WRAPPINGS_MIGRATION).insert(conn)?",
         ],
     );

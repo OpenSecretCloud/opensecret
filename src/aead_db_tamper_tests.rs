@@ -153,6 +153,68 @@ async fn db_password_verifier_substitution_fails_before_issuing_victim_session()
 
 #[tokio::test]
 #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_victim_password_verifier_copy_to_attacker_does_not_issue_attacker_session() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let victim_email = format!("aead-pw-copy-victim-{marker}@example.com");
+    let attacker_email = format!("aead-pw-copy-attacker-{marker}@example.com");
+    let victim_password = "victim-password-before-copy-to-attacker";
+    let attacker_password = "attacker-password-before-copy-to-attacker";
+
+    let victim =
+        create_password_wrapped_user(&app_state, project.id, victim_email, victim_password).await;
+    let attacker = create_password_wrapped_user(
+        &app_state,
+        project.id,
+        attacker_email.clone(),
+        attacker_password,
+    )
+    .await;
+
+    copy_victim_password_verifier_to_attacker(&app_state, &victim, &attacker);
+
+    let attacker_password_login_after_tamper = app_state
+        .authenticate_user(
+            Some(attacker_email.clone()),
+            None,
+            attacker_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("attacker login with attacker password should not error");
+    assert!(
+        attacker_password_login_after_tamper.is_none(),
+        "attacker password must not verify after victim password verifier is copied into attacker row"
+    );
+
+    let victim_password_login_in_attacker_row = app_state
+        .authenticate_user(
+            Some(attacker_email),
+            None,
+            victim_password.to_string(),
+            project.id,
+        )
+        .await;
+    assert!(
+        matches!(
+            victim_password_login_in_attacker_row,
+            Err(Error::AuthenticationError)
+        ),
+        "even the password that matches the copied verifier must not unwrap the attacker's seed context"
+    );
+
+    let _ = app_state.db.delete_user(&victim);
+    let _ = app_state.db.delete_user(&attacker);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
 async fn db_legacy_seed_substitution_does_not_change_authenticated_attacker_key() {
     let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
         eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
@@ -963,6 +1025,18 @@ fn copy_attacker_password_verifier_to_victim(app_state: &AppState, attacker: &Us
     victim
         .update_password(conn, attacker.password_enc.clone())
         .expect("tampered victim password verifier should update");
+}
+
+fn copy_victim_password_verifier_to_attacker(app_state: &AppState, victim: &User, attacker: &User) {
+    let conn = &mut app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("test database connection should be available");
+
+    attacker
+        .update_password(conn, victim.password_enc.clone())
+        .expect("tampered attacker password verifier should update");
 }
 
 fn copy_victim_legacy_seed_to_attacker(app_state: &AppState, victim: &User, attacker: &User) {

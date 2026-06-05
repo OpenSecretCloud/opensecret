@@ -143,19 +143,6 @@ impl UserOAuthConnection {
             .map_err(OAuthError::DatabaseError)
     }
 
-    pub fn get_by_provider_and_provider_user_id(
-        conn: &mut PgConnection,
-        lookup_provider_id: i32,
-        lookup_provider_user_id: &str,
-    ) -> Result<Option<UserOAuthConnection>, OAuthError> {
-        user_oauth_connections::table
-            .filter(user_oauth_connections::provider_id.eq(lookup_provider_id))
-            .filter(user_oauth_connections::provider_user_id.eq(lookup_provider_user_id))
-            .first::<UserOAuthConnection>(conn)
-            .optional()
-            .map_err(OAuthError::DatabaseError)
-    }
-
     pub fn get_by_provider_subject_and_project(
         conn: &mut PgConnection,
         lookup_provider_id: i32,

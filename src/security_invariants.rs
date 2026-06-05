@@ -31,6 +31,19 @@ fn request_time_paths_do_not_use_legacy_seed_decrypt_helpers() {
     );
 }
 
+#[test]
+fn openai_compatible_routes_do_not_request_user_storage_keys() {
+    let openai_routes = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/openai.rs");
+    let contents =
+        fs::read_to_string(&openai_routes).expect("OpenAI route source should be readable");
+
+    assert!(
+        !contents.contains("get_user_key("),
+        "{} must not call get_user_key without API-key-bound seed wraps",
+        openai_routes.display()
+    );
+}
+
 fn collect_forbidden_legacy_seed_matches(
     path: &Path,
     forbidden_patterns: &[&str],

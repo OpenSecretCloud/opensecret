@@ -254,8 +254,11 @@ mod tests {
 
     const ROOT_KEY: [u8; 32] = [7u8; 32];
     const USER_UUID: Uuid = Uuid::from_u128(0x2f4f7d9c1cf84c0c8c1a5e9b3e8bde12);
+    const ATTACKER_UUID: Uuid = Uuid::from_u128(0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa);
     const PROJECT_ID: i32 = 42;
     const PASSWORD_VERIFIER: &str = "$argon2id$v=19$m=19456,t=2,p=1$fake-salt$fake-password-hash";
+    const ATTACKER_PASSWORD_VERIFIER: &str =
+        "$argon2id$v=19$m=19456,t=2,p=1$attacker-salt$attacker-password-hash";
 
     fn password_binding() -> AuthBinding {
         compute_password_auth_binding(
@@ -461,6 +464,122 @@ mod tests {
     }
 
     #[test]
+    fn copied_password_seed_wrap_cannot_unwrap_under_attacker_account_context() {
+        let victim_binding = password_binding();
+        let attacker_binding = compute_password_auth_binding(
+            &ROOT_KEY,
+            PROJECT_ID,
+            ATTACKER_UUID,
+            PasswordLoginIdentifierKind::Email,
+            "attacker@example.com",
+            ATTACKER_PASSWORD_VERIFIER,
+        )
+        .unwrap();
+        let victim_seed = b"victim mnemonic";
+
+        let victim_seed_enc = encrypt_seed_v1(
+            &ROOT_KEY,
+            victim_seed,
+            USER_UUID,
+            PROJECT_ID,
+            CredentialKind::Password,
+            &victim_binding,
+        )
+        .unwrap();
+
+        let copied_into_attacker_row = victim_seed_enc;
+        let attacker_unwrap = decrypt_seed_v1(
+            &ROOT_KEY,
+            &copied_into_attacker_row,
+            ATTACKER_UUID,
+            PROJECT_ID,
+            CredentialKind::Password,
+            &attacker_binding,
+        );
+
+        assert!(attacker_unwrap.is_err());
+    }
+
+    #[test]
+    fn swapped_password_verifier_cannot_unwrap_victim_seed() {
+        let victim_binding = password_binding();
+        let binding_after_attacker_password_enc_swap = compute_password_auth_binding(
+            &ROOT_KEY,
+            PROJECT_ID,
+            USER_UUID,
+            PasswordLoginIdentifierKind::Email,
+            "alice@example.com",
+            ATTACKER_PASSWORD_VERIFIER,
+        )
+        .unwrap();
+        let victim_seed = b"victim mnemonic";
+
+        let victim_seed_enc = encrypt_seed_v1(
+            &ROOT_KEY,
+            victim_seed,
+            USER_UUID,
+            PROJECT_ID,
+            CredentialKind::Password,
+            &victim_binding,
+        )
+        .unwrap();
+
+        let victim_shell_unwrap = decrypt_seed_v1(
+            &ROOT_KEY,
+            &victim_seed_enc,
+            USER_UUID,
+            PROJECT_ID,
+            CredentialKind::Password,
+            &binding_after_attacker_password_enc_swap,
+        );
+
+        assert!(victim_shell_unwrap.is_err());
+    }
+
+    #[test]
+    fn copied_oauth_seed_wrap_cannot_unwrap_under_attacker_provider_subject() {
+        let victim_binding = compute_oauth_auth_binding(
+            &ROOT_KEY,
+            PROJECT_ID,
+            USER_UUID,
+            "google",
+            "victim-google-sub",
+        )
+        .unwrap();
+        let attacker_binding = compute_oauth_auth_binding(
+            &ROOT_KEY,
+            PROJECT_ID,
+            ATTACKER_UUID,
+            "google",
+            "attacker-google-sub",
+        )
+        .unwrap();
+        let victim_seed = b"victim oauth mnemonic";
+
+        let victim_seed_enc = encrypt_seed_v1(
+            &ROOT_KEY,
+            victim_seed,
+            USER_UUID,
+            PROJECT_ID,
+            CredentialKind::OAuth,
+            &victim_binding,
+        )
+        .unwrap();
+
+        let copied_into_attacker_row = victim_seed_enc;
+        let attacker_unwrap = decrypt_seed_v1(
+            &ROOT_KEY,
+            &copied_into_attacker_row,
+            ATTACKER_UUID,
+            PROJECT_ID,
+            CredentialKind::OAuth,
+            &attacker_binding,
+        );
+
+        assert!(attacker_unwrap.is_err());
+    }
+
+    #[test]
     fn seed_wrap_rejects_wrong_account_context() {
         let binding = password_binding();
         let seed = b"victim mnemonic";
@@ -477,7 +596,7 @@ mod tests {
         assert!(decrypt_seed_v1(
             &ROOT_KEY,
             &encrypted,
-            Uuid::from_u128(0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa),
+            ATTACKER_UUID,
             PROJECT_ID,
             CredentialKind::Password,
             &binding,

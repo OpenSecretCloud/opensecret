@@ -24,6 +24,12 @@ use crate::web::{
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
+use crate::models::user_seed_wrappings::NewUserSeedWrapping;
+use crate::seed_wrapping::{
+    compute_password_auth_binding, encrypt_seed_v1, normalize_email_login_identifier,
+    normalize_guest_login_identifier, password_credential_lookup_hash, CredentialKind,
+    PasswordLoginIdentifierKind, SEED_WRAP_VERSION_V1,
+};
 use crate::{
     aws_credentials::AwsCredentialError,
     models::enclave_secrets::NewEnclaveSecret,
@@ -735,6 +741,64 @@ impl AppState {
         }
     }
 
+    fn password_login_identifier_for_user(user: &User) -> (PasswordLoginIdentifierKind, String) {
+        match user.get_email() {
+            Some(email) => (
+                PasswordLoginIdentifierKind::Email,
+                normalize_email_login_identifier(email),
+            ),
+            None => (
+                PasswordLoginIdentifierKind::GuestUuid,
+                normalize_guest_login_identifier(user.uuid),
+            ),
+        }
+    }
+
+    fn create_password_seed_wrap_for_user(
+        &self,
+        user: &User,
+        decrypted_password_verifier: &str,
+        plaintext_seed: &[u8],
+    ) -> Result<(), Error> {
+        let (login_identifier_kind, normalized_login_identifier) =
+            Self::password_login_identifier_for_user(user);
+
+        let auth_binding = compute_password_auth_binding(
+            &self.enclave_key,
+            user.project_id,
+            user.uuid,
+            login_identifier_kind,
+            &normalized_login_identifier,
+            decrypted_password_verifier,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        let credential_lookup_hash =
+            password_credential_lookup_hash(&self.enclave_key, user.project_id, user.uuid)
+                .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        let seed_enc = encrypt_seed_v1(
+            &self.enclave_key,
+            plaintext_seed,
+            user.uuid,
+            user.project_id,
+            CredentialKind::Password,
+            &auth_binding,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        let new_wrapping = NewUserSeedWrapping::new(
+            user.uuid,
+            CredentialKind::Password.as_str(),
+            credential_lookup_hash.as_bytes().to_vec(),
+            SEED_WRAP_VERSION_V1,
+            seed_enc,
+        );
+
+        self.db.upsert_user_seed_wrapping(new_wrapping)?;
+        Ok(())
+    }
+
     async fn register_user(&self, creds: RegisterCredentials) -> Result<User, Error> {
         // Get project by client_id
         let project = self
@@ -788,6 +852,8 @@ impl AppState {
             .with_name_option(creds.name);
 
         let user = self.db.create_user(new_user)?;
+
+        self.create_password_seed_wrap_for_user(&user, &password_hash, user_seed_words.as_bytes())?;
 
         tracing::info!("registered new user: {:?} {:?}", user.email, user.uuid);
 

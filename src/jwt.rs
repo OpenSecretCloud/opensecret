@@ -428,6 +428,11 @@ impl NewToken {
         app_state: &AppState,
         auth_context: &AuthContext,
     ) -> Result<Self, ApiError> {
+        if user.project_id != auth_context.project_id {
+            tracing::error!("User token auth context project does not match user project");
+            return Err(ApiError::BadRequest);
+        }
+
         let (aud, duration) = match &token_type {
             TokenType::Access => (
                 Some(USER_ACCESS.to_string()),
@@ -455,8 +460,9 @@ impl NewToken {
         auth_context.apply_to_claims(&mut custom_claims);
 
         tracing::debug!(
-            "Creating new v2 user token with claims: {:?}",
-            custom_claims
+            "Creating new v2 user token for user {} with audience {:?}",
+            user.get_id(),
+            custom_claims.aud
         );
 
         let now = Utc::now();

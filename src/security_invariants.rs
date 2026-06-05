@@ -129,6 +129,35 @@ fn legacy_token_constructor_is_only_used_for_third_party_tokens() {
 }
 
 #[test]
+fn user_token_constructor_binds_signed_auth_context_to_user_project_without_logging_binding() {
+    let jwt_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/jwt.rs");
+    let contents = fs::read_to_string(&jwt_source).expect("JWT source should be readable");
+    let constructor_body = extract_function_body(&contents, "pub fn new_with_auth_context");
+
+    for required_pattern in [
+        "if user.project_id != auth_context.project_id",
+        "return Err(ApiError::BadRequest)",
+        "auth_context.apply_to_claims(&mut custom_claims)",
+    ] {
+        assert!(
+            constructor_body.contains(required_pattern),
+            "v2 user token constructor must contain `{required_pattern}`"
+        );
+    }
+
+    for forbidden_pattern in [
+        "Creating new v2 user token with claims",
+        "{:?},\n            custom_claims",
+        "{:?}\",\n            custom_claims",
+    ] {
+        assert!(
+            !constructor_body.contains(forbidden_pattern),
+            "v2 user token constructor must not log full custom claims via `{forbidden_pattern}`"
+        );
+    }
+}
+
+#[test]
 fn destructive_password_reset_wipes_user_key_encrypted_storage_roots() {
     let db_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db.rs");
     let contents = fs::read_to_string(&db_source).expect("DB source should be readable");

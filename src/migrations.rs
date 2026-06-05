@@ -15,7 +15,7 @@ use crate::{
     models::{
         app_data_migrations::{AppDataMigration, AppDataMigrationError, NewAppDataMigration},
         oauth::{OAuthError, OAuthProvider, UserOAuthConnection},
-        schema::users,
+        schema::{user_seed_wrappings, users},
         user_seed_wrappings::{NewUserSeedWrapping, UserSeedWrappingError},
         users::User,
     },
@@ -97,6 +97,14 @@ enum SeedWrapTranslationError {
         project_id: i32,
         connection_count: i64,
     },
+    #[error(
+        "Seed wrap postflight mismatch for {credential_kind}: expected {expected_count}, actual {actual_count}"
+    )]
+    PostflightWrapCountMismatch {
+        credential_kind: String,
+        expected_count: i64,
+        actual_count: i64,
+    },
 }
 
 #[cfg(feature = "seed-wrap-translation")]
@@ -130,6 +138,13 @@ impl From<SeedWrapTranslationError> for Error {
                 connection_count,
             } => Error::EncryptionError(format!(
                 "Duplicate OAuth provider subject for provider {provider_id}, subject {provider_user_id}, project {project_id}: {connection_count} connections"
+            )),
+            SeedWrapTranslationError::PostflightWrapCountMismatch {
+                credential_kind,
+                expected_count,
+                actual_count,
+            } => Error::EncryptionError(format!(
+                "Seed wrap postflight mismatch for {credential_kind}: expected {expected_count}, actual {actual_count}"
             )),
         }
     }
@@ -175,6 +190,8 @@ fn migrate_aead_seed_wrappings_v1(app_state: &Arc<AppState>) -> Result<(), Error
 
         let all_users = users::table.order(users::id.asc()).load::<User>(conn)?;
         let mut expected_wraps = 0usize;
+        let mut expected_password_wraps = 0usize;
+        let mut expected_oauth_wraps = 0usize;
 
         for user in all_users {
             let legacy_seed_enc = user
@@ -188,6 +205,7 @@ fn migrate_aead_seed_wrappings_v1(app_state: &Arc<AppState>) -> Result<(), Error
                 let verifier = String::from_utf8(verifier_bytes)?;
                 upsert_password_seed_wrap(conn, app_state, &user, &verifier, &plaintext_seed)?;
                 user_wraps += 1;
+                expected_password_wraps += 1;
             }
 
             let oauth_connections = UserOAuthConnection::get_all_for_user(conn, user.uuid)?;
@@ -208,6 +226,7 @@ fn migrate_aead_seed_wrappings_v1(app_state: &Arc<AppState>) -> Result<(), Error
                     &plaintext_seed,
                 )?;
                 user_wraps += 1;
+                expected_oauth_wraps += 1;
             }
 
             if user_wraps == 0 {
@@ -215,6 +234,17 @@ fn migrate_aead_seed_wrappings_v1(app_state: &Arc<AppState>) -> Result<(), Error
             }
             expected_wraps += user_wraps;
         }
+
+        validate_seed_wrap_postflight_count(
+            conn,
+            CredentialKind::Password.as_str(),
+            expected_password_wraps,
+        )?;
+        validate_seed_wrap_postflight_count(
+            conn,
+            CredentialKind::OAuth.as_str(),
+            expected_oauth_wraps,
+        )?;
 
         NewAppDataMigration::new(AEAD_SEED_WRAPPINGS_MIGRATION).insert(conn)?;
         info!(
@@ -255,6 +285,29 @@ fn validate_no_duplicate_oauth_subjects_by_project(
             provider_user_id: duplicate.provider_user_id,
             project_id: duplicate.project_id,
             connection_count: duplicate.connection_count,
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "seed-wrap-translation")]
+fn validate_seed_wrap_postflight_count(
+    conn: &mut PgConnection,
+    credential_kind: &str,
+    expected_count: usize,
+) -> Result<(), SeedWrapTranslationError> {
+    let actual_count = user_seed_wrappings::table
+        .filter(user_seed_wrappings::credential_kind.eq(credential_kind))
+        .count()
+        .get_result::<i64>(conn)?;
+    let expected_count = expected_count as i64;
+
+    if actual_count != expected_count {
+        return Err(SeedWrapTranslationError::PostflightWrapCountMismatch {
+            credential_kind: credential_kind.to_string(),
+            expected_count,
+            actual_count,
         });
     }
 

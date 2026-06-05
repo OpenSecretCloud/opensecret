@@ -294,6 +294,90 @@ fn oauth_login_uses_verified_project_scoped_subject_and_pre_token_unwrap() {
     }
 }
 
+#[test]
+fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
+    let main_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+    let main_contents = fs::read_to_string(&main_source).expect("main source should be readable");
+    let protected_source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/protected_routes.rs");
+    let protected_contents =
+        fs::read_to_string(&protected_source).expect("protected route source should be readable");
+
+    let change_password_route =
+        extract_function_body(&protected_contents, "pub async fn change_password");
+    for required_pattern in [
+        ".authenticate_user(",
+        ".update_user_password_and_seed_wrap(",
+        "NewToken::new_with_auth_context(",
+        "TokenType::Access",
+        "TokenType::Refresh",
+        "&new_auth_context",
+    ] {
+        assert!(
+            change_password_route.contains(required_pattern),
+            "password change route must contain `{required_pattern}`"
+        );
+    }
+
+    let password_update_helper = extract_function_body(
+        &main_contents,
+        "async fn update_user_password_and_seed_wrap",
+    );
+    for required_pattern in [
+        "decrypt_seed_for_auth_context(user, auth_context)",
+        "encrypt_user_password_verifier(new_password)",
+        "new_password_seed_wrapping_for_user(user, &password_hash, &plaintext_seed)",
+        "password_auth_context_for_user(user, &password_hash)",
+        ".update_user_password_and_seed_wrap(user, encrypted_password, new_wrapping)",
+        "verify_seed_wrap_for_auth_context(user, &new_auth_context)",
+    ] {
+        assert!(
+            password_update_helper.contains(required_pattern),
+            "password update helper must contain `{required_pattern}`"
+        );
+    }
+
+    let guest_conversion_route =
+        extract_function_body(&protected_contents, "pub async fn convert_guest_to_email");
+    assert!(
+        protected_contents.contains("Extension(auth_context): Extension<AuthContext>"),
+        "guest conversion route must require AuthContext extension"
+    );
+    for required_pattern in [
+        ".convert_guest_to_email_and_seed_wrap(",
+        "&auth_context",
+        "NewToken::new_with_auth_context(",
+        "TokenType::Access",
+        "TokenType::Refresh",
+        "&new_auth_context",
+    ] {
+        assert!(
+            guest_conversion_route.contains(required_pattern),
+            "guest conversion route must contain `{required_pattern}`"
+        );
+    }
+
+    let guest_conversion_helper = extract_function_body(
+        &main_contents,
+        "async fn convert_guest_to_email_and_seed_wrap",
+    );
+    for required_pattern in [
+        "decrypt_seed_for_auth_context(user, auth_context)",
+        "encrypt_user_password_verifier(password)",
+        "updated_user.email = Some(email)",
+        "updated_user.password_enc = Some(encrypted_password)",
+        "new_password_seed_wrapping_for_user(",
+        "password_auth_context_for_user(&updated_user, &password_hash)",
+        ".update_user_and_seed_wrap(&updated_user, new_wrapping)",
+        "verify_seed_wrap_for_auth_context(&updated_user, &new_auth_context)",
+    ] {
+        assert!(
+            guest_conversion_helper.contains(required_pattern),
+            "guest conversion helper must contain `{required_pattern}`"
+        );
+    }
+}
+
 fn collect_forbidden_legacy_seed_matches(
     path: &Path,
     forbidden_patterns: &[&str],

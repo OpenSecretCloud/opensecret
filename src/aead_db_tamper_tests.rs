@@ -4,7 +4,7 @@ use crate::{
     models::{
         oauth::NewUserOAuthConnection,
         org_projects::OrgProject,
-        schema::org_projects,
+        schema::{org_projects, user_oauth_connections},
         user_seed_wrappings::NewUserSeedWrapping,
         users::{NewUser, User},
     },
@@ -210,6 +210,83 @@ async fn db_oauth_seed_wrap_substitution_fails_for_attacker_provider_subject() {
     let _ = app_state.db.delete_user(&attacker);
 }
 
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_oauth_connection_remap_fails_before_victim_seed_unwrap() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let victim_email = format!("aead-oauth-remap-victim-{marker}@example.com");
+    let attacker_email = format!("aead-oauth-remap-attacker-{marker}@example.com");
+    let victim_provider_subject = format!("victim-google-remap-sub-{marker}");
+    let attacker_provider_subject = format!("attacker-google-remap-sub-{marker}");
+
+    let victim = create_oauth_wrapped_user(
+        &app_state,
+        project.id,
+        victim_email,
+        "google",
+        victim_provider_subject,
+    )
+    .await;
+    let attacker = create_oauth_wrapped_user(
+        &app_state,
+        project.id,
+        attacker_email,
+        "google",
+        attacker_provider_subject.clone(),
+    )
+    .await;
+
+    remap_attacker_oauth_connection_to_victim(
+        &app_state,
+        &attacker,
+        &victim,
+        &attacker_provider_subject,
+    );
+
+    let google_provider = app_state
+        .db
+        .get_oauth_provider_by_name("google")
+        .expect("test OAuth provider lookup should succeed")
+        .expect("test OAuth provider should exist after AppState build");
+    let remapped_connection = app_state
+        .db
+        .get_project_user_oauth_connection_by_provider_subject(
+            google_provider.id,
+            &attacker_provider_subject,
+            project.id,
+        )
+        .expect("remapped OAuth subject lookup should not error")
+        .expect("remapped OAuth subject should resolve to a connection");
+    assert_eq!(
+        remapped_connection.user_id, victim.uuid,
+        "DB tamper precondition should map attacker subject to victim user"
+    );
+
+    let victim_auth_context_from_attacker_subject = app_state
+        .oauth_auth_context_for_user(&victim, "google", &attacker_provider_subject)
+        .expect("victim OAuth auth context should compute from remapped subject");
+    let victim_unwrap_after_connection_remap = app_state
+        .verify_seed_wrap_for_auth_context(&victim, &victim_auth_context_from_attacker_subject);
+
+    assert!(
+        matches!(
+            victim_unwrap_after_connection_remap,
+            Err(Error::AuthenticationError)
+        ),
+        "remapped attacker OAuth subject must not unwrap victim seed"
+    );
+
+    let _ = app_state.db.delete_user(&victim);
+    let _ = app_state.db.delete_user(&attacker);
+}
+
 async fn build_local_test_app_state(database_url: String) -> AppState {
     let db = setup_db(database_url);
     AppStateBuilder::default()
@@ -331,6 +408,31 @@ fn copy_attacker_password_verifier_to_victim(app_state: &AppState, attacker: &Us
     victim
         .update_password(conn, attacker.password_enc.clone())
         .expect("tampered victim password verifier should update");
+}
+
+fn remap_attacker_oauth_connection_to_victim(
+    app_state: &AppState,
+    attacker: &User,
+    victim: &User,
+    attacker_provider_subject: &str,
+) {
+    let conn = &mut app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("test database connection should be available");
+
+    let updated_rows = diesel::update(user_oauth_connections::table)
+        .filter(user_oauth_connections::user_id.eq(attacker.uuid))
+        .filter(user_oauth_connections::provider_user_id.eq(attacker_provider_subject))
+        .set(user_oauth_connections::user_id.eq(victim.uuid))
+        .execute(conn)
+        .expect("tampered OAuth connection should update");
+
+    assert_eq!(
+        updated_rows, 1,
+        "DB tamper precondition should move exactly one OAuth connection"
+    );
 }
 
 fn copy_victim_seed_wrap_ciphertext_to_attacker(

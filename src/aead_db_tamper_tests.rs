@@ -83,6 +83,70 @@ async fn db_seed_wrap_substitution_fails_before_issuing_password_session() {
     let _ = app_state.db.delete_user(&attacker);
 }
 
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_password_verifier_substitution_fails_before_issuing_victim_session() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let victim_email = format!("aead-pw-tamper-victim-{marker}@example.com");
+    let attacker_email = format!("aead-pw-tamper-attacker-{marker}@example.com");
+    let victim_password = "victim-password-before-password-row-tamper";
+    let attacker_password = "attacker-password-before-password-row-tamper";
+
+    let victim = create_password_wrapped_user(
+        &app_state,
+        project.id,
+        victim_email.clone(),
+        victim_password,
+    )
+    .await;
+    let attacker =
+        create_password_wrapped_user(&app_state, project.id, attacker_email, attacker_password)
+            .await;
+
+    let victim_login_before_tamper = app_state
+        .authenticate_user(
+            Some(victim_email.clone()),
+            None,
+            victim_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("untampered victim login should not error");
+    assert!(
+        victim_login_before_tamper.is_some(),
+        "untampered victim login should verify and unwrap"
+    );
+
+    copy_attacker_password_verifier_to_victim(&app_state, &attacker, &victim);
+
+    let victim_shell_login_after_tamper = app_state
+        .authenticate_user(
+            Some(victim_email),
+            None,
+            attacker_password.to_string(),
+            project.id,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            victim_shell_login_after_tamper,
+            Err(Error::AuthenticationError)
+        ),
+        "copied attacker password verifier must not produce a victim session"
+    );
+
+    let _ = app_state.db.delete_user(&victim);
+    let _ = app_state.db.delete_user(&attacker);
+}
+
 async fn build_local_test_app_state(database_url: String) -> AppState {
     let db = setup_db(database_url);
     AppStateBuilder::default()
@@ -142,6 +206,18 @@ async fn create_password_wrapped_user(
         .expect("test user seed wrap should insert");
 
     user
+}
+
+fn copy_attacker_password_verifier_to_victim(app_state: &AppState, attacker: &User, victim: &User) {
+    let conn = &mut app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("test database connection should be available");
+
+    victim
+        .update_password(conn, attacker.password_enc.clone())
+        .expect("tampered victim password verifier should update");
 }
 
 fn copy_victim_seed_wrap_ciphertext_to_attacker(

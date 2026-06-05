@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{collections::BTreeSet, fs, path::Path};
 
 const REQUEST_TIME_SCAN_ROOTS: &[&str] = &["src/main.rs", "src/web"];
 
@@ -26,6 +26,26 @@ const DESTRUCTIVE_RESET_REQUIRED_TABLES: &[&str] = &[
     "conversation_projects",
     "conversation_summaries",
     "conversations",
+];
+
+const DESTRUCTIVE_RESET_CASCADE_ENCRYPTED_TABLES: &[(&str, &str)] = &[
+    ("assistant_messages", "conversations"),
+    ("reasoning_items", "conversations"),
+    ("responses", "conversations"),
+    ("tool_calls", "conversations"),
+    ("tool_outputs", "conversations"),
+    ("user_messages", "conversations"),
+];
+
+const DESTRUCTIVE_RESET_UPDATED_ENCRYPTED_TABLES: &[&str] = &["users"];
+
+const ENCRYPTED_TABLES_NOT_USER_PRIVATE_STORAGE: &[&str] = &[
+    "account_deletion_requests",
+    "org_project_secrets",
+    "password_reset_requests",
+    "platform_password_reset_requests",
+    "platform_users",
+    "user_oauth_connections",
 ];
 
 #[test]
@@ -261,6 +281,59 @@ fn destructive_password_reset_wipes_user_key_encrypted_storage_roots() {
         assert!(
             reset_body.contains(required_pattern),
             "destructive reset must contain `{required_pattern}`"
+        );
+    }
+}
+
+#[test]
+fn destructive_password_reset_encrypted_schema_inventory_is_classified() {
+    let schema_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/models/schema.rs");
+    let contents = fs::read_to_string(&schema_source).expect("schema source should be readable");
+    let encrypted_tables = collect_schema_tables_with_encrypted_columns(&contents);
+
+    let mut classified_tables = BTreeSet::new();
+    classified_tables.extend(DESTRUCTIVE_RESET_REQUIRED_TABLES.iter().copied());
+    classified_tables.extend(
+        DESTRUCTIVE_RESET_CASCADE_ENCRYPTED_TABLES
+            .iter()
+            .map(|(table_name, _owner_table)| *table_name),
+    );
+    classified_tables.extend(DESTRUCTIVE_RESET_UPDATED_ENCRYPTED_TABLES.iter().copied());
+    classified_tables.extend(ENCRYPTED_TABLES_NOT_USER_PRIVATE_STORAGE.iter().copied());
+
+    let unclassified_tables = encrypted_tables
+        .iter()
+        .filter(|table_name| !classified_tables.contains(table_name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(
+        unclassified_tables.is_empty(),
+        "encrypted schema tables must be classified for destructive reset handling:\n{}",
+        unclassified_tables.join("\n")
+    );
+
+    let db_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db.rs");
+    let db_contents = fs::read_to_string(&db_source).expect("DB source should be readable");
+    let reset_marker = "debug!(\"Completing destructive password reset\");";
+    let reset_marker_index = db_contents.find(reset_marker).unwrap_or_else(|| {
+        panic!("destructive reset implementation should contain `{reset_marker}`")
+    });
+    let implementation_start = db_contents[..reset_marker_index]
+        .rfind("fn complete_destructive_password_reset")
+        .expect("destructive reset implementation signature should exist");
+    let reset_body = extract_function_body(
+        &db_contents[implementation_start..],
+        "fn complete_destructive_password_reset",
+    );
+
+    for (cascade_table, owner_table) in DESTRUCTIVE_RESET_CASCADE_ENCRYPTED_TABLES {
+        assert!(
+            encrypted_tables.contains(*cascade_table),
+            "`{cascade_table}` should remain in the encrypted schema inventory"
+        );
+        assert!(
+            reset_body.contains(&format!("{owner_table}::table")),
+            "`{cascade_table}` is classified as cascade-covered, so destructive reset must delete owner `{owner_table}`"
         );
     }
 }
@@ -735,6 +808,52 @@ fn collect_pattern_matches(path: &Path, pattern: &str, findings: &mut Vec<String
             ));
         }
     }
+}
+
+fn collect_schema_tables_with_encrypted_columns(schema_source: &str) -> BTreeSet<String> {
+    let mut encrypted_tables = BTreeSet::new();
+    let mut in_table_macro = false;
+    let mut current_table: Option<String> = None;
+
+    for line in schema_source.lines() {
+        let trimmed = line.trim();
+
+        if trimmed == "diesel::table! {" {
+            in_table_macro = true;
+            current_table = None;
+            continue;
+        }
+
+        if !in_table_macro {
+            continue;
+        }
+
+        if current_table.is_none() && trimmed.ends_with('{') && trimmed.contains(" (") {
+            let table_name = trimmed
+                .split_whitespace()
+                .next()
+                .expect("schema table declaration should have a table name");
+            current_table = Some(table_name.to_string());
+            continue;
+        }
+
+        if trimmed == "}" {
+            in_table_macro = false;
+            current_table = None;
+            continue;
+        }
+
+        let is_encrypted_column =
+            trimmed.contains("_enc ->") || trimmed.contains("encrypted_code ->");
+        if is_encrypted_column {
+            let table_name = current_table.as_ref().unwrap_or_else(|| {
+                panic!("encrypted column `{trimmed}` should appear inside a table declaration")
+            });
+            encrypted_tables.insert(table_name.clone());
+        }
+    }
+
+    encrypted_tables
 }
 
 fn extract_function_body<'a>(source: &'a str, signature: &str) -> &'a str {

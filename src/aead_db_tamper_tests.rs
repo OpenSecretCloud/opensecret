@@ -7,7 +7,14 @@ use crate::{
         oauth::NewUserOAuthConnection,
         org_projects::OrgProject,
         password_reset::NewPasswordResetRequest,
-        schema::{org_projects, user_oauth_connections, users},
+        responses::{
+            NewAssistantMessage, NewConversation, NewReasoningItem, NewResponse, NewToolCall,
+            NewToolOutput, NewUserMessage, ResponseStatus,
+        },
+        schema::{
+            assistant_messages, conversations, org_projects, reasoning_items, responses,
+            tool_calls, tool_outputs, user_messages, user_oauth_connections, users,
+        },
         user_kv::{NewUserKV, UserKV},
         user_seed_wrappings::NewUserSeedWrapping,
         users::{NewUser, User},
@@ -16,6 +23,7 @@ use crate::{
     seed_wrapping::{password_reset_code_mac, CredentialKind},
     AppMode, AppState, AppStateBuilder, Error,
 };
+use chrono::Utc;
 use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
 use password_auth::generate_hash;
 use secp256k1::SecretKey;
@@ -1023,6 +1031,45 @@ async fn db_destructive_password_reset_invalidates_old_auth_context_and_rotates_
     let _ = app_state.db.delete_user(&user);
 }
 
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_destructive_password_reset_wipes_response_storage_cascade() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let email = format!("aead-reset-cascade-{marker}@example.com");
+    let old_password = "old-password-before-reset-cascade";
+    let new_password = "new-password-after-reset-cascade";
+    let reset_code = "CASCADE1";
+    let reset_secret = format!("cascade-reset-secret-{marker}");
+
+    let user =
+        create_password_wrapped_user(&app_state, project.id, email.clone(), old_password).await;
+    insert_response_storage_stack_for_user(&app_state, user.uuid);
+    assert_response_storage_counts(&app_state, user.uuid, 1);
+
+    insert_valid_reset_request_for_user(&app_state, project.id, &user, reset_code, &reset_secret);
+    app_state
+        .confirm_password_reset(
+            email,
+            reset_code.to_string(),
+            reset_secret,
+            new_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("destructive password reset should complete with response storage rows present");
+
+    assert_response_storage_counts(&app_state, user.uuid, 0);
+
+    let _ = app_state.db.delete_user(&user);
+}
+
 async fn build_local_test_app_state(database_url: String) -> AppState {
     let db = setup_db(database_url);
     AppStateBuilder::default()
@@ -1049,6 +1096,168 @@ fn first_active_project(app_state: &AppState) -> OrgProject {
         .order(org_projects::id.asc())
         .first::<OrgProject>(conn)
         .expect("test database should contain at least one active project")
+}
+
+fn insert_response_storage_stack_for_user(app_state: &AppState, user_id: Uuid) {
+    let conn = &mut app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("test database connection should be available");
+
+    let conversation = NewConversation {
+        uuid: Uuid::new_v4(),
+        user_id,
+        project_id: None,
+        is_pinned: false,
+        metadata_enc: Some(vec![1, 2, 3]),
+    }
+    .insert(conn)
+    .expect("test conversation should insert");
+
+    let response = NewResponse {
+        uuid: Uuid::new_v4(),
+        user_id,
+        conversation_id: conversation.id,
+        status: ResponseStatus::Completed,
+        model: "aead-reset-cascade-test".to_string(),
+        temperature: None,
+        top_p: None,
+        max_output_tokens: None,
+        tool_choice: None,
+        parallel_tool_calls: false,
+        store: true,
+        metadata_enc: Some(vec![4, 5, 6]),
+    }
+    .insert(conn)
+    .expect("test response should insert");
+
+    NewUserMessage {
+        uuid: Uuid::new_v4(),
+        conversation_id: conversation.id,
+        response_id: Some(response.id),
+        user_id,
+        content_enc: vec![7, 8, 9],
+        prompt_tokens: 3,
+    }
+    .insert(conn)
+    .expect("test user message should insert");
+
+    let assistant_message = NewAssistantMessage {
+        uuid: Uuid::new_v4(),
+        conversation_id: conversation.id,
+        response_id: Some(response.id),
+        user_id,
+        content_enc: Some(vec![10, 11, 12]),
+        completion_tokens: 3,
+        status: "completed".to_string(),
+        finish_reason: Some("stop".to_string()),
+        created_at: Utc::now(),
+    }
+    .insert(conn)
+    .expect("test assistant message should insert");
+
+    let tool_call = NewToolCall {
+        uuid: Uuid::new_v4(),
+        conversation_id: conversation.id,
+        response_id: Some(response.id),
+        user_id,
+        name: "aead_reset_test_tool".to_string(),
+        arguments_enc: Some(vec![13, 14, 15]),
+        argument_tokens: 3,
+        status: "completed".to_string(),
+        created_at: Utc::now(),
+    }
+    .insert(conn)
+    .expect("test tool call should insert");
+
+    NewToolOutput {
+        uuid: Uuid::new_v4(),
+        conversation_id: conversation.id,
+        response_id: Some(response.id),
+        user_id,
+        tool_call_fk: tool_call.id,
+        output_enc: vec![16, 17, 18],
+        output_tokens: 3,
+        status: "completed".to_string(),
+        error: None,
+        created_at: Utc::now(),
+    }
+    .insert(conn)
+    .expect("test tool output should insert");
+
+    NewReasoningItem {
+        uuid: Uuid::new_v4(),
+        conversation_id: conversation.id,
+        response_id: Some(response.id),
+        assistant_message_id: Some(assistant_message.id),
+        user_id,
+        content_enc: Some(vec![19, 20, 21]),
+        summary_enc: Some(vec![22, 23, 24]),
+        reasoning_tokens: 3,
+        status: "completed".to_string(),
+        created_at: Utc::now(),
+    }
+    .insert(conn)
+    .expect("test reasoning item should insert");
+}
+
+fn assert_response_storage_counts(app_state: &AppState, user_id: Uuid, expected_count: i64) {
+    let conn = &mut app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("test database connection should be available");
+
+    let conversation_count = conversations::table
+        .filter(conversations::user_id.eq(user_id))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("conversation count should query");
+    let response_count = responses::table
+        .filter(responses::user_id.eq(user_id))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("response count should query");
+    let user_message_count = user_messages::table
+        .filter(user_messages::user_id.eq(user_id))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("user message count should query");
+    let assistant_message_count = assistant_messages::table
+        .filter(assistant_messages::user_id.eq(user_id))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("assistant message count should query");
+    let tool_call_count = tool_calls::table
+        .filter(tool_calls::user_id.eq(user_id))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("tool call count should query");
+    let tool_output_count = tool_outputs::table
+        .filter(tool_outputs::user_id.eq(user_id))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("tool output count should query");
+    let reasoning_item_count = reasoning_items::table
+        .filter(reasoning_items::user_id.eq(user_id))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("reasoning item count should query");
+
+    assert_eq!(conversation_count, expected_count, "conversation row count");
+    assert_eq!(response_count, expected_count, "response row count");
+    assert_eq!(user_message_count, expected_count, "user message row count");
+    assert_eq!(
+        assistant_message_count, expected_count,
+        "assistant message row count"
+    );
+    assert_eq!(tool_call_count, expected_count, "tool call row count");
+    assert_eq!(tool_output_count, expected_count, "tool output row count");
+    assert_eq!(
+        reasoning_item_count, expected_count,
+        "reasoning item row count"
+    );
 }
 
 async fn create_password_wrapped_user(

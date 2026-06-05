@@ -366,26 +366,14 @@ pub async fn refresh_token(
         .await
         .map_err(|_| ApiError::Unauthorized)?;
 
-    let auth_context = if claims.token_format.is_some() {
-        let auth_context = AuthContext::from_claims(&claims)?;
-        data.verify_seed_wrap_for_auth_context(&user, &auth_context)
-            .map_err(|_| ApiError::InvalidJwt)?;
-        Some(auth_context)
-    } else {
-        None
-    };
+    let auth_context = AuthContext::from_claims(&claims)?;
+    data.verify_seed_wrap_for_auth_context(&user, &auth_context)
+        .map_err(|_| ApiError::InvalidJwt)?;
 
-    let (new_access_token, new_refresh_token) = if let Some(auth_context) = auth_context {
-        (
-            NewToken::new_with_auth_context(&user, TokenType::Access, &data, &auth_context)?,
-            NewToken::new_with_auth_context(&user, TokenType::Refresh, &data, &auth_context)?,
-        )
-    } else {
-        (
-            NewToken::new(&user, TokenType::Access, &data)?,
-            NewToken::new(&user, TokenType::Refresh, &data)?,
-        )
-    };
+    let new_access_token =
+        NewToken::new_with_auth_context(&user, TokenType::Access, &data, &auth_context)?;
+    let new_refresh_token =
+        NewToken::new_with_auth_context(&user, TokenType::Refresh, &data, &auth_context)?;
 
     let response = RefreshResponse {
         access_token: new_access_token.token,

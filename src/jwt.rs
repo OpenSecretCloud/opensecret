@@ -354,18 +354,6 @@ impl NewToken {
 
     pub fn new(user: &User, token_type: TokenType, app_state: &AppState) -> Result<Self, ApiError> {
         let (aud, azp, role, duration) = match &token_type {
-            TokenType::Access => (
-                Some(USER_ACCESS.to_string()),
-                None,
-                None,
-                Duration::minutes(app_state.config.access_token_maxage),
-            ),
-            TokenType::Refresh => (
-                Some(USER_REFRESH.to_string()),
-                None,
-                None,
-                Duration::days(app_state.config.refresh_token_maxage),
-            ),
             TokenType::ThirdParty { aud, azp } => {
                 // Validate the audience URL against allowed domains
                 if aud.is_some() {
@@ -378,6 +366,10 @@ impl NewToken {
                     Some("authenticated".to_string()),
                     Duration::hours(1),
                 )
+            }
+            TokenType::Access | TokenType::Refresh => {
+                tracing::error!("User access/refresh tokens require AuthContext");
+                return Err(ApiError::BadRequest);
             }
         };
 
@@ -430,7 +422,6 @@ impl NewToken {
         })
     }
 
-    #[allow(dead_code)]
     pub fn new_with_auth_context(
         user: &User,
         token_type: TokenType,
@@ -605,6 +596,11 @@ pub async fn validate_jwt(
         Err(_) => return ApiError::InvalidJwt.into_response(),
     };
 
+    let auth_context = match AuthContext::from_claims(&claims) {
+        Ok(auth_context) => auth_context,
+        Err(_) => return ApiError::InvalidJwt.into_response(),
+    };
+
     let user_uuid: Uuid = match Uuid::parse_str(&claims.sub) {
         Ok(uuid) => uuid,
         Err(e) => {
@@ -621,6 +617,12 @@ pub async fn validate_jwt(
         }
     };
 
+    if user.project_id != auth_context.project_id {
+        tracing::error!("JWT auth context project does not match user project");
+        return ApiError::InvalidJwt.into_response();
+    }
+
+    req.extensions_mut().insert(auth_context);
     req.extensions_mut().insert(user);
     tracing::debug!("Exiting validate_jwt");
     next.run(req).await

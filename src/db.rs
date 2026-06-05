@@ -145,7 +145,6 @@ pub trait DBConnection {
     fn create_user(&self, new_user: NewUser) -> Result<User, DBError>;
     fn get_user_by_uuid(&self, uuid: Uuid) -> Result<User, DBError>;
     fn get_user_by_email(&self, email: String, project_id: i32) -> Result<User, DBError>;
-    fn set_user_key(&self, user: User, private_key: Vec<u8>) -> Result<(), DBError>;
     fn create_user_seed_wrapping(
         &self,
         new_wrapping: NewUserSeedWrapping,
@@ -764,16 +763,6 @@ impl DBConnection for PostgresConnection {
         let result = User::get_by_email(conn, email, project_id)?.ok_or(DBError::UserNotFound);
         if let Err(ref e) = result {
             error!("Failed to get user by email: {:?}", e);
-        }
-        result
-    }
-
-    fn set_user_key(&self, user: User, private_key: Vec<u8>) -> Result<(), DBError> {
-        debug!("Setting user key");
-        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        let result = user.set_key(conn, private_key).map_err(DBError::from);
-        if let Err(ref e) = result {
-            error!("Failed to set user key: {:?}", e);
         }
         result
     }

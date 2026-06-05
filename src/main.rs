@@ -157,9 +157,6 @@ pub enum Error {
     #[error("Private key could not be generated")]
     PrivateKeyGenerationFailure,
 
-    #[error("Private key already exists")]
-    PrivateKeyAlreadyExists,
-
     #[error("User not found")]
     UserNotFound,
 

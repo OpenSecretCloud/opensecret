@@ -168,6 +168,41 @@ fn destructive_password_reset_wipes_user_key_encrypted_storage_roots() {
     }
 }
 
+#[test]
+fn seed_wrap_translation_startup_path_is_feature_gated() {
+    let migrations_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/migrations.rs");
+    let contents =
+        fs::read_to_string(&migrations_source).expect("migrations source should be readable");
+    let startup_call = "migrate_aead_seed_wrappings_v1(app_state)?;";
+    let startup_call_index = contents
+        .find(startup_call)
+        .unwrap_or_else(|| panic!("startup migration call `{startup_call}` should exist"));
+
+    let prefix_window_start = startup_call_index.saturating_sub(120);
+    let prefix_window = &contents[prefix_window_start..startup_call_index];
+    assert!(
+        prefix_window.contains("#[cfg(feature = \"seed-wrap-translation\")]"),
+        "startup seed-wrap translation call must be feature-gated"
+    );
+
+    for required_gated_item in [
+        "fn migrate_aead_seed_wrappings_v1",
+        "fn validate_no_duplicate_oauth_subjects_by_project",
+        "fn upsert_password_seed_wrap",
+        "fn upsert_oauth_seed_wrap",
+    ] {
+        let item_index = contents
+            .find(required_gated_item)
+            .unwrap_or_else(|| panic!("`{required_gated_item}` should exist"));
+        let item_prefix_start = item_index.saturating_sub(120);
+        let item_prefix = &contents[item_prefix_start..item_index];
+        assert!(
+            item_prefix.contains("#[cfg(feature = \"seed-wrap-translation\")]"),
+            "`{required_gated_item}` must be feature-gated"
+        );
+    }
+}
+
 fn collect_forbidden_legacy_seed_matches(
     path: &Path,
     forbidden_patterns: &[&str],

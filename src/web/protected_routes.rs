@@ -834,7 +834,7 @@ pub async fn change_password(
         )
         .await
     {
-        Ok(Some(authenticated_user)) if authenticated_user.uuid == user.uuid => {
+        Ok(Some(authenticated_user)) if authenticated_user.user.uuid == user.uuid => {
             // Current password is correct, proceed with password change
             match data
                 .update_user_password(&user, change_request.new_password)

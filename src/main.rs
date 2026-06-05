@@ -24,11 +24,13 @@ use crate::web::{
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
+use crate::jwt::{AuthContext, AuthMethod};
 use crate::models::user_seed_wrappings::NewUserSeedWrapping;
 use crate::seed_wrapping::{
-    compute_password_auth_binding, encrypt_seed_v1, normalize_email_login_identifier,
-    normalize_guest_login_identifier, password_credential_lookup_hash, CredentialKind,
-    PasswordLoginIdentifierKind, SEED_WRAP_VERSION_V1,
+    compute_password_auth_binding, decrypt_seed_v1, encrypt_seed_v1,
+    normalize_email_login_identifier, normalize_guest_login_identifier,
+    password_credential_lookup_hash, AuthBinding, CredentialKind, PasswordLoginIdentifierKind,
+    SEED_WRAP_VERSION_V1,
 };
 use crate::{
     aws_credentials::AwsCredentialError,
@@ -427,6 +429,12 @@ pub struct AppState {
     brave_client: Option<Arc<crate::brave::BraveClient>>,
 }
 
+#[derive(Debug, Clone)]
+struct AuthenticatedUser {
+    user: User,
+    auth_context: AuthContext,
+}
+
 #[derive(Default)]
 pub struct AppStateBuilder {
     app_mode: Option<AppMode>,
@@ -754,16 +762,15 @@ impl AppState {
         }
     }
 
-    fn create_password_seed_wrap_for_user(
+    fn password_auth_binding_for_user(
         &self,
         user: &User,
         decrypted_password_verifier: &str,
-        plaintext_seed: &[u8],
-    ) -> Result<(), Error> {
+    ) -> Result<AuthBinding, Error> {
         let (login_identifier_kind, normalized_login_identifier) =
             Self::password_login_identifier_for_user(user);
 
-        let auth_binding = compute_password_auth_binding(
+        compute_password_auth_binding(
             &self.enclave_key,
             user.project_id,
             user.uuid,
@@ -771,7 +778,71 @@ impl AppState {
             &normalized_login_identifier,
             decrypted_password_verifier,
         )
-        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+        .map_err(|e| Error::EncryptionError(e.to_string()))
+    }
+
+    fn password_auth_context_for_user(
+        &self,
+        user: &User,
+        decrypted_password_verifier: &str,
+    ) -> Result<AuthContext, Error> {
+        let auth_binding =
+            self.password_auth_binding_for_user(user, decrypted_password_verifier)?;
+        Ok(AuthContext::new(
+            AuthMethod::Password,
+            user.project_id,
+            *auth_binding.as_bytes(),
+        ))
+    }
+
+    fn verify_seed_wrap_for_auth_context(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+    ) -> Result<(), Error> {
+        if user.project_id != auth_context.project_id {
+            return Err(Error::AuthenticationError);
+        }
+
+        let credential_kind = match auth_context.method {
+            AuthMethod::Password => CredentialKind::Password,
+            AuthMethod::OAuth => CredentialKind::OAuth,
+        };
+        let auth_binding = AuthBinding::from_bytes(auth_context.auth_binding);
+        let candidates = self
+            .db
+            .get_user_seed_wrappings_for_user_and_kind(user.uuid, credential_kind.as_str())?;
+
+        for candidate in candidates {
+            if candidate.wrapping_version != SEED_WRAP_VERSION_V1 {
+                continue;
+            }
+
+            if decrypt_seed_v1(
+                &self.enclave_key,
+                &candidate.seed_enc,
+                user.uuid,
+                user.project_id,
+                credential_kind,
+                &auth_binding,
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+        }
+
+        Err(Error::AuthenticationError)
+    }
+
+    fn create_password_seed_wrap_for_user(
+        &self,
+        user: &User,
+        decrypted_password_verifier: &str,
+        plaintext_seed: &[u8],
+    ) -> Result<(), Error> {
+        let auth_binding =
+            self.password_auth_binding_for_user(user, decrypted_password_verifier)?;
 
         let credential_lookup_hash =
             password_credential_lookup_hash(&self.enclave_key, user.project_id, user.uuid)
@@ -866,7 +937,7 @@ impl AppState {
         user_id: Option<Uuid>,
         user_password: String,
         user_project_id: i32,
-    ) -> Result<Option<User>, Error> {
+    ) -> Result<Option<AuthenticatedUser>, Error> {
         // Ensure at least one identifier is provided
         if user_email.is_none() && user_id.is_none() {
             return Err(Error::AuthenticationError);
@@ -901,6 +972,7 @@ impl AppState {
 
         let decrypted_password_hash = String::from_utf8(decrypted_password_bytes)
             .map_err(|e| Error::EncryptionError(format!("Failed to decode UTF-8: {}", e)))?;
+        let verifier_for_binding = decrypted_password_hash.clone();
 
         // Verifying the password is blocking and potentially slow, so we'll do so via
         // `spawn_blocking`.
@@ -909,7 +981,12 @@ impl AppState {
                 .await?;
 
         match res {
-            Ok(_) => Ok(Some(user)),
+            Ok(_) => {
+                let auth_context =
+                    self.password_auth_context_for_user(&user, &verifier_for_binding)?;
+                self.verify_seed_wrap_for_auth_context(&user, &auth_context)?;
+                Ok(Some(AuthenticatedUser { user, auth_context }))
+            }
             Err(_) => Ok(None),
         }
     }

@@ -64,6 +64,10 @@ pub fn normalize_guest_login_identifier(user_uuid: Uuid) -> String {
 pub struct AuthBinding([u8; 32]);
 
 impl AuthBinding {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

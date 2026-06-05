@@ -33,6 +33,10 @@ impl User {
         self.seed_enc.clone()
     }
 
+    pub fn seed_encrypted(&self) -> Option<&[u8]> {
+        self.seed_enc.as_deref()
+    }
+
     pub fn get_by_id(conn: &mut PgConnection, lookup_id: i32) -> Result<Option<User>, UserError> {
         users::table
             .filter(users::id.eq(lookup_id))

@@ -692,3 +692,617 @@ async fn migrate_project_secret(
 
     Ok(())
 }
+
+#[cfg(all(test, feature = "seed-wrap-translation"))]
+mod tests {
+    use super::*;
+    use crate::{
+        db::setup_db,
+        encrypt::encrypt_with_key,
+        models::{
+            oauth::NewUserOAuthConnection,
+            org_projects::OrgProject,
+            schema::{app_data_migrations, org_projects},
+            user_seed_wrappings::UserSeedWrapping,
+            users::NewUser,
+        },
+        private_key::generate_twelve_word_seed,
+        AppStateBuilder,
+    };
+    use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
+    use password_auth::generate_hash;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    #[ignore = "requires AEAD_TRANSLATION_TEST_DATABASE_URL pointing at an empty disposable migrated local Postgres"]
+    async fn db_seed_wrap_translation_is_atomic_idempotent_and_creates_expected_wraps() {
+        let Some(database_url) = translation_test_database_url() else {
+            eprintln!("skipping: AEAD_TRANSLATION_TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let app_state = build_local_translation_app_state(database_url).await;
+        assert_empty_translation_state(&app_state);
+
+        let project = first_active_project(&app_state);
+        let marker = Uuid::new_v4();
+
+        let duplicate_subject = format!("duplicate-google-sub-{marker}");
+        let duplicate_a = insert_legacy_oauth_user(
+            &app_state,
+            project.id,
+            format!("translation-duplicate-a-{marker}@example.com"),
+            "google",
+            duplicate_subject.clone(),
+        )
+        .await;
+        let duplicate_b = insert_legacy_oauth_user(
+            &app_state,
+            project.id,
+            format!("translation-duplicate-b-{marker}@example.com"),
+            "google",
+            duplicate_subject,
+        )
+        .await;
+
+        let duplicate_result = migrate_aead_seed_wrappings_v1(&app_state);
+        assert!(
+            matches!(duplicate_result, Err(Error::EncryptionError(message)) if message.contains("Duplicate OAuth provider subject")),
+            "duplicate OAuth provider subjects in one project must fail before translation"
+        );
+        assert!(!migration_marker_exists(&app_state));
+        assert_eq!(total_seed_wrap_count(&app_state), 0);
+        delete_test_users(&app_state, &[&duplicate_a.user, &duplicate_b.user]);
+
+        let valid_before_failure = insert_legacy_password_user(
+            &app_state,
+            project.id,
+            Some(format!(
+                "translation-valid-before-failure-{marker}@example.com"
+            )),
+            "valid-password-before-rollback",
+        )
+        .await;
+        let invalid_no_credential = insert_legacy_no_credential_user(
+            &app_state,
+            project.id,
+            format!("translation-no-credential-{marker}@example.com"),
+        )
+        .await;
+
+        let rollback_result = migrate_aead_seed_wrappings_v1(&app_state);
+        assert!(
+            matches!(rollback_result, Err(Error::EncryptionError(message)) if message.contains("has no usable credential")),
+            "translation must fail when a legacy user has no password or OAuth credential"
+        );
+        assert!(!migration_marker_exists(&app_state));
+        assert_eq!(
+            total_seed_wrap_count(&app_state),
+            0,
+            "seed wraps written before a later user failure must roll back with the transaction"
+        );
+        delete_test_users(
+            &app_state,
+            &[&valid_before_failure.user, &invalid_no_credential],
+        );
+
+        let password_user = insert_legacy_password_user(
+            &app_state,
+            project.id,
+            Some(format!("translation-password-{marker}@example.com")),
+            "password-user-password",
+        )
+        .await;
+        let guest_user =
+            insert_legacy_password_user(&app_state, project.id, None, "guest-user-password").await;
+        let oauth_user = insert_legacy_oauth_user(
+            &app_state,
+            project.id,
+            format!("translation-oauth-{marker}@example.com"),
+            "google",
+            format!("translation-google-sub-{marker}"),
+        )
+        .await;
+        let multi_user = insert_legacy_password_user(
+            &app_state,
+            project.id,
+            Some(format!("translation-multi-{marker}@example.com")),
+            "multi-user-password",
+        )
+        .await;
+        let multi_oauth_subject = format!("translation-multi-github-sub-{marker}");
+        insert_oauth_connection(
+            &app_state,
+            &multi_user.user,
+            "github",
+            multi_oauth_subject.clone(),
+        );
+
+        migrate_aead_seed_wrappings_v1(&app_state).expect(
+            "translation should complete for password, guest, OAuth, and multi-credential users",
+        );
+
+        assert!(migration_marker_exists(&app_state));
+        assert_eq!(total_seed_wrap_count(&app_state), 5);
+        assert_eq!(
+            seed_wrap_count_for_user_and_kind(
+                &app_state,
+                password_user.user.uuid,
+                CredentialKind::Password
+            ),
+            1
+        );
+        assert_eq!(
+            seed_wrap_count_for_user_and_kind(
+                &app_state,
+                guest_user.user.uuid,
+                CredentialKind::Password
+            ),
+            1
+        );
+        assert_eq!(
+            seed_wrap_count_for_user_and_kind(
+                &app_state,
+                oauth_user.user.uuid,
+                CredentialKind::OAuth
+            ),
+            1
+        );
+        assert_eq!(
+            seed_wrap_count_for_user_and_kind(
+                &app_state,
+                multi_user.user.uuid,
+                CredentialKind::Password
+            ),
+            1
+        );
+        assert_eq!(
+            seed_wrap_count_for_user_and_kind(
+                &app_state,
+                multi_user.user.uuid,
+                CredentialKind::OAuth
+            ),
+            1
+        );
+
+        assert_legacy_seed_bytes_unchanged(
+            &app_state,
+            password_user.user.uuid,
+            &password_user.legacy_seed_enc,
+        );
+        assert_legacy_seed_bytes_unchanged(
+            &app_state,
+            guest_user.user.uuid,
+            &guest_user.legacy_seed_enc,
+        );
+        assert_legacy_seed_bytes_unchanged(
+            &app_state,
+            oauth_user.user.uuid,
+            &oauth_user.legacy_seed_enc,
+        );
+        assert_legacy_seed_bytes_unchanged(
+            &app_state,
+            multi_user.user.uuid,
+            &multi_user.legacy_seed_enc,
+        );
+
+        assert_password_wrap_decrypts(&app_state, &password_user);
+        assert_password_wrap_decrypts(&app_state, &guest_user);
+        assert_oauth_wrap_decrypts(&app_state, &oauth_user);
+        assert_oauth_wrap_decrypts(
+            &app_state,
+            &LegacyOAuthFixture {
+                user: multi_user.user.clone(),
+                seed_words: multi_user.seed_words.clone(),
+                legacy_seed_enc: multi_user.legacy_seed_enc.clone(),
+                provider_name: "github".to_string(),
+                provider_user_id: multi_oauth_subject,
+            },
+        );
+
+        let seed_wraps_before_second_run = seed_wrap_snapshots(&app_state);
+        overwrite_legacy_seed(&app_state, password_user.user.uuid, b"tampered legacy seed").await;
+        migrate_aead_seed_wrappings_v1(&app_state)
+            .expect("completed marker should make the second translation call skip");
+        assert_eq!(
+            seed_wrap_snapshots(&app_state),
+            seed_wraps_before_second_run,
+            "completed marker must prevent rerunning translation from tampered legacy seed_enc"
+        );
+
+        delete_test_users(
+            &app_state,
+            &[
+                &password_user.user,
+                &guest_user.user,
+                &oauth_user.user,
+                &multi_user.user,
+            ],
+        );
+        delete_translation_marker(&app_state);
+    }
+
+    #[derive(Debug)]
+    struct LegacyPasswordFixture {
+        user: User,
+        seed_words: String,
+        password_hash: String,
+        legacy_seed_enc: Vec<u8>,
+    }
+
+    #[derive(Debug)]
+    struct LegacyOAuthFixture {
+        user: User,
+        seed_words: String,
+        legacy_seed_enc: Vec<u8>,
+        provider_name: String,
+        provider_user_id: String,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct SeedWrapSnapshot {
+        user_id: Uuid,
+        credential_kind: String,
+        credential_lookup_hash: Vec<u8>,
+        wrapping_version: i16,
+        seed_enc: Vec<u8>,
+    }
+
+    fn translation_test_database_url() -> Option<String> {
+        let database_url = std::env::var("AEAD_TRANSLATION_TEST_DATABASE_URL").ok()?;
+        assert!(
+            database_url.contains("localhost") || database_url.contains("127.0.0.1"),
+            "AEAD_TRANSLATION_TEST_DATABASE_URL must point at local Postgres"
+        );
+        assert!(
+            database_url.contains("aead") && database_url.contains("scratch"),
+            "AEAD_TRANSLATION_TEST_DATABASE_URL must point at a disposable AEAD scratch database"
+        );
+        Some(database_url)
+    }
+
+    async fn build_local_translation_app_state(database_url: String) -> Arc<AppState> {
+        let db = setup_db(database_url);
+        Arc::new(
+            AppStateBuilder::default()
+                .app_mode(AppMode::Local)
+                .db(db)
+                .enclave_key([42u8; 32].to_vec())
+                .aws_credential_manager(Arc::new(RwLock::new(None)))
+                .openai_api_base("http://localhost:9".to_string())
+                .jwt_secret([24u8; 32].to_vec())
+                .build()
+                .await
+                .expect("local test app state should build"),
+        )
+    }
+
+    fn assert_empty_translation_state(app_state: &Arc<AppState>) {
+        let conn = &mut test_conn(app_state);
+        let user_count = users::table
+            .count()
+            .get_result::<i64>(conn)
+            .expect("user count should load");
+        let seed_wrap_count = user_seed_wrappings::table
+            .count()
+            .get_result::<i64>(conn)
+            .expect("seed wrap count should load");
+        let marker = AppDataMigration::get(conn, AEAD_SEED_WRAPPINGS_MIGRATION)
+            .expect("migration marker lookup should not fail");
+
+        assert_eq!(
+            user_count, 0,
+            "translation migration test requires an empty user table"
+        );
+        assert_eq!(
+            seed_wrap_count, 0,
+            "translation migration test requires an empty seed-wrap table"
+        );
+        assert!(
+            marker.is_none(),
+            "translation migration test requires no completed marker"
+        );
+    }
+
+    fn first_active_project(app_state: &Arc<AppState>) -> OrgProject {
+        let conn = &mut test_conn(app_state);
+        org_projects::table
+            .filter(org_projects::status.eq("active"))
+            .order(org_projects::id.asc())
+            .first::<OrgProject>(conn)
+            .expect("test database should contain at least one active project")
+    }
+
+    async fn insert_legacy_password_user(
+        app_state: &Arc<AppState>,
+        project_id: i32,
+        email: Option<String>,
+        password: &str,
+    ) -> LegacyPasswordFixture {
+        let seed_words = generate_twelve_word_seed(app_state.aws_credential_manager.clone())
+            .await
+            .expect("test seed should generate")
+            .to_string();
+        let password_hash = generate_hash(password);
+        let secret_key = SecretKey::from_slice(&app_state.enclave_key)
+            .expect("test enclave key should be valid");
+        let password_enc = encrypt_with_key(&secret_key, password_hash.as_bytes()).await;
+        let legacy_seed_enc = encrypt_with_key(&secret_key, seed_words.as_bytes()).await;
+        let user = NewUser::new(
+            email,
+            Some(password_enc),
+            project_id,
+            legacy_seed_enc.clone(),
+        )
+        .insert(&mut test_conn(app_state))
+        .expect("legacy password user should insert");
+
+        LegacyPasswordFixture {
+            user,
+            seed_words,
+            password_hash,
+            legacy_seed_enc,
+        }
+    }
+
+    async fn insert_legacy_oauth_user(
+        app_state: &Arc<AppState>,
+        project_id: i32,
+        email: String,
+        provider_name: &str,
+        provider_user_id: String,
+    ) -> LegacyOAuthFixture {
+        let seed_words = generate_twelve_word_seed(app_state.aws_credential_manager.clone())
+            .await
+            .expect("test seed should generate")
+            .to_string();
+        let secret_key = SecretKey::from_slice(&app_state.enclave_key)
+            .expect("test enclave key should be valid");
+        let legacy_seed_enc = encrypt_with_key(&secret_key, seed_words.as_bytes()).await;
+        let user = NewUser::new(Some(email), None, project_id, legacy_seed_enc.clone())
+            .insert(&mut test_conn(app_state))
+            .expect("legacy OAuth user should insert");
+
+        insert_oauth_connection(app_state, &user, provider_name, provider_user_id.clone());
+
+        LegacyOAuthFixture {
+            user,
+            seed_words,
+            legacy_seed_enc,
+            provider_name: provider_name.to_string(),
+            provider_user_id,
+        }
+    }
+
+    async fn insert_legacy_no_credential_user(
+        app_state: &Arc<AppState>,
+        project_id: i32,
+        email: String,
+    ) -> User {
+        let seed_words = generate_twelve_word_seed(app_state.aws_credential_manager.clone())
+            .await
+            .expect("test seed should generate")
+            .to_string();
+        let secret_key = SecretKey::from_slice(&app_state.enclave_key)
+            .expect("test enclave key should be valid");
+        let legacy_seed_enc = encrypt_with_key(&secret_key, seed_words.as_bytes()).await;
+        NewUser::new(Some(email), None, project_id, legacy_seed_enc)
+            .insert(&mut test_conn(app_state))
+            .expect("legacy no-credential user should insert")
+    }
+
+    fn insert_oauth_connection(
+        app_state: &Arc<AppState>,
+        user: &User,
+        provider_name: &str,
+        provider_user_id: String,
+    ) {
+        let provider = app_state
+            .db
+            .get_oauth_provider_by_name(provider_name)
+            .expect("test OAuth provider lookup should succeed")
+            .expect("test OAuth provider should exist after AppState build");
+
+        NewUserOAuthConnection::new(
+            user.uuid,
+            provider.id,
+            provider_user_id,
+            Vec::new(),
+            None,
+            None,
+        )
+        .insert(&mut test_conn(app_state))
+        .expect("legacy OAuth connection should insert");
+    }
+
+    fn assert_password_wrap_decrypts(app_state: &Arc<AppState>, fixture: &LegacyPasswordFixture) {
+        let (identifier_kind, normalized_identifier) = match fixture.user.get_email() {
+            Some(email) => (
+                PasswordLoginIdentifierKind::Email,
+                normalize_email_login_identifier(email),
+            ),
+            None => (
+                PasswordLoginIdentifierKind::GuestUuid,
+                normalize_guest_login_identifier(fixture.user.uuid),
+            ),
+        };
+        let auth_binding = compute_password_auth_binding(
+            &app_state.enclave_key,
+            fixture.user.project_id,
+            fixture.user.uuid,
+            identifier_kind,
+            &normalized_identifier,
+            &fixture.password_hash,
+        )
+        .expect("password auth binding should compute");
+        let wrap = only_seed_wrap_for_user_and_kind(
+            app_state,
+            fixture.user.uuid,
+            CredentialKind::Password,
+        );
+        let decrypted_seed = decrypt_seed_v1(
+            &app_state.enclave_key,
+            &wrap.seed_enc,
+            fixture.user.uuid,
+            fixture.user.project_id,
+            CredentialKind::Password,
+            &auth_binding,
+        )
+        .expect("migrated password wrap should decrypt");
+
+        assert_eq!(decrypted_seed, fixture.seed_words.as_bytes());
+    }
+
+    fn assert_oauth_wrap_decrypts(app_state: &Arc<AppState>, fixture: &LegacyOAuthFixture) {
+        let auth_binding = compute_oauth_auth_binding(
+            &app_state.enclave_key,
+            fixture.user.project_id,
+            fixture.user.uuid,
+            &fixture.provider_name,
+            &fixture.provider_user_id,
+        )
+        .expect("OAuth auth binding should compute");
+        let wrap =
+            only_seed_wrap_for_user_and_kind(app_state, fixture.user.uuid, CredentialKind::OAuth);
+        let decrypted_seed = decrypt_seed_v1(
+            &app_state.enclave_key,
+            &wrap.seed_enc,
+            fixture.user.uuid,
+            fixture.user.project_id,
+            CredentialKind::OAuth,
+            &auth_binding,
+        )
+        .expect("migrated OAuth wrap should decrypt");
+
+        assert_eq!(decrypted_seed, fixture.seed_words.as_bytes());
+    }
+
+    fn assert_legacy_seed_bytes_unchanged(
+        app_state: &Arc<AppState>,
+        user_uuid: Uuid,
+        expected_seed_enc: &[u8],
+    ) {
+        let user = User::get_by_uuid(&mut test_conn(app_state), user_uuid)
+            .expect("user lookup should not fail")
+            .expect("user should still exist");
+        assert_eq!(
+            user.seed_encrypted(),
+            Some(expected_seed_enc),
+            "translation must leave legacy users.seed_enc unchanged"
+        );
+    }
+
+    fn total_seed_wrap_count(app_state: &Arc<AppState>) -> i64 {
+        user_seed_wrappings::table
+            .count()
+            .get_result::<i64>(&mut test_conn(app_state))
+            .expect("seed wrap count should load")
+    }
+
+    fn seed_wrap_count_for_user_and_kind(
+        app_state: &Arc<AppState>,
+        user_uuid: Uuid,
+        credential_kind: CredentialKind,
+    ) -> i64 {
+        user_seed_wrappings::table
+            .filter(user_seed_wrappings::user_id.eq(user_uuid))
+            .filter(user_seed_wrappings::credential_kind.eq(credential_kind.as_str()))
+            .count()
+            .get_result::<i64>(&mut test_conn(app_state))
+            .expect("seed wrap count should load")
+    }
+
+    fn only_seed_wrap_for_user_and_kind(
+        app_state: &Arc<AppState>,
+        user_uuid: Uuid,
+        credential_kind: CredentialKind,
+    ) -> UserSeedWrapping {
+        let wraps = user_seed_wrappings::table
+            .filter(user_seed_wrappings::user_id.eq(user_uuid))
+            .filter(user_seed_wrappings::credential_kind.eq(credential_kind.as_str()))
+            .load::<UserSeedWrapping>(&mut test_conn(app_state))
+            .expect("seed wraps should load");
+        assert_eq!(wraps.len(), 1);
+        wraps.into_iter().next().expect("just asserted one wrap")
+    }
+
+    fn seed_wrap_snapshots(app_state: &Arc<AppState>) -> Vec<SeedWrapSnapshot> {
+        let mut snapshots = user_seed_wrappings::table
+            .load::<UserSeedWrapping>(&mut test_conn(app_state))
+            .expect("seed wraps should load")
+            .into_iter()
+            .map(|wrap| SeedWrapSnapshot {
+                user_id: wrap.user_id,
+                credential_kind: wrap.credential_kind,
+                credential_lookup_hash: wrap.credential_lookup_hash,
+                wrapping_version: wrap.wrapping_version,
+                seed_enc: wrap.seed_enc,
+            })
+            .collect::<Vec<_>>();
+
+        snapshots.sort_by(|left, right| {
+            (
+                left.user_id,
+                &left.credential_kind,
+                &left.credential_lookup_hash,
+                left.wrapping_version,
+            )
+                .cmp(&(
+                    right.user_id,
+                    &right.credential_kind,
+                    &right.credential_lookup_hash,
+                    right.wrapping_version,
+                ))
+        });
+        snapshots
+    }
+
+    fn migration_marker_exists(app_state: &Arc<AppState>) -> bool {
+        AppDataMigration::exists(&mut test_conn(app_state), AEAD_SEED_WRAPPINGS_MIGRATION)
+            .expect("migration marker lookup should not fail")
+    }
+
+    async fn overwrite_legacy_seed(
+        app_state: &Arc<AppState>,
+        user_uuid: Uuid,
+        plaintext_seed: &[u8],
+    ) {
+        let secret_key = SecretKey::from_slice(&app_state.enclave_key)
+            .expect("test enclave key should be valid");
+        let seed_enc = encrypt_with_key(&secret_key, plaintext_seed).await;
+        let updated_rows = diesel::update(users::table)
+            .filter(users::uuid.eq(user_uuid))
+            .set(users::seed_enc.eq(Some(seed_enc)))
+            .execute(&mut test_conn(app_state))
+            .expect("legacy seed tamper should update");
+        assert_eq!(updated_rows, 1);
+    }
+
+    fn delete_test_users(app_state: &Arc<AppState>, users: &[&User]) {
+        for user in users {
+            app_state
+                .db
+                .delete_user(user)
+                .expect("test user cleanup should delete");
+        }
+    }
+
+    fn delete_translation_marker(app_state: &Arc<AppState>) {
+        diesel::delete(
+            app_data_migrations::table
+                .filter(app_data_migrations::name.eq(AEAD_SEED_WRAPPINGS_MIGRATION)),
+        )
+        .execute(&mut test_conn(app_state))
+        .expect("translation marker cleanup should delete");
+    }
+
+    fn test_conn(
+        app_state: &Arc<AppState>,
+    ) -> diesel::r2d2::PooledConnection<diesel::r2d2::ConnectionManager<PgConnection>> {
+        app_state
+            .db
+            .get_pool()
+            .get()
+            .expect("test database connection should be available")
+    }
+}

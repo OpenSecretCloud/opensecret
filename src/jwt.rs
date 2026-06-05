@@ -817,19 +817,24 @@ mod tests {
     }
 
     #[test]
-    fn auth_context_rejects_legacy_claim_shape() {
-        let claims = CustomClaims {
-            sub: Uuid::nil().to_string(),
-            aud: Some(USER_ACCESS.to_string()),
-            azp: None,
-            role: None,
-            token_format: None,
-            auth_method: None,
-            project_id: None,
-            auth_binding: None,
-        };
+    fn auth_context_rejects_legacy_user_access_and_refresh_claim_shapes() {
+        for audience in [USER_ACCESS, USER_REFRESH] {
+            let claims = CustomClaims {
+                sub: Uuid::nil().to_string(),
+                aud: Some(audience.to_string()),
+                azp: None,
+                role: None,
+                token_format: None,
+                auth_method: None,
+                project_id: None,
+                auth_binding: None,
+            };
 
-        assert!(AuthContext::from_claims(&claims).is_err());
+            assert!(
+                AuthContext::from_claims(&claims).is_err(),
+                "legacy {audience} claims without auth context must be rejected"
+            );
+        }
     }
 
     #[test]

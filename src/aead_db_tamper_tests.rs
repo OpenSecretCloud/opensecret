@@ -2,6 +2,7 @@ use crate::{
     db::setup_db,
     encrypt::encrypt_with_key,
     models::{
+        oauth::NewUserOAuthConnection,
         org_projects::OrgProject,
         schema::org_projects,
         user_seed_wrappings::NewUserSeedWrapping,
@@ -147,6 +148,68 @@ async fn db_password_verifier_substitution_fails_before_issuing_victim_session()
     let _ = app_state.db.delete_user(&attacker);
 }
 
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_oauth_seed_wrap_substitution_fails_for_attacker_provider_subject() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let victim_email = format!("aead-oauth-tamper-victim-{marker}@example.com");
+    let attacker_email = format!("aead-oauth-tamper-attacker-{marker}@example.com");
+    let victim_provider_subject = format!("victim-google-sub-{marker}");
+    let attacker_provider_subject = format!("attacker-google-sub-{marker}");
+
+    let victim = create_oauth_wrapped_user(
+        &app_state,
+        project.id,
+        victim_email,
+        "google",
+        victim_provider_subject,
+    )
+    .await;
+    let attacker = create_oauth_wrapped_user(
+        &app_state,
+        project.id,
+        attacker_email,
+        "google",
+        attacker_provider_subject.clone(),
+    )
+    .await;
+
+    let attacker_auth_context = app_state
+        .oauth_auth_context_for_user(&attacker, "google", &attacker_provider_subject)
+        .expect("attacker OAuth auth context should compute");
+    app_state
+        .verify_seed_wrap_for_auth_context(&attacker, &attacker_auth_context)
+        .expect("untampered attacker OAuth wrap should verify");
+
+    copy_victim_seed_wrap_ciphertext_to_attacker_for_kind(
+        &app_state,
+        &victim,
+        &attacker,
+        CredentialKind::OAuth,
+    );
+
+    let attacker_unwrap_after_tamper =
+        app_state.verify_seed_wrap_for_auth_context(&attacker, &attacker_auth_context);
+
+    assert!(
+        matches!(
+            attacker_unwrap_after_tamper,
+            Err(Error::AuthenticationError)
+        ),
+        "copied victim OAuth seed wrap must not unwrap for attacker provider subject"
+    );
+
+    let _ = app_state.db.delete_user(&victim);
+    let _ = app_state.db.delete_user(&attacker);
+}
+
 async fn build_local_test_app_state(database_url: String) -> AppState {
     let db = setup_db(database_url);
     AppStateBuilder::default()
@@ -208,6 +271,56 @@ async fn create_password_wrapped_user(
     user
 }
 
+async fn create_oauth_wrapped_user(
+    app_state: &AppState,
+    project_id: i32,
+    email: String,
+    provider_name: &str,
+    provider_user_id: String,
+) -> User {
+    let secret_key =
+        SecretKey::from_slice(&app_state.enclave_key).expect("test enclave key should be valid");
+    let user_seed_words = generate_twelve_word_seed(app_state.aws_credential_manager.clone())
+        .await
+        .expect("test seed should generate")
+        .to_string();
+    let legacy_seed_enc = encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
+
+    let user = app_state
+        .db
+        .create_user(NewUser::new(Some(email), None, project_id, legacy_seed_enc))
+        .expect("test OAuth user should insert");
+
+    let provider = app_state
+        .db
+        .get_oauth_provider_by_name(provider_name)
+        .expect("test OAuth provider lookup should succeed")
+        .expect("test OAuth provider should exist after AppState build");
+
+    app_state
+        .db
+        .create_user_oauth_connection(NewUserOAuthConnection {
+            user_id: user.uuid,
+            provider_id: provider.id,
+            provider_user_id: provider_user_id.clone(),
+            access_token_enc: Vec::new(),
+            refresh_token_enc: None,
+            expires_at: None,
+        })
+        .expect("test OAuth connection should insert");
+
+    app_state
+        .create_oauth_seed_wrap_for_user(
+            &user,
+            provider_name,
+            &provider_user_id,
+            user_seed_words.as_bytes(),
+        )
+        .expect("test OAuth seed wrap should insert");
+
+    user
+}
+
 fn copy_attacker_password_verifier_to_victim(app_state: &AppState, attacker: &User, victim: &User) {
     let conn = &mut app_state
         .db
@@ -225,26 +338,40 @@ fn copy_victim_seed_wrap_ciphertext_to_attacker(
     victim: &User,
     attacker: &User,
 ) {
+    copy_victim_seed_wrap_ciphertext_to_attacker_for_kind(
+        app_state,
+        victim,
+        attacker,
+        CredentialKind::Password,
+    );
+}
+
+fn copy_victim_seed_wrap_ciphertext_to_attacker_for_kind(
+    app_state: &AppState,
+    victim: &User,
+    attacker: &User,
+    credential_kind: CredentialKind,
+) {
     let victim_wrap = app_state
         .db
-        .get_user_seed_wrappings_for_user_and_kind(victim.uuid, CredentialKind::Password.as_str())
+        .get_user_seed_wrappings_for_user_and_kind(victim.uuid, credential_kind.as_str())
         .expect("victim seed wraps should load")
         .into_iter()
         .next()
-        .expect("victim password wrap should exist");
+        .expect("victim credential wrap should exist");
     let attacker_wrap = app_state
         .db
-        .get_user_seed_wrappings_for_user_and_kind(attacker.uuid, CredentialKind::Password.as_str())
+        .get_user_seed_wrappings_for_user_and_kind(attacker.uuid, credential_kind.as_str())
         .expect("attacker seed wraps should load")
         .into_iter()
         .next()
-        .expect("attacker password wrap should exist");
+        .expect("attacker credential wrap should exist");
 
     app_state
         .db
         .upsert_user_seed_wrapping(NewUserSeedWrapping::new(
             attacker.uuid,
-            CredentialKind::Password.as_str(),
+            credential_kind.as_str(),
             attacker_wrap.credential_lookup_hash,
             attacker_wrap.wrapping_version,
             victim_wrap.seed_enc,

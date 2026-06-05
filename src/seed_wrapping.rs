@@ -52,6 +52,14 @@ impl PasswordLoginIdentifierKind {
     }
 }
 
+pub fn normalize_email_login_identifier(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
+pub fn normalize_guest_login_identifier(user_uuid: Uuid) -> String {
+    user_uuid.to_string()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthBinding([u8; 32]);
 
@@ -294,17 +302,30 @@ mod tests {
     #[test]
     fn guest_password_auth_binding_uses_guest_identifier_kind() {
         let email_binding = password_binding();
+        let guest_identifier = normalize_guest_login_identifier(USER_UUID);
         let guest_binding = compute_password_auth_binding(
             &ROOT_KEY,
             PROJECT_ID,
             USER_UUID,
             PasswordLoginIdentifierKind::GuestUuid,
-            USER_UUID.to_string().as_str(),
+            &guest_identifier,
             PASSWORD_VERIFIER,
         )
         .unwrap();
 
         assert_ne!(email_binding, guest_binding);
+    }
+
+    #[test]
+    fn login_identifier_normalization_is_deterministic() {
+        assert_eq!(
+            normalize_email_login_identifier("  Alice@Example.COM "),
+            "alice@example.com"
+        );
+        assert_eq!(
+            normalize_guest_login_identifier(USER_UUID),
+            "2f4f7d9c-1cf8-4c0c-8c1a-5e9b3e8bde12"
+        );
     }
 
     #[test]

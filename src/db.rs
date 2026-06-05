@@ -1,6 +1,9 @@
 use crate::models::account_deletion::{
     AccountDeletionError, AccountDeletionRequest, NewAccountDeletionRequest,
 };
+use crate::models::app_data_migrations::{
+    AppDataMigration, AppDataMigrationError, NewAppDataMigration,
+};
 use crate::models::enclave_secrets::{EnclaveSecret, EnclaveSecretError, NewEnclaveSecret};
 use crate::models::invite_codes::{InviteCode, InviteCodeError, NewInviteCode};
 use crate::models::oauth::{
@@ -37,6 +40,9 @@ use crate::models::responses::{
 };
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
 use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
+use crate::models::user_seed_wrappings::{
+    NewUserSeedWrapping, UserSeedWrapping, UserSeedWrappingError,
+};
 use crate::models::users::{NewUser, User, UserError};
 use crate::models::{
     email_verification::{EmailVerification, EmailVerificationError, NewEmailVerification},
@@ -128,6 +134,10 @@ pub enum DBError {
     ProjectSettingNotFound,
     #[error("Responses API error: {0}")]
     ResponsesError(#[from] crate::models::responses::ResponsesError),
+    #[error("User seed wrapping error: {0}")]
+    UserSeedWrappingError(#[from] UserSeedWrappingError),
+    #[error("App data migration error: {0}")]
+    AppDataMigrationError(#[from] AppDataMigrationError),
 }
 
 #[allow(dead_code)]
@@ -136,6 +146,38 @@ pub trait DBConnection {
     fn get_user_by_uuid(&self, uuid: Uuid) -> Result<User, DBError>;
     fn get_user_by_email(&self, email: String, project_id: i32) -> Result<User, DBError>;
     fn set_user_key(&self, user: User, private_key: Vec<u8>) -> Result<(), DBError>;
+    fn create_user_seed_wrapping(
+        &self,
+        new_wrapping: NewUserSeedWrapping,
+    ) -> Result<UserSeedWrapping, DBError>;
+    fn upsert_user_seed_wrapping(
+        &self,
+        new_wrapping: NewUserSeedWrapping,
+    ) -> Result<UserSeedWrapping, DBError>;
+    fn get_user_seed_wrappings_for_user_and_kind(
+        &self,
+        user_id: Uuid,
+        credential_kind: &str,
+    ) -> Result<Vec<UserSeedWrapping>, DBError>;
+    fn get_user_seed_wrapping_by_credential(
+        &self,
+        user_id: Uuid,
+        credential_kind: &str,
+        credential_lookup_hash: &[u8],
+        wrapping_version: i16,
+    ) -> Result<Option<UserSeedWrapping>, DBError>;
+    fn delete_user_seed_wrappings_for_user(&self, user_id: Uuid) -> Result<usize, DBError>;
+    fn delete_user_seed_wrappings_for_user_and_kind(
+        &self,
+        user_id: Uuid,
+        credential_kind: &str,
+    ) -> Result<usize, DBError>;
+    fn get_app_data_migration(&self, name: &str) -> Result<Option<AppDataMigration>, DBError>;
+    fn app_data_migration_exists(&self, name: &str) -> Result<bool, DBError>;
+    fn create_app_data_migration(
+        &self,
+        new_migration: NewAppDataMigration,
+    ) -> Result<AppDataMigration, DBError>;
     fn get_pool(&self) -> &diesel::r2d2::Pool<diesel::r2d2::ConnectionManager<PgConnection>>;
     fn create_enclave_secret(&self, new_secret: NewEnclaveSecret)
         -> Result<EnclaveSecret, DBError>;
@@ -719,6 +761,85 @@ impl DBConnection for PostgresConnection {
             error!("Failed to set user key: {:?}", e);
         }
         result
+    }
+
+    fn create_user_seed_wrapping(
+        &self,
+        new_wrapping: NewUserSeedWrapping,
+    ) -> Result<UserSeedWrapping, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_wrapping.insert(conn).map_err(DBError::from)
+    }
+
+    fn upsert_user_seed_wrapping(
+        &self,
+        new_wrapping: NewUserSeedWrapping,
+    ) -> Result<UserSeedWrapping, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_wrapping
+            .upsert_by_credential(conn)
+            .map_err(DBError::from)
+    }
+
+    fn get_user_seed_wrappings_for_user_and_kind(
+        &self,
+        user_id: Uuid,
+        credential_kind: &str,
+    ) -> Result<Vec<UserSeedWrapping>, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserSeedWrapping::get_for_user_and_kind(conn, user_id, credential_kind)
+            .map_err(DBError::from)
+    }
+
+    fn get_user_seed_wrapping_by_credential(
+        &self,
+        user_id: Uuid,
+        credential_kind: &str,
+        credential_lookup_hash: &[u8],
+        wrapping_version: i16,
+    ) -> Result<Option<UserSeedWrapping>, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserSeedWrapping::get_by_credential(
+            conn,
+            user_id,
+            credential_kind,
+            credential_lookup_hash,
+            wrapping_version,
+        )
+        .map_err(DBError::from)
+    }
+
+    fn delete_user_seed_wrappings_for_user(&self, user_id: Uuid) -> Result<usize, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserSeedWrapping::delete_for_user(conn, user_id).map_err(DBError::from)
+    }
+
+    fn delete_user_seed_wrappings_for_user_and_kind(
+        &self,
+        user_id: Uuid,
+        credential_kind: &str,
+    ) -> Result<usize, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserSeedWrapping::delete_for_user_and_kind(conn, user_id, credential_kind)
+            .map_err(DBError::from)
+    }
+
+    fn get_app_data_migration(&self, name: &str) -> Result<Option<AppDataMigration>, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        AppDataMigration::get(conn, name).map_err(DBError::from)
+    }
+
+    fn app_data_migration_exists(&self, name: &str) -> Result<bool, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        AppDataMigration::exists(conn, name).map_err(DBError::from)
+    }
+
+    fn create_app_data_migration(
+        &self,
+        new_migration: NewAppDataMigration,
+    ) -> Result<AppDataMigration, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_migration.insert(conn).map_err(DBError::from)
     }
 
     fn get_pool(&self) -> &diesel::r2d2::Pool<diesel::r2d2::ConnectionManager<PgConnection>> {

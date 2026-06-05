@@ -62,6 +62,44 @@ fn openai_compatible_routes_do_not_request_user_storage_keys() {
 }
 
 #[test]
+fn openai_jwt_fallback_inserts_signed_auth_context_but_api_keys_do_not() {
+    let openai_auth_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/openai_auth.rs");
+    let contents =
+        fs::read_to_string(&openai_auth_source).expect("OpenAI auth source should be readable");
+    let middleware_body = extract_function_body(&contents, "pub async fn validate_openai_auth");
+
+    for required_pattern in [
+        "AuthContext::from_claims(&claims)",
+        "if user.project_id != auth_context.project_id",
+        "req.extensions_mut().insert(auth_context)",
+        "req.extensions_mut().insert(AuthMethod::Jwt)",
+    ] {
+        assert!(
+            middleware_body.contains(required_pattern),
+            "OpenAI JWT fallback must contain `{required_pattern}`"
+        );
+    }
+
+    let api_key_insert = "req.extensions_mut().insert(AuthMethod::ApiKey)";
+    let api_key_index = middleware_body
+        .find(api_key_insert)
+        .expect("OpenAI API-key branch should insert AuthMethod::ApiKey");
+    let jwt_auth_context_index = middleware_body
+        .find("AuthContext::from_claims(&claims)")
+        .expect("OpenAI JWT fallback should parse AuthContext from claims");
+    assert!(
+        api_key_index < jwt_auth_context_index,
+        "OpenAI API-key branch should return before JWT AuthContext parsing"
+    );
+
+    let api_key_branch = &middleware_body[..jwt_auth_context_index];
+    assert!(
+        !api_key_branch.contains("insert(auth_context)"),
+        "OpenAI API-key auth must not synthesize or insert AuthContext without API-key-bound seed wraps"
+    );
+}
+
+#[test]
 fn refresh_route_preserves_signed_auth_context_without_recomputing_binding() {
     let login_routes = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/login_routes.rs");
     let contents =

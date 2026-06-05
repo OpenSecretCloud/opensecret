@@ -11,11 +11,13 @@ type HmacSha256 = Hmac<Sha256>;
 
 const AUTH_BINDING_MAC_INFO: &[u8] = b"os.auth-binding-mac.v1";
 const CREDENTIAL_LOOKUP_MAC_INFO: &[u8] = b"os.credential-lookup-mac.v1";
+const PASSWORD_RESET_CODE_MAC_INFO: &[u8] = b"os.password-reset-code-mac.v1";
 const SEED_WRAP_ROOT_INFO: &[u8] = b"os.seed-wrap-root.v1";
 const SEED_WRAP_AEAD_KEY_INFO: &[u8] = b"os.seed-wrap-aead-key.v1";
 
 const PASSWORD_AUTH_BINDING_DOMAIN: &str = "os.password-auth-binding.v1";
 const PASSWORD_LOOKUP_DOMAIN: &str = "os.password-lookup.v1";
+const PASSWORD_RESET_CODE_DOMAIN: &str = "os.password-reset-code.v1";
 const OAUTH_AUTH_BINDING_DOMAIN: &str = "os.oauth-auth-binding.v1";
 const OAUTH_LOOKUP_DOMAIN: &str = "os.oauth-lookup.v1";
 const SEED_WRAP_DOMAIN: &str = "os.seed-wrap.v1";
@@ -160,6 +162,21 @@ pub fn oauth_credential_lookup_hash(
         CREDENTIAL_LOOKUP_MAC_INFO,
         &facts.into_bytes(),
     )?))
+}
+
+pub fn password_reset_code_mac(
+    root_key: &[u8],
+    project_id: i32,
+    user_uuid: Uuid,
+    alphanumeric_code: &str,
+) -> Result<[u8; 32], EncryptError> {
+    let mut facts = CanonicalBytes::new(PASSWORD_RESET_CODE_DOMAIN);
+    facts
+        .append_i32(project_id)
+        .append_uuid(user_uuid)
+        .append_str(alphanumeric_code);
+
+    hmac_with_root_domain_key(root_key, PASSWORD_RESET_CODE_MAC_INFO, &facts.into_bytes())
 }
 
 pub fn encrypt_seed_v1(
@@ -361,6 +378,23 @@ mod tests {
         .unwrap();
 
         assert_ne!(google_lookup, github_lookup);
+    }
+
+    #[test]
+    fn password_reset_code_mac_is_bound_to_user_and_project() {
+        let base = password_reset_code_mac(&ROOT_KEY, PROJECT_ID, USER_UUID, "ABC12345").unwrap();
+        let other_user = password_reset_code_mac(
+            &ROOT_KEY,
+            PROJECT_ID,
+            Uuid::from_u128(0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb),
+            "ABC12345",
+        )
+        .unwrap();
+        let other_project =
+            password_reset_code_mac(&ROOT_KEY, PROJECT_ID + 1, USER_UUID, "ABC12345").unwrap();
+
+        assert_ne!(base, other_user);
+        assert_ne!(base, other_project);
     }
 
     #[test]

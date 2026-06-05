@@ -49,11 +49,11 @@ use crate::models::{
     org_memberships::OrgRole,
 };
 use chrono::{DateTime, Utc};
-use diesel::Connection;
 use diesel::{
     pg::PgConnection,
     r2d2::{ConnectionManager, Pool},
 };
+use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl};
 use std::sync::Arc;
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -208,14 +208,23 @@ pub trait DBConnection {
         user_id: Uuid,
         encrypted_code: Vec<u8>,
     ) -> Result<Option<PasswordResetRequest>, DBError>;
-    fn update_user_password(
+    fn update_user_password_and_seed_wrap(
         &self,
         user: &User,
-        new_password_enc: Option<Vec<u8>>,
+        new_password_enc: Vec<u8>,
+        new_wrapping: NewUserSeedWrapping,
     ) -> Result<(), DBError>;
     fn mark_password_reset_as_complete(
         &self,
         request: &PasswordResetRequest,
+    ) -> Result<(), DBError>;
+    fn complete_destructive_password_reset(
+        &self,
+        user: &User,
+        reset_request: &PasswordResetRequest,
+        new_password_enc: Vec<u8>,
+        new_legacy_seed_enc: Vec<u8>,
+        new_wrapping: NewUserSeedWrapping,
     ) -> Result<(), DBError>;
 
     // Account Deletion methods
@@ -960,20 +969,19 @@ impl DBConnection for PostgresConnection {
         result
     }
 
-    fn update_user_password(
+    fn update_user_password_and_seed_wrap(
         &self,
         user: &User,
-        new_password_enc: Option<Vec<u8>>,
+        new_password_enc: Vec<u8>,
+        new_wrapping: NewUserSeedWrapping,
     ) -> Result<(), DBError> {
-        debug!("Updating user password");
+        debug!("Updating user password and password seed wrap");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        let result = user
-            .update_password(conn, new_password_enc)
-            .map_err(DBError::from);
-        if let Err(ref e) = result {
-            error!("Failed to update user password: {:?}", e);
-        }
-        result
+        conn.transaction::<_, DBError, _>(|conn| {
+            user.update_password(conn, Some(new_password_enc))?;
+            new_wrapping.upsert_by_credential(conn)?;
+            Ok(())
+        })
     }
 
     fn mark_password_reset_as_complete(
@@ -987,6 +995,74 @@ impl DBConnection for PostgresConnection {
             error!("Failed to mark password reset request as complete: {:?}", e);
         }
         result
+    }
+
+    fn complete_destructive_password_reset(
+        &self,
+        user: &User,
+        reset_request: &PasswordResetRequest,
+        new_password_enc: Vec<u8>,
+        new_legacy_seed_enc: Vec<u8>,
+        new_wrapping: NewUserSeedWrapping,
+    ) -> Result<(), DBError> {
+        use crate::models::schema::{
+            agent_schedule_runs, agent_schedules, agents, conversation_projects, conversations,
+            memory_blocks, notification_events, push_devices, user_embeddings, user_instructions,
+            user_kv, user_preferences, user_seed_wrappings, users,
+        };
+
+        debug!("Completing destructive password reset");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        conn.transaction::<_, DBError, _>(|conn| {
+            let user_id = user.uuid;
+
+            diesel::delete(
+                user_seed_wrappings::table.filter(user_seed_wrappings::user_id.eq(user_id)),
+            )
+            .execute(conn)?;
+            diesel::delete(user_embeddings::table.filter(user_embeddings::user_id.eq(user_id)))
+                .execute(conn)?;
+            diesel::delete(
+                agent_schedule_runs::table.filter(agent_schedule_runs::user_id.eq(user_id)),
+            )
+            .execute(conn)?;
+            diesel::delete(agent_schedules::table.filter(agent_schedules::user_id.eq(user_id)))
+                .execute(conn)?;
+            diesel::delete(agents::table.filter(agents::user_id.eq(user_id))).execute(conn)?;
+            diesel::delete(
+                notification_events::table.filter(notification_events::user_id.eq(user_id)),
+            )
+            .execute(conn)?;
+            diesel::delete(push_devices::table.filter(push_devices::user_id.eq(user_id)))
+                .execute(conn)?;
+            diesel::delete(memory_blocks::table.filter(memory_blocks::user_id.eq(user_id)))
+                .execute(conn)?;
+            diesel::delete(user_preferences::table.filter(user_preferences::user_id.eq(user_id)))
+                .execute(conn)?;
+            diesel::delete(user_kv::table.filter(user_kv::user_id.eq(user_id))).execute(conn)?;
+            diesel::delete(user_instructions::table.filter(user_instructions::user_id.eq(user_id)))
+                .execute(conn)?;
+            diesel::delete(
+                conversation_projects::table.filter(conversation_projects::user_id.eq(user_id)),
+            )
+            .execute(conn)?;
+            diesel::delete(conversations::table.filter(conversations::user_id.eq(user_id)))
+                .execute(conn)?;
+
+            diesel::update(users::table.filter(users::uuid.eq(user_id)))
+                .set((
+                    users::password_enc.eq(Some(new_password_enc)),
+                    users::seed_enc.eq(Some(new_legacy_seed_enc)),
+                    users::updated_at.eq(diesel::dsl::now),
+                ))
+                .execute(conn)?;
+
+            new_wrapping.upsert_by_credential(conn)?;
+            reset_request.mark_as_reset(conn)?;
+
+            Ok(())
+        })
     }
 
     // OAuth Provider method implementations

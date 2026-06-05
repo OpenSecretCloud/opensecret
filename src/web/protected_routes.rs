@@ -843,7 +843,11 @@ pub async fn change_password(
         Ok(Some(authenticated_user)) if authenticated_user.user.uuid == user.uuid => {
             // Current password is correct, proceed with password change
             match data
-                .update_user_password(&user, change_request.new_password)
+                .update_user_password_and_seed_wrap(
+                    &user,
+                    &authenticated_user.auth_context,
+                    change_request.new_password,
+                )
                 .await
             {
                 Ok(()) => {

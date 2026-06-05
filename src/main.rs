@@ -29,8 +29,8 @@ use crate::models::user_seed_wrappings::NewUserSeedWrapping;
 use crate::seed_wrapping::{
     compute_oauth_auth_binding, compute_password_auth_binding, decrypt_seed_v1, encrypt_seed_v1,
     normalize_email_login_identifier, normalize_guest_login_identifier,
-    oauth_credential_lookup_hash, password_credential_lookup_hash, AuthBinding, CredentialKind,
-    PasswordLoginIdentifierKind, SEED_WRAP_VERSION_V1,
+    oauth_credential_lookup_hash, password_credential_lookup_hash, password_reset_code_mac,
+    AuthBinding, CredentialKind, PasswordLoginIdentifierKind, SEED_WRAP_VERSION_V1,
 };
 use crate::{
     aws_credentials::AwsCredentialError,
@@ -874,12 +874,12 @@ impl AppState {
             .map(|_| ())
     }
 
-    fn create_password_seed_wrap_for_user(
+    fn new_password_seed_wrapping_for_user(
         &self,
         user: &User,
         decrypted_password_verifier: &str,
         plaintext_seed: &[u8],
-    ) -> Result<(), Error> {
+    ) -> Result<NewUserSeedWrapping, Error> {
         let auth_binding =
             self.password_auth_binding_for_user(user, decrypted_password_verifier)?;
 
@@ -897,13 +897,26 @@ impl AppState {
         )
         .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
-        let new_wrapping = NewUserSeedWrapping::new(
+        Ok(NewUserSeedWrapping::new(
             user.uuid,
             CredentialKind::Password.as_str(),
             credential_lookup_hash.as_bytes().to_vec(),
             SEED_WRAP_VERSION_V1,
             seed_enc,
-        );
+        ))
+    }
+
+    fn create_password_seed_wrap_for_user(
+        &self,
+        user: &User,
+        decrypted_password_verifier: &str,
+        plaintext_seed: &[u8],
+    ) -> Result<(), Error> {
+        let new_wrapping = self.new_password_seed_wrapping_for_user(
+            user,
+            decrypted_password_verifier,
+            plaintext_seed,
+        )?;
 
         self.db.upsert_user_seed_wrapping(new_wrapping)?;
         Ok(())
@@ -1346,15 +1359,18 @@ impl AppState {
                 // Only proceed with email if user has one
                 if user.get_email().is_some() {
                     // User exists, proceed with the actual reset request
-                    let secret_key = SecretKey::from_slice(&self.enclave_key)
-                        .map_err(|e| Error::EncryptionError(e.to_string()))?;
-                    let encrypted_code =
-                        encrypt_key_deterministic(&secret_key, alphanumeric_code.as_bytes());
+                    let reset_code_mac = password_reset_code_mac(
+                        &self.enclave_key,
+                        project_id,
+                        user.uuid,
+                        &alphanumeric_code,
+                    )
+                    .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
                     let new_request = NewPasswordResetRequest::new(
                         user.uuid,
                         hashed_secret,
-                        encrypted_code,
+                        reset_code_mac.to_vec(),
                         24, // 24 hours expiration
                     );
 
@@ -1404,14 +1420,16 @@ impl AppState {
             return Err(Error::UserNotFound);
         }
 
-        // Deterministically encrypt the provided alphanumeric code for lookup
+        // MAC the provided alphanumeric code for lookup, bound to this user/project.
         let secret_key = SecretKey::from_slice(&self.enclave_key)
             .map_err(|e| Error::EncryptionError(e.to_string()))?;
-        let encrypted_code = encrypt_key_deterministic(&secret_key, alphanumeric_code.as_bytes());
+        let reset_code_mac =
+            password_reset_code_mac(&self.enclave_key, project_id, user.uuid, &alphanumeric_code)
+                .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
         let reset_request = self
             .db
-            .get_password_reset_request_by_user_id_and_code(user.uuid, encrypted_code)?;
+            .get_password_reset_request_by_user_id_and_code(user.uuid, reset_code_mac.to_vec())?;
 
         if let Some(reset_request) = reset_request {
             if reset_request.is_expired() {
@@ -1428,9 +1446,27 @@ impl AppState {
                 .ct_eq(reset_request.hashed_secret.as_bytes())
                 .into()
             {
-                // Password verification succeeded, continue with reset
-                self.update_user_password(&user, new_password).await?;
-                self.db.mark_password_reset_as_complete(&reset_request)?;
+                let user_seed_words =
+                    generate_twelve_word_seed(self.aws_credential_manager.clone())
+                        .await?
+                        .to_string();
+                let legacy_seed_enc =
+                    encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
+                let (password_hash, encrypted_password) =
+                    self.encrypt_user_password_verifier(new_password).await?;
+                let new_wrapping = self.new_password_seed_wrapping_for_user(
+                    &user,
+                    &password_hash,
+                    user_seed_words.as_bytes(),
+                )?;
+
+                self.db.complete_destructive_password_reset(
+                    &user,
+                    &reset_request,
+                    encrypted_password,
+                    legacy_seed_enc,
+                    new_wrapping,
+                )?;
 
                 // Send confirmation email in the background
                 let app_state = self.clone();
@@ -1636,23 +1672,32 @@ impl AppState {
         }
     }
 
-    pub async fn update_user_password(
+    async fn update_user_password_and_seed_wrap(
         &self,
         user: &User,
+        auth_context: &AuthContext,
         new_password: String,
     ) -> Result<(), Error> {
-        // Hash the new password
-        let password_hash = password_auth::generate_hash(new_password);
+        let plaintext_seed = self.decrypt_seed_for_auth_context(user, auth_context)?;
+        let (password_hash, encrypted_password) =
+            self.encrypt_user_password_verifier(new_password).await?;
+        let new_wrapping =
+            self.new_password_seed_wrapping_for_user(user, &password_hash, &plaintext_seed)?;
 
-        // Encrypt the hashed password
+        self.db
+            .update_user_password_and_seed_wrap(user, encrypted_password, new_wrapping)
+            .map_err(Error::from)
+    }
+
+    async fn encrypt_user_password_verifier(
+        &self,
+        new_password: String,
+    ) -> Result<(String, Vec<u8>), Error> {
+        let password_hash = password_auth::generate_hash(new_password);
         let secret_key = SecretKey::from_slice(&self.enclave_key)
             .map_err(|e| Error::EncryptionError(e.to_string()))?;
         let encrypted_password = encrypt_with_key(&secret_key, password_hash.as_bytes()).await;
-
-        // Update the user's password
-        self.db
-            .update_user_password(user, Some(encrypted_password))
-            .map_err(Error::from)
+        Ok((password_hash, encrypted_password))
     }
 
     pub async fn update_platform_user_password(

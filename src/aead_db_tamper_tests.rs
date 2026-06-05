@@ -1,15 +1,17 @@
 use crate::{
     db::setup_db,
     encrypt::encrypt_with_key,
+    generate_reset_hash,
     models::{
         oauth::NewUserOAuthConnection,
         org_projects::OrgProject,
-        schema::{org_projects, user_oauth_connections},
+        password_reset::NewPasswordResetRequest,
+        schema::{org_projects, user_oauth_connections, users},
         user_seed_wrappings::NewUserSeedWrapping,
         users::{NewUser, User},
     },
     private_key::generate_twelve_word_seed,
-    seed_wrapping::CredentialKind,
+    seed_wrapping::{password_reset_code_mac, CredentialKind},
     AppMode, AppState, AppStateBuilder, Error,
 };
 use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
@@ -142,6 +144,84 @@ async fn db_password_verifier_substitution_fails_before_issuing_victim_session()
             Err(Error::AuthenticationError)
         ),
         "copied attacker password verifier must not produce a victim session"
+    );
+
+    let _ = app_state.db.delete_user(&victim);
+    let _ = app_state.db.delete_user(&attacker);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_legacy_seed_substitution_does_not_change_authenticated_attacker_key() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let victim_email = format!("aead-legacy-seed-victim-{marker}@example.com");
+    let attacker_email = format!("aead-legacy-seed-attacker-{marker}@example.com");
+    let victim_password = "victim-password-before-legacy-seed-tamper";
+    let attacker_password = "attacker-password-before-legacy-seed-tamper";
+
+    let victim =
+        create_password_wrapped_user(&app_state, project.id, victim_email, victim_password).await;
+    let attacker = create_password_wrapped_user(
+        &app_state,
+        project.id,
+        attacker_email.clone(),
+        attacker_password,
+    )
+    .await;
+
+    let attacker_login_before_tamper = app_state
+        .authenticate_user(
+            Some(attacker_email.clone()),
+            None,
+            attacker_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("untampered attacker login should not error")
+        .expect("untampered attacker login should verify and unwrap");
+    let attacker_key_before = app_state
+        .get_user_key(
+            &attacker_login_before_tamper.user,
+            &attacker_login_before_tamper.auth_context,
+            None,
+            None,
+        )
+        .await
+        .expect("untampered attacker key should derive");
+
+    copy_victim_legacy_seed_to_attacker(&app_state, &victim, &attacker);
+
+    let attacker_login_after_tamper = app_state
+        .authenticate_user(
+            Some(attacker_email),
+            None,
+            attacker_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("legacy seed tamper should not make attacker login error")
+        .expect("attacker password login should still verify against attacker wrap");
+    let attacker_key_after = app_state
+        .get_user_key(
+            &attacker_login_after_tamper.user,
+            &attacker_login_after_tamper.auth_context,
+            None,
+            None,
+        )
+        .await
+        .expect("attacker key should still derive from authenticated seed wrap");
+
+    assert_eq!(
+        attacker_key_before.secret_bytes(),
+        attacker_key_after.secret_bytes(),
+        "copied legacy users.seed_enc must not affect authenticated attacker seed unwrap"
     );
 
     let _ = app_state.db.delete_user(&victim);
@@ -287,6 +367,81 @@ async fn db_oauth_connection_remap_fails_before_victim_seed_unwrap() {
     let _ = app_state.db.delete_user(&attacker);
 }
 
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_copied_password_reset_row_mac_fails_for_victim() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let victim_email = format!("aead-reset-tamper-victim-{marker}@example.com");
+    let attacker_email = format!("aead-reset-tamper-attacker-{marker}@example.com");
+    let victim_password = "victim-password-before-reset-row-tamper";
+    let attacker_password = "attacker-password-before-reset-row-tamper";
+    let reset_code = "R3S3T123";
+    let reset_secret = format!("reset-secret-{marker}");
+    let attempted_new_password = "attacker-reset-row-new-password";
+
+    let victim = create_password_wrapped_user(
+        &app_state,
+        project.id,
+        victim_email.clone(),
+        victim_password,
+    )
+    .await;
+    let attacker =
+        create_password_wrapped_user(&app_state, project.id, attacker_email, attacker_password)
+            .await;
+
+    insert_copied_attacker_reset_request_for_victim(
+        &app_state,
+        project.id,
+        &attacker,
+        &victim,
+        reset_code,
+        &reset_secret,
+    );
+
+    let victim_reset_after_row_copy = app_state
+        .confirm_password_reset(
+            victim_email.clone(),
+            reset_code.to_string(),
+            reset_secret.clone(),
+            attempted_new_password.to_string(),
+            project.id,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            victim_reset_after_row_copy,
+            Err(Error::InvalidPasswordResetRequest)
+        ),
+        "victim reset must not find a row containing an attacker-bound reset-code MAC"
+    );
+
+    let victim_login_after_failed_reset = app_state
+        .authenticate_user(
+            Some(victim_email),
+            None,
+            victim_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("victim login after failed reset should not error");
+    assert!(
+        victim_login_after_failed_reset.is_some(),
+        "failed copied reset-row attempt must leave victim password usable"
+    );
+
+    let _ = app_state.db.delete_user(&victim);
+    let _ = app_state.db.delete_user(&attacker);
+}
+
 async fn build_local_test_app_state(database_url: String) -> AppState {
     let db = setup_db(database_url);
     AppStateBuilder::default()
@@ -410,6 +565,29 @@ fn copy_attacker_password_verifier_to_victim(app_state: &AppState, attacker: &Us
         .expect("tampered victim password verifier should update");
 }
 
+fn copy_victim_legacy_seed_to_attacker(app_state: &AppState, victim: &User, attacker: &User) {
+    let conn = &mut app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("test database connection should be available");
+    let victim_legacy_seed = victim
+        .seed_encrypted()
+        .expect("victim legacy seed should exist")
+        .to_vec();
+
+    let updated_rows = diesel::update(users::table)
+        .filter(users::uuid.eq(attacker.uuid))
+        .set(users::seed_enc.eq(Some(victim_legacy_seed)))
+        .execute(conn)
+        .expect("tampered attacker legacy seed should update");
+
+    assert_eq!(
+        updated_rows, 1,
+        "DB tamper precondition should update exactly one attacker user row"
+    );
+}
+
 fn remap_attacker_oauth_connection_to_victim(
     app_state: &AppState,
     attacker: &User,
@@ -433,6 +611,34 @@ fn remap_attacker_oauth_connection_to_victim(
         updated_rows, 1,
         "DB tamper precondition should move exactly one OAuth connection"
     );
+}
+
+fn insert_copied_attacker_reset_request_for_victim(
+    app_state: &AppState,
+    project_id: i32,
+    attacker: &User,
+    victim: &User,
+    reset_code: &str,
+    reset_secret: &str,
+) {
+    let attacker_reset_code_mac = password_reset_code_mac(
+        &app_state.enclave_key,
+        project_id,
+        attacker.uuid,
+        reset_code,
+    )
+    .expect("attacker reset-code MAC should compute");
+    let copied_request = NewPasswordResetRequest::new(
+        victim.uuid,
+        generate_reset_hash(reset_secret.to_string()),
+        attacker_reset_code_mac.to_vec(),
+        24,
+    );
+
+    app_state
+        .db
+        .create_password_reset_request(copied_request)
+        .expect("copied reset request row should insert");
 }
 
 fn copy_victim_seed_wrap_ciphertext_to_attacker(

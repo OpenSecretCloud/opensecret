@@ -27,7 +27,13 @@ use crate::{
     },
 };
 #[cfg(feature = "seed-wrap-translation")]
-use diesel::{pg::PgConnection, prelude::*, sql_query, sql_types::Text, Connection};
+use diesel::{
+    pg::PgConnection,
+    prelude::*,
+    sql_query,
+    sql_types::{BigInt, Integer, Text},
+    Connection, QueryableByName,
+};
 #[cfg(feature = "seed-wrap-translation")]
 use uuid::Uuid;
 
@@ -82,6 +88,15 @@ enum SeedWrapTranslationError {
         connection_id: i32,
         provider_id: i32,
     },
+    #[error(
+        "Duplicate OAuth provider subject for provider {provider_id}, subject {provider_user_id}, project {project_id}: {connection_count} connections"
+    )]
+    DuplicateOAuthSubject {
+        provider_id: i32,
+        provider_user_id: String,
+        project_id: i32,
+        connection_count: i64,
+    },
 }
 
 #[cfg(feature = "seed-wrap-translation")]
@@ -108,8 +123,30 @@ impl From<SeedWrapTranslationError> for Error {
             } => Error::EncryptionError(format!(
                 "OAuth connection {connection_id} references missing provider {provider_id}"
             )),
+            SeedWrapTranslationError::DuplicateOAuthSubject {
+                provider_id,
+                provider_user_id,
+                project_id,
+                connection_count,
+            } => Error::EncryptionError(format!(
+                "Duplicate OAuth provider subject for provider {provider_id}, subject {provider_user_id}, project {project_id}: {connection_count} connections"
+            )),
         }
     }
+}
+
+#[cfg(feature = "seed-wrap-translation")]
+#[derive(QueryableByName)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+struct DuplicateOAuthSubject {
+    #[diesel(sql_type = Integer)]
+    provider_id: i32,
+    #[diesel(sql_type = Text)]
+    provider_user_id: String,
+    #[diesel(sql_type = Integer)]
+    project_id: i32,
+    #[diesel(sql_type = BigInt)]
+    connection_count: i64,
 }
 
 #[cfg(feature = "seed-wrap-translation")]
@@ -133,6 +170,8 @@ fn migrate_aead_seed_wrappings_v1(app_state: &Arc<AppState>) -> Result<(), Error
             info!("AEAD seed wrapping translation already completed; skipping");
             return Ok(());
         }
+
+        validate_no_duplicate_oauth_subjects_by_project(conn)?;
 
         let all_users = users::table.order(users::id.asc()).load::<User>(conn)?;
         let mut expected_wraps = 0usize;
@@ -185,6 +224,41 @@ fn migrate_aead_seed_wrappings_v1(app_state: &Arc<AppState>) -> Result<(), Error
         Ok(())
     })
     .map_err(Error::from)
+}
+
+#[cfg(feature = "seed-wrap-translation")]
+fn validate_no_duplicate_oauth_subjects_by_project(
+    conn: &mut PgConnection,
+) -> Result<(), SeedWrapTranslationError> {
+    let duplicates = sql_query(
+        r#"
+        SELECT
+            user_oauth_connections.provider_id AS provider_id,
+            user_oauth_connections.provider_user_id AS provider_user_id,
+            users.project_id AS project_id,
+            COUNT(*)::BIGINT AS connection_count
+        FROM user_oauth_connections
+        INNER JOIN users ON users.uuid = user_oauth_connections.user_id
+        GROUP BY
+            user_oauth_connections.provider_id,
+            user_oauth_connections.provider_user_id,
+            users.project_id
+        HAVING COUNT(*) > 1
+        LIMIT 1
+        "#,
+    )
+    .load::<DuplicateOAuthSubject>(conn)?;
+
+    if let Some(duplicate) = duplicates.into_iter().next() {
+        return Err(SeedWrapTranslationError::DuplicateOAuthSubject {
+            provider_id: duplicate.provider_id,
+            provider_user_id: duplicate.provider_user_id,
+            project_id: duplicate.project_id,
+            connection_count: duplicate.connection_count,
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "seed-wrap-translation")]

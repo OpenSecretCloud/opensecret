@@ -27,10 +27,10 @@ use crate::{attestation_routes::SessionState, web::platform_routes};
 use crate::jwt::{AuthContext, AuthMethod};
 use crate::models::user_seed_wrappings::NewUserSeedWrapping;
 use crate::seed_wrapping::{
-    compute_password_auth_binding, decrypt_seed_v1, encrypt_seed_v1,
+    compute_oauth_auth_binding, compute_password_auth_binding, decrypt_seed_v1, encrypt_seed_v1,
     normalize_email_login_identifier, normalize_guest_login_identifier,
-    password_credential_lookup_hash, AuthBinding, CredentialKind, PasswordLoginIdentifierKind,
-    SEED_WRAP_VERSION_V1,
+    oauth_credential_lookup_hash, password_credential_lookup_hash, AuthBinding, CredentialKind,
+    PasswordLoginIdentifierKind, SEED_WRAP_VERSION_V1,
 };
 use crate::{
     aws_credentials::AwsCredentialError,
@@ -795,6 +795,37 @@ impl AppState {
         ))
     }
 
+    fn oauth_auth_binding_for_user(
+        &self,
+        user: &User,
+        provider_name: &str,
+        provider_user_id: &str,
+    ) -> Result<AuthBinding, Error> {
+        compute_oauth_auth_binding(
+            &self.enclave_key,
+            user.project_id,
+            user.uuid,
+            provider_name,
+            provider_user_id,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))
+    }
+
+    fn oauth_auth_context_for_user(
+        &self,
+        user: &User,
+        provider_name: &str,
+        provider_user_id: &str,
+    ) -> Result<AuthContext, Error> {
+        let auth_binding =
+            self.oauth_auth_binding_for_user(user, provider_name, provider_user_id)?;
+        Ok(AuthContext::new(
+            AuthMethod::OAuth,
+            user.project_id,
+            *auth_binding.as_bytes(),
+        ))
+    }
+
     fn verify_seed_wrap_for_auth_context(
         &self,
         user: &User,
@@ -861,6 +892,46 @@ impl AppState {
         let new_wrapping = NewUserSeedWrapping::new(
             user.uuid,
             CredentialKind::Password.as_str(),
+            credential_lookup_hash.as_bytes().to_vec(),
+            SEED_WRAP_VERSION_V1,
+            seed_enc,
+        );
+
+        self.db.upsert_user_seed_wrapping(new_wrapping)?;
+        Ok(())
+    }
+
+    fn create_oauth_seed_wrap_for_user(
+        &self,
+        user: &User,
+        provider_name: &str,
+        provider_user_id: &str,
+        plaintext_seed: &[u8],
+    ) -> Result<(), Error> {
+        let auth_binding =
+            self.oauth_auth_binding_for_user(user, provider_name, provider_user_id)?;
+        let credential_lookup_hash = oauth_credential_lookup_hash(
+            &self.enclave_key,
+            user.project_id,
+            user.uuid,
+            provider_name,
+            provider_user_id,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        let seed_enc = encrypt_seed_v1(
+            &self.enclave_key,
+            plaintext_seed,
+            user.uuid,
+            user.project_id,
+            CredentialKind::OAuth,
+            &auth_binding,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        let new_wrapping = NewUserSeedWrapping::new(
+            user.uuid,
+            CredentialKind::OAuth.as_str(),
             credential_lookup_hash.as_bytes().to_vec(),
             SEED_WRAP_VERSION_V1,
             seed_enc,

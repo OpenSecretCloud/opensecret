@@ -269,6 +269,12 @@ pub trait DBConnection {
         provider_id: i32,
         provider_user_id: &str,
     ) -> Result<Option<UserOAuthConnection>, DBError>;
+    fn get_project_user_oauth_connection_by_provider_subject(
+        &self,
+        provider_id: i32,
+        provider_user_id: &str,
+        project_id: i32,
+    ) -> Result<Option<UserOAuthConnection>, DBError>;
     fn get_all_user_oauth_connections_for_user(
         &self,
         user_id: Uuid,
@@ -1054,6 +1060,22 @@ impl DBConnection for PostgresConnection {
             conn,
             provider_id,
             provider_user_id,
+        )
+        .map_err(DBError::from)
+    }
+
+    fn get_project_user_oauth_connection_by_provider_subject(
+        &self,
+        provider_id: i32,
+        provider_user_id: &str,
+        project_id: i32,
+    ) -> Result<Option<UserOAuthConnection>, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserOAuthConnection::get_by_provider_subject_and_project(
+            conn,
+            provider_id,
+            provider_user_id,
+            project_id,
         )
         .map_err(DBError::from)
     }

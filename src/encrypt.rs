@@ -471,6 +471,27 @@ mod tests {
         assert_eq!(content, decrypted);
     }
 
+    #[tokio::test]
+    async fn legacy_aes_gcm_ciphertext_has_no_owner_context_binding() {
+        let root_key = SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let wrong_root_key = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let victim_seed = b"victim seed mnemonic bytes";
+
+        let encrypted_seed = encrypt_with_key(&root_key, victim_seed).await;
+
+        assert!(
+            decrypt_with_key(&wrong_root_key, &encrypted_seed).is_err(),
+            "legacy AES-GCM still authenticates the root key"
+        );
+
+        let attacker_row_decrypt = decrypt_with_key(&root_key, &encrypted_seed).unwrap();
+        assert_eq!(
+            victim_seed.to_vec(),
+            attacker_row_decrypt,
+            "legacy ciphertext has no AAD parameter for user, credential, table, or row ownership"
+        );
+    }
+
     #[test]
     fn test_deterministic_encryption() {
         let key = SecretKey::from_slice(&[1u8; 32]).unwrap();

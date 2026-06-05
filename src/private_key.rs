@@ -227,6 +227,33 @@ mod tests {
         (enclave_key, encrypted_seed)
     }
 
+    #[tokio::test]
+    async fn legacy_seed_ciphertext_copy_derives_original_user_key() {
+        let (enclave_key, victim_encrypted_seed) = create_mock_encrypted_seed(TEST_MNEMONIC).await;
+
+        let victim_key = decrypt_user_seed_to_key(
+            enclave_key.clone(),
+            victim_encrypted_seed.clone(),
+            None,
+            None,
+        )
+        .expect("victim seed should decrypt with the enclave root key");
+
+        // This is the current threat model issue from the investigation:
+        // the decrypt helper only sees root-key ciphertext. It receives no
+        // authenticated user/credential binding, so a copied victim seed blob
+        // derives the same key in any logical account context.
+        let attacker_row_copied_seed = victim_encrypted_seed;
+        let attacker_session_key =
+            decrypt_user_seed_to_key(enclave_key, attacker_row_copied_seed, None, None)
+                .expect("legacy copied seed decrypts because no AAD binding exists");
+
+        assert_eq!(
+            victim_key.display_secret().to_string(),
+            attacker_session_key.display_secret().to_string()
+        );
+    }
+
     #[test]
     fn test_bip85_integration_with_bip85_extended_crate() {
         // This test verifies that the bip85_extended crate works as expected

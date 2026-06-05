@@ -101,6 +101,9 @@ mod sqs;
 mod tokens;
 mod web;
 
+#[cfg(test)]
+mod aead_db_tamper_tests;
+
 use apple_signin::AppleJwtVerifier;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
 use proxy_config::ProxyRouter;

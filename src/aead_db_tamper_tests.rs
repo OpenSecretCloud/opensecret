@@ -230,6 +230,96 @@ async fn db_legacy_seed_substitution_does_not_change_authenticated_attacker_key(
 
 #[tokio::test]
 #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_password_change_invalidates_old_auth_context_and_preserves_seed() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let email = format!("aead-password-change-{marker}@example.com");
+    let old_password = "old-password-before-change";
+    let new_password = "new-password-after-change";
+
+    let user =
+        create_password_wrapped_user(&app_state, project.id, email.clone(), old_password).await;
+
+    let old_login = app_state
+        .authenticate_user(
+            Some(email.clone()),
+            None,
+            old_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("old password login should not error")
+        .expect("old password login should verify and unwrap");
+    let old_key = app_state
+        .get_user_key(&old_login.user, &old_login.auth_context, None, None)
+        .await
+        .expect("old key should derive before password change");
+
+    let new_auth_context = app_state
+        .update_user_password_and_seed_wrap(
+            &old_login.user,
+            &old_login.auth_context,
+            new_password.to_string(),
+        )
+        .await
+        .expect("password change should rewrap seed");
+
+    let old_context_after_change =
+        app_state.verify_seed_wrap_for_auth_context(&old_login.user, &old_login.auth_context);
+    assert!(
+        matches!(old_context_after_change, Err(Error::AuthenticationError)),
+        "old password auth context must not unwrap after password change"
+    );
+
+    let old_password_login_after_change = app_state
+        .authenticate_user(
+            Some(email.clone()),
+            None,
+            old_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("old password login after change should not error");
+    assert!(
+        old_password_login_after_change.is_none(),
+        "old password must not authenticate after password change"
+    );
+
+    let new_password_login = app_state
+        .authenticate_user(Some(email), None, new_password.to_string(), project.id)
+        .await
+        .expect("new password login should not error")
+        .expect("new password should verify and unwrap");
+    let new_key = app_state
+        .get_user_key(
+            &new_password_login.user,
+            &new_password_login.auth_context,
+            None,
+            None,
+        )
+        .await
+        .expect("new key should derive after password change");
+
+    app_state
+        .verify_seed_wrap_for_auth_context(&new_password_login.user, &new_auth_context)
+        .expect("new auth context returned by password change should unwrap");
+    assert_eq!(
+        old_key.secret_bytes(),
+        new_key.secret_bytes(),
+        "normal password change must preserve the existing user seed"
+    );
+
+    let _ = app_state.db.delete_user(&user);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
 async fn db_oauth_seed_wrap_substitution_fails_for_attacker_provider_subject() {
     let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
         eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
@@ -442,6 +532,108 @@ async fn db_copied_password_reset_row_mac_fails_for_victim() {
     let _ = app_state.db.delete_user(&attacker);
 }
 
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_destructive_password_reset_invalidates_old_auth_context_and_rotates_seed() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let email = format!("aead-destructive-reset-{marker}@example.com");
+    let old_password = "old-password-before-destructive-reset";
+    let new_password = "new-password-after-destructive-reset";
+    let reset_code = "R0T8KEY1";
+    let reset_secret = format!("destructive-reset-secret-{marker}");
+
+    let user =
+        create_password_wrapped_user(&app_state, project.id, email.clone(), old_password).await;
+
+    let old_login = app_state
+        .authenticate_user(
+            Some(email.clone()),
+            None,
+            old_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("old password login should not error")
+        .expect("old password login should verify and unwrap");
+    let old_key = app_state
+        .get_user_key(&old_login.user, &old_login.auth_context, None, None)
+        .await
+        .expect("old key should derive before destructive reset");
+
+    insert_valid_reset_request_for_user(&app_state, project.id, &user, reset_code, &reset_secret);
+    app_state
+        .confirm_password_reset(
+            email.clone(),
+            reset_code.to_string(),
+            reset_secret,
+            new_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("destructive password reset should complete");
+
+    let old_context_after_reset =
+        app_state.verify_seed_wrap_for_auth_context(&old_login.user, &old_login.auth_context);
+    assert!(
+        matches!(old_context_after_reset, Err(Error::AuthenticationError)),
+        "old auth context must not unwrap after destructive reset"
+    );
+
+    let old_password_login_after_reset = app_state
+        .authenticate_user(
+            Some(email.clone()),
+            None,
+            old_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("old password login after reset should not error");
+    assert!(
+        old_password_login_after_reset.is_none(),
+        "old password must not authenticate after destructive reset"
+    );
+
+    let new_password_login = app_state
+        .authenticate_user(Some(email), None, new_password.to_string(), project.id)
+        .await
+        .expect("new password login should not error")
+        .expect("new password should verify and unwrap after reset");
+    let new_key = app_state
+        .get_user_key(
+            &new_password_login.user,
+            &new_password_login.auth_context,
+            None,
+            None,
+        )
+        .await
+        .expect("new key should derive after destructive reset");
+
+    assert_ne!(
+        old_key.secret_bytes(),
+        new_key.secret_bytes(),
+        "destructive password reset must rotate the user seed"
+    );
+
+    let remaining_wraps = app_state
+        .db
+        .get_user_seed_wrappings_for_user_and_kind(user.uuid, CredentialKind::Password.as_str())
+        .expect("post-reset seed wraps should load");
+    assert_eq!(
+        remaining_wraps.len(),
+        1,
+        "destructive reset should leave exactly one password seed wrap"
+    );
+
+    let _ = app_state.db.delete_user(&user);
+}
+
 async fn build_local_test_app_state(database_url: String) -> AppState {
     let db = setup_db(database_url);
     AppStateBuilder::default()
@@ -639,6 +831,29 @@ fn insert_copied_attacker_reset_request_for_victim(
         .db
         .create_password_reset_request(copied_request)
         .expect("copied reset request row should insert");
+}
+
+fn insert_valid_reset_request_for_user(
+    app_state: &AppState,
+    project_id: i32,
+    user: &User,
+    reset_code: &str,
+    reset_secret: &str,
+) {
+    let reset_code_mac =
+        password_reset_code_mac(&app_state.enclave_key, project_id, user.uuid, reset_code)
+            .expect("reset-code MAC should compute");
+    let request = NewPasswordResetRequest::new(
+        user.uuid,
+        generate_reset_hash(reset_secret.to_string()),
+        reset_code_mac.to_vec(),
+        24,
+    );
+
+    app_state
+        .db
+        .create_password_reset_request(request)
+        .expect("valid reset request row should insert");
 }
 
 fn copy_victim_seed_wrap_ciphertext_to_attacker(

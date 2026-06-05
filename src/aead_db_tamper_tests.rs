@@ -1,6 +1,6 @@
 use crate::{
     db::setup_db,
-    encrypt::encrypt_with_key,
+    encrypt::{decrypt_with_key, encrypt_with_key},
     generate_reset_hash,
     login_routes::RegisterCredentials,
     models::{
@@ -12,7 +12,7 @@ use crate::{
         user_seed_wrappings::NewUserSeedWrapping,
         users::{NewUser, User},
     },
-    private_key::generate_twelve_word_seed,
+    private_key::{generate_twelve_word_seed, plaintext_user_seed_to_mnemonic},
     seed_wrapping::{password_reset_code_mac, CredentialKind},
     AppMode, AppState, AppStateBuilder, Error,
 };
@@ -333,6 +333,105 @@ async fn db_legacy_seed_substitution_does_not_change_authenticated_attacker_key(
         attacker_key_before.secret_bytes(),
         attacker_key_after.secret_bytes(),
         "copied legacy users.seed_enc must not affect authenticated attacker seed unwrap"
+    );
+
+    let _ = app_state.db.delete_user(&victim);
+    let _ = app_state.db.delete_user(&attacker);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_legacy_seed_substitution_does_not_export_victim_mnemonic() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let victim_email = format!("aead-private-key-victim-{marker}@example.com");
+    let attacker_email = format!("aead-private-key-attacker-{marker}@example.com");
+    let victim_password = "victim-password-before-private-key-export-tamper";
+    let attacker_password = "attacker-password-before-private-key-export-tamper";
+
+    let victim =
+        create_password_wrapped_user(&app_state, project.id, victim_email, victim_password).await;
+    let attacker = create_password_wrapped_user(
+        &app_state,
+        project.id,
+        attacker_email.clone(),
+        attacker_password,
+    )
+    .await;
+
+    let attacker_login_before_tamper = app_state
+        .authenticate_user(
+            Some(attacker_email.clone()),
+            None,
+            attacker_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("untampered attacker login should not error")
+        .expect("untampered attacker login should verify and unwrap");
+    let attacker_seed_before = app_state
+        .decrypt_seed_for_auth_context(
+            &attacker_login_before_tamper.user,
+            &attacker_login_before_tamper.auth_context,
+        )
+        .expect("untampered attacker seed should unwrap");
+    let attacker_mnemonic_before = plaintext_user_seed_to_mnemonic(&attacker_seed_before)
+        .expect("untampered attacker seed should parse as mnemonic")
+        .to_string();
+
+    let legacy_secret_key = SecretKey::from_slice(&app_state.enclave_key)
+        .expect("test enclave key should be a valid legacy SecretKey");
+    let victim_legacy_seed = decrypt_with_key(
+        &legacy_secret_key,
+        victim
+            .seed_encrypted()
+            .expect("victim legacy seed should exist"),
+    )
+    .expect("victim legacy seed should decrypt");
+    let victim_mnemonic = plaintext_user_seed_to_mnemonic(&victim_legacy_seed)
+        .expect("victim legacy seed should parse as mnemonic")
+        .to_string();
+    assert_ne!(
+        attacker_mnemonic_before, victim_mnemonic,
+        "test precondition should use different victim and attacker seeds"
+    );
+
+    copy_victim_legacy_seed_to_attacker(&app_state, &victim, &attacker);
+
+    let attacker_login_after_tamper = app_state
+        .authenticate_user(
+            Some(attacker_email),
+            None,
+            attacker_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("legacy seed tamper should not make attacker login error")
+        .expect("attacker password login should still verify against attacker wrap");
+    let exported_seed_after_tamper = app_state
+        .decrypt_seed_for_auth_context(
+            &attacker_login_after_tamper.user,
+            &attacker_login_after_tamper.auth_context,
+        )
+        .expect("attacker private-key export seed should still unwrap");
+    let exported_mnemonic_after_tamper =
+        plaintext_user_seed_to_mnemonic(&exported_seed_after_tamper)
+            .expect("attacker private-key export seed should parse as mnemonic")
+            .to_string();
+
+    assert_eq!(
+        exported_mnemonic_after_tamper, attacker_mnemonic_before,
+        "copied legacy users.seed_enc must not change the authenticated private-key export seed"
+    );
+    assert_ne!(
+        exported_mnemonic_after_tamper, victim_mnemonic,
+        "copied legacy users.seed_enc must not export the victim mnemonic"
     );
 
     let _ = app_state.db.delete_user(&victim);

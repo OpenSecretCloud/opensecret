@@ -537,6 +537,53 @@ mod tests {
     }
 
     #[test]
+    fn password_change_rewrap_invalidates_old_password_binding() {
+        let old_binding = password_binding();
+        let new_password_verifier = "$argon2id$v=19$m=19456,t=2,p=1$new-salt$new-password-hash";
+        let new_binding = compute_password_auth_binding(
+            &ROOT_KEY,
+            PROJECT_ID,
+            USER_UUID,
+            PasswordLoginIdentifierKind::Email,
+            "alice@example.com",
+            new_password_verifier,
+        )
+        .unwrap();
+        let seed = b"same user seed after password change";
+
+        let rewrapped_seed = encrypt_seed_v1(
+            &ROOT_KEY,
+            seed,
+            USER_UUID,
+            PROJECT_ID,
+            CredentialKind::Password,
+            &new_binding,
+        )
+        .unwrap();
+
+        assert!(decrypt_seed_v1(
+            &ROOT_KEY,
+            &rewrapped_seed,
+            USER_UUID,
+            PROJECT_ID,
+            CredentialKind::Password,
+            &old_binding,
+        )
+        .is_err());
+
+        let decrypted = decrypt_seed_v1(
+            &ROOT_KEY,
+            &rewrapped_seed,
+            USER_UUID,
+            PROJECT_ID,
+            CredentialKind::Password,
+            &new_binding,
+        )
+        .unwrap();
+        assert_eq!(seed.to_vec(), decrypted);
+    }
+
+    #[test]
     fn copied_oauth_seed_wrap_cannot_unwrap_under_attacker_provider_subject() {
         let victim_binding = compute_oauth_auth_binding(
             &ROOT_KEY,

@@ -90,6 +90,13 @@ diesel::table! {
 }
 
 diesel::table! {
+    app_data_migrations (name) {
+        name -> Text,
+        completed_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     assistant_messages (id) {
         id -> Int8,
         uuid -> Uuid,
@@ -572,6 +579,19 @@ diesel::table! {
 }
 
 diesel::table! {
+    user_seed_wrappings (id) {
+        id -> Int8,
+        user_id -> Uuid,
+        credential_kind -> Text,
+        credential_lookup_hash -> Bytea,
+        wrapping_version -> Int2,
+        seed_enc -> Bytea,
+        created_at -> Timestamptz,
+        updated_at -> Timestamptz,
+    }
+}
+
+diesel::table! {
     users (id) {
         id -> Int4,
         uuid -> Uuid,
@@ -624,6 +644,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     agent_schedule_runs,
     agent_schedules,
     agents,
+    app_data_migrations,
     assistant_messages,
     conversation_projects,
     conversation_summaries,
@@ -658,5 +679,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     user_messages,
     user_oauth_connections,
     user_preferences,
+    user_seed_wrappings,
     users,
 );

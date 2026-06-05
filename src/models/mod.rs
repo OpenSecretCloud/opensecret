@@ -1,4 +1,5 @@
 pub mod account_deletion;
+pub mod app_data_migrations;
 pub mod email_verification;
 pub mod enclave_secrets;
 pub mod invite_codes;
@@ -18,4 +19,5 @@ pub mod schema;
 pub mod token_usage;
 pub mod user_api_keys;
 pub mod user_kv;
+pub mod user_seed_wrappings;
 pub mod users;

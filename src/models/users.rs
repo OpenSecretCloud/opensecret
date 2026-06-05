@@ -29,10 +29,6 @@ pub struct User {
 }
 
 impl User {
-    pub async fn get_seed_encrypted(&self) -> Option<Vec<u8>> {
-        self.seed_enc.clone()
-    }
-
     pub fn seed_encrypted(&self) -> Option<&[u8]> {
         self.seed_enc.as_deref()
     }

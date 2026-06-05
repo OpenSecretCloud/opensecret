@@ -1,7 +1,9 @@
 use crate::encrypt;
-use crate::jwt::{NewToken, TokenType};
+use crate::jwt::{AuthContext, NewToken, TokenType};
 use crate::message_signing::SigningAlgorithm;
-use crate::private_key::{decrypt_user_seed_to_mnemonic, VALID_BIP39_WORD_COUNTS};
+use crate::private_key::{
+    derive_bip85_mnemonic_from_root, plaintext_user_seed_to_mnemonic, VALID_BIP39_WORD_COUNTS,
+};
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
 use crate::Error;
 use crate::KVPair;
@@ -641,12 +643,13 @@ pub async fn user_protected(
 pub async fn get_kv(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
     Path(key): Path<String>,
 ) -> Result<Json<EncryptedResponse<Option<String>>>, ApiError> {
     debug!("Entering get_kv function");
 
-    let value = match data.get(user.uuid, key).await {
+    let value = match data.get(&user, &auth_context, key).await {
         Ok(kv) => kv,
         Err(e) => {
             tracing::error!("Error getting key-value pair: {:?}", e);
@@ -660,6 +663,7 @@ pub async fn get_kv(
 pub async fn put_kv(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
     Path(key): Path<String>,
     Extension(value): Extension<String>,
@@ -668,7 +672,7 @@ pub async fn put_kv(
     info!("Putting key-value pair for user");
     tracing::trace!("putting key-value pair: {} = {}", key, value);
 
-    match data.put(user.uuid, key, value.clone()).await {
+    match data.put(&user, &auth_context, key, value.clone()).await {
         Ok(kv) => kv,
         Err(e) => {
             tracing::error!("Error putting key-value pair: {:?}", e);
@@ -683,12 +687,13 @@ pub async fn put_kv(
 pub async fn delete_kv(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
     Path(key): Path<String>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     debug!("Entering delete_kv function");
 
-    match data.delete(user.uuid, key).await {
+    match data.delete(&user, &auth_context, key).await {
         Ok(_) => {
             let response = json!({ "message": "Resource deleted successfully" });
             debug!("Exiting delete_kv function");
@@ -727,11 +732,12 @@ pub async fn delete_all_kv(
 pub async fn list_kv(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<Vec<KVPair>>>, ApiError> {
     debug!("Entering list_kv function");
 
-    let kvs = match data.list(user.uuid).await {
+    let kvs = match data.list(&user, &auth_context).await {
         Ok(kvs) => kvs,
         Err(e) => {
             tracing::error!("Error listing key-value pairs: {:?}", e);
@@ -861,6 +867,7 @@ pub async fn change_password(
 pub async fn get_private_key(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
     Query(query): Query<DerivationPathQuery>,
 ) -> Result<Json<EncryptedResponse<PrivateKeyResponse>>, ApiError> {
@@ -878,47 +885,27 @@ pub async fn get_private_key(
     debug!("Validating derivation paths");
     query.validate()?;
 
-    // First try to get the existing encrypted seed
-    debug!("Retrieving encrypted seed for user");
-    let encrypted_seed = match user.get_seed_encrypted().await {
-        Some(seed) => {
-            debug!("Found existing encrypted seed");
-            seed
-        }
-        None => {
-            // Only generate a new key if one doesn't exist
-            info!(
-                "No seed found, generating new private key for user: {}",
-                user.uuid
-            );
-            data.generate_private_key(user.uuid)
-                .await
-                .map_err(|e| {
-                    error!("Failed to generate private key: {:?}", e);
-                    ApiError::InternalServerError
-                })?
-                .get_seed_encrypted()
-                .await
-                .ok_or_else(|| {
-                    error!("Private key not found after generation: {}", user.uuid);
-                    ApiError::InternalServerError
-                })?
-        }
-    };
+    debug!("Retrieving authenticated seed wrap for user");
+    let plaintext_seed = data
+        .decrypt_seed_for_auth_context(&user, &auth_context)
+        .map_err(|e| {
+            error!("Failed to decrypt authenticated seed wrap: {:?}", e);
+            ApiError::Unauthorized
+        })?;
+    let root_mnemonic = plaintext_user_seed_to_mnemonic(&plaintext_seed).map_err(|e| {
+        error!("Failed to parse user seed mnemonic: {:?}", e);
+        ApiError::InternalServerError
+    })?;
 
     // Check if BIP-85 derivation is requested
     if let Some(bip85_path) = &query.key_options.seed_phrase_derivation_path {
         info!("BIP-85 derivation requested with path: {}", bip85_path);
         // Derive a child mnemonic
-        let child_mnemonic = crate::private_key::decrypt_and_derive_bip85_mnemonic(
-            data.enclave_key.clone(),
-            encrypted_seed,
-            bip85_path,
-        )
-        .map_err(|e| {
-            error!("BIP-85 derivation error: {:?}", e);
-            ApiError::BadRequest
-        })?;
+        let child_mnemonic =
+            derive_bip85_mnemonic_from_root(root_mnemonic, bip85_path).map_err(|e| {
+                error!("BIP-85 derivation error: {:?}", e);
+                ApiError::BadRequest
+            })?;
 
         let word_count = child_mnemonic.word_count();
         info!(
@@ -936,17 +923,11 @@ pub async fn get_private_key(
     } else {
         // Return root mnemonic
         info!("Returning root mnemonic (no BIP-85 derivation)");
-        let mnemonic = decrypt_user_seed_to_mnemonic(data.enclave_key.clone(), encrypted_seed)
-            .map_err(|e| {
-                error!("Failed to decrypt user seed: {:?}", e);
-                ApiError::InternalServerError
-            })?;
-
-        let word_count = mnemonic.word_count();
+        let word_count = root_mnemonic.word_count();
         debug!("Root mnemonic has {} words", word_count);
 
         let response = PrivateKeyResponse {
-            mnemonic: mnemonic.to_string(),
+            mnemonic: root_mnemonic.to_string(),
         };
 
         debug!("Encrypting response with root mnemonic");
@@ -958,6 +939,7 @@ pub async fn get_private_key(
 pub async fn get_private_key_bytes(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
     Query(query): Query<DerivationPathQuery>,
 ) -> Result<Json<EncryptedResponse<PrivateKeyBytesResponse>>, ApiError> {
@@ -982,7 +964,8 @@ pub async fn get_private_key_bytes(
     debug!("Getting user key with provided derivation paths");
     let secret_key = data
         .get_user_key(
-            user.uuid,
+            &user,
+            &auth_context,
             query.key_options.private_key_derivation_path.as_deref(),
             query.key_options.seed_phrase_derivation_path.as_deref(),
         )
@@ -1018,6 +1001,7 @@ pub async fn get_private_key_bytes(
 pub async fn sign_message(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(sign_request): Extension<SignMessageRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<SignMessageResponseJson>>, ApiError> {
@@ -1064,7 +1048,8 @@ pub async fn sign_message(
     );
     let response = data
         .sign_message(
-            user.uuid,
+            &user,
+            &auth_context,
             &message_bytes,
             sign_request.algorithm,
             derivation_path,
@@ -1091,6 +1076,7 @@ pub async fn sign_message(
 pub async fn get_public_key(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
     Query(query): Query<PublicKeyQuery>,
 ) -> Result<Json<EncryptedResponse<PublicKeyResponseJson>>, ApiError> {
@@ -1107,7 +1093,12 @@ pub async fn get_public_key(
     let seed_phrase_derivation_path = query.key_options.seed_phrase_derivation_path.as_deref();
 
     let user_secret_key = data
-        .get_user_key(user.uuid, derivation_path, seed_phrase_derivation_path)
+        .get_user_key(
+            &user,
+            &auth_context,
+            derivation_path,
+            seed_phrase_derivation_path,
+        )
         .await
         .map_err(|e| {
             error!("Error getting user key: {:?}", e);
@@ -1272,6 +1263,7 @@ pub async fn generate_third_party_token(
 pub async fn encrypt_data(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(request): Extension<EncryptDataRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<EncryptDataResponse>>, ApiError> {
@@ -1290,7 +1282,12 @@ pub async fn encrypt_data(
 
     // Get the user's key
     let user_key = data
-        .get_user_key(user.uuid, derivation_path, seed_phrase_derivation_path)
+        .get_user_key(
+            &user,
+            &auth_context,
+            derivation_path,
+            seed_phrase_derivation_path,
+        )
         .await
         .map_err(|e| match e {
             Error::InvalidDerivationPath(msg) => {
@@ -1325,6 +1322,7 @@ pub async fn encrypt_data(
 pub async fn decrypt_data(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(request): Extension<DecryptDataRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<String>>, ApiError> {
@@ -1347,7 +1345,12 @@ pub async fn decrypt_data(
 
     // Get the user's key
     let user_key = data
-        .get_user_key(user.uuid, derivation_path, seed_phrase_derivation_path)
+        .get_user_key(
+            &user,
+            &auth_context,
+            derivation_path,
+            seed_phrase_derivation_path,
+        )
         .await
         .map_err(|e| match e {
             Error::InvalidDerivationPath(msg) => {

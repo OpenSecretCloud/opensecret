@@ -35,7 +35,7 @@ use crate::seed_wrapping::{
 use crate::{
     aws_credentials::AwsCredentialError,
     models::enclave_secrets::NewEnclaveSecret,
-    private_key::{decrypt_user_seed_to_key, generate_twelve_word_seed},
+    private_key::{generate_twelve_word_seed, plaintext_user_seed_to_key},
 };
 use crate::{billing::BillingClient, web::platform::common::PROJECT_RESEND_API_KEY};
 use crate::{
@@ -826,11 +826,11 @@ impl AppState {
         ))
     }
 
-    fn verify_seed_wrap_for_auth_context(
+    fn decrypt_seed_for_auth_context(
         &self,
         user: &User,
         auth_context: &AuthContext,
-    ) -> Result<(), Error> {
+    ) -> Result<Vec<u8>, Error> {
         if user.project_id != auth_context.project_id {
             return Err(Error::AuthenticationError);
         }
@@ -849,21 +849,29 @@ impl AppState {
                 continue;
             }
 
-            if decrypt_seed_v1(
+            match decrypt_seed_v1(
                 &self.enclave_key,
                 &candidate.seed_enc,
                 user.uuid,
                 user.project_id,
                 credential_kind,
                 &auth_binding,
-            )
-            .is_ok()
-            {
-                return Ok(());
+            ) {
+                Ok(seed) => return Ok(seed),
+                Err(_) => continue,
             }
         }
 
         Err(Error::AuthenticationError)
+    }
+
+    fn verify_seed_wrap_for_auth_context(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+    ) -> Result<(), Error> {
+        self.decrypt_seed_for_auth_context(user, auth_context)
+            .map(|_| ())
     }
 
     fn create_password_seed_wrap_for_user(
@@ -1073,7 +1081,8 @@ impl AppState {
     /// Returns the user's private key, optionally derived using the provided derivation paths.
     ///
     /// # Arguments
-    /// * `user_uuid` - The UUID of the user
+    /// * `user` - The authenticated user
+    /// * `auth_context` - The signed auth context from the validated user JWT
     /// * `derivation_path` - Optional BIP-32 derivation path
     /// * `seed_phrase_derivation_path` - Optional BIP-85 derivation path to derive a child seed
     ///
@@ -1082,11 +1091,12 @@ impl AppState {
     ///   BIP-85 and/or BIP-32 derivation paths
     async fn get_user_key(
         &self,
-        user_uuid: Uuid,
+        user: &User,
+        auth_context: &AuthContext,
         derivation_path: Option<&str>,
         seed_phrase_derivation_path: Option<&str>,
     ) -> Result<SecretKey, Error> {
-        info!("Getting user key for UUID: {}", user_uuid);
+        info!("Getting user key for UUID: {}", user.uuid);
 
         if let Some(path) = derivation_path {
             debug!("Using BIP-32 derivation path: {}", path);
@@ -1096,44 +1106,24 @@ impl AppState {
             debug!("Using BIP-85 derivation path: {}", path);
         }
 
-        let user = self.get_user(user_uuid).await?;
-        debug!("User retrieved successfully");
+        let plaintext_seed = self.decrypt_seed_for_auth_context(user, auth_context)?;
 
-        let encrypted_seed = match user.get_seed_encrypted().await {
-            Some(es) => {
-                debug!("Found existing encrypted seed for user");
-                es
-            }
-            None => {
-                // create seed if not already exists
-                info!(
-                    "No seed found for user {}, generating new private key",
-                    user_uuid
-                );
-                let updated_user = self.generate_private_key(user_uuid).await?;
-                updated_user.get_seed_encrypted().await.ok_or_else(|| {
-                    error!("Seed not found after generation for user: {}", user_uuid);
-                    Error::PrivateKeyGenerationFailure
-                })?
-            }
-        };
-
-        debug!("Decrypting user seed and deriving key");
-        let user_secret_key = decrypt_user_seed_to_key(
-            self.enclave_key.clone(),
-            encrypted_seed,
+        debug!("Deriving user key from authenticated seed wrap");
+        let user_secret_key = plaintext_user_seed_to_key(
+            &plaintext_seed,
             derivation_path,
             seed_phrase_derivation_path,
         )?;
 
-        info!("Successfully derived key for user: {}", user_uuid);
+        info!("Successfully derived key for user: {}", user.uuid);
         Ok(user_secret_key)
     }
 
     /// Sign a message with the user's private key, using the specified algorithm
     async fn sign_message(
         &self,
-        user_uuid: Uuid,
+        user: &User,
+        auth_context: &AuthContext,
         message_bytes: &[u8],
         algorithm: message_signing::SigningAlgorithm,
         derivation_path: Option<&str>,
@@ -1141,7 +1131,7 @@ impl AppState {
     ) -> Result<message_signing::SignMessageResponse, Error> {
         info!(
             "Signing message for user: {}, algorithm: {:?}",
-            user_uuid, algorithm
+            user.uuid, algorithm
         );
 
         if let Some(path) = derivation_path {
@@ -1154,59 +1144,53 @@ impl AppState {
 
         debug!("Getting user key for message signing");
         let user_secret_key = self
-            .get_user_key(user_uuid, derivation_path, seed_phrase_derivation_path)
+            .get_user_key(
+                user,
+                auth_context,
+                derivation_path,
+                seed_phrase_derivation_path,
+            )
             .await?;
 
         debug!("Signing message with algorithm: {:?}", algorithm);
         let result = message_signing::sign_message(&user_secret_key, message_bytes, algorithm);
 
         if result.is_ok() {
-            info!("Message signed successfully for user: {}", user_uuid);
+            info!("Message signed successfully for user: {}", user.uuid);
         } else {
-            error!("Failed to sign message for user: {}", user_uuid);
+            error!("Failed to sign message for user: {}", user.uuid);
         }
 
         result
     }
 
-    // DEPRECATED: New users now always get a private key
-    async fn generate_private_key(&self, user_uuid: Uuid) -> Result<User, Error> {
-        let user = self.get_user(user_uuid).await?;
-
-        if user.get_seed_encrypted().await.is_none() {
-            let user_seed_words = generate_twelve_word_seed(self.aws_credential_manager.clone())
-                .await?
-                .to_string();
-
-            let secret_key = SecretKey::from_slice(&self.enclave_key.clone())
-                .map_err(|e| Error::EncryptionError(e.to_string()))?;
-
-            let encrypted_key = encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
-
-            self.db.set_user_key(user, encrypted_key)?;
-
-            self.get_user(user_uuid).await
-        } else {
-            Err(Error::PrivateKeyAlreadyExists)
-        }
-    }
-
-    async fn get(&self, user_id: Uuid, key: String) -> StoreResult<Option<String>> {
+    async fn get(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+        key: String,
+    ) -> StoreResult<Option<String>> {
         let user_key = self
-            .get_user_key(user_id, None, None)
+            .get_user_key(user, auth_context, None, None)
             .await
             .map_err(|_| StoreError::Unauthorized)?;
-        kv::get(self.db.get_pool(), user_id, &key, &user_key)
+        kv::get(self.db.get_pool(), user.uuid, &key, &user_key)
     }
 
-    async fn put(&self, user_id: Uuid, key: String, value: String) -> StoreResult<()> {
+    async fn put(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+        key: String,
+        value: String,
+    ) -> StoreResult<()> {
         let user_key = self
-            .get_user_key(user_id, None, None)
+            .get_user_key(user, auth_context, None, None)
             .await
             .map_err(|_| StoreError::Unauthorized)?;
         kv::put(
             self.db.get_pool(),
-            user_id,
+            user.uuid,
             key,
             value,
             &user_key,
@@ -1215,24 +1199,29 @@ impl AppState {
         .await
     }
 
-    async fn delete(&self, user_id: Uuid, key: String) -> StoreResult<()> {
+    async fn delete(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+        key: String,
+    ) -> StoreResult<()> {
         let user_key = self
-            .get_user_key(user_id, None, None)
+            .get_user_key(user, auth_context, None, None)
             .await
             .map_err(|_| StoreError::Unauthorized)?;
-        kv::delete(self.db.get_pool(), user_id, &key, &user_key)
+        kv::delete(self.db.get_pool(), user.uuid, &key, &user_key)
     }
 
     async fn delete_all(&self, user_id: Uuid) -> StoreResult<()> {
         kv::delete_all(self.db.get_pool(), user_id)
     }
 
-    async fn list(&self, user_id: Uuid) -> StoreResult<Vec<KVPair>> {
+    async fn list(&self, user: &User, auth_context: &AuthContext) -> StoreResult<Vec<KVPair>> {
         let user_key = self
-            .get_user_key(user_id, None, None)
+            .get_user_key(user, auth_context, None, None)
             .await
             .map_err(|_| StoreError::Unauthorized)?;
-        kv::list(self.db.get_pool(), user_id, &user_key)
+        kv::list(self.db.get_pool(), user.uuid, &user_key)
     }
 
     pub async fn get_aws_credentials(&self) -> Option<AwsCredentials> {

@@ -3,6 +3,7 @@
 
 use crate::{
     encrypt::{decrypt_content, encrypt_with_key},
+    jwt::AuthContext,
     models::responses::{ConversationProjectFilter, NewConversation},
     models::users::User,
     web::{
@@ -61,17 +62,18 @@ impl ConversationContext {
     async fn load(
         state: &AppState,
         conversation_id: Uuid,
-        user_uuid: Uuid,
+        user: &User,
+        auth_context: &AuthContext,
     ) -> Result<Self, ApiError> {
         // Get conversation (verifies ownership)
         let conversation = state
             .db
-            .get_conversation_by_uuid_and_user(conversation_id, user_uuid)
+            .get_conversation_by_uuid_and_user(conversation_id, user.uuid)
             .map_err(error_mapping::map_conversation_error)?;
 
         // Get user's encryption key
         let user_key = state
-            .get_user_key(user_uuid, None, None)
+            .get_user_key(user, auth_context, None, None)
             .await
             .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -382,6 +384,7 @@ async fn create_conversation(
     State(state): State<Arc<AppState>>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<CreateConversationRequest>,
 ) -> Result<Json<EncryptedResponse<ConversationResponse>>, ApiError> {
     debug!("Creating new conversation for user: {}", user.uuid);
@@ -400,7 +403,7 @@ async fn create_conversation(
 
     // Get user's encryption key
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(&user, &auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -472,13 +475,14 @@ async fn get_conversation(
     Path(conversation_id): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationResponse>>, ApiError> {
     debug!(
         "Getting conversation {} for user {}",
         conversation_id, user.uuid
     );
 
-    let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
+    let ctx = ConversationContext::load(&state, conversation_id, &user, &auth_context).await?;
     let mut project_cache = HashMap::new();
     let response = build_conversation_response(
         &state,
@@ -498,6 +502,7 @@ async fn update_conversation(
     Path(conversation_id): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<UpdateConversationRequest>,
 ) -> Result<Json<EncryptedResponse<ConversationResponse>>, ApiError> {
     debug!(
@@ -509,7 +514,7 @@ async fn update_conversation(
         return Err(ApiError::BadRequest);
     }
 
-    let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
+    let ctx = ConversationContext::load(&state, conversation_id, &user, &auth_context).await?;
 
     let metadata_enc = if let Some(metadata) = body.metadata.as_ref() {
         validate_metadata(metadata)?;
@@ -565,13 +570,14 @@ async fn delete_conversation(
     Path(conversation_id): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
     debug!(
         "Deleting conversation {} for user {}",
         conversation_id, user.uuid
     );
 
-    let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
+    let ctx = ConversationContext::load(&state, conversation_id, &user, &auth_context).await?;
 
     // Delete the conversation (cascades will delete all associated responses)
     state
@@ -591,13 +597,14 @@ async fn list_conversation_items(
     Query(params): Query<ListItemsParams>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationItemListResponse>>, ApiError> {
     debug!(
         "Listing items for conversation {} for user {}",
         conversation_id, user.uuid
     );
 
-    let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
+    let ctx = ConversationContext::load(&state, conversation_id, &user, &auth_context).await?;
 
     // Validate limit
     let limit = if params.limit <= 0 {
@@ -681,13 +688,14 @@ async fn get_conversation_item(
     Path((conversation_id, item_id)): Path<(Uuid, Uuid)>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
     debug!(
         "Getting item {} from conversation {} for user {}",
         item_id, conversation_id, user.uuid
     );
 
-    let ctx = ConversationContext::load(&state, conversation_id, user.uuid).await?;
+    let ctx = ConversationContext::load(&state, conversation_id, &user, &auth_context).await?;
 
     // Get all messages from the conversation
     // For this single item lookup, we fetch all messages (no pagination)
@@ -720,6 +728,7 @@ async fn list_conversations(
     Query(params): Query<ListConversationsParams>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationListResponse>>, ApiError> {
     debug!("Listing conversations for user: {}", user.uuid);
 
@@ -767,7 +776,7 @@ async fn list_conversations(
 
     // Get user's encryption key for decrypting metadata
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(&user, &auth_context, None, None)
         .await
         .map_err(|_| ApiError::InternalServerError)?;
 

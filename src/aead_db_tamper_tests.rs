@@ -320,6 +320,95 @@ async fn db_password_change_invalidates_old_auth_context_and_preserves_seed() {
 
 #[tokio::test]
 #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_guest_conversion_invalidates_old_auth_context_and_preserves_seed() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let guest_password = "guest-password-before-conversion";
+    let email_password = "email-password-after-guest-conversion";
+    let email = format!("aead-guest-conversion-{marker}@example.com");
+
+    let guest = create_guest_wrapped_user(&app_state, project.id, guest_password).await;
+
+    let guest_login = app_state
+        .authenticate_user(
+            None,
+            Some(guest.uuid),
+            guest_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("guest login should not error")
+        .expect("guest password should verify and unwrap");
+    let guest_key_before = app_state
+        .get_user_key(&guest_login.user, &guest_login.auth_context, None, None)
+        .await
+        .expect("guest key should derive before conversion");
+
+    let (updated_user, new_auth_context) = app_state
+        .convert_guest_to_email_and_seed_wrap(
+            &guest_login.user,
+            &guest_login.auth_context,
+            email.clone(),
+            email_password.to_string(),
+            Some("Converted Guest".to_string()),
+        )
+        .await
+        .expect("guest conversion should rewrap seed");
+
+    let old_context_after_conversion =
+        app_state.verify_seed_wrap_for_auth_context(&guest_login.user, &guest_login.auth_context);
+    assert!(
+        matches!(
+            old_context_after_conversion,
+            Err(Error::AuthenticationError)
+        ),
+        "old guest auth context must not unwrap after guest-to-email conversion"
+    );
+
+    let old_guest_login_after_conversion = app_state
+        .authenticate_user(
+            None,
+            Some(guest.uuid),
+            guest_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("old guest login after conversion should not error");
+    assert!(
+        old_guest_login_after_conversion.is_none(),
+        "old guest password must not authenticate after conversion"
+    );
+
+    let email_login = app_state
+        .authenticate_user(Some(email), None, email_password.to_string(), project.id)
+        .await
+        .expect("email login after conversion should not error")
+        .expect("email password should verify and unwrap after conversion");
+    let email_key_after = app_state
+        .get_user_key(&email_login.user, &email_login.auth_context, None, None)
+        .await
+        .expect("email key should derive after conversion");
+
+    app_state
+        .verify_seed_wrap_for_auth_context(&updated_user, &new_auth_context)
+        .expect("new auth context returned by guest conversion should unwrap");
+    assert_eq!(
+        guest_key_before.secret_bytes(),
+        email_key_after.secret_bytes(),
+        "guest-to-email conversion must preserve the existing user seed"
+    );
+
+    let _ = app_state.db.delete_user(&updated_user);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
 async fn db_oauth_seed_wrap_substitution_fails_for_attacker_provider_subject() {
     let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
         eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
@@ -691,6 +780,34 @@ async fn create_password_wrapped_user(
     app_state
         .create_password_seed_wrap_for_user(&user, &password_hash, user_seed_words.as_bytes())
         .expect("test user seed wrap should insert");
+
+    user
+}
+
+async fn create_guest_wrapped_user(app_state: &AppState, project_id: i32, password: &str) -> User {
+    let secret_key =
+        SecretKey::from_slice(&app_state.enclave_key).expect("test enclave key should be valid");
+    let password_hash = generate_hash(password);
+    let password_enc = encrypt_with_key(&secret_key, password_hash.as_bytes()).await;
+    let user_seed_words = generate_twelve_word_seed(app_state.aws_credential_manager.clone())
+        .await
+        .expect("test seed should generate")
+        .to_string();
+    let legacy_seed_enc = encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
+
+    let user = app_state
+        .db
+        .create_user(NewUser::new(
+            None,
+            Some(password_enc),
+            project_id,
+            legacy_seed_enc,
+        ))
+        .expect("test guest user should insert");
+
+    app_state
+        .create_password_seed_wrap_for_user(&user, &password_hash, user_seed_words.as_bytes())
+        .expect("test guest seed wrap should insert");
 
     user
 }

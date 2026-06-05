@@ -816,6 +816,7 @@ pub async fn request_new_verification_code(
 pub async fn change_password(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(change_request): Extension<ChangePasswordRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
@@ -844,7 +845,7 @@ pub async fn change_password(
             match data
                 .update_user_password_and_seed_wrap(
                     &user,
-                    &authenticated_user.auth_context,
+                    &auth_context,
                     change_request.new_password,
                 )
                 .await

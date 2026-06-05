@@ -350,9 +350,16 @@ fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
 
     let change_password_route =
         extract_function_body(&protected_contents, "pub async fn change_password");
+    assert!(
+        protected_contents.contains(
+            "pub async fn change_password(\n    State(data): State<Arc<AppState>>,\n    Extension(user): Extension<User>,\n    Extension(auth_context): Extension<AuthContext>,"
+        ),
+        "password change route must require the current signed AuthContext extension"
+    );
     for required_pattern in [
         ".authenticate_user(",
         ".update_user_password_and_seed_wrap(",
+        "&auth_context",
         "NewToken::new_with_auth_context(",
         "TokenType::Access",
         "TokenType::Refresh",
@@ -363,6 +370,10 @@ fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
             "password change route must contain `{required_pattern}`"
         );
     }
+    assert!(
+        !change_password_route.contains("&authenticated_user.auth_context"),
+        "password change must unwrap with the current signed AuthContext, not a DB-recomputed password auth context"
+    );
 
     let password_update_helper = extract_function_body(
         &main_contents,

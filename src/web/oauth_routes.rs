@@ -1541,3 +1541,147 @@ async fn encrypt_access_token(
     })?;
     Ok(encrypt::encrypt_with_key(&secret_key, access_token.as_bytes()).await)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        db::setup_db,
+        encrypt::encrypt_with_key,
+        models::{org_projects::OrgProject, schema::org_projects},
+        AppMode, AppStateBuilder,
+    };
+    use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+    async fn db_oauth_same_email_different_subject_is_not_linked() {
+        let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+            eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let app_state = build_local_test_app_state(database_url).await;
+        let project = first_active_project(&app_state);
+        let marker = Uuid::new_v4();
+        let email = format!("aead-oauth-subject-mismatch-{marker}@example.com");
+        let existing_subject = format!("existing-google-sub-{marker}");
+        let attacker_subject = format!("attacker-google-sub-{marker}");
+
+        let user = create_oauth_wrapped_user(
+            &app_state,
+            project.id,
+            email.clone(),
+            "google",
+            existing_subject,
+        )
+        .await;
+
+        let result = find_or_create_user_from_oauth(
+            &app_state,
+            Some(email),
+            attacker_subject.clone(),
+            "google",
+            "attacker-access-token".to_string(),
+            Some("Attacker Name".to_string()),
+            project.id,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ApiError::UserExistsNotLinked)),
+            "same email with a different verified provider subject must not be linked"
+        );
+
+        let google_provider = app_state
+            .db
+            .get_oauth_provider_by_name("google")
+            .expect("test OAuth provider lookup should succeed")
+            .expect("test OAuth provider should exist after AppState build");
+        let attacker_connection = app_state
+            .db
+            .get_project_user_oauth_connection_by_provider_subject(
+                google_provider.id,
+                &attacker_subject,
+                project.id,
+            )
+            .expect("attacker subject lookup should not error");
+        assert!(
+            attacker_connection.is_none(),
+            "failed same-email OAuth attempt must not create attacker subject connection"
+        );
+
+        let _ = app_state.db.delete_user(&user);
+    }
+
+    async fn build_local_test_app_state(database_url: String) -> AppState {
+        let db = setup_db(database_url);
+        AppStateBuilder::default()
+            .app_mode(AppMode::Local)
+            .db(db)
+            .enclave_key([42u8; 32].to_vec())
+            .aws_credential_manager(Arc::new(RwLock::new(None)))
+            .openai_api_base("http://localhost:9".to_string())
+            .jwt_secret([24u8; 32].to_vec())
+            .build()
+            .await
+            .expect("local test app state should build")
+    }
+
+    fn first_active_project(app_state: &AppState) -> OrgProject {
+        let conn = &mut app_state
+            .db
+            .get_pool()
+            .get()
+            .expect("test database connection should be available");
+
+        org_projects::table
+            .filter(org_projects::status.eq("active"))
+            .order(org_projects::id.asc())
+            .first::<OrgProject>(conn)
+            .expect("test database should contain at least one active project")
+    }
+
+    async fn create_oauth_wrapped_user(
+        app_state: &AppState,
+        project_id: i32,
+        email: String,
+        provider_name: &str,
+        provider_user_id: String,
+    ) -> User {
+        let secret_key = SecretKey::from_slice(&app_state.enclave_key)
+            .expect("test enclave key should be valid");
+        let user_seed_words = generate_twelve_word_seed(app_state.aws_credential_manager.clone())
+            .await
+            .expect("test seed should generate")
+            .to_string();
+        let legacy_seed_enc = encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
+
+        let user = app_state
+            .db
+            .create_user(NewUser::new(Some(email), None, project_id, legacy_seed_enc))
+            .expect("test OAuth user should insert");
+
+        let provider = app_state
+            .db
+            .get_oauth_provider_by_name(provider_name)
+            .expect("test OAuth provider lookup should succeed")
+            .expect("test OAuth provider should exist after AppState build");
+
+        create_provider_connection(app_state, &user, provider.id, provider_user_id.clone(), "")
+            .await
+            .expect("test OAuth connection should insert");
+
+        app_state
+            .create_oauth_seed_wrap_for_user(
+                &user,
+                provider_name,
+                &provider_user_id,
+                user_seed_words.as_bytes(),
+            )
+            .expect("test OAuth seed wrap should insert");
+
+        user
+    }
+}

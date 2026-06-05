@@ -506,11 +506,25 @@ fn password_registration_and_login_issue_tokens_only_after_seed_wrap_verificatio
         "generate_hash(password)",
         "generate_twelve_word_seed",
         "NewUser::new(creds.email, Some(encrypted_pw), project.id, encrypted_key)",
-        "create_password_seed_wrap_for_user(&user, &password_hash, user_seed_words.as_bytes())",
+        "create_user_with_password_seed_wrap(",
     ] {
         assert!(
             register_user_body.contains(required_pattern),
             "registration helper must contain `{required_pattern}`"
+        );
+    }
+
+    let create_user_wrap_body =
+        extract_function_body(&main_contents, "fn create_user_with_password_seed_wrap");
+    for required_pattern in [
+        "conn.transaction::<_, CreateUserSeedWrapTransactionError, _>",
+        "new_user.insert(conn)",
+        "new_password_seed_wrapping_for_user(",
+        "new_wrapping.upsert_by_credential(conn)",
+    ] {
+        assert!(
+            create_user_wrap_body.contains(required_pattern),
+            "password registration must atomically create user and seed wrap with `{required_pattern}`"
         );
     }
 

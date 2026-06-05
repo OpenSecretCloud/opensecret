@@ -25,7 +25,7 @@ use crate::web::{
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
 use crate::jwt::{AuthContext, AuthMethod};
-use crate::models::user_seed_wrappings::NewUserSeedWrapping;
+use crate::models::user_seed_wrappings::{NewUserSeedWrapping, UserSeedWrappingError};
 use crate::seed_wrapping::{
     compute_oauth_auth_binding, compute_password_auth_binding, decrypt_seed_v1, encrypt_seed_v1,
     normalize_email_login_identifier, normalize_guest_login_identifier,
@@ -40,7 +40,7 @@ use crate::{
 use crate::{billing::BillingClient, web::platform::common::PROJECT_RESEND_API_KEY};
 use crate::{
     db::{setup_db, DBConnection, DBError},
-    models::users::{NewUser, User},
+    models::users::{NewUser, User, UserError},
 };
 use crate::{encrypt::create_new_encryption_key, jwt::validate_jwt};
 use aws_credentials::{AwsCredentialManager, AwsCredentials};
@@ -50,6 +50,7 @@ use base64::Engine as _;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::KeyInit;
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use diesel::Connection;
 use kv::{KVPair, StoreError, StoreResult};
 use password_auth::{generate_hash, verify_password, VerifyError};
 use rand_core::{CryptoRng, RngCore};
@@ -219,6 +220,35 @@ pub enum Error {
 
     #[error("Key derivation failed: {0}")]
     KeyDerivationError(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CreateUserSeedWrapTransactionError {
+    #[error("Diesel error: {0}")]
+    Diesel(#[from] diesel::result::Error),
+    #[error("User error: {0}")]
+    User(#[from] UserError),
+    #[error("User seed wrapping error: {0}")]
+    UserSeedWrapping(#[from] UserSeedWrappingError),
+    #[error("Application error: {0}")]
+    App(#[from] Error),
+}
+
+impl From<CreateUserSeedWrapTransactionError> for Error {
+    fn from(error: CreateUserSeedWrapTransactionError) -> Self {
+        match error {
+            CreateUserSeedWrapTransactionError::Diesel(e) => {
+                Error::DatabaseError(DBError::QueryError(e))
+            }
+            CreateUserSeedWrapTransactionError::User(e) => {
+                Error::DatabaseError(DBError::UserError(e))
+            }
+            CreateUserSeedWrapTransactionError::UserSeedWrapping(e) => {
+                Error::DatabaseError(DBError::UserSeedWrappingError(e))
+            }
+            CreateUserSeedWrapTransactionError::App(e) => e,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -961,6 +991,31 @@ impl AppState {
         Ok(())
     }
 
+    fn create_user_with_password_seed_wrap(
+        &self,
+        new_user: NewUser,
+        decrypted_password_verifier: &str,
+        plaintext_seed: &[u8],
+    ) -> Result<User, Error> {
+        let conn = &mut self
+            .db
+            .get_pool()
+            .get()
+            .map_err(|_| Error::DatabaseError(DBError::ConnectionError))?;
+
+        conn.transaction::<_, CreateUserSeedWrapTransactionError, _>(|conn| {
+            let user = new_user.insert(conn)?;
+            let new_wrapping = self.new_password_seed_wrapping_for_user(
+                &user,
+                decrypted_password_verifier,
+                plaintext_seed,
+            )?;
+            new_wrapping.upsert_by_credential(conn)?;
+            Ok(user)
+        })
+        .map_err(Error::from)
+    }
+
     fn create_oauth_seed_wrap_for_user(
         &self,
         user: &User,
@@ -1090,9 +1145,11 @@ impl AppState {
         let new_user = NewUser::new(creds.email, Some(encrypted_pw), project.id, encrypted_key)
             .with_name_option(creds.name);
 
-        let user = self.db.create_user(new_user)?;
-
-        self.create_password_seed_wrap_for_user(&user, &password_hash, user_seed_words.as_bytes())?;
+        let user = self.create_user_with_password_seed_wrap(
+            new_user,
+            &password_hash,
+            user_seed_words.as_bytes(),
+        )?;
 
         tracing::info!("registered new user: {:?} {:?}", user.email, user.uuid);
 

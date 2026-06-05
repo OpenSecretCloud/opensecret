@@ -2,6 +2,7 @@ use crate::{
     db::setup_db,
     encrypt::encrypt_with_key,
     generate_reset_hash,
+    login_routes::RegisterCredentials,
     models::{
         oauth::NewUserOAuthConnection,
         org_projects::OrgProject,
@@ -21,6 +22,53 @@ use secp256k1::SecretKey;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_password_registration_creates_initial_seed_wrap_and_login_works() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let email = format!("aead-registration-{marker}@example.com");
+    let password = "registration-password-before-login";
+
+    let user = app_state
+        .register_user(RegisterCredentials {
+            name: Some("AEAD Registration Test".to_string()),
+            email: Some(email.clone()),
+            password: password.to_string(),
+            client_id: project.client_id,
+        })
+        .await
+        .expect("registration should create user and initial seed wrap");
+
+    let password_wraps = app_state
+        .db
+        .get_user_seed_wrappings_for_user_and_kind(user.uuid, CredentialKind::Password.as_str())
+        .expect("registered user's password seed wraps should load");
+    assert_eq!(
+        password_wraps.len(),
+        1,
+        "password registration should commit exactly one initial password seed wrap"
+    );
+
+    let login = app_state
+        .authenticate_user(Some(email), None, password.to_string(), project.id)
+        .await
+        .expect("registered user login should not error")
+        .expect("registered password should verify and unwrap");
+    app_state
+        .get_user_key(&login.user, &login.auth_context, None, None)
+        .await
+        .expect("registered user's auth context should derive a user key");
+
+    let _ = app_state.db.delete_user(&user);
+}
 
 #[tokio::test]
 #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]

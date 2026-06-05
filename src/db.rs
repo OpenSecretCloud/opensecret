@@ -1017,6 +1017,11 @@ impl DBConnection for PostgresConnection {
         conn.transaction::<_, DBError, _>(|conn| {
             let user_id = user.uuid;
 
+            let _locked_user = users::table
+                .filter(users::uuid.eq(user_id))
+                .for_update()
+                .first::<User>(conn)?;
+
             diesel::delete(
                 user_seed_wrappings::table.filter(user_seed_wrappings::user_id.eq(user_id)),
             )

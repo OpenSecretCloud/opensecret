@@ -44,6 +44,42 @@ fn openai_compatible_routes_do_not_request_user_storage_keys() {
     );
 }
 
+#[test]
+fn refresh_route_preserves_signed_auth_context_without_recomputing_binding() {
+    let login_routes = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/login_routes.rs");
+    let contents =
+        fs::read_to_string(&login_routes).expect("login route source should be readable");
+    let refresh_body = extract_function_body(&contents, "pub async fn refresh_token");
+
+    for required_pattern in [
+        "AuthContext::from_claims(&claims)",
+        "verify_seed_wrap_for_auth_context(&user, &auth_context)",
+        "NewToken::new_with_auth_context(&user, TokenType::Access, &data, &auth_context)",
+        "NewToken::new_with_auth_context(&user, TokenType::Refresh, &data, &auth_context)",
+    ] {
+        assert!(
+            refresh_body.contains(required_pattern),
+            "refresh route must contain `{required_pattern}`"
+        );
+    }
+
+    for forbidden_pattern in [
+        "authenticate_user",
+        "password_auth_context_for_user",
+        "oauth_auth_context_for_user",
+        "compute_password_auth_binding",
+        "compute_oauth_auth_binding",
+        "password_enc",
+        "provider_user_id",
+        "get_user_oauth_connection",
+    ] {
+        assert!(
+            !refresh_body.contains(forbidden_pattern),
+            "refresh route must not recompute auth binding from DB state via `{forbidden_pattern}`"
+        );
+    }
+}
+
 fn collect_forbidden_legacy_seed_matches(
     path: &Path,
     forbidden_patterns: &[&str],
@@ -74,4 +110,31 @@ fn collect_forbidden_legacy_seed_matches(
             }
         }
     }
+}
+
+fn extract_function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let signature_start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("function signature `{signature}` should exist"));
+    let body_start = source[signature_start..]
+        .find('{')
+        .map(|offset| signature_start + offset)
+        .unwrap_or_else(|| panic!("function `{signature}` should have a body"));
+
+    let mut depth = 0i32;
+    for (relative_index, byte) in source[body_start..].bytes().enumerate() {
+        match byte {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let body_end = body_start + relative_index + 1;
+                    return &source[body_start..body_end];
+                }
+            }
+            _ => {}
+        }
+    }
+
+    panic!("function `{signature}` body should be balanced");
 }

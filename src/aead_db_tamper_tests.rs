@@ -15,6 +15,7 @@ use crate::{
             assistant_messages, conversations, org_projects, reasoning_items, responses,
             tool_calls, tool_outputs, user_messages, user_oauth_connections, users,
         },
+        user_api_keys::NewUserApiKey,
         user_kv::{NewUserKV, UserKV},
         user_seed_wrappings::NewUserSeedWrapping,
         users::{NewUser, User},
@@ -948,6 +949,15 @@ async fn db_destructive_password_reset_invalidates_old_auth_context_and_rotates_
 
     let user =
         create_password_wrapped_user(&app_state, project.id, email.clone(), old_password).await;
+    let api_key_name = format!("reset-preserved-api-key-{marker}");
+    app_state
+        .db
+        .create_user_api_key(NewUserApiKey::new(
+            user.uuid,
+            format!("test-api-key-hash-{marker}"),
+            api_key_name.clone(),
+        ))
+        .expect("test API key should insert before destructive reset");
 
     let old_login = app_state
         .authenticate_user(
@@ -1017,6 +1027,17 @@ async fn db_destructive_password_reset_invalidates_old_auth_context_and_rotates_
         new_key.secret_bytes(),
         "destructive password reset must rotate the user seed"
     );
+
+    let api_keys_after_reset = app_state
+        .db
+        .get_all_user_api_keys_for_user(user.uuid)
+        .expect("API keys should load after destructive reset");
+    assert_eq!(
+        api_keys_after_reset.len(),
+        1,
+        "destructive reset should preserve existing user API keys in this release"
+    );
+    assert_eq!(api_keys_after_reset[0].name, api_key_name);
 
     let remaining_wraps = app_state
         .db

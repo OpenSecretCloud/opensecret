@@ -283,6 +283,11 @@ fn destructive_password_reset_wipes_user_key_encrypted_storage_roots() {
             "destructive reset must contain `{required_pattern}`"
         );
     }
+
+    assert!(
+        !reset_body.contains("user_api_keys::table"),
+        "destructive password reset must preserve user_api_keys in this release"
+    );
 }
 
 #[test]

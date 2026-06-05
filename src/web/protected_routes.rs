@@ -26,7 +26,6 @@ use base64::{engine::general_purpose, Engine as _};
 use bitcoin::bip32::DerivationPath;
 use chrono::{DateTime, Utc};
 use secp256k1::Secp256k1;
-use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::str::FromStr;
@@ -850,8 +849,24 @@ pub async fn change_password(
                 )
                 .await
             {
-                Ok(()) => {
-                    let response = json!({ "message": "Password changed successfully" });
+                Ok(new_auth_context) => {
+                    let access_token = NewToken::new_with_auth_context(
+                        &user,
+                        TokenType::Access,
+                        &data,
+                        &new_auth_context,
+                    )?;
+                    let refresh_token = NewToken::new_with_auth_context(
+                        &user,
+                        TokenType::Refresh,
+                        &data,
+                        &new_auth_context,
+                    )?;
+                    let response = json!({
+                        "message": "Password changed successfully",
+                        "access_token": access_token.token,
+                        "refresh_token": refresh_token.token
+                    });
                     debug!("Exiting change_password function");
                     encrypt_response(&data, &session_id, &response).await
                 }
@@ -1136,6 +1151,7 @@ pub async fn get_public_key(
 pub async fn convert_guest_to_email(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(convert_request): Extension<ConvertGuestRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
@@ -1162,23 +1178,19 @@ pub async fn convert_guest_to_email(
         return Err(ApiError::EmailAlreadyExists);
     }
 
-    // Hash and encrypt the new password
-    let password_hash = password_auth::generate_hash(convert_request.password);
-    let secret_key =
-        SecretKey::from_slice(&data.enclave_key).map_err(|_| ApiError::InternalServerError)?;
-    let encrypted_password = encrypt::encrypt_with_key(&secret_key, password_hash.as_bytes()).await;
-
-    // Update the user with new email, password, and optional name
-    let mut updated_user = user.clone();
-    updated_user.email = Some(convert_request.email);
-    updated_user.password_enc = Some(encrypted_password);
-    updated_user.name = convert_request.name;
-
-    // Save the changes
-    if let Err(e) = data.db.update_user(&updated_user) {
-        error!("Failed to update user: {:?}", e);
-        return Err(ApiError::InternalServerError);
-    }
+    let (updated_user, new_auth_context) = data
+        .convert_guest_to_email_and_seed_wrap(
+            &user,
+            &auth_context,
+            convert_request.email,
+            convert_request.password,
+            convert_request.name,
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to convert guest user: {:?}", e);
+            ApiError::InternalServerError
+        })?;
 
     // Create email verification entry
     let new_verification = NewEmailVerification::new(updated_user.uuid, 24, false);
@@ -1205,8 +1217,23 @@ pub async fn convert_guest_to_email(
         });
     }
 
+    let access_token = NewToken::new_with_auth_context(
+        &updated_user,
+        TokenType::Access,
+        &data,
+        &new_auth_context,
+    )?;
+    let refresh_token = NewToken::new_with_auth_context(
+        &updated_user,
+        TokenType::Refresh,
+        &data,
+        &new_auth_context,
+    )?;
+
     let response = json!({
-        "message": "Successfully converted guest account to email account. Please check your email for verification."
+        "message": "Successfully converted guest account to email account. Please check your email for verification.",
+        "access_token": access_token.token,
+        "refresh_token": refresh_token.token
     });
 
     debug!("Exiting convert_guest_to_email function");

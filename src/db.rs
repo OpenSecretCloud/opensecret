@@ -296,6 +296,11 @@ pub trait DBConnection {
     fn create_token_usage(&self, new_usage: NewTokenUsage) -> Result<TokenUsage, DBError>;
 
     fn update_user(&self, user: &User) -> Result<(), DBError>;
+    fn update_user_and_seed_wrap(
+        &self,
+        user: &User,
+        new_wrapping: NewUserSeedWrapping,
+    ) -> Result<(), DBError>;
 
     // New org-related methods
     fn create_org(&self, new_org: NewOrg) -> Result<Org, DBError>;
@@ -1188,6 +1193,19 @@ impl DBConnection for PostgresConnection {
     fn update_user(&self, user: &User) -> Result<(), DBError> {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         user.update(conn).map_err(DBError::from)
+    }
+
+    fn update_user_and_seed_wrap(
+        &self,
+        user: &User,
+        new_wrapping: NewUserSeedWrapping,
+    ) -> Result<(), DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        conn.transaction::<_, DBError, _>(|conn| {
+            user.update(conn)?;
+            new_wrapping.upsert_by_credential(conn)?;
+            Ok(())
+        })
     }
 
     // Org implementations

@@ -1677,16 +1677,53 @@ impl AppState {
         user: &User,
         auth_context: &AuthContext,
         new_password: String,
-    ) -> Result<(), Error> {
+    ) -> Result<AuthContext, Error> {
         let plaintext_seed = self.decrypt_seed_for_auth_context(user, auth_context)?;
         let (password_hash, encrypted_password) =
             self.encrypt_user_password_verifier(new_password).await?;
         let new_wrapping =
             self.new_password_seed_wrapping_for_user(user, &password_hash, &plaintext_seed)?;
+        let new_auth_context = self.password_auth_context_for_user(user, &password_hash)?;
 
         self.db
             .update_user_password_and_seed_wrap(user, encrypted_password, new_wrapping)
-            .map_err(Error::from)
+            .map_err(Error::from)?;
+        self.verify_seed_wrap_for_auth_context(user, &new_auth_context)?;
+
+        Ok(new_auth_context)
+    }
+
+    async fn convert_guest_to_email_and_seed_wrap(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+        email: String,
+        password: String,
+        name: Option<String>,
+    ) -> Result<(User, AuthContext), Error> {
+        let plaintext_seed = self.decrypt_seed_for_auth_context(user, auth_context)?;
+        let (password_hash, encrypted_password) =
+            self.encrypt_user_password_verifier(password).await?;
+
+        let mut updated_user = user.clone();
+        updated_user.email = Some(email);
+        updated_user.password_enc = Some(encrypted_password);
+        updated_user.name = name;
+
+        let new_wrapping = self.new_password_seed_wrapping_for_user(
+            &updated_user,
+            &password_hash,
+            &plaintext_seed,
+        )?;
+        let new_auth_context =
+            self.password_auth_context_for_user(&updated_user, &password_hash)?;
+
+        self.db
+            .update_user_and_seed_wrap(&updated_user, new_wrapping)
+            .map_err(Error::from)?;
+        self.verify_seed_wrap_for_auth_context(&updated_user, &new_auth_context)?;
+
+        Ok((updated_user, new_auth_context))
     }
 
     async fn encrypt_user_password_verifier(

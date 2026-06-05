@@ -378,6 +378,68 @@ fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
     }
 }
 
+#[test]
+fn password_registration_and_login_issue_tokens_only_after_seed_wrap_verification() {
+    let main_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+    let main_contents = fs::read_to_string(&main_source).expect("main source should be readable");
+    let login_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/login_routes.rs");
+    let login_contents =
+        fs::read_to_string(&login_source).expect("login route source should be readable");
+
+    let register_user_body = extract_function_body(&main_contents, "async fn register_user");
+    for required_pattern in [
+        "generate_hash(password)",
+        "generate_twelve_word_seed",
+        "NewUser::new(creds.email, Some(encrypted_pw), project.id, encrypted_key)",
+        "create_password_seed_wrap_for_user(&user, &password_hash, user_seed_words.as_bytes())",
+    ] {
+        assert!(
+            register_user_body.contains(required_pattern),
+            "registration helper must contain `{required_pattern}`"
+        );
+    }
+
+    let register_route = extract_function_body(&login_contents, "pub async fn register");
+    for required_pattern in [
+        "data.register_user(creds.clone()).await",
+        "login_internal(",
+        "password: creds.password",
+    ] {
+        assert!(
+            register_route.contains(required_pattern),
+            "registration route must contain `{required_pattern}`"
+        );
+    }
+
+    let authenticate_body = extract_function_body(&main_contents, "async fn authenticate_user");
+    for required_pattern in [
+        "decrypt_with_key(&secret_key, user.password_enc.as_ref().unwrap())",
+        "verify_password(user_password, &decrypted_password_hash)",
+        "password_auth_context_for_user(&user, &verifier_for_binding)",
+        "verify_seed_wrap_for_auth_context(&user, &auth_context)",
+        "AuthenticatedUser { user, auth_context }",
+    ] {
+        assert!(
+            authenticate_body.contains(required_pattern),
+            "password authentication must contain `{required_pattern}`"
+        );
+    }
+
+    let login_internal_body = extract_function_body(&login_contents, "async fn login_internal");
+    for required_pattern in [
+        ".authenticate_user(",
+        "NewToken::new_with_auth_context(",
+        "TokenType::Access",
+        "TokenType::Refresh",
+        "&authenticated_user.auth_context",
+    ] {
+        assert!(
+            login_internal_body.contains(required_pattern),
+            "password login must contain `{required_pattern}`"
+        );
+    }
+}
+
 fn collect_forbidden_legacy_seed_matches(
     path: &Path,
     forbidden_patterns: &[&str],

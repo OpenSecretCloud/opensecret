@@ -245,6 +245,30 @@ fn seed_wrap_translation_is_all_or_nothing_with_preflight_and_postflight() {
             "NewAppDataMigration::new(AEAD_SEED_WRAPPINGS_MIGRATION).insert(conn)?",
         ],
     );
+
+    for helper_name in ["fn upsert_password_seed_wrap", "fn upsert_oauth_seed_wrap"] {
+        let helper_body = extract_function_body(&contents, helper_name);
+        for required_pattern in [
+            "encrypt_seed_v1(",
+            "decrypt_seed_v1(",
+            "if verified_seed != plaintext_seed",
+            ".upsert_by_credential(conn)?",
+        ] {
+            assert!(
+                helper_body.contains(required_pattern),
+                "translation helper `{helper_name}` must verify generated wraps before insert with `{required_pattern}`"
+            );
+        }
+        assert_patterns_in_order(
+            helper_body,
+            &[
+                "encrypt_seed_v1(",
+                "decrypt_seed_v1(",
+                "if verified_seed != plaintext_seed",
+                ".upsert_by_credential(conn)?",
+            ],
+        );
+    }
 }
 
 #[test]
@@ -452,6 +476,31 @@ fn password_registration_and_login_issue_tokens_only_after_seed_wrap_verificatio
         assert!(
             register_user_body.contains(required_pattern),
             "registration helper must contain `{required_pattern}`"
+        );
+    }
+
+    let new_password_wrap_body =
+        extract_function_body(&main_contents, "fn new_password_seed_wrapping_for_user");
+    for required_pattern in [
+        "encrypt_seed_v1(",
+        "verify_new_password_seed_wrapping_for_user(",
+    ] {
+        assert!(
+            new_password_wrap_body.contains(required_pattern),
+            "new password seed wrap construction must contain `{required_pattern}`"
+        );
+    }
+
+    let create_oauth_wrap_body =
+        extract_function_body(&main_contents, "fn create_oauth_seed_wrap_for_user");
+    for required_pattern in [
+        "encrypt_seed_v1(",
+        "verify_new_oauth_seed_wrapping_for_user(",
+        "upsert_user_seed_wrapping(new_wrapping)",
+    ] {
+        assert!(
+            create_oauth_wrap_body.contains(required_pattern),
+            "OAuth seed wrap creation must contain `{required_pattern}`"
         );
     }
 

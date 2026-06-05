@@ -20,8 +20,8 @@ use crate::{
         users::User,
     },
     seed_wrapping::{
-        compute_oauth_auth_binding, compute_password_auth_binding, encrypt_seed_v1,
-        normalize_email_login_identifier, normalize_guest_login_identifier,
+        compute_oauth_auth_binding, compute_password_auth_binding, decrypt_seed_v1,
+        encrypt_seed_v1, normalize_email_login_identifier, normalize_guest_login_identifier,
         oauth_credential_lookup_hash, password_credential_lookup_hash, CredentialKind,
         PasswordLoginIdentifierKind, SEED_WRAP_VERSION_V1,
     },
@@ -350,6 +350,19 @@ fn upsert_password_seed_wrap(
         CredentialKind::Password,
         &auth_binding,
     )?;
+    let verified_seed = decrypt_seed_v1(
+        &app_state.enclave_key,
+        &seed_enc,
+        user.uuid,
+        user.project_id,
+        CredentialKind::Password,
+        &auth_binding,
+    )?;
+    if verified_seed != plaintext_seed {
+        return Err(SeedWrapTranslationError::Encrypt(
+            EncryptError::FailedToDecrypt,
+        ));
+    }
 
     NewUserSeedWrapping::new(
         user.uuid,
@@ -394,6 +407,19 @@ fn upsert_oauth_seed_wrap(
         CredentialKind::OAuth,
         &auth_binding,
     )?;
+    let verified_seed = decrypt_seed_v1(
+        &app_state.enclave_key,
+        &seed_enc,
+        user.uuid,
+        user.project_id,
+        CredentialKind::OAuth,
+        &auth_binding,
+    )?;
+    if verified_seed != plaintext_seed {
+        return Err(SeedWrapTranslationError::Encrypt(
+            EncryptError::FailedToDecrypt,
+        ));
+    }
 
     NewUserSeedWrapping::new(
         user.uuid,

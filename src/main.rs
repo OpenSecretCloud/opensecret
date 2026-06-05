@@ -899,13 +899,22 @@ impl AppState {
         )
         .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
-        Ok(NewUserSeedWrapping::new(
+        let new_wrapping = NewUserSeedWrapping::new(
             user.uuid,
             CredentialKind::Password.as_str(),
             credential_lookup_hash.as_bytes().to_vec(),
             SEED_WRAP_VERSION_V1,
             seed_enc,
-        ))
+        );
+
+        self.verify_new_password_seed_wrapping_for_user(
+            user,
+            decrypted_password_verifier,
+            plaintext_seed,
+            &new_wrapping,
+        )?;
+
+        Ok(new_wrapping)
     }
 
     fn verify_new_password_seed_wrapping_for_user(
@@ -988,7 +997,44 @@ impl AppState {
             seed_enc,
         );
 
+        self.verify_new_oauth_seed_wrapping_for_user(
+            user,
+            provider_name,
+            provider_user_id,
+            plaintext_seed,
+            &new_wrapping,
+        )?;
+
         self.db.upsert_user_seed_wrapping(new_wrapping)?;
+        Ok(())
+    }
+
+    fn verify_new_oauth_seed_wrapping_for_user(
+        &self,
+        user: &User,
+        provider_name: &str,
+        provider_user_id: &str,
+        plaintext_seed: &[u8],
+        new_wrapping: &NewUserSeedWrapping,
+    ) -> Result<(), Error> {
+        let auth_binding =
+            self.oauth_auth_binding_for_user(user, provider_name, provider_user_id)?;
+        let decrypted_seed = decrypt_seed_v1(
+            &self.enclave_key,
+            &new_wrapping.seed_enc,
+            user.uuid,
+            user.project_id,
+            CredentialKind::OAuth,
+            &auth_binding,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        if decrypted_seed != plaintext_seed {
+            return Err(Error::EncryptionError(
+                "New OAuth seed wrap verification failed".to_string(),
+            ));
+        }
+
         Ok(())
     }
 

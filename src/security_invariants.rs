@@ -62,6 +62,24 @@ fn openai_compatible_routes_do_not_request_user_storage_keys() {
 }
 
 #[test]
+fn user_jwt_middleware_requires_active_seed_wrap_before_request_extensions() {
+    let jwt_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/jwt.rs");
+    let contents = fs::read_to_string(&jwt_source).expect("JWT source should be readable");
+    let middleware_body = extract_function_body(&contents, "pub async fn validate_jwt");
+
+    assert_patterns_in_order(
+        middleware_body,
+        &[
+            "AuthContext::from_claims(&claims)",
+            "if user.project_id != auth_context.project_id",
+            "verify_seed_wrap_for_auth_context(&user, &auth_context)",
+            "req.extensions_mut().insert(auth_context)",
+            "req.extensions_mut().insert(user)",
+        ],
+    );
+}
+
+#[test]
 fn openai_jwt_fallback_inserts_signed_auth_context_but_api_keys_do_not() {
     let openai_auth_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/openai_auth.rs");
     let contents =
@@ -71,6 +89,7 @@ fn openai_jwt_fallback_inserts_signed_auth_context_but_api_keys_do_not() {
     for required_pattern in [
         "AuthContext::from_claims(&claims)",
         "if user.project_id != auth_context.project_id",
+        "verify_seed_wrap_for_auth_context(&user, &auth_context)",
         "req.extensions_mut().insert(auth_context)",
         "req.extensions_mut().insert(AuthMethod::Jwt)",
     ] {
@@ -79,6 +98,17 @@ fn openai_jwt_fallback_inserts_signed_auth_context_but_api_keys_do_not() {
             "OpenAI JWT fallback must contain `{required_pattern}`"
         );
     }
+    assert_patterns_in_order(
+        middleware_body,
+        &[
+            "AuthContext::from_claims(&claims)",
+            "if user.project_id != auth_context.project_id",
+            "verify_seed_wrap_for_auth_context(&user, &auth_context)",
+            "req.extensions_mut().insert(auth_context)",
+            "req.extensions_mut().insert(user)",
+            "req.extensions_mut().insert(AuthMethod::Jwt)",
+        ],
+    );
 
     let api_key_insert = "req.extensions_mut().insert(AuthMethod::ApiKey)";
     let api_key_index = middleware_body

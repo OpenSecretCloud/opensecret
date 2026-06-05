@@ -628,6 +628,14 @@ pub async fn validate_jwt(
         return ApiError::InvalidJwt.into_response();
     }
 
+    if let Err(e) = data.verify_seed_wrap_for_auth_context(&user, &auth_context) {
+        tracing::error!(
+            "JWT auth context no longer unwraps an active seed wrap: {:?}",
+            e
+        );
+        return ApiError::InvalidJwt.into_response();
+    }
+
     req.extensions_mut().insert(auth_context);
     req.extensions_mut().insert(user);
     tracing::debug!("Exiting validate_jwt");

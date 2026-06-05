@@ -540,12 +540,29 @@ fn password_registration_and_login_issue_tokens_only_after_seed_wrap_verificatio
         );
     }
 
+    let create_oauth_user_wrap_body =
+        extract_function_body(&main_contents, "pub fn create_user_with_oauth_seed_wrap");
+    for required_pattern in [
+        "conn.transaction::<_, CreateUserSeedWrapTransactionError, _>",
+        "new_user.insert(conn)",
+        "NewUserOAuthConnection",
+        "new_connection.insert(conn)",
+        "new_oauth_seed_wrapping_for_user(",
+        "new_wrapping.upsert_by_credential(conn)",
+        "NewEmailVerification::new(user.uuid, 24, true)",
+        "new_verification.insert(conn)",
+    ] {
+        assert!(
+            create_oauth_user_wrap_body.contains(required_pattern),
+            "OAuth registration must atomically create user, provider connection, seed wrap, and verified email with `{required_pattern}`"
+        );
+    }
+
     let create_oauth_wrap_body =
-        extract_function_body(&main_contents, "fn create_oauth_seed_wrap_for_user");
+        extract_function_body(&main_contents, "fn new_oauth_seed_wrapping_for_user");
     for required_pattern in [
         "encrypt_seed_v1(",
         "verify_new_oauth_seed_wrapping_for_user(",
-        "upsert_user_seed_wrapping(new_wrapping)",
     ] {
         assert!(
             create_oauth_wrap_body.contains(required_pattern),

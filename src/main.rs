@@ -11,6 +11,8 @@ use crate::encrypt::{
 use crate::jwt::validate_platform_jwt;
 use crate::login_routes::RegisterCredentials;
 use crate::models::account_deletion::{AccountDeletionError, NewAccountDeletionRequest};
+use crate::models::email_verification::{EmailVerificationError, NewEmailVerification};
+use crate::models::oauth::{NewUserOAuthConnection, OAuthError};
 use crate::models::password_reset::NewPasswordResetRequest;
 use crate::models::platform_password_reset::NewPlatformPasswordResetRequest;
 use crate::models::platform_users::PlatformUser;
@@ -230,6 +232,10 @@ enum CreateUserSeedWrapTransactionError {
     User(#[from] UserError),
     #[error("User seed wrapping error: {0}")]
     UserSeedWrapping(#[from] UserSeedWrappingError),
+    #[error("OAuth error: {0}")]
+    OAuth(#[from] OAuthError),
+    #[error("Email verification error: {0}")]
+    EmailVerification(#[from] EmailVerificationError),
     #[error("Application error: {0}")]
     App(#[from] Error),
 }
@@ -245,6 +251,12 @@ impl From<CreateUserSeedWrapTransactionError> for Error {
             }
             CreateUserSeedWrapTransactionError::UserSeedWrapping(e) => {
                 Error::DatabaseError(DBError::UserSeedWrappingError(e))
+            }
+            CreateUserSeedWrapTransactionError::OAuth(e) => {
+                Error::DatabaseError(DBError::OAuthError(e))
+            }
+            CreateUserSeedWrapTransactionError::EmailVerification(e) => {
+                Error::DatabaseError(DBError::EmailVerificationError(e))
             }
             CreateUserSeedWrapTransactionError::App(e) => e,
         }
@@ -1016,13 +1028,13 @@ impl AppState {
         .map_err(Error::from)
     }
 
-    fn create_oauth_seed_wrap_for_user(
+    fn new_oauth_seed_wrapping_for_user(
         &self,
         user: &User,
         provider_name: &str,
         provider_user_id: &str,
         plaintext_seed: &[u8],
-    ) -> Result<(), Error> {
+    ) -> Result<NewUserSeedWrapping, Error> {
         let auth_binding =
             self.oauth_auth_binding_for_user(user, provider_name, provider_user_id)?;
         let credential_lookup_hash = oauth_credential_lookup_hash(
@@ -1060,8 +1072,69 @@ impl AppState {
             &new_wrapping,
         )?;
 
+        Ok(new_wrapping)
+    }
+
+    fn create_oauth_seed_wrap_for_user(
+        &self,
+        user: &User,
+        provider_name: &str,
+        provider_user_id: &str,
+        plaintext_seed: &[u8],
+    ) -> Result<(), Error> {
+        let new_wrapping = self.new_oauth_seed_wrapping_for_user(
+            user,
+            provider_name,
+            provider_user_id,
+            plaintext_seed,
+        )?;
+
         self.db.upsert_user_seed_wrapping(new_wrapping)?;
         Ok(())
+    }
+
+    pub fn create_user_with_oauth_seed_wrap(
+        &self,
+        new_user: NewUser,
+        provider_id: i32,
+        provider_name: &str,
+        provider_user_id: &str,
+        access_token_enc: Vec<u8>,
+        plaintext_seed: &[u8],
+    ) -> Result<User, Error> {
+        let conn = &mut self
+            .db
+            .get_pool()
+            .get()
+            .map_err(|_| Error::DatabaseError(DBError::ConnectionError))?;
+
+        conn.transaction::<_, CreateUserSeedWrapTransactionError, _>(|conn| {
+            let user = new_user.insert(conn)?;
+
+            let new_connection = NewUserOAuthConnection {
+                user_id: user.uuid,
+                provider_id,
+                provider_user_id: provider_user_id.to_string(),
+                access_token_enc,
+                refresh_token_enc: None,
+                expires_at: None,
+            };
+            new_connection.insert(conn)?;
+
+            let new_wrapping = self.new_oauth_seed_wrapping_for_user(
+                &user,
+                provider_name,
+                provider_user_id,
+                plaintext_seed,
+            )?;
+            new_wrapping.upsert_by_credential(conn)?;
+
+            let new_verification = NewEmailVerification::new(user.uuid, 24, true);
+            new_verification.insert(conn)?;
+
+            Ok(user)
+        })
+        .map_err(Error::from)
     }
 
     fn verify_new_oauth_seed_wrapping_for_user(

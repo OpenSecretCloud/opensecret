@@ -1,4 +1,5 @@
 use crate::apple_signin::{generate_apple_client_secret, validate_apple_native_token};
+use crate::encrypt::encrypt_with_key;
 use crate::models::oauth::{NewUserOAuthConnection, UserOAuthConnection};
 use crate::oauth::OAuthState;
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
@@ -10,7 +11,6 @@ use crate::GithubProvider;
 use crate::GoogleProvider;
 use crate::{decrypt_with_key, private_key::generate_twelve_word_seed};
 use crate::{encrypt, DBError};
-use crate::{encrypt::encrypt_with_key, models::email_verification::NewEmailVerification};
 use crate::{
     jwt::{AuthContext, NewToken, TokenType},
     models::{
@@ -1244,40 +1244,23 @@ async fn find_or_create_user_from_oauth(
             let new_user = NewUser::new(Some(email), None, project_id, encrypted_key)
                 .with_name(user_name.unwrap_or_default());
 
-            let user = app_state.db.create_user(new_user).map_err(|e| {
-                error!("Failed to create new user: {:?}", e);
-                ApiError::InternalServerError
-            })?;
+            let encrypted_access_token = if !access_token.is_empty() {
+                encrypt_access_token(app_state, &access_token).await?
+            } else {
+                Vec::new()
+            };
 
-            // Create connection for the new user
-            create_provider_connection(
-                app_state,
-                &user,
-                provider.id,
-                provider_user_id.clone(),
-                &access_token,
-            )
-            .await?;
-
-            app_state
-                .create_oauth_seed_wrap_for_user(
-                    &user,
+            let user = app_state
+                .create_user_with_oauth_seed_wrap(
+                    new_user,
+                    provider.id,
                     provider_name,
                     &provider_user_id,
+                    encrypted_access_token,
                     user_seed_words.as_bytes(),
                 )
                 .map_err(|e| {
-                    error!("Failed to create OAuth seed wrap: {:?}", e);
-                    ApiError::InternalServerError
-                })?;
-
-            // Create email verification entry as already verified
-            let new_verification = NewEmailVerification::new(user.uuid, 24, true);
-            app_state
-                .db
-                .create_email_verification(new_verification)
-                .map_err(|e| {
-                    error!("Error creating email verification: {:?}", e);
+                    error!("Failed to create new OAuth user and seed wrap: {:?}", e);
                     ApiError::InternalServerError
                 })?;
 
@@ -1549,6 +1532,7 @@ mod tests {
         db::setup_db,
         encrypt::encrypt_with_key,
         models::{org_projects::OrgProject, schema::org_projects},
+        seed_wrapping::CredentialKind,
         AppMode, AppStateBuilder,
     };
     use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
@@ -1613,6 +1597,82 @@ mod tests {
         );
 
         let _ = app_state.db.delete_user(&user);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+    async fn db_oauth_new_user_creates_initial_seed_wrap_and_login_works() {
+        let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+            eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let app_state = build_local_test_app_state(database_url).await;
+        let project = first_active_project(&app_state);
+        let marker = Uuid::new_v4();
+        let email = format!("aead-oauth-registration-{marker}@example.com");
+        let provider_subject = format!("google-sub-{marker}");
+
+        let authenticated_user = find_or_create_user_from_oauth(
+            &app_state,
+            Some(email.clone()),
+            provider_subject.clone(),
+            "google",
+            "oauth-registration-access-token".to_string(),
+            Some("OAuth Registration Test".to_string()),
+            project.id,
+        )
+        .await
+        .expect("new OAuth registration should create user and auth context");
+
+        assert_eq!(authenticated_user.user.get_email(), Some(email.as_str()));
+
+        let google_provider = app_state
+            .db
+            .get_oauth_provider_by_name("google")
+            .expect("test OAuth provider lookup should succeed")
+            .expect("test OAuth provider should exist after AppState build");
+        let connection = app_state
+            .db
+            .get_project_user_oauth_connection_by_provider_subject(
+                google_provider.id,
+                &provider_subject,
+                project.id,
+            )
+            .expect("new OAuth provider subject should load")
+            .expect("new OAuth provider subject should be connected");
+        assert_eq!(connection.user_id, authenticated_user.user.uuid);
+
+        let verification = app_state
+            .db
+            .get_email_verification_by_user_id(authenticated_user.user.uuid)
+            .expect("new OAuth user should have a verified email row");
+        assert!(
+            verification.is_verified,
+            "OAuth-created users should have verified email rows"
+        );
+
+        let oauth_wraps = app_state
+            .db
+            .get_user_seed_wrappings_for_user_and_kind(
+                authenticated_user.user.uuid,
+                CredentialKind::OAuth.as_str(),
+            )
+            .expect("new OAuth user's seed wraps should load");
+        assert_eq!(
+            oauth_wraps.len(),
+            1,
+            "OAuth registration should commit exactly one initial OAuth seed wrap"
+        );
+
+        app_state
+            .verify_seed_wrap_for_auth_context(
+                &authenticated_user.user,
+                &authenticated_user.auth_context,
+            )
+            .expect("new OAuth auth context should unwrap the committed seed wrap");
+
+        let _ = app_state.db.delete_user(&authenticated_user.user);
     }
 
     async fn build_local_test_app_state(database_url: String) -> AppState {

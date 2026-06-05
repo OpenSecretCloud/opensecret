@@ -203,6 +203,97 @@ fn seed_wrap_translation_startup_path_is_feature_gated() {
     }
 }
 
+#[test]
+fn user_password_reset_uses_mac_lookup_and_destructive_reseed() {
+    let main_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+    let contents = fs::read_to_string(&main_source).expect("main source should be readable");
+    let create_body = extract_function_body(&contents, "async fn create_password_reset_request");
+    let confirm_body = extract_function_body(&contents, "async fn confirm_password_reset");
+
+    for required_pattern in [
+        "password_reset_code_mac(",
+        "NewPasswordResetRequest::new(",
+        "reset_code_mac.to_vec()",
+    ] {
+        assert!(
+            create_body.contains(required_pattern),
+            "password reset request creation must contain `{required_pattern}`"
+        );
+    }
+
+    for required_pattern in [
+        "password_reset_code_mac(",
+        "get_password_reset_request_by_user_id_and_code(user.uuid, reset_code_mac.to_vec())",
+        "generate_twelve_word_seed",
+        "complete_destructive_password_reset(",
+    ] {
+        assert!(
+            confirm_body.contains(required_pattern),
+            "password reset confirm must contain `{required_pattern}`"
+        );
+    }
+
+    for forbidden_pattern in [
+        "encrypt_with_key(&secret_key, alphanumeric_code",
+        "encrypt_with_key(&secret_key, alphanumeric_code.as_bytes())",
+    ] {
+        assert!(
+            !create_body.contains(forbidden_pattern),
+            "user password reset must not store portable encrypted reset codes via `{forbidden_pattern}`"
+        );
+    }
+}
+
+#[test]
+fn oauth_login_uses_verified_project_scoped_subject_and_pre_token_unwrap() {
+    let oauth_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/oauth_routes.rs");
+    let contents =
+        fs::read_to_string(&oauth_source).expect("OAuth route source should be readable");
+    let shared_oauth_body =
+        extract_function_body(&contents, "async fn find_or_create_user_from_oauth");
+    let authenticated_body = extract_function_body(&contents, "fn authenticated_oauth_user");
+    let apple_native_body =
+        extract_function_body(&contents, "pub async fn handle_apple_native_signin");
+
+    for required_pattern in [
+        "get_project_user_oauth_connection_by_provider_subject(",
+        "provider.id",
+        "&provider_user_id",
+        "project_id",
+        "update_provider_connection(app_state, &existing_connection, &access_token)",
+        "authenticated_oauth_user(app_state, user, provider_name, &provider_user_id)",
+    ] {
+        assert!(
+            shared_oauth_body.contains(required_pattern),
+            "shared OAuth flow must contain `{required_pattern}`"
+        );
+    }
+
+    for required_pattern in [
+        "oauth_auth_context_for_user(&user, provider_name, provider_user_id)",
+        "verify_seed_wrap_for_auth_context(&user, &auth_context)",
+    ] {
+        assert!(
+            authenticated_body.contains(required_pattern),
+            "OAuth token issuance must contain `{required_pattern}`"
+        );
+    }
+
+    for required_pattern in [
+        "get_project_user_oauth_connection_by_provider_subject(",
+        "apple_provider.id",
+        "&verified_user_id",
+        "project.id",
+        "update_provider_connection(&app_state, &connection, &access_token)",
+        "authenticated_oauth_user(&app_state, user, \"apple\", &verified_user_id)",
+    ] {
+        assert!(
+            apple_native_body.contains(required_pattern),
+            "Apple native OAuth flow must contain `{required_pattern}`"
+        );
+    }
+}
+
 fn collect_forbidden_legacy_seed_matches(
     path: &Path,
     forbidden_patterns: &[&str],

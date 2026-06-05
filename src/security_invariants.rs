@@ -269,6 +269,7 @@ fn user_password_reset_uses_mac_lookup_and_destructive_reseed() {
         "password_reset_code_mac(",
         "get_password_reset_request_by_user_id_and_code(user.uuid, reset_code_mac.to_vec())",
         "generate_twelve_word_seed",
+        "verify_new_password_seed_wrapping_for_user(",
         "complete_destructive_password_reset(",
     ] {
         assert!(

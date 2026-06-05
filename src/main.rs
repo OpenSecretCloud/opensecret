@@ -908,6 +908,34 @@ impl AppState {
         ))
     }
 
+    fn verify_new_password_seed_wrapping_for_user(
+        &self,
+        user: &User,
+        decrypted_password_verifier: &str,
+        plaintext_seed: &[u8],
+        new_wrapping: &NewUserSeedWrapping,
+    ) -> Result<(), Error> {
+        let auth_binding =
+            self.password_auth_binding_for_user(user, decrypted_password_verifier)?;
+        let decrypted_seed = decrypt_seed_v1(
+            &self.enclave_key,
+            &new_wrapping.seed_enc,
+            user.uuid,
+            user.project_id,
+            CredentialKind::Password,
+            &auth_binding,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        if decrypted_seed != plaintext_seed {
+            return Err(Error::EncryptionError(
+                "New password seed wrap verification failed".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     fn create_password_seed_wrap_for_user(
         &self,
         user: &User,
@@ -1460,6 +1488,12 @@ impl AppState {
                     &user,
                     &password_hash,
                     user_seed_words.as_bytes(),
+                )?;
+                self.verify_new_password_seed_wrapping_for_user(
+                    &user,
+                    &password_hash,
+                    user_seed_words.as_bytes(),
+                    &new_wrapping,
                 )?;
 
                 self.db.complete_destructive_password_reset(

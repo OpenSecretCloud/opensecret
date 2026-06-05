@@ -973,6 +973,16 @@ async fn db_destructive_password_reset_invalidates_old_auth_context_and_rotates_
         .get_user_key(&old_login.user, &old_login.auth_context, None, None)
         .await
         .expect("old key should derive before destructive reset");
+    let legacy_secret_key = SecretKey::from_slice(&app_state.enclave_key)
+        .expect("test enclave key should be a valid legacy SecretKey");
+    let old_legacy_seed = decrypt_with_key(
+        &legacy_secret_key,
+        old_login
+            .user
+            .seed_encrypted()
+            .expect("old user should have legacy seed for rollback"),
+    )
+    .expect("old legacy seed should decrypt before destructive reset");
 
     insert_valid_reset_request_for_user(&app_state, project.id, &user, reset_code, &reset_secret);
     app_state
@@ -1026,6 +1036,26 @@ async fn db_destructive_password_reset_invalidates_old_auth_context_and_rotates_
         old_key.secret_bytes(),
         new_key.secret_bytes(),
         "destructive password reset must rotate the user seed"
+    );
+
+    let new_authenticated_seed = app_state
+        .decrypt_seed_for_auth_context(&new_password_login.user, &new_password_login.auth_context)
+        .expect("new auth context should unwrap new seed after destructive reset");
+    assert_ne!(
+        old_legacy_seed, new_authenticated_seed,
+        "destructive reset must generate a fresh seed"
+    );
+    let new_legacy_seed = decrypt_with_key(
+        &legacy_secret_key,
+        new_password_login
+            .user
+            .seed_encrypted()
+            .expect("reset should preserve rollback legacy seed column"),
+    )
+    .expect("new legacy seed should decrypt after destructive reset");
+    assert_eq!(
+        new_legacy_seed, new_authenticated_seed,
+        "destructive reset must overwrite legacy users.seed_enc with the new authenticated seed"
     );
 
     let api_keys_after_reset = app_state

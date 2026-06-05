@@ -86,6 +86,7 @@ mod oauth;
 mod os_flags;
 mod private_key;
 mod proxy_config;
+mod seed_wrapping;
 mod sqs;
 mod tokens;
 mod web;

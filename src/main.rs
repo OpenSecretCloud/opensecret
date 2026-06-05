@@ -94,6 +94,8 @@ mod oauth;
 mod os_flags;
 mod private_key;
 mod proxy_config;
+#[cfg(test)]
+mod security_invariants;
 mod seed_wrapping;
 mod sqs;
 mod tokens;

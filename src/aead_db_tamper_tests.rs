@@ -7,6 +7,7 @@ use crate::{
         org_projects::OrgProject,
         password_reset::NewPasswordResetRequest,
         schema::{org_projects, user_oauth_connections, users},
+        user_kv::{NewUserKV, UserKV},
         user_seed_wrappings::NewUserSeedWrapping,
         users::{NewUser, User},
     },
@@ -222,6 +223,96 @@ async fn db_legacy_seed_substitution_does_not_change_authenticated_attacker_key(
         attacker_key_before.secret_bytes(),
         attacker_key_after.secret_bytes(),
         "copied legacy users.seed_enc must not affect authenticated attacker seed unwrap"
+    );
+
+    let _ = app_state.db.delete_user(&victim);
+    let _ = app_state.db.delete_user(&attacker);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_copied_kv_rows_do_not_decrypt_under_attacker_auth_context() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let victim_email = format!("aead-kv-copy-victim-{marker}@example.com");
+    let attacker_email = format!("aead-kv-copy-attacker-{marker}@example.com");
+    let victim_password = "victim-password-before-kv-copy";
+    let attacker_password = "attacker-password-before-kv-copy";
+
+    let victim = create_password_wrapped_user(
+        &app_state,
+        project.id,
+        victim_email.clone(),
+        victim_password,
+    )
+    .await;
+    let attacker = create_password_wrapped_user(
+        &app_state,
+        project.id,
+        attacker_email.clone(),
+        attacker_password,
+    )
+    .await;
+
+    let victim_login = app_state
+        .authenticate_user(
+            Some(victim_email),
+            None,
+            victim_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("victim login should not error")
+        .expect("victim password should verify and unwrap");
+    let attacker_login = app_state
+        .authenticate_user(
+            Some(attacker_email),
+            None,
+            attacker_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("attacker login should not error")
+        .expect("attacker password should verify and unwrap");
+
+    app_state
+        .put(
+            &victim_login.user,
+            &victim_login.auth_context,
+            "copied-kv-secret".to_string(),
+            "victim plaintext must not leak".to_string(),
+        )
+        .await
+        .expect("victim KV insert should succeed");
+
+    copy_victim_kv_rows_to_attacker(&app_state, &victim, &attacker);
+
+    let attacker_list = app_state
+        .list(&attacker_login.user, &attacker_login.auth_context)
+        .await;
+
+    assert!(
+        matches!(attacker_list, Err(crate::kv::StoreError::DecryptionError)),
+        "copied victim KV ciphertext must fail under the attacker's authenticated user key"
+    );
+
+    let attacker_get = app_state
+        .get(
+            &attacker_login.user,
+            &attacker_login.auth_context,
+            "copied-kv-secret".to_string(),
+        )
+        .await
+        .expect("attacker get should not error for a missing attacker-encrypted key");
+    assert!(
+        attacker_get.is_none(),
+        "attacker lookup with the plaintext key must not match the copied victim encrypted key"
     );
 
     let _ = app_state.db.delete_user(&victim);
@@ -895,6 +986,26 @@ fn copy_victim_legacy_seed_to_attacker(app_state: &AppState, victim: &User, atta
         updated_rows, 1,
         "DB tamper precondition should update exactly one attacker user row"
     );
+}
+
+fn copy_victim_kv_rows_to_attacker(app_state: &AppState, victim: &User, attacker: &User) {
+    let conn = &mut app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("test database connection should be available");
+    let victim_rows = UserKV::get_all_for_user(conn, victim.uuid)
+        .expect("victim KV rows should load before copy");
+    assert!(
+        !victim_rows.is_empty(),
+        "DB tamper precondition requires at least one victim KV row"
+    );
+
+    for row in victim_rows {
+        NewUserKV::new(attacker.uuid, row.key_enc, row.value_enc)
+            .insert(conn)
+            .expect("copied victim KV row should insert for attacker");
+    }
 }
 
 fn remap_attacker_oauth_connection_to_victim(

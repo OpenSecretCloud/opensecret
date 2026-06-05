@@ -11,6 +11,23 @@ const LEGACY_SEED_PATTERNS: &[&str] = &[
     "decrypt_and_derive_bip85_mnemonic",
 ];
 
+const DESTRUCTIVE_RESET_REQUIRED_TABLES: &[&str] = &[
+    "user_seed_wrappings",
+    "user_embeddings",
+    "agent_schedule_runs",
+    "agent_schedules",
+    "agents",
+    "notification_events",
+    "push_devices",
+    "memory_blocks",
+    "user_preferences",
+    "user_kv",
+    "user_instructions",
+    "conversation_projects",
+    "conversation_summaries",
+    "conversations",
+];
+
 #[test]
 fn request_time_paths_do_not_use_legacy_seed_decrypt_helpers() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -109,6 +126,46 @@ fn legacy_token_constructor_is_only_used_for_third_party_tokens() {
 
     assert!(third_party_body.contains("NewToken::new("));
     assert!(third_party_body.contains("TokenType::ThirdParty"));
+}
+
+#[test]
+fn destructive_password_reset_wipes_user_key_encrypted_storage_roots() {
+    let db_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db.rs");
+    let contents = fs::read_to_string(&db_source).expect("DB source should be readable");
+    let reset_marker = "debug!(\"Completing destructive password reset\");";
+    let reset_marker_index = contents.find(reset_marker).unwrap_or_else(|| {
+        panic!("destructive reset implementation should contain `{reset_marker}`")
+    });
+    let implementation_start = contents[..reset_marker_index]
+        .rfind("fn complete_destructive_password_reset")
+        .expect("destructive reset implementation signature should exist");
+    let reset_body = extract_function_body(
+        &contents[implementation_start..],
+        "fn complete_destructive_password_reset",
+    );
+
+    for table_name in DESTRUCTIVE_RESET_REQUIRED_TABLES {
+        assert!(
+            reset_body.contains(&format!("{table_name}::table")),
+            "destructive reset must delete from `{table_name}`"
+        );
+        assert!(
+            reset_body.contains(&format!("{table_name}::user_id.eq(user_id)")),
+            "destructive reset must scope `{table_name}` deletion to user_id"
+        );
+    }
+
+    for required_pattern in [
+        "users::password_enc.eq(Some(new_password_enc))",
+        "users::seed_enc.eq(Some(new_legacy_seed_enc))",
+        "new_wrapping.upsert_by_credential(conn)",
+        "reset_request.mark_as_reset(conn)",
+    ] {
+        assert!(
+            reset_body.contains(required_pattern),
+            "destructive reset must contain `{required_pattern}`"
+        );
+    }
 }
 
 fn collect_forbidden_legacy_seed_matches(

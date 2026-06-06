@@ -48,6 +48,7 @@ use crate::models::{
     email_verification::{EmailVerification, EmailVerificationError, NewEmailVerification},
     org_memberships::OrgRole,
 };
+use crate::seed_wrapping::CredentialKind;
 use chrono::{DateTime, Utc};
 use diesel::{
     pg::PgConnection,
@@ -968,7 +969,12 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         conn.transaction::<_, DBError, _>(|conn| {
             user.update_password(conn, Some(new_password_enc))?;
-            new_wrapping.upsert_by_credential(conn)?;
+            UserSeedWrapping::delete_for_user_and_kind(
+                conn,
+                user.uuid,
+                CredentialKind::Password.as_str(),
+            )?;
+            new_wrapping.insert(conn)?;
             Ok(())
         })
     }
@@ -997,8 +1003,8 @@ impl DBConnection for PostgresConnection {
         use crate::models::schema::{
             agent_schedule_runs, agent_schedules, agents, conversation_projects,
             conversation_summaries, conversations, memory_blocks, notification_events,
-            push_devices, user_embeddings, user_instructions, user_kv, user_preferences,
-            user_seed_wrappings, users,
+            password_reset_requests, push_devices, user_embeddings, user_instructions, user_kv,
+            user_preferences, user_seed_wrappings, users,
         };
 
         debug!("Completing destructive password reset");
@@ -1011,6 +1017,28 @@ impl DBConnection for PostgresConnection {
                 .filter(users::uuid.eq(user_id))
                 .for_update()
                 .first::<User>(conn)?;
+
+            let consumed_reset_count = diesel::update(
+                password_reset_requests::table
+                    .filter(password_reset_requests::id.eq(reset_request.id))
+                    .filter(password_reset_requests::user_id.eq(user_id))
+                    .filter(password_reset_requests::is_reset.eq(false))
+                    .filter(password_reset_requests::expiration_time.gt(diesel::dsl::now)),
+            )
+            .set(password_reset_requests::is_reset.eq(true))
+            .execute(conn)?;
+            if consumed_reset_count != 1 {
+                return Err(DBError::PasswordResetRequestNotFound);
+            }
+
+            diesel::update(
+                password_reset_requests::table
+                    .filter(password_reset_requests::user_id.eq(user_id))
+                    .filter(password_reset_requests::id.ne(reset_request.id))
+                    .filter(password_reset_requests::is_reset.eq(false)),
+            )
+            .set(password_reset_requests::is_reset.eq(true))
+            .execute(conn)?;
 
             diesel::delete(
                 user_seed_wrappings::table.filter(user_seed_wrappings::user_id.eq(user_id)),
@@ -1058,7 +1086,6 @@ impl DBConnection for PostgresConnection {
                 .execute(conn)?;
 
             new_wrapping.upsert_by_credential(conn)?;
-            reset_request.mark_as_reset(conn)?;
 
             Ok(())
         })
@@ -1183,7 +1210,12 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         conn.transaction::<_, DBError, _>(|conn| {
             user.update(conn)?;
-            new_wrapping.upsert_by_credential(conn)?;
+            UserSeedWrapping::delete_for_user_and_kind(
+                conn,
+                user.uuid,
+                CredentialKind::Password.as_str(),
+            )?;
+            new_wrapping.insert(conn)?;
             Ok(())
         })
     }

@@ -12,8 +12,9 @@ use crate::{
             NewToolOutput, NewUserMessage, ResponseStatus,
         },
         schema::{
-            assistant_messages, conversations, org_projects, reasoning_items, responses,
-            tool_calls, tool_outputs, user_messages, user_oauth_connections, users,
+            assistant_messages, conversations, org_projects, password_reset_requests,
+            reasoning_items, responses, tool_calls, tool_outputs, user_messages,
+            user_oauth_connections, user_seed_wrappings, users,
         },
         user_api_keys::NewUserApiKey,
         user_kv::{NewUserKV, UserKV},
@@ -629,6 +630,78 @@ async fn db_password_change_invalidates_old_auth_context_and_preserves_seed() {
 
 #[tokio::test]
 #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_password_change_deletes_tampered_stale_password_wraps() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let email = format!("aead-password-change-stale-wrap-{marker}@example.com");
+    let old_password = "old-password-before-stale-wrap-change";
+    let new_password = "new-password-after-stale-wrap-change";
+
+    let user =
+        create_password_wrapped_user(&app_state, project.id, email.clone(), old_password).await;
+
+    let old_login = app_state
+        .authenticate_user(
+            Some(email.clone()),
+            None,
+            old_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("old password login should not error")
+        .expect("old password login should verify and unwrap");
+
+    tamper_password_wrap_lookup_hash(&app_state, &user, marker.as_bytes().to_vec());
+
+    app_state
+        .update_user_password_and_seed_wrap(
+            &old_login.user,
+            &old_login.auth_context,
+            new_password.to_string(),
+        )
+        .await
+        .expect("password change should delete stale wraps and rewrap seed");
+
+    let old_context_after_change =
+        app_state.verify_seed_wrap_for_auth_context(&old_login.user, &old_login.auth_context);
+    assert!(
+        matches!(old_context_after_change, Err(Error::AuthenticationError)),
+        "old auth context must not unwrap after lookup-hash-tampered password wrap replacement"
+    );
+
+    let password_wraps = app_state
+        .db
+        .get_user_seed_wrappings_for_user_and_kind(user.uuid, CredentialKind::Password.as_str())
+        .expect("post-change password wraps should load");
+    assert_eq!(
+        password_wraps.len(),
+        1,
+        "password change must delete every existing password wrap before inserting the replacement"
+    );
+
+    let new_password_login = app_state
+        .authenticate_user(Some(email), None, new_password.to_string(), project.id)
+        .await
+        .expect("new password login should not error")
+        .expect("new password should verify and unwrap");
+    app_state
+        .verify_seed_wrap_for_auth_context(
+            &new_password_login.user,
+            &new_password_login.auth_context,
+        )
+        .expect("new auth context should unwrap the replacement wrap");
+
+    let _ = app_state.db.delete_user(&user);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
 async fn db_guest_conversion_invalidates_old_auth_context_and_preserves_seed() {
     let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
         eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
@@ -1077,6 +1150,111 @@ async fn db_destructive_password_reset_invalidates_old_auth_context_and_rotates_
         remaining_wraps.len(),
         1,
         "destructive reset should leave exactly one password seed wrap"
+    );
+
+    let _ = app_state.db.delete_user(&user);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_destructive_password_reset_consumes_other_active_reset_requests() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let email = format!("aead-reset-consumes-stale-{marker}@example.com");
+    let old_password = "old-password-before-reset-consume";
+    let first_new_password = "new-password-after-first-reset-consume";
+    let second_new_password = "new-password-after-stale-reset-consume";
+    let first_reset_code = "CONSUME1";
+    let first_reset_secret = format!("first-reset-secret-{marker}");
+    let stale_reset_code = "CONSUME2";
+    let stale_reset_secret = format!("stale-reset-secret-{marker}");
+
+    let user =
+        create_password_wrapped_user(&app_state, project.id, email.clone(), old_password).await;
+
+    insert_valid_reset_request_for_user(
+        &app_state,
+        project.id,
+        &user,
+        first_reset_code,
+        &first_reset_secret,
+    );
+    insert_valid_reset_request_for_user(
+        &app_state,
+        project.id,
+        &user,
+        stale_reset_code,
+        &stale_reset_secret,
+    );
+    assert_eq!(
+        active_password_reset_request_count(&app_state, user.uuid),
+        2,
+        "test setup should create two active reset requests"
+    );
+
+    app_state
+        .confirm_password_reset(
+            email.clone(),
+            first_reset_code.to_string(),
+            first_reset_secret,
+            first_new_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("first destructive password reset should complete");
+
+    assert_eq!(
+        active_password_reset_request_count(&app_state, user.uuid),
+        0,
+        "successful destructive reset must invalidate every other active reset request"
+    );
+
+    let stale_reset_result = app_state
+        .confirm_password_reset(
+            email.clone(),
+            stale_reset_code.to_string(),
+            stale_reset_secret,
+            second_new_password.to_string(),
+            project.id,
+        )
+        .await;
+    assert!(
+        matches!(stale_reset_result, Err(Error::InvalidPasswordResetRequest)),
+        "stale reset credential must not trigger a second destructive reset"
+    );
+
+    let first_new_login = app_state
+        .authenticate_user(
+            Some(email.clone()),
+            None,
+            first_new_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("first new password login should not error")
+        .expect("first new password should still authenticate");
+    app_state
+        .verify_seed_wrap_for_auth_context(&first_new_login.user, &first_new_login.auth_context)
+        .expect("first reset password auth context should still unwrap");
+
+    let stale_new_password_login = app_state
+        .authenticate_user(
+            Some(email),
+            None,
+            second_new_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("stale reset password login should not error");
+    assert!(
+        stale_new_password_login.is_none(),
+        "stale reset attempt must not rotate the account to the stale new password"
     );
 
     let _ = app_state.db.delete_user(&user);
@@ -1563,6 +1741,41 @@ fn insert_valid_reset_request_for_user(
         .db
         .create_password_reset_request(request)
         .expect("valid reset request row should insert");
+}
+
+fn active_password_reset_request_count(app_state: &AppState, user_id: Uuid) -> i64 {
+    let conn = &mut app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("test database connection should be available");
+
+    password_reset_requests::table
+        .filter(password_reset_requests::user_id.eq(user_id))
+        .filter(password_reset_requests::is_reset.eq(false))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("active password reset request count should query")
+}
+
+fn tamper_password_wrap_lookup_hash(app_state: &AppState, user: &User, new_lookup_hash: Vec<u8>) {
+    let conn = &mut app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("test database connection should be available");
+
+    let updated_rows = diesel::update(user_seed_wrappings::table)
+        .filter(user_seed_wrappings::user_id.eq(user.uuid))
+        .filter(user_seed_wrappings::credential_kind.eq(CredentialKind::Password.as_str()))
+        .set(user_seed_wrappings::credential_lookup_hash.eq(new_lookup_hash))
+        .execute(conn)
+        .expect("tampered password wrap lookup hash should update");
+
+    assert_eq!(
+        updated_rows, 1,
+        "DB tamper precondition should mutate exactly one password seed wrap"
+    );
 }
 
 fn copy_victim_seed_wrap_ciphertext_to_attacker(

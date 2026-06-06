@@ -276,7 +276,13 @@ fn destructive_password_reset_wipes_user_key_encrypted_storage_roots() {
         "users::password_enc.eq(Some(new_password_enc))",
         "users::seed_enc.eq(Some(new_legacy_seed_enc))",
         "new_wrapping.upsert_by_credential(conn)",
-        "reset_request.mark_as_reset(conn)",
+        "password_reset_requests::id.eq(reset_request.id)",
+        "password_reset_requests::user_id.eq(user_id)",
+        "password_reset_requests::is_reset.eq(false)",
+        "password_reset_requests::expiration_time.gt(diesel::dsl::now)",
+        "if consumed_reset_count != 1",
+        "DBError::PasswordResetRequestNotFound",
+        "password_reset_requests::id.ne(reset_request.id)",
     ] {
         assert!(
             reset_body.contains(required_pattern),
@@ -548,6 +554,8 @@ fn oauth_login_uses_verified_project_scoped_subject_and_pre_token_unwrap() {
 fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
     let main_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
     let main_contents = fs::read_to_string(&main_source).expect("main source should be readable");
+    let db_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/db.rs");
+    let db_contents = fs::read_to_string(&db_source).expect("DB source should be readable");
     let protected_source =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/protected_routes.rs");
     let protected_contents =
@@ -598,6 +606,27 @@ fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
         );
     }
 
+    let password_update_start = db_contents
+        .rfind("fn update_user_password_and_seed_wrap")
+        .expect("password seed-wrap update implementation signature should exist");
+    let password_update_db = extract_function_body(
+        &db_contents[password_update_start..],
+        "fn update_user_password_and_seed_wrap",
+    );
+    assert_patterns_in_order(
+        password_update_db,
+        &[
+            "user.update_password(conn, Some(new_password_enc))",
+            "UserSeedWrapping::delete_for_user_and_kind(",
+            "CredentialKind::Password.as_str()",
+            "new_wrapping.insert(conn)",
+        ],
+    );
+    assert!(
+        !password_update_db.contains("new_wrapping.upsert_by_credential(conn)"),
+        "password change must delete all password wraps before inserting the replacement, not rely on DB-controlled lookup-hash upsert"
+    );
+
     let guest_conversion_route =
         extract_function_body(&protected_contents, "pub async fn convert_guest_to_email");
     assert!(
@@ -637,6 +666,27 @@ fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
             "guest conversion helper must contain `{required_pattern}`"
         );
     }
+
+    let guest_update_start = db_contents
+        .rfind("fn update_user_and_seed_wrap")
+        .expect("guest seed-wrap update implementation signature should exist");
+    let guest_update_db = extract_function_body(
+        &db_contents[guest_update_start..],
+        "fn update_user_and_seed_wrap",
+    );
+    assert_patterns_in_order(
+        guest_update_db,
+        &[
+            "user.update(conn)",
+            "UserSeedWrapping::delete_for_user_and_kind(",
+            "CredentialKind::Password.as_str()",
+            "new_wrapping.insert(conn)",
+        ],
+    );
+    assert!(
+        !guest_update_db.contains("new_wrapping.upsert_by_credential(conn)"),
+        "guest conversion must delete all password wraps before inserting the replacement, not rely on DB-controlled lookup-hash upsert"
+    );
 }
 
 #[test]

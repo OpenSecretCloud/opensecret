@@ -1562,8 +1562,9 @@ impl AppState {
         // Check if the user exists
         match self.db.get_user_by_email(email.clone(), project_id) {
             Ok(user) => {
-                // Only proceed with email if user has one
-                if user.get_email().is_some() {
+                // Only password-backed users can use the password reset flow. OAuth-only
+                // users recover by signing in with their linked OAuth provider.
+                if user.get_email().is_some() && user.password_enc.is_some() {
                     // User exists, proceed with the actual reset request
                     let reset_code_mac = password_reset_code_mac(
                         &self.enclave_key,
@@ -1622,7 +1623,7 @@ impl AppState {
         let user = self.db.get_user_by_email(email.clone(), project_id)?;
 
         // Verify user has an email
-        if user.get_email().is_none() {
+        if user.get_email().is_none() || user.password_enc.is_none() {
             return Err(Error::UserNotFound);
         }
 
@@ -1890,6 +1891,10 @@ impl AppState {
         auth_context: &AuthContext,
         new_password: String,
     ) -> Result<AuthContext, Error> {
+        let expected_password_enc = user
+            .password_enc
+            .as_deref()
+            .ok_or(Error::AuthenticationError)?;
         let plaintext_seed = self.decrypt_seed_for_auth_context(user, auth_context)?;
         let (password_hash, encrypted_password) =
             self.encrypt_user_password_verifier(new_password).await?;
@@ -1898,44 +1903,19 @@ impl AppState {
         let new_auth_context = self.password_auth_context_for_user(user, &password_hash)?;
 
         self.db
-            .update_user_password_and_seed_wrap(user, encrypted_password, new_wrapping)
-            .map_err(Error::from)?;
+            .update_user_password_and_seed_wrap(
+                user,
+                expected_password_enc,
+                encrypted_password,
+                new_wrapping,
+            )
+            .map_err(|err| match err {
+                DBError::StaleCredentialState => Error::AuthenticationError,
+                err => Error::from(err),
+            })?;
         self.verify_seed_wrap_for_auth_context(user, &new_auth_context)?;
 
         Ok(new_auth_context)
-    }
-
-    async fn convert_guest_to_email_and_seed_wrap(
-        &self,
-        user: &User,
-        auth_context: &AuthContext,
-        email: String,
-        password: String,
-        name: Option<String>,
-    ) -> Result<(User, AuthContext), Error> {
-        let plaintext_seed = self.decrypt_seed_for_auth_context(user, auth_context)?;
-        let (password_hash, encrypted_password) =
-            self.encrypt_user_password_verifier(password).await?;
-
-        let mut updated_user = user.clone();
-        updated_user.email = Some(email);
-        updated_user.password_enc = Some(encrypted_password);
-        updated_user.name = name;
-
-        let new_wrapping = self.new_password_seed_wrapping_for_user(
-            &updated_user,
-            &password_hash,
-            &plaintext_seed,
-        )?;
-        let new_auth_context =
-            self.password_auth_context_for_user(&updated_user, &password_hash)?;
-
-        self.db
-            .update_user_and_seed_wrap(&updated_user, new_wrapping)
-            .map_err(Error::from)?;
-        self.verify_seed_wrap_for_auth_context(&updated_user, &new_auth_context)?;
-
-        Ok((updated_user, new_auth_context))
     }
 
     async fn encrypt_user_password_verifier(

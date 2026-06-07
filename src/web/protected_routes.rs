@@ -30,7 +30,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::spawn;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use validator::Validate;
@@ -346,13 +345,6 @@ pub struct PublicKeyQuery {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ConvertGuestRequest {
-    pub email: String,
-    pub password: String,
-    pub name: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct ThirdPartyTokenRequest {
     pub audience: Option<String>,
 }
@@ -519,13 +511,6 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
         .route(
             "/protected/public_key",
             get(get_public_key).layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
-        )
-        .route(
-            "/protected/convert_guest",
-            post(convert_guest_to_email).layer(from_fn_with_state(
-                app_state.clone(),
-                decrypt_request::<ConvertGuestRequest>,
-            )),
         )
         .route(
             "/protected/third_party_token",
@@ -873,7 +858,10 @@ pub async fn change_password(
                 }
                 Err(e) => {
                     error!("Error changing password: {:?}", e);
-                    Err(ApiError::InternalServerError)
+                    match e {
+                        Error::AuthenticationError => Err(ApiError::InvalidUsernameOrPassword),
+                        _ => Err(ApiError::InternalServerError),
+                    }
                 }
             }
         }
@@ -1146,98 +1134,6 @@ pub async fn get_public_key(
     };
 
     debug!("Exiting get_public_key function");
-    encrypt_response(&data, &session_id, &response).await
-}
-
-pub async fn convert_guest_to_email(
-    State(data): State<Arc<AppState>>,
-    Extension(user): Extension<User>,
-    Extension(auth_context): Extension<AuthContext>,
-    Extension(convert_request): Extension<ConvertGuestRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering convert_guest_to_email function");
-
-    // Check if user is eligible for conversion
-    if !user.is_guest() {
-        error!("User already has an email address");
-        return Err(ApiError::BadRequest);
-    }
-
-    if user.password_enc.is_none() {
-        error!("OAuth users cannot be converted");
-        return Err(ApiError::BadRequest);
-    }
-
-    // Check if email is already taken
-    if data
-        .db
-        .get_user_by_email(convert_request.email.clone(), user.project_id)
-        .is_ok()
-    {
-        error!("Email address already in use");
-        return Err(ApiError::EmailAlreadyExists);
-    }
-
-    let (updated_user, new_auth_context) = data
-        .convert_guest_to_email_and_seed_wrap(
-            &user,
-            &auth_context,
-            convert_request.email,
-            convert_request.password,
-            convert_request.name,
-        )
-        .await
-        .map_err(|e| {
-            error!("Failed to convert guest user: {:?}", e);
-            ApiError::InternalServerError
-        })?;
-
-    // Create email verification entry
-    let new_verification = NewEmailVerification::new(updated_user.uuid, 24, false);
-    let verification = match data.db.create_email_verification(new_verification) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("Error creating email verification: {:?}", e);
-            return Err(ApiError::InternalServerError);
-        }
-    };
-
-    // Send verification email
-    if let Some(email) = updated_user.get_email() {
-        let email = email.to_string();
-        let verification_code = verification.verification_code;
-        let data = data.clone();
-        let project_id = updated_user.project_id;
-        spawn(async move {
-            if let Err(e) =
-                send_verification_email(&data, project_id, email, verification_code).await
-            {
-                tracing::error!("Could not send verification email: {e}");
-            }
-        });
-    }
-
-    let access_token = NewToken::new_with_auth_context(
-        &updated_user,
-        TokenType::Access,
-        &data,
-        &new_auth_context,
-    )?;
-    let refresh_token = NewToken::new_with_auth_context(
-        &updated_user,
-        TokenType::Refresh,
-        &data,
-        &new_auth_context,
-    )?;
-
-    let response = json!({
-        "message": "Successfully converted guest account to email account. Please check your email for verification.",
-        "access_token": access_token.token,
-        "refresh_token": refresh_token.token
-    });
-
-    debug!("Exiting convert_guest_to_email function");
     encrypt_response(&data, &session_id, &response).await
 }
 

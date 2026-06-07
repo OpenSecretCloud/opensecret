@@ -466,6 +466,7 @@ fn user_password_reset_uses_mac_lookup_and_destructive_reseed() {
     let confirm_body = extract_function_body(&contents, "async fn confirm_password_reset");
 
     for required_pattern in [
+        "user.password_enc.is_some()",
         "password_reset_code_mac(",
         "NewPasswordResetRequest::new(",
         "reset_code_mac.to_vec()",
@@ -477,6 +478,7 @@ fn user_password_reset_uses_mac_lookup_and_destructive_reseed() {
     }
 
     for required_pattern in [
+        "user.password_enc.is_none()",
         "password_reset_code_mac(",
         "get_password_reset_request_by_user_id_and_code(user.uuid, reset_code_mac.to_vec())",
         "generate_twelve_word_seed",
@@ -593,11 +595,15 @@ fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
         "async fn update_user_password_and_seed_wrap",
     );
     for required_pattern in [
+        "let expected_password_enc = user",
         "decrypt_seed_for_auth_context(user, auth_context)",
         "encrypt_user_password_verifier(new_password)",
         "new_password_seed_wrapping_for_user(user, &password_hash, &plaintext_seed)",
         "password_auth_context_for_user(user, &password_hash)",
-        ".update_user_password_and_seed_wrap(user, encrypted_password, new_wrapping)",
+        "expected_password_enc",
+        "encrypted_password",
+        "new_wrapping",
+        "DBError::StaleCredentialState => Error::AuthenticationError",
         "verify_seed_wrap_for_auth_context(user, &new_auth_context)",
     ] {
         assert!(
@@ -616,7 +622,10 @@ fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
     assert_patterns_in_order(
         password_update_db,
         &[
-            "user.update_password(conn, Some(new_password_enc))",
+            "users::password_enc.eq(Some(expected_password_enc.to_vec()))",
+            "users::password_enc.eq(Some(new_password_enc))",
+            "if updated_user_count != 1",
+            "DBError::StaleCredentialState",
             "UserSeedWrapping::delete_for_user_and_kind(",
             "CredentialKind::Password.as_str()",
             "new_wrapping.insert(conn)",
@@ -627,65 +636,12 @@ fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
         "password change must delete all password wraps before inserting the replacement, not rely on DB-controlled lookup-hash upsert"
     );
 
-    let guest_conversion_route =
-        extract_function_body(&protected_contents, "pub async fn convert_guest_to_email");
     assert!(
-        protected_contents.contains("Extension(auth_context): Extension<AuthContext>"),
-        "guest conversion route must require AuthContext extension"
-    );
-    for required_pattern in [
-        ".convert_guest_to_email_and_seed_wrap(",
-        "&auth_context",
-        "NewToken::new_with_auth_context(",
-        "TokenType::Access",
-        "TokenType::Refresh",
-        "&new_auth_context",
-    ] {
-        assert!(
-            guest_conversion_route.contains(required_pattern),
-            "guest conversion route must contain `{required_pattern}`"
-        );
-    }
-
-    let guest_conversion_helper = extract_function_body(
-        &main_contents,
-        "async fn convert_guest_to_email_and_seed_wrap",
-    );
-    for required_pattern in [
-        "decrypt_seed_for_auth_context(user, auth_context)",
-        "encrypt_user_password_verifier(password)",
-        "updated_user.email = Some(email)",
-        "updated_user.password_enc = Some(encrypted_password)",
-        "new_password_seed_wrapping_for_user(",
-        "password_auth_context_for_user(&updated_user, &password_hash)",
-        ".update_user_and_seed_wrap(&updated_user, new_wrapping)",
-        "verify_seed_wrap_for_auth_context(&updated_user, &new_auth_context)",
-    ] {
-        assert!(
-            guest_conversion_helper.contains(required_pattern),
-            "guest conversion helper must contain `{required_pattern}`"
-        );
-    }
-
-    let guest_update_start = db_contents
-        .rfind("fn update_user_and_seed_wrap")
-        .expect("guest seed-wrap update implementation signature should exist");
-    let guest_update_db = extract_function_body(
-        &db_contents[guest_update_start..],
-        "fn update_user_and_seed_wrap",
-    );
-    assert_patterns_in_order(
-        guest_update_db,
-        &[
-            "user.update(conn)",
-            "UserSeedWrapping::delete_for_user_and_kind(",
-            "CredentialKind::Password.as_str()",
-            "new_wrapping.insert(conn)",
-        ],
-    );
-    assert!(
-        !guest_update_db.contains("new_wrapping.upsert_by_credential(conn)"),
-        "guest conversion must delete all password wraps before inserting the replacement, not rely on DB-controlled lookup-hash upsert"
+        !protected_contents.contains("/protected/convert_guest")
+            && !protected_contents.contains("convert_guest_to_email")
+            && !main_contents.contains("convert_guest_to_email_and_seed_wrap")
+            && !db_contents.contains("update_user_and_seed_wrap"),
+        "guest conversion is intentionally unsupported; do not reintroduce it without revisiting the seed-wrap lifecycle"
     );
 }
 

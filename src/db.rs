@@ -38,6 +38,7 @@ use crate::models::responses::{
     ProjectInstructionUpdate, RawThreadMessage, RawThreadMessageMetadata, ReasoningItem, Response,
     ResponseStatus, ResponsesError, ToolCall, ToolOutput, UserInstruction, UserMessage,
 };
+use crate::models::schema::users;
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
 use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
 use crate::models::user_seed_wrappings::{
@@ -139,6 +140,8 @@ pub enum DBError {
     UserSeedWrappingError(#[from] UserSeedWrappingError),
     #[error("App data migration error: {0}")]
     AppDataMigrationError(#[from] AppDataMigrationError),
+    #[error("Credential state changed during update")]
+    StaleCredentialState,
 }
 
 #[allow(dead_code)]
@@ -211,6 +214,7 @@ pub trait DBConnection {
     fn update_user_password_and_seed_wrap(
         &self,
         user: &User,
+        expected_password_enc: &[u8],
         new_password_enc: Vec<u8>,
         new_wrapping: NewUserSeedWrapping,
     ) -> Result<(), DBError>;
@@ -291,12 +295,6 @@ pub trait DBConnection {
     fn create_token_usage(&self, new_usage: NewTokenUsage) -> Result<TokenUsage, DBError>;
 
     fn update_user(&self, user: &User) -> Result<(), DBError>;
-    fn update_user_and_seed_wrap(
-        &self,
-        user: &User,
-        new_wrapping: NewUserSeedWrapping,
-    ) -> Result<(), DBError>;
-
     // New org-related methods
     fn create_org(&self, new_org: NewOrg) -> Result<Org, DBError>;
     fn get_org_by_id(&self, id: i32) -> Result<Org, DBError>;
@@ -962,13 +960,27 @@ impl DBConnection for PostgresConnection {
     fn update_user_password_and_seed_wrap(
         &self,
         user: &User,
+        expected_password_enc: &[u8],
         new_password_enc: Vec<u8>,
         new_wrapping: NewUserSeedWrapping,
     ) -> Result<(), DBError> {
         debug!("Updating user password and password seed wrap");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         conn.transaction::<_, DBError, _>(|conn| {
-            user.update_password(conn, Some(new_password_enc))?;
+            let updated_user_count = diesel::update(
+                users::table
+                    .filter(users::uuid.eq(user.uuid))
+                    .filter(users::password_enc.eq(Some(expected_password_enc.to_vec()))),
+            )
+            .set((
+                users::password_enc.eq(Some(new_password_enc)),
+                users::updated_at.eq(diesel::dsl::now),
+            ))
+            .execute(conn)?;
+            if updated_user_count != 1 {
+                return Err(DBError::StaleCredentialState);
+            }
+
             UserSeedWrapping::delete_for_user_and_kind(
                 conn,
                 user.uuid,
@@ -1200,24 +1212,6 @@ impl DBConnection for PostgresConnection {
     fn update_user(&self, user: &User) -> Result<(), DBError> {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         user.update(conn).map_err(DBError::from)
-    }
-
-    fn update_user_and_seed_wrap(
-        &self,
-        user: &User,
-        new_wrapping: NewUserSeedWrapping,
-    ) -> Result<(), DBError> {
-        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        conn.transaction::<_, DBError, _>(|conn| {
-            user.update(conn)?;
-            UserSeedWrapping::delete_for_user_and_kind(
-                conn,
-                user.uuid,
-                CredentialKind::Password.as_str(),
-            )?;
-            new_wrapping.insert(conn)?;
-            Ok(())
-        })
     }
 
     // Org implementations

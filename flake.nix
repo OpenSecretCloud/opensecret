@@ -131,10 +131,10 @@
         '';
 
         # Function to create rootfs with specific APP_MODE
-        mkRootfs = appMode: pkgs.buildEnv {
+        mkRootfs = { appMode, opensecretPkg ? opensecret }: pkgs.buildEnv {
           name = "opensecret-rootfs-${appMode}";
           paths = [
-            opensecret
+            opensecretPkg
             (pkgs.writeScriptBin "entrypoint" ''
               #!${pkgs.bash}/bin/bash
 
@@ -176,7 +176,7 @@
 
               # Copy opensecret and continuum-proxy to their locations
               mkdir -p /app
-              install -m 755 ${opensecret}/bin/opensecret /app/
+              install -m 755 ${opensecretPkg}/bin/opensecret /app/
               install -m 755 ${continuum-proxy}/bin/continuum-proxy /app/
               install -m 755 ${tinfoil-proxy}/bin/tinfoil-proxy /app/
 
@@ -233,8 +233,8 @@
         };
 
         # Function to create EIF with specific APP_MODE
-        mkEif = appMode: nitro.buildEif {
-          name = "opensecret-eif-${appMode}";
+        mkEif = { appMode, opensecretPkg ? opensecret, nameSuffix ? "" }: nitro.buildEif {
+          name = "opensecret-eif-${appMode}${nameSuffix}";
           # The kernel image location varies by architecture
           kernel = if arch == "aarch64"
             then "${customKernel}/Image"  # ARM64 uses Image
@@ -245,13 +245,15 @@
           # NSM driver is built into kernel 6.8+, so we don't need the old module
           # Setting to null to skip loading the incompatible old module
           nsmKo = null;
-          copyToRoot = mkRootfs appMode;
+          copyToRoot = mkRootfs { inherit appMode opensecretPkg; };
           entrypoint = "/bin/entrypoint";
         };
 
-        # Build the main Rust package
-        opensecret = pkgs.rustPlatform.buildRustPackage {
-          pname = "opensecret";
+        # Build the main Rust package. The default package is the steady-state
+        # server; the seed-wrap translation package is intentionally separate so
+        # it can produce a distinct attested EIF/PCR.
+        mkOpensecret = { pnameSuffix ? "", cargoFeatures ? [] }: pkgs.rustPlatform.buildRustPackage {
+          pname = "opensecret${pnameSuffix}";
           version = "0.1.0";
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
@@ -274,6 +276,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
+          cargoBuildFeatures = cargoFeatures;
           nativeBuildInputs = [
             pkgs.pkg-config
             rustAnalyzer
@@ -287,6 +290,11 @@
             pkgs.diesel-cli
           ];
           LIBPQ_LIB_DIR = "${pkgs.postgresql.lib}/lib";
+        };
+        opensecret = mkOpensecret {};
+        opensecretSeedWrapTranslation = mkOpensecret {
+          pnameSuffix = "-seed-wrap-translation";
+          cargoFeatures = [ "seed-wrap-translation" ];
         };
 
         # Use pre-built NSM library and KMS tools from nitro-bins directory
@@ -447,10 +455,26 @@
       {
         packages = {
           default = opensecret;
+          "opensecret-seed-wrap-translation" = opensecretSeedWrapTranslation;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-          eif-dev = mkEif "dev";
-          eif-prod = mkEif "prod";
-          eif-preview = mkEif "preview";
+          eif-dev = mkEif { appMode = "dev"; };
+          eif-prod = mkEif { appMode = "prod"; };
+          eif-preview = mkEif { appMode = "preview"; };
+          "eif-dev-seed-wrap-translation" = mkEif {
+            appMode = "dev";
+            opensecretPkg = opensecretSeedWrapTranslation;
+            nameSuffix = "-seed-wrap-translation";
+          };
+          "eif-prod-seed-wrap-translation" = mkEif {
+            appMode = "prod";
+            opensecretPkg = opensecretSeedWrapTranslation;
+            nameSuffix = "-seed-wrap-translation";
+          };
+          "eif-preview-seed-wrap-translation" = mkEif {
+            appMode = "preview";
+            opensecretPkg = opensecretSeedWrapTranslation;
+            nameSuffix = "-seed-wrap-translation";
+          };
         };
 
         apps = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {

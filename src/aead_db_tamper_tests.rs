@@ -1,5 +1,5 @@
 use crate::{
-    db::setup_db,
+    db::{setup_db, DBError},
     encrypt::{decrypt_with_key, encrypt_with_key},
     generate_reset_hash,
     login_routes::RegisterCredentials,
@@ -702,7 +702,7 @@ async fn db_password_change_deletes_tampered_stale_password_wraps() {
 
 #[tokio::test]
 #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
-async fn db_guest_conversion_invalidates_old_auth_context_and_preserves_seed() {
+async fn db_password_change_cannot_commit_after_destructive_reset_rotates_seed() {
     let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
         eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
         return;
@@ -711,82 +711,99 @@ async fn db_guest_conversion_invalidates_old_auth_context_and_preserves_seed() {
     let app_state = build_local_test_app_state(database_url).await;
     let project = first_active_project(&app_state);
     let marker = Uuid::new_v4();
-    let guest_password = "guest-password-before-conversion";
-    let email_password = "email-password-after-guest-conversion";
-    let email = format!("aead-guest-conversion-{marker}@example.com");
+    let email = format!("aead-password-change-reset-race-{marker}@example.com");
+    let old_password = "old-password-before-reset-race";
+    let reset_password = "reset-password-after-reset-race";
+    let racing_password = "racing-password-after-stale-change";
+    let reset_code = "RACE0001";
+    let reset_secret = format!("reset-race-secret-{marker}");
 
-    let guest = create_guest_wrapped_user(&app_state, project.id, guest_password).await;
+    let user =
+        create_password_wrapped_user(&app_state, project.id, email.clone(), old_password).await;
 
-    let guest_login = app_state
+    let old_login = app_state
         .authenticate_user(
+            Some(email.clone()),
             None,
-            Some(guest.uuid),
-            guest_password.to_string(),
+            old_password.to_string(),
             project.id,
         )
         .await
-        .expect("guest login should not error")
-        .expect("guest password should verify and unwrap");
-    let guest_key_before = app_state
-        .get_user_key(&guest_login.user, &guest_login.auth_context, None, None)
+        .expect("old password login should not error")
+        .expect("old password login should verify and unwrap");
+    let old_seed = app_state
+        .decrypt_seed_for_auth_context(&old_login.user, &old_login.auth_context)
+        .expect("old auth context should unwrap before reset");
+    let expected_old_password_enc = old_login
+        .user
+        .password_enc
+        .clone()
+        .expect("password user should have old password verifier ciphertext");
+    let (racing_password_hash, racing_password_enc) = app_state
+        .encrypt_user_password_verifier(racing_password.to_string())
         .await
-        .expect("guest key should derive before conversion");
+        .expect("racing password verifier should encrypt");
+    let stale_racing_wrapping = app_state
+        .new_password_seed_wrapping_for_user(&old_login.user, &racing_password_hash, &old_seed)
+        .expect("stale racing password wrap should be constructible before reset");
 
-    let (updated_user, new_auth_context) = app_state
-        .convert_guest_to_email_and_seed_wrap(
-            &guest_login.user,
-            &guest_login.auth_context,
+    insert_valid_reset_request_for_user(&app_state, project.id, &user, reset_code, &reset_secret);
+    app_state
+        .confirm_password_reset(
             email.clone(),
-            email_password.to_string(),
-            Some("Converted Guest".to_string()),
+            reset_code.to_string(),
+            reset_secret,
+            reset_password.to_string(),
+            project.id,
         )
         .await
-        .expect("guest conversion should rewrap seed");
+        .expect("destructive reset should win the race and commit first");
 
-    let old_context_after_conversion =
-        app_state.verify_seed_wrap_for_auth_context(&guest_login.user, &guest_login.auth_context);
+    let stale_password_change_result = app_state.db.update_user_password_and_seed_wrap(
+        &old_login.user,
+        &expected_old_password_enc,
+        racing_password_enc,
+        stale_racing_wrapping,
+    );
     assert!(
         matches!(
-            old_context_after_conversion,
-            Err(Error::AuthenticationError)
+            stale_password_change_result,
+            Err(DBError::StaleCredentialState)
         ),
-        "old guest auth context must not unwrap after guest-to-email conversion"
+        "password change must fail if destructive reset changed the credential row after old auth proof"
     );
 
-    let old_guest_login_after_conversion = app_state
+    let old_context_after_reset =
+        app_state.verify_seed_wrap_for_auth_context(&old_login.user, &old_login.auth_context);
+    assert!(
+        matches!(old_context_after_reset, Err(Error::AuthenticationError)),
+        "old auth context must remain invalid after the stale password change is rejected"
+    );
+
+    let racing_login = app_state
         .authenticate_user(
+            Some(email.clone()),
             None,
-            Some(guest.uuid),
-            guest_password.to_string(),
+            racing_password.to_string(),
             project.id,
         )
         .await
-        .expect("old guest login after conversion should not error");
+        .expect("racing password login should not error");
     assert!(
-        old_guest_login_after_conversion.is_none(),
-        "old guest password must not authenticate after conversion"
+        racing_login.is_none(),
+        "rejected stale password change must not make the racing password valid"
     );
 
-    let email_login = app_state
-        .authenticate_user(Some(email), None, email_password.to_string(), project.id)
+    let reset_login = app_state
+        .authenticate_user(Some(email), None, reset_password.to_string(), project.id)
         .await
-        .expect("email login after conversion should not error")
-        .expect("email password should verify and unwrap after conversion");
-    let email_key_after = app_state
-        .get_user_key(&email_login.user, &email_login.auth_context, None, None)
-        .await
-        .expect("email key should derive after conversion");
-
+        .expect("reset password login should not error")
+        .expect("reset password should remain valid");
     app_state
-        .verify_seed_wrap_for_auth_context(&updated_user, &new_auth_context)
-        .expect("new auth context returned by guest conversion should unwrap");
-    assert_eq!(
-        guest_key_before.secret_bytes(),
-        email_key_after.secret_bytes(),
-        "guest-to-email conversion must preserve the existing user seed"
-    );
+        .verify_seed_wrap_for_auth_context(&reset_login.user, &reset_login.auth_context)
+        .expect("reset auth context should still unwrap");
 
-    let _ = app_state.db.delete_user(&updated_user);
+    let _ = app_state.db.delete_user(&user);
 }
 
 #[tokio::test]
@@ -1518,34 +1535,6 @@ async fn create_password_wrapped_user(
     app_state
         .create_password_seed_wrap_for_user(&user, &password_hash, user_seed_words.as_bytes())
         .expect("test user seed wrap should insert");
-
-    user
-}
-
-async fn create_guest_wrapped_user(app_state: &AppState, project_id: i32, password: &str) -> User {
-    let secret_key =
-        SecretKey::from_slice(&app_state.enclave_key).expect("test enclave key should be valid");
-    let password_hash = generate_hash(password);
-    let password_enc = encrypt_with_key(&secret_key, password_hash.as_bytes()).await;
-    let user_seed_words = generate_twelve_word_seed(app_state.aws_credential_manager.clone())
-        .await
-        .expect("test seed should generate")
-        .to_string();
-    let legacy_seed_enc = encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
-
-    let user = app_state
-        .db
-        .create_user(NewUser::new(
-            None,
-            Some(password_enc),
-            project_id,
-            legacy_seed_enc,
-        ))
-        .expect("test guest user should insert");
-
-    app_state
-        .create_password_seed_wrap_for_user(&user, &password_hash, user_seed_words.as_bytes())
-        .expect("test guest seed wrap should insert");
 
     user
 }

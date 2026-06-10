@@ -1016,7 +1016,7 @@ impl DBConnection for PostgresConnection {
             agent_schedule_runs, agent_schedules, agents, conversation_projects,
             conversation_summaries, conversations, memory_blocks, notification_events,
             password_reset_requests, push_devices, user_embeddings, user_instructions, user_kv,
-            user_preferences, user_seed_wrappings, users,
+            user_oauth_connections, user_preferences, user_seed_wrappings, users,
         };
 
         debug!("Completing destructive password reset");
@@ -1054,6 +1054,10 @@ impl DBConnection for PostgresConnection {
 
             diesel::delete(
                 user_seed_wrappings::table.filter(user_seed_wrappings::user_id.eq(user_id)),
+            )
+            .execute(conn)?;
+            diesel::delete(
+                user_oauth_connections::table.filter(user_oauth_connections::user_id.eq(user_id)),
             )
             .execute(conn)?;
             diesel::delete(user_embeddings::table.filter(user_embeddings::user_id.eq(user_id)))

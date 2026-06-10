@@ -276,6 +276,8 @@ fn destructive_password_reset_wipes_user_key_encrypted_storage_roots() {
         "users::password_enc.eq(Some(new_password_enc))",
         "users::seed_enc.eq(Some(new_legacy_seed_enc))",
         "new_wrapping.upsert_by_credential(conn)",
+        "user_oauth_connections::table",
+        "user_oauth_connections::user_id.eq(user_id)",
         "password_reset_requests::id.eq(reset_request.id)",
         "password_reset_requests::user_id.eq(user_id)",
         "password_reset_requests::is_reset.eq(false)",

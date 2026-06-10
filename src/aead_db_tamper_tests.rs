@@ -33,6 +33,10 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+fn test_credential(label: &str) -> &'static str {
+    Box::leak(format!("aead-test-credential-{label}").into_boxed_str())
+}
+
 #[tokio::test]
 #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
 async fn db_password_registration_creates_initial_seed_wrap_and_login_works() {
@@ -45,7 +49,7 @@ async fn db_password_registration_creates_initial_seed_wrap_and_login_works() {
     let project = first_active_project(&app_state);
     let marker = Uuid::new_v4();
     let email = format!("aead-registration-{marker}@example.com");
-    let password = "registration-password-before-login";
+    let password = test_credential("registration-before-login");
 
     let user = app_state
         .register_user(RegisterCredentials {
@@ -93,8 +97,8 @@ async fn db_seed_wrap_substitution_fails_before_issuing_password_session() {
     let marker = Uuid::new_v4();
     let victim_email = format!("aead-tamper-victim-{marker}@example.com");
     let attacker_email = format!("aead-tamper-attacker-{marker}@example.com");
-    let victim_password = "victim-password-before-tamper";
-    let attacker_password = "attacker-password-before-tamper";
+    let victim_password = test_credential("victim-before-tamper");
+    let attacker_password = test_credential("attacker-before-tamper");
 
     let victim = create_password_wrapped_user(
         &app_state,
@@ -158,8 +162,8 @@ async fn db_password_verifier_substitution_fails_before_issuing_victim_session()
     let marker = Uuid::new_v4();
     let victim_email = format!("aead-pw-tamper-victim-{marker}@example.com");
     let attacker_email = format!("aead-pw-tamper-attacker-{marker}@example.com");
-    let victim_password = "victim-password-before-password-row-tamper";
-    let attacker_password = "attacker-password-before-password-row-tamper";
+    let victim_password = test_credential("victim-before-verifier-row-tamper");
+    let attacker_password = test_credential("attacker-before-verifier-row-tamper");
 
     let victim = create_password_wrapped_user(
         &app_state,
@@ -222,8 +226,8 @@ async fn db_victim_password_verifier_copy_to_attacker_does_not_issue_attacker_se
     let marker = Uuid::new_v4();
     let victim_email = format!("aead-pw-copy-victim-{marker}@example.com");
     let attacker_email = format!("aead-pw-copy-attacker-{marker}@example.com");
-    let victim_password = "victim-password-before-copy-to-attacker";
-    let attacker_password = "attacker-password-before-copy-to-attacker";
+    let victim_password = test_credential("victim-before-copy-to-attacker");
+    let attacker_password = test_credential("attacker-before-copy-to-attacker");
 
     let victim =
         create_password_wrapped_user(&app_state, project.id, victim_email, victim_password).await;
@@ -284,8 +288,8 @@ async fn db_legacy_seed_substitution_does_not_change_authenticated_attacker_key(
     let marker = Uuid::new_v4();
     let victim_email = format!("aead-legacy-seed-victim-{marker}@example.com");
     let attacker_email = format!("aead-legacy-seed-attacker-{marker}@example.com");
-    let victim_password = "victim-password-before-legacy-seed-tamper";
-    let attacker_password = "attacker-password-before-legacy-seed-tamper";
+    let victim_password = test_credential("victim-before-legacy-seed-tamper");
+    let attacker_password = test_credential("attacker-before-legacy-seed-tamper");
 
     let victim =
         create_password_wrapped_user(&app_state, project.id, victim_email, victim_password).await;
@@ -362,8 +366,8 @@ async fn db_legacy_seed_substitution_does_not_export_victim_mnemonic() {
     let marker = Uuid::new_v4();
     let victim_email = format!("aead-private-key-victim-{marker}@example.com");
     let attacker_email = format!("aead-private-key-attacker-{marker}@example.com");
-    let victim_password = "victim-password-before-private-key-export-tamper";
-    let attacker_password = "attacker-password-before-private-key-export-tamper";
+    let victim_password = test_credential("victim-before-private-key-export-tamper");
+    let attacker_password = test_credential("attacker-before-private-key-export-tamper");
 
     let victim =
         create_password_wrapped_user(&app_state, project.id, victim_email, victim_password).await;
@@ -461,8 +465,8 @@ async fn db_copied_kv_rows_do_not_decrypt_under_attacker_auth_context() {
     let marker = Uuid::new_v4();
     let victim_email = format!("aead-kv-copy-victim-{marker}@example.com");
     let attacker_email = format!("aead-kv-copy-attacker-{marker}@example.com");
-    let victim_password = "victim-password-before-kv-copy";
-    let attacker_password = "attacker-password-before-kv-copy";
+    let victim_password = test_credential("victim-before-kv-copy");
+    let attacker_password = test_credential("attacker-before-kv-copy");
 
     let victim = create_password_wrapped_user(
         &app_state,
@@ -550,8 +554,8 @@ async fn db_password_change_invalidates_old_auth_context_and_preserves_seed() {
     let project = first_active_project(&app_state);
     let marker = Uuid::new_v4();
     let email = format!("aead-password-change-{marker}@example.com");
-    let old_password = "old-password-before-change";
-    let new_password = "new-password-after-change";
+    let old_password = test_credential("old-before-change");
+    let new_password = test_credential("new-after-change");
 
     let user =
         create_password_wrapped_user(&app_state, project.id, email.clone(), old_password).await;
@@ -640,8 +644,8 @@ async fn db_password_change_deletes_tampered_stale_password_wraps() {
     let project = first_active_project(&app_state);
     let marker = Uuid::new_v4();
     let email = format!("aead-password-change-stale-wrap-{marker}@example.com");
-    let old_password = "old-password-before-stale-wrap-change";
-    let new_password = "new-password-after-stale-wrap-change";
+    let old_password = test_credential("old-before-stale-wrap-change");
+    let new_password = test_credential("new-after-stale-wrap-change");
 
     let user =
         create_password_wrapped_user(&app_state, project.id, email.clone(), old_password).await;
@@ -712,9 +716,9 @@ async fn db_password_change_cannot_commit_after_destructive_reset_rotates_seed()
     let project = first_active_project(&app_state);
     let marker = Uuid::new_v4();
     let email = format!("aead-password-change-reset-race-{marker}@example.com");
-    let old_password = "old-password-before-reset-race";
-    let reset_password = "reset-password-after-reset-race";
-    let racing_password = "racing-password-after-stale-change";
+    let old_password = test_credential("old-before-reset-race");
+    let reset_password = test_credential("reset-after-reset-race");
+    let racing_password = test_credential("racing-after-stale-change");
     let reset_code = "RACE0001";
     let reset_secret = format!("reset-race-secret-{marker}");
 
@@ -958,11 +962,11 @@ async fn db_copied_password_reset_row_mac_fails_for_victim() {
     let marker = Uuid::new_v4();
     let victim_email = format!("aead-reset-tamper-victim-{marker}@example.com");
     let attacker_email = format!("aead-reset-tamper-attacker-{marker}@example.com");
-    let victim_password = "victim-password-before-reset-row-tamper";
-    let attacker_password = "attacker-password-before-reset-row-tamper";
+    let victim_password = test_credential("victim-before-reset-row-tamper");
+    let attacker_password = test_credential("attacker-before-reset-row-tamper");
     let reset_code = "R3S3T123";
     let reset_secret = format!("reset-secret-{marker}");
-    let attempted_new_password = "attacker-reset-row-new-password";
+    let attempted_new_password = test_credential("attacker-reset-row-new");
 
     let victim = create_password_wrapped_user(
         &app_state,
@@ -1032,8 +1036,8 @@ async fn db_destructive_password_reset_invalidates_old_auth_context_and_rotates_
     let project = first_active_project(&app_state);
     let marker = Uuid::new_v4();
     let email = format!("aead-destructive-reset-{marker}@example.com");
-    let old_password = "old-password-before-destructive-reset";
-    let new_password = "new-password-after-destructive-reset";
+    let old_password = test_credential("old-before-destructive-reset");
+    let new_password = test_credential("new-after-destructive-reset");
     let reset_code = "R0T8KEY1";
     let reset_secret = format!("destructive-reset-secret-{marker}");
 
@@ -1184,9 +1188,9 @@ async fn db_destructive_password_reset_consumes_other_active_reset_requests() {
     let project = first_active_project(&app_state);
     let marker = Uuid::new_v4();
     let email = format!("aead-reset-consumes-stale-{marker}@example.com");
-    let old_password = "old-password-before-reset-consume";
-    let first_new_password = "new-password-after-first-reset-consume";
-    let second_new_password = "new-password-after-stale-reset-consume";
+    let old_password = test_credential("old-before-reset-consume");
+    let first_new_password = test_credential("new-after-first-reset-consume");
+    let second_new_password = test_credential("new-after-stale-reset-consume");
     let first_reset_code = "CONSUME1";
     let first_reset_secret = format!("first-reset-secret-{marker}");
     let stale_reset_code = "CONSUME2";
@@ -1289,8 +1293,8 @@ async fn db_destructive_password_reset_wipes_response_storage_cascade() {
     let project = first_active_project(&app_state);
     let marker = Uuid::new_v4();
     let email = format!("aead-reset-cascade-{marker}@example.com");
-    let old_password = "old-password-before-reset-cascade";
-    let new_password = "new-password-after-reset-cascade";
+    let old_password = test_credential("old-before-reset-cascade");
+    let new_password = test_credential("new-after-reset-cascade");
     let reset_code = "CASCADE1";
     let reset_secret = format!("cascade-reset-secret-{marker}");
 

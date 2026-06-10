@@ -760,7 +760,7 @@ mod tests {
             Some(format!(
                 "translation-valid-before-failure-{marker}@example.com"
             )),
-            "valid-password-before-rollback",
+            test_credential("valid-before-rollback"),
         )
         .await;
         let invalid_no_credential = insert_legacy_no_credential_user(
@@ -790,11 +790,16 @@ mod tests {
             &app_state,
             project.id,
             Some(format!("translation-password-{marker}@example.com")),
-            "password-user-password",
+            test_credential("credential-user"),
         )
         .await;
-        let guest_user =
-            insert_legacy_password_user(&app_state, project.id, None, "guest-user-password").await;
+        let guest_user = insert_legacy_password_user(
+            &app_state,
+            project.id,
+            None,
+            test_credential("guest-user"),
+        )
+        .await;
         let oauth_user = insert_legacy_oauth_user(
             &app_state,
             project.id,
@@ -807,7 +812,7 @@ mod tests {
             &app_state,
             project.id,
             Some(format!("translation-multi-{marker}@example.com")),
-            "multi-user-password",
+            test_credential("multi-user"),
         )
         .await;
         let multi_oauth_subject = format!("translation-multi-github-sub-{marker}");
@@ -959,6 +964,10 @@ mod tests {
             "AEAD_TRANSLATION_TEST_DATABASE_URL must point at a disposable AEAD scratch database"
         );
         Some(database_url)
+    }
+
+    fn test_credential(label: &str) -> &'static str {
+        Box::leak(format!("aead-translation-test-credential-{label}").into_boxed_str())
     }
 
     async fn build_local_translation_app_state(database_url: String) -> Arc<AppState> {

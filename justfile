@@ -857,7 +857,7 @@ deploy-preview-nix: build-eif-preview verify-pcr-preview scp-eif-to-aws-preview
 
 # Clean EIF build artifacts
 clean-eif:
-    rm -f result
+    rm -f result result-steady result-translation result-dev-translation result-preview-translation
 
 ### Tinfoil Proxy Commands ###
 

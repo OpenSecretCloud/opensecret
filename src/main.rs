@@ -987,6 +987,7 @@ impl AppState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn create_password_seed_wrap_for_user(
         &self,
         user: &User,
@@ -1075,6 +1076,7 @@ impl AppState {
         Ok(new_wrapping)
     }
 
+    #[cfg(test)]
     fn create_oauth_seed_wrap_for_user(
         &self,
         user: &User,

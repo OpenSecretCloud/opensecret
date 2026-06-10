@@ -1,6 +1,8 @@
 use crate::apple_signin::{generate_apple_client_secret, validate_apple_native_token};
 use crate::encrypt::encrypt_with_key;
-use crate::models::oauth::{NewUserOAuthConnection, UserOAuthConnection};
+#[cfg(test)]
+use crate::models::oauth::NewUserOAuthConnection;
+use crate::models::oauth::UserOAuthConnection;
 use crate::oauth::OAuthState;
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
 use crate::web::login_routes::handle_new_user_registration;
@@ -1480,6 +1482,7 @@ async fn update_provider_connection(
     Ok(())
 }
 
+#[cfg(test)]
 async fn create_provider_connection(
     app_state: &AppState,
     user: &User,

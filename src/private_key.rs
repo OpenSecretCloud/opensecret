@@ -9,11 +9,12 @@ use std::{str::FromStr, sync::Arc};
 use tracing::{debug, error, info};
 
 use crate::{
-    aws_credentials::AwsCredentialManager,
-    encrypt::{decrypt_with_key, generate_random_enclave},
-    web::protected_routes::validate_bip85_path,
-    Error,
+    aws_credentials::AwsCredentialManager, encrypt::generate_random_enclave,
+    web::protected_routes::validate_bip85_path, Error,
 };
+
+#[cfg(test)]
+use crate::encrypt::decrypt_with_key;
 
 // Valid BIP-39 word counts - we only support 12, 18, and 24
 pub const VALID_BIP39_WORD_COUNTS: [u32; 3] = [12, 18, 24];
@@ -30,6 +31,7 @@ pub async fn generate_twelve_word_seed(
     Ok(mnemonic)
 }
 
+#[cfg(test)]
 pub fn decrypt_user_seed_to_key(
     enclave_key: Vec<u8>,
     encrypted_seed: Vec<u8>,
@@ -102,6 +104,7 @@ fn derive_mnemonic_to_key(
     }
 }
 
+#[cfg(test)]
 pub fn decrypt_user_seed_to_mnemonic(
     enclave_key: Vec<u8>,
     encrypted_seed: Vec<u8>,
@@ -133,6 +136,7 @@ pub fn decrypt_user_seed_to_mnemonic(
 ///
 /// # Returns
 /// * `Result<Mnemonic, Error>` - The derived BIP-39 mnemonic or an error
+#[cfg(test)]
 pub fn decrypt_and_derive_bip85_mnemonic(
     enclave_key: Vec<u8>,
     encrypted_seed: Vec<u8>,

@@ -130,7 +130,7 @@ pub fn decrypt_user_seed_to_mnemonic(
 ///   where:
 ///   - PURPOSE' is the BIP-85 purpose value (83696968', must be hardened)
 ///   - APP' is for BIP-39 mnemonics (39', must be hardened)
-///   - LANGUAGE' is typically 0' for English (must be hardened)
+///   - LANGUAGE' is 0' for English (must be hardened); other languages are not currently supported
 ///   - WORDS' must be one of VALID_BIP39_WORD_COUNTS (12', 18', 24', must be hardened)
 ///   - INDEX' is the derivation index (must be hardened)
 ///
@@ -458,6 +458,7 @@ mod tests {
         let invalid_paths = [
             "m/83696968/39'/0'/12'/0'",    // Purpose not hardened
             "m/83696968'/39/0'/12'/0'",    // Application not hardened
+            "m/83696968'/39'/1'/12'/0'",   // Unsupported non-English language
             "m/44'/0'/0'/0/0",             // Not a BIP-85 path
             "m/83696968'/39'/0'/12'/0'/0", // Extra segment
         ];

@@ -121,7 +121,7 @@ pub struct KeyOptions {
     /// Format: "m/83696968'/39'/0'/12'/0'" where:
     ///   - 83696968' is the BIP-85 purpose
     ///   - 39' is for BIP-39 mnemonics
-    ///   - 0' is the coin type
+    ///   - 0' is the language code; only English (0') is currently supported
     ///   - 12', 18', or 24' is the word count (only these word counts are supported)
     ///   - 0' is the index
     pub seed_phrase_derivation_path: Option<String>,
@@ -188,41 +188,34 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
         return Err(ApiError::BadRequest);
     }
 
-    // Check purpose is BIP85_PURPOSE (83696968')
-    let purpose = segments[1];
-    if !purpose.starts_with(&BIP85_PURPOSE.to_string())
-        || !(purpose.ends_with('\'') || purpose.ends_with('h'))
-    {
+    let purpose = parse_hardened_bip85_segment(segments[1], "purpose", path)?;
+    if purpose != BIP85_PURPOSE {
         error!(
             "BIP-85 path purpose must be {}' or {}h, found '{}': {}",
-            BIP85_PURPOSE, BIP85_PURPOSE, purpose, path
+            BIP85_PURPOSE, BIP85_PURPOSE, segments[1], path
         );
         return Err(ApiError::BadRequest);
     }
 
-    // Check application is BIP85_APPLICATION_BIP39 (39' for BIP-39 mnemonic)
-    let application = segments[2];
-    if !application.starts_with(&BIP85_APPLICATION_BIP39.to_string())
-        || !(application.ends_with('\'') || application.ends_with('h'))
-    {
+    let application = parse_hardened_bip85_segment(segments[2], "application", path)?;
+    if application != BIP85_APPLICATION_BIP39 {
         error!(
             "BIP-85 path application must be {}' or {}h for BIP-39 mnemonics, found '{}': {}",
-            BIP85_APPLICATION_BIP39, BIP85_APPLICATION_BIP39, application, path
+            BIP85_APPLICATION_BIP39, BIP85_APPLICATION_BIP39, segments[2], path
         );
         return Err(ApiError::BadRequest);
     }
 
-    // Check language is hardened
-    let language = segments[3];
-    if !(language.ends_with('\'') || language.ends_with('h')) {
+    let language = parse_hardened_bip85_segment(segments[3], "language", path)?;
+    if language != 0 {
         error!(
-            "BIP-85 path language must be hardened, found '{}': {}",
-            language, path
+            "BIP-85 path language must be 0' or 0h for English, found '{}': {}",
+            segments[3], path
         );
         return Err(ApiError::BadRequest);
     }
 
-    debug!("BIP-85 path language component valid: {}", language);
+    debug!("BIP-85 path language component valid: {}", segments[3]);
 
     // Check word count is valid (12, 18, 24) and hardened
     let word_count = segments[4];
@@ -283,6 +276,27 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
     info!("BIP-85 path validation successful: {}", path);
 
     Ok(())
+}
+
+fn parse_hardened_bip85_segment(segment: &str, name: &str, path: &str) -> Result<u32, ApiError> {
+    if !(segment.ends_with('\'') || segment.ends_with('h')) {
+        error!(
+            "BIP-85 path {} must be hardened, found '{}': {}",
+            name, segment, path
+        );
+        return Err(ApiError::BadRequest);
+    }
+
+    segment
+        .trim_end_matches(&['\'', 'h'][..])
+        .parse::<u32>()
+        .map_err(|_| {
+            error!(
+                "BIP-85 path {} must be a valid number, found '{}': {}",
+                name, segment, path
+            );
+            ApiError::BadRequest
+        })
 }
 
 /// Query parameters for endpoints that accept a derivation path.
@@ -1606,7 +1620,6 @@ mod tests {
             "m/83696968'/39'/0'/24'/0'",   // Standard BIP-85 for 24-word mnemonic
             "m/83696968'/39'/0'/12'/5'",   // BIP-85 with non-zero index
             "m/83696968'/39'/0'/12'/255'", // BIP-85 with large index
-            "m/83696968'/39'/1'/12'/0'",   // BIP-85 with non-English language
             // Test alternate hardened notation
             "m/83696968h/39h/0h/12h/0h", // Using 'h' notation instead of '
         ];
@@ -1637,6 +1650,9 @@ mod tests {
             "m/83696968'/39'/0'/15'/0'",   // Invalid word count (not 12,18,24)
             "m/83696968'/39'/0'/21'/0'",   // Invalid word count (not 12,18,24)
             "m/83696968'/39'/0'/256'/0'",  // Word count too large
+            "m/836969681'/39'/0'/12'/0'",  // Wrong purpose with valid prefix
+            "m/83696968'/390'/0'/12'/0'",  // Wrong application with valid prefix
+            "m/83696968'/39'/1'/12'/0'",   // Unsupported non-English language
             "m/83696968'",                 // Incomplete path (too few segments)
             "m/83696968'/39'",             // Incomplete path (too few segments)
             "m/83696968'/39'/0'",          // Incomplete path (too few segments)

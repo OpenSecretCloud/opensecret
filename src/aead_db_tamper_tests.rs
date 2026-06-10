@@ -8,13 +8,13 @@ use crate::{
         org_projects::OrgProject,
         password_reset::NewPasswordResetRequest,
         responses::{
-            NewAssistantMessage, NewConversation, NewReasoningItem, NewResponse, NewToolCall,
-            NewToolOutput, NewUserMessage, ResponseStatus,
+            NewAssistantMessage, NewConversation, NewConversationProject, NewReasoningItem,
+            NewResponse, NewToolCall, NewToolOutput, NewUserMessage, ResponseStatus,
         },
         schema::{
-            assistant_messages, conversations, org_projects, password_reset_requests,
-            reasoning_items, responses, tool_calls, tool_outputs, user_messages,
-            user_oauth_connections, user_seed_wrappings, users,
+            assistant_messages, conversation_projects, conversation_summaries, conversations,
+            org_projects, password_reset_requests, reasoning_items, responses, tool_calls,
+            tool_outputs, user_messages, user_oauth_connections, user_seed_wrappings, users,
         },
         user_api_keys::NewUserApiKey,
         user_kv::{NewUserKV, UserKV},
@@ -1355,10 +1355,18 @@ fn insert_response_storage_stack_for_user(app_state: &AppState, user_id: Uuid) {
         .get()
         .expect("test database connection should be available");
 
+    let conversation_project = NewConversationProject {
+        uuid: Uuid::new_v4(),
+        user_id,
+        name_enc: vec![25, 26, 27],
+    }
+    .insert(conn)
+    .expect("test conversation project should insert");
+
     let conversation = NewConversation {
         uuid: Uuid::new_v4(),
         user_id,
-        project_id: None,
+        project_id: Some(conversation_project.id),
         is_pinned: false,
         metadata_enc: Some(vec![1, 2, 3]),
     }
@@ -1450,6 +1458,20 @@ fn insert_response_storage_stack_for_user(app_state: &AppState, user_id: Uuid) {
     }
     .insert(conn)
     .expect("test reasoning item should insert");
+
+    let summary_time = Utc::now();
+    diesel::insert_into(conversation_summaries::table)
+        .values((
+            conversation_summaries::user_id.eq(user_id),
+            conversation_summaries::conversation_id.eq(conversation.id),
+            conversation_summaries::from_created_at.eq(summary_time),
+            conversation_summaries::to_created_at.eq(summary_time),
+            conversation_summaries::message_count.eq(1),
+            conversation_summaries::content_enc.eq(vec![28, 29, 30]),
+            conversation_summaries::content_tokens.eq(3),
+        ))
+        .execute(conn)
+        .expect("test conversation summary should insert");
 }
 
 fn assert_response_storage_counts(app_state: &AppState, user_id: Uuid, expected_count: i64) {
@@ -1464,6 +1486,16 @@ fn assert_response_storage_counts(app_state: &AppState, user_id: Uuid, expected_
         .count()
         .get_result::<i64>(conn)
         .expect("conversation count should query");
+    let conversation_project_count = conversation_projects::table
+        .filter(conversation_projects::user_id.eq(user_id))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("conversation project count should query");
+    let conversation_summary_count = conversation_summaries::table
+        .filter(conversation_summaries::user_id.eq(user_id))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("conversation summary count should query");
     let response_count = responses::table
         .filter(responses::user_id.eq(user_id))
         .count()
@@ -1496,6 +1528,14 @@ fn assert_response_storage_counts(app_state: &AppState, user_id: Uuid, expected_
         .expect("reasoning item count should query");
 
     assert_eq!(conversation_count, expected_count, "conversation row count");
+    assert_eq!(
+        conversation_project_count, expected_count,
+        "conversation project row count"
+    );
+    assert_eq!(
+        conversation_summary_count, expected_count,
+        "conversation summary row count"
+    );
     assert_eq!(response_count, expected_count, "response row count");
     assert_eq!(user_message_count, expected_count, "user message row count");
     assert_eq!(
@@ -1790,20 +1830,27 @@ fn copy_victim_seed_wrap_ciphertext_to_attacker_for_kind(
     attacker: &User,
     credential_kind: CredentialKind,
 ) {
-    let victim_wrap = app_state
+    let victim_wraps = app_state
         .db
         .get_user_seed_wrappings_for_user_and_kind(victim.uuid, credential_kind.as_str())
-        .expect("victim seed wraps should load")
-        .into_iter()
-        .next()
-        .expect("victim credential wrap should exist");
-    let attacker_wrap = app_state
+        .expect("victim seed wraps should load");
+    assert_eq!(
+        victim_wraps.len(),
+        1,
+        "tamper helper expects exactly one victim wrap for the credential kind"
+    );
+    let victim_wrap = victim_wraps.into_iter().next().unwrap();
+
+    let attacker_wraps = app_state
         .db
         .get_user_seed_wrappings_for_user_and_kind(attacker.uuid, credential_kind.as_str())
-        .expect("attacker seed wraps should load")
-        .into_iter()
-        .next()
-        .expect("attacker credential wrap should exist");
+        .expect("attacker seed wraps should load");
+    assert_eq!(
+        attacker_wraps.len(),
+        1,
+        "tamper helper expects exactly one attacker wrap for the credential kind"
+    );
+    let attacker_wrap = attacker_wraps.into_iter().next().unwrap();
 
     app_state
         .db

@@ -355,6 +355,13 @@ build-eif-dev:
     echo "EIF build completed. PCR:"
     cat result/pcr.json
 
+# Build steady-state dev EIF for AEAD rollout with a distinct output path
+build-eif-dev-steady:
+    rm -f result-dev-steady
+    nix build '.?submodules=1#eif-dev' -o result-dev-steady
+    echo "Steady-state dev EIF build completed. PCR:"
+    cat result-dev-steady/pcr.json
+
 # Build EIF for production environment
 build-eif-prod:
     nix build .?submodules=1#eif-prod
@@ -398,6 +405,9 @@ build-eif-preview-seed-wrap-translation:
 # Build both production AEAD rollout artifacts without reusing the same result symlink
 build-eif-prod-aead-rollout: build-eif-prod-seed-wrap-translation build-eif-prod-steady
 
+# Build both dev AEAD rollout artifacts without reusing the same result symlink
+build-eif-dev-aead-rollout: build-eif-dev-seed-wrap-translation build-eif-dev-steady
+
 # Build EIF with custom environment variables
 build-eif-custom env_vars:
     #!/usr/bin/env bash
@@ -411,6 +421,14 @@ copy-pcr-dev:
     echo "EIF build completed. PCR:"
     cat result/pcr.json
     cp -f result/pcr.json ./pcrDev.json
+
+# Capture steady-state dev PCR for AEAD rollout
+copy-pcr-dev-steady: build-eif-dev-steady
+    cp -f result-dev-steady/pcr.json ./pcrDev.json
+
+# Capture one-off seed-wrap translation dev PCR for AEAD rollout
+copy-pcr-dev-seed-wrap-translation: build-eif-dev-seed-wrap-translation
+    cp -f result-dev-translation/pcr.json ./pcrDevSeedWrapTranslation.json
 
 # Build EIF for production environment
 copy-pcr-prod:
@@ -667,9 +685,59 @@ _verify-pcr-internal env pcr_file:
 verify-pcr-dev:
     just _verify-pcr-internal dev pcrDev.json
 
+# Verify steady-state dev PCR for AEAD rollout
+verify-pcr-dev-steady:
+    #!/usr/bin/env bash
+    if [ ! -f ./pcrDev.json ]; then
+        echo "No pcrDev.json found. Capturing steady-state dev PCR first..."
+        just copy-pcr-dev-steady
+        exit 0
+    fi
+
+    if [ ! -f result-dev-steady/pcr.json ]; then
+        echo "No result-dev-steady/pcr.json found. Building steady-state dev EIF first..."
+        just build-eif-dev-steady
+    fi
+
+    if diff -q ./pcrDev.json result-dev-steady/pcr.json > /dev/null; then
+        echo "✅ Steady-state dev PCR values match!"
+    else
+        echo "❌ Steady-state dev PCR values do not match!"
+        echo "Expected (./pcrDev.json):"
+        cat ./pcrDev.json
+        echo "Got (result-dev-steady/pcr.json):"
+        cat result-dev-steady/pcr.json
+        exit 1
+    fi
+
 # Verify PCR values for prod environment
 verify-pcr-prod:
     just _verify-pcr-internal prod pcrProd.json
+
+# Verify one-off seed-wrap translation dev PCR for AEAD rollout
+verify-pcr-dev-seed-wrap-translation:
+    #!/usr/bin/env bash
+    if [ ! -f ./pcrDevSeedWrapTranslation.json ]; then
+        echo "No pcrDevSeedWrapTranslation.json found. Capturing translation dev PCR first..."
+        just copy-pcr-dev-seed-wrap-translation
+        exit 0
+    fi
+
+    if [ ! -f result-dev-translation/pcr.json ]; then
+        echo "No result-dev-translation/pcr.json found. Building translation dev EIF first..."
+        just build-eif-dev-seed-wrap-translation
+    fi
+
+    if diff -q ./pcrDevSeedWrapTranslation.json result-dev-translation/pcr.json > /dev/null; then
+        echo "✅ Seed-wrap translation dev PCR values match!"
+    else
+        echo "❌ Seed-wrap translation dev PCR values do not match!"
+        echo "Expected (./pcrDevSeedWrapTranslation.json):"
+        cat ./pcrDevSeedWrapTranslation.json
+        echo "Got (result-dev-translation/pcr.json):"
+        cat result-dev-translation/pcr.json
+        exit 1
+    fi
 
 # Verify steady-state production PCR for AEAD rollout
 verify-pcr-prod-steady:
@@ -754,6 +822,16 @@ scp-eif-to-aws-dev:
     ssh -i $DEV_SSH_KEY $DEV_SERVER "rm -f ~/opensecret.eif"
     scp -i $DEV_SSH_KEY result/image.eif $DEV_SERVER:~/opensecret.eif
 
+# SCP the one-off AEAD seed-wrap translation EIF to AWS parent instance (dev)
+scp-eif-to-aws-dev-seed-wrap-translation:
+    ssh -i $DEV_SSH_KEY $DEV_SERVER "rm -f ~/opensecret-aead-translation.eif"
+    scp -i $DEV_SSH_KEY result-dev-translation/image.eif $DEV_SERVER:~/opensecret-aead-translation.eif
+
+# SCP the AEAD steady-state EIF to AWS parent instance (dev)
+scp-eif-to-aws-dev-steady:
+    ssh -i $DEV_SSH_KEY $DEV_SERVER "rm -f ~/opensecret-aead-steady.eif"
+    scp -i $DEV_SSH_KEY result-dev-steady/image.eif $DEV_SERVER:~/opensecret-aead-steady.eif
+
 # SCP the Nix-built EIF to AWS parent instance (prod)
 scp-eif-to-aws-prod:
     ssh -i $PROD_SSH_KEY $PROD_SERVER "rm -f ~/opensecret.eif"
@@ -777,6 +855,12 @@ scp-eif-to-aws-preview:
 # Stage to dev environment without debug mode (using Nix-built EIF)
 stage-dev-nix: build-eif-dev scp-eif-to-aws-dev
 
+# Stage the one-off AEAD translation EIF to dev without running it
+stage-dev-aead-translation: build-eif-dev-seed-wrap-translation scp-eif-to-aws-dev-seed-wrap-translation
+
+# Stage the AEAD steady-state EIF to dev without running it
+stage-dev-aead-steady: build-eif-dev-steady scp-eif-to-aws-dev-steady
+
 # Stage to prod environment without debug mode (using Nix-built EIF)
 stage-prod-nix: build-eif-prod scp-eif-to-aws-prod
 
@@ -792,6 +876,14 @@ stage-preview-nix: build-eif-preview scp-eif-to-aws-preview
 # Run EIF file on AWS (dev)
 run-eif-dev:
     ssh -i $DEV_SSH_KEY $DEV_SERVER "nitro-cli run-enclave --eif-path opensecret.eif --memory 16384 --cpu-count 4"
+
+# Run the one-off AEAD seed-wrap translation EIF on AWS (dev)
+run-eif-dev-seed-wrap-translation:
+    ssh -i $DEV_SSH_KEY $DEV_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-translation.eif --memory 16384 --cpu-count 4"
+
+# Run the AEAD steady-state EIF on AWS (dev)
+run-eif-dev-steady:
+    ssh -i $DEV_SSH_KEY $DEV_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-steady.eif --memory 16384 --cpu-count 4"
 
 # Run EIF file on AWS (prod)
 run-eif-prod:
@@ -857,7 +949,7 @@ deploy-preview-nix: build-eif-preview verify-pcr-preview scp-eif-to-aws-preview
 
 # Clean EIF build artifacts
 clean-eif:
-    rm -f result result-steady result-translation result-dev-translation result-preview-translation
+    rm -f result result-dev-steady result-dev-translation result-steady result-translation result-preview-translation
 
 ### Tinfoil Proxy Commands ###
 

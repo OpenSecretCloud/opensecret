@@ -595,6 +595,98 @@ append-pcr-prod:
     echo "   PCR0: $CURRENT_PCR0"
     echo "   Timestamp: $TIMESTAMP"
 
+# Sign and append PCR measurements from a specific PCR file into a history file.
+_append-pcr-file pcr_file history_file label:
+    #!/usr/bin/env bash
+    set -e
+
+    PCR_FILE="./{{pcr_file}}"
+    HISTORY_FILE="./{{history_file}}"
+
+    # Check for required environment variable
+    if [ -z "${SIGNING_PRIVATE_KEY}" ]; then
+        echo "❌ Error: SIGNING_PRIVATE_KEY environment variable is not set"
+        echo "Please generate keys with: ./pcr_sign.js generate-keys"
+        echo "Then set the environment variables with:"
+        echo "export SIGNING_PRIVATE_KEY='...'"
+        echo "export SIGNING_PUBLIC_KEY='...'"
+        exit 1
+    fi
+
+    # Check if the Node.js script exists and is executable
+    if [ ! -x "./pcr_sign.js" ]; then
+        chmod +x ./pcr_sign.js
+    fi
+
+    if [ ! -f "$PCR_FILE" ]; then
+        echo "❌ Error: $PCR_FILE does not exist"
+        exit 1
+    fi
+
+    # Initialize empty history file if it doesn't exist
+    if [ ! -f "$HISTORY_FILE" ]; then
+        echo "[]" > "$HISTORY_FILE"
+    fi
+
+    # Get current PCR values
+    PCR_CONTENT=$(cat "$PCR_FILE")
+    CURRENT_PCR0=$(echo "$PCR_CONTENT" | jq -r '.PCR0')
+    CURRENT_PCR1=$(echo "$PCR_CONTENT" | jq -r '.PCR1')
+    CURRENT_PCR2=$(echo "$PCR_CONTENT" | jq -r '.PCR2')
+
+    # Check if this PCR0 already exists in the history
+    HISTORY=$(cat "$HISTORY_FILE")
+    PCR0_EXISTS=$(echo "$HISTORY" | jq --arg pcr0 "$CURRENT_PCR0" 'map(select(.PCR0 == $pcr0)) | length')
+
+    if [ "$PCR0_EXISTS" -gt "0" ]; then
+        echo "⚠️  PCR0 value already exists in {{history_file}} for {{label}}"
+        echo "    Skipping append operation to avoid duplicates."
+        exit 0
+    fi
+
+    # Generate a timestamp
+    TIMESTAMP=$(date +%s)
+
+    # Sign just the PCR0 value
+    echo "Signing {{label}} PCR0: $CURRENT_PCR0"
+    SIGNATURE=$(./pcr_sign.js sign-pcr0 "$CURRENT_PCR0")
+
+    if [ -z "$SIGNATURE" ]; then
+        echo "❌ Error: Failed to create signature"
+        exit 1
+    fi
+
+    # Create a new history entry. Keep the existing history schema stable.
+    NEW_ENTRY=$(jq -n \
+      --arg pcr0 "$CURRENT_PCR0" \
+      --arg pcr1 "$CURRENT_PCR1" \
+      --arg pcr2 "$CURRENT_PCR2" \
+      --arg sig "$SIGNATURE" \
+      --arg ts "$TIMESTAMP" \
+      '{
+        "PCR0": $pcr0,
+        "PCR1": $pcr1,
+        "PCR2": $pcr2,
+        "timestamp": ($ts | tonumber),
+        "signature": $sig
+      }')
+
+    # Append to history file
+    echo "$HISTORY" | jq --argjson entry "$NEW_ENTRY" '. + [$entry]' > "$HISTORY_FILE"
+
+    echo "✅ Successfully appended signed PCR entry to {{history_file}}"
+    echo "   Label: {{label}}"
+    echo "   PCR0: $CURRENT_PCR0"
+    echo "   Timestamp: $TIMESTAMP"
+
+# Sign and append one-off seed-wrap translation PCR measurements for dev.
+append-pcr-dev-seed-wrap-translation:
+    just _append-pcr-file pcrDevSeedWrapTranslation.json pcrDevHistory.json dev-seed-wrap-translation
+
+# Sign and append one-off seed-wrap translation PCR measurements for prod.
+append-pcr-prod-seed-wrap-translation:
+    just _append-pcr-file pcrProdSeedWrapTranslation.json pcrProdHistory.json prod-seed-wrap-translation
+
 # Update PCR dev with signature and append to history
 update-pcr-dev:
     just copy-pcr-dev
@@ -607,13 +699,27 @@ update-pcr-prod:
     just append-pcr-prod
     echo "✅ PCR prod values updated and history appended"
 
+# Update dev PCRs for the AEAD rollout steady-state and one-off translation EIFs.
+update-pcr-dev-aead-rollout:
+    just copy-pcr-dev-steady
+    just append-pcr-dev
+    just copy-pcr-dev-seed-wrap-translation
+    just append-pcr-dev-seed-wrap-translation
+    echo "✅ AEAD rollout dev PCR values updated for steady-state and translation EIFs"
+
+# Update prod PCRs for the AEAD rollout steady-state and one-off translation EIFs.
+update-pcr-prod-aead-rollout:
+    just copy-pcr-prod-steady
+    just append-pcr-prod
+    just copy-pcr-prod-seed-wrap-translation
+    just append-pcr-prod-seed-wrap-translation
+    echo "✅ AEAD rollout prod PCR values updated for steady-state and translation EIFs"
+
 # Update all PCR values for both dev and prod environments
 update-pcr-all:
-    just copy-pcr-dev
-    just append-pcr-dev
-    just copy-pcr-prod
-    just append-pcr-prod
-    echo "✅ All PCR values updated and history appended for both dev and prod"
+    just update-pcr-dev-aead-rollout
+    just update-pcr-prod-aead-rollout
+    echo "✅ All AEAD rollout PCR values updated and history appended for dev and prod"
 
 
 # Generate a key pair for PCR signing and output to terminal (no files created)

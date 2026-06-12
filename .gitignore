@@ -3,6 +3,7 @@
 /build
 /result
 /.local/
+/result-*
 /*.tar
 /*/*.tar
 

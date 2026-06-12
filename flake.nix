@@ -276,7 +276,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
-          cargoBuildFeatures = cargoFeatures;
+          buildFeatures = cargoFeatures;
           nativeBuildInputs = [
             pkgs.pkg-config
             rustAnalyzer

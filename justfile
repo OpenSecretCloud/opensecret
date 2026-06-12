@@ -985,11 +985,11 @@ run-eif-dev:
 
 # Run the one-off AEAD seed-wrap translation EIF on AWS (dev)
 run-eif-dev-seed-wrap-translation:
-    ssh -i $DEV_SSH_KEY $DEV_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-translation.eif --memory 16384 --cpu-count 4"
+    ssh -i $DEV_SSH_KEY $DEV_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-translation.eif --enclave-name opensecret-aead-translation --memory 16384 --cpu-count 4"
 
 # Run the AEAD steady-state EIF on AWS (dev)
 run-eif-dev-steady:
-    ssh -i $DEV_SSH_KEY $DEV_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-steady.eif --memory 16384 --cpu-count 4"
+    ssh -i $DEV_SSH_KEY $DEV_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-steady.eif --enclave-name opensecret --memory 16384 --cpu-count 4"
 
 # Run EIF file on AWS (prod)
 run-eif-prod:
@@ -997,11 +997,11 @@ run-eif-prod:
 
 # Run the one-off AEAD seed-wrap translation EIF on AWS (prod)
 run-eif-prod-seed-wrap-translation:
-    ssh -i $PROD_SSH_KEY $PROD_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-translation.eif --memory 16384 --cpu-count 4"
+    ssh -i $PROD_SSH_KEY $PROD_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-translation.eif --enclave-name opensecret-aead-translation --memory 16384 --cpu-count 4"
 
 # Run the AEAD steady-state EIF on AWS (prod)
 run-eif-prod-steady:
-    ssh -i $PROD_SSH_KEY $PROD_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-steady.eif --memory 16384 --cpu-count 4"
+    ssh -i $PROD_SSH_KEY $PROD_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-steady.eif --enclave-name opensecret --memory 16384 --cpu-count 4"
 
 # Run EIF file on AWS (preview)
 run-eif-preview:

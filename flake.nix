@@ -54,8 +54,7 @@
         ];
         darwinOnlyInputs = [
           pkgs.libiconv
-          pkgs.darwin.apple_sdk.frameworks.Security
-          pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+          pkgs.apple-sdk
         ];
         inputs = commonInputs
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux linuxOnlyInputs
@@ -95,15 +94,25 @@
         setupEnvScript = pkgs.writeShellScript "setup-env" ''
           if [ ! -f .env ]; then
             cp .env.sample .env
-            sed -i 's|DATABASE_URL=postgres://localhost/opensecret|DATABASE_URL=postgres://opensecret_user:password@localhost:5432/opensecret|g' .env
+
+            replace_env() {
+              local pattern="$1"
+              local replacement="$2"
+              local tmp
+              tmp="$(mktemp)"
+              sed "s|$pattern|$replacement|g" .env > "$tmp"
+              mv "$tmp" .env
+            }
+
+            replace_env 'DATABASE_URL=postgres://localhost/opensecret' 'DATABASE_URL=postgres://opensecret_user:password@localhost:5432/opensecret'
 
             # Get a new ENCLAVE_SECRET_MOCK value using openssl
             export enclaveSecret=$(openssl rand -hex 32)
-            sed -i "s|ENCLAVE_SECRET_MOCK=|ENCLAVE_SECRET_MOCK=$enclaveSecret|g" .env
+            replace_env 'ENCLAVE_SECRET_MOCK=' "ENCLAVE_SECRET_MOCK=$enclaveSecret"
 
             # Get a new JWT_SECRET value using openssl
             export jwtSecret=$(openssl rand -base64 32)
-            sed -i "s|JWT_SECRET=|JWT_SECRET=$jwtSecret|g" .env
+            replace_env 'JWT_SECRET=' "JWT_SECRET=$jwtSecret"
           fi
         '';
 
@@ -449,6 +458,11 @@
             export CC_wasm32_unknown_unknown=${pkgs.llvmPackages_14.clang-unwrapped}/bin/clang-14
             export CFLAGS_wasm32_unknown_unknown="-I ${pkgs.llvmPackages_14.libclang.lib}/lib/clang/14.0.6/include/"
             export PKG_CONFIG_PATH=${pkgs.openssl.dev}/lib/pkgconfig
+
+            ${pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+              export CC=clang
+              export CXX=clang++
+            ''}
 
             ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
               alias docker='podman'

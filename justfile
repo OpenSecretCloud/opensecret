@@ -195,6 +195,90 @@ update-continuum-proxy version="v1.39.1":
     just update-continuum-proxy-version {{version}}
     just build-continuum-proxy
 
+### Local macOS Proxy Commands ###
+
+# Build macOS-native Continuum and Tinfoil proxy binaries under .local/bin.
+# Run from a Nix dev shell, for example: nix develop -c just build-local-proxies-macos
+build-local-proxies-macos: build-continuum-proxy-macos build-tinfoil-proxy-macos
+
+# Build a macOS-native Continuum proxy without replacing the checked-in Linux binary.
+build-continuum-proxy-macos:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p .local/bin
+    version="$(sed -n 's/.*version = "\([^"]*\)".*/\1/p' privatemode-public/version.nix)"
+    if [ -z "$version" ]; then
+        echo "Could not read Continuum version from privatemode-public/version.nix" >&2
+        exit 1
+    fi
+    cd privatemode-public
+    CGO_ENABLED=0 go build \
+        -tags contrast_unstable_api \
+        -ldflags "-X github.com/edgelesssys/continuum/internal/oss/constants.version=$version" \
+        -o ../.local/bin/continuum-proxy-darwin \
+        ./privatemode-proxy
+    ../.local/bin/continuum-proxy-darwin --version
+
+# Build a macOS-native Tinfoil proxy without replacing the checked-in Linux binary.
+build-tinfoil-proxy-macos:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p .local/bin
+    cd tinfoil-proxy
+    CGO_ENABLED=0 go build -o ../.local/bin/tinfoil-proxy-darwin .
+    file ../.local/bin/tinfoil-proxy-darwin
+
+# Run the macOS-native Continuum proxy on CONTINUUM_PROXY_PORT, default 8092.
+# The API key is read from CONTINUUM_API_KEY or .local/secrets/continuum_api_key.
+run-continuum-proxy-macos:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bin=".local/bin/continuum-proxy-darwin"
+    key_file=".local/secrets/continuum_api_key"
+    port="${CONTINUUM_PROXY_PORT:-8092}"
+    workspace="${CONTINUUM_PROXY_WORKSPACE:-.local/continuum}"
+    if [ ! -x "$bin" ]; then
+        echo "$bin is missing. Run: nix develop -c just build-continuum-proxy-macos" >&2
+        exit 1
+    fi
+    api_key="${CONTINUUM_API_KEY:-}"
+    if [ -z "$api_key" ] && [ -f "$key_file" ]; then
+        api_key="$(tr -d '\r\n' < "$key_file")"
+    fi
+    if [ -z "$api_key" ]; then
+        echo "Set CONTINUUM_API_KEY or write the key to $key_file" >&2
+        exit 1
+    fi
+    mkdir -p "$workspace"
+    exec "$bin" --port "$port" --workspace "$workspace" --apiKey "$api_key"
+
+# Run the macOS-native Tinfoil proxy on TINFOIL_PROXY_PORT, default 8093.
+# The API key is read from TINFOIL_API_KEY or .local/secrets/tinfoil_api_key.
+run-tinfoil-proxy-macos:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    bin=".local/bin/tinfoil-proxy-darwin"
+    key_file=".local/secrets/tinfoil_api_key"
+    port="${TINFOIL_PROXY_PORT:-8093}"
+    if [ ! -x "$bin" ]; then
+        echo "$bin is missing. Run: nix develop -c just build-tinfoil-proxy-macos" >&2
+        exit 1
+    fi
+    api_key="${TINFOIL_API_KEY:-}"
+    if [ -z "$api_key" ] && [ -f "$key_file" ]; then
+        api_key="$(tr -d '\r\n' < "$key_file")"
+    fi
+    if [ -z "$api_key" ]; then
+        echo "Set TINFOIL_API_KEY or write the key to $key_file" >&2
+        exit 1
+    fi
+    TINFOIL_API_KEY="$api_key" TINFOIL_PROXY_PORT="$port" exec "$bin"
+
+# Run the local OpenSecret backend pointed at the macOS proxy ports.
+# Requires Postgres from nix develop and a populated .env.
+run-local-backend-macos:
+    APP_MODE="${APP_MODE:-local}" OPENAI_API_BASE="${OPENAI_API_BASE:-http://127.0.0.1:8092}" TINFOIL_API_BASE="${TINFOIL_API_BASE:-http://127.0.0.1:8093}" cargo run
+
 ### Enclave Management ###
 
 # Terminate the running application enclave (dev)

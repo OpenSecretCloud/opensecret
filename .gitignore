@@ -2,6 +2,7 @@
 /target
 /build
 /result
+/.local/
 /*.tar
 /*/*.tar
 

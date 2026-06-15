@@ -2716,11 +2716,11 @@ async fn main() -> Result<(), Error> {
         )
         .layer(cors);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .unwrap();
+    let bind_addr =
+        std::env::var("OPENSECRET_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
 
-    tracing::info!("Listening on http://localhost:3000");
+    tracing::info!("Listening on http://{}", bind_addr);
 
     Ok(axum::serve(listener, app.into_make_service()).await?)
 }

@@ -61,9 +61,15 @@
           ++ pkgs.lib.optionals pkgs.stdenv.isDarwin darwinOnlyInputs;
 
         setupPostgresScript = pkgs.writeShellScript "setup-postgres" ''
-          export PGDATA="$PWD/.pgdata"
-          export PGPORT=5432
-          export PGSOCKETS="$PWD/.pgdata/sockets"
+          case "''${OPENSECRET_DEV_POSTGRES:-1}" in
+            0|false|False|FALSE|no|No|NO|skip|Skip|SKIP)
+              exit 0
+              ;;
+          esac
+
+          export PGDATA="''${PGDATA:-$PWD/.pgdata}"
+          export PGPORT="''${PGPORT:-5432}"
+          export PGSOCKETS="''${PGSOCKETS:-$PGDATA/sockets}"
 
           # Skip if Postgres is already running
           if ${pkgs.postgresql}/bin/pg_isready -h localhost -p $PGPORT >/dev/null 2>&1; then
@@ -92,6 +98,12 @@
         '';
 
         setupEnvScript = pkgs.writeShellScript "setup-env" ''
+          case "''${OPENSECRET_DEV_ENV:-1}" in
+            0|false|False|FALSE|no|No|NO|skip|Skip|SKIP)
+              exit 0
+              ;;
+          esac
+
           if [ ! -f .env ]; then
             cp .env.sample .env
 
@@ -104,7 +116,9 @@
               mv "$tmp" .env
             }
 
-            replace_env 'DATABASE_URL=postgres://localhost/opensecret' 'DATABASE_URL=postgres://opensecret_user:password@localhost:5432/opensecret'
+            export PGPORT="''${PGPORT:-5432}"
+            export OPENSECRET_DEV_DATABASE_URL="''${OPENSECRET_DEV_DATABASE_URL:-postgres://opensecret_user:password@localhost:$PGPORT/opensecret}"
+            replace_env 'DATABASE_URL=postgres://localhost/opensecret' "DATABASE_URL=$OPENSECRET_DEV_DATABASE_URL"
 
             # Get a new ENCLAVE_SECRET_MOCK value using openssl
             export enclaveSecret=$(openssl rand -hex 32)
@@ -453,6 +467,11 @@
         devShell = pkgs.mkShell {
           packages = inputs;
           shellHook = ''
+            export PGDATA="''${PGDATA:-$PWD/.pgdata}"
+            export PGPORT="''${PGPORT:-5432}"
+            export PGSOCKETS="''${PGSOCKETS:-$PGDATA/sockets}"
+            export OPENSECRET_DEV_DATABASE_URL="''${OPENSECRET_DEV_DATABASE_URL:-postgres://opensecret_user:password@localhost:$PGPORT/opensecret}"
+
             export LIBCLANG_PATH=${pkgs.libclang.lib}/lib/
             export LD_LIBRARY_PATH=${pkgs.openssl}/lib:$LD_LIBRARY_PATH
             export CC_wasm32_unknown_unknown=${pkgs.llvmPackages_14.clang-unwrapped}/bin/clang-14

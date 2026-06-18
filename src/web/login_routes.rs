@@ -2,7 +2,7 @@ use crate::User;
 use crate::{
     db::DBError,
     email::{send_hello_email, send_verification_email},
-    jwt::{validate_token, NewToken, TokenType},
+    jwt::{validate_token, AuthContext, NewToken, TokenType},
     models::email_verification::NewEmailVerification,
 };
 use crate::{jwt::USER_REFRESH, web::encryption_middleware::EncryptedResponse};
@@ -211,11 +211,21 @@ async fn login_internal(data: Arc<AppState>, creds: Credentials) -> Result<AuthR
         .await
     {
         Ok(Some(authenticated_user)) => {
-            let access_token = NewToken::new(&authenticated_user, TokenType::Access, &data)?;
-            let refresh_token = NewToken::new(&authenticated_user, TokenType::Refresh, &data)?;
+            let access_token = NewToken::new_with_auth_context(
+                &authenticated_user.user,
+                TokenType::Access,
+                &data,
+                &authenticated_user.auth_context,
+            )?;
+            let refresh_token = NewToken::new_with_auth_context(
+                &authenticated_user.user,
+                TokenType::Refresh,
+                &data,
+                &authenticated_user.auth_context,
+            )?;
             let auth_response = AuthResponse {
-                id: authenticated_user.get_id(),
-                email: authenticated_user.get_email().map(|s| s.to_string()),
+                id: authenticated_user.user.get_id(),
+                email: authenticated_user.user.get_email().map(|s| s.to_string()),
                 access_token: access_token.token,
                 refresh_token: refresh_token.token,
             };
@@ -356,8 +366,14 @@ pub async fn refresh_token(
         .await
         .map_err(|_| ApiError::Unauthorized)?;
 
-    let new_access_token = NewToken::new(&user, TokenType::Access, &data)?;
-    let new_refresh_token = NewToken::new(&user, TokenType::Refresh, &data)?;
+    let auth_context = AuthContext::from_claims(&claims)?;
+    data.verify_seed_wrap_for_auth_context(&user, &auth_context)
+        .map_err(|_| ApiError::InvalidJwt)?;
+
+    let new_access_token =
+        NewToken::new_with_auth_context(&user, TokenType::Access, &data, &auth_context)?;
+    let new_refresh_token =
+        NewToken::new_with_auth_context(&user, TokenType::Refresh, &data, &auth_context)?;
 
     let response = RefreshResponse {
         access_token: new_access_token.token,

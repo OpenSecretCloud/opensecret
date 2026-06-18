@@ -1,6 +1,9 @@
 use crate::models::account_deletion::{
     AccountDeletionError, AccountDeletionRequest, NewAccountDeletionRequest,
 };
+use crate::models::app_data_migrations::{
+    AppDataMigration, AppDataMigrationError, NewAppDataMigration,
+};
 use crate::models::enclave_secrets::{EnclaveSecret, EnclaveSecretError, NewEnclaveSecret};
 use crate::models::invite_codes::{InviteCode, InviteCodeError, NewInviteCode};
 use crate::models::oauth::{
@@ -35,19 +38,24 @@ use crate::models::responses::{
     ProjectInstructionUpdate, RawThreadMessage, RawThreadMessageMetadata, ReasoningItem, Response,
     ResponseStatus, ResponsesError, ToolCall, ToolOutput, UserInstruction, UserMessage,
 };
+use crate::models::schema::users;
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
 use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
+use crate::models::user_seed_wrappings::{
+    NewUserSeedWrapping, UserSeedWrapping, UserSeedWrappingError,
+};
 use crate::models::users::{NewUser, User, UserError};
 use crate::models::{
     email_verification::{EmailVerification, EmailVerificationError, NewEmailVerification},
     org_memberships::OrgRole,
 };
+use crate::seed_wrapping::CredentialKind;
 use chrono::{DateTime, Utc};
-use diesel::Connection;
 use diesel::{
     pg::PgConnection,
     r2d2::{ConnectionManager, Pool},
 };
+use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl};
 use std::sync::Arc;
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -128,6 +136,12 @@ pub enum DBError {
     ProjectSettingNotFound,
     #[error("Responses API error: {0}")]
     ResponsesError(#[from] crate::models::responses::ResponsesError),
+    #[error("User seed wrapping error: {0}")]
+    UserSeedWrappingError(#[from] UserSeedWrappingError),
+    #[error("App data migration error: {0}")]
+    AppDataMigrationError(#[from] AppDataMigrationError),
+    #[error("Credential state changed during update")]
+    StaleCredentialState,
 }
 
 #[allow(dead_code)]
@@ -135,7 +149,38 @@ pub trait DBConnection {
     fn create_user(&self, new_user: NewUser) -> Result<User, DBError>;
     fn get_user_by_uuid(&self, uuid: Uuid) -> Result<User, DBError>;
     fn get_user_by_email(&self, email: String, project_id: i32) -> Result<User, DBError>;
-    fn set_user_key(&self, user: User, private_key: Vec<u8>) -> Result<(), DBError>;
+    fn create_user_seed_wrapping(
+        &self,
+        new_wrapping: NewUserSeedWrapping,
+    ) -> Result<UserSeedWrapping, DBError>;
+    fn upsert_user_seed_wrapping(
+        &self,
+        new_wrapping: NewUserSeedWrapping,
+    ) -> Result<UserSeedWrapping, DBError>;
+    fn get_user_seed_wrappings_for_user_and_kind(
+        &self,
+        user_id: Uuid,
+        credential_kind: &str,
+    ) -> Result<Vec<UserSeedWrapping>, DBError>;
+    fn get_user_seed_wrapping_by_credential(
+        &self,
+        user_id: Uuid,
+        credential_kind: &str,
+        credential_lookup_hash: &[u8],
+        wrapping_version: i16,
+    ) -> Result<Option<UserSeedWrapping>, DBError>;
+    fn delete_user_seed_wrappings_for_user(&self, user_id: Uuid) -> Result<usize, DBError>;
+    fn delete_user_seed_wrappings_for_user_and_kind(
+        &self,
+        user_id: Uuid,
+        credential_kind: &str,
+    ) -> Result<usize, DBError>;
+    fn get_app_data_migration(&self, name: &str) -> Result<Option<AppDataMigration>, DBError>;
+    fn app_data_migration_exists(&self, name: &str) -> Result<bool, DBError>;
+    fn create_app_data_migration(
+        &self,
+        new_migration: NewAppDataMigration,
+    ) -> Result<AppDataMigration, DBError>;
     fn get_pool(&self) -> &diesel::r2d2::Pool<diesel::r2d2::ConnectionManager<PgConnection>>;
     fn create_enclave_secret(&self, new_secret: NewEnclaveSecret)
         -> Result<EnclaveSecret, DBError>;
@@ -166,14 +211,24 @@ pub trait DBConnection {
         user_id: Uuid,
         encrypted_code: Vec<u8>,
     ) -> Result<Option<PasswordResetRequest>, DBError>;
-    fn update_user_password(
+    fn update_user_password_and_seed_wrap(
         &self,
         user: &User,
-        new_password_enc: Option<Vec<u8>>,
+        expected_password_enc: &[u8],
+        new_password_enc: Vec<u8>,
+        new_wrapping: NewUserSeedWrapping,
     ) -> Result<(), DBError>;
     fn mark_password_reset_as_complete(
         &self,
         request: &PasswordResetRequest,
+    ) -> Result<(), DBError>;
+    fn complete_destructive_password_reset(
+        &self,
+        user: &User,
+        reset_request: &PasswordResetRequest,
+        new_password_enc: Vec<u8>,
+        new_legacy_seed_enc: Vec<u8>,
+        new_wrapping: NewUserSeedWrapping,
     ) -> Result<(), DBError>;
 
     // Account Deletion methods
@@ -222,10 +277,11 @@ pub trait DBConnection {
         user_id: Uuid,
         provider_id: i32,
     ) -> Result<Option<UserOAuthConnection>, DBError>;
-    fn get_user_oauth_connection_by_provider_and_provider_user_id(
+    fn get_project_user_oauth_connection_by_provider_subject(
         &self,
         provider_id: i32,
         provider_user_id: &str,
+        project_id: i32,
     ) -> Result<Option<UserOAuthConnection>, DBError>;
     fn get_all_user_oauth_connections_for_user(
         &self,
@@ -239,7 +295,6 @@ pub trait DBConnection {
     fn create_token_usage(&self, new_usage: NewTokenUsage) -> Result<TokenUsage, DBError>;
 
     fn update_user(&self, user: &User) -> Result<(), DBError>;
-
     // New org-related methods
     fn create_org(&self, new_org: NewOrg) -> Result<Org, DBError>;
     fn get_org_by_id(&self, id: i32) -> Result<Org, DBError>;
@@ -711,14 +766,83 @@ impl DBConnection for PostgresConnection {
         result
     }
 
-    fn set_user_key(&self, user: User, private_key: Vec<u8>) -> Result<(), DBError> {
-        debug!("Setting user key");
+    fn create_user_seed_wrapping(
+        &self,
+        new_wrapping: NewUserSeedWrapping,
+    ) -> Result<UserSeedWrapping, DBError> {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        let result = user.set_key(conn, private_key).map_err(DBError::from);
-        if let Err(ref e) = result {
-            error!("Failed to set user key: {:?}", e);
-        }
-        result
+        new_wrapping.insert(conn).map_err(DBError::from)
+    }
+
+    fn upsert_user_seed_wrapping(
+        &self,
+        new_wrapping: NewUserSeedWrapping,
+    ) -> Result<UserSeedWrapping, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_wrapping
+            .upsert_by_credential(conn)
+            .map_err(DBError::from)
+    }
+
+    fn get_user_seed_wrappings_for_user_and_kind(
+        &self,
+        user_id: Uuid,
+        credential_kind: &str,
+    ) -> Result<Vec<UserSeedWrapping>, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserSeedWrapping::get_for_user_and_kind(conn, user_id, credential_kind)
+            .map_err(DBError::from)
+    }
+
+    fn get_user_seed_wrapping_by_credential(
+        &self,
+        user_id: Uuid,
+        credential_kind: &str,
+        credential_lookup_hash: &[u8],
+        wrapping_version: i16,
+    ) -> Result<Option<UserSeedWrapping>, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserSeedWrapping::get_by_credential(
+            conn,
+            user_id,
+            credential_kind,
+            credential_lookup_hash,
+            wrapping_version,
+        )
+        .map_err(DBError::from)
+    }
+
+    fn delete_user_seed_wrappings_for_user(&self, user_id: Uuid) -> Result<usize, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserSeedWrapping::delete_for_user(conn, user_id).map_err(DBError::from)
+    }
+
+    fn delete_user_seed_wrappings_for_user_and_kind(
+        &self,
+        user_id: Uuid,
+        credential_kind: &str,
+    ) -> Result<usize, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserSeedWrapping::delete_for_user_and_kind(conn, user_id, credential_kind)
+            .map_err(DBError::from)
+    }
+
+    fn get_app_data_migration(&self, name: &str) -> Result<Option<AppDataMigration>, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        AppDataMigration::get(conn, name).map_err(DBError::from)
+    }
+
+    fn app_data_migration_exists(&self, name: &str) -> Result<bool, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        AppDataMigration::exists(conn, name).map_err(DBError::from)
+    }
+
+    fn create_app_data_migration(
+        &self,
+        new_migration: NewAppDataMigration,
+    ) -> Result<AppDataMigration, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_migration.insert(conn).map_err(DBError::from)
     }
 
     fn get_pool(&self) -> &diesel::r2d2::Pool<diesel::r2d2::ConnectionManager<PgConnection>> {
@@ -833,20 +957,38 @@ impl DBConnection for PostgresConnection {
         result
     }
 
-    fn update_user_password(
+    fn update_user_password_and_seed_wrap(
         &self,
         user: &User,
-        new_password_enc: Option<Vec<u8>>,
+        expected_password_enc: &[u8],
+        new_password_enc: Vec<u8>,
+        new_wrapping: NewUserSeedWrapping,
     ) -> Result<(), DBError> {
-        debug!("Updating user password");
+        debug!("Updating user password and password seed wrap");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        let result = user
-            .update_password(conn, new_password_enc)
-            .map_err(DBError::from);
-        if let Err(ref e) = result {
-            error!("Failed to update user password: {:?}", e);
-        }
-        result
+        conn.transaction::<_, DBError, _>(|conn| {
+            let updated_user_count = diesel::update(
+                users::table
+                    .filter(users::uuid.eq(user.uuid))
+                    .filter(users::password_enc.eq(Some(expected_password_enc.to_vec()))),
+            )
+            .set((
+                users::password_enc.eq(Some(new_password_enc)),
+                users::updated_at.eq(diesel::dsl::now),
+            ))
+            .execute(conn)?;
+            if updated_user_count != 1 {
+                return Err(DBError::StaleCredentialState);
+            }
+
+            UserSeedWrapping::delete_for_user_and_kind(
+                conn,
+                user.uuid,
+                CredentialKind::Password.as_str(),
+            )?;
+            new_wrapping.insert(conn)?;
+            Ok(())
+        })
     }
 
     fn mark_password_reset_as_complete(
@@ -860,6 +1002,109 @@ impl DBConnection for PostgresConnection {
             error!("Failed to mark password reset request as complete: {:?}", e);
         }
         result
+    }
+
+    fn complete_destructive_password_reset(
+        &self,
+        user: &User,
+        reset_request: &PasswordResetRequest,
+        new_password_enc: Vec<u8>,
+        new_legacy_seed_enc: Vec<u8>,
+        new_wrapping: NewUserSeedWrapping,
+    ) -> Result<(), DBError> {
+        use crate::models::schema::{
+            agent_schedule_runs, agent_schedules, agents, conversation_projects,
+            conversation_summaries, conversations, memory_blocks, notification_events,
+            password_reset_requests, push_devices, user_embeddings, user_instructions, user_kv,
+            user_oauth_connections, user_preferences, user_seed_wrappings, users,
+        };
+
+        debug!("Completing destructive password reset");
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        conn.transaction::<_, DBError, _>(|conn| {
+            let user_id = user.uuid;
+
+            let _locked_user = users::table
+                .filter(users::uuid.eq(user_id))
+                .for_update()
+                .first::<User>(conn)?;
+
+            let consumed_reset_count = diesel::update(
+                password_reset_requests::table
+                    .filter(password_reset_requests::id.eq(reset_request.id))
+                    .filter(password_reset_requests::user_id.eq(user_id))
+                    .filter(password_reset_requests::is_reset.eq(false))
+                    .filter(password_reset_requests::expiration_time.gt(diesel::dsl::now)),
+            )
+            .set(password_reset_requests::is_reset.eq(true))
+            .execute(conn)?;
+            if consumed_reset_count != 1 {
+                return Err(DBError::PasswordResetRequestNotFound);
+            }
+
+            diesel::update(
+                password_reset_requests::table
+                    .filter(password_reset_requests::user_id.eq(user_id))
+                    .filter(password_reset_requests::id.ne(reset_request.id))
+                    .filter(password_reset_requests::is_reset.eq(false)),
+            )
+            .set(password_reset_requests::is_reset.eq(true))
+            .execute(conn)?;
+
+            diesel::delete(
+                user_seed_wrappings::table.filter(user_seed_wrappings::user_id.eq(user_id)),
+            )
+            .execute(conn)?;
+            diesel::delete(
+                user_oauth_connections::table.filter(user_oauth_connections::user_id.eq(user_id)),
+            )
+            .execute(conn)?;
+            diesel::delete(user_embeddings::table.filter(user_embeddings::user_id.eq(user_id)))
+                .execute(conn)?;
+            diesel::delete(
+                agent_schedule_runs::table.filter(agent_schedule_runs::user_id.eq(user_id)),
+            )
+            .execute(conn)?;
+            diesel::delete(agent_schedules::table.filter(agent_schedules::user_id.eq(user_id)))
+                .execute(conn)?;
+            diesel::delete(agents::table.filter(agents::user_id.eq(user_id))).execute(conn)?;
+            diesel::delete(
+                notification_events::table.filter(notification_events::user_id.eq(user_id)),
+            )
+            .execute(conn)?;
+            diesel::delete(push_devices::table.filter(push_devices::user_id.eq(user_id)))
+                .execute(conn)?;
+            diesel::delete(memory_blocks::table.filter(memory_blocks::user_id.eq(user_id)))
+                .execute(conn)?;
+            diesel::delete(user_preferences::table.filter(user_preferences::user_id.eq(user_id)))
+                .execute(conn)?;
+            diesel::delete(user_kv::table.filter(user_kv::user_id.eq(user_id))).execute(conn)?;
+            diesel::delete(user_instructions::table.filter(user_instructions::user_id.eq(user_id)))
+                .execute(conn)?;
+            diesel::delete(
+                conversation_projects::table.filter(conversation_projects::user_id.eq(user_id)),
+            )
+            .execute(conn)?;
+            diesel::delete(
+                conversation_summaries::table.filter(conversation_summaries::user_id.eq(user_id)),
+            )
+            .execute(conn)?;
+            diesel::delete(conversations::table.filter(conversations::user_id.eq(user_id)))
+                .execute(conn)?;
+
+            diesel::update(users::table.filter(users::uuid.eq(user_id)))
+                .set((
+                    users::password_enc.eq(Some(new_password_enc)),
+                    users::seed_enc.eq(Some(new_legacy_seed_enc)),
+                    users::updated_at.eq(diesel::dsl::now),
+                ))
+                .execute(conn)?;
+
+            new_wrapping.upsert_by_credential(conn)?;
+
+            Ok(())
+        })
     }
 
     // OAuth Provider method implementations
@@ -923,16 +1168,18 @@ impl DBConnection for PostgresConnection {
             .map_err(DBError::from)
     }
 
-    fn get_user_oauth_connection_by_provider_and_provider_user_id(
+    fn get_project_user_oauth_connection_by_provider_subject(
         &self,
         provider_id: i32,
         provider_user_id: &str,
+        project_id: i32,
     ) -> Result<Option<UserOAuthConnection>, DBError> {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
-        UserOAuthConnection::get_by_provider_and_provider_user_id(
+        UserOAuthConnection::get_by_provider_subject_and_project(
             conn,
             provider_id,
             provider_user_id,
+            project_id,
         )
         .map_err(DBError::from)
     }

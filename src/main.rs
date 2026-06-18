@@ -11,6 +11,8 @@ use crate::encrypt::{
 use crate::jwt::validate_platform_jwt;
 use crate::login_routes::RegisterCredentials;
 use crate::models::account_deletion::{AccountDeletionError, NewAccountDeletionRequest};
+use crate::models::email_verification::{EmailVerificationError, NewEmailVerification};
+use crate::models::oauth::{NewUserOAuthConnection, OAuthError};
 use crate::models::password_reset::NewPasswordResetRequest;
 use crate::models::platform_password_reset::NewPlatformPasswordResetRequest;
 use crate::models::platform_users::PlatformUser;
@@ -24,15 +26,23 @@ use crate::web::{
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
+use crate::jwt::{AuthContext, AuthMethod};
+use crate::models::user_seed_wrappings::{NewUserSeedWrapping, UserSeedWrappingError};
+use crate::seed_wrapping::{
+    compute_oauth_auth_binding, compute_password_auth_binding, decrypt_seed_v1, encrypt_seed_v1,
+    normalize_email_login_identifier, normalize_guest_login_identifier,
+    oauth_credential_lookup_hash, password_credential_lookup_hash, password_reset_code_mac,
+    AuthBinding, CredentialKind, PasswordLoginIdentifierKind, SEED_WRAP_VERSION_V1,
+};
 use crate::{
     aws_credentials::AwsCredentialError,
     models::enclave_secrets::NewEnclaveSecret,
-    private_key::{decrypt_user_seed_to_key, generate_twelve_word_seed},
+    private_key::{generate_twelve_word_seed, plaintext_user_seed_to_key},
 };
 use crate::{billing::BillingClient, web::platform::common::PROJECT_RESEND_API_KEY};
 use crate::{
     db::{setup_db, DBConnection, DBError},
-    models::users::{NewUser, User},
+    models::users::{NewUser, User, UserError},
 };
 use crate::{encrypt::create_new_encryption_key, jwt::validate_jwt};
 use aws_credentials::{AwsCredentialManager, AwsCredentials};
@@ -42,6 +52,7 @@ use base64::Engine as _;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::KeyInit;
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use diesel::Connection;
 use kv::{KVPair, StoreError, StoreResult};
 use password_auth::{generate_hash, verify_password, VerifyError};
 use rand_core::{CryptoRng, RngCore};
@@ -86,9 +97,15 @@ mod oauth;
 mod os_flags;
 mod private_key;
 mod proxy_config;
+#[cfg(test)]
+mod security_invariants;
+mod seed_wrapping;
 mod sqs;
 mod tokens;
 mod web;
+
+#[cfg(test)]
+mod aead_db_tamper_tests;
 
 use apple_signin::AppleJwtVerifier;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
@@ -142,9 +159,6 @@ pub enum Error {
 
     #[error("Private key could not be generated")]
     PrivateKeyGenerationFailure,
-
-    #[error("Private key already exists")]
-    PrivateKeyAlreadyExists,
 
     #[error("User not found")]
     UserNotFound,
@@ -208,6 +222,45 @@ pub enum Error {
 
     #[error("Key derivation failed: {0}")]
     KeyDerivationError(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CreateUserSeedWrapTransactionError {
+    #[error("Diesel error: {0}")]
+    Diesel(#[from] diesel::result::Error),
+    #[error("User error: {0}")]
+    User(#[from] UserError),
+    #[error("User seed wrapping error: {0}")]
+    UserSeedWrapping(#[from] UserSeedWrappingError),
+    #[error("OAuth error: {0}")]
+    OAuth(#[from] OAuthError),
+    #[error("Email verification error: {0}")]
+    EmailVerification(#[from] EmailVerificationError),
+    #[error("Application error: {0}")]
+    App(#[from] Error),
+}
+
+impl From<CreateUserSeedWrapTransactionError> for Error {
+    fn from(error: CreateUserSeedWrapTransactionError) -> Self {
+        match error {
+            CreateUserSeedWrapTransactionError::Diesel(e) => {
+                Error::DatabaseError(DBError::QueryError(e))
+            }
+            CreateUserSeedWrapTransactionError::User(e) => {
+                Error::DatabaseError(DBError::UserError(e))
+            }
+            CreateUserSeedWrapTransactionError::UserSeedWrapping(e) => {
+                Error::DatabaseError(DBError::UserSeedWrappingError(e))
+            }
+            CreateUserSeedWrapTransactionError::OAuth(e) => {
+                Error::DatabaseError(DBError::OAuthError(e))
+            }
+            CreateUserSeedWrapTransactionError::EmailVerification(e) => {
+                Error::DatabaseError(DBError::EmailVerificationError(e))
+            }
+            CreateUserSeedWrapTransactionError::App(e) => e,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -418,6 +471,12 @@ pub struct AppState {
     apple_jwt_verifier: Arc<AppleJwtVerifier>,
     cancellation_broadcast: tokio::sync::broadcast::Sender<Uuid>,
     brave_client: Option<Arc<crate::brave::BraveClient>>,
+}
+
+#[derive(Debug, Clone)]
+struct AuthenticatedUser {
+    user: User,
+    auth_context: AuthContext,
 }
 
 #[derive(Default)]
@@ -734,6 +793,381 @@ impl AppState {
         }
     }
 
+    fn password_login_identifier_for_user(user: &User) -> (PasswordLoginIdentifierKind, String) {
+        match user.get_email() {
+            Some(email) => (
+                PasswordLoginIdentifierKind::Email,
+                normalize_email_login_identifier(email),
+            ),
+            None => (
+                PasswordLoginIdentifierKind::GuestUuid,
+                normalize_guest_login_identifier(user.uuid),
+            ),
+        }
+    }
+
+    fn password_auth_binding_for_user(
+        &self,
+        user: &User,
+        decrypted_password_verifier: &str,
+    ) -> Result<AuthBinding, Error> {
+        let (login_identifier_kind, normalized_login_identifier) =
+            Self::password_login_identifier_for_user(user);
+
+        compute_password_auth_binding(
+            &self.enclave_key,
+            user.project_id,
+            user.uuid,
+            login_identifier_kind,
+            &normalized_login_identifier,
+            decrypted_password_verifier,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))
+    }
+
+    fn password_auth_context_for_user(
+        &self,
+        user: &User,
+        decrypted_password_verifier: &str,
+    ) -> Result<AuthContext, Error> {
+        let auth_binding =
+            self.password_auth_binding_for_user(user, decrypted_password_verifier)?;
+        Ok(AuthContext::new(
+            AuthMethod::Password,
+            user.project_id,
+            *auth_binding.as_bytes(),
+        ))
+    }
+
+    fn oauth_auth_binding_for_user(
+        &self,
+        user: &User,
+        provider_name: &str,
+        provider_user_id: &str,
+    ) -> Result<AuthBinding, Error> {
+        compute_oauth_auth_binding(
+            &self.enclave_key,
+            user.project_id,
+            user.uuid,
+            provider_name,
+            provider_user_id,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))
+    }
+
+    fn oauth_auth_context_for_user(
+        &self,
+        user: &User,
+        provider_name: &str,
+        provider_user_id: &str,
+    ) -> Result<AuthContext, Error> {
+        let auth_binding =
+            self.oauth_auth_binding_for_user(user, provider_name, provider_user_id)?;
+        Ok(AuthContext::new(
+            AuthMethod::OAuth,
+            user.project_id,
+            *auth_binding.as_bytes(),
+        ))
+    }
+
+    fn decrypt_seed_for_auth_context(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+    ) -> Result<Vec<u8>, Error> {
+        if user.project_id != auth_context.project_id {
+            return Err(Error::AuthenticationError);
+        }
+
+        let credential_kind = match auth_context.method {
+            AuthMethod::Password => CredentialKind::Password,
+            AuthMethod::OAuth => CredentialKind::OAuth,
+        };
+        let auth_binding = AuthBinding::from_bytes(auth_context.auth_binding);
+        let candidates = self
+            .db
+            .get_user_seed_wrappings_for_user_and_kind(user.uuid, credential_kind.as_str())?;
+
+        for candidate in candidates {
+            if candidate.wrapping_version != SEED_WRAP_VERSION_V1 {
+                continue;
+            }
+
+            match decrypt_seed_v1(
+                &self.enclave_key,
+                &candidate.seed_enc,
+                user.uuid,
+                user.project_id,
+                credential_kind,
+                &auth_binding,
+            ) {
+                Ok(seed) => return Ok(seed),
+                Err(_) => continue,
+            }
+        }
+
+        Err(Error::AuthenticationError)
+    }
+
+    fn verify_seed_wrap_for_auth_context(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+    ) -> Result<(), Error> {
+        self.decrypt_seed_for_auth_context(user, auth_context)
+            .map(|_| ())
+    }
+
+    fn new_password_seed_wrapping_for_user(
+        &self,
+        user: &User,
+        decrypted_password_verifier: &str,
+        plaintext_seed: &[u8],
+    ) -> Result<NewUserSeedWrapping, Error> {
+        let auth_binding =
+            self.password_auth_binding_for_user(user, decrypted_password_verifier)?;
+
+        let credential_lookup_hash =
+            password_credential_lookup_hash(&self.enclave_key, user.project_id, user.uuid)
+                .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        let seed_enc = encrypt_seed_v1(
+            &self.enclave_key,
+            plaintext_seed,
+            user.uuid,
+            user.project_id,
+            CredentialKind::Password,
+            &auth_binding,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        let new_wrapping = NewUserSeedWrapping::new(
+            user.uuid,
+            CredentialKind::Password.as_str(),
+            credential_lookup_hash.as_bytes().to_vec(),
+            SEED_WRAP_VERSION_V1,
+            seed_enc,
+        );
+
+        self.verify_new_password_seed_wrapping_for_user(
+            user,
+            decrypted_password_verifier,
+            plaintext_seed,
+            &new_wrapping,
+        )?;
+
+        Ok(new_wrapping)
+    }
+
+    fn verify_new_password_seed_wrapping_for_user(
+        &self,
+        user: &User,
+        decrypted_password_verifier: &str,
+        plaintext_seed: &[u8],
+        new_wrapping: &NewUserSeedWrapping,
+    ) -> Result<(), Error> {
+        let auth_binding =
+            self.password_auth_binding_for_user(user, decrypted_password_verifier)?;
+        let decrypted_seed = decrypt_seed_v1(
+            &self.enclave_key,
+            &new_wrapping.seed_enc,
+            user.uuid,
+            user.project_id,
+            CredentialKind::Password,
+            &auth_binding,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        if decrypted_seed != plaintext_seed {
+            return Err(Error::EncryptionError(
+                "New password seed wrap verification failed".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn create_password_seed_wrap_for_user(
+        &self,
+        user: &User,
+        decrypted_password_verifier: &str,
+        plaintext_seed: &[u8],
+    ) -> Result<(), Error> {
+        let new_wrapping = self.new_password_seed_wrapping_for_user(
+            user,
+            decrypted_password_verifier,
+            plaintext_seed,
+        )?;
+
+        self.db.upsert_user_seed_wrapping(new_wrapping)?;
+        Ok(())
+    }
+
+    fn create_user_with_password_seed_wrap(
+        &self,
+        new_user: NewUser,
+        decrypted_password_verifier: &str,
+        plaintext_seed: &[u8],
+    ) -> Result<User, Error> {
+        let conn = &mut self
+            .db
+            .get_pool()
+            .get()
+            .map_err(|_| Error::DatabaseError(DBError::ConnectionError))?;
+
+        conn.transaction::<_, CreateUserSeedWrapTransactionError, _>(|conn| {
+            let user = new_user.insert(conn)?;
+            let new_wrapping = self.new_password_seed_wrapping_for_user(
+                &user,
+                decrypted_password_verifier,
+                plaintext_seed,
+            )?;
+            new_wrapping.upsert_by_credential(conn)?;
+            Ok(user)
+        })
+        .map_err(Error::from)
+    }
+
+    fn new_oauth_seed_wrapping_for_user(
+        &self,
+        user: &User,
+        provider_name: &str,
+        provider_user_id: &str,
+        plaintext_seed: &[u8],
+    ) -> Result<NewUserSeedWrapping, Error> {
+        let auth_binding =
+            self.oauth_auth_binding_for_user(user, provider_name, provider_user_id)?;
+        let credential_lookup_hash = oauth_credential_lookup_hash(
+            &self.enclave_key,
+            user.project_id,
+            user.uuid,
+            provider_name,
+            provider_user_id,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        let seed_enc = encrypt_seed_v1(
+            &self.enclave_key,
+            plaintext_seed,
+            user.uuid,
+            user.project_id,
+            CredentialKind::OAuth,
+            &auth_binding,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        let new_wrapping = NewUserSeedWrapping::new(
+            user.uuid,
+            CredentialKind::OAuth.as_str(),
+            credential_lookup_hash.as_bytes().to_vec(),
+            SEED_WRAP_VERSION_V1,
+            seed_enc,
+        );
+
+        self.verify_new_oauth_seed_wrapping_for_user(
+            user,
+            provider_name,
+            provider_user_id,
+            plaintext_seed,
+            &new_wrapping,
+        )?;
+
+        Ok(new_wrapping)
+    }
+
+    #[cfg(test)]
+    fn create_oauth_seed_wrap_for_user(
+        &self,
+        user: &User,
+        provider_name: &str,
+        provider_user_id: &str,
+        plaintext_seed: &[u8],
+    ) -> Result<(), Error> {
+        let new_wrapping = self.new_oauth_seed_wrapping_for_user(
+            user,
+            provider_name,
+            provider_user_id,
+            plaintext_seed,
+        )?;
+
+        self.db.upsert_user_seed_wrapping(new_wrapping)?;
+        Ok(())
+    }
+
+    pub fn create_user_with_oauth_seed_wrap(
+        &self,
+        new_user: NewUser,
+        provider_id: i32,
+        provider_name: &str,
+        provider_user_id: &str,
+        access_token_enc: Vec<u8>,
+        plaintext_seed: &[u8],
+    ) -> Result<User, Error> {
+        let conn = &mut self
+            .db
+            .get_pool()
+            .get()
+            .map_err(|_| Error::DatabaseError(DBError::ConnectionError))?;
+
+        conn.transaction::<_, CreateUserSeedWrapTransactionError, _>(|conn| {
+            let user = new_user.insert(conn)?;
+
+            let new_connection = NewUserOAuthConnection {
+                user_id: user.uuid,
+                provider_id,
+                provider_user_id: provider_user_id.to_string(),
+                access_token_enc,
+                refresh_token_enc: None,
+                expires_at: None,
+            };
+            new_connection.insert(conn)?;
+
+            let new_wrapping = self.new_oauth_seed_wrapping_for_user(
+                &user,
+                provider_name,
+                provider_user_id,
+                plaintext_seed,
+            )?;
+            new_wrapping.upsert_by_credential(conn)?;
+
+            let new_verification = NewEmailVerification::new(user.uuid, 24, true);
+            new_verification.insert(conn)?;
+
+            Ok(user)
+        })
+        .map_err(Error::from)
+    }
+
+    fn verify_new_oauth_seed_wrapping_for_user(
+        &self,
+        user: &User,
+        provider_name: &str,
+        provider_user_id: &str,
+        plaintext_seed: &[u8],
+        new_wrapping: &NewUserSeedWrapping,
+    ) -> Result<(), Error> {
+        let auth_binding =
+            self.oauth_auth_binding_for_user(user, provider_name, provider_user_id)?;
+        let decrypted_seed = decrypt_seed_v1(
+            &self.enclave_key,
+            &new_wrapping.seed_enc,
+            user.uuid,
+            user.project_id,
+            CredentialKind::OAuth,
+            &auth_binding,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        if decrypted_seed != plaintext_seed {
+            return Err(Error::EncryptionError(
+                "New OAuth seed wrap verification failed".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     async fn register_user(&self, creds: RegisterCredentials) -> Result<User, Error> {
         // Get project by client_id
         let project = self
@@ -786,7 +1220,11 @@ impl AppState {
         let new_user = NewUser::new(creds.email, Some(encrypted_pw), project.id, encrypted_key)
             .with_name_option(creds.name);
 
-        let user = self.db.create_user(new_user)?;
+        let user = self.create_user_with_password_seed_wrap(
+            new_user,
+            &password_hash,
+            user_seed_words.as_bytes(),
+        )?;
 
         tracing::info!("registered new user: {:?} {:?}", user.email, user.uuid);
 
@@ -799,7 +1237,7 @@ impl AppState {
         user_id: Option<Uuid>,
         user_password: String,
         user_project_id: i32,
-    ) -> Result<Option<User>, Error> {
+    ) -> Result<Option<AuthenticatedUser>, Error> {
         // Ensure at least one identifier is provided
         if user_email.is_none() && user_id.is_none() {
             return Err(Error::AuthenticationError);
@@ -834,6 +1272,7 @@ impl AppState {
 
         let decrypted_password_hash = String::from_utf8(decrypted_password_bytes)
             .map_err(|e| Error::EncryptionError(format!("Failed to decode UTF-8: {}", e)))?;
+        let verifier_for_binding = decrypted_password_hash.clone();
 
         // Verifying the password is blocking and potentially slow, so we'll do so via
         // `spawn_blocking`.
@@ -842,7 +1281,12 @@ impl AppState {
                 .await?;
 
         match res {
-            Ok(_) => Ok(Some(user)),
+            Ok(_) => {
+                let auth_context =
+                    self.password_auth_context_for_user(&user, &verifier_for_binding)?;
+                self.verify_seed_wrap_for_auth_context(&user, &auth_context)?;
+                Ok(Some(AuthenticatedUser { user, auth_context }))
+            }
             Err(_) => Ok(None),
         }
     }
@@ -858,7 +1302,8 @@ impl AppState {
     /// Returns the user's private key, optionally derived using the provided derivation paths.
     ///
     /// # Arguments
-    /// * `user_uuid` - The UUID of the user
+    /// * `user` - The authenticated user
+    /// * `auth_context` - The signed auth context from the validated user JWT
     /// * `derivation_path` - Optional BIP-32 derivation path
     /// * `seed_phrase_derivation_path` - Optional BIP-85 derivation path to derive a child seed
     ///
@@ -867,11 +1312,12 @@ impl AppState {
     ///   BIP-85 and/or BIP-32 derivation paths
     async fn get_user_key(
         &self,
-        user_uuid: Uuid,
+        user: &User,
+        auth_context: &AuthContext,
         derivation_path: Option<&str>,
         seed_phrase_derivation_path: Option<&str>,
     ) -> Result<SecretKey, Error> {
-        info!("Getting user key for UUID: {}", user_uuid);
+        info!("Getting user key for UUID: {}", user.uuid);
 
         if let Some(path) = derivation_path {
             debug!("Using BIP-32 derivation path: {}", path);
@@ -881,44 +1327,24 @@ impl AppState {
             debug!("Using BIP-85 derivation path: {}", path);
         }
 
-        let user = self.get_user(user_uuid).await?;
-        debug!("User retrieved successfully");
+        let plaintext_seed = self.decrypt_seed_for_auth_context(user, auth_context)?;
 
-        let encrypted_seed = match user.get_seed_encrypted().await {
-            Some(es) => {
-                debug!("Found existing encrypted seed for user");
-                es
-            }
-            None => {
-                // create seed if not already exists
-                info!(
-                    "No seed found for user {}, generating new private key",
-                    user_uuid
-                );
-                let updated_user = self.generate_private_key(user_uuid).await?;
-                updated_user.get_seed_encrypted().await.ok_or_else(|| {
-                    error!("Seed not found after generation for user: {}", user_uuid);
-                    Error::PrivateKeyGenerationFailure
-                })?
-            }
-        };
-
-        debug!("Decrypting user seed and deriving key");
-        let user_secret_key = decrypt_user_seed_to_key(
-            self.enclave_key.clone(),
-            encrypted_seed,
+        debug!("Deriving user key from authenticated seed wrap");
+        let user_secret_key = plaintext_user_seed_to_key(
+            &plaintext_seed,
             derivation_path,
             seed_phrase_derivation_path,
         )?;
 
-        info!("Successfully derived key for user: {}", user_uuid);
+        info!("Successfully derived key for user: {}", user.uuid);
         Ok(user_secret_key)
     }
 
     /// Sign a message with the user's private key, using the specified algorithm
     async fn sign_message(
         &self,
-        user_uuid: Uuid,
+        user: &User,
+        auth_context: &AuthContext,
         message_bytes: &[u8],
         algorithm: message_signing::SigningAlgorithm,
         derivation_path: Option<&str>,
@@ -926,7 +1352,7 @@ impl AppState {
     ) -> Result<message_signing::SignMessageResponse, Error> {
         info!(
             "Signing message for user: {}, algorithm: {:?}",
-            user_uuid, algorithm
+            user.uuid, algorithm
         );
 
         if let Some(path) = derivation_path {
@@ -939,59 +1365,53 @@ impl AppState {
 
         debug!("Getting user key for message signing");
         let user_secret_key = self
-            .get_user_key(user_uuid, derivation_path, seed_phrase_derivation_path)
+            .get_user_key(
+                user,
+                auth_context,
+                derivation_path,
+                seed_phrase_derivation_path,
+            )
             .await?;
 
         debug!("Signing message with algorithm: {:?}", algorithm);
         let result = message_signing::sign_message(&user_secret_key, message_bytes, algorithm);
 
         if result.is_ok() {
-            info!("Message signed successfully for user: {}", user_uuid);
+            info!("Message signed successfully for user: {}", user.uuid);
         } else {
-            error!("Failed to sign message for user: {}", user_uuid);
+            error!("Failed to sign message for user: {}", user.uuid);
         }
 
         result
     }
 
-    // DEPRECATED: New users now always get a private key
-    async fn generate_private_key(&self, user_uuid: Uuid) -> Result<User, Error> {
-        let user = self.get_user(user_uuid).await?;
-
-        if user.get_seed_encrypted().await.is_none() {
-            let user_seed_words = generate_twelve_word_seed(self.aws_credential_manager.clone())
-                .await?
-                .to_string();
-
-            let secret_key = SecretKey::from_slice(&self.enclave_key.clone())
-                .map_err(|e| Error::EncryptionError(e.to_string()))?;
-
-            let encrypted_key = encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
-
-            self.db.set_user_key(user, encrypted_key)?;
-
-            self.get_user(user_uuid).await
-        } else {
-            Err(Error::PrivateKeyAlreadyExists)
-        }
-    }
-
-    async fn get(&self, user_id: Uuid, key: String) -> StoreResult<Option<String>> {
+    async fn get(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+        key: String,
+    ) -> StoreResult<Option<String>> {
         let user_key = self
-            .get_user_key(user_id, None, None)
+            .get_user_key(user, auth_context, None, None)
             .await
             .map_err(|_| StoreError::Unauthorized)?;
-        kv::get(self.db.get_pool(), user_id, &key, &user_key)
+        kv::get(self.db.get_pool(), user.uuid, &key, &user_key)
     }
 
-    async fn put(&self, user_id: Uuid, key: String, value: String) -> StoreResult<()> {
+    async fn put(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+        key: String,
+        value: String,
+    ) -> StoreResult<()> {
         let user_key = self
-            .get_user_key(user_id, None, None)
+            .get_user_key(user, auth_context, None, None)
             .await
             .map_err(|_| StoreError::Unauthorized)?;
         kv::put(
             self.db.get_pool(),
-            user_id,
+            user.uuid,
             key,
             value,
             &user_key,
@@ -1000,24 +1420,29 @@ impl AppState {
         .await
     }
 
-    async fn delete(&self, user_id: Uuid, key: String) -> StoreResult<()> {
+    async fn delete(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+        key: String,
+    ) -> StoreResult<()> {
         let user_key = self
-            .get_user_key(user_id, None, None)
+            .get_user_key(user, auth_context, None, None)
             .await
             .map_err(|_| StoreError::Unauthorized)?;
-        kv::delete(self.db.get_pool(), user_id, &key, &user_key)
+        kv::delete(self.db.get_pool(), user.uuid, &key, &user_key)
     }
 
     async fn delete_all(&self, user_id: Uuid) -> StoreResult<()> {
         kv::delete_all(self.db.get_pool(), user_id)
     }
 
-    async fn list(&self, user_id: Uuid) -> StoreResult<Vec<KVPair>> {
+    async fn list(&self, user: &User, auth_context: &AuthContext) -> StoreResult<Vec<KVPair>> {
         let user_key = self
-            .get_user_key(user_id, None, None)
+            .get_user_key(user, auth_context, None, None)
             .await
             .map_err(|_| StoreError::Unauthorized)?;
-        kv::list(self.db.get_pool(), user_id, &user_key)
+        kv::list(self.db.get_pool(), user.uuid, &user_key)
     }
 
     pub async fn get_aws_credentials(&self) -> Option<AwsCredentials> {
@@ -1139,18 +1564,22 @@ impl AppState {
         // Check if the user exists
         match self.db.get_user_by_email(email.clone(), project_id) {
             Ok(user) => {
-                // Only proceed with email if user has one
-                if user.get_email().is_some() {
+                // Only password-backed users can use the password reset flow. OAuth-only
+                // users recover by signing in with their linked OAuth provider.
+                if user.get_email().is_some() && user.password_enc.is_some() {
                     // User exists, proceed with the actual reset request
-                    let secret_key = SecretKey::from_slice(&self.enclave_key)
-                        .map_err(|e| Error::EncryptionError(e.to_string()))?;
-                    let encrypted_code =
-                        encrypt_key_deterministic(&secret_key, alphanumeric_code.as_bytes());
+                    let reset_code_mac = password_reset_code_mac(
+                        &self.enclave_key,
+                        project_id,
+                        user.uuid,
+                        &alphanumeric_code,
+                    )
+                    .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
                     let new_request = NewPasswordResetRequest::new(
                         user.uuid,
                         hashed_secret,
-                        encrypted_code,
+                        reset_code_mac.to_vec(),
                         24, // 24 hours expiration
                     );
 
@@ -1196,18 +1625,20 @@ impl AppState {
         let user = self.db.get_user_by_email(email.clone(), project_id)?;
 
         // Verify user has an email
-        if user.get_email().is_none() {
+        if user.get_email().is_none() || user.password_enc.is_none() {
             return Err(Error::UserNotFound);
         }
 
-        // Deterministically encrypt the provided alphanumeric code for lookup
+        // MAC the provided alphanumeric code for lookup, bound to this user/project.
         let secret_key = SecretKey::from_slice(&self.enclave_key)
             .map_err(|e| Error::EncryptionError(e.to_string()))?;
-        let encrypted_code = encrypt_key_deterministic(&secret_key, alphanumeric_code.as_bytes());
+        let reset_code_mac =
+            password_reset_code_mac(&self.enclave_key, project_id, user.uuid, &alphanumeric_code)
+                .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
         let reset_request = self
             .db
-            .get_password_reset_request_by_user_id_and_code(user.uuid, encrypted_code)?;
+            .get_password_reset_request_by_user_id_and_code(user.uuid, reset_code_mac.to_vec())?;
 
         if let Some(reset_request) = reset_request {
             if reset_request.is_expired() {
@@ -1224,9 +1655,33 @@ impl AppState {
                 .ct_eq(reset_request.hashed_secret.as_bytes())
                 .into()
             {
-                // Password verification succeeded, continue with reset
-                self.update_user_password(&user, new_password).await?;
-                self.db.mark_password_reset_as_complete(&reset_request)?;
+                let user_seed_words =
+                    generate_twelve_word_seed(self.aws_credential_manager.clone())
+                        .await?
+                        .to_string();
+                let legacy_seed_enc =
+                    encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
+                let (password_hash, encrypted_password) =
+                    self.encrypt_user_password_verifier(new_password).await?;
+                let new_wrapping = self.new_password_seed_wrapping_for_user(
+                    &user,
+                    &password_hash,
+                    user_seed_words.as_bytes(),
+                )?;
+                self.verify_new_password_seed_wrapping_for_user(
+                    &user,
+                    &password_hash,
+                    user_seed_words.as_bytes(),
+                    &new_wrapping,
+                )?;
+
+                self.db.complete_destructive_password_reset(
+                    &user,
+                    &reset_request,
+                    encrypted_password,
+                    legacy_seed_enc,
+                    new_wrapping,
+                )?;
 
                 // Send confirmation email in the background
                 let app_state = self.clone();
@@ -1432,23 +1887,48 @@ impl AppState {
         }
     }
 
-    pub async fn update_user_password(
+    async fn update_user_password_and_seed_wrap(
         &self,
         user: &User,
+        auth_context: &AuthContext,
         new_password: String,
-    ) -> Result<(), Error> {
-        // Hash the new password
-        let password_hash = password_auth::generate_hash(new_password);
+    ) -> Result<AuthContext, Error> {
+        let expected_password_enc = user
+            .password_enc
+            .as_deref()
+            .ok_or(Error::AuthenticationError)?;
+        let plaintext_seed = self.decrypt_seed_for_auth_context(user, auth_context)?;
+        let (password_hash, encrypted_password) =
+            self.encrypt_user_password_verifier(new_password).await?;
+        let new_wrapping =
+            self.new_password_seed_wrapping_for_user(user, &password_hash, &plaintext_seed)?;
+        let new_auth_context = self.password_auth_context_for_user(user, &password_hash)?;
 
-        // Encrypt the hashed password
+        self.db
+            .update_user_password_and_seed_wrap(
+                user,
+                expected_password_enc,
+                encrypted_password,
+                new_wrapping,
+            )
+            .map_err(|err| match err {
+                DBError::StaleCredentialState => Error::AuthenticationError,
+                err => Error::from(err),
+            })?;
+        self.verify_seed_wrap_for_auth_context(user, &new_auth_context)?;
+
+        Ok(new_auth_context)
+    }
+
+    async fn encrypt_user_password_verifier(
+        &self,
+        new_password: String,
+    ) -> Result<(String, Vec<u8>), Error> {
+        let password_hash = password_auth::generate_hash(new_password);
         let secret_key = SecretKey::from_slice(&self.enclave_key)
             .map_err(|e| Error::EncryptionError(e.to_string()))?;
         let encrypted_password = encrypt_with_key(&secret_key, password_hash.as_bytes()).await;
-
-        // Update the user's password
-        self.db
-            .update_user_password(user, Some(encrypted_password))
-            .map_err(Error::from)
+        Ok((password_hash, encrypted_password))
     }
 
     pub async fn update_platform_user_password(

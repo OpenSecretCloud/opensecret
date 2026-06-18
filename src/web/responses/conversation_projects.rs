@@ -2,6 +2,7 @@
 
 use crate::{
     encrypt::{decrypt_string, encrypt_with_key},
+    jwt::AuthContext,
     models::responses::{NewConversationProject, ProjectInstructionUpdate},
     models::users::User,
     tokens::count_tokens,
@@ -34,14 +35,19 @@ struct ConversationProjectContext {
 }
 
 impl ConversationProjectContext {
-    async fn load(state: &AppState, project_id: Uuid, user_uuid: Uuid) -> Result<Self, ApiError> {
+    async fn load(
+        state: &AppState,
+        project_id: Uuid,
+        user: &User,
+        auth_context: &AuthContext,
+    ) -> Result<Self, ApiError> {
         let project = state
             .db
-            .get_conversation_project_by_uuid_and_user(project_id, user_uuid)
+            .get_conversation_project_by_uuid_and_user(project_id, user.uuid)
             .map_err(error_mapping::map_conversation_project_error)?;
 
         let user_key = state
-            .get_user_key(user_uuid, None, None)
+            .get_user_key(user, auth_context, None, None)
             .await
             .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -153,11 +159,12 @@ async fn create_conversation_project(
     State(state): State<Arc<AppState>>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<CreateConversationProjectRequest>,
 ) -> Result<Json<EncryptedResponse<ConversationProjectResponse>>, ApiError> {
     let name = validate_project_name(&body.name)?;
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(&user, &auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -179,6 +186,7 @@ async fn list_conversation_projects(
     Query(params): Query<ListConversationProjectsParams>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationProjectListResponse>>, ApiError> {
     let limit = if params.limit <= 0 {
         DEFAULT_PAGINATION_LIMIT
@@ -199,7 +207,7 @@ async fn list_conversation_projects(
     };
 
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(&user, &auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -235,8 +243,9 @@ async fn get_conversation_project(
     Path(project_id): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationProjectResponse>>, ApiError> {
-    let ctx = ConversationProjectContext::load(&state, project_id, user.uuid).await?;
+    let ctx = ConversationProjectContext::load(&state, project_id, &user, &auth_context).await?;
     let instructions = state
         .db
         .get_project_instruction(ctx.project.id, user.uuid)
@@ -256,13 +265,14 @@ async fn update_conversation_project(
     Path(project_id): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<UpdateConversationProjectRequest>,
 ) -> Result<Json<EncryptedResponse<ConversationProjectResponse>>, ApiError> {
     if body.name.is_none() && body.instructions.is_missing() {
         return Err(ApiError::BadRequest);
     }
 
-    let ctx = ConversationProjectContext::load(&state, project_id, user.uuid).await?;
+    let ctx = ConversationProjectContext::load(&state, project_id, &user, &auth_context).await?;
 
     let name_enc = if let Some(name) = body.name.as_ref() {
         let name = validate_project_name(name)?;

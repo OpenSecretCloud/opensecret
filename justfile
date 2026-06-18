@@ -355,17 +355,58 @@ build-eif-dev:
     echo "EIF build completed. PCR:"
     cat result/pcr.json
 
+# Build steady-state dev EIF for AEAD rollout with a distinct output path
+build-eif-dev-steady:
+    rm -f result-dev-steady
+    nix build '.?submodules=1#eif-dev' -o result-dev-steady
+    echo "Steady-state dev EIF build completed. PCR:"
+    cat result-dev-steady/pcr.json
+
 # Build EIF for production environment
 build-eif-prod:
     nix build .?submodules=1#eif-prod
     echo "EIF build completed. PCR:"
     cat result/pcr.json
 
+# Build steady-state production EIF for AEAD rollout with a distinct output path
+build-eif-prod-steady:
+    rm -f result-steady
+    nix build '.?submodules=1#eif-prod' -o result-steady
+    echo "Steady-state production EIF build completed. PCR:"
+    cat result-steady/pcr.json
+
+# Build one-off seed-wrap translation EIF for production AEAD rollout
+build-eif-prod-seed-wrap-translation:
+    rm -f result-translation
+    nix build '.?submodules=1#eif-prod-seed-wrap-translation' -o result-translation
+    echo "Seed-wrap translation production EIF build completed. PCR:"
+    cat result-translation/pcr.json
+
+# Build one-off seed-wrap translation EIF for development rehearsal
+build-eif-dev-seed-wrap-translation:
+    rm -f result-dev-translation
+    nix build '.?submodules=1#eif-dev-seed-wrap-translation' -o result-dev-translation
+    echo "Seed-wrap translation dev EIF build completed. PCR:"
+    cat result-dev-translation/pcr.json
+
 # Build EIF for preview environment
 build-eif-preview:
     nix build .?submodules=1#eif-preview
     echo "EIF build completed. PCR:"
     cat result/pcr.json
+
+# Build one-off seed-wrap translation EIF for preview rehearsal
+build-eif-preview-seed-wrap-translation:
+    rm -f result-preview-translation
+    nix build '.?submodules=1#eif-preview-seed-wrap-translation' -o result-preview-translation
+    echo "Seed-wrap translation preview EIF build completed. PCR:"
+    cat result-preview-translation/pcr.json
+
+# Build both production AEAD rollout artifacts without reusing the same result symlink
+build-eif-prod-aead-rollout: build-eif-prod-seed-wrap-translation build-eif-prod-steady
+
+# Build both dev AEAD rollout artifacts without reusing the same result symlink
+build-eif-dev-aead-rollout: build-eif-dev-seed-wrap-translation build-eif-dev-steady
 
 # Build EIF with custom environment variables
 build-eif-custom env_vars:
@@ -381,12 +422,28 @@ copy-pcr-dev:
     cat result/pcr.json
     cp -f result/pcr.json ./pcrDev.json
 
+# Capture steady-state dev PCR for AEAD rollout
+copy-pcr-dev-steady: build-eif-dev-steady
+    cp -f result-dev-steady/pcr.json ./pcrDev.json
+
+# Capture one-off seed-wrap translation dev PCR for AEAD rollout
+copy-pcr-dev-seed-wrap-translation: build-eif-dev-seed-wrap-translation
+    cp -f result-dev-translation/pcr.json ./pcrDevSeedWrapTranslation.json
+
 # Build EIF for production environment
 copy-pcr-prod:
     nix build .?submodules=1#eif-prod
     echo "EIF build completed. PCR:"
     cat result/pcr.json
     cp -f result/pcr.json ./pcrProd.json
+
+# Capture steady-state production PCR for AEAD rollout
+copy-pcr-prod-steady: build-eif-prod-steady
+    cp -f result-steady/pcr.json ./pcrProd.json
+
+# Capture one-off seed-wrap translation production PCR for AEAD rollout
+copy-pcr-prod-seed-wrap-translation: build-eif-prod-seed-wrap-translation
+    cp -f result-translation/pcr.json ./pcrProdSeedWrapTranslation.json
 
 # Sign and append PCR measurements for dev environment
 append-pcr-dev:
@@ -538,6 +595,98 @@ append-pcr-prod:
     echo "   PCR0: $CURRENT_PCR0"
     echo "   Timestamp: $TIMESTAMP"
 
+# Sign and append PCR measurements from a specific PCR file into a history file.
+_append-pcr-file pcr_file history_file label:
+    #!/usr/bin/env bash
+    set -e
+
+    PCR_FILE="./{{pcr_file}}"
+    HISTORY_FILE="./{{history_file}}"
+
+    # Check for required environment variable
+    if [ -z "${SIGNING_PRIVATE_KEY}" ]; then
+        echo "❌ Error: SIGNING_PRIVATE_KEY environment variable is not set"
+        echo "Please generate keys with: ./pcr_sign.js generate-keys"
+        echo "Then set the environment variables with:"
+        echo "export SIGNING_PRIVATE_KEY='...'"
+        echo "export SIGNING_PUBLIC_KEY='...'"
+        exit 1
+    fi
+
+    # Check if the Node.js script exists and is executable
+    if [ ! -x "./pcr_sign.js" ]; then
+        chmod +x ./pcr_sign.js
+    fi
+
+    if [ ! -f "$PCR_FILE" ]; then
+        echo "❌ Error: $PCR_FILE does not exist"
+        exit 1
+    fi
+
+    # Initialize empty history file if it doesn't exist
+    if [ ! -f "$HISTORY_FILE" ]; then
+        echo "[]" > "$HISTORY_FILE"
+    fi
+
+    # Get current PCR values
+    PCR_CONTENT=$(cat "$PCR_FILE")
+    CURRENT_PCR0=$(echo "$PCR_CONTENT" | jq -r '.PCR0')
+    CURRENT_PCR1=$(echo "$PCR_CONTENT" | jq -r '.PCR1')
+    CURRENT_PCR2=$(echo "$PCR_CONTENT" | jq -r '.PCR2')
+
+    # Check if this PCR0 already exists in the history
+    HISTORY=$(cat "$HISTORY_FILE")
+    PCR0_EXISTS=$(echo "$HISTORY" | jq --arg pcr0 "$CURRENT_PCR0" 'map(select(.PCR0 == $pcr0)) | length')
+
+    if [ "$PCR0_EXISTS" -gt "0" ]; then
+        echo "⚠️  PCR0 value already exists in {{history_file}} for {{label}}"
+        echo "    Skipping append operation to avoid duplicates."
+        exit 0
+    fi
+
+    # Generate a timestamp
+    TIMESTAMP=$(date +%s)
+
+    # Sign just the PCR0 value
+    echo "Signing {{label}} PCR0: $CURRENT_PCR0"
+    SIGNATURE=$(./pcr_sign.js sign-pcr0 "$CURRENT_PCR0")
+
+    if [ -z "$SIGNATURE" ]; then
+        echo "❌ Error: Failed to create signature"
+        exit 1
+    fi
+
+    # Create a new history entry. Keep the existing history schema stable.
+    NEW_ENTRY=$(jq -n \
+      --arg pcr0 "$CURRENT_PCR0" \
+      --arg pcr1 "$CURRENT_PCR1" \
+      --arg pcr2 "$CURRENT_PCR2" \
+      --arg sig "$SIGNATURE" \
+      --arg ts "$TIMESTAMP" \
+      '{
+        "PCR0": $pcr0,
+        "PCR1": $pcr1,
+        "PCR2": $pcr2,
+        "timestamp": ($ts | tonumber),
+        "signature": $sig
+      }')
+
+    # Append to history file
+    echo "$HISTORY" | jq --argjson entry "$NEW_ENTRY" '. + [$entry]' > "$HISTORY_FILE"
+
+    echo "✅ Successfully appended signed PCR entry to {{history_file}}"
+    echo "   Label: {{label}}"
+    echo "   PCR0: $CURRENT_PCR0"
+    echo "   Timestamp: $TIMESTAMP"
+
+# Sign and append one-off seed-wrap translation PCR measurements for dev.
+append-pcr-dev-seed-wrap-translation:
+    just _append-pcr-file pcrDevSeedWrapTranslation.json pcrDevHistory.json dev-seed-wrap-translation
+
+# Sign and append one-off seed-wrap translation PCR measurements for prod.
+append-pcr-prod-seed-wrap-translation:
+    just _append-pcr-file pcrProdSeedWrapTranslation.json pcrProdHistory.json prod-seed-wrap-translation
+
 # Update PCR dev with signature and append to history
 update-pcr-dev:
     just copy-pcr-dev
@@ -550,13 +699,27 @@ update-pcr-prod:
     just append-pcr-prod
     echo "✅ PCR prod values updated and history appended"
 
+# Update dev PCRs for the AEAD rollout steady-state and one-off translation EIFs.
+update-pcr-dev-aead-rollout:
+    just copy-pcr-dev-steady
+    just append-pcr-dev
+    just copy-pcr-dev-seed-wrap-translation
+    just append-pcr-dev-seed-wrap-translation
+    echo "✅ AEAD rollout dev PCR values updated for steady-state and translation EIFs"
+
+# Update prod PCRs for the AEAD rollout steady-state and one-off translation EIFs.
+update-pcr-prod-aead-rollout:
+    just copy-pcr-prod-steady
+    just append-pcr-prod
+    just copy-pcr-prod-seed-wrap-translation
+    just append-pcr-prod-seed-wrap-translation
+    echo "✅ AEAD rollout prod PCR values updated for steady-state and translation EIFs"
+
 # Update all PCR values for both dev and prod environments
 update-pcr-all:
-    just copy-pcr-dev
-    just append-pcr-dev
-    just copy-pcr-prod
-    just append-pcr-prod
-    echo "✅ All PCR values updated and history appended for both dev and prod"
+    just update-pcr-dev-aead-rollout
+    just update-pcr-prod-aead-rollout
+    echo "✅ All AEAD rollout PCR values updated and history appended for dev and prod"
 
 
 # Generate a key pair for PCR signing and output to terminal (no files created)
@@ -628,9 +791,109 @@ _verify-pcr-internal env pcr_file:
 verify-pcr-dev:
     just _verify-pcr-internal dev pcrDev.json
 
+# Verify steady-state dev PCR for AEAD rollout
+verify-pcr-dev-steady:
+    #!/usr/bin/env bash
+    if [ ! -f ./pcrDev.json ]; then
+        echo "No pcrDev.json found. Capturing steady-state dev PCR first..."
+        just copy-pcr-dev-steady
+        exit 0
+    fi
+
+    if [ ! -f result-dev-steady/pcr.json ]; then
+        echo "No result-dev-steady/pcr.json found. Building steady-state dev EIF first..."
+        just build-eif-dev-steady
+    fi
+
+    if diff -q ./pcrDev.json result-dev-steady/pcr.json > /dev/null; then
+        echo "✅ Steady-state dev PCR values match!"
+    else
+        echo "❌ Steady-state dev PCR values do not match!"
+        echo "Expected (./pcrDev.json):"
+        cat ./pcrDev.json
+        echo "Got (result-dev-steady/pcr.json):"
+        cat result-dev-steady/pcr.json
+        exit 1
+    fi
+
 # Verify PCR values for prod environment
 verify-pcr-prod:
     just _verify-pcr-internal prod pcrProd.json
+
+# Verify one-off seed-wrap translation dev PCR for AEAD rollout
+verify-pcr-dev-seed-wrap-translation:
+    #!/usr/bin/env bash
+    if [ ! -f ./pcrDevSeedWrapTranslation.json ]; then
+        echo "No pcrDevSeedWrapTranslation.json found. Capturing translation dev PCR first..."
+        just copy-pcr-dev-seed-wrap-translation
+        exit 0
+    fi
+
+    if [ ! -f result-dev-translation/pcr.json ]; then
+        echo "No result-dev-translation/pcr.json found. Building translation dev EIF first..."
+        just build-eif-dev-seed-wrap-translation
+    fi
+
+    if diff -q ./pcrDevSeedWrapTranslation.json result-dev-translation/pcr.json > /dev/null; then
+        echo "✅ Seed-wrap translation dev PCR values match!"
+    else
+        echo "❌ Seed-wrap translation dev PCR values do not match!"
+        echo "Expected (./pcrDevSeedWrapTranslation.json):"
+        cat ./pcrDevSeedWrapTranslation.json
+        echo "Got (result-dev-translation/pcr.json):"
+        cat result-dev-translation/pcr.json
+        exit 1
+    fi
+
+# Verify steady-state production PCR for AEAD rollout
+verify-pcr-prod-steady:
+    #!/usr/bin/env bash
+    if [ ! -f ./pcrProd.json ]; then
+        echo "No pcrProd.json found. Capturing steady-state production PCR first..."
+        just copy-pcr-prod-steady
+        exit 0
+    fi
+
+    if [ ! -f result-steady/pcr.json ]; then
+        echo "No result-steady/pcr.json found. Building steady-state production EIF first..."
+        just build-eif-prod-steady
+    fi
+
+    if diff -q ./pcrProd.json result-steady/pcr.json > /dev/null; then
+        echo "✅ Steady-state production PCR values match!"
+    else
+        echo "❌ Steady-state production PCR values do not match!"
+        echo "Expected (./pcrProd.json):"
+        cat ./pcrProd.json
+        echo "Got (result-steady/pcr.json):"
+        cat result-steady/pcr.json
+        exit 1
+    fi
+
+# Verify one-off seed-wrap translation production PCR for AEAD rollout
+verify-pcr-prod-seed-wrap-translation:
+    #!/usr/bin/env bash
+    if [ ! -f ./pcrProdSeedWrapTranslation.json ]; then
+        echo "No pcrProdSeedWrapTranslation.json found. Capturing translation production PCR first..."
+        just copy-pcr-prod-seed-wrap-translation
+        exit 0
+    fi
+
+    if [ ! -f result-translation/pcr.json ]; then
+        echo "No result-translation/pcr.json found. Building translation production EIF first..."
+        just build-eif-prod-seed-wrap-translation
+    fi
+
+    if diff -q ./pcrProdSeedWrapTranslation.json result-translation/pcr.json > /dev/null; then
+        echo "✅ Seed-wrap translation production PCR values match!"
+    else
+        echo "❌ Seed-wrap translation production PCR values do not match!"
+        echo "Expected (./pcrProdSeedWrapTranslation.json):"
+        cat ./pcrProdSeedWrapTranslation.json
+        echo "Got (result-translation/pcr.json):"
+        cat result-translation/pcr.json
+        exit 1
+    fi
 
 # Verify PCR values for preview environment
 verify-pcr-preview:
@@ -665,10 +928,30 @@ scp-eif-to-aws-dev:
     ssh -i $DEV_SSH_KEY $DEV_SERVER "rm -f ~/opensecret.eif"
     scp -i $DEV_SSH_KEY result/image.eif $DEV_SERVER:~/opensecret.eif
 
+# SCP the one-off AEAD seed-wrap translation EIF to AWS parent instance (dev)
+scp-eif-to-aws-dev-seed-wrap-translation:
+    ssh -i $DEV_SSH_KEY $DEV_SERVER "rm -f ~/opensecret-aead-translation.eif"
+    scp -i $DEV_SSH_KEY result-dev-translation/image.eif $DEV_SERVER:~/opensecret-aead-translation.eif
+
+# SCP the AEAD steady-state EIF to AWS parent instance (dev)
+scp-eif-to-aws-dev-steady:
+    ssh -i $DEV_SSH_KEY $DEV_SERVER "rm -f ~/opensecret-aead-steady.eif"
+    scp -i $DEV_SSH_KEY result-dev-steady/image.eif $DEV_SERVER:~/opensecret-aead-steady.eif
+
 # SCP the Nix-built EIF to AWS parent instance (prod)
 scp-eif-to-aws-prod:
     ssh -i $PROD_SSH_KEY $PROD_SERVER "rm -f ~/opensecret.eif"
     scp -i $PROD_SSH_KEY result/image.eif $PROD_SERVER:~/opensecret.eif
+
+# SCP the one-off AEAD seed-wrap translation EIF to AWS parent instance (prod)
+scp-eif-to-aws-prod-seed-wrap-translation:
+    ssh -i $PROD_SSH_KEY $PROD_SERVER "rm -f ~/opensecret-aead-translation.eif"
+    scp -i $PROD_SSH_KEY result-translation/image.eif $PROD_SERVER:~/opensecret-aead-translation.eif
+
+# SCP the AEAD steady-state EIF to AWS parent instance (prod)
+scp-eif-to-aws-prod-steady:
+    ssh -i $PROD_SSH_KEY $PROD_SERVER "rm -f ~/opensecret-aead-steady.eif"
+    scp -i $PROD_SSH_KEY result-steady/image.eif $PROD_SERVER:~/opensecret-aead-steady.eif
 
 # SCP the Nix-built EIF to AWS parent instance (preview)
 scp-eif-to-aws-preview:
@@ -678,8 +961,20 @@ scp-eif-to-aws-preview:
 # Stage to dev environment without debug mode (using Nix-built EIF)
 stage-dev-nix: build-eif-dev scp-eif-to-aws-dev
 
+# Stage the one-off AEAD translation EIF to dev without running it
+stage-dev-aead-translation: build-eif-dev-seed-wrap-translation scp-eif-to-aws-dev-seed-wrap-translation
+
+# Stage the AEAD steady-state EIF to dev without running it
+stage-dev-aead-steady: build-eif-dev-steady scp-eif-to-aws-dev-steady
+
 # Stage to prod environment without debug mode (using Nix-built EIF)
 stage-prod-nix: build-eif-prod scp-eif-to-aws-prod
+
+# Stage the one-off AEAD translation EIF to prod without running it
+stage-prod-aead-translation: build-eif-prod-seed-wrap-translation scp-eif-to-aws-prod-seed-wrap-translation
+
+# Stage the AEAD steady-state EIF to prod without running it
+stage-prod-aead-steady: build-eif-prod-steady scp-eif-to-aws-prod-steady
 
 # Stage to preview environment without debug mode (using Nix-built EIF)
 stage-preview-nix: build-eif-preview scp-eif-to-aws-preview
@@ -688,9 +983,25 @@ stage-preview-nix: build-eif-preview scp-eif-to-aws-preview
 run-eif-dev:
     ssh -i $DEV_SSH_KEY $DEV_SERVER "nitro-cli run-enclave --eif-path opensecret.eif --memory 16384 --cpu-count 4"
 
+# Run the one-off AEAD seed-wrap translation EIF on AWS (dev)
+run-eif-dev-seed-wrap-translation:
+    ssh -i $DEV_SSH_KEY $DEV_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-translation.eif --enclave-name opensecret-aead-translation --memory 16384 --cpu-count 4"
+
+# Run the AEAD steady-state EIF on AWS (dev)
+run-eif-dev-steady:
+    ssh -i $DEV_SSH_KEY $DEV_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-steady.eif --enclave-name opensecret --memory 16384 --cpu-count 4"
+
 # Run EIF file on AWS (prod)
 run-eif-prod:
     ssh -i $PROD_SSH_KEY $PROD_SERVER "nitro-cli run-enclave --eif-path opensecret.eif --memory 16384 --cpu-count 4"
+
+# Run the one-off AEAD seed-wrap translation EIF on AWS (prod)
+run-eif-prod-seed-wrap-translation:
+    ssh -i $PROD_SSH_KEY $PROD_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-translation.eif --enclave-name opensecret-aead-translation --memory 16384 --cpu-count 4"
+
+# Run the AEAD steady-state EIF on AWS (prod)
+run-eif-prod-steady:
+    ssh -i $PROD_SSH_KEY $PROD_SERVER "nitro-cli run-enclave --eif-path opensecret-aead-steady.eif --enclave-name opensecret --memory 16384 --cpu-count 4"
 
 # Run EIF file on AWS (preview)
 run-eif-preview:
@@ -744,7 +1055,7 @@ deploy-preview-nix: build-eif-preview verify-pcr-preview scp-eif-to-aws-preview
 
 # Clean EIF build artifacts
 clean-eif:
-    rm -f result
+    rm -f result result-dev-steady result-dev-translation result-steady result-translation result-preview-translation
 
 ### Tinfoil Proxy Commands ###
 

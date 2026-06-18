@@ -5,6 +5,7 @@ use crate::{
     billing::BillingError,
     db::DBError,
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
+    jwt::AuthContext,
     model_config::{
         model_config, resolve_completion_model_id, ResponsesModelConfig, SamplingConfig,
     },
@@ -1556,6 +1557,7 @@ async fn spawn_title_generation_task(
 async fn validate_and_normalize_input(
     state: &Arc<AppState>,
     user: &User,
+    auth_context: &AuthContext,
     body: &ResponsesCreateRequest,
 ) -> Result<PreparedRequest, ApiError> {
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
@@ -1588,7 +1590,7 @@ async fn validate_and_normalize_input(
 
     // Get user's encryption key
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(user, auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -2512,6 +2514,7 @@ async fn create_response_stream(
     headers: HeaderMap,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(mut body): Extension<ResponsesCreateRequest>,
 ) -> Result<Response, ApiError> {
     trace!("=== ENTERING create_response_stream ===");
@@ -2564,7 +2567,7 @@ async fn create_response_stream(
     );
 
     // Phase 1: Validate and normalize input
-    let prepared = validate_and_normalize_input(&state, &user, &body).await?;
+    let prepared = validate_and_normalize_input(&state, &user, &auth_context, &body).await?;
 
     // Phase 2: Build context and check billing
     let context =
@@ -3173,6 +3176,7 @@ async fn get_response(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<ResponsesRetrieveResponse>>, ApiError> {
     debug!("Getting response {} for user {}", id, user.uuid);
@@ -3191,7 +3195,7 @@ async fn get_response(
 
     // Get user's encryption key
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(&user, &auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 

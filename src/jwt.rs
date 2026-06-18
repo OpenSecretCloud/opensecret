@@ -10,6 +10,7 @@ use axum::{
     middleware::Next,
     response::IntoResponse,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
 use jwt_compact::{alg::Es256k, prelude::*, AlgorithmExt};
 use secp256k1::{All, PublicKey, Secp256k1, SecretKey};
@@ -31,6 +32,8 @@ pub const USER_REFRESH: &str = "refresh";
 
 pub const PLATFORM_ACCESS: &str = "platform_access";
 pub const PLATFORM_REFRESH: &str = "platform_refresh";
+
+pub const USER_TOKEN_FORMAT_V2: u8 = 2;
 
 #[derive(Debug, Clone)]
 pub enum TokenType {
@@ -80,6 +83,93 @@ pub struct CustomClaims {
     pub azp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    #[serde(rename = "tf", skip_serializing_if = "Option::is_none")]
+    pub token_format: Option<u8>,
+    #[serde(rename = "am", skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
+    #[serde(rename = "pid", skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<i32>,
+    #[serde(rename = "ab", skip_serializing_if = "Option::is_none")]
+    pub auth_binding: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMethod {
+    Password,
+    OAuth,
+}
+
+impl AuthMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthMethod::Password => "password",
+            AuthMethod::OAuth => "oauth",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, ApiError> {
+        match value {
+            "password" => Ok(AuthMethod::Password),
+            "oauth" => Ok(AuthMethod::OAuth),
+            _ => Err(ApiError::InvalidJwt),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthContext {
+    pub token_format: u8,
+    pub method: AuthMethod,
+    pub project_id: i32,
+    pub auth_binding: [u8; 32],
+}
+
+impl AuthContext {
+    pub fn new(method: AuthMethod, project_id: i32, auth_binding: [u8; 32]) -> Self {
+        Self {
+            token_format: USER_TOKEN_FORMAT_V2,
+            method,
+            project_id,
+            auth_binding,
+        }
+    }
+
+    pub fn apply_to_claims(&self, claims: &mut CustomClaims) {
+        claims.token_format = Some(self.token_format);
+        claims.auth_method = Some(self.method.as_str().to_string());
+        claims.project_id = Some(self.project_id);
+        claims.auth_binding = Some(URL_SAFE_NO_PAD.encode(self.auth_binding));
+    }
+
+    pub fn from_claims(claims: &CustomClaims) -> Result<Self, ApiError> {
+        if claims.token_format != Some(USER_TOKEN_FORMAT_V2) {
+            tracing::error!("Missing or invalid user token format");
+            return Err(ApiError::InvalidJwt);
+        }
+
+        let method = claims
+            .auth_method
+            .as_deref()
+            .ok_or(ApiError::InvalidJwt)
+            .and_then(AuthMethod::from_str)?;
+
+        let project_id = claims.project_id.ok_or(ApiError::InvalidJwt)?;
+
+        let auth_binding_claim = claims.auth_binding.as_ref().ok_or(ApiError::InvalidJwt)?;
+        let auth_binding_bytes = URL_SAFE_NO_PAD
+            .decode(auth_binding_claim)
+            .map_err(|_| ApiError::InvalidJwt)?;
+        let auth_binding: [u8; 32] = auth_binding_bytes
+            .try_into()
+            .map_err(|_| ApiError::InvalidJwt)?;
+
+        Ok(Self {
+            token_format: USER_TOKEN_FORMAT_V2,
+            method,
+            project_id,
+            auth_binding,
+        })
+    }
 }
 
 impl TokenType {
@@ -264,18 +354,6 @@ impl NewToken {
 
     pub fn new(user: &User, token_type: TokenType, app_state: &AppState) -> Result<Self, ApiError> {
         let (aud, azp, role, duration) = match &token_type {
-            TokenType::Access => (
-                Some(USER_ACCESS.to_string()),
-                None,
-                None,
-                Duration::minutes(app_state.config.access_token_maxage),
-            ),
-            TokenType::Refresh => (
-                Some(USER_REFRESH.to_string()),
-                None,
-                None,
-                Duration::days(app_state.config.refresh_token_maxage),
-            ),
             TokenType::ThirdParty { aud, azp } => {
                 // Validate the audience URL against allowed domains
                 if aud.is_some() {
@@ -289,6 +367,10 @@ impl NewToken {
                     Duration::hours(1),
                 )
             }
+            TokenType::Access | TokenType::Refresh => {
+                tracing::error!("User access/refresh tokens require AuthContext");
+                return Err(ApiError::BadRequest);
+            }
         };
 
         let custom_claims = CustomClaims {
@@ -296,6 +378,10 @@ impl NewToken {
             aud,
             azp,
             role,
+            token_format: None,
+            auth_method: None,
+            project_id: None,
+            auth_binding: None,
         };
 
         tracing::debug!("Creating new token with claims: {:?}", custom_claims);
@@ -336,6 +422,73 @@ impl NewToken {
         })
     }
 
+    pub fn new_with_auth_context(
+        user: &User,
+        token_type: TokenType,
+        app_state: &AppState,
+        auth_context: &AuthContext,
+    ) -> Result<Self, ApiError> {
+        if user.project_id != auth_context.project_id {
+            tracing::error!("User token auth context project does not match user project");
+            return Err(ApiError::BadRequest);
+        }
+
+        let (aud, duration) = match &token_type {
+            TokenType::Access => (
+                Some(USER_ACCESS.to_string()),
+                Duration::minutes(app_state.config.access_token_maxage),
+            ),
+            TokenType::Refresh => (
+                Some(USER_REFRESH.to_string()),
+                Duration::days(app_state.config.refresh_token_maxage),
+            ),
+            TokenType::ThirdParty { .. } => {
+                return Err(ApiError::BadRequest);
+            }
+        };
+
+        let mut custom_claims = CustomClaims {
+            sub: user.get_id().to_string(),
+            aud,
+            azp: None,
+            role: None,
+            token_format: None,
+            auth_method: None,
+            project_id: None,
+            auth_binding: None,
+        };
+        auth_context.apply_to_claims(&mut custom_claims);
+
+        tracing::debug!(
+            "Creating new v2 user token for user {} with audience {:?}",
+            user.get_id(),
+            custom_claims.aud
+        );
+
+        let now = Utc::now();
+        let iat = now - Duration::minutes(1);
+        let exp = iat + duration;
+
+        let mut claims = Claims::new(custom_claims);
+        claims.issued_at = Some(iat);
+        claims.expiration = Some(exp);
+        claims.not_before = Some(iat);
+
+        let header = Header::empty().with_token_type("JWT");
+        let es256k = Es256k::<Sha256>::new(app_state.config.jwt_keys.secp.clone());
+
+        let token_string = es256k
+            .token(&header, &claims, &app_state.config.jwt_keys.signing_key)
+            .map_err(|e| {
+                tracing::error!("Error creating v2 user token: {:?}", e);
+                ApiError::InternalServerError
+            })?;
+
+        Ok(Self {
+            token: token_string,
+        })
+    }
+
     pub fn new_for_platform_user(
         user: &PlatformUser,
         token_type: TokenType,
@@ -363,6 +516,10 @@ impl NewToken {
             aud: Some(aud),
             azp,
             role: None,
+            token_format: None,
+            auth_method: None,
+            project_id: None,
+            auth_binding: None,
         };
 
         tracing::debug!(
@@ -445,6 +602,11 @@ pub async fn validate_jwt(
         Err(_) => return ApiError::InvalidJwt.into_response(),
     };
 
+    let auth_context = match AuthContext::from_claims(&claims) {
+        Ok(auth_context) => auth_context,
+        Err(_) => return ApiError::InvalidJwt.into_response(),
+    };
+
     let user_uuid: Uuid = match Uuid::parse_str(&claims.sub) {
         Ok(uuid) => uuid,
         Err(e) => {
@@ -461,6 +623,20 @@ pub async fn validate_jwt(
         }
     };
 
+    if user.project_id != auth_context.project_id {
+        tracing::error!("JWT auth context project does not match user project");
+        return ApiError::InvalidJwt.into_response();
+    }
+
+    if let Err(e) = data.verify_seed_wrap_for_auth_context(&user, &auth_context) {
+        tracing::error!(
+            "JWT auth context no longer unwraps an active seed wrap: {:?}",
+            e
+        );
+        return ApiError::InvalidJwt.into_response();
+    }
+
+    req.extensions_mut().insert(auth_context);
     req.extensions_mut().insert(user);
     tracing::debug!("Exiting validate_jwt");
     next.run(req).await
@@ -584,6 +760,10 @@ mod tests {
                 aud: Some("https://example.com".to_string()),
                 azp: Some(Uuid::nil().to_string()),
                 role: Some("authenticated".to_string()),
+                token_format: None,
+                auth_method: None,
+                project_id: None,
+                auth_binding: None,
             });
             claims.issued_at = Some(now);
             claims.not_before = Some(now);
@@ -609,5 +789,87 @@ mod tests {
         .expect("token should decode");
 
         assert_eq!(decoded.claims.custom, claims.custom);
+    }
+
+    #[test]
+    fn auth_context_round_trips_through_custom_claims() {
+        let auth_context = AuthContext::new(AuthMethod::Password, 7, [3u8; 32]);
+        let mut claims = CustomClaims {
+            sub: Uuid::nil().to_string(),
+            aud: Some(USER_ACCESS.to_string()),
+            azp: None,
+            role: None,
+            token_format: None,
+            auth_method: None,
+            project_id: None,
+            auth_binding: None,
+        };
+
+        auth_context.apply_to_claims(&mut claims);
+        let parsed = AuthContext::from_claims(&claims).unwrap();
+
+        assert_eq!(auth_context, parsed);
+        let expected_binding = URL_SAFE_NO_PAD.encode([3u8; 32]);
+        assert_eq!(
+            claims.auth_binding.as_deref(),
+            Some(expected_binding.as_str())
+        );
+    }
+
+    #[test]
+    fn auth_context_rejects_legacy_user_access_and_refresh_claim_shapes() {
+        for audience in [USER_ACCESS, USER_REFRESH] {
+            let claims = CustomClaims {
+                sub: Uuid::nil().to_string(),
+                aud: Some(audience.to_string()),
+                azp: None,
+                role: None,
+                token_format: None,
+                auth_method: None,
+                project_id: None,
+                auth_binding: None,
+            };
+
+            assert!(
+                AuthContext::from_claims(&claims).is_err(),
+                "legacy {audience} claims without auth context must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_context_rejects_bad_method() {
+        let mut claims = CustomClaims {
+            sub: Uuid::nil().to_string(),
+            aud: Some(USER_ACCESS.to_string()),
+            azp: None,
+            role: None,
+            token_format: None,
+            auth_method: None,
+            project_id: None,
+            auth_binding: None,
+        };
+        AuthContext::new(AuthMethod::OAuth, 7, [4u8; 32]).apply_to_claims(&mut claims);
+        claims.auth_method = Some("api_key".to_string());
+
+        assert!(AuthContext::from_claims(&claims).is_err());
+    }
+
+    #[test]
+    fn auth_context_rejects_wrong_binding_length() {
+        let mut claims = CustomClaims {
+            sub: Uuid::nil().to_string(),
+            aud: Some(USER_ACCESS.to_string()),
+            azp: None,
+            role: None,
+            token_format: None,
+            auth_method: None,
+            project_id: None,
+            auth_binding: None,
+        };
+        AuthContext::new(AuthMethod::Password, 7, [5u8; 32]).apply_to_claims(&mut claims);
+        claims.auth_binding = Some(URL_SAFE_NO_PAD.encode([5u8; 31]));
+
+        assert!(AuthContext::from_claims(&claims).is_err());
     }
 }

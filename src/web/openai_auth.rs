@@ -1,4 +1,4 @@
-use crate::jwt::{validate_token, USER_ACCESS};
+use crate::jwt::{validate_token, AuthContext, USER_ACCESS};
 use crate::ApiError;
 use axum::{
     body::Body,
@@ -77,6 +77,11 @@ pub async fn validate_openai_auth(
         Err(_) => return ApiError::InvalidJwt.into_response(),
     };
 
+    let auth_context = match AuthContext::from_claims(&claims) {
+        Ok(auth_context) => auth_context,
+        Err(_) => return ApiError::InvalidJwt.into_response(),
+    };
+
     let user_uuid: Uuid = match Uuid::parse_str(&claims.sub) {
         Ok(uuid) => uuid,
         Err(e) => {
@@ -93,6 +98,20 @@ pub async fn validate_openai_auth(
         }
     };
 
+    if user.project_id != auth_context.project_id {
+        tracing::error!("JWT auth context project does not match user project");
+        return ApiError::InvalidJwt.into_response();
+    }
+
+    if let Err(e) = data.verify_seed_wrap_for_auth_context(&user, &auth_context) {
+        tracing::error!(
+            "OpenAI JWT auth context no longer unwraps an active seed wrap: {:?}",
+            e
+        );
+        return ApiError::InvalidJwt.into_response();
+    }
+
+    req.extensions_mut().insert(auth_context);
     req.extensions_mut().insert(user);
     req.extensions_mut().insert(AuthMethod::Jwt);
     next.run(req).await

@@ -1,4 +1,4 @@
-use crate::models::schema::{oauth_providers, user_oauth_connections};
+use crate::models::schema::{oauth_providers, user_oauth_connections, users};
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,8 @@ use uuid::Uuid;
 pub enum OAuthError {
     #[error("Database error: {0}")]
     DatabaseError(#[from] diesel::result::Error),
+    #[error("Multiple OAuth connections found for provider subject in project")]
+    AmbiguousProviderSubjectForProject,
 }
 
 // OAuthProvider model
@@ -99,7 +101,10 @@ impl NewOAuthProvider {
 }
 
 // UserOAuthConnection model
-#[derive(Queryable, Identifiable, AsChangeset, Serialize, Deserialize, Clone, Debug)]
+#[derive(
+    Queryable, Identifiable, AsChangeset, Selectable, Serialize, Deserialize, Clone, Debug,
+)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
 #[diesel(table_name = user_oauth_connections)]
 pub struct UserOAuthConnection {
     pub id: i32,
@@ -138,17 +143,27 @@ impl UserOAuthConnection {
             .map_err(OAuthError::DatabaseError)
     }
 
-    pub fn get_by_provider_and_provider_user_id(
+    pub fn get_by_provider_subject_and_project(
         conn: &mut PgConnection,
         lookup_provider_id: i32,
         lookup_provider_user_id: &str,
+        lookup_project_id: i32,
     ) -> Result<Option<UserOAuthConnection>, OAuthError> {
-        user_oauth_connections::table
+        let mut matches = user_oauth_connections::table
+            .inner_join(users::table.on(users::uuid.eq(user_oauth_connections::user_id)))
             .filter(user_oauth_connections::provider_id.eq(lookup_provider_id))
             .filter(user_oauth_connections::provider_user_id.eq(lookup_provider_user_id))
-            .first::<UserOAuthConnection>(conn)
-            .optional()
-            .map_err(OAuthError::DatabaseError)
+            .filter(users::project_id.eq(lookup_project_id))
+            .select(UserOAuthConnection::as_select())
+            .limit(2)
+            .load::<UserOAuthConnection>(conn)
+            .map_err(OAuthError::DatabaseError)?;
+
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.pop()),
+            _ => Err(OAuthError::AmbiguousProviderSubjectForProject),
+        }
     }
 
     pub fn get_all_for_user(

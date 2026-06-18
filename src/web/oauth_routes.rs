@@ -1,5 +1,8 @@
 use crate::apple_signin::{generate_apple_client_secret, validate_apple_native_token};
+use crate::encrypt::encrypt_with_key;
+#[cfg(test)]
 use crate::models::oauth::NewUserOAuthConnection;
+use crate::models::oauth::UserOAuthConnection;
 use crate::oauth::OAuthState;
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
 use crate::web::login_routes::handle_new_user_registration;
@@ -10,9 +13,8 @@ use crate::GithubProvider;
 use crate::GoogleProvider;
 use crate::{decrypt_with_key, private_key::generate_twelve_word_seed};
 use crate::{encrypt, DBError};
-use crate::{encrypt::encrypt_with_key, models::email_verification::NewEmailVerification};
 use crate::{
-    jwt::{NewToken, TokenType},
+    jwt::{AuthContext, NewToken, TokenType},
     models::{
         project_settings::OAuthProviderSettings,
         users::{NewUser, User},
@@ -126,6 +128,11 @@ pub struct OAuthCallbackResponse {
     email: String,
     access_token: String,
     refresh_token: String,
+}
+
+struct AuthenticatedOAuthUser {
+    user: User,
+    auth_context: AuthContext,
 }
 
 #[derive(Deserialize, Clone)]
@@ -752,7 +759,7 @@ pub async fn oauth_callback(
     let access_token = token.access_token().secret().to_string();
 
     // Fetch user information and find or create the user
-    let user = match provider_name {
+    let authenticated_user = match provider_name {
         "github" => {
             debug!("Access token obtained, fetching GitHub user");
             // Get GitHub provider for GitHub-specific operations
@@ -773,7 +780,7 @@ pub async fn oauth_callback(
 
             find_or_create_user_from_oauth(
                 &app_state,
-                github_user.email.clone().unwrap_or_default(),
+                github_user.email.clone(),
                 github_user.id.to_string(),
                 "github",
                 access_token,
@@ -802,7 +809,7 @@ pub async fn oauth_callback(
 
             find_or_create_user_from_oauth(
                 &app_state,
-                google_user.email.clone(),
+                Some(google_user.email.clone()),
                 google_user.sub.clone(),
                 "google",
                 access_token,
@@ -867,105 +874,23 @@ pub async fn oauth_callback(
                 }
             };
 
-            // For Apple, we need a special approach:
-            // 1. First, try to find any existing users with this Apple ID
-            // 2. If found, just use that user - no need for email
-            // 3. Only if this is a first-time user, we need an email
-
             let sub = apple_user.sub.clone();
+            // For Apple web flow, use the refresh token if available, otherwise empty string
+            let token_to_store = token
+                .refresh_token()
+                .map(|rt| rt.secret().to_string())
+                .unwrap_or_else(|| "".to_string());
 
-            // Get the Apple provider from the database to get its ID
-            let apple_db_provider = app_state
-                .db
-                .get_oauth_provider_by_name("apple")
-                .map_err(|e| {
-                    error!("Failed to get Apple OAuth provider: {:?}", e);
-                    ApiError::InternalServerError
-                })?
-                .ok_or_else(|| {
-                    error!("Apple OAuth provider not found");
-                    ApiError::InternalServerError
-                })?;
-
-            // Directly query for a user with this Apple ID
-            let existing_user = if let Some(connection) = app_state
-                .db
-                .get_user_oauth_connection_by_provider_and_provider_user_id(
-                    apple_db_provider.id,
-                    &sub,
-                )? {
-                // Found a connection - get the user
-                debug!("Found existing connection for Apple ID: {}", sub);
-
-                let user = app_state.db.get_user_by_uuid(connection.user_id)?;
-
-                // CRITICAL: Verify user belongs to the current project
-                if user.project_id != project.id {
-                    debug!("User found but belongs to different project");
-                    // Treat as if no connection exists for this project
-                    None
-                } else {
-                    // Update the connection with the new token
-                    // For Apple web flow, use the refresh token if available, otherwise empty string
-                    let token_to_store = token
-                        .refresh_token()
-                        .map(|rt| rt.secret().to_string())
-                        .unwrap_or_else(|| "".to_string());
-
-                    update_provider_connection(
-                        &app_state,
-                        &user,
-                        apple_db_provider.id,
-                        &token_to_store,
-                    )
-                    .await?;
-
-                    Some(user)
-                }
-            } else {
-                // No existing connection found
-                debug!("No existing connection found for Apple ID: {}", sub);
-                None
-            };
-
-            // If user was found, return that user
-            if let Some(user) = existing_user {
-                debug!("Using existing user for Apple OAuth");
-                user
-            } else {
-                // For new users, we absolutely need a valid email (not empty)
-                debug!(
-                    "No existing user found with Apple ID: {}, creating new user",
-                    sub
-                );
-
-                // Make sure we have a non-empty email
-                let email = apple_user
-                    .email
-                    .clone()
-                    .filter(|e| !e.is_empty())
-                    .ok_or_else(|| {
-                        error!("No valid email found in Apple token for new user");
-                        ApiError::NoEmailFound
-                    })?;
-
-                // For Apple web flow, use the refresh token if available, otherwise empty string
-                let token_to_store = token
-                    .refresh_token()
-                    .map(|rt| rt.secret().to_string())
-                    .unwrap_or_else(|| "".to_string());
-
-                find_or_create_user_from_oauth(
-                    &app_state,
-                    email,
-                    sub,
-                    "apple",
-                    token_to_store, // Store refresh token instead of access token
-                    apple_user.name.clone(),
-                    project.id,
-                )
-                .await?
-            }
+            find_or_create_user_from_oauth(
+                &app_state,
+                apple_user.email.clone(),
+                sub,
+                "apple",
+                token_to_store,
+                apple_user.name.clone(),
+                project.id,
+            )
+            .await?
         }
         _ => {
             error!("Unsupported provider: {}", provider_name);
@@ -973,25 +898,7 @@ pub async fn oauth_callback(
         }
     };
 
-    // Generate JWT tokens
-    let access_token = NewToken::new(&user, TokenType::Access, &app_state).map_err(|e| {
-        error!("Failed to generate access token: {:?}", e);
-        ApiError::InternalServerError
-    })?;
-    let refresh_token = NewToken::new(&user, TokenType::Refresh, &app_state).map_err(|e| {
-        error!("Failed to generate refresh token: {:?}", e);
-        ApiError::InternalServerError
-    })?;
-
-    let auth_response = OAuthCallbackResponse {
-        id: user.get_id(),
-        email: user
-            .get_email()
-            .expect("OAuth user must have email")
-            .to_string(),
-        access_token: access_token.token,
-        refresh_token: refresh_token.token,
-    };
+    let auth_response = oauth_callback_response(&app_state, &authenticated_user)?;
 
     debug!("Exiting {} callback function", provider_name);
     encrypt_response(&app_state, &session_id, &auth_response).await
@@ -1188,15 +1095,75 @@ async fn fetch_apple_user(
     Err(ApiError::NoEmailFound)
 }
 
+fn authenticated_oauth_user(
+    app_state: &AppState,
+    user: User,
+    provider_name: &str,
+    provider_user_id: &str,
+) -> Result<AuthenticatedOAuthUser, ApiError> {
+    let auth_context = app_state
+        .oauth_auth_context_for_user(&user, provider_name, provider_user_id)
+        .map_err(|e| {
+            error!("Failed to compute OAuth auth context: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+
+    app_state
+        .verify_seed_wrap_for_auth_context(&user, &auth_context)
+        .map_err(|e| {
+            error!("OAuth seed wrap verification failed: {:?}", e);
+            ApiError::Unauthorized
+        })?;
+
+    Ok(AuthenticatedOAuthUser { user, auth_context })
+}
+
+fn oauth_callback_response(
+    app_state: &AppState,
+    authenticated_user: &AuthenticatedOAuthUser,
+) -> Result<OAuthCallbackResponse, ApiError> {
+    let access_token = NewToken::new_with_auth_context(
+        &authenticated_user.user,
+        TokenType::Access,
+        app_state,
+        &authenticated_user.auth_context,
+    )
+    .map_err(|e| {
+        error!("Failed to generate access token: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+    let refresh_token = NewToken::new_with_auth_context(
+        &authenticated_user.user,
+        TokenType::Refresh,
+        app_state,
+        &authenticated_user.auth_context,
+    )
+    .map_err(|e| {
+        error!("Failed to generate refresh token: {:?}", e);
+        ApiError::InternalServerError
+    })?;
+
+    Ok(OAuthCallbackResponse {
+        id: authenticated_user.user.get_id(),
+        email: authenticated_user
+            .user
+            .get_email()
+            .expect("OAuth user must have email")
+            .to_string(),
+        access_token: access_token.token,
+        refresh_token: refresh_token.token,
+    })
+}
+
 async fn find_or_create_user_from_oauth(
     app_state: &AppState,
-    email: String,
+    email: Option<String>,
     provider_user_id: String,
     provider_name: &str,
     access_token: String,
     user_name: Option<String>,
     project_id: i32,
-) -> Result<User, ApiError> {
+) -> Result<AuthenticatedOAuthUser, ApiError> {
     let provider = app_state
         .db
         .get_oauth_provider_by_name(provider_name)
@@ -1209,10 +1176,40 @@ async fn find_or_create_user_from_oauth(
             ApiError::InternalServerError
         })?;
 
-    // Try to find the user by email
+    if let Some(existing_connection) = app_state
+        .db
+        .get_project_user_oauth_connection_by_provider_subject(
+            provider.id,
+            &provider_user_id,
+            project_id,
+        )
+        .map_err(|e| {
+            error!(
+                "Failed to get OAuth connection for verified provider subject: {:?}",
+                e
+            );
+            ApiError::InternalServerError
+        })?
+    {
+        let user = app_state.db.get_user_by_uuid(existing_connection.user_id)?;
+        if user.project_id != project_id {
+            error!("OAuth connection user belongs to a different project");
+            return Err(ApiError::Unauthorized);
+        }
+
+        update_provider_connection(app_state, &existing_connection, &access_token).await?;
+        return authenticated_oauth_user(app_state, user, provider_name, &provider_user_id);
+    }
+
+    let email = email
+        .filter(|email| !email.trim().is_empty())
+        .ok_or_else(|| {
+            error!("No valid email found for new OAuth user");
+            ApiError::NoEmailFound
+        })?;
+
     match app_state.db.get_user_by_email(email.clone(), project_id) {
         Ok(existing_user) => {
-            // User exists, check if they have a connection with the provider
             let existing_connection = app_state
                 .db
                 .get_user_oauth_connection_by_user_and_provider(existing_user.uuid, provider.id)
@@ -1222,12 +1219,12 @@ async fn find_or_create_user_from_oauth(
                 })?;
 
             if existing_connection.is_some() {
-                // User has already linked their account, update the token
-                update_provider_connection(app_state, &existing_user, provider.id, &access_token)
-                    .await?;
-                Ok(existing_user)
+                error!(
+                    "Existing user has a {} connection, but not for the verified provider subject",
+                    provider_name
+                );
+                Err(ApiError::UserExistsNotLinked)
             } else {
-                // User exists but hasn't linked the provider before
                 error!("User exists but hasn't linked {} before", provider_name);
                 Err(ApiError::UserExistsNotLinked)
             }
@@ -1246,38 +1243,33 @@ async fn find_or_create_user_from_oauth(
             let encrypted_key = encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
 
             // Create new user
-            let new_user = NewUser::new(Some(email.clone()), None, project_id, encrypted_key)
+            let new_user = NewUser::new(Some(email), None, project_id, encrypted_key)
                 .with_name(user_name.unwrap_or_default());
 
-            let user = app_state.db.create_user(new_user).map_err(|e| {
-                error!("Failed to create new user: {:?}", e);
-                ApiError::InternalServerError
-            })?;
+            let encrypted_access_token = if !access_token.is_empty() {
+                encrypt_access_token(app_state, &access_token).await?
+            } else {
+                Vec::new()
+            };
 
-            // Create connection for the new user
-            create_provider_connection(
-                app_state,
-                &user,
-                provider.id,
-                provider_user_id,
-                &access_token,
-            )
-            .await?;
-
-            // Create email verification entry as already verified
-            let new_verification = NewEmailVerification::new(user.uuid, 24, true);
-            app_state
-                .db
-                .create_email_verification(new_verification)
+            let user = app_state
+                .create_user_with_oauth_seed_wrap(
+                    new_user,
+                    provider.id,
+                    provider_name,
+                    &provider_user_id,
+                    encrypted_access_token,
+                    user_seed_words.as_bytes(),
+                )
                 .map_err(|e| {
-                    error!("Error creating email verification: {:?}", e);
+                    error!("Failed to create new OAuth user and seed wrap: {:?}", e);
                     ApiError::InternalServerError
                 })?;
 
             // Handle new user registration
             handle_new_user_registration(app_state, &user, false).await?;
 
-            Ok(user)
+            authenticated_oauth_user(app_state, user, provider_name, &provider_user_id)
         }
         Err(e) => {
             error!("Database error when fetching user: {:?}", e);
@@ -1362,61 +1354,40 @@ pub async fn handle_apple_native_signin(
     // The iOS device handles authentication and token management
     let access_token = "".to_string(); // Empty string instead of storing the ID token
 
-    // For Apple, we need a special approach:
-    // 1. First, try to find any existing users with this Apple ID
-    // 2. If found, just use that user - no need for email
-    // 3. Only if this is a first-time user, we need an email
-
-    // Directly query for existing connection with this Apple ID
     if let Some(connection) = app_state
         .db
-        .get_user_oauth_connection_by_provider_and_provider_user_id(
+        .get_project_user_oauth_connection_by_provider_subject(
             apple_provider.id,
             &verified_user_id,
-        )?
+            project.id,
+        )
+        .map_err(|e| {
+            error!(
+                "Failed to get Apple OAuth connection for verified subject: {:?}",
+                e
+            );
+            ApiError::InternalServerError
+        })?
     {
-        // Found a connection - get the user
         debug!(
             "Found existing connection for Apple ID: {}",
             verified_user_id
         );
 
         let user = app_state.db.get_user_by_uuid(connection.user_id)?;
-
-        // CRITICAL: Verify user belongs to the current project
         if user.project_id != project.id {
-            debug!("User found but belongs to different project, treating as new user");
-            // Fall through to create new user for this project
-        } else {
-            // Update the connection with an empty string instead of storing the ID token
-            update_provider_connection(&app_state, &user, apple_provider.id, &access_token).await?;
-
-            // Generate JWT tokens
-            let access_token =
-                NewToken::new(&user, TokenType::Access, &app_state).map_err(|e| {
-                    error!("Failed to generate access token: {:?}", e);
-                    ApiError::InternalServerError
-                })?;
-
-            let refresh_token =
-                NewToken::new(&user, TokenType::Refresh, &app_state).map_err(|e| {
-                    error!("Failed to generate refresh token: {:?}", e);
-                    ApiError::InternalServerError
-                })?;
-
-            let auth_response = OAuthCallbackResponse {
-                id: user.get_id(),
-                email: user
-                    .get_email()
-                    .expect("OAuth user must have email")
-                    .to_string(),
-                access_token: access_token.token,
-                refresh_token: refresh_token.token,
-            };
-
-            debug!("Apple sign-in successful for existing user");
-            return encrypt_response(&app_state, &session_id, &auth_response).await;
+            error!("Apple OAuth connection user belongs to a different project");
+            return Err(ApiError::Unauthorized);
         }
+
+        update_provider_connection(&app_state, &connection, &access_token).await?;
+
+        let authenticated_user =
+            authenticated_oauth_user(&app_state, user, "apple", &verified_user_id)?;
+        let auth_response = oauth_callback_response(&app_state, &authenticated_user)?;
+
+        debug!("Apple sign-in successful for existing user");
+        return encrypt_response(&app_state, &session_id, &auth_response).await;
     }
 
     // If we get here, user doesn't exist - need to create new user
@@ -1470,9 +1441,9 @@ pub async fn handle_apple_native_signin(
     };
 
     // Create the new user
-    let user = find_or_create_user_from_oauth(
+    let authenticated_user = find_or_create_user_from_oauth(
         &app_state,
-        email,
+        Some(email),
         verified_user_id,
         "apple",
         access_token,
@@ -1481,26 +1452,7 @@ pub async fn handle_apple_native_signin(
     )
     .await?;
 
-    // Generate JWT tokens
-    let access_token = NewToken::new(&user, TokenType::Access, &app_state).map_err(|e| {
-        error!("Failed to generate access token: {:?}", e);
-        ApiError::InternalServerError
-    })?;
-
-    let refresh_token = NewToken::new(&user, TokenType::Refresh, &app_state).map_err(|e| {
-        error!("Failed to generate refresh token: {:?}", e);
-        ApiError::InternalServerError
-    })?;
-
-    let auth_response = OAuthCallbackResponse {
-        id: user.get_id(),
-        email: user
-            .get_email()
-            .expect("OAuth user must have email")
-            .to_string(),
-        access_token: access_token.token,
-        refresh_token: refresh_token.token,
-    };
+    let auth_response = oauth_callback_response(&app_state, &authenticated_user)?;
 
     debug!("Apple native sign-in successful for new user");
     encrypt_response(&app_state, &session_id, &auth_response).await
@@ -1508,18 +1460,10 @@ pub async fn handle_apple_native_signin(
 
 async fn update_provider_connection(
     app_state: &AppState,
-    user: &User,
-    provider_id: i32,
+    connection: &UserOAuthConnection,
     token: &str,
 ) -> Result<(), ApiError> {
-    let mut connection = app_state
-        .db
-        .get_user_oauth_connection_by_user_and_provider(user.uuid, provider_id)
-        .map_err(|e| {
-            error!("Failed to get existing OAuth connection: {:?}", e);
-            ApiError::InternalServerError
-        })?
-        .expect("Connection should exist");
+    let mut connection = connection.clone();
 
     // Only encrypt and update token if it's not empty
     if !token.is_empty() {
@@ -1538,6 +1482,7 @@ async fn update_provider_connection(
     Ok(())
 }
 
+#[cfg(test)]
 async fn create_provider_connection(
     app_state: &AppState,
     user: &User,
@@ -1581,4 +1526,225 @@ async fn encrypt_access_token(
         ApiError::InternalServerError
     })?;
     Ok(encrypt::encrypt_with_key(&secret_key, access_token.as_bytes()).await)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        db::setup_db,
+        encrypt::encrypt_with_key,
+        models::{org_projects::OrgProject, schema::org_projects},
+        seed_wrapping::CredentialKind,
+        AppMode, AppStateBuilder,
+    };
+    use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+    async fn db_oauth_same_email_different_subject_is_not_linked() {
+        let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+            eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let app_state = build_local_test_app_state(database_url).await;
+        let project = first_active_project(&app_state);
+        let marker = Uuid::new_v4();
+        let email = format!("aead-oauth-subject-mismatch-{marker}@example.com");
+        let existing_subject = format!("existing-google-sub-{marker}");
+        let attacker_subject = format!("attacker-google-sub-{marker}");
+
+        let user = create_oauth_wrapped_user(
+            &app_state,
+            project.id,
+            email.clone(),
+            "google",
+            existing_subject,
+        )
+        .await;
+
+        let result = find_or_create_user_from_oauth(
+            &app_state,
+            Some(email),
+            attacker_subject.clone(),
+            "google",
+            "attacker-access-token".to_string(),
+            Some("Attacker Name".to_string()),
+            project.id,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ApiError::UserExistsNotLinked)),
+            "same email with a different verified provider subject must not be linked"
+        );
+
+        let google_provider = app_state
+            .db
+            .get_oauth_provider_by_name("google")
+            .expect("test OAuth provider lookup should succeed")
+            .expect("test OAuth provider should exist after AppState build");
+        let attacker_connection = app_state
+            .db
+            .get_project_user_oauth_connection_by_provider_subject(
+                google_provider.id,
+                &attacker_subject,
+                project.id,
+            )
+            .expect("attacker subject lookup should not error");
+        assert!(
+            attacker_connection.is_none(),
+            "failed same-email OAuth attempt must not create attacker subject connection"
+        );
+
+        let _ = app_state.db.delete_user(&user);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+    async fn db_oauth_new_user_creates_initial_seed_wrap_and_login_works() {
+        let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+            eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let app_state = build_local_test_app_state(database_url).await;
+        let project = first_active_project(&app_state);
+        let marker = Uuid::new_v4();
+        let email = format!("aead-oauth-registration-{marker}@example.com");
+        let provider_subject = format!("google-sub-{marker}");
+
+        let authenticated_user = find_or_create_user_from_oauth(
+            &app_state,
+            Some(email.clone()),
+            provider_subject.clone(),
+            "google",
+            "oauth-registration-access-token".to_string(),
+            Some("OAuth Registration Test".to_string()),
+            project.id,
+        )
+        .await
+        .expect("new OAuth registration should create user and auth context");
+
+        assert_eq!(authenticated_user.user.get_email(), Some(email.as_str()));
+
+        let google_provider = app_state
+            .db
+            .get_oauth_provider_by_name("google")
+            .expect("test OAuth provider lookup should succeed")
+            .expect("test OAuth provider should exist after AppState build");
+        let connection = app_state
+            .db
+            .get_project_user_oauth_connection_by_provider_subject(
+                google_provider.id,
+                &provider_subject,
+                project.id,
+            )
+            .expect("new OAuth provider subject should load")
+            .expect("new OAuth provider subject should be connected");
+        assert_eq!(connection.user_id, authenticated_user.user.uuid);
+
+        let verification = app_state
+            .db
+            .get_email_verification_by_user_id(authenticated_user.user.uuid)
+            .expect("new OAuth user should have a verified email row");
+        assert!(
+            verification.is_verified,
+            "OAuth-created users should have verified email rows"
+        );
+
+        let oauth_wraps = app_state
+            .db
+            .get_user_seed_wrappings_for_user_and_kind(
+                authenticated_user.user.uuid,
+                CredentialKind::OAuth.as_str(),
+            )
+            .expect("new OAuth user's seed wraps should load");
+        assert_eq!(
+            oauth_wraps.len(),
+            1,
+            "OAuth registration should commit exactly one initial OAuth seed wrap"
+        );
+
+        app_state
+            .verify_seed_wrap_for_auth_context(
+                &authenticated_user.user,
+                &authenticated_user.auth_context,
+            )
+            .expect("new OAuth auth context should unwrap the committed seed wrap");
+
+        let _ = app_state.db.delete_user(&authenticated_user.user);
+    }
+
+    async fn build_local_test_app_state(database_url: String) -> AppState {
+        let db = setup_db(database_url);
+        AppStateBuilder::default()
+            .app_mode(AppMode::Local)
+            .db(db)
+            .enclave_key([42u8; 32].to_vec())
+            .aws_credential_manager(Arc::new(RwLock::new(None)))
+            .openai_api_base("http://localhost:9".to_string())
+            .jwt_secret([24u8; 32].to_vec())
+            .build()
+            .await
+            .expect("local test app state should build")
+    }
+
+    fn first_active_project(app_state: &AppState) -> OrgProject {
+        let conn = &mut app_state
+            .db
+            .get_pool()
+            .get()
+            .expect("test database connection should be available");
+
+        org_projects::table
+            .filter(org_projects::status.eq("active"))
+            .order(org_projects::id.asc())
+            .first::<OrgProject>(conn)
+            .expect("test database should contain at least one active project")
+    }
+
+    async fn create_oauth_wrapped_user(
+        app_state: &AppState,
+        project_id: i32,
+        email: String,
+        provider_name: &str,
+        provider_user_id: String,
+    ) -> User {
+        let secret_key = SecretKey::from_slice(&app_state.enclave_key)
+            .expect("test enclave key should be valid");
+        let user_seed_words = generate_twelve_word_seed(app_state.aws_credential_manager.clone())
+            .await
+            .expect("test seed should generate")
+            .to_string();
+        let legacy_seed_enc = encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
+
+        let user = app_state
+            .db
+            .create_user(NewUser::new(Some(email), None, project_id, legacy_seed_enc))
+            .expect("test OAuth user should insert");
+
+        let provider = app_state
+            .db
+            .get_oauth_provider_by_name(provider_name)
+            .expect("test OAuth provider lookup should succeed")
+            .expect("test OAuth provider should exist after AppState build");
+
+        create_provider_connection(app_state, &user, provider.id, provider_user_id.clone(), "")
+            .await
+            .expect("test OAuth connection should insert");
+
+        app_state
+            .create_oauth_seed_wrap_for_user(
+                &user,
+                provider_name,
+                &provider_user_id,
+                user_seed_words.as_bytes(),
+            )
+            .expect("test OAuth seed wrap should insert");
+
+        user
+    }
 }

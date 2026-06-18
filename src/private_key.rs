@@ -9,11 +9,12 @@ use std::{str::FromStr, sync::Arc};
 use tracing::{debug, error, info};
 
 use crate::{
-    aws_credentials::AwsCredentialManager,
-    encrypt::{decrypt_with_key, generate_random_enclave},
-    web::protected_routes::validate_bip85_path,
-    Error,
+    aws_credentials::AwsCredentialManager, encrypt::generate_random_enclave,
+    web::protected_routes::validate_bip85_path, Error,
 };
+
+#[cfg(test)]
+use crate::encrypt::decrypt_with_key;
 
 // Valid BIP-39 word counts - we only support 12, 18, and 24
 pub const VALID_BIP39_WORD_COUNTS: [u32; 3] = [12, 18, 24];
@@ -30,9 +31,36 @@ pub async fn generate_twelve_word_seed(
     Ok(mnemonic)
 }
 
+#[cfg(test)]
 pub fn decrypt_user_seed_to_key(
     enclave_key: Vec<u8>,
     encrypted_seed: Vec<u8>,
+    derivation_path: Option<&str>,
+    seed_phrase_derivation_path: Option<&str>,
+) -> Result<SecretKey, Error> {
+    let root_mnemonic = decrypt_user_seed_to_mnemonic(enclave_key, encrypted_seed)?;
+    derive_mnemonic_to_key(root_mnemonic, derivation_path, seed_phrase_derivation_path)
+}
+
+pub fn plaintext_user_seed_to_mnemonic(plaintext_seed: &[u8]) -> Result<Mnemonic, Error> {
+    let decrypted_user_seed_str = std::str::from_utf8(plaintext_seed)
+        .map_err(|e| Error::EncryptionError(format!("Failed to decode UTF-8: {}", e)))?;
+    let user_mnemonic = Mnemonic::from_str(decrypted_user_seed_str)
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+    Ok(user_mnemonic)
+}
+
+pub fn plaintext_user_seed_to_key(
+    plaintext_seed: &[u8],
+    derivation_path: Option<&str>,
+    seed_phrase_derivation_path: Option<&str>,
+) -> Result<SecretKey, Error> {
+    let root_mnemonic = plaintext_user_seed_to_mnemonic(plaintext_seed)?;
+    derive_mnemonic_to_key(root_mnemonic, derivation_path, seed_phrase_derivation_path)
+}
+
+fn derive_mnemonic_to_key(
+    root_mnemonic: Mnemonic,
     derivation_path: Option<&str>,
     seed_phrase_derivation_path: Option<&str>,
 ) -> Result<SecretKey, Error> {
@@ -40,15 +68,12 @@ pub fn decrypt_user_seed_to_key(
     let (source_mnemonic, uses_bip85) = if let Some(bip85_path) = seed_phrase_derivation_path {
         info!("Using BIP-85 derivation with path: {}", bip85_path);
         (
-            decrypt_and_derive_bip85_mnemonic(enclave_key, encrypted_seed, bip85_path)?,
+            derive_bip85_mnemonic_from_root(root_mnemonic, bip85_path)?,
             true,
         )
     } else {
         debug!("Using root mnemonic (no BIP-85 derivation)");
-        (
-            decrypt_user_seed_to_mnemonic(enclave_key, encrypted_seed)?,
-            false,
-        )
+        (root_mnemonic, false)
     };
 
     // Generate seed from the appropriate mnemonic (either the root or the BIP-85 derived one)
@@ -79,6 +104,7 @@ pub fn decrypt_user_seed_to_key(
     }
 }
 
+#[cfg(test)]
 pub fn decrypt_user_seed_to_mnemonic(
     enclave_key: Vec<u8>,
     encrypted_seed: Vec<u8>,
@@ -104,12 +130,13 @@ pub fn decrypt_user_seed_to_mnemonic(
 ///   where:
 ///   - PURPOSE' is the BIP-85 purpose value (83696968', must be hardened)
 ///   - APP' is for BIP-39 mnemonics (39', must be hardened)
-///   - LANGUAGE' is typically 0' for English (must be hardened)
+///   - LANGUAGE' is 0' for English (must be hardened); other languages are not currently supported
 ///   - WORDS' must be one of VALID_BIP39_WORD_COUNTS (12', 18', 24', must be hardened)
 ///   - INDEX' is the derivation index (must be hardened)
 ///
 /// # Returns
 /// * `Result<Mnemonic, Error>` - The derived BIP-39 mnemonic or an error
+#[cfg(test)]
 pub fn decrypt_and_derive_bip85_mnemonic(
     enclave_key: Vec<u8>,
     encrypted_seed: Vec<u8>,
@@ -131,9 +158,29 @@ pub fn decrypt_and_derive_bip85_mnemonic(
     // 2. Decrypt user root mnemonic
     debug!("Decrypting user root mnemonic");
     let root_mnemonic = decrypt_user_seed_to_mnemonic(enclave_key, encrypted_seed)?;
+    derive_bip85_mnemonic_from_root(root_mnemonic, bip85_path)
+}
+
+pub fn derive_bip85_mnemonic_from_root(
+    root_mnemonic: Mnemonic,
+    bip85_path: &str,
+) -> Result<Mnemonic, Error> {
+    info!(
+        "Starting BIP-85 mnemonic derivation with path: {}",
+        bip85_path
+    );
+
+    // 1. Validate BIP-85 path format
+    debug!("Validating BIP-85 path format");
+    // Convert ApiError to our Error type
+    validate_bip85_path(bip85_path).map_err(|_| {
+        error!("BIP-85 path validation failed: {}", bip85_path);
+        Error::InvalidDerivationPath(format!("Invalid BIP-85 path format: {}", bip85_path))
+    })?;
+
     let root_seed = root_mnemonic.to_seed("");
 
-    // 3. Convert root_seed to Xpriv
+    // 2. Convert root_seed to Xpriv
     debug!("Converting root seed to extended private key");
     let secp = Secp256k1::new();
     let xpriv = Xpriv::new_master(Network::Bitcoin, &root_seed).map_err(|e| {
@@ -141,7 +188,7 @@ pub fn decrypt_and_derive_bip85_mnemonic(
         Error::EncryptionError(e.to_string())
     })?;
 
-    // 4. Parse the BIP-85 path to extract required parameters
+    // 3. Parse the BIP-85 path to extract required parameters
     debug!("Parsing BIP-85 path to extract parameters");
     // Safe to unwrap these values since we already validated the path
     let segments: Vec<&str> = bip85_path.split('/').collect();
@@ -172,7 +219,7 @@ pub fn decrypt_and_derive_bip85_mnemonic(
         Error::InvalidDerivationPath(format!("Invalid index: {}", index_segment))
     })?;
 
-    // 5. Use the bip85_extended crate to derive the mnemonic
+    // 4. Use the bip85_extended crate to derive the mnemonic
     info!(
         "Deriving BIP-85 mnemonic with {} words at index {}",
         word_count, index
@@ -180,7 +227,7 @@ pub fn decrypt_and_derive_bip85_mnemonic(
     let bip85_mnemonic_result =
         bip85_extended::mnemonic::to_mnemonic(&secp, &xpriv, word_count, index);
 
-    // 6. Return the derived mnemonic or convert error
+    // 5. Return the derived mnemonic or convert error
     match bip85_mnemonic_result {
         Ok(derived_mnemonic) => {
             info!(
@@ -225,6 +272,50 @@ mod tests {
         let encrypted_seed = encrypt_with_key(&secret_key, mnemonic.as_bytes()).await;
 
         (enclave_key, encrypted_seed)
+    }
+
+    #[tokio::test]
+    async fn legacy_seed_ciphertext_copy_derives_original_user_key() {
+        let (enclave_key, victim_encrypted_seed) = create_mock_encrypted_seed(TEST_MNEMONIC).await;
+
+        let victim_key = decrypt_user_seed_to_key(
+            enclave_key.clone(),
+            victim_encrypted_seed.clone(),
+            None,
+            None,
+        )
+        .expect("victim seed should decrypt with the enclave root key");
+
+        // This is the current threat model issue from the investigation:
+        // the decrypt helper only sees root-key ciphertext. It receives no
+        // authenticated user/credential binding, so a copied victim seed blob
+        // derives the same key in any logical account context.
+        let attacker_row_copied_seed = victim_encrypted_seed;
+        let attacker_session_key =
+            decrypt_user_seed_to_key(enclave_key, attacker_row_copied_seed, None, None)
+                .expect("legacy copied seed decrypts because no AAD binding exists");
+
+        assert_eq!(
+            victim_key.display_secret().to_string(),
+            attacker_session_key.display_secret().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn plaintext_seed_key_derivation_matches_legacy_decrypt_path() {
+        let (enclave_key, encrypted_seed) = create_mock_encrypted_seed(TEST_MNEMONIC).await;
+
+        let legacy_key =
+            decrypt_user_seed_to_key(enclave_key, encrypted_seed, Some(TEST_BIP32_PATH), None)
+                .expect("legacy encrypted seed path should derive");
+        let plaintext_key =
+            plaintext_user_seed_to_key(TEST_MNEMONIC.as_bytes(), Some(TEST_BIP32_PATH), None)
+                .expect("plaintext seed path should derive");
+
+        assert_eq!(
+            legacy_key.display_secret().to_string(),
+            plaintext_key.display_secret().to_string()
+        );
     }
 
     #[test]
@@ -367,6 +458,7 @@ mod tests {
         let invalid_paths = [
             "m/83696968/39'/0'/12'/0'",    // Purpose not hardened
             "m/83696968'/39/0'/12'/0'",    // Application not hardened
+            "m/83696968'/39'/1'/12'/0'",   // Unsupported non-English language
             "m/44'/0'/0'/0/0",             // Not a BIP-85 path
             "m/83696968'/39'/0'/12'/0'/0", // Extra segment
         ];

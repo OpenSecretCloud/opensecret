@@ -3,6 +3,7 @@
 
 use crate::{
     encrypt::{decrypt_string, encrypt_with_key},
+    jwt::AuthContext,
     models::responses::NewUserInstruction,
     models::users::User,
     tokens::count_tokens,
@@ -61,17 +62,18 @@ impl InstructionContext {
     async fn load(
         state: &AppState,
         instruction_id: Uuid,
-        user_uuid: Uuid,
+        user: &User,
+        auth_context: &AuthContext,
     ) -> Result<Self, ApiError> {
         // Get instruction (verifies ownership)
         let instruction = state
             .db
-            .get_user_instruction_by_uuid_and_user(instruction_id, user_uuid)
+            .get_user_instruction_by_uuid_and_user(instruction_id, user.uuid)
             .map_err(error_mapping::map_instruction_error)?;
 
         // Get user's encryption key
         let user_key = state
-            .get_user_key(user_uuid, None, None)
+            .get_user_key(user, auth_context, None, None)
             .await
             .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -247,6 +249,7 @@ async fn create_instruction(
     State(state): State<Arc<AppState>>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<CreateInstructionRequest>,
 ) -> Result<Json<EncryptedResponse<InstructionResponse>>, ApiError> {
     debug!("Creating new instruction for user: {}", user.uuid);
@@ -264,7 +267,7 @@ async fn create_instruction(
 
     // Get user's encryption key
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(&user, &auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -317,13 +320,14 @@ async fn get_instruction(
     Path(instruction_id): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<InstructionResponse>>, ApiError> {
     debug!(
         "Getting instruction {} for user {}",
         instruction_id, user.uuid
     );
 
-    let ctx = InstructionContext::load(&state, instruction_id, user.uuid).await?;
+    let ctx = InstructionContext::load(&state, instruction_id, &user, &auth_context).await?;
     let (name, prompt) = ctx.decrypt_content()?;
 
     let response = InstructionResponseBuilder::new(ctx.instruction)
@@ -340,6 +344,7 @@ async fn update_instruction(
     Path(instruction_id): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<UpdateInstructionRequest>,
 ) -> Result<Json<EncryptedResponse<InstructionResponse>>, ApiError> {
     debug!(
@@ -353,7 +358,7 @@ async fn update_instruction(
         return Err(ApiError::BadRequest);
     }
 
-    let ctx = InstructionContext::load(&state, instruction_id, user.uuid).await?;
+    let ctx = InstructionContext::load(&state, instruction_id, &user, &auth_context).await?;
     let (current_name, current_prompt) = ctx.decrypt_content()?;
 
     // Determine final values (use existing if not provided in update)
@@ -415,13 +420,14 @@ async fn delete_instruction(
     Path(instruction_id): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
     debug!(
         "Deleting instruction {} for user {}",
         instruction_id, user.uuid
     );
 
-    let ctx = InstructionContext::load(&state, instruction_id, user.uuid).await?;
+    let ctx = InstructionContext::load(&state, instruction_id, &user, &auth_context).await?;
 
     // Delete the instruction
     state
@@ -444,6 +450,7 @@ async fn list_instructions(
     Query(params): Query<ListInstructionsParams>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<InstructionListResponse>>, ApiError> {
     debug!("Listing instructions for user: {}", user.uuid);
 
@@ -468,7 +475,7 @@ async fn list_instructions(
 
     // Get user's encryption key for decrypting content
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(&user, &auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -517,13 +524,14 @@ async fn set_default_instruction(
     Path(instruction_id): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<InstructionResponse>>, ApiError> {
     debug!(
         "Setting instruction {} as default for user {}",
         instruction_id, user.uuid
     );
 
-    let ctx = InstructionContext::load(&state, instruction_id, user.uuid).await?;
+    let ctx = InstructionContext::load(&state, instruction_id, &user, &auth_context).await?;
 
     // If already default, just return it
     if ctx.instruction.is_default {

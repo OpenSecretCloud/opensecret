@@ -1,7 +1,9 @@
 use crate::encrypt;
-use crate::jwt::{NewToken, TokenType};
+use crate::jwt::{AuthContext, NewToken, TokenType};
 use crate::message_signing::SigningAlgorithm;
-use crate::private_key::{decrypt_user_seed_to_mnemonic, VALID_BIP39_WORD_COUNTS};
+use crate::private_key::{
+    derive_bip85_mnemonic_from_root, plaintext_user_seed_to_mnemonic, VALID_BIP39_WORD_COUNTS,
+};
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
 use crate::Error;
 use crate::KVPair;
@@ -24,12 +26,10 @@ use base64::{engine::general_purpose, Engine as _};
 use bitcoin::bip32::DerivationPath;
 use chrono::{DateTime, Utc};
 use secp256k1::Secp256k1;
-use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::spawn;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use validator::Validate;
@@ -121,7 +121,7 @@ pub struct KeyOptions {
     /// Format: "m/83696968'/39'/0'/12'/0'" where:
     ///   - 83696968' is the BIP-85 purpose
     ///   - 39' is for BIP-39 mnemonics
-    ///   - 0' is the coin type
+    ///   - 0' is the language code; only English (0') is currently supported
     ///   - 12', 18', or 24' is the word count (only these word counts are supported)
     ///   - 0' is the index
     pub seed_phrase_derivation_path: Option<String>,
@@ -188,41 +188,34 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
         return Err(ApiError::BadRequest);
     }
 
-    // Check purpose is BIP85_PURPOSE (83696968')
-    let purpose = segments[1];
-    if !purpose.starts_with(&BIP85_PURPOSE.to_string())
-        || !(purpose.ends_with('\'') || purpose.ends_with('h'))
-    {
+    let purpose = parse_hardened_bip85_segment(segments[1], "purpose", path)?;
+    if purpose != BIP85_PURPOSE {
         error!(
             "BIP-85 path purpose must be {}' or {}h, found '{}': {}",
-            BIP85_PURPOSE, BIP85_PURPOSE, purpose, path
+            BIP85_PURPOSE, BIP85_PURPOSE, segments[1], path
         );
         return Err(ApiError::BadRequest);
     }
 
-    // Check application is BIP85_APPLICATION_BIP39 (39' for BIP-39 mnemonic)
-    let application = segments[2];
-    if !application.starts_with(&BIP85_APPLICATION_BIP39.to_string())
-        || !(application.ends_with('\'') || application.ends_with('h'))
-    {
+    let application = parse_hardened_bip85_segment(segments[2], "application", path)?;
+    if application != BIP85_APPLICATION_BIP39 {
         error!(
             "BIP-85 path application must be {}' or {}h for BIP-39 mnemonics, found '{}': {}",
-            BIP85_APPLICATION_BIP39, BIP85_APPLICATION_BIP39, application, path
+            BIP85_APPLICATION_BIP39, BIP85_APPLICATION_BIP39, segments[2], path
         );
         return Err(ApiError::BadRequest);
     }
 
-    // Check language is hardened
-    let language = segments[3];
-    if !(language.ends_with('\'') || language.ends_with('h')) {
+    let language = parse_hardened_bip85_segment(segments[3], "language", path)?;
+    if language != 0 {
         error!(
-            "BIP-85 path language must be hardened, found '{}': {}",
-            language, path
+            "BIP-85 path language must be 0' or 0h for English, found '{}': {}",
+            segments[3], path
         );
         return Err(ApiError::BadRequest);
     }
 
-    debug!("BIP-85 path language component valid: {}", language);
+    debug!("BIP-85 path language component valid: {}", segments[3]);
 
     // Check word count is valid (12, 18, 24) and hardened
     let word_count = segments[4];
@@ -285,6 +278,27 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn parse_hardened_bip85_segment(segment: &str, name: &str, path: &str) -> Result<u32, ApiError> {
+    if !(segment.ends_with('\'') || segment.ends_with('h')) {
+        error!(
+            "BIP-85 path {} must be hardened, found '{}': {}",
+            name, segment, path
+        );
+        return Err(ApiError::BadRequest);
+    }
+
+    segment
+        .trim_end_matches(&['\'', 'h'][..])
+        .parse::<u32>()
+        .map_err(|_| {
+            error!(
+                "BIP-85 path {} must be a valid number, found '{}': {}",
+                name, segment, path
+            );
+            ApiError::BadRequest
+        })
+}
+
 /// Query parameters for endpoints that accept a derivation path.
 /// The derivation path should follow BIP32 format (e.g., "m/44'/0'/0'/0/0").
 #[derive(Debug, Clone, Deserialize)]
@@ -342,13 +356,6 @@ pub struct PublicKeyQuery {
     algorithm: SigningAlgorithm,
     #[serde(default, flatten)]
     key_options: KeyOptions,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ConvertGuestRequest {
-    pub email: String,
-    pub password: String,
-    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -520,13 +527,6 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
             get(get_public_key).layer(from_fn_with_state(app_state.clone(), decrypt_request::<()>)),
         )
         .route(
-            "/protected/convert_guest",
-            post(convert_guest_to_email).layer(from_fn_with_state(
-                app_state.clone(),
-                decrypt_request::<ConvertGuestRequest>,
-            )),
-        )
-        .route(
             "/protected/third_party_token",
             post(generate_third_party_token).layer(from_fn_with_state(
                 app_state.clone(),
@@ -641,12 +641,13 @@ pub async fn user_protected(
 pub async fn get_kv(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
     Path(key): Path<String>,
 ) -> Result<Json<EncryptedResponse<Option<String>>>, ApiError> {
     debug!("Entering get_kv function");
 
-    let value = match data.get(user.uuid, key).await {
+    let value = match data.get(&user, &auth_context, key).await {
         Ok(kv) => kv,
         Err(e) => {
             tracing::error!("Error getting key-value pair: {:?}", e);
@@ -660,6 +661,7 @@ pub async fn get_kv(
 pub async fn put_kv(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
     Path(key): Path<String>,
     Extension(value): Extension<String>,
@@ -668,7 +670,7 @@ pub async fn put_kv(
     info!("Putting key-value pair for user");
     tracing::trace!("putting key-value pair: {} = {}", key, value);
 
-    match data.put(user.uuid, key, value.clone()).await {
+    match data.put(&user, &auth_context, key, value.clone()).await {
         Ok(kv) => kv,
         Err(e) => {
             tracing::error!("Error putting key-value pair: {:?}", e);
@@ -683,12 +685,13 @@ pub async fn put_kv(
 pub async fn delete_kv(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
     Path(key): Path<String>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     debug!("Entering delete_kv function");
 
-    match data.delete(user.uuid, key).await {
+    match data.delete(&user, &auth_context, key).await {
         Ok(_) => {
             let response = json!({ "message": "Resource deleted successfully" });
             debug!("Exiting delete_kv function");
@@ -727,11 +730,12 @@ pub async fn delete_all_kv(
 pub async fn list_kv(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<Vec<KVPair>>>, ApiError> {
     debug!("Entering list_kv function");
 
-    let kvs = match data.list(user.uuid).await {
+    let kvs = match data.list(&user, &auth_context).await {
         Ok(kvs) => kvs,
         Err(e) => {
             tracing::error!("Error listing key-value pairs: {:?}", e);
@@ -811,6 +815,7 @@ pub async fn request_new_verification_code(
 pub async fn change_password(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(change_request): Extension<ChangePasswordRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
@@ -834,20 +839,43 @@ pub async fn change_password(
         )
         .await
     {
-        Ok(Some(authenticated_user)) if authenticated_user.uuid == user.uuid => {
+        Ok(Some(authenticated_user)) if authenticated_user.user.uuid == user.uuid => {
             // Current password is correct, proceed with password change
             match data
-                .update_user_password(&user, change_request.new_password)
+                .update_user_password_and_seed_wrap(
+                    &user,
+                    &auth_context,
+                    change_request.new_password,
+                )
                 .await
             {
-                Ok(()) => {
-                    let response = json!({ "message": "Password changed successfully" });
+                Ok(new_auth_context) => {
+                    let access_token = NewToken::new_with_auth_context(
+                        &user,
+                        TokenType::Access,
+                        &data,
+                        &new_auth_context,
+                    )?;
+                    let refresh_token = NewToken::new_with_auth_context(
+                        &user,
+                        TokenType::Refresh,
+                        &data,
+                        &new_auth_context,
+                    )?;
+                    let response = json!({
+                        "message": "Password changed successfully",
+                        "access_token": access_token.token,
+                        "refresh_token": refresh_token.token
+                    });
                     debug!("Exiting change_password function");
                     encrypt_response(&data, &session_id, &response).await
                 }
                 Err(e) => {
                     error!("Error changing password: {:?}", e);
-                    Err(ApiError::InternalServerError)
+                    match e {
+                        Error::AuthenticationError => Err(ApiError::InvalidUsernameOrPassword),
+                        _ => Err(ApiError::InternalServerError),
+                    }
                 }
             }
         }
@@ -861,6 +889,7 @@ pub async fn change_password(
 pub async fn get_private_key(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
     Query(query): Query<DerivationPathQuery>,
 ) -> Result<Json<EncryptedResponse<PrivateKeyResponse>>, ApiError> {
@@ -878,47 +907,27 @@ pub async fn get_private_key(
     debug!("Validating derivation paths");
     query.validate()?;
 
-    // First try to get the existing encrypted seed
-    debug!("Retrieving encrypted seed for user");
-    let encrypted_seed = match user.get_seed_encrypted().await {
-        Some(seed) => {
-            debug!("Found existing encrypted seed");
-            seed
-        }
-        None => {
-            // Only generate a new key if one doesn't exist
-            info!(
-                "No seed found, generating new private key for user: {}",
-                user.uuid
-            );
-            data.generate_private_key(user.uuid)
-                .await
-                .map_err(|e| {
-                    error!("Failed to generate private key: {:?}", e);
-                    ApiError::InternalServerError
-                })?
-                .get_seed_encrypted()
-                .await
-                .ok_or_else(|| {
-                    error!("Private key not found after generation: {}", user.uuid);
-                    ApiError::InternalServerError
-                })?
-        }
-    };
+    debug!("Retrieving authenticated seed wrap for user");
+    let plaintext_seed = data
+        .decrypt_seed_for_auth_context(&user, &auth_context)
+        .map_err(|e| {
+            error!("Failed to decrypt authenticated seed wrap: {:?}", e);
+            ApiError::Unauthorized
+        })?;
+    let root_mnemonic = plaintext_user_seed_to_mnemonic(&plaintext_seed).map_err(|e| {
+        error!("Failed to parse user seed mnemonic: {:?}", e);
+        ApiError::InternalServerError
+    })?;
 
     // Check if BIP-85 derivation is requested
     if let Some(bip85_path) = &query.key_options.seed_phrase_derivation_path {
         info!("BIP-85 derivation requested with path: {}", bip85_path);
         // Derive a child mnemonic
-        let child_mnemonic = crate::private_key::decrypt_and_derive_bip85_mnemonic(
-            data.enclave_key.clone(),
-            encrypted_seed,
-            bip85_path,
-        )
-        .map_err(|e| {
-            error!("BIP-85 derivation error: {:?}", e);
-            ApiError::BadRequest
-        })?;
+        let child_mnemonic =
+            derive_bip85_mnemonic_from_root(root_mnemonic, bip85_path).map_err(|e| {
+                error!("BIP-85 derivation error: {:?}", e);
+                ApiError::BadRequest
+            })?;
 
         let word_count = child_mnemonic.word_count();
         info!(
@@ -936,17 +945,11 @@ pub async fn get_private_key(
     } else {
         // Return root mnemonic
         info!("Returning root mnemonic (no BIP-85 derivation)");
-        let mnemonic = decrypt_user_seed_to_mnemonic(data.enclave_key.clone(), encrypted_seed)
-            .map_err(|e| {
-                error!("Failed to decrypt user seed: {:?}", e);
-                ApiError::InternalServerError
-            })?;
-
-        let word_count = mnemonic.word_count();
+        let word_count = root_mnemonic.word_count();
         debug!("Root mnemonic has {} words", word_count);
 
         let response = PrivateKeyResponse {
-            mnemonic: mnemonic.to_string(),
+            mnemonic: root_mnemonic.to_string(),
         };
 
         debug!("Encrypting response with root mnemonic");
@@ -958,6 +961,7 @@ pub async fn get_private_key(
 pub async fn get_private_key_bytes(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
     Query(query): Query<DerivationPathQuery>,
 ) -> Result<Json<EncryptedResponse<PrivateKeyBytesResponse>>, ApiError> {
@@ -982,7 +986,8 @@ pub async fn get_private_key_bytes(
     debug!("Getting user key with provided derivation paths");
     let secret_key = data
         .get_user_key(
-            user.uuid,
+            &user,
+            &auth_context,
             query.key_options.private_key_derivation_path.as_deref(),
             query.key_options.seed_phrase_derivation_path.as_deref(),
         )
@@ -1018,6 +1023,7 @@ pub async fn get_private_key_bytes(
 pub async fn sign_message(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(sign_request): Extension<SignMessageRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<SignMessageResponseJson>>, ApiError> {
@@ -1064,7 +1070,8 @@ pub async fn sign_message(
     );
     let response = data
         .sign_message(
-            user.uuid,
+            &user,
+            &auth_context,
             &message_bytes,
             sign_request.algorithm,
             derivation_path,
@@ -1091,6 +1098,7 @@ pub async fn sign_message(
 pub async fn get_public_key(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
     Query(query): Query<PublicKeyQuery>,
 ) -> Result<Json<EncryptedResponse<PublicKeyResponseJson>>, ApiError> {
@@ -1107,7 +1115,12 @@ pub async fn get_public_key(
     let seed_phrase_derivation_path = query.key_options.seed_phrase_derivation_path.as_deref();
 
     let user_secret_key = data
-        .get_user_key(user.uuid, derivation_path, seed_phrase_derivation_path)
+        .get_user_key(
+            &user,
+            &auth_context,
+            derivation_path,
+            seed_phrase_derivation_path,
+        )
         .await
         .map_err(|e| {
             error!("Error getting user key: {:?}", e);
@@ -1135,86 +1148,6 @@ pub async fn get_public_key(
     };
 
     debug!("Exiting get_public_key function");
-    encrypt_response(&data, &session_id, &response).await
-}
-
-pub async fn convert_guest_to_email(
-    State(data): State<Arc<AppState>>,
-    Extension(user): Extension<User>,
-    Extension(convert_request): Extension<ConvertGuestRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering convert_guest_to_email function");
-
-    // Check if user is eligible for conversion
-    if !user.is_guest() {
-        error!("User already has an email address");
-        return Err(ApiError::BadRequest);
-    }
-
-    if user.password_enc.is_none() {
-        error!("OAuth users cannot be converted");
-        return Err(ApiError::BadRequest);
-    }
-
-    // Check if email is already taken
-    if data
-        .db
-        .get_user_by_email(convert_request.email.clone(), user.project_id)
-        .is_ok()
-    {
-        error!("Email address already in use");
-        return Err(ApiError::EmailAlreadyExists);
-    }
-
-    // Hash and encrypt the new password
-    let password_hash = password_auth::generate_hash(convert_request.password);
-    let secret_key =
-        SecretKey::from_slice(&data.enclave_key).map_err(|_| ApiError::InternalServerError)?;
-    let encrypted_password = encrypt::encrypt_with_key(&secret_key, password_hash.as_bytes()).await;
-
-    // Update the user with new email, password, and optional name
-    let mut updated_user = user.clone();
-    updated_user.email = Some(convert_request.email);
-    updated_user.password_enc = Some(encrypted_password);
-    updated_user.name = convert_request.name;
-
-    // Save the changes
-    if let Err(e) = data.db.update_user(&updated_user) {
-        error!("Failed to update user: {:?}", e);
-        return Err(ApiError::InternalServerError);
-    }
-
-    // Create email verification entry
-    let new_verification = NewEmailVerification::new(updated_user.uuid, 24, false);
-    let verification = match data.db.create_email_verification(new_verification) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("Error creating email verification: {:?}", e);
-            return Err(ApiError::InternalServerError);
-        }
-    };
-
-    // Send verification email
-    if let Some(email) = updated_user.get_email() {
-        let email = email.to_string();
-        let verification_code = verification.verification_code;
-        let data = data.clone();
-        let project_id = updated_user.project_id;
-        spawn(async move {
-            if let Err(e) =
-                send_verification_email(&data, project_id, email, verification_code).await
-            {
-                tracing::error!("Could not send verification email: {e}");
-            }
-        });
-    }
-
-    let response = json!({
-        "message": "Successfully converted guest account to email account. Please check your email for verification."
-    });
-
-    debug!("Exiting convert_guest_to_email function");
     encrypt_response(&data, &session_id, &response).await
 }
 
@@ -1272,6 +1205,7 @@ pub async fn generate_third_party_token(
 pub async fn encrypt_data(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(request): Extension<EncryptDataRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<EncryptDataResponse>>, ApiError> {
@@ -1290,7 +1224,12 @@ pub async fn encrypt_data(
 
     // Get the user's key
     let user_key = data
-        .get_user_key(user.uuid, derivation_path, seed_phrase_derivation_path)
+        .get_user_key(
+            &user,
+            &auth_context,
+            derivation_path,
+            seed_phrase_derivation_path,
+        )
         .await
         .map_err(|e| match e {
             Error::InvalidDerivationPath(msg) => {
@@ -1325,6 +1264,7 @@ pub async fn encrypt_data(
 pub async fn decrypt_data(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(request): Extension<DecryptDataRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<String>>, ApiError> {
@@ -1347,7 +1287,12 @@ pub async fn decrypt_data(
 
     // Get the user's key
     let user_key = data
-        .get_user_key(user.uuid, derivation_path, seed_phrase_derivation_path)
+        .get_user_key(
+            &user,
+            &auth_context,
+            derivation_path,
+            seed_phrase_derivation_path,
+        )
         .await
         .map_err(|e| match e {
             Error::InvalidDerivationPath(msg) => {
@@ -1675,7 +1620,6 @@ mod tests {
             "m/83696968'/39'/0'/24'/0'",   // Standard BIP-85 for 24-word mnemonic
             "m/83696968'/39'/0'/12'/5'",   // BIP-85 with non-zero index
             "m/83696968'/39'/0'/12'/255'", // BIP-85 with large index
-            "m/83696968'/39'/1'/12'/0'",   // BIP-85 with non-English language
             // Test alternate hardened notation
             "m/83696968h/39h/0h/12h/0h", // Using 'h' notation instead of '
         ];
@@ -1706,6 +1650,9 @@ mod tests {
             "m/83696968'/39'/0'/15'/0'",   // Invalid word count (not 12,18,24)
             "m/83696968'/39'/0'/21'/0'",   // Invalid word count (not 12,18,24)
             "m/83696968'/39'/0'/256'/0'",  // Word count too large
+            "m/836969681'/39'/0'/12'/0'",  // Wrong purpose with valid prefix
+            "m/83696968'/390'/0'/12'/0'",  // Wrong application with valid prefix
+            "m/83696968'/39'/1'/12'/0'",   // Unsupported non-English language
             "m/83696968'",                 // Incomplete path (too few segments)
             "m/83696968'/39'",             // Incomplete path (too few segments)
             "m/83696968'/39'/0'",          // Incomplete path (too few segments)

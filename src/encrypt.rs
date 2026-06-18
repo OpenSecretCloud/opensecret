@@ -1,19 +1,21 @@
 use aes_gcm::{
-    aead::{Aead as GcmAead, KeyInit as GcmKeyInit},
+    aead::{Aead as GcmAead, KeyInit as GcmKeyInit, Payload},
     Aes256Gcm, Nonce as GcmNonce,
 };
 use aes_siv::{Aes256SivAead, Nonce as SivNonce};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use generic_array::typenum;
 use generic_array::GenericArray;
+use hkdf::Hkdf;
 use rand_core::RngCore;
 use secp256k1::rand::rngs::OsRng;
 use secp256k1::SecretKey;
 use serde::de::DeserializeOwned;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 use std::{process::Command, sync::Arc};
 use tokio::sync::Mutex;
 use tracing::error;
+use uuid::Uuid;
 
 use crate::aws_credentials::AwsCredentialManager;
 
@@ -29,6 +31,8 @@ pub enum EncryptError {
     NoContent,
     #[error("Deserialization failed: {0}")]
     DeserializationFailed(String),
+    #[error("Key derivation failed")]
+    KeyDerivationFailed,
 }
 
 pub async fn encrypt_with_key(encryption_key: &SecretKey, bytes: &[u8]) -> Vec<u8> {
@@ -83,6 +87,130 @@ pub fn decrypt_with_key(encryption_key: &SecretKey, bytes: &[u8]) -> Result<Vec<
 
     tracing::trace!("Exiting decrypt_with_key");
     Ok(result)
+}
+
+pub type AeadKey = [u8; 32];
+
+pub fn derive_key(root_key: &[u8], info: &[u8]) -> Result<AeadKey, EncryptError> {
+    derive_key_with_optional_salt(root_key, None, info)
+}
+
+pub fn derive_key_with_salt(
+    input_key: &[u8],
+    salt: &[u8],
+    info: &[u8],
+) -> Result<AeadKey, EncryptError> {
+    derive_key_with_optional_salt(input_key, Some(salt), info)
+}
+
+fn derive_key_with_optional_salt(
+    input_key: &[u8],
+    salt: Option<&[u8]>,
+    info: &[u8],
+) -> Result<AeadKey, EncryptError> {
+    let hkdf = Hkdf::<Sha256>::new(salt, input_key);
+    let mut output = [0u8; 32];
+    hkdf.expand(info, &mut output)
+        .map_err(|_| EncryptError::KeyDerivationFailed)?;
+    Ok(output)
+}
+
+pub fn encrypt_aead_v1(
+    encryption_key: &AeadKey,
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, EncryptError> {
+    let cipher =
+        Aes256Gcm::new_from_slice(encryption_key).map_err(|_| EncryptError::FailedToDecrypt)?;
+    let nonce: [u8; 12] = generate_random::<12>();
+    let nonce = GcmNonce::from_slice(&nonce);
+
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| EncryptError::FailedToDecrypt)?;
+
+    let mut encrypted = nonce.to_vec();
+    encrypted.extend(ciphertext);
+    Ok(encrypted)
+}
+
+pub fn decrypt_aead_v1(
+    encryption_key: &AeadKey,
+    bytes: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, EncryptError> {
+    if bytes.len() < 12 {
+        return Err(EncryptError::BadData);
+    }
+
+    let nonce = GcmNonce::from_slice(&bytes[..12]);
+    let ciphertext = &bytes[12..];
+    let cipher =
+        Aes256Gcm::new_from_slice(encryption_key).map_err(|_| EncryptError::FailedToDecrypt)?;
+
+    cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| EncryptError::FailedToDecrypt)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CanonicalBytes {
+    bytes: Vec<u8>,
+}
+
+impl CanonicalBytes {
+    pub fn new(domain: &str) -> Self {
+        let mut canonical = Self::default();
+        canonical.append_str(domain);
+        canonical
+    }
+
+    pub fn append_str(&mut self, value: &str) -> &mut Self {
+        self.append_field(b's', value.as_bytes())
+    }
+
+    pub fn append_bytes(&mut self, value: &[u8]) -> &mut Self {
+        self.append_field(b'b', value)
+    }
+
+    pub fn append_i16(&mut self, value: i16) -> &mut Self {
+        self.append_field(b'i', &value.to_be_bytes())
+    }
+
+    pub fn append_i32(&mut self, value: i32) -> &mut Self {
+        self.append_field(b'I', &value.to_be_bytes())
+    }
+
+    pub fn append_uuid(&mut self, value: Uuid) -> &mut Self {
+        self.append_field(b'u', value.as_bytes())
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    fn append_field(&mut self, tag: u8, value: &[u8]) -> &mut Self {
+        let len: u32 = value
+            .len()
+            .try_into()
+            .expect("canonical field length should fit in u32");
+        self.bytes.push(tag);
+        self.bytes.extend_from_slice(&len.to_be_bytes());
+        self.bytes.extend_from_slice(value);
+        self
+    }
 }
 
 // ============================================================================
@@ -469,6 +597,50 @@ mod tests {
 
         let decrypted = decrypt_with_key(&key, &encrypted).unwrap();
         assert_eq!(content, decrypted);
+    }
+
+    #[tokio::test]
+    async fn legacy_aes_gcm_ciphertext_has_no_owner_context_binding() {
+        let root_key = SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let wrong_root_key = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let victim_seed = b"victim seed mnemonic bytes";
+
+        let encrypted_seed = encrypt_with_key(&root_key, victim_seed).await;
+
+        assert!(
+            decrypt_with_key(&wrong_root_key, &encrypted_seed).is_err(),
+            "legacy AES-GCM still authenticates the root key"
+        );
+
+        let attacker_row_decrypt = decrypt_with_key(&root_key, &encrypted_seed).unwrap();
+        assert_eq!(
+            victim_seed.to_vec(),
+            attacker_row_decrypt,
+            "legacy ciphertext has no AAD parameter for user, credential, table, or row ownership"
+        );
+    }
+
+    #[test]
+    fn canonical_bytes_are_length_delimited() {
+        let mut first = CanonicalBytes::new("domain");
+        first.append_str("ab").append_str("c");
+
+        let mut second = CanonicalBytes::new("domain");
+        second.append_str("a").append_str("bc");
+
+        assert_ne!(first.into_bytes(), second.into_bytes());
+    }
+
+    #[test]
+    fn aead_v1_authenticates_aad() {
+        let key = derive_key(&[1u8; 32], b"test.aead-v1").unwrap();
+        let content = b"plaintext";
+        let encrypted = encrypt_aead_v1(&key, content, b"aad:victim").unwrap();
+
+        let decrypted = decrypt_aead_v1(&key, &encrypted, b"aad:victim").unwrap();
+        assert_eq!(content.to_vec(), decrypted);
+
+        assert!(decrypt_aead_v1(&key, &encrypted, b"aad:attacker").is_err());
     }
 
     #[test]

@@ -358,20 +358,6 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         GEMMA4_RESPONSES_MODEL_CONFIG,
     ),
     ModelConfigEntry::new(
-        "qwen3-vl-30b",
-        "Qwen3-VL 30B",
-        "Qwen3-VL",
-        "Vision-capable multimodal model.",
-        ModelAccessTier::Starter,
-        ModelCapabilities::chat(false, true),
-        &[],
-        true,
-        true,
-        false,
-        30,
-        256_000,
-    ),
-    ModelConfigEntry::new(
         "kimi-k2-6",
         "Kimi K2.6",
         "Kimi K2.6",
@@ -386,10 +372,10 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         256_000,
     ),
     ModelConfigEntry::new(
-        "glm-5-1",
-        "GLM 5.1",
-        "GLM 5.1",
-        "Pro reasoning model.",
+        "glm-5-2",
+        "GLM 5.2",
+        "GLM 5.2",
+        "Long-horizon pro reasoning model.",
         ModelAccessTier::Pro,
         ModelCapabilities::chat(true, false),
         &["New", "Reasoning"],
@@ -397,7 +383,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         true,
         false,
         50,
-        202_000,
+        384_000,
     ),
     ModelConfigEntry::with_responses(
         "deepseek-v4-pro",
@@ -596,10 +582,9 @@ mod tests {
         assert_eq!(model_context_window("llama3-3-70b"), 128_000);
         assert_eq!(model_context_window("gpt-oss-120b"), 128_000);
         assert_eq!(model_context_window("gpt-oss-safeguard-120b"), 131_000);
-        assert_eq!(model_context_window("qwen3-vl-30b"), 256_000);
         assert_eq!(model_context_window("kimi-k2-6"), 256_000);
         assert_eq!(model_context_window("gemma4-31b"), 256_000);
-        assert_eq!(model_context_window("glm-5-1"), 202_000);
+        assert_eq!(model_context_window("glm-5-2"), 384_000);
         assert_eq!(model_context_window("deepseek-v4-pro"), 800_000);
         assert_eq!(model_context_window(AUTO_QUICK_MODEL_ID), 128_000);
         assert_eq!(model_context_window(AUTO_POWERFUL_MODEL_ID), 256_000);
@@ -611,10 +596,9 @@ mod tests {
             "llama3-3-70b",
             "gpt-oss-120b",
             "gpt-oss-safeguard-120b",
-            "qwen3-vl-30b",
             "kimi-k2-6",
             "gemma4-31b",
-            "glm-5-1",
+            "glm-5-2",
         ] {
             let config = model_config(model);
 

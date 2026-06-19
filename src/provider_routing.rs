@@ -183,17 +183,19 @@ impl ProviderRouter {
         requested_model: &str,
     ) -> Result<SelectedProviderRoute, ProviderRoutingError> {
         let proxy = proxy_router.get_completion_proxy();
+        let resolved_public_model_id =
+            resolve_public_model_id(requested_model).map(ToOwned::to_owned);
         let provider_model_id = if proxy.provider_name == ProviderName::Tinfoil.as_str() {
             resolve_completion_model_id(requested_model)
                 .ok_or_else(|| ProviderRoutingError::UnsupportedModel(requested_model.into()))?
                 .to_string()
         } else {
-            requested_model.to_string()
+            resolved_public_model_id
+                .clone()
+                .unwrap_or_else(|| requested_model.to_string())
         };
 
-        let public_model_id = resolve_public_model_id(requested_model)
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| provider_model_id.clone());
+        let public_model_id = resolved_public_model_id.unwrap_or_else(|| provider_model_id.clone());
 
         let response_model_id = if proxy.provider_name == ProviderName::Tinfoil.as_str() {
             canonicalize_tinfoil_model(&provider_model_id)
@@ -382,6 +384,51 @@ mod tests {
         assert_eq!(selected.public_model_id, "gpt-oss-120b");
         assert_eq!(selected.provider_model_id, "gpt-oss-120b");
         assert_eq!(selected.response_model_id, "gpt-oss-120b");
+        assert_eq!(selected.bucket, None);
+    }
+
+    #[test]
+    fn test_non_tinfoil_fallback_resolves_known_alias_before_provider_request() {
+        let router = ProviderRouter::default();
+        let proxy_router = ProxyRouter::new("http://continuum.example.com".to_string(), None, None);
+
+        let selected = router
+            .select_completion_route(
+                &proxy_router,
+                uuid_for_bucket(50),
+                crate::model_config::AUTO_QUICK_MODEL_ID,
+            )
+            .expect("route");
+
+        assert_eq!(selected.proxy.provider_name, "continuum");
+        assert_eq!(
+            selected.public_model_id,
+            crate::model_config::QUICK_MODEL_ID
+        );
+        assert_eq!(
+            selected.provider_model_id,
+            crate::model_config::QUICK_MODEL_ID
+        );
+        assert_eq!(
+            selected.response_model_id,
+            crate::model_config::QUICK_MODEL_ID
+        );
+        assert_eq!(selected.bucket, None);
+    }
+
+    #[test]
+    fn test_non_tinfoil_fallback_preserves_unknown_model_passthrough() {
+        let router = ProviderRouter::default();
+        let proxy_router = ProxyRouter::new("http://continuum.example.com".to_string(), None, None);
+
+        let selected = router
+            .select_completion_route(&proxy_router, uuid_for_bucket(50), "provider-native-model")
+            .expect("route");
+
+        assert_eq!(selected.proxy.provider_name, "continuum");
+        assert_eq!(selected.public_model_id, "provider-native-model");
+        assert_eq!(selected.provider_model_id, "provider-native-model");
+        assert_eq!(selected.response_model_id, "provider-native-model");
         assert_eq!(selected.bucket, None);
     }
 

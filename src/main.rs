@@ -1215,9 +1215,7 @@ impl AppState {
             .await?
             .to_string();
 
-        let encrypted_key = encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
-
-        let new_user = NewUser::new(creds.email, Some(encrypted_pw), project.id, encrypted_key)
+        let new_user = NewUser::new(creds.email, Some(encrypted_pw), project.id, None)
             .with_name_option(creds.name);
 
         let user = self.create_user_with_password_seed_wrap(
@@ -1630,8 +1628,6 @@ impl AppState {
         }
 
         // MAC the provided alphanumeric code for lookup, bound to this user/project.
-        let secret_key = SecretKey::from_slice(&self.enclave_key)
-            .map_err(|e| Error::EncryptionError(e.to_string()))?;
         let reset_code_mac =
             password_reset_code_mac(&self.enclave_key, project_id, user.uuid, &alphanumeric_code)
                 .map_err(|e| Error::EncryptionError(e.to_string()))?;
@@ -1659,8 +1655,6 @@ impl AppState {
                     generate_twelve_word_seed(self.aws_credential_manager.clone())
                         .await?
                         .to_string();
-                let legacy_seed_enc =
-                    encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
                 let (password_hash, encrypted_password) =
                     self.encrypt_user_password_verifier(new_password).await?;
                 let new_wrapping = self.new_password_seed_wrapping_for_user(
@@ -1679,7 +1673,6 @@ impl AppState {
                     &user,
                     &reset_request,
                     encrypted_password,
-                    legacy_seed_enc,
                     new_wrapping,
                 )?;
 

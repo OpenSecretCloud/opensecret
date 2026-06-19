@@ -1139,17 +1139,9 @@ async fn db_destructive_password_reset_invalidates_old_auth_context_and_rotates_
         old_legacy_seed, new_authenticated_seed,
         "destructive reset must generate a fresh seed"
     );
-    let new_legacy_seed = decrypt_with_key(
-        &legacy_secret_key,
-        new_password_login
-            .user
-            .seed_encrypted()
-            .expect("reset should preserve rollback legacy seed column"),
-    )
-    .expect("new legacy seed should decrypt after destructive reset");
-    assert_eq!(
-        new_legacy_seed, new_authenticated_seed,
-        "destructive reset must overwrite legacy users.seed_enc with the new authenticated seed"
+    assert!(
+        new_password_login.user.seed_encrypted().is_none(),
+        "destructive reset must clear legacy users.seed_enc now that code rollback bridge is ending"
     );
 
     let api_keys_after_reset = app_state
@@ -1572,7 +1564,7 @@ async fn create_password_wrapped_user(
             Some(email),
             Some(password_enc),
             project_id,
-            legacy_seed_enc,
+            Some(legacy_seed_enc),
         ))
         .expect("test user should insert");
 
@@ -1600,7 +1592,12 @@ async fn create_oauth_wrapped_user(
 
     let user = app_state
         .db
-        .create_user(NewUser::new(Some(email), None, project_id, legacy_seed_enc))
+        .create_user(NewUser::new(
+            Some(email),
+            None,
+            project_id,
+            Some(legacy_seed_enc),
+        ))
         .expect("test OAuth user should insert");
 
     let provider = app_state

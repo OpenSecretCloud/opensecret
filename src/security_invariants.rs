@@ -274,7 +274,7 @@ fn destructive_password_reset_wipes_user_key_encrypted_storage_roots() {
 
     for required_pattern in [
         "users::password_enc.eq(Some(new_password_enc))",
-        "users::seed_enc.eq(Some(new_legacy_seed_enc))",
+        "users::seed_enc.eq(None::<Vec<u8>>)",
         "new_wrapping.upsert_by_credential(conn)",
         "user_oauth_connections::table",
         "user_oauth_connections::user_id.eq(user_id)",
@@ -291,6 +291,11 @@ fn destructive_password_reset_wipes_user_key_encrypted_storage_roots() {
             "destructive reset must contain `{required_pattern}`"
         );
     }
+
+    assert!(
+        !reset_body.contains("new_legacy_seed_enc"),
+        "destructive reset must clear, not rewrite, the legacy users.seed_enc bridge"
+    );
 
     assert!(
         !reset_body.contains("user_api_keys::table"),
@@ -352,111 +357,38 @@ fn destructive_password_reset_encrypted_schema_inventory_is_classified() {
 }
 
 #[test]
-fn seed_wrap_translation_startup_path_is_feature_gated() {
-    let migrations_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/migrations.rs");
-    let contents =
+fn seed_wrap_translation_code_and_build_targets_are_removed_after_rollout() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let migrations_source = manifest_dir.join("src/migrations.rs");
+    let migrations_contents =
         fs::read_to_string(&migrations_source).expect("migrations source should be readable");
-    let startup_call = "migrate_aead_seed_wrappings_v1(app_state)?;";
-    let startup_call_index = contents
-        .find(startup_call)
-        .unwrap_or_else(|| panic!("startup migration call `{startup_call}` should exist"));
+    let cargo_contents =
+        fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("Cargo.toml should be readable");
 
-    let prefix_window_start = startup_call_index.saturating_sub(120);
-    let prefix_window = &contents[prefix_window_start..startup_call_index];
-    assert!(
-        prefix_window.contains("#[cfg(feature = \"seed-wrap-translation\")]"),
-        "startup seed-wrap translation call must be feature-gated"
-    );
+    let mut checked_files = vec![
+        ("src/migrations.rs", migrations_contents),
+        ("Cargo.toml", cargo_contents),
+    ];
 
-    for required_gated_item in [
-        "fn migrate_aead_seed_wrappings_v1",
-        "fn validate_no_duplicate_oauth_subjects_by_project",
-        "fn validate_user_seed_wrap_postflight_count",
-        "fn validate_no_duplicate_seed_wrap_credentials",
-        "fn validate_seed_wrap_postflight_count",
-        "fn upsert_password_seed_wrap",
-        "fn upsert_oauth_seed_wrap",
-    ] {
-        let item_index = contents
-            .find(required_gated_item)
-            .unwrap_or_else(|| panic!("`{required_gated_item}` should exist"));
-        let item_prefix_start = item_index.saturating_sub(120);
-        let item_prefix = &contents[item_prefix_start..item_index];
-        assert!(
-            item_prefix.contains("#[cfg(feature = \"seed-wrap-translation\")]"),
-            "`{required_gated_item}` must be feature-gated"
-        );
-    }
-}
-
-#[test]
-fn seed_wrap_translation_is_all_or_nothing_with_preflight_and_postflight() {
-    let migrations_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/migrations.rs");
-    let contents =
-        fs::read_to_string(&migrations_source).expect("migrations source should be readable");
-    let migration_body = extract_function_body(&contents, "fn migrate_aead_seed_wrappings_v1");
-
-    for required_pattern in [
-        "conn.transaction::<_, SeedWrapTranslationError, _>(|conn|",
-        "SELECT pg_advisory_xact_lock(hashtext($1))",
-        ".bind::<Text, _>(AEAD_SEED_WRAPPINGS_MIGRATION)",
-        "AppDataMigration::get(conn, AEAD_SEED_WRAPPINGS_MIGRATION)?",
-        "validate_no_duplicate_oauth_subjects_by_project(conn)?",
-        "users::table.order(users::id.asc()).load::<User>(conn)?",
-        ".seed_encrypted()",
-        "decrypt_with_key(&legacy_secret_key, legacy_seed_enc)?",
-        "upsert_password_seed_wrap(conn, app_state, &user, &verifier, &plaintext_seed)?",
-        "upsert_oauth_seed_wrap(",
-        "if user_wraps == 0",
-        "SeedWrapTranslationError::NoUsableCredential(user.uuid)",
-        "validate_user_seed_wrap_postflight_count(",
-        "validate_seed_wrap_postflight_count(",
-        "validate_no_duplicate_seed_wrap_credentials(conn)?",
-        "NewAppDataMigration::new(AEAD_SEED_WRAPPINGS_MIGRATION).insert(conn)?",
-    ] {
-        assert!(
-            migration_body.contains(required_pattern),
-            "seed-wrap translation migration must contain `{required_pattern}`"
-        );
+    for repo_root_file in ["flake.nix", "justfile"] {
+        if let Ok(contents) = fs::read_to_string(manifest_dir.join(repo_root_file)) {
+            checked_files.push((repo_root_file, contents));
+        }
     }
 
-    assert_patterns_in_order(
-        migration_body,
-        &[
-            "conn.transaction::<_, SeedWrapTranslationError, _>(|conn|",
-            "SELECT pg_advisory_xact_lock(hashtext($1))",
-            "AppDataMigration::get(conn, AEAD_SEED_WRAPPINGS_MIGRATION)?",
-            "validate_no_duplicate_oauth_subjects_by_project(conn)?",
-            "users::table.order(users::id.asc()).load::<User>(conn)?",
-            "validate_user_seed_wrap_postflight_count(",
-            "validate_seed_wrap_postflight_count(",
-            "validate_no_duplicate_seed_wrap_credentials(conn)?",
-            "NewAppDataMigration::new(AEAD_SEED_WRAPPINGS_MIGRATION).insert(conn)?",
-        ],
-    );
-
-    for helper_name in ["fn upsert_password_seed_wrap", "fn upsert_oauth_seed_wrap"] {
-        let helper_body = extract_function_body(&contents, helper_name);
-        for required_pattern in [
-            "encrypt_seed_v1(",
-            "decrypt_seed_v1(",
-            "if verified_seed != plaintext_seed",
-            ".upsert_by_credential(conn)?",
-        ] {
+    for forbidden_pattern in [
+        "seed-wrap-translation",
+        "migrate_aead_seed_wrappings_v1",
+        "AEAD_SEED_WRAPPINGS_MIGRATION",
+        "SeedWrapTranslationError",
+        "opensecret-aead-translation",
+    ] {
+        for (file_name, contents) in &checked_files {
             assert!(
-                helper_body.contains(required_pattern),
-                "translation helper `{helper_name}` must verify generated wraps before insert with `{required_pattern}`"
+                !contents.contains(forbidden_pattern),
+                "post-rollout serving source/build file `{file_name}` must not contain `{forbidden_pattern}`"
             );
         }
-        assert_patterns_in_order(
-            helper_body,
-            &[
-                "encrypt_seed_v1(",
-                "decrypt_seed_v1(",
-                "if verified_seed != plaintext_seed",
-                ".upsert_by_credential(conn)?",
-            ],
-        );
     }
 }
 
@@ -496,10 +428,12 @@ fn user_password_reset_uses_mac_lookup_and_destructive_reseed() {
     for forbidden_pattern in [
         "encrypt_with_key(&secret_key, alphanumeric_code",
         "encrypt_with_key(&secret_key, alphanumeric_code.as_bytes())",
+        "legacy_seed_enc",
+        "encrypt_with_key(&secret_key, user_seed_words.as_bytes())",
     ] {
         assert!(
-            !create_body.contains(forbidden_pattern),
-            "user password reset must not store portable encrypted reset codes via `{forbidden_pattern}`"
+            !create_body.contains(forbidden_pattern) && !confirm_body.contains(forbidden_pattern),
+            "user password reset must not store portable encrypted reset/seed material via `{forbidden_pattern}`"
         );
     }
 }
@@ -659,7 +593,7 @@ fn password_registration_and_login_issue_tokens_only_after_seed_wrap_verificatio
     for required_pattern in [
         "generate_hash(password)",
         "generate_twelve_word_seed",
-        "NewUser::new(creds.email, Some(encrypted_pw), project.id, encrypted_key)",
+        "NewUser::new(creds.email, Some(encrypted_pw), project.id, None)",
         "create_user_with_password_seed_wrap(",
     ] {
         assert!(
@@ -667,6 +601,10 @@ fn password_registration_and_login_issue_tokens_only_after_seed_wrap_verificatio
             "registration helper must contain `{required_pattern}`"
         );
     }
+    assert!(
+        !register_user_body.contains("encrypt_with_key(&secret_key, user_seed_words.as_bytes())"),
+        "registration must not write legacy users.seed_enc ciphertext"
+    );
 
     let create_user_wrap_body =
         extract_function_body(&main_contents, "fn create_user_with_password_seed_wrap");

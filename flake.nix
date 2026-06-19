@@ -249,11 +249,8 @@
           entrypoint = "/bin/entrypoint";
         };
 
-        # Build the main Rust package. The default package is the steady-state
-        # server; the seed-wrap translation package is intentionally separate so
-        # it can produce a distinct attested EIF/PCR.
-        mkOpensecret = { pnameSuffix ? "", cargoFeatures ? [] }: pkgs.rustPlatform.buildRustPackage {
-          pname = "opensecret${pnameSuffix}";
+        opensecret = pkgs.rustPlatform.buildRustPackage {
+          pname = "opensecret";
           version = "0.1.0";
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
@@ -276,7 +273,6 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
-          buildFeatures = cargoFeatures;
           nativeBuildInputs = [
             pkgs.pkg-config
             rustAnalyzer
@@ -290,11 +286,6 @@
             pkgs.diesel-cli
           ];
           LIBPQ_LIB_DIR = "${pkgs.postgresql.lib}/lib";
-        };
-        opensecret = mkOpensecret {};
-        opensecretSeedWrapTranslation = mkOpensecret {
-          pnameSuffix = "-seed-wrap-translation";
-          cargoFeatures = [ "seed-wrap-translation" ];
         };
 
         # Use pre-built NSM library and KMS tools from nitro-bins directory
@@ -455,26 +446,10 @@
       {
         packages = {
           default = opensecret;
-          "opensecret-seed-wrap-translation" = opensecretSeedWrapTranslation;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           eif-dev = mkEif { appMode = "dev"; };
           eif-prod = mkEif { appMode = "prod"; };
           eif-preview = mkEif { appMode = "preview"; };
-          "eif-dev-seed-wrap-translation" = mkEif {
-            appMode = "dev";
-            opensecretPkg = opensecretSeedWrapTranslation;
-            nameSuffix = "-seed-wrap-translation";
-          };
-          "eif-prod-seed-wrap-translation" = mkEif {
-            appMode = "prod";
-            opensecretPkg = opensecretSeedWrapTranslation;
-            nameSuffix = "-seed-wrap-translation";
-          };
-          "eif-preview-seed-wrap-translation" = mkEif {
-            appMode = "preview";
-            opensecretPkg = opensecretSeedWrapTranslation;
-            nameSuffix = "-seed-wrap-translation";
-          };
         };
 
         apps = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {

@@ -1,9 +1,8 @@
-use crate::model_config::{
-    model_catalog_response, openai_models_response, resolve_completion_model_id,
-};
+use crate::model_config::{model_catalog_response, openai_models_response};
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
-use crate::proxy_config::{canonicalize_tinfoil_model, ProxyConfig};
+use crate::provider_routing::ProviderRoutingError;
+use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
@@ -741,9 +740,6 @@ pub async fn get_chat_completion_response(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
-    // Extract the model from the request - error if not specified
-    let proxy_config = state.proxy_router.get_completion_proxy();
-
     let requested_model_name = modified_body
         .get("model")
         .and_then(|m| m.as_str())
@@ -752,29 +748,38 @@ pub async fn get_chat_completion_response(
             ApiError::BadRequest
         })?
         .to_string();
-    let model_name = if proxy_config.provider_name == "tinfoil" {
-        match resolve_completion_model_id(&requested_model_name) {
-            Some(model) => model.to_string(),
-            None => {
-                error!(
-                    "Unsupported completion model requested: {}",
-                    requested_model_name
-                );
-                return Err(ApiError::BadRequest);
-            }
-        }
-    } else {
-        requested_model_name.clone()
-    };
 
-    if requested_model_name != model_name {
+    let selected_route = state
+        .provider_router
+        .select_completion_route(&state.proxy_router, user.uuid, &requested_model_name)
+        .map_err(|err| match err {
+            ProviderRoutingError::UnsupportedModel(model) => {
+                error!("Unsupported completion model requested: {}", model);
+                ApiError::BadRequest
+            }
+            ProviderRoutingError::NoEligibleRoute(model) => {
+                error!("No eligible provider route for completion model: {}", model);
+                ApiError::InternalServerError
+            }
+        })?;
+
+    if requested_model_name != selected_route.public_model_id
+        || selected_route.public_model_id != selected_route.provider_model_id
+    {
         debug!(
-            "Resolved requested model {} to provider model {}",
-            requested_model_name, model_name
+            "Selected completion route: requested_model={}, public_model={}, provider={}, provider_model={}, bucket={:?}",
+            requested_model_name,
+            selected_route.public_model_id,
+            selected_route.proxy.provider_name,
+            selected_route.provider_model_id,
+            selected_route.bucket
         );
     }
-    modified_body.insert("model".to_string(), json!(model_name.clone()));
-    billing_context.model_name = model_name.clone();
+    modified_body.insert(
+        "model".to_string(),
+        json!(selected_route.provider_model_id.clone()),
+    );
+    billing_context.model_name = selected_route.public_model_id.clone();
 
     // Create a new hyper client with better timeout configuration
     let https = HttpsConnector::new();
@@ -784,10 +789,17 @@ pub async fn get_chat_completion_response(
         .build::<_, HyperBody>(https);
 
     // Prepare the request to proxies
-    debug!("Sending request for model: {}", model_name);
+    debug!(
+        "Sending request for public model {} as provider model {} via {}",
+        selected_route.public_model_id,
+        selected_route.provider_model_id,
+        selected_route.proxy.provider_name
+    );
 
     let (res, successful_provider) = {
         let mut request_body = modified_body.clone();
+        let proxy_config = selected_route.proxy.clone();
+        let provider_model_name = selected_route.provider_model_id.clone();
 
         ensure_stream_usage(&mut request_body);
 
@@ -801,14 +813,14 @@ pub async fn get_chat_completion_response(
 
         debug!(
             "Completion request metadata before provider call: user_uuid={}, provider={}, model={}, metadata={:?}",
-            user.uuid, proxy_config.provider_name, model_name, request_log_metadata
+            user.uuid, proxy_config.provider_name, provider_model_name, request_log_metadata
         );
 
         match try_provider(&client, &proxy_config, &request_body_json, headers).await {
             Ok(response) => {
                 info!(
                     "Successfully got response from provider {} for model {}",
-                    proxy_config.provider_name, model_name
+                    proxy_config.provider_name, provider_model_name
                 );
                 (response, proxy_config.provider_name.clone())
             }
@@ -817,13 +829,13 @@ pub async fn get_chat_completion_response(
                     "Completion request metadata at provider failure: user_uuid={}, provider={}, model={}, error={}, metadata={:?}",
                     user.uuid,
                     proxy_config.provider_name,
-                    model_name,
+                    provider_model_name,
                     err,
                     request_log_metadata
                 );
                 error!(
                     "Chat completion request failed for provider {} and model {}: {}",
-                    proxy_config.provider_name, model_name, err
+                    proxy_config.provider_name, provider_model_name, err
                 );
                 return Err(ApiError::InternalServerError);
             }
@@ -850,9 +862,7 @@ pub async fn get_chat_completion_response(
                 ApiError::InternalServerError
             })?;
 
-        if successful_provider == "tinfoil" {
-            canonicalize_response_model(&mut response_json);
-        }
+        canonicalize_response_model(&mut response_json, &selected_route.response_model_id);
 
         // ✅ Handle billing HERE, inside completions API
         if let Some(usage) = extract_usage(&response_json) {
@@ -890,6 +900,7 @@ pub async fn get_chat_completion_response(
     let user_clone = user.clone();
     let billing_ctx = billing_context.clone();
     let provider = successful_provider.clone();
+    let response_model_id = selected_route.response_model_id.clone();
 
     tokio::spawn(async move {
         let mut body_stream = res.into_body().into_stream();
@@ -958,9 +969,7 @@ pub async fn get_chat_completion_response(
                                             }
                                         }
 
-                                        if provider == "tinfoil" {
-                                            canonicalize_response_model(&mut json);
-                                        }
+                                        canonicalize_response_model(&mut json, &response_model_id);
 
                                         // Send full JSON chunk to consumer (preserves all metadata)
                                         if tx_consumer
@@ -1106,10 +1115,10 @@ fn is_terminal_stream_chunk(json: &Value) -> bool {
         .is_some_and(|choices| choices.is_empty())
 }
 
-fn canonicalize_response_model(json: &mut Value) {
+fn canonicalize_response_model(json: &mut Value, response_model_id: &str) {
     if let Some(model_value) = json.get_mut("model") {
-        if let Some(model) = model_value.as_str() {
-            *model_value = json!(canonicalize_tinfoil_model(model));
+        if model_value.as_str().is_some() {
+            *model_value = json!(response_model_id);
         }
     }
 }

@@ -96,6 +96,7 @@ mod models;
 mod oauth;
 mod os_flags;
 mod private_key;
+mod provider_routing;
 mod proxy_config;
 #[cfg(test)]
 mod security_invariants;
@@ -109,6 +110,7 @@ mod aead_db_tamper_tests;
 
 use apple_signin::AppleJwtVerifier;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
+use provider_routing::ProviderRouter;
 use proxy_config::ProxyRouter;
 
 const ENCLAVE_KEY_NAME: &str = "enclave_key";
@@ -461,6 +463,7 @@ pub struct AppState {
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
     enclave_key: Vec<u8>,
     proxy_router: Arc<ProxyRouter>,
+    provider_router: Arc<ProviderRouter>,
     resend_api_key: Option<String>,
     ephemeral_keys: Arc<RwLock<HashMap<String, EphemeralSecret>>>,
     session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, SessionState>>>,
@@ -727,6 +730,7 @@ impl AppStateBuilder {
             self.openai_api_key.clone(),
             self.tinfoil_api_base.clone(),
         ));
+        let provider_router = Arc::new(ProviderRouter::default());
 
         let (cancellation_tx, _) = tokio::sync::broadcast::channel(1024);
 
@@ -757,6 +761,7 @@ impl AppStateBuilder {
             aws_credential_manager,
             enclave_key,
             proxy_router,
+            provider_router,
             resend_api_key: self.resend_api_key,
             ephemeral_keys: Arc::new(RwLock::new(HashMap::new())),
             session_states: Arc::new(tokio::sync::RwLock::new(HashMap::new())),

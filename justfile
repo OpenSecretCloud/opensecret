@@ -250,7 +250,7 @@ run-continuum-proxy-macos:
         exit 1
     fi
     mkdir -p "$workspace"
-    exec "$bin" --port "$port" --workspace "$workspace" --apiKey "$api_key"
+    exec "$bin" --port "$port" --workspace "$workspace" --apiKey "$api_key" --sharedPromptCache
 
 # Run the macOS-native Tinfoil proxy on TINFOIL_PROXY_PORT, default 8093.
 # The API key is read from TINFOIL_API_KEY or .local/secrets/tinfoil_api_key.

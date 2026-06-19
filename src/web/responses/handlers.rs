@@ -6,9 +6,7 @@ use crate::{
     db::DBError,
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
     jwt::AuthContext,
-    model_config::{
-        model_config, resolve_completion_model_id, ResponsesModelConfig, SamplingConfig,
-    },
+    model_config::{model_config, resolve_public_model_id, ResponsesModelConfig, SamplingConfig},
     models::responses::{NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
     tokens::{count_tokens, model_max_ctx},
@@ -175,7 +173,7 @@ fn build_model_turn_request(
     prompt_messages: &[Value],
     tools_enabled: bool,
 ) -> Value {
-    let config_model = resolve_completion_model_id(&body.model).unwrap_or(body.model.as_str());
+    let config_model = resolve_public_model_id(&body.model).unwrap_or(body.model.as_str());
     let responses_config = model_config(config_model).responses;
     let sampling = resolve_responses_sampling(body);
     let mut chat_request = json!({
@@ -2521,7 +2519,7 @@ async fn create_response_stream(
     trace!("User: {}", user.uuid);
     let requested_model = body.model.clone();
     let completion_provider = state.proxy_router.get_completion_proxy();
-    let resolved_model = match resolve_completion_model_id(&requested_model) {
+    let resolved_model = match resolve_public_model_id(&requested_model) {
         Some(model) => model.to_string(),
         None if completion_provider.provider_name != "tinfoil" => requested_model.clone(),
         None => {

@@ -1,5 +1,4 @@
 use crate::apple_signin::{generate_apple_client_secret, validate_apple_native_token};
-use crate::encrypt::encrypt_with_key;
 #[cfg(test)]
 use crate::models::oauth::NewUserOAuthConnection;
 use crate::models::oauth::UserOAuthConnection;
@@ -1237,13 +1236,8 @@ async fn find_or_create_user_from_oauth(
                     .map_err(|_e| ApiError::InternalServerError)?
                     .to_string();
 
-            let secret_key = SecretKey::from_slice(&app_state.enclave_key.clone())
-                .map_err(|_e| ApiError::EncryptionError)?;
-
-            let encrypted_key = encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
-
             // Create new user
-            let new_user = NewUser::new(Some(email), None, project_id, encrypted_key)
+            let new_user = NewUser::new(Some(email), None, project_id, None)
                 .with_name(user_name.unwrap_or_default());
 
             let encrypted_access_token = if !access_token.is_empty() {
@@ -1723,7 +1717,12 @@ mod tests {
 
         let user = app_state
             .db
-            .create_user(NewUser::new(Some(email), None, project_id, legacy_seed_enc))
+            .create_user(NewUser::new(
+                Some(email),
+                None,
+                project_id,
+                Some(legacy_seed_enc),
+            ))
             .expect("test OAuth user should insert");
 
         let provider = app_state

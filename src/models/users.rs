@@ -158,7 +158,7 @@ pub struct NewUser {
     pub name: Option<String>,
     pub email: Option<String>,
     pub password_enc: Option<Vec<u8>>,
-    pub seed_enc: Vec<u8>,
+    pub seed_enc: Option<Vec<u8>>,
     pub project_id: i32,
 }
 
@@ -167,7 +167,7 @@ impl NewUser {
         email: Option<String>,
         password_enc: Option<Vec<u8>>,
         project_id: i32,
-        seed_enc: Vec<u8>,
+        seed_enc: Option<Vec<u8>>,
     ) -> Self {
         NewUser {
             name: None,

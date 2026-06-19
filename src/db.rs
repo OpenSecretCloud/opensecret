@@ -227,7 +227,6 @@ pub trait DBConnection {
         user: &User,
         reset_request: &PasswordResetRequest,
         new_password_enc: Vec<u8>,
-        new_legacy_seed_enc: Vec<u8>,
         new_wrapping: NewUserSeedWrapping,
     ) -> Result<(), DBError>;
 
@@ -1009,7 +1008,6 @@ impl DBConnection for PostgresConnection {
         user: &User,
         reset_request: &PasswordResetRequest,
         new_password_enc: Vec<u8>,
-        new_legacy_seed_enc: Vec<u8>,
         new_wrapping: NewUserSeedWrapping,
     ) -> Result<(), DBError> {
         use crate::models::schema::{
@@ -1096,7 +1094,7 @@ impl DBConnection for PostgresConnection {
             diesel::update(users::table.filter(users::uuid.eq(user_id)))
                 .set((
                     users::password_enc.eq(Some(new_password_enc)),
-                    users::seed_enc.eq(Some(new_legacy_seed_enc)),
+                    users::seed_enc.eq(None::<Vec<u8>>),
                     users::updated_at.eq(diesel::dsl::now),
                 ))
                 .execute(conn)?;

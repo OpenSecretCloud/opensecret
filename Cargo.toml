@@ -78,6 +78,3 @@ once_cell = "1.19"
 
 [dev-dependencies]
 openssl = "0.10.78"
-
-[features]
-seed-wrap-translation = []

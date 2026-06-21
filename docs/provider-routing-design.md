@@ -12,15 +12,17 @@ Continuum without changing the public OpenSecret API surface.
 - Provider-specific model IDs are translated only at request-send time.
 - Kimi is pinned to the current provider-specific model version. Do not route
   public Kimi traffic to a moving `latest` alias.
-- The first implementation should be a configurable, sticky, weighted router.
-- The first production rollout target is 70/30, with 30% of eligible Kimi
-  traffic sent to Continuum. The router still supports 50/50 and other future
-  percentages through static weights.
+- The first implementation should be a configurable router with static weights
+  available as a fallback mechanism.
+- The first production launch should not send Continuum traffic by default.
+  Kimi should default to Tinfoil, and Continuum should be enabled only through
+  an os-flags cohort that can start with internal users and slowly grow toward
+  30%.
 - The initial config is static in code. Runtime health and availability can
   override selection, but they do not rewrite the base config.
 - When os-flags is configured, the Kimi Continuum cohort can be controlled by
   an evaluated user flag. If the flag service is unavailable or the flag is
-  missing, OpenSecret falls back to the static in-code split.
+  missing, OpenSecret falls back to the model's default provider, Tinfoil.
 - Weights should exist at both provider and model-route levels.
 - OpenSecret should not auto-retry failed completion requests. Clients can retry
   if they want.
@@ -166,7 +168,7 @@ struct ModelProviderRoute {
 }
 ```
 
-Current rollout config:
+Current launch config:
 
 ```text
 providers:
@@ -179,6 +181,8 @@ providers:
 
 models:
   kimi-k2-6:
+    default_provider: tinfoil
+    continuum_flag_key: provider-routing.kimi-k2-6.continuum
     tinfoil:
       enabled: true
       weight: 100
@@ -195,15 +199,17 @@ enabled provider and model route weights into one effective route weight. Tests
 should cover the resulting bucket distribution so future changes do not
 silently change traffic splits.
 
-For the first rollout, provider-level weights carry the overall traffic split
-and model-route weights stay at `100` for providers that should be eligible for
-Kimi. Later model-specific rollouts can lower a route weight without changing
-global provider posture.
+For the first production launch, the Kimi model's `default_provider` carries the
+safe behavior: Tinfoil unless os-flags explicitly opts the user into Continuum.
+Provider-level weights remain available for fallback and future routing work,
+but they should not silently send 30% of Kimi traffic to Continuum before the
+manual flag rollout is ready.
 
 ## os-flags Routing Control
 
-The static route table remains the fallback source of truth, but Kimi routing can
-now use os-flags as the primary control plane for the Continuum cohort.
+The static route table remains the provider eligibility source of truth, but
+Kimi routing now uses os-flags as the primary control plane for the Continuum
+cohort.
 
 Current flag key:
 
@@ -216,20 +222,32 @@ that boolean flag using the user's account UUID:
 
 - `true`: prefer the Continuum provider route.
 - `false`: prefer the Tinfoil provider route.
-- flag missing, os-flags unconfigured, network/service error: use the static
-  weighted split.
+- flag missing, os-flags unconfigured, network/service error: use the model
+  default provider, Tinfoil.
 
 The provider router still validates route eligibility after reading the flag. If
 the preferred provider is not configured or does not have a usable proxy,
-OpenSecret falls back to the static eligible-route selection. This keeps
+OpenSecret falls back to the model default provider first. If that is also not
+eligible, it falls back to the static eligible-route selection. This keeps
 os-flags from becoming a hard dependency for completions and keeps provider
 availability checks inside the provider-routing layer.
 
-To run a 30% Continuum rollout through os-flags, create the flag with default
-`false` and `rollout_percent=30`. The service evaluates the user's UUID and
-returns `true` for the rollout cohort. OpenSecret caches successful flag
-responses in memory for 10 minutes, keyed by user UUID, requested flag keys, and
-`include_reasons`.
+Initial rollout plan:
+
+1. Create the flag with `default_value=false` and `rollout_percent=0`.
+2. Add per-user overrides for internal team accounts that should smoke test
+   Continuum Kimi.
+3. Increase `rollout_percent` gradually toward 30% once production behavior
+   looks healthy.
+4. Keep OpenSecret's default provider as Tinfoil until a later automatic
+   fallback/circuit-breaker layer is ready.
+
+OpenSecret caches successful flag responses in memory for 10 minutes, keyed by
+user UUID and requested flag keys.
+
+Future routing controls should include a manual kill switch flag that disables
+Continuum Kimi entirely, plus provider:model health state that can remove
+Continuum from eligibility when provider failures cross a conservative threshold.
 
 ## Failure Classification
 
@@ -543,9 +561,12 @@ Phase 1: Sticky weighted routing
 Phase 1b: os-flags controlled rollout
 
 - Use os-flags as the primary Kimi Continuum cohort selector when configured.
-- Preserve the static weighted split as the fallback for missing flags or
-  os-flags failures.
+- Default Kimi to Tinfoil for missing flags or os-flags failures.
+- Start with internal per-user overrides, then gradually increase the os-flags
+  rollout percentage toward 30%.
 - Do not grant OpenSecret write access to os-flags for request-time routing.
+- Document future manual Continuum kill switch and automatic provider:model
+  circuit breaker work.
 
 Phase 2: Metrics and classification
 

@@ -27,8 +27,6 @@ pub enum OsFlagsError {
 pub struct UserFlagsResponse {
     pub user_uuid: Uuid,
     pub flags: HashMap<String, bool>,
-    #[serde(default)]
-    pub reasons: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -43,7 +41,6 @@ pub struct OsFlagsClient {
 struct UserFlagsCacheKey {
     user_uuid: Uuid,
     keys: Option<Vec<String>>,
-    include_reasons: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -59,11 +56,10 @@ struct UserFlagsCache {
 }
 
 impl UserFlagsCacheKey {
-    fn new(user_uuid: Uuid, keys: Option<&[&str]>, include_reasons: bool) -> Self {
+    fn new(user_uuid: Uuid, keys: Option<&[&str]>) -> Self {
         Self {
             user_uuid,
             keys: normalize_keys(keys),
-            include_reasons,
         }
     }
 }
@@ -141,9 +137,8 @@ impl OsFlagsClient {
         &self,
         user_uuid: Uuid,
         keys: Option<&[&str]>,
-        include_reasons: bool,
     ) -> Result<UserFlagsResponse, OsFlagsError> {
-        let cache_key = UserFlagsCacheKey::new(user_uuid, keys, include_reasons);
+        let cache_key = UserFlagsCacheKey::new(user_uuid, keys);
         if let Some(response) = self.cache.get(&cache_key).await {
             return Ok(response);
         }
@@ -158,9 +153,6 @@ impl OsFlagsClient {
                 if !keys.is_empty() {
                     qp.append_pair("keys", &keys.join(","));
                 }
-            }
-            if include_reasons {
-                qp.append_pair("include_reasons", "1");
             }
         }
 
@@ -201,7 +193,7 @@ impl OsFlagsClient {
         key: &str,
     ) -> Result<Option<bool>, OsFlagsError> {
         let keys = [key];
-        let resp = self.get_user_flags(user_uuid, Some(&keys), false).await?;
+        let resp = self.get_user_flags(user_uuid, Some(&keys)).await?;
         Ok(resp.flags.get(key).copied())
     }
 }
@@ -244,15 +236,14 @@ mod tests {
         UserFlagsResponse {
             user_uuid,
             flags: HashMap::from([("flag_a".to_string(), true)]),
-            reasons: HashMap::new(),
         }
     }
 
     #[test]
     fn cache_key_normalizes_keys() {
         let user_uuid = Uuid::new_v4();
-        let a = UserFlagsCacheKey::new(user_uuid, Some(&["flag_b", "flag_a", "flag_a", ""]), false);
-        let b = UserFlagsCacheKey::new(user_uuid, Some(&["flag_a", "flag_b"]), false);
+        let a = UserFlagsCacheKey::new(user_uuid, Some(&["flag_b", "flag_a", "flag_a", ""]));
+        let b = UserFlagsCacheKey::new(user_uuid, Some(&["flag_a", "flag_b"]));
 
         assert_eq!(a, b);
     }
@@ -260,9 +251,9 @@ mod tests {
     #[test]
     fn cache_key_treats_empty_keys_as_all_flags() {
         let user_uuid = Uuid::new_v4();
-        let a = UserFlagsCacheKey::new(user_uuid, None, false);
-        let b = UserFlagsCacheKey::new(user_uuid, Some(&[]), false);
-        let c = UserFlagsCacheKey::new(user_uuid, Some(&["", " "]), false);
+        let a = UserFlagsCacheKey::new(user_uuid, None);
+        let b = UserFlagsCacheKey::new(user_uuid, Some(&[]));
+        let c = UserFlagsCacheKey::new(user_uuid, Some(&["", " "]));
 
         assert_eq!(a, b);
         assert_eq!(b, c);
@@ -272,7 +263,7 @@ mod tests {
     async fn cache_entries_expire() {
         let cache = UserFlagsCache::new(Duration::from_millis(5));
         let user_uuid = Uuid::new_v4();
-        let key = UserFlagsCacheKey::new(user_uuid, Some(&["flag_a"]), false);
+        let key = UserFlagsCacheKey::new(user_uuid, Some(&["flag_a"]));
 
         cache.insert(key.clone(), response(user_uuid)).await;
         assert!(cache.get(&key).await.is_some());

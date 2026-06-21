@@ -18,6 +18,9 @@ Continuum without changing the public OpenSecret API surface.
   percentages through static weights.
 - The initial config is static in code. Runtime health and availability can
   override selection, but they do not rewrite the base config.
+- When os-flags is configured, the Kimi Continuum cohort can be controlled by
+  an evaluated user flag. If the flag service is unavailable or the flag is
+  missing, OpenSecret falls back to the static in-code split.
 - Weights should exist at both provider and model-route levels.
 - OpenSecret should not auto-retry failed completion requests. Clients can retry
   if they want.
@@ -196,6 +199,37 @@ For the first rollout, provider-level weights carry the overall traffic split
 and model-route weights stay at `100` for providers that should be eligible for
 Kimi. Later model-specific rollouts can lower a route weight without changing
 global provider posture.
+
+## os-flags Routing Control
+
+The static route table remains the fallback source of truth, but Kimi routing can
+now use os-flags as the primary control plane for the Continuum cohort.
+
+Current flag key:
+
+```text
+provider-routing.kimi-k2-6.continuum
+```
+
+For `kimi-k2-6` and aliases that resolve to it, OpenSecret asks os-flags for
+that boolean flag using the user's account UUID:
+
+- `true`: prefer the Continuum provider route.
+- `false`: prefer the Tinfoil provider route.
+- flag missing, os-flags unconfigured, network/service error: use the static
+  weighted split.
+
+The provider router still validates route eligibility after reading the flag. If
+the preferred provider is not configured or does not have a usable proxy,
+OpenSecret falls back to the static eligible-route selection. This keeps
+os-flags from becoming a hard dependency for completions and keeps provider
+availability checks inside the provider-routing layer.
+
+To run a 30% Continuum rollout through os-flags, create the flag with default
+`false` and `rollout_percent=30`. The service evaluates the user's UUID and
+returns `true` for the rollout cohort. OpenSecret caches successful flag
+responses in memory for 10 minutes, keyed by user UUID, requested flag keys, and
+`include_reasons`.
 
 ## Failure Classification
 
@@ -505,6 +539,13 @@ Phase 1: Sticky weighted routing
 - Translate provider model IDs only at request send time.
 - Keep public model catalog unchanged.
 - Add focused unit tests for 50/50 bucketing and provider model translation.
+
+Phase 1b: os-flags controlled rollout
+
+- Use os-flags as the primary Kimi Continuum cohort selector when configured.
+- Preserve the static weighted split as the fallback for missing flags or
+  os-flags failures.
+- Do not grant OpenSecret write access to os-flags for request-time routing.
 
 Phase 2: Metrics and classification
 

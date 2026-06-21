@@ -110,7 +110,7 @@ mod aead_db_tamper_tests;
 
 use apple_signin::AppleJwtVerifier;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
-use provider_routing::ProviderRouter;
+use provider_routing::{ProviderName, ProviderRouter};
 use proxy_config::ProxyRouter;
 
 const ENCLAVE_KEY_NAME: &str = "enclave_key";
@@ -794,6 +794,43 @@ impl AppState {
                     user_uuid, flag_key, e
                 );
                 false
+            }
+        }
+    }
+
+    pub(crate) async fn provider_routing_preference(
+        &self,
+        user_uuid: Uuid,
+        requested_model: &str,
+    ) -> Option<ProviderName> {
+        let flag_key = self
+            .provider_router
+            .continuum_flag_key_for_completion_model(requested_model)?;
+
+        let Some(client) = &self.os_flags_client else {
+            trace!(
+                "os-flags client not configured; using static provider routing for model {}",
+                requested_model
+            );
+            return None;
+        };
+
+        match client.get_bool_flag(user_uuid, flag_key).await {
+            Ok(Some(true)) => Some(ProviderName::Continuum),
+            Ok(Some(false)) => Some(ProviderName::Tinfoil),
+            Ok(None) => {
+                debug!(
+                    "os-flags provider routing flag missing (user_uuid={}, requested_model={}, flag_key={}); using static provider routing",
+                    user_uuid, requested_model, flag_key
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    "os-flags provider routing check failed (user_uuid={}, requested_model={}, flag_key={}): {}; using static provider routing",
+                    user_uuid, requested_model, flag_key, e
+                );
+                None
             }
         }
     }

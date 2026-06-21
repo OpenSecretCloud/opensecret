@@ -192,9 +192,17 @@ impl OsFlagsClient {
     }
 
     pub async fn is_enabled(&self, user_uuid: Uuid, key: &str) -> Result<bool, OsFlagsError> {
+        Ok(self.get_bool_flag(user_uuid, key).await?.unwrap_or(false))
+    }
+
+    pub async fn get_bool_flag(
+        &self,
+        user_uuid: Uuid,
+        key: &str,
+    ) -> Result<Option<bool>, OsFlagsError> {
         let keys = [key];
         let resp = self.get_user_flags(user_uuid, Some(&keys), false).await?;
-        Ok(resp.flags.get(key).copied().unwrap_or(false))
+        Ok(resp.flags.get(key).copied())
     }
 }
 

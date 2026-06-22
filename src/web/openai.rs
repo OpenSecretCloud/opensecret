@@ -1141,26 +1141,6 @@ fn canonicalize_response_model(json: &mut Value, response_model_id: &str) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn strips_provider_managed_cache_salt_field() {
-        let mut body = serde_json::Map::from_iter([
-            ("model".to_string(), json!("kimi-k2-6")),
-            ("cache_salt".to_string(), json!("user-supplied")),
-            ("messages".to_string(), json!([])),
-        ]);
-
-        strip_provider_managed_request_fields(&mut body);
-
-        assert_eq!(body.get("model"), Some(&json!("kimi-k2-6")));
-        assert_eq!(body.get("messages"), Some(&json!([])));
-        assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
-    }
-}
-
 /// Helper to extract SSE frame from buffer
 /// Returns the data portion of "data: <content>" frames, None if no complete frame available
 fn extract_sse_frame(buffer: &mut String) -> Option<String> {
@@ -2244,5 +2224,25 @@ async fn try_provider(
                 proxy_config.provider_name
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_provider_managed_cache_salt_field() {
+        let mut body = serde_json::Map::from_iter([
+            ("model".to_string(), json!("kimi-k2-6")),
+            ("cache_salt".to_string(), json!("user-supplied")),
+            ("messages".to_string(), json!([])),
+        ]);
+
+        strip_provider_managed_request_fields(&mut body);
+
+        assert_eq!(body.get("model"), Some(&json!("kimi-k2-6")));
+        assert_eq!(body.get("messages"), Some(&json!([])));
+        assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
     }
 }

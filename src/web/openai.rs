@@ -41,6 +41,8 @@ const MAX_AUDIO_SIZE: usize = 100 * 1024 * 1024;
 const REQUEST_TIMEOUT_SECS: u64 = 120; // Request timeout (generous for large non-streaming responses)
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming reads
 
+const PROVIDER_MANAGED_CACHE_SALT_FIELD: &str = "cache_salt";
+
 const LOG_PREVIEW_CHARS: usize = 20;
 
 #[derive(Clone, Default)]
@@ -788,6 +790,7 @@ pub async fn get_chat_completion_response(
         "model".to_string(),
         json!(selected_route.provider_model_id.clone()),
     );
+    strip_provider_managed_request_fields(&mut modified_body);
     billing_context.model_name = selected_route.public_model_id.clone();
 
     // Create a new hyper client with better timeout configuration
@@ -1098,6 +1101,12 @@ fn ensure_stream_usage(body: &mut serde_json::Map<String, Value>) {
     }
 }
 
+fn strip_provider_managed_request_fields(body: &mut serde_json::Map<String, Value>) {
+    if body.remove(PROVIDER_MANAGED_CACHE_SALT_FIELD).is_some() {
+        debug!("Stripped provider-managed completion request field: cache_salt");
+    }
+}
+
 /// Helper to check if a streaming chunk has a finish_reason
 /// This indicates it's the final chunk in the stream
 fn has_finish_reason(json: &Value) -> bool {
@@ -1129,6 +1138,26 @@ fn canonicalize_response_model(json: &mut Value, response_model_id: &str) {
         if model_value.as_str().is_some() {
             *model_value = json!(response_model_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_provider_managed_cache_salt_field() {
+        let mut body = serde_json::Map::from_iter([
+            ("model".to_string(), json!("kimi-k2-6")),
+            ("cache_salt".to_string(), json!("user-supplied")),
+            ("messages".to_string(), json!([])),
+        ]);
+
+        strip_provider_managed_request_fields(&mut body);
+
+        assert_eq!(body.get("model"), Some(&json!("kimi-k2-6")));
+        assert_eq!(body.get("messages"), Some(&json!([])));
+        assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
     }
 }
 

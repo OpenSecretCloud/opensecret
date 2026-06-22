@@ -222,8 +222,8 @@ that boolean flag using the user's account UUID:
 
 - `true`: prefer the Continuum provider route.
 - `false`: prefer the Tinfoil provider route.
-- flag missing, os-flags unconfigured, network/service error: use the model
-  default provider, Tinfoil.
+- flag missing, os-flags unconfigured, network/service error, or provider-routing
+  flag lookup timeout: use the model default provider, Tinfoil.
 
 The provider router still validates route eligibility after reading the flag. If
 the preferred provider is not configured or does not have a usable proxy,
@@ -243,7 +243,8 @@ Initial rollout plan:
    fallback/circuit-breaker layer is ready.
 
 OpenSecret caches successful flag responses in memory for 10 minutes, keyed by
-user UUID and requested flag keys.
+user UUID and requested flag keys. Provider-routing flag lookups have a 5-second
+cap before falling back to the model default provider.
 
 Future routing controls should include a manual kill switch flag that disables
 Continuum Kimi entirely, plus provider:model health state that can remove
@@ -295,7 +296,9 @@ are observed.
 
 Continuum/Privatemode prompt caching should be enabled globally at the
 Continuum proxy layer with `--sharedPromptCache`. OpenSecret should not expose
-or require Privatemode-specific `cache_salt` request fields for this route.
+or require Privatemode-specific `cache_salt` request fields for this route. If a
+client sends `cache_salt`, OpenSecret strips it before forwarding the provider
+request.
 
 With no fixed prompt cache salt configured, the proxy uses one random salt for
 all requests handled by that proxy instance. This gives us the intended latency

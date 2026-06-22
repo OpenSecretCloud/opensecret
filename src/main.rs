@@ -129,6 +129,7 @@ const BILLING_SERVER_URL_NAME: &str = "billing_server_url";
 const BRAVE_API_KEY_NAME: &str = "brave_api_key";
 const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
 const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
+const PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EnclaveRequest {
@@ -815,20 +816,32 @@ impl AppState {
             return None;
         };
 
-        match client.get_bool_flag(user_uuid, flag_key).await {
-            Ok(Some(true)) => Some(ProviderPreference::feature_flag(ProviderName::Continuum)),
-            Ok(Some(false)) => Some(ProviderPreference::feature_flag(ProviderName::Tinfoil)),
-            Ok(None) => {
+        match tokio::time::timeout(
+            Duration::from_secs(PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS),
+            client.get_bool_flag(user_uuid, flag_key),
+        )
+        .await
+        {
+            Ok(Ok(Some(true))) => Some(ProviderPreference::feature_flag(ProviderName::Continuum)),
+            Ok(Ok(Some(false))) => Some(ProviderPreference::feature_flag(ProviderName::Tinfoil)),
+            Ok(Ok(None)) => {
                 debug!(
                     "os-flags provider routing flag missing (user_uuid={}, requested_model={}, flag_key={}); using default provider routing",
                     user_uuid, requested_model, flag_key
                 );
                 None
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(
                     "os-flags provider routing check failed (user_uuid={}, requested_model={}, flag_key={}): {}; using default provider routing",
                     user_uuid, requested_model, flag_key, e
+                );
+                None
+            }
+            Err(_) => {
+                warn!(
+                    "os-flags provider routing check timed out after {}s (user_uuid={}, requested_model={}, flag_key={}); using default provider routing",
+                    PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS, user_uuid, requested_model, flag_key
                 );
                 None
             }

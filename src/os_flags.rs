@@ -194,7 +194,14 @@ impl OsFlagsClient {
     ) -> Result<Option<bool>, OsFlagsError> {
         let keys = [key];
         let resp = self.get_user_flags(user_uuid, Some(&keys)).await?;
-        Ok(resp.flags.get(key).copied())
+        let value = resp.flags.get(key).copied();
+        tracing::debug!(
+            user_uuid = %user_uuid,
+            flag_key = %key,
+            enabled = ?value,
+            "os-flags bool flag evaluated"
+        );
+        Ok(value)
     }
 }
 

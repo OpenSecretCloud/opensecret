@@ -43,7 +43,7 @@ const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming r
 
 const PROVIDER_MANAGED_CACHE_SALT_FIELD: &str = "cache_salt";
 
-const LOG_PREVIEW_CHARS: usize = 20;
+const LOG_PREVIEW_CHARS: usize = 150;
 
 #[derive(Clone, Default)]
 struct CompletionRequestLogMetadata {

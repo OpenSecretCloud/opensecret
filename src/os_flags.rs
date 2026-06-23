@@ -2,12 +2,14 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
 use url::Url;
 use uuid::Uuid;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const USER_FLAGS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum OsFlagsError {
@@ -25,8 +27,6 @@ pub enum OsFlagsError {
 pub struct UserFlagsResponse {
     pub user_uuid: Uuid,
     pub flags: HashMap<String, bool>,
-    #[serde(default)]
-    pub reasons: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -34,6 +34,83 @@ pub struct OsFlagsClient {
     client: reqwest::Client,
     base_url: Url,
     api_key: Option<Arc<String>>,
+    cache: UserFlagsCache,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct UserFlagsCacheKey {
+    user_uuid: Uuid,
+    keys: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct UserFlagsCacheEntry {
+    response: UserFlagsResponse,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct UserFlagsCache {
+    inner: Arc<RwLock<HashMap<UserFlagsCacheKey, UserFlagsCacheEntry>>>,
+    ttl: Duration,
+}
+
+impl UserFlagsCacheKey {
+    fn new(user_uuid: Uuid, keys: Option<&[&str]>) -> Self {
+        Self {
+            user_uuid,
+            keys: normalize_keys(keys),
+        }
+    }
+}
+
+impl Default for UserFlagsCache {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+            ttl: USER_FLAGS_CACHE_TTL,
+        }
+    }
+}
+
+impl UserFlagsCache {
+    #[cfg(test)]
+    fn new(ttl: Duration) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(HashMap::new())),
+            ttl,
+        }
+    }
+
+    async fn get(&self, key: &UserFlagsCacheKey) -> Option<UserFlagsResponse> {
+        let now = Instant::now();
+        {
+            let inner = self.inner.read().await;
+            let entry = inner.get(key)?;
+            if entry.expires_at > now {
+                return Some(entry.response.clone());
+            }
+        }
+
+        let mut inner = self.inner.write().await;
+        if inner.get(key).is_some_and(|entry| entry.expires_at <= now) {
+            inner.remove(key);
+        }
+        None
+    }
+
+    async fn insert(&self, key: UserFlagsCacheKey, response: UserFlagsResponse) {
+        let now = Instant::now();
+        let mut inner = self.inner.write().await;
+        evict_expired(&mut inner, now);
+        inner.insert(
+            key,
+            UserFlagsCacheEntry {
+                response,
+                expires_at: now + self.ttl,
+            },
+        );
+    }
 }
 
 impl OsFlagsClient {
@@ -52,6 +129,7 @@ impl OsFlagsClient {
             client,
             base_url,
             api_key: api_key.map(Arc::new),
+            cache: UserFlagsCache::default(),
         })
     }
 
@@ -59,21 +137,22 @@ impl OsFlagsClient {
         &self,
         user_uuid: Uuid,
         keys: Option<&[&str]>,
-        include_reasons: bool,
     ) -> Result<UserFlagsResponse, OsFlagsError> {
+        let cache_key = UserFlagsCacheKey::new(user_uuid, keys);
+        if let Some(response) = self.cache.get(&cache_key).await {
+            return Ok(response);
+        }
+
         let mut url = self
             .base_url
             .join(&format!("v1/users/{}/flags", user_uuid))?;
 
         {
             let mut qp = url.query_pairs_mut();
-            if let Some(keys) = keys {
+            if let Some(keys) = cache_key.keys.as_ref() {
                 if !keys.is_empty() {
                     qp.append_pair("keys", &keys.join(","));
                 }
-            }
-            if include_reasons {
-                qp.append_pair("include_reasons", "1");
             }
         }
 
@@ -86,7 +165,9 @@ impl OsFlagsClient {
         let status = resp.status();
 
         if status.is_success() {
-            Ok(resp.json::<UserFlagsResponse>().await?)
+            let response = resp.json::<UserFlagsResponse>().await?;
+            self.cache.insert(cache_key, response.clone()).await;
+            Ok(response)
         } else {
             let text = resp.text().await.unwrap_or_default();
             let message = serde_json::from_str::<serde_json::Value>(&text)
@@ -103,9 +184,17 @@ impl OsFlagsClient {
     }
 
     pub async fn is_enabled(&self, user_uuid: Uuid, key: &str) -> Result<bool, OsFlagsError> {
+        Ok(self.get_bool_flag(user_uuid, key).await?.unwrap_or(false))
+    }
+
+    pub async fn get_bool_flag(
+        &self,
+        user_uuid: Uuid,
+        key: &str,
+    ) -> Result<Option<bool>, OsFlagsError> {
         let keys = [key];
-        let resp = self.get_user_flags(user_uuid, Some(&keys), false).await?;
-        Ok(resp.flags.get(key).copied().unwrap_or(false))
+        let resp = self.get_user_flags(user_uuid, Some(&keys)).await?;
+        Ok(resp.flags.get(key).copied())
     }
 }
 
@@ -114,6 +203,72 @@ impl std::fmt::Debug for OsFlagsClient {
         f.debug_struct("OsFlagsClient")
             .field("base_url", &self.base_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("cache_ttl", &self.cache.ttl)
             .finish()
+    }
+}
+
+fn normalize_keys(keys: Option<&[&str]>) -> Option<Vec<String>> {
+    let mut keys = keys?
+        .iter()
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return None;
+    }
+
+    keys.sort_unstable();
+    keys.dedup();
+    Some(keys)
+}
+
+fn evict_expired(inner: &mut HashMap<UserFlagsCacheKey, UserFlagsCacheEntry>, now: Instant) {
+    inner.retain(|_, entry| entry.expires_at > now);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(user_uuid: Uuid) -> UserFlagsResponse {
+        UserFlagsResponse {
+            user_uuid,
+            flags: HashMap::from([("flag_a".to_string(), true)]),
+        }
+    }
+
+    #[test]
+    fn cache_key_normalizes_keys() {
+        let user_uuid = Uuid::new_v4();
+        let a = UserFlagsCacheKey::new(user_uuid, Some(&["flag_b", "flag_a", "flag_a", ""]));
+        let b = UserFlagsCacheKey::new(user_uuid, Some(&["flag_a", "flag_b"]));
+
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn cache_key_treats_empty_keys_as_all_flags() {
+        let user_uuid = Uuid::new_v4();
+        let a = UserFlagsCacheKey::new(user_uuid, None);
+        let b = UserFlagsCacheKey::new(user_uuid, Some(&[]));
+        let c = UserFlagsCacheKey::new(user_uuid, Some(&["", " "]));
+
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[tokio::test]
+    async fn cache_entries_expire() {
+        let cache = UserFlagsCache::new(Duration::from_millis(5));
+        let user_uuid = Uuid::new_v4();
+        let key = UserFlagsCacheKey::new(user_uuid, Some(&["flag_a"]));
+
+        cache.insert(key.clone(), response(user_uuid)).await;
+        assert!(cache.get(&key).await.is_some());
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(cache.get(&key).await.is_none());
     }
 }

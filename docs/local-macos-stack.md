@@ -15,7 +15,7 @@ Maple frontend    VITE_OPEN_SECRET_API_URL=http://127.0.0.1:3000
 
 In local mode, OpenSecret reads `.env` through `dotenv`.
 
-When `OPENAI_API_BASE` is not `api.openai.com`, OpenSecret treats it as the default Continuum-compatible proxy and does not require `OPENAI_API_KEY` for that route.
+When `OPENAI_API_BASE` is not `api.openai.com`, OpenSecret treats it as the default Continuum-compatible proxy and does not require `OPENAI_API_KEY` for that route. The local Continuum proxy recipe enables Privatemode shared prompt caching at the proxy layer, so callers do not need to send a per-request `cache_salt`.
 
 When `TINFOIL_API_BASE` is set, OpenSecret uses it for the Tinfoil route.
 
@@ -109,6 +109,6 @@ nix develop -c just dev
 
 ## Notes
 
-- Production Linux/Nitro entrypoint behavior is unchanged.
+- Production Linux/Nitro and local macOS Continuum proxy launches enable Privatemode shared prompt caching without a fixed prompt cache salt. The cache is shared by requests handled by the same proxy instance and is reset when that proxy restarts.
 - The macOS proxy binaries are generated local artifacts only.
 - Device builds, TestFlight, notarization, and production app signing still need Apple developer credentials configured separately.

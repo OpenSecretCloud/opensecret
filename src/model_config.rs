@@ -468,6 +468,14 @@ pub fn resolve_completion_model_id(model: &str) -> Option<&'static str> {
         .map(|entry| entry.provider_id)
 }
 
+pub fn resolve_public_model_id(model: &str) -> Option<&'static str> {
+    let canonical = alias_target(model).unwrap_or(model);
+    MODEL_CONFIGS
+        .iter()
+        .find(|entry| entry.id == canonical && entry.api_listed && entry.enabled)
+        .map(|entry| entry.id)
+}
+
 pub fn model_config(model: &str) -> ModelConfig {
     let canonical = alias_target(model).unwrap_or(model);
 
@@ -673,6 +681,24 @@ mod tests {
         assert_eq!(resolve_completion_model_id("quick"), None);
         assert_eq!(resolve_completion_model_id("kimi-k2-5"), None);
         assert_eq!(resolve_completion_model_id("unknown-model"), None);
+    }
+
+    #[test]
+    fn test_resolve_public_model_aliases() {
+        assert_eq!(
+            resolve_public_model_id(AUTO_QUICK_MODEL_ID),
+            Some(QUICK_MODEL_ID)
+        );
+        assert_eq!(
+            resolve_public_model_id(AUTO_POWERFUL_MODEL_ID),
+            Some(POWERFUL_MODEL_ID)
+        );
+        assert_eq!(
+            resolve_public_model_id("gpt-oss-safeguard-120b"),
+            Some("gpt-oss-safeguard-120b")
+        );
+        assert_eq!(resolve_public_model_id("kimi-k2-5"), None);
+        assert_eq!(resolve_public_model_id("unknown-model"), None);
     }
 
     #[test]

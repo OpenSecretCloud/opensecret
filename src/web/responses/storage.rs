@@ -80,6 +80,35 @@ fn create_assistant_message_if_missing(
     }
 }
 
+fn update_terminal_response_status(
+    db: &Arc<dyn DBConnection + Send + Sync>,
+    response_id: i64,
+    response_uuid: Uuid,
+    status: ResponseStatus,
+    reason: &str,
+) {
+    match db.update_response_status_if_current(
+        response_id,
+        ResponseStatus::InProgress,
+        status,
+        Some(Utc::now()),
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            debug!(
+                "Storage: skipped setting response {} ({}) to {:?} after {}; response was no longer in_progress",
+                response_id, response_uuid, status, reason
+            );
+        }
+        Err(e) => {
+            error!(
+                "Failed to update response {} ({}) status to {:?} after {}: {:?}",
+                response_id, response_uuid, status, reason, e
+            );
+        }
+    }
+}
+
 async fn finalize_assistant_message(
     db: &Arc<dyn DBConnection + Send + Sync>,
     user_key: &SecretKey,
@@ -261,6 +290,7 @@ pub async fn storage_task(
     tool_persist_ack: Option<mpsc::Sender<Result<(), String>>>,
     db: Arc<dyn DBConnection + Send + Sync>,
     response_id: i64,
+    response_uuid: Uuid,
     first_item_created_at: chrono::DateTime<chrono::Utc>,
     conversation_id: i64,
     user_id: Uuid,
@@ -402,8 +432,8 @@ pub async fn storage_task(
             }
             StorageMessage::ResponseDone { finish_reason } => {
                 debug!(
-                    "Storage: response done {} with finish_reason={}",
-                    response_id, finish_reason
+                    "Storage: response done {} ({}) with finish_reason={}",
+                    response_id, response_uuid, finish_reason
                 );
                 // Sender invariant: stream_one_assistant_turn always emits MessageDone /
                 // ReasoningDone before ResponseDone. If that invariant ever breaks we'd
@@ -424,27 +454,27 @@ pub async fn storage_task(
                     )
                     .await;
                 }
-                if let Err(e) = db.update_response_status(
+                update_terminal_response_status(
+                    &db,
                     response_id,
+                    response_uuid,
                     ResponseStatus::Completed,
-                    Some(Utc::now()),
-                ) {
-                    error!("Failed to update response status to completed: {:?}", e);
-                }
+                    "ResponseDone",
+                );
                 return;
             }
             StorageMessage::Cancelled => {
                 debug!(
-                    "Storage: cancellation received for response {}",
-                    response_id
+                    "Storage: cancellation received for response {} ({})",
+                    response_id, response_uuid
                 );
-                if let Err(e) = db.update_response_status(
+                update_terminal_response_status(
+                    &db,
                     response_id,
+                    response_uuid,
                     ResponseStatus::Cancelled,
-                    Some(Utc::now()),
-                ) {
-                    error!("Failed to update response status to cancelled: {:?}", e);
-                }
+                    "cancellation",
+                );
                 mark_pending_items_incomplete(
                     &db,
                     &user_key,
@@ -456,12 +486,17 @@ pub async fn storage_task(
                 return;
             }
             StorageMessage::Error(error_msg) => {
-                error!("Storage: received error: {}", error_msg);
-                if let Err(e) =
-                    db.update_response_status(response_id, ResponseStatus::Failed, Some(Utc::now()))
-                {
-                    error!("Failed to update response status to failed: {:?}", e);
-                }
+                error!(
+                    "Storage: received error for response {} ({}): {}",
+                    response_id, response_uuid, error_msg
+                );
+                update_terminal_response_status(
+                    &db,
+                    response_id,
+                    response_uuid,
+                    ResponseStatus::Failed,
+                    "streaming error",
+                );
                 mark_pending_items_incomplete(
                     &db,
                     &user_key,
@@ -573,14 +608,17 @@ pub async fn storage_task(
         }
     }
 
-    warn!("Storage channel closed before receiving ResponseDone signal");
-    if let Err(e) = db.update_response_status(response_id, ResponseStatus::Failed, Some(Utc::now()))
-    {
-        error!(
-            "Failed to update response status after premature channel close: {:?}",
-            e
-        );
-    }
+    warn!(
+        "Storage channel closed before receiving ResponseDone signal for response {} ({})",
+        response_id, response_uuid
+    );
+    update_terminal_response_status(
+        &db,
+        response_id,
+        response_uuid,
+        ResponseStatus::Failed,
+        "premature storage channel close",
+    );
     mark_pending_items_incomplete(
         &db,
         &user_key,

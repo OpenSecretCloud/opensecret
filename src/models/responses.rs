@@ -155,25 +155,55 @@ impl Response {
             .map_err(ResponsesError::DatabaseError)
     }
 
+    pub fn update_status_if_current(
+        conn: &mut PgConnection,
+        id: i64,
+        current_status: ResponseStatus,
+        new_status: ResponseStatus,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<usize, ResponsesError> {
+        diesel::update(
+            responses::table
+                .filter(responses::id.eq(id))
+                .filter(responses::status.eq(current_status)),
+        )
+        .set((
+            responses::status.eq(new_status),
+            responses::completed_at.eq(completed_at),
+            responses::updated_at.eq(diesel::dsl::now),
+        ))
+        .execute(conn)
+        .map_err(ResponsesError::DatabaseError)
+    }
+
     pub fn cancel_by_uuid_and_user(
         conn: &mut PgConnection,
         uuid: Uuid,
         user_id: Uuid,
     ) -> Result<Response, ResponsesError> {
-        let response = Self::get_by_uuid_and_user(conn, uuid, user_id)?;
+        let cancelable_status = responses::status
+            .eq(ResponseStatus::InProgress)
+            .or(responses::status.eq(ResponseStatus::Queued));
 
-        match response.status {
-            ResponseStatus::InProgress | ResponseStatus::Queued => {
-                diesel::update(responses::table.filter(responses::id.eq(response.id)))
-                    .set((
-                        responses::status.eq(ResponseStatus::Cancelled),
-                        responses::completed_at.eq(diesel::dsl::now),
-                        responses::updated_at.eq(diesel::dsl::now),
-                    ))
-                    .get_result(conn)
-                    .map_err(ResponsesError::DatabaseError)
+        match diesel::update(
+            responses::table
+                .filter(responses::uuid.eq(uuid))
+                .filter(responses::user_id.eq(user_id))
+                .filter(cancelable_status),
+        )
+        .set((
+            responses::status.eq(ResponseStatus::Cancelled),
+            responses::completed_at.eq(diesel::dsl::now),
+            responses::updated_at.eq(diesel::dsl::now),
+        ))
+        .get_result(conn)
+        {
+            Ok(response) => Ok(response),
+            Err(diesel::result::Error::NotFound) => {
+                Self::get_by_uuid_and_user(conn, uuid, user_id)?;
+                Err(ResponsesError::ValidationError)
             }
-            _ => Err(ResponsesError::ValidationError),
+            Err(e) => Err(ResponsesError::DatabaseError(e)),
         }
     }
 

@@ -39,7 +39,7 @@ use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, convert::Infallible, sync::Arc, time::Duration};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
@@ -262,11 +262,15 @@ mod tests {
         append_streamed_tool_calls, apply_responses_model_defaults,
         build_internal_system_prompt_for_now, build_model_turn_request, build_provider_tools,
         finalize_first_model_tool_call, has_streamed_tool_call_entries, resolve_responses_sampling,
-        ClientResponseState, ConversationParam, InputMessage, ResponsesCreateRequest,
-        StreamedToolCall, MAPLE_WEB_SEARCH_PROMPT,
+        wait_for_response_cancellation, ClientResponseState, ConversationParam, InputMessage,
+        ResponsesCreateRequest, StorageMessage, StreamedToolCall, MAPLE_WEB_SEARCH_PROMPT,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
+    use tokio::{
+        sync::{broadcast, mpsc},
+        time::{timeout, Duration},
+    };
     use uuid::Uuid;
 
     #[test]
@@ -322,6 +326,51 @@ mod tests {
             metadata: None,
             stream: true,
         }
+    }
+
+    #[tokio::test]
+    async fn wait_for_response_cancellation_ignores_unrelated_broadcasts() {
+        let response_uuid = Uuid::new_v4();
+        let unrelated_uuid = Uuid::new_v4();
+        let (cancel_tx, cancel_rx) = broadcast::channel(8);
+        let (storage_tx, mut storage_rx) = mpsc::channel(2);
+        let (client_tx, mut client_rx) = mpsc::channel(2);
+
+        let listener = tokio::spawn(wait_for_response_cancellation(
+            response_uuid,
+            cancel_rx,
+            storage_tx,
+            client_tx,
+        ));
+
+        cancel_tx.send(unrelated_uuid).unwrap();
+        assert!(
+            timeout(Duration::from_millis(25), storage_rx.recv())
+                .await
+                .is_err(),
+            "unrelated cancellation should not emit a storage cancellation"
+        );
+        assert!(
+            timeout(Duration::from_millis(25), client_rx.recv())
+                .await
+                .is_err(),
+            "unrelated cancellation should not emit a client cancellation"
+        );
+        assert!(
+            !listener.is_finished(),
+            "listener should continue after unrelated cancellation"
+        );
+
+        cancel_tx.send(response_uuid).unwrap();
+        assert!(matches!(
+            storage_rx.recv().await,
+            Some(StorageMessage::Cancelled)
+        ));
+        assert!(matches!(
+            client_rx.recv().await,
+            Some(StorageMessage::Cancelled)
+        ));
+        listener.await.unwrap();
     }
 
     #[test]
@@ -2507,6 +2556,50 @@ async fn setup_completion_processor(
     Ok(persisted.response.clone())
 }
 
+async fn wait_for_response_cancellation(
+    response_uuid: Uuid,
+    mut cancel_rx: broadcast::Receiver<Uuid>,
+    tx_storage: mpsc::Sender<StorageMessage>,
+    tx_client: mpsc::Sender<StorageMessage>,
+) {
+    loop {
+        match cancel_rx.recv().await {
+            Ok(cancelled_id) if cancelled_id == response_uuid => {
+                debug!(
+                    "Orchestrator: Received cancellation during phases 5-6 for response {}",
+                    response_uuid
+                );
+
+                let _ = tx_storage.send(StorageMessage::Cancelled).await;
+                let _ = tx_client.send(StorageMessage::Cancelled).await;
+
+                trace!("Orchestrator: Cancellation handled, exiting");
+                return;
+            }
+            Ok(cancelled_id) => {
+                trace!(
+                    "Orchestrator: ignoring cancellation for unrelated response {} while running response {}",
+                    cancelled_id,
+                    response_uuid
+                );
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    "Orchestrator: cancellation listener for response {} lagged by {} message(s)",
+                    response_uuid, skipped
+                );
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                warn!(
+                    "Orchestrator: cancellation channel closed while response {} was still running",
+                    response_uuid
+                );
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
 async fn create_response_stream(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -2671,6 +2764,7 @@ async fn create_response_stream(
                     Some(tx_tool_ack),
                     db,
                     response_id,
+                    response_uuid,
                     first_response_item_created_at,
                     conversation_id,
                     user_id,
@@ -2697,8 +2791,15 @@ async fn create_response_stream(
         tokio::spawn(async move {
             trace!("Orchestrator: Starting phases 5-6 in background");
 
-            // Subscribe to cancellation broadcast
-            let mut cancel_rx = orchestrator_state.cancellation_broadcast.subscribe();
+            // Subscribe to cancellation broadcast. The endpoint lives on a separate
+            // request task, so each stream listens for its own response UUID.
+            let cancel_rx = orchestrator_state.cancellation_broadcast.subscribe();
+            let cancellation_listener = wait_for_response_cancellation(
+                response_uuid,
+                cancel_rx,
+                orchestrator_tx_storage.clone(),
+                orchestrator_tx_client.clone(),
+            );
 
             // Run phases 5-6 with cancellation support
             tokio::select! {
@@ -2751,17 +2852,7 @@ async fn create_response_stream(
                     trace!("Orchestrator: Phases 5-6 completed normally");
                 }
 
-                Ok(cancelled_id) = cancel_rx.recv() => {
-                    if cancelled_id == response_uuid {
-                        debug!("Orchestrator: Received cancellation during phases 5-6 for response {}", response_uuid);
-
-                        // Send cancellation to both channels
-                        let _ = orchestrator_tx_storage.send(StorageMessage::Cancelled).await;
-                        let _ = orchestrator_tx_client.send(StorageMessage::Cancelled).await;
-
-                        trace!("Orchestrator: Cancellation handled, exiting");
-                    }
-                }
+                _ = cancellation_listener => {}
             }
         });
 
@@ -3354,18 +3445,17 @@ async fn cancel_response(
             }
         })?;
 
-    // Only allow cancelling in_progress responses
-    if response.status != ResponseStatus::InProgress {
+    // Only allow cancelling responses that have not reached a terminal state.
+    if !matches!(
+        response.status,
+        ResponseStatus::Queued | ResponseStatus::InProgress
+    ) {
         debug!(
             "Cannot cancel response {} with status {:?}",
             id, response.status
         );
         return Err(ApiError::BadRequest);
     }
-
-    // Broadcast cancellation signal to all listeners
-    debug!("Broadcasting cancellation signal for response {}", id);
-    let _ = state.cancellation_broadcast.send(id);
 
     // Update the response status in the database
     let response = state.db.cancel_response(id, user.uuid).map_err(|e| {
@@ -3380,6 +3470,12 @@ async fn cancel_response(
             _ => ApiError::InternalServerError,
         }
     })?;
+
+    // Broadcast cancellation signal to stream listeners after the DB transition
+    // succeeds so storage cannot race the endpoint and turn a valid cancel into
+    // a bad request.
+    debug!("Broadcasting cancellation signal for response {}", id);
+    let _ = state.cancellation_broadcast.send(id);
 
     // No usage or output for cancelled responses
     let retrieve_response = ResponsesRetrieveResponse {

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::spawn;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use uuid::Uuid;
 
 #[derive(Deserialize, Clone)]
@@ -136,12 +136,10 @@ pub async fn login(
     Extension(creds): Extension<Credentials>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<AuthResponse>>, ApiError> {
-    debug!("Entering login function");
     tracing::trace!("call login");
 
     let auth_response = login_internal(data.clone(), creds).await?;
     let result = encrypt_response(&data, &session_id, &auth_response).await;
-    debug!("Exiting login function");
     result
 }
 
@@ -247,7 +245,6 @@ pub async fn logout(
     Extension(logout_request): Extension<LogoutRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering logout function");
     info!("Logout request received");
     // TODO actually delete the refresh token
     tracing::trace!(
@@ -256,7 +253,6 @@ pub async fn logout(
     );
     let response = json!({ "message": "Logged out successfully" });
     let result = encrypt_response(&data, &session_id, &response).await;
-    debug!("Exiting logout function");
     result
 }
 
@@ -265,7 +261,6 @@ pub async fn register(
     Extension(creds): Extension<RegisterCredentials>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<AuthResponse>>, ApiError> {
-    debug!("Entering register function");
     tracing::trace!("call register");
 
     let user = match data.register_user(creds.clone()).await {
@@ -296,7 +291,6 @@ pub async fn register(
     .await?;
 
     let result = encrypt_response(&data, &session_id, &login_result).await;
-    debug!("Exiting register function");
     result
 }
 
@@ -353,7 +347,6 @@ pub async fn refresh_token(
     Extension(refresh_request): Extension<RefreshRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<RefreshResponse>>, ApiError> {
-    debug!("Entering refresh_token function");
     info!("Refresh token request received");
 
     let claims = validate_token(&refresh_request.refresh_token, &data, USER_REFRESH)?;
@@ -380,7 +373,6 @@ pub async fn refresh_token(
         refresh_token: new_refresh_token.token,
     };
     let result = encrypt_response(&data, &session_id, &response).await;
-    debug!("Exiting refresh_token function");
     result
 }
 
@@ -389,7 +381,6 @@ pub async fn verify_email(
     Path(code): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering verify_email function");
     let verification = match data.db.get_email_verification_by_code(code) {
         Ok(v) => v,
         Err(DBError::EmailVerificationNotFound) => return Err(ApiError::BadRequest),
@@ -416,7 +407,6 @@ pub async fn verify_email(
         "message": "Email verified successfully"
     });
     let result = encrypt_response(&data, &session_id, &response).await;
-    debug!("Exiting verify_email function");
     result
 }
 
@@ -425,8 +415,6 @@ pub async fn password_reset_request(
     Extension(payload): Extension<PasswordResetRequestPayload>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering password_reset_request function");
-
     // Get project by client_id
     let project = data
         .db
@@ -471,7 +459,6 @@ pub async fn password_reset_request(
         "message": "If an account with that email exists, we have sent a password reset link."
     });
     let result = encrypt_response(&data, &session_id, &response).await;
-    debug!("Exiting password_reset_request function");
     result
 }
 
@@ -480,8 +467,6 @@ pub async fn password_reset_confirm(
     Extension(payload): Extension<PasswordResetConfirmPayload>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering password_reset_confirm function");
-
     // Get project by client_id
     let project = data
         .db
@@ -526,6 +511,5 @@ pub async fn password_reset_confirm(
         "message": "Password reset successful. You can now log in with your new password."
     });
     let result = encrypt_response(&data, &session_id, &response).await;
-    debug!("Exiting password_reset_confirm function");
     result
 }

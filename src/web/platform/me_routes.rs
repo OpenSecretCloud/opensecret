@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::spawn;
-use tracing::{debug, error};
+use tracing::error;
 use uuid::Uuid;
 use validator::Validate;
 
@@ -65,8 +65,6 @@ async fn get_platform_user(
     Extension(platform_user): Extension<PlatformUser>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<MeResponse>>, ApiError> {
-    debug!("Entering get_platform_user function");
-
     // Check if email is verified
     let email_verified = match data
         .db
@@ -126,8 +124,6 @@ async fn get_platform_user(
         user,
         organizations,
     };
-
-    debug!("Exiting get_platform_user function");
     encrypt_response(&data, &session_id, &response).await
 }
 
@@ -136,8 +132,6 @@ async fn request_platform_verification(
     Extension(platform_user): Extension<PlatformUser>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering request_platform_verification function");
-
     // Check if the user is already verified
     match data
         .db
@@ -199,7 +193,6 @@ async fn request_platform_verification(
     });
 
     let response = json!({ "message": "New verification code sent successfully" });
-    debug!("Exiting request_platform_verification function");
     encrypt_response(&data, &session_id, &response).await
 }
 
@@ -209,8 +202,6 @@ pub async fn platform_change_password(
     Extension(change_request): Extension<PlatformChangePasswordRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering platform_change_password function");
-
     // Validate request
     if let Err(errors) = change_request.validate() {
         error!("Validation error: {:?}", errors);
@@ -236,7 +227,6 @@ pub async fn platform_change_password(
             {
                 Ok(()) => {
                     let response = json!({ "message": "Password changed successfully" });
-                    debug!("Exiting platform_change_password function");
                     encrypt_response(&data, &session_id, &response).await
                 }
                 Err(e) => {

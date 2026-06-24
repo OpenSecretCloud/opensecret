@@ -425,8 +425,6 @@ pub async fn initiate_oauth(
     Extension(session_id): Extension<Uuid>,
     provider_name: &str,
 ) -> Result<Json<EncryptedResponse<OAuthOAuthCallbackResponse>>, ApiError> {
-    debug!("Entering init {} auth function", provider_name);
-
     // Get project
     let project = app_state
         .db
@@ -469,8 +467,6 @@ pub async fn initiate_oauth(
         auth_url,
         state: state_base64,
     };
-
-    debug!("Exiting init {} auth function", provider_name);
     encrypt_response(&app_state, &session_id, &response).await
 }
 
@@ -480,7 +476,6 @@ pub async fn oauth_callback(
     Extension(session_id): Extension<Uuid>,
     provider_name: &str,
 ) -> Result<Json<EncryptedResponse<OAuthCallbackResponse>>, ApiError> {
-    debug!("Entering {} callback function", provider_name);
     debug!(
         "Received code (redacted, len={})",
         callback_request.code.len()
@@ -898,8 +893,6 @@ pub async fn oauth_callback(
     };
 
     let auth_response = oauth_callback_response(&app_state, &authenticated_user)?;
-
-    debug!("Exiting {} callback function", provider_name);
     encrypt_response(&app_state, &session_id, &auth_response).await
 }
 

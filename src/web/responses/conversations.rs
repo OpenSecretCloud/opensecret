@@ -28,7 +28,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{collections::HashMap, sync::Arc};
-use tracing::{debug, error, trace};
+use tracing::error;
 use uuid::Uuid;
 
 // ============================================================================
@@ -387,8 +387,6 @@ async fn create_conversation(
     Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<CreateConversationRequest>,
 ) -> Result<Json<EncryptedResponse<ConversationResponse>>, ApiError> {
-    debug!("Creating new conversation for user: {}", user.uuid);
-
     // Reject initial items - not supported in our simplified flow
     // Users must use POST /v1/responses to add messages to conversations
     if let Some(items) = &body.items {
@@ -443,14 +441,10 @@ async fn create_conversation(
         metadata_enc,
     };
 
-    trace!("Creating conversation with: {:?}", new_conversation);
-
     let conversation = state
         .db
         .create_conversation(new_conversation)
         .map_err(error_mapping::map_generic_db_error)?;
-
-    trace!("Created conversation: {:?}", conversation);
 
     let mut project_cache = HashMap::new();
     if let Some(project) = project {
@@ -477,11 +471,6 @@ async fn get_conversation(
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationResponse>>, ApiError> {
-    debug!(
-        "Getting conversation {} for user {}",
-        conversation_id, user.uuid
-    );
-
     let ctx = ConversationContext::load(&state, conversation_id, &user, &auth_context).await?;
     let mut project_cache = HashMap::new();
     let response = build_conversation_response(
@@ -505,11 +494,6 @@ async fn update_conversation(
     Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<UpdateConversationRequest>,
 ) -> Result<Json<EncryptedResponse<ConversationResponse>>, ApiError> {
-    debug!(
-        "Updating conversation {} for user {}",
-        conversation_id, user.uuid
-    );
-
     if body.metadata.is_none() && body.project_id.is_missing() && body.pinned.is_none() {
         return Err(ApiError::BadRequest);
     }
@@ -572,11 +556,6 @@ async fn delete_conversation(
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
-    debug!(
-        "Deleting conversation {} for user {}",
-        conversation_id, user.uuid
-    );
-
     let ctx = ConversationContext::load(&state, conversation_id, &user, &auth_context).await?;
 
     // Delete the conversation (cascades will delete all associated responses)
@@ -599,11 +578,6 @@ async fn list_conversation_items(
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationItemListResponse>>, ApiError> {
-    debug!(
-        "Listing items for conversation {} for user {}",
-        conversation_id, user.uuid
-    );
-
     let ctx = ConversationContext::load(&state, conversation_id, &user, &auth_context).await?;
 
     // Validate limit
@@ -625,24 +599,6 @@ async fn list_conversation_items(
         )
         .map_err(error_mapping::map_message_error)?;
 
-    trace!(
-        "Retrieved {} raw messages for conversation {} (limit={}, after={:?}, order={})",
-        raw_messages.len(),
-        conversation_id,
-        limit,
-        params.after,
-        params.order
-    );
-    for (i, msg) in raw_messages.iter().enumerate() {
-        trace!(
-            "Message {}: uuid={}, type={}, created_at={}",
-            i,
-            msg.uuid,
-            msg.message_type,
-            msg.created_at
-        );
-    }
-
     // Check if there are more results
     let has_more = raw_messages.len() > limit as usize;
 
@@ -660,8 +616,6 @@ async fn list_conversation_items(
         0, // Start from beginning since pagination is already applied at DB level
         messages_to_return.len(),
     )?;
-
-    trace!("Final items count: {}, has_more: {}", items.len(), has_more);
 
     // Extract cursor IDs
     let (first_id, last_id) = Paginator::get_cursor_ids(&items, |item| match item {
@@ -690,11 +644,6 @@ async fn get_conversation_item(
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
-    debug!(
-        "Getting item {} from conversation {} for user {}",
-        item_id, conversation_id, user.uuid
-    );
-
     let ctx = ConversationContext::load(&state, conversation_id, &user, &auth_context).await?;
 
     // Get all messages from the conversation
@@ -730,8 +679,6 @@ async fn list_conversations(
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationListResponse>>, ApiError> {
-    debug!("Listing conversations for user: {}", user.uuid);
-
     // Validate limit
     let limit = if params.limit <= 0 {
         DEFAULT_PAGINATION_LIMIT
@@ -755,15 +702,6 @@ async fn list_conversations(
         )
         .map_err(error_mapping::map_generic_db_error)?;
 
-    trace!(
-        "Retrieved {} conversations for user {} (limit={}, after={:?}, order={})",
-        conversations.len(),
-        user.uuid,
-        limit,
-        params.after,
-        params.order
-    );
-
     // Check if there are more results
     let has_more = conversations.len() > limit as usize;
 
@@ -785,8 +723,6 @@ async fn list_conversations(
     // Convert to response format
     let mut data = Vec::with_capacity(conversations_to_return.len());
     for conv in conversations_to_return {
-        trace!("Raw conversation object: {:?}", conv);
-        trace!("Conv metadata_enc present: {}", conv.metadata_enc.is_some());
         data.push(build_conversation_response(
             &state,
             user.uuid,
@@ -808,8 +744,6 @@ async fn list_conversations(
         last_id,
     };
 
-    trace!("Final ConversationListResponse: {:?}", response);
-
     encrypt_response(&state, &session_id, &response).await
 }
 
@@ -819,8 +753,6 @@ async fn delete_all_conversations(
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Deleting all conversations for user {}", user.uuid);
-
     state
         .db
         .delete_all_conversations(user.uuid)
@@ -848,12 +780,6 @@ async fn batch_delete_conversations(
     if body.ids.is_empty() || body.ids.len() > MAX_CONVERSATION_BATCH_SIZE {
         return Err(ApiError::BadRequest);
     }
-
-    debug!(
-        "Batch deleting {} conversations for user {}",
-        body.ids.len(),
-        user.uuid
-    );
 
     let mut results = Vec::with_capacity(body.ids.len());
 
@@ -915,7 +841,7 @@ async fn batch_update_conversation_project(
         return Err(ApiError::BadRequest);
     }
 
-    let (target_project_uuid, target_project_id) = match body.project_id {
+    let (_, target_project_id) = match body.project_id {
         NullableField::Value(project_uuid) => (
             Some(project_uuid),
             Some(
@@ -929,12 +855,6 @@ async fn batch_update_conversation_project(
         NullableField::Null => (None, None),
         NullableField::Missing => return Err(ApiError::BadRequest),
     };
-
-    debug!(
-        "Batch updating {} conversations to project {:?}",
-        body.ids.len(),
-        target_project_uuid
-    );
 
     state
         .db

@@ -736,7 +736,6 @@ pub(crate) struct PostgresConnection {
 
 impl DBConnection for PostgresConnection {
     fn create_user(&self, new_user: NewUser) -> Result<User, DBError> {
-        debug!("Creating new user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_user.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -746,7 +745,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_user_by_uuid(&self, uuid: Uuid) -> Result<User, DBError> {
-        debug!("Getting user by UUID");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = User::get_by_uuid(conn, uuid)?.ok_or(DBError::UserNotFound);
         if let Err(ref e) = result {
@@ -756,7 +754,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_user_by_email(&self, email: String, project_id: i32) -> Result<User, DBError> {
-        debug!("Getting user by email and project");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = User::get_by_email(conn, email, project_id)?.ok_or(DBError::UserNotFound);
         if let Err(ref e) = result {
@@ -919,7 +916,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn verify_email(&self, verification: &mut EmailVerification) -> Result<(), DBError> {
-        debug!("Verifying email");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = verification.verify(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -932,7 +928,6 @@ impl DBConnection for PostgresConnection {
         &self,
         new_request: NewPasswordResetRequest,
     ) -> Result<PasswordResetRequest, DBError> {
-        debug!("Creating new password reset request");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_request.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -946,7 +941,6 @@ impl DBConnection for PostgresConnection {
         user_id: Uuid,
         encrypted_code: Vec<u8>,
     ) -> Result<Option<PasswordResetRequest>, DBError> {
-        debug!("Getting password reset request by user_id and encrypted code");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = PasswordResetRequest::get_by_user_id_and_code(conn, user_id, &encrypted_code)
             .map_err(DBError::from);
@@ -963,7 +957,6 @@ impl DBConnection for PostgresConnection {
         new_password_enc: Vec<u8>,
         new_wrapping: NewUserSeedWrapping,
     ) -> Result<(), DBError> {
-        debug!("Updating user password and password seed wrap");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         conn.transaction::<_, DBError, _>(|conn| {
             let updated_user_count = diesel::update(
@@ -994,7 +987,6 @@ impl DBConnection for PostgresConnection {
         &self,
         request: &PasswordResetRequest,
     ) -> Result<(), DBError> {
-        debug!("Marking password reset request as complete");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = request.mark_as_reset(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1218,7 +1210,6 @@ impl DBConnection for PostgresConnection {
 
     // Org implementations
     fn create_org(&self, new_org: NewOrg) -> Result<Org, DBError> {
-        debug!("Creating new org");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_org.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1228,7 +1219,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_org_by_id(&self, id: i32) -> Result<Org, DBError> {
-        debug!("Getting org by ID");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = Org::get_by_id(conn, id)?.ok_or(DBError::OrgNotFound);
         if let Err(ref e) = result {
@@ -1238,7 +1228,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_org_by_uuid(&self, uuid: Uuid) -> Result<Org, DBError> {
-        debug!("Getting org by UUID");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = Org::get_by_uuid(conn, uuid)?.ok_or(DBError::OrgNotFound);
         if let Err(ref e) = result {
@@ -1248,7 +1237,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_org_by_name(&self, name: &str) -> Result<Option<Org>, DBError> {
-        debug!("Getting org by name");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = Org::get_by_name(conn, name).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1258,7 +1246,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_all_orgs(&self) -> Result<Vec<Org>, DBError> {
-        debug!("Getting all orgs");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = Org::get_all(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1268,7 +1255,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn update_org(&self, org: &Org) -> Result<(), DBError> {
-        debug!("Updating org");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = org.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1278,7 +1264,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn delete_org(&self, org: &Org) -> Result<(), DBError> {
-        debug!("Deleting org");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = org.delete(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1289,7 +1274,6 @@ impl DBConnection for PostgresConnection {
 
     // Org project implementations
     fn create_org_project(&self, new_project: NewOrgProject) -> Result<OrgProject, DBError> {
-        debug!("Creating new org project");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_project.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1299,7 +1283,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_org_project_by_id(&self, id: i32) -> Result<OrgProject, DBError> {
-        debug!("Getting org project by ID");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgProject::get_by_id(conn, id)?.ok_or(DBError::OrgProjectNotFound);
         if let Err(ref e) = result {
@@ -1309,7 +1292,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_org_project_by_uuid(&self, uuid: Uuid) -> Result<OrgProject, DBError> {
-        debug!("Getting org project by UUID");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgProject::get_by_uuid(conn, uuid)?.ok_or(DBError::OrgProjectNotFound);
         if let Err(ref e) = result {
@@ -1319,7 +1301,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_org_project_by_client_id(&self, client_id: Uuid) -> Result<OrgProject, DBError> {
-        debug!("Getting org project by client ID");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result =
             OrgProject::get_by_client_id(conn, client_id)?.ok_or(DBError::OrgProjectNotFound);
@@ -1334,7 +1315,6 @@ impl DBConnection for PostgresConnection {
         name: &str,
         org_id: i32,
     ) -> Result<Option<OrgProject>, DBError> {
-        debug!("Getting org project by name and org");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgProject::get_by_name_and_org(conn, name, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1344,7 +1324,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_all_org_projects_for_org(&self, org_id: i32) -> Result<Vec<OrgProject>, DBError> {
-        debug!("Getting all org projects for org");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgProject::get_all_for_org(conn, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1354,7 +1333,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_active_org_projects_for_org(&self, org_id: i32) -> Result<Vec<OrgProject>, DBError> {
-        debug!("Getting active org projects for org");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgProject::get_active_for_org(conn, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1364,7 +1342,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn update_org_project(&self, project: &OrgProject) -> Result<(), DBError> {
-        debug!("Updating org project");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = project.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1374,7 +1351,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn delete_org_project(&self, project: &OrgProject) -> Result<(), DBError> {
-        debug!("Deleting org project");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = project.delete(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1388,7 +1364,6 @@ impl DBConnection for PostgresConnection {
         &self,
         new_secret: NewOrgProjectSecret,
     ) -> Result<OrgProjectSecret, DBError> {
-        debug!("Creating new org project secret");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_secret.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1398,7 +1373,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_org_project_secret_by_id(&self, id: i32) -> Result<OrgProjectSecret, DBError> {
-        debug!("Getting org project secret by ID");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result =
             OrgProjectSecret::get_by_id(conn, id)?.ok_or(DBError::OrgProjectSecretNotFound);
@@ -1413,7 +1387,6 @@ impl DBConnection for PostgresConnection {
         key_name: &str,
         project_id: i32,
     ) -> Result<Option<OrgProjectSecret>, DBError> {
-        debug!("Getting org project secret by key name and project");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgProjectSecret::get_by_key_name_and_project(conn, key_name, project_id)
             .map_err(DBError::from);
@@ -1430,7 +1403,6 @@ impl DBConnection for PostgresConnection {
         &self,
         project_id: i32,
     ) -> Result<Vec<OrgProjectSecret>, DBError> {
-        debug!("Getting all org project secrets for project");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgProjectSecret::get_all_for_project(conn, project_id).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1440,7 +1412,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn update_org_project_secret(&self, secret: &OrgProjectSecret) -> Result<(), DBError> {
-        debug!("Updating org project secret");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = secret.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1450,7 +1421,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn delete_org_project_secret(&self, secret: &OrgProjectSecret) -> Result<(), DBError> {
-        debug!("Deleting org project secret");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = secret.delete(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1461,7 +1431,6 @@ impl DBConnection for PostgresConnection {
 
     // Invite code implementations
     fn create_invite_code(&self, new_invite: NewInviteCode) -> Result<InviteCode, DBError> {
-        debug!("Creating new invite code");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_invite.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1471,7 +1440,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_invite_code_by_id(&self, id: i32) -> Result<InviteCode, DBError> {
-        debug!("Getting invite code by ID");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = InviteCode::get_by_id(conn, id)?.ok_or(DBError::InviteCodeNotFound);
         if let Err(ref e) = result {
@@ -1481,7 +1449,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_invite_code_by_code(&self, code: Uuid) -> Result<InviteCode, DBError> {
-        debug!("Getting invite code by code");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = InviteCode::get_by_code(conn, code)?.ok_or(DBError::InviteCodeNotFound);
         if let Err(ref e) = result {
@@ -1495,7 +1462,6 @@ impl DBConnection for PostgresConnection {
         email: &str,
         org_id: i32,
     ) -> Result<Option<InviteCode>, DBError> {
-        debug!("Getting invite code by email and org");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = InviteCode::get_by_email_and_org(conn, email, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1505,7 +1471,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_all_invite_codes_for_org(&self, org_id: i32) -> Result<Vec<InviteCode>, DBError> {
-        debug!("Getting all invite codes for org");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = InviteCode::get_all_for_org(conn, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1515,7 +1480,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn mark_invite_code_as_used(&self, invite: &InviteCode) -> Result<(), DBError> {
-        debug!("Marking invite code as used");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = invite.mark_as_used(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1525,7 +1489,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn update_invite_code(&self, invite: &InviteCode) -> Result<(), DBError> {
-        debug!("Updating invite code");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = invite.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1535,7 +1498,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn delete_invite_code(&self, invite: &InviteCode) -> Result<(), DBError> {
-        debug!("Deleting invite code");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = invite.delete(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1546,7 +1508,6 @@ impl DBConnection for PostgresConnection {
 
     // Platform user methods
     fn create_platform_user(&self, new_user: NewPlatformUser) -> Result<PlatformUser, DBError> {
-        debug!("Creating new platform user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_user.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1556,7 +1517,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_platform_user_by_id(&self, id: i32) -> Result<PlatformUser, DBError> {
-        debug!("Getting platform user by ID");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = PlatformUser::get_by_id(conn, id)?.ok_or(DBError::PlatformUserNotFound);
         if let Err(ref e) = result {
@@ -1566,7 +1526,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_platform_user_by_uuid(&self, uuid: Uuid) -> Result<PlatformUser, DBError> {
-        debug!("Getting platform user by UUID");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = PlatformUser::get_by_uuid(conn, uuid)?.ok_or(DBError::PlatformUserNotFound);
         if let Err(ref e) = result {
@@ -1576,7 +1535,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_platform_user_by_email(&self, email: &str) -> Result<Option<PlatformUser>, DBError> {
-        debug!("Getting platform user by email");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = PlatformUser::get_by_email(conn, email).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1586,7 +1544,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn update_platform_user(&self, user: &PlatformUser) -> Result<(), DBError> {
-        debug!("Updating platform user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = user.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1600,7 +1557,6 @@ impl DBConnection for PostgresConnection {
         user: &PlatformUser,
         new_password_enc: Vec<u8>,
     ) -> Result<(), DBError> {
-        debug!("Updating platform user password");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = user
             .update_password(conn, new_password_enc)
@@ -1616,7 +1572,6 @@ impl DBConnection for PostgresConnection {
         &self,
         new_membership: NewOrgMembership,
     ) -> Result<OrgMembership, DBError> {
-        debug!("Creating new org membership");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_membership
             .insert(conn)
@@ -1632,7 +1587,6 @@ impl DBConnection for PostgresConnection {
         platform_user_id: Uuid,
         org_id: i32,
     ) -> Result<OrgMembership, DBError> {
-        debug!("Getting org membership by platform user and org");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgMembership::get_by_platform_user_and_org(conn, platform_user_id, org_id)
             .map_err(DBError::from);
@@ -1650,7 +1604,6 @@ impl DBConnection for PostgresConnection {
         platform_user_id: Uuid,
         org_id: i32,
     ) -> Result<OrgMembershipWithUser, DBError> {
-        debug!("Getting org membership with user info by platform user and org");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result =
             OrgMembership::get_by_platform_user_and_org_with_user(conn, platform_user_id, org_id)
@@ -1668,7 +1621,6 @@ impl DBConnection for PostgresConnection {
         &self,
         platform_user_id: Uuid,
     ) -> Result<Vec<OrgMembership>, DBError> {
-        debug!("Getting all org memberships for platform user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result =
             OrgMembership::get_all_for_platform_user(conn, platform_user_id).map_err(DBError::from);
@@ -1682,7 +1634,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_all_org_memberships_for_org(&self, org_id: i32) -> Result<Vec<OrgMembership>, DBError> {
-        debug!("Getting all org memberships for org");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgMembership::get_all_for_org(conn, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1695,7 +1646,6 @@ impl DBConnection for PostgresConnection {
         &self,
         org_id: i32,
     ) -> Result<Vec<OrgMembershipWithUser>, DBError> {
-        debug!("Getting all org memberships with users for org");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgMembership::get_all_with_users_for_org(conn, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1708,7 +1658,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn update_org_membership(&self, membership: &OrgMembership) -> Result<(), DBError> {
-        debug!("Updating org membership");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = membership.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1718,7 +1667,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn delete_org_membership(&self, membership: &OrgMembership) -> Result<(), DBError> {
-        debug!("Deleting org membership");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = membership.delete(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1732,7 +1680,6 @@ impl DBConnection for PostgresConnection {
         membership: &mut OrgMembership,
         new_role: OrgRole,
     ) -> Result<(), DBError> {
-        debug!("Updating org membership role with owner check");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgMembership::update_role_with_owner_check(conn, membership, new_role)
             .map_err(|e| match e {
@@ -1753,7 +1700,6 @@ impl DBConnection for PostgresConnection {
         &self,
         membership: &OrgMembership,
     ) -> Result<(), DBError> {
-        debug!("Deleting org membership with owner check");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result =
             OrgMembership::delete_with_owner_check(conn, membership).map_err(|e| match e {
@@ -1777,7 +1723,6 @@ impl DBConnection for PostgresConnection {
         page: Option<i64>,
         per_page: Option<i64>,
     ) -> Result<(Vec<User>, i64), DBError> {
-        debug!("Getting all users for project");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         // Get total count first
@@ -1793,7 +1738,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn create_org_with_owner(&self, new_org: NewOrg, owner_id: Uuid) -> Result<Org, DBError> {
-        debug!("Creating new organization with owner");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         conn.transaction(|conn| {
@@ -1813,7 +1757,6 @@ impl DBConnection for PostgresConnection {
         invite: &InviteCode,
         new_membership: NewOrgMembership,
     ) -> Result<OrgMembership, DBError> {
-        debug!("Starting invite acceptance transaction");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         conn.transaction(|conn| {
@@ -1833,7 +1776,6 @@ impl DBConnection for PostgresConnection {
         project_id: i32,
         category: SettingCategory,
     ) -> Result<Option<ProjectSetting>, DBError> {
-        debug!("Getting project settings");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         ProjectSetting::get_by_project_and_category(conn, project_id, category)
             .map_err(DBError::from)
@@ -1845,7 +1787,6 @@ impl DBConnection for PostgresConnection {
         category: SettingCategory,
         settings: serde_json::Value,
     ) -> Result<ProjectSetting, DBError> {
-        debug!("Updating project settings");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         // Check if settings exist
@@ -1870,7 +1811,6 @@ impl DBConnection for PostgresConnection {
         &self,
         project_id: i32,
     ) -> Result<Option<EmailSettings>, DBError> {
-        debug!("Getting project email settings");
         let settings = self.get_project_settings(project_id, SettingCategory::Email)?;
 
         match settings {
@@ -1884,7 +1824,6 @@ impl DBConnection for PostgresConnection {
         project_id: i32,
         settings: EmailSettings,
     ) -> Result<ProjectSetting, DBError> {
-        debug!("Updating project email settings");
         let new_settings = NewProjectSetting::new_email_settings(project_id, settings)?;
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
@@ -1905,7 +1844,6 @@ impl DBConnection for PostgresConnection {
         &self,
         project_id: i32,
     ) -> Result<Option<OAuthSettings>, DBError> {
-        debug!("Getting project OAuth settings");
         let settings = self.get_project_settings(project_id, SettingCategory::OAuth)?;
 
         match settings {
@@ -1919,7 +1857,6 @@ impl DBConnection for PostgresConnection {
         project_id: i32,
         settings: OAuthSettings,
     ) -> Result<ProjectSetting, DBError> {
-        debug!("Updating project OAuth settings");
         let new_settings = NewProjectSetting::new_oauth_settings(project_id, settings)?;
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
@@ -1941,7 +1878,6 @@ impl DBConnection for PostgresConnection {
         &self,
         new_verification: NewPlatformEmailVerification,
     ) -> Result<PlatformEmailVerification, DBError> {
-        debug!("Creating new platform email verification");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_verification.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -1954,7 +1890,6 @@ impl DBConnection for PostgresConnection {
         &self,
         id: i32,
     ) -> Result<PlatformEmailVerification, DBError> {
-        debug!("Getting platform email verification by ID");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = PlatformEmailVerification::get_by_id(conn, id)?
             .ok_or(DBError::PlatformEmailVerificationNotFound);
@@ -1968,7 +1903,6 @@ impl DBConnection for PostgresConnection {
         &self,
         platform_user_id: Uuid,
     ) -> Result<PlatformEmailVerification, DBError> {
-        debug!("Getting platform email verification by platform user ID");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = PlatformEmailVerification::get_by_platform_user_id(conn, platform_user_id)?
             .ok_or(DBError::PlatformEmailVerificationNotFound);
@@ -1985,7 +1919,6 @@ impl DBConnection for PostgresConnection {
         &self,
         code: Uuid,
     ) -> Result<PlatformEmailVerification, DBError> {
-        debug!("Getting platform email verification by code");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = PlatformEmailVerification::get_by_verification_code(conn, code)?
             .ok_or(DBError::PlatformEmailVerificationNotFound);
@@ -1999,7 +1932,6 @@ impl DBConnection for PostgresConnection {
         &self,
         verification: &PlatformEmailVerification,
     ) -> Result<(), DBError> {
-        debug!("Updating platform email verification");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = verification.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -2012,7 +1944,6 @@ impl DBConnection for PostgresConnection {
         &self,
         verification: &PlatformEmailVerification,
     ) -> Result<(), DBError> {
-        debug!("Deleting platform email verification");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = verification.delete(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -2025,7 +1956,6 @@ impl DBConnection for PostgresConnection {
         &self,
         verification: &mut PlatformEmailVerification,
     ) -> Result<(), DBError> {
-        debug!("Verifying platform email");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = verification.verify(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -2039,7 +1969,6 @@ impl DBConnection for PostgresConnection {
         &self,
         new_request: NewPlatformPasswordResetRequest,
     ) -> Result<PlatformPasswordResetRequest, DBError> {
-        debug!("Creating new platform password reset request");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_request.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -2053,7 +1982,6 @@ impl DBConnection for PostgresConnection {
         user_id: Uuid,
         encrypted_code: Vec<u8>,
     ) -> Result<Option<PlatformPasswordResetRequest>, DBError> {
-        debug!("Getting platform password reset request by user_id and encrypted code");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result =
             PlatformPasswordResetRequest::get_by_user_id_and_code(conn, user_id, &encrypted_code)
@@ -2068,7 +1996,6 @@ impl DBConnection for PostgresConnection {
         &self,
         request: &PlatformPasswordResetRequest,
     ) -> Result<(), DBError> {
-        debug!("Marking platform password reset request as complete");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = request.mark_as_reset(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -2096,7 +2023,6 @@ impl DBConnection for PostgresConnection {
 
     // User API key implementations
     fn create_user_api_key(&self, new_key: NewUserApiKey) -> Result<UserApiKey, DBError> {
-        debug!("Creating new user API key");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_key.insert(conn).map_err(DBError::from)
     }
@@ -2128,13 +2054,11 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_all_user_api_keys_for_user(&self, user_id: Uuid) -> Result<Vec<UserApiKey>, DBError> {
-        debug!("Getting all API keys for user: {}", user_id);
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         UserApiKey::get_all_for_user(conn, user_id).map_err(DBError::from)
     }
 
     fn delete_user_api_key(&self, id: i32, user_id: Uuid) -> Result<(), DBError> {
-        debug!("Deleting API key {} for user {}", id, user_id);
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         // First verify the key belongs to the user
         // Use the same error for both "not found" and "unauthorized" to prevent information disclosure
@@ -2147,7 +2071,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn delete_user_api_key_by_name(&self, name: &str, user_id: Uuid) -> Result<(), DBError> {
-        debug!("Deleting API key '{}' for user {}", name, user_id);
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         // First find the key by name and user_id, then delete it
         // Use the same error for both "not found" and "unauthorized" to prevent information disclosure
@@ -2162,7 +2085,6 @@ impl DBConnection for PostgresConnection {
         &self,
         new_request: NewAccountDeletionRequest,
     ) -> Result<AccountDeletionRequest, DBError> {
-        debug!("Creating new account deletion request");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_request.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -2176,7 +2098,6 @@ impl DBConnection for PostgresConnection {
         user_id: Uuid,
         encrypted_code: Vec<u8>,
     ) -> Result<Option<AccountDeletionRequest>, DBError> {
-        debug!("Getting account deletion request by user_id and encrypted code");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result =
             AccountDeletionRequest::get_by_user_id_and_code(conn, user_id, &encrypted_code)
@@ -2191,7 +2112,6 @@ impl DBConnection for PostgresConnection {
         &self,
         request: &AccountDeletionRequest,
     ) -> Result<(), DBError> {
-        debug!("Marking account deletion request as complete");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = request.mark_as_deleted(conn).map_err(DBError::from);
         if let Err(ref e) = result {
@@ -2204,7 +2124,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn delete_user(&self, user: &User) -> Result<(), DBError> {
-        debug!("Deleting user with UUID: {}", user.uuid);
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         // Use the User model's delete method
@@ -2243,7 +2162,6 @@ impl DBConnection for PostgresConnection {
         &self,
         new_conversation: NewConversation,
     ) -> Result<Conversation, DBError> {
-        debug!("Creating new conversation");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_conversation.insert(conn).map_err(DBError::from)
     }
@@ -2254,8 +2172,6 @@ impl DBConnection for PostgresConnection {
     ) -> Result<ConversationProject, DBError> {
         use crate::models::schema::users;
         use diesel::prelude::*;
-
-        debug!("Creating new conversation project");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         conn.transaction::<ConversationProject, ResponsesError, _>(|tx| {
@@ -2279,7 +2195,6 @@ impl DBConnection for PostgresConnection {
         conversation_id: i64,
         user_id: Uuid,
     ) -> Result<Conversation, DBError> {
-        debug!("Getting conversation by ID and user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Conversation::get_by_id_and_user(conn, conversation_id, user_id).map_err(DBError::from)
     }
@@ -2289,7 +2204,6 @@ impl DBConnection for PostgresConnection {
         conversation_uuid: Uuid,
         user_id: Uuid,
     ) -> Result<Conversation, DBError> {
-        debug!("Getting conversation by UUID and user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Conversation::get_by_uuid_and_user(conn, conversation_uuid, user_id).map_err(DBError::from)
     }
@@ -2299,7 +2213,6 @@ impl DBConnection for PostgresConnection {
         project_id: i64,
         user_id: Uuid,
     ) -> Result<ConversationProject, DBError> {
-        debug!("Getting conversation project by ID and user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         ConversationProject::get_by_id_and_user(conn, project_id, user_id).map_err(DBError::from)
     }
@@ -2309,7 +2222,6 @@ impl DBConnection for PostgresConnection {
         project_uuid: Uuid,
         user_id: Uuid,
     ) -> Result<ConversationProject, DBError> {
-        debug!("Getting conversation project by UUID and user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         ConversationProject::get_by_uuid_and_user(conn, project_uuid, user_id)
             .map_err(DBError::from)
@@ -2321,7 +2233,6 @@ impl DBConnection for PostgresConnection {
         user_id: Uuid,
         metadata_enc: Vec<u8>,
     ) -> Result<Conversation, DBError> {
-        debug!("Updating conversation metadata");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Conversation::update_metadata(conn, conversation_id, user_id, metadata_enc)
             .map_err(DBError::from)
@@ -2335,7 +2246,6 @@ impl DBConnection for PostgresConnection {
         project_id: Option<Option<i64>>,
         is_pinned: Option<bool>,
     ) -> Result<Conversation, DBError> {
-        debug!("Updating conversation");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Conversation::update(
             conn,
@@ -2354,7 +2264,6 @@ impl DBConnection for PostgresConnection {
         user_id: Uuid,
         target_project_id: Option<i64>,
     ) -> Result<(), DBError> {
-        debug!("Batch updating conversation projects");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Conversation::batch_update_project(conn, conversation_uuids, user_id, target_project_id)
             .map_err(DBError::from)
@@ -2369,7 +2278,6 @@ impl DBConnection for PostgresConnection {
         project_filter: ConversationProjectFilter,
         pinned: Option<bool>,
     ) -> Result<Vec<Conversation>, DBError> {
-        debug!("Listing conversations for user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Conversation::list_for_user(conn, user_id, limit, after, order, project_filter, pinned)
             .map_err(DBError::from)
@@ -2382,7 +2290,6 @@ impl DBConnection for PostgresConnection {
         after: Option<Uuid>,
         order: &str,
     ) -> Result<Vec<ConversationProject>, DBError> {
-        debug!("Listing conversation projects for user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         ConversationProject::list_for_user(conn, user_id, limit, after, order)
             .map_err(DBError::from)
@@ -2395,7 +2302,6 @@ impl DBConnection for PostgresConnection {
         name_enc: Option<Vec<u8>>,
         instruction_update: ProjectInstructionUpdate,
     ) -> Result<ConversationProject, DBError> {
-        debug!("Updating conversation project");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         use crate::models::schema::{conversation_projects, user_instructions};
@@ -2492,26 +2398,22 @@ impl DBConnection for PostgresConnection {
     }
 
     fn delete_conversation(&self, conversation_id: i64, user_id: Uuid) -> Result<(), DBError> {
-        debug!("Deleting conversation");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Conversation::delete_by_id_and_user(conn, conversation_id, user_id).map_err(DBError::from)
     }
 
     fn delete_all_conversations(&self, user_id: Uuid) -> Result<(), DBError> {
-        debug!("Deleting all conversations for user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Conversation::delete_all_for_user(conn, user_id).map_err(DBError::from)
     }
 
     fn delete_conversation_project(&self, project_id: i64, user_id: Uuid) -> Result<(), DBError> {
-        debug!("Deleting conversation project");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         ConversationProject::delete_by_id_and_user(conn, project_id, user_id).map_err(DBError::from)
     }
 
     // Responses (job tracker) implementations
     fn create_response(&self, new_response: NewResponse) -> Result<Response, DBError> {
-        debug!("Creating new response");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_response.insert(conn).map_err(DBError::from)
     }
@@ -2521,7 +2423,6 @@ impl DBConnection for PostgresConnection {
         uuid: Uuid,
         user_id: Uuid,
     ) -> Result<Response, DBError> {
-        debug!("Getting response by UUID and user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Response::get_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
     }
@@ -2532,19 +2433,16 @@ impl DBConnection for PostgresConnection {
         status: ResponseStatus,
         completed_at: Option<DateTime<Utc>>,
     ) -> Result<(), DBError> {
-        debug!("Updating response status");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Response::update_status(conn, id, status, completed_at).map_err(DBError::from)
     }
 
     fn cancel_response(&self, uuid: Uuid, user_id: Uuid) -> Result<Response, DBError> {
-        debug!("Cancelling response");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Response::cancel_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
     }
 
     fn delete_response(&self, uuid: Uuid, user_id: Uuid) -> Result<(), DBError> {
-        debug!("Deleting response");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Response::delete_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
     }
@@ -2560,7 +2458,6 @@ impl DBConnection for PostgresConnection {
         message_uuid: Uuid,
         assistant_message_uuid: Option<Uuid>,
     ) -> Result<(Conversation, Option<Response>, UserMessage), DBError> {
-        debug!("Creating conversation with response and message");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         NewConversation::create_with_response_and_message(
             conn,
@@ -2581,7 +2478,6 @@ impl DBConnection for PostgresConnection {
         &self,
         user_id: Uuid,
     ) -> Result<Option<UserInstruction>, DBError> {
-        debug!("Getting default user instruction for user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         use crate::models::schema::user_instructions;
@@ -2601,7 +2497,6 @@ impl DBConnection for PostgresConnection {
         project_id: i64,
         user_id: Uuid,
     ) -> Result<Option<UserInstruction>, DBError> {
-        debug!("Getting project instruction for project");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         use crate::models::schema::user_instructions;
@@ -2620,7 +2515,6 @@ impl DBConnection for PostgresConnection {
         conversation_id: i64,
         user_id: Uuid,
     ) -> Result<Option<UserInstruction>, DBError> {
-        debug!("Getting project instruction for conversation");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         use crate::models::schema::{conversations, user_instructions};
@@ -2653,7 +2547,6 @@ impl DBConnection for PostgresConnection {
         uuid: Uuid,
         user_id: Uuid,
     ) -> Result<UserInstruction, DBError> {
-        debug!("Getting user instruction by UUID for user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         use crate::models::schema::user_instructions;
@@ -2676,7 +2569,6 @@ impl DBConnection for PostgresConnection {
         &self,
         new_instruction: NewUserInstruction,
     ) -> Result<UserInstruction, DBError> {
-        debug!("Creating new user instruction");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         use crate::models::schema::user_instructions;
@@ -2711,7 +2603,6 @@ impl DBConnection for PostgresConnection {
         prompt_tokens: i32,
         is_default: bool,
     ) -> Result<UserInstruction, DBError> {
-        debug!("Updating user instruction");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         use crate::models::schema::user_instructions;
@@ -2750,7 +2641,6 @@ impl DBConnection for PostgresConnection {
     }
 
     fn delete_user_instruction(&self, id: i64, user_id: Uuid) -> Result<(), DBError> {
-        debug!("Deleting user instruction");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         use crate::models::schema::user_instructions;
@@ -2781,7 +2671,6 @@ impl DBConnection for PostgresConnection {
         after: Option<Uuid>,
         order: &str,
     ) -> Result<Vec<UserInstruction>, DBError> {
-        debug!("Listing user instructions");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         use crate::models::schema::user_instructions;
@@ -2845,7 +2734,6 @@ impl DBConnection for PostgresConnection {
         id: i64,
         user_id: Uuid,
     ) -> Result<UserInstruction, DBError> {
-        debug!("Setting default user instruction");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
 
         use crate::models::schema::user_instructions;
@@ -2880,7 +2768,6 @@ impl DBConnection for PostgresConnection {
 
     // User messages
     fn create_user_message(&self, new_msg: NewUserMessage) -> Result<UserMessage, DBError> {
-        debug!("Creating new user message");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_msg.insert(conn).map_err(DBError::from)
     }
@@ -2890,7 +2777,6 @@ impl DBConnection for PostgresConnection {
         id: i64,
         prompt_tokens: i32,
     ) -> Result<(), DBError> {
-        debug!("Updating user message prompt tokens");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         use crate::models::schema::user_messages;
         use diesel::prelude::*;
@@ -2903,13 +2789,11 @@ impl DBConnection for PostgresConnection {
     }
 
     fn get_user_message(&self, id: i64, user_id: Uuid) -> Result<UserMessage, DBError> {
-        debug!("Getting user message by ID and user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         UserMessage::get_by_id_and_user(conn, id, user_id).map_err(DBError::from)
     }
 
     fn get_user_message_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<UserMessage, DBError> {
-        debug!("Getting user message by UUID and user");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         UserMessage::get_by_uuid_and_user(conn, uuid, user_id).map_err(DBError::from)
     }
@@ -2919,7 +2803,6 @@ impl DBConnection for PostgresConnection {
         &self,
         new_msg: NewAssistantMessage,
     ) -> Result<AssistantMessage, DBError> {
-        debug!("Creating new assistant message");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_msg.insert(conn).map_err(DBError::from)
     }
@@ -2930,7 +2813,6 @@ impl DBConnection for PostgresConnection {
     ) -> Result<Option<AssistantMessage>, DBError> {
         use crate::models::schema::assistant_messages::dsl::*;
         use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, RunQueryDsl};
-        debug!("Getting assistant message by UUID: {}", message_uuid);
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         assistant_messages
             .filter(uuid.eq(message_uuid))
@@ -2947,7 +2829,6 @@ impl DBConnection for PostgresConnection {
         status: String,
         finish_reason: Option<String>,
     ) -> Result<AssistantMessage, DBError> {
-        debug!("Updating assistant message {}", message_uuid);
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         AssistantMessage::update(
             conn,
@@ -2962,7 +2843,6 @@ impl DBConnection for PostgresConnection {
 
     // Reasoning items
     fn create_reasoning_item(&self, new_item: NewReasoningItem) -> Result<ReasoningItem, DBError> {
-        debug!("Creating new reasoning item");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_item.insert(conn).map_err(DBError::from)
     }
@@ -2974,7 +2854,6 @@ impl DBConnection for PostgresConnection {
         reasoning_tokens: i32,
         status: String,
     ) -> Result<ReasoningItem, DBError> {
-        debug!("Updating reasoning item {}", item_uuid);
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         ReasoningItem::update(conn, item_uuid, content_enc, reasoning_tokens, status)
             .map_err(DBError::from)
@@ -2982,19 +2861,16 @@ impl DBConnection for PostgresConnection {
 
     // Tool calls / outputs
     fn create_tool_call(&self, new_call: NewToolCall) -> Result<ToolCall, DBError> {
-        debug!("Creating new tool call");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_call.insert(conn).map_err(DBError::from)
     }
 
     fn get_tool_call_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<ToolCall, DBError> {
-        debug!("Getting tool call by UUID: {} for user: {}", uuid, user_id);
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         ToolCall::get_by_uuid(conn, uuid, user_id).map_err(DBError::from)
     }
 
     fn create_tool_output(&self, new_output: NewToolOutput) -> Result<ToolOutput, DBError> {
-        debug!("Creating new tool output");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_output.insert(conn).map_err(DBError::from)
     }
@@ -3007,7 +2883,6 @@ impl DBConnection for PostgresConnection {
         after: Option<Uuid>,
         order: &str,
     ) -> Result<Vec<RawThreadMessage>, DBError> {
-        debug!("Getting conversation context messages");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         RawThreadMessage::get_conversation_context(conn, conversation_id, limit, after, order)
             .map_err(DBError::from)
@@ -3017,7 +2892,6 @@ impl DBConnection for PostgresConnection {
         &self,
         response_id: i64,
     ) -> Result<Vec<RawThreadMessage>, DBError> {
-        debug!("Getting response context messages");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         RawThreadMessage::get_response_context(conn, response_id).map_err(DBError::from)
     }
@@ -3027,7 +2901,6 @@ impl DBConnection for PostgresConnection {
         &self,
         conversation_id: i64,
     ) -> Result<Vec<RawThreadMessageMetadata>, DBError> {
-        debug!("Getting conversation context metadata (lightweight)");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         RawThreadMessageMetadata::get_conversation_context_metadata(conn, conversation_id)
             .map_err(DBError::from)
@@ -3038,14 +2911,12 @@ impl DBConnection for PostgresConnection {
         conversation_id: i64,
         message_ids: &[(String, i64)],
     ) -> Result<Vec<RawThreadMessage>, DBError> {
-        debug!("Getting {} specific messages by ID", message_ids.len());
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         RawThreadMessage::get_messages_by_ids(conn, conversation_id, message_ids)
             .map_err(DBError::from)
     }
 
     fn delete_user_message(&self, id: Uuid, user_id: Uuid) -> Result<(), DBError> {
-        debug!("Deleting user message");
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         // First get the message by UUID to find its ID
         let msg = UserMessage::get_by_uuid_and_user(conn, id, user_id)?;

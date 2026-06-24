@@ -343,8 +343,6 @@ pub async fn send_hello_email(
     project_id: i32,
     to_email: String,
 ) -> Result<(), EmailError> {
-    tracing::debug!("Entering send_hello_email");
-
     // Get project name
     let project = app_state
         .db
@@ -380,8 +378,6 @@ pub async fn send_hello_email(
         tracing::error!("Failed to send email: {}", e);
         EmailError::UnknownError
     });
-
-    tracing::debug!("Exiting send_hello_email");
     Ok(())
 }
 
@@ -391,8 +387,6 @@ pub async fn send_verification_email(
     to_email: String,
     verification_code: uuid::Uuid,
 ) -> Result<(), EmailError> {
-    tracing::debug!("Entering send_verification_email");
-
     let (api_key, from_email) = get_project_email_settings(app_state, project_id).await?;
     let resend = Resend::new(&api_key);
 
@@ -472,8 +466,6 @@ pub async fn send_verification_email(
         tracing::error!("Failed to send email: {}", e);
         EmailError::UnknownError
     });
-
-    tracing::debug!("Exiting send_verification_email");
     Ok(())
 }
 
@@ -483,8 +475,6 @@ pub async fn send_password_reset_email(
     to_email: String,
     alphanumeric_code: String,
 ) -> Result<(), EmailError> {
-    tracing::debug!("Entering send_password_reset_email");
-
     let (api_key, from_email) = get_project_email_settings(app_state, project_id).await?;
     let resend = Resend::new(&api_key);
 
@@ -543,8 +533,6 @@ pub async fn send_password_reset_email(
         tracing::error!("Failed to send email: {}", e);
         EmailError::UnknownError
     });
-
-    tracing::debug!("Exiting send_password_reset_email");
     Ok(())
 }
 
@@ -553,8 +541,6 @@ pub async fn send_password_reset_confirmation_email(
     project_id: i32,
     to_email: String,
 ) -> Result<(), EmailError> {
-    tracing::debug!("Entering send_password_reset_confirmation_email");
-
     let (api_key, from_email) = get_project_email_settings(app_state, project_id).await?;
     let resend = Resend::new(&api_key);
 
@@ -615,8 +601,6 @@ pub async fn send_password_reset_confirmation_email(
         tracing::error!("Failed to send email: {}", e);
         EmailError::UnknownError
     });
-
-    tracing::debug!("Exiting send_password_reset_confirmation_email");
     Ok(())
 }
 
@@ -626,8 +610,6 @@ pub async fn send_platform_verification_email(
     to_email: String,
     verification_code: uuid::Uuid,
 ) -> Result<(), EmailError> {
-    tracing::debug!("Entering send_verification_email");
-
     if resend_api_key.is_none() {
         return Err(EmailError::ApiKeyNotFound);
     }
@@ -692,8 +674,6 @@ pub async fn send_platform_verification_email(
         tracing::error!("Failed to send email: {}", e);
         EmailError::UnknownError
     });
-
-    tracing::debug!("Exiting send_verification_email");
     Ok(())
 }
 
@@ -705,7 +685,6 @@ pub async fn send_platform_invite_email(
     invite_code: Uuid,
     org_id: Uuid,
 ) -> Result<(), EmailError> {
-    tracing::debug!("Entering send_platform_invite_email");
     if resend_api_key.is_none() {
         return Err(EmailError::ApiKeyNotFound);
     }
@@ -770,8 +749,6 @@ pub async fn send_platform_invite_email(
         tracing::error!("Failed to send email: {}", e);
         EmailError::UnknownError
     });
-
-    tracing::debug!("Exiting send_platform_invite_email");
     Ok(())
 }
 
@@ -791,8 +768,6 @@ pub async fn send_platform_password_reset_email(
     to_email: String,
     alphanumeric_code: String,
 ) -> Result<(), EmailError> {
-    tracing::debug!("Entering send_platform_password_reset_email");
-
     if resend_api_key.is_none() {
         return Err(EmailError::ApiKeyNotFound);
     }
@@ -858,8 +833,6 @@ pub async fn send_platform_password_reset_email(
         tracing::error!("Failed to send email: {}", e);
         EmailError::UnknownError
     });
-
-    tracing::debug!("Exiting send_platform_password_reset_email");
     Ok(())
 }
 
@@ -868,8 +841,6 @@ pub async fn send_platform_password_reset_confirmation_email(
     resend_api_key: Option<String>,
     to_email: String,
 ) -> Result<(), EmailError> {
-    tracing::debug!("Entering send_platform_password_reset_confirmation_email");
-
     if resend_api_key.is_none() {
         return Err(EmailError::ApiKeyNotFound);
     }
@@ -917,8 +888,6 @@ pub async fn send_platform_password_reset_confirmation_email(
         tracing::error!("Failed to send email: {}", e);
         EmailError::UnknownError
     });
-
-    tracing::debug!("Exiting send_platform_password_reset_confirmation_email");
     Ok(())
 }
 
@@ -928,8 +897,6 @@ pub async fn send_account_deletion_email(
     to_email: String,
     confirmation_code: String,
 ) -> Result<(), EmailError> {
-    tracing::debug!("Entering send_account_deletion_email");
-
     let (api_key, from_email) = get_project_email_settings(app_state, project_id).await?;
     let resend = Resend::new(&api_key);
 
@@ -989,8 +956,6 @@ pub async fn send_account_deletion_email(
         tracing::error!("Failed to send email: {}", e);
         EmailError::UnknownError
     });
-
-    tracing::debug!("Exiting send_account_deletion_email");
     Ok(())
 }
 
@@ -999,8 +964,6 @@ pub async fn send_account_deletion_confirmation_email(
     project_id: i32,
     to_email: String,
 ) -> Result<(), EmailError> {
-    tracing::debug!("Entering send_account_deletion_confirmation_email");
-
     let (api_key, from_email) = get_project_email_settings(app_state, project_id).await?;
     let resend = Resend::new(&api_key);
 
@@ -1056,7 +1019,5 @@ pub async fn send_account_deletion_confirmation_email(
         tracing::error!("Failed to send email: {}", e);
         EmailError::UnknownError
     });
-
-    tracing::debug!("Exiting send_account_deletion_confirmation_email");
     Ok(())
 }

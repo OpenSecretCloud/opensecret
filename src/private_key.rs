@@ -6,7 +6,7 @@ use bitcoin::{
 };
 use secp256k1::SecretKey;
 use std::{str::FromStr, sync::Arc};
-use tracing::{debug, error, info};
+use tracing::error;
 
 use crate::{
     aws_credentials::AwsCredentialManager, encrypt::generate_random_enclave,
@@ -65,41 +65,28 @@ fn derive_mnemonic_to_key(
     seed_phrase_derivation_path: Option<&str>,
 ) -> Result<SecretKey, Error> {
     // If seed_phrase_derivation_path is provided, derive a child mnemonic using BIP-85
-    let (source_mnemonic, uses_bip85) = if let Some(bip85_path) = seed_phrase_derivation_path {
-        info!("Using BIP-85 derivation with path: {}", bip85_path);
-        (
-            derive_bip85_mnemonic_from_root(root_mnemonic, bip85_path)?,
-            true,
-        )
+    let source_mnemonic = if let Some(bip85_path) = seed_phrase_derivation_path {
+        derive_bip85_mnemonic_from_root(root_mnemonic, bip85_path)?
     } else {
-        debug!("Using root mnemonic (no BIP-85 derivation)");
-        (root_mnemonic, false)
+        root_mnemonic
     };
 
     // Generate seed from the appropriate mnemonic (either the root or the BIP-85 derived one)
-    info!(
-        "Generating seed from {} mnemonic",
-        if uses_bip85 { "BIP-85 derived" } else { "root" }
-    );
     let seed = source_mnemonic.to_seed("");
 
     // Create extended private key from the seed
-    debug!("Creating extended private key from seed");
     let xprivkey = Xpriv::new_master(Network::Bitcoin, &seed)
         .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
     // If a derivation path is provided, derive the child key
     if let Some(path) = derivation_path {
-        info!("Deriving child key with BIP-32 path: {}", path);
         let path = DerivationPath::from_str(path)
             .map_err(|e| Error::InvalidDerivationPath(e.to_string()))?;
         let derived_key = xprivkey
             .derive_priv(&secp256k1::Secp256k1::new(), &path)
             .map_err(|e| Error::KeyDerivationError(e.to_string()))?;
-        debug!("Successfully derived child key using BIP-32 path");
         Ok(derived_key.private_key)
     } else {
-        debug!("Using master key (no BIP-32 derivation)");
         Ok(xprivkey.private_key)
     }
 }
@@ -142,13 +129,7 @@ pub fn decrypt_and_derive_bip85_mnemonic(
     encrypted_seed: Vec<u8>,
     bip85_path: &str,
 ) -> Result<Mnemonic, Error> {
-    info!(
-        "Starting BIP-85 mnemonic derivation with path: {}",
-        bip85_path
-    );
-
     // 1. Validate BIP-85 path format
-    debug!("Validating BIP-85 path format");
     // Convert ApiError to our Error type
     validate_bip85_path(bip85_path).map_err(|_| {
         error!("BIP-85 path validation failed: {}", bip85_path);
@@ -156,7 +137,6 @@ pub fn decrypt_and_derive_bip85_mnemonic(
     })?;
 
     // 2. Decrypt user root mnemonic
-    debug!("Decrypting user root mnemonic");
     let root_mnemonic = decrypt_user_seed_to_mnemonic(enclave_key, encrypted_seed)?;
     derive_bip85_mnemonic_from_root(root_mnemonic, bip85_path)
 }
@@ -165,13 +145,7 @@ pub fn derive_bip85_mnemonic_from_root(
     root_mnemonic: Mnemonic,
     bip85_path: &str,
 ) -> Result<Mnemonic, Error> {
-    info!(
-        "Starting BIP-85 mnemonic derivation with path: {}",
-        bip85_path
-    );
-
     // 1. Validate BIP-85 path format
-    debug!("Validating BIP-85 path format");
     // Convert ApiError to our Error type
     validate_bip85_path(bip85_path).map_err(|_| {
         error!("BIP-85 path validation failed: {}", bip85_path);
@@ -181,7 +155,6 @@ pub fn derive_bip85_mnemonic_from_root(
     let root_seed = root_mnemonic.to_seed("");
 
     // 2. Convert root_seed to Xpriv
-    debug!("Converting root seed to extended private key");
     let secp = Secp256k1::new();
     let xpriv = Xpriv::new_master(Network::Bitcoin, &root_seed).map_err(|e| {
         error!("Failed to create master key from seed: {}", e);
@@ -189,7 +162,6 @@ pub fn derive_bip85_mnemonic_from_root(
     })?;
 
     // 3. Parse the BIP-85 path to extract required parameters
-    debug!("Parsing BIP-85 path to extract parameters");
     // Safe to unwrap these values since we already validated the path
     let segments: Vec<&str> = bip85_path.split('/').collect();
 
@@ -220,22 +192,12 @@ pub fn derive_bip85_mnemonic_from_root(
     })?;
 
     // 4. Use the bip85_extended crate to derive the mnemonic
-    info!(
-        "Deriving BIP-85 mnemonic with {} words at index {}",
-        word_count, index
-    );
     let bip85_mnemonic_result =
         bip85_extended::mnemonic::to_mnemonic(&secp, &xpriv, word_count, index);
 
     // 5. Return the derived mnemonic or convert error
     match bip85_mnemonic_result {
-        Ok(derived_mnemonic) => {
-            info!(
-                "Successfully derived BIP-85 mnemonic with {} words",
-                word_count
-            );
-            Ok(derived_mnemonic)
-        }
+        Ok(derived_mnemonic) => Ok(derived_mnemonic),
         Err(e) => {
             error!("BIP-85 derivation failed: {}, path: {}", e, bip85_path);
             Err(Error::KeyDerivationError(format!(

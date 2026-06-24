@@ -584,7 +584,6 @@ pub async fn validate_jwt(
     mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    tracing::debug!("Entering validate_jwt");
     let token = match req
         .headers()
         .get(header::AUTHORIZATION)
@@ -638,7 +637,6 @@ pub async fn validate_jwt(
 
     req.extensions_mut().insert(auth_context);
     req.extensions_mut().insert(user);
-    tracing::debug!("Exiting validate_jwt");
     next.run(req).await
 }
 
@@ -647,7 +645,6 @@ pub async fn validate_platform_jwt(
     mut req: Request<Body>,
     next: Next,
 ) -> impl IntoResponse {
-    tracing::debug!("Entering validate_platform_jwt");
     let token = match req
         .headers()
         .get(header::AUTHORIZATION)
@@ -682,7 +679,6 @@ pub async fn validate_platform_jwt(
     };
 
     req.extensions_mut().insert(platform_user);
-    tracing::debug!("Exiting validate_platform_jwt");
     next.run(req).await
 }
 

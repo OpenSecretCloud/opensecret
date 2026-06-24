@@ -134,24 +134,17 @@ pub struct KeyOptions {
 impl KeyOptions {
     /// Validates both derivation paths if present.
     pub fn validate(&self) -> Result<(), ApiError> {
-        debug!("Validating key options");
-
         // Validate private_key_derivation_path if present
         if let Some(ref path) = self.private_key_derivation_path {
-            debug!("Validating BIP-32 derivation path: {}", path);
             validate_path(path)?;
-            info!("BIP-32 derivation path validation successful: {}", path);
         }
 
         // Validate seed_phrase_derivation_path if present
         if let Some(ref path) = self.seed_phrase_derivation_path {
-            debug!("Validating BIP-85 derivation path: {}", path);
             validate_path(path)?;
             validate_bip85_path(path)?;
-            info!("BIP-85 derivation path validation successful: {}", path);
         }
 
-        debug!("Key options validation completed successfully");
         Ok(())
     }
 }
@@ -164,8 +157,6 @@ impl KeyOptions {
 /// - WORDS' must be one of VALID_BIP39_WORD_COUNTS (12', 18', 24', must be hardened)
 /// - INDEX' is the derivation index (must be hardened)
 pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
-    debug!("Validating BIP-85 path: {}", path);
-
     // Split the path into segments
     let segments: Vec<&str> = path.split('/').collect();
 
@@ -215,8 +206,6 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
         return Err(ApiError::BadRequest);
     }
 
-    debug!("BIP-85 path language component valid: {}", segments[3]);
-
     // Check word count is valid (12, 18, 24) and hardened
     let word_count = segments[4];
     let word_count_value = match word_count.trim_end_matches(&['\'', 'h'][..]).parse::<u32>() {
@@ -239,8 +228,6 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
         return Err(ApiError::BadRequest);
     }
 
-    debug!("BIP-85 path word count valid: {} words", word_count_value);
-
     // Check word count is hardened
     if !(word_count.ends_with('\'') || word_count.ends_with('h')) {
         error!(
@@ -261,7 +248,7 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
     }
 
     // Try to parse the index to ensure it's a valid number
-    let index_value = match index.trim_end_matches(&['\'', 'h'][..]).parse::<u32>() {
+    match index.trim_end_matches(&['\'', 'h'][..]).parse::<u32>() {
         Ok(value) => value,
         Err(_) => {
             error!(
@@ -271,9 +258,6 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
             return Err(ApiError::BadRequest);
         }
     };
-
-    debug!("BIP-85 path index valid: {}", index_value);
-    info!("BIP-85 path validation successful: {}", path);
 
     Ok(())
 }
@@ -572,8 +556,6 @@ pub async fn user_protected(
     Extension(user): Extension<User>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<ProtectedUserData>>, ApiError> {
-    debug!("Entering user_protected function");
-    tracing::info!("user_protected request");
     let mut app_user: AppUser = AppUser::from(&user);
 
     // Set email verification status - only if not a guest user
@@ -633,8 +615,6 @@ pub async fn user_protected(
     }
 
     let response = ProtectedUserData { user: app_user };
-
-    debug!("Exiting user_protected function");
     encrypt_response(&data, &session_id, &response).await
 }
 
@@ -645,8 +625,6 @@ pub async fn get_kv(
     Extension(session_id): Extension<Uuid>,
     Path(key): Path<String>,
 ) -> Result<Json<EncryptedResponse<Option<String>>>, ApiError> {
-    debug!("Entering get_kv function");
-
     let value = match data.get(&user, &auth_context, key).await {
         Ok(kv) => kv,
         Err(e) => {
@@ -654,7 +632,6 @@ pub async fn get_kv(
             return Err(ApiError::InternalServerError);
         }
     };
-    debug!("Exiting get_kv function");
     encrypt_response(&data, &session_id, &value).await
 }
 
@@ -666,10 +643,6 @@ pub async fn put_kv(
     Path(key): Path<String>,
     Extension(value): Extension<String>,
 ) -> Result<Json<EncryptedResponse<String>>, ApiError> {
-    debug!("Entering put_kv function");
-    info!("Putting key-value pair for user");
-    tracing::trace!("putting key-value pair: {} = {}", key, value);
-
     match data.put(&user, &auth_context, key, value.clone()).await {
         Ok(kv) => kv,
         Err(e) => {
@@ -677,8 +650,6 @@ pub async fn put_kv(
             return Err(ApiError::InternalServerError);
         }
     };
-
-    debug!("Exiting put_kv function");
     encrypt_response(&data, &session_id, &value).await
 }
 
@@ -689,12 +660,9 @@ pub async fn delete_kv(
     Extension(session_id): Extension<Uuid>,
     Path(key): Path<String>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering delete_kv function");
-
     match data.delete(&user, &auth_context, key).await {
         Ok(_) => {
             let response = json!({ "message": "Resource deleted successfully" });
-            debug!("Exiting delete_kv function");
             encrypt_response(&data, &session_id, &response).await
         }
         Err(e) => {
@@ -709,15 +677,11 @@ pub async fn delete_all_kv(
     Extension(user): Extension<User>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering delete_all_kv function");
-    info!("Deleting all key-value pairs for user");
-
     match data.delete_all(user.uuid).await {
         Ok(_) => {
             let response = json!({
                 "message": "All key-value pairs deleted successfully"
             });
-            debug!("Exiting delete_all_kv function");
             encrypt_response(&data, &session_id, &response).await
         }
         Err(e) => {
@@ -733,8 +697,6 @@ pub async fn list_kv(
     Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<Vec<KVPair>>>, ApiError> {
-    debug!("Entering list_kv function");
-
     let kvs = match data.list(&user, &auth_context).await {
         Ok(kvs) => kvs,
         Err(e) => {
@@ -742,7 +704,6 @@ pub async fn list_kv(
             return Err(ApiError::InternalServerError);
         }
     };
-    debug!("Exiting list_kv function");
     encrypt_response(&data, &session_id, &kvs).await
 }
 
@@ -751,8 +712,6 @@ pub async fn request_new_verification_code(
     Extension(user): Extension<User>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering request_new_verification_code function");
-
     // First check if user has an email
     let email = match user.get_email() {
         Some(email) => email.to_string(),
@@ -808,7 +767,6 @@ pub async fn request_new_verification_code(
     }
 
     let response = json!({ "message": "New verification code sent successfully" });
-    debug!("Exiting request_new_verification_code function");
     encrypt_response(&data, &session_id, &response).await
 }
 
@@ -819,8 +777,6 @@ pub async fn change_password(
     Extension(change_request): Extension<ChangePasswordRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering change_password function");
-
     // Check if user is an OAuth-only user
     if user.password_enc.is_none() {
         error!("OAuth-only user attempted to change password");
@@ -867,7 +823,6 @@ pub async fn change_password(
                         "access_token": access_token.token,
                         "refresh_token": refresh_token.token
                     });
-                    debug!("Exiting change_password function");
                     encrypt_response(&data, &session_id, &response).await
                 }
                 Err(e) => {
@@ -893,21 +848,9 @@ pub async fn get_private_key(
     Extension(session_id): Extension<Uuid>,
     Query(query): Query<DerivationPathQuery>,
 ) -> Result<Json<EncryptedResponse<PrivateKeyResponse>>, ApiError> {
-    info!("Entering get_private_key function for user: {}", user.uuid);
-
-    // Log received derivation paths for debugging purposes
-    if let Some(path) = &query.key_options.seed_phrase_derivation_path {
-        info!("Received BIP-85 derivation path: {}", path);
-    }
-    if let Some(path) = &query.key_options.private_key_derivation_path {
-        info!("Received BIP-32 derivation path: {}", path);
-    }
-
     // Validate paths if present
-    debug!("Validating derivation paths");
     query.validate()?;
 
-    debug!("Retrieving authenticated seed wrap for user");
     let plaintext_seed = data
         .decrypt_seed_for_auth_context(&user, &auth_context)
         .map_err(|e| {
@@ -921,7 +864,6 @@ pub async fn get_private_key(
 
     // Check if BIP-85 derivation is requested
     if let Some(bip85_path) = &query.key_options.seed_phrase_derivation_path {
-        info!("BIP-85 derivation requested with path: {}", bip85_path);
         // Derive a child mnemonic
         let child_mnemonic =
             derive_bip85_mnemonic_from_root(root_mnemonic, bip85_path).map_err(|e| {
@@ -929,31 +871,17 @@ pub async fn get_private_key(
                 ApiError::BadRequest
             })?;
 
-        let word_count = child_mnemonic.word_count();
-        info!(
-            "Successfully derived BIP-85 mnemonic with {} words",
-            word_count
-        );
-
         let response = PrivateKeyResponse {
             mnemonic: child_mnemonic.to_string(),
         };
 
-        debug!("Encrypting response with derived mnemonic");
-        info!("Exiting get_private_key function with derived BIP-85 mnemonic");
         encrypt_response(&data, &session_id, &response).await
     } else {
         // Return root mnemonic
-        info!("Returning root mnemonic (no BIP-85 derivation)");
-        let word_count = root_mnemonic.word_count();
-        debug!("Root mnemonic has {} words", word_count);
-
         let response = PrivateKeyResponse {
             mnemonic: root_mnemonic.to_string(),
         };
 
-        debug!("Encrypting response with root mnemonic");
-        info!("Exiting get_private_key function with root mnemonic");
         encrypt_response(&data, &session_id, &response).await
     }
 }
@@ -965,25 +893,10 @@ pub async fn get_private_key_bytes(
     Extension(session_id): Extension<Uuid>,
     Query(query): Query<DerivationPathQuery>,
 ) -> Result<Json<EncryptedResponse<PrivateKeyBytesResponse>>, ApiError> {
-    info!(
-        "Entering get_private_key_bytes function for user: {}",
-        user.uuid
-    );
-
-    // Log received derivation paths for debugging purposes
-    if let Some(path) = &query.key_options.seed_phrase_derivation_path {
-        info!("Received BIP-85 derivation path: {}", path);
-    }
-    if let Some(path) = &query.key_options.private_key_derivation_path {
-        info!("Received BIP-32 derivation path: {}", path);
-    }
-
     // Validate derivation path if present
-    debug!("Validating derivation paths");
     query.validate()?;
 
     // Use the method that supports both BIP-85 and BIP-32 derivation
-    debug!("Getting user key with provided derivation paths");
     let secret_key = data
         .get_user_key(
             &user,
@@ -1007,16 +920,11 @@ pub async fn get_private_key_bytes(
             }
         })?;
 
-    info!("Successfully retrieved private key for user: {}", user.uuid);
-
     // Convert key to string
-    debug!("Converting private key to string format");
     let response = PrivateKeyBytesResponse {
         private_key: secret_key.display_secret().to_string(),
     };
 
-    debug!("Encrypting private key response");
-    info!("Exiting get_private_key_bytes function");
     encrypt_response(&data, &session_id, &response).await
 }
 
@@ -1027,11 +935,7 @@ pub async fn sign_message(
     Extension(sign_request): Extension<SignMessageRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<SignMessageResponseJson>>, ApiError> {
-    info!("Entering sign_message function for user: {}", user.uuid);
-    debug!("Sign request algorithm: {:?}", sign_request.algorithm);
-
     // Validate key_options
-    debug!("Validating key options");
     let validation_query = DerivationPathQuery {
         key_options: sign_request.key_options.clone(),
     };
@@ -1047,16 +951,6 @@ pub async fn sign_message(
         .seed_phrase_derivation_path
         .as_deref();
 
-    // Log derivation paths if present
-    if let Some(path) = derivation_path {
-        info!("Using BIP-32 derivation path: {}", path);
-    }
-
-    if let Some(path) = seed_phrase_derivation_path {
-        info!("Using BIP-85 derivation path: {}", path);
-    }
-
-    debug!("Decoding base64 message");
     let message_bytes = general_purpose::STANDARD
         .decode(&sign_request.message_base64)
         .map_err(|e| {
@@ -1064,10 +958,6 @@ pub async fn sign_message(
             ApiError::BadRequest
         })?;
 
-    debug!(
-        "Signing message with algorithm: {:?}",
-        sign_request.algorithm
-    );
     let response = data
         .sign_message(
             &user,
@@ -1083,15 +973,11 @@ pub async fn sign_message(
             ApiError::InternalServerError
         })?;
 
-    info!("Message signed successfully for user: {}", user.uuid);
-    debug!("Creating JSON response");
     let json_response = SignMessageResponseJson {
         signature: response.signature.to_string(),
         message_hash: hex::encode(response.message_hash),
     };
 
-    debug!("Encrypting signed message response");
-    info!("Exiting sign_message function");
     encrypt_response(&data, &session_id, &json_response).await
 }
 
@@ -1102,8 +988,6 @@ pub async fn get_public_key(
     Extension(session_id): Extension<Uuid>,
     Query(query): Query<PublicKeyQuery>,
 ) -> Result<Json<EncryptedResponse<PublicKeyResponseJson>>, ApiError> {
-    debug!("Entering get_public_key function");
-
     // Validate the key_options
     let validation_query = DerivationPathQuery {
         key_options: query.key_options.clone(),
@@ -1146,8 +1030,6 @@ pub async fn get_public_key(
         public_key: public_key_str,
         algorithm: query.algorithm,
     };
-
-    debug!("Exiting get_public_key function");
     encrypt_response(&data, &session_id, &response).await
 }
 
@@ -1157,12 +1039,6 @@ pub async fn generate_third_party_token(
     Extension(request): Extension<ThirdPartyTokenRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<ThirdPartyTokenResponse>>, ApiError> {
-    debug!("Entering generate_third_party_token function");
-    info!(
-        "Generating third party token for user {} with audience {:?}",
-        user.uuid, request.audience
-    );
-
     // Validate the audience
     if let Some(audience) = request.audience.as_ref() {
         if audience.is_empty() || (audience.contains(':') && url::Url::parse(audience).is_err()) {
@@ -1170,8 +1046,6 @@ pub async fn generate_third_party_token(
             return Err(ApiError::BadRequest);
         }
     }
-
-    debug!("Audience validation successful");
 
     let project = data.db.get_org_project_by_id(user.project_id)?;
 
@@ -1183,13 +1057,7 @@ pub async fn generate_third_party_token(
         },
         &data,
     ) {
-        Ok(token) => {
-            info!(
-                "Successfully generated third party token for user {}",
-                user.uuid
-            );
-            token
-        }
+        Ok(token) => token,
         Err(e) => {
             error!("Failed to generate third party token: {:?}", e);
             return Err(e);
@@ -1197,8 +1065,6 @@ pub async fn generate_third_party_token(
     };
 
     let response = ThirdPartyTokenResponse { token: token.token };
-
-    debug!("Exiting generate_third_party_token function");
     encrypt_response(&data, &session_id, &response).await
 }
 
@@ -1209,9 +1075,6 @@ pub async fn encrypt_data(
     Extension(request): Extension<EncryptDataRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<EncryptDataResponse>>, ApiError> {
-    debug!("Entering encrypt_data function");
-    info!("Encrypting data for user {}", user.uuid);
-
     // Validate key_options
     let validation_query = DerivationPathQuery {
         key_options: request.key_options.clone(),
@@ -1256,8 +1119,6 @@ pub async fn encrypt_data(
     let response = EncryptDataResponse {
         encrypted_data: encrypted_data_base64,
     };
-
-    debug!("Exiting encrypt_data function");
     encrypt_response(&data, &session_id, &response).await
 }
 
@@ -1268,18 +1129,11 @@ pub async fn decrypt_data(
     Extension(request): Extension<DecryptDataRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<String>>, ApiError> {
-    debug!("Entering decrypt_data function");
-    info!(
-        "Decrypting data for user {} with key options: {:?}",
-        user.uuid, request.key_options
-    );
-
     // Validate key_options
     let validation_query = DerivationPathQuery {
         key_options: request.key_options.clone(),
     };
     validation_query.validate()?;
-    debug!("Derivation path validation successful");
 
     // Extract derivation paths from key_options
     let derivation_path = request.key_options.private_key_derivation_path.as_deref();
@@ -1308,7 +1162,6 @@ pub async fn decrypt_data(
                 ApiError::InternalServerError
             }
         })?;
-    debug!("Successfully retrieved user key");
 
     // Decode the base64 encrypted data
     let encrypted_data = match general_purpose::STANDARD.decode(&request.encrypted_data) {
@@ -1321,10 +1174,7 @@ pub async fn decrypt_data(
 
     // Decrypt the data
     let decrypted_data = match encrypt::decrypt_with_key(&user_key, &encrypted_data) {
-        Ok(data) => {
-            debug!("Successfully decrypted data");
-            data
-        }
+        Ok(data) => data,
         Err(e) => {
             error!("Decryption failed: {e}");
             return Err(ApiError::BadRequest);
@@ -1339,8 +1189,6 @@ pub async fn decrypt_data(
             return Err(ApiError::BadRequest);
         }
     };
-
-    debug!("Exiting decrypt_data function, preparing encrypted response");
     encrypt_response(&data, &session_id, &decrypted_string).await
 }
 
@@ -1350,7 +1198,6 @@ pub async fn initiate_account_deletion(
     Extension(delete_request): Extension<InitiateAccountDeletionRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering initiate_account_deletion function");
     info!("User {} is initiating account deletion request", user.uuid);
 
     // Create the account deletion request
@@ -1370,7 +1217,6 @@ pub async fn initiate_account_deletion(
             });
 
             let result = encrypt_response(&data, &session_id, &response).await;
-            debug!("Exiting initiate_account_deletion function");
             result
         }
         Err(e) => {
@@ -1386,7 +1232,6 @@ pub async fn confirm_account_deletion(
     Extension(confirm_request): Extension<ConfirmAccountDeletionRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering confirm_account_deletion function");
     info!("User {} is confirming account deletion", user.uuid);
 
     // Confirm the account deletion
@@ -1404,7 +1249,6 @@ pub async fn confirm_account_deletion(
             });
 
             let result = encrypt_response(&data, &session_id, &response).await;
-            debug!("Exiting confirm_account_deletion function");
             result
         }
         Err(e) => match e {

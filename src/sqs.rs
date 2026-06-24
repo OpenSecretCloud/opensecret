@@ -40,6 +40,73 @@ pub struct UsageEvent {
     pub provider_name: String,
     #[serde(default)]
     pub model_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<i32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::str::FromStr;
+
+    #[test]
+    fn usage_event_omits_missing_cached_input_tokens() {
+        let event = UsageEvent {
+            event_id: Uuid::parse_str("8c6c975a-1f33-439d-98f1-7dd26d4d3e89").unwrap(),
+            user_id: Uuid::parse_str("6142db59-fc0c-413d-8792-579fc1457fe2").unwrap(),
+            input_tokens: 100,
+            output_tokens: 20,
+            estimated_cost: BigDecimal::from_str("0.001").unwrap(),
+            chat_time: Utc::now(),
+            is_api_request: false,
+            provider_name: "continuum".to_string(),
+            model_name: "kimi-k2-6".to_string(),
+            cached_input_tokens: None,
+        };
+
+        let serialized = serde_json::to_value(event).unwrap();
+
+        assert!(serialized.get("cached_input_tokens").is_none());
+    }
+
+    #[test]
+    fn usage_event_serializes_cached_input_tokens_when_present() {
+        let event = UsageEvent {
+            event_id: Uuid::parse_str("8c6c975a-1f33-439d-98f1-7dd26d4d3e89").unwrap(),
+            user_id: Uuid::parse_str("6142db59-fc0c-413d-8792-579fc1457fe2").unwrap(),
+            input_tokens: 100,
+            output_tokens: 20,
+            estimated_cost: BigDecimal::from_str("0.001").unwrap(),
+            chat_time: Utc::now(),
+            is_api_request: true,
+            provider_name: "continuum".to_string(),
+            model_name: "kimi-k2-6".to_string(),
+            cached_input_tokens: Some(42),
+        };
+
+        let serialized = serde_json::to_value(event).unwrap();
+
+        assert_eq!(serialized.get("cached_input_tokens"), Some(&json!(42)));
+    }
+
+    #[test]
+    fn usage_event_deserializes_missing_cached_input_tokens_as_none() {
+        let event: UsageEvent = serde_json::from_value(json!({
+            "event_id": "8c6c975a-1f33-439d-98f1-7dd26d4d3e89",
+            "user_id": "6142db59-fc0c-413d-8792-579fc1457fe2",
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "estimated_cost": "0.001",
+            "chat_time": Utc::now(),
+            "is_api_request": false,
+            "provider_name": "continuum",
+            "model_name": "kimi-k2-6"
+        }))
+        .unwrap();
+
+        assert_eq!(event.cached_input_tokens, None);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -478,6 +478,7 @@ impl BillingContext {
 pub struct CompletionUsage {
     pub prompt_tokens: i32,
     pub completion_tokens: i32,
+    pub cached_prompt_tokens: Option<i32>,
 }
 
 /// A chunk from the completion stream
@@ -1058,15 +1059,26 @@ fn extract_usage(json: &Value) -> Option<CompletionUsage> {
         return None;
     }
 
+    let prompt_tokens = usage_json
+        .get("prompt_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .clamp(0, i32::MAX as i64) as i32;
+
+    let cached_prompt_tokens = usage_json
+        .get("prompt_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(|v| v.as_i64())
+        .map(|tokens| tokens.clamp(0, prompt_tokens as i64) as i32);
+
     Some(CompletionUsage {
-        prompt_tokens: usage_json
-            .get("prompt_tokens")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0) as i32,
+        prompt_tokens,
         completion_tokens: usage_json
             .get("completion_tokens")
             .and_then(|v| v.as_i64())
-            .unwrap_or(0) as i32,
+            .unwrap_or(0)
+            .clamp(0, i32::MAX as i64) as i32,
+        cached_prompt_tokens,
     })
 }
 
@@ -1174,6 +1186,8 @@ async fn publish_usage_event_internal(
         return;
     }
 
+    // Local token_usage keeps the legacy rough estimate for observability.
+    // The billing server recomputes authoritative provider cost from SQS tokens.
     let input_cost =
         BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(usage.prompt_tokens);
     let output_cost =
@@ -1181,11 +1195,12 @@ async fn publish_usage_event_internal(
     let total_cost = input_cost + output_cost;
 
     info!(
-        "Chat completion usage for user {}: model={}, provider={}, prompt_tokens={}, completion_tokens={}, total_tokens={}, estimated_cost={}",
+        "Chat completion usage for user {}: model={}, provider={}, prompt_tokens={}, cached_prompt_tokens={}, completion_tokens={}, total_tokens={}, estimated_cost={}",
         user.uuid,
         billing_context.model_name,
         provider_name,
         usage.prompt_tokens,
+        usage.cached_prompt_tokens.unwrap_or(0),
         usage.completion_tokens,
         usage.prompt_tokens + usage.completion_tokens,
         total_cost
@@ -1211,26 +1226,62 @@ async fn publish_usage_event_internal(
             error!("Failed to save token usage: {:?}", e);
         }
 
+        let cached_input_tokens = usage.cached_prompt_tokens;
+
         // Post event to SQS if configured
         if let Some(publisher) = &state_clone.sqs_publisher {
-            let event = UsageEvent {
-                event_id: Uuid::new_v4(),
+            let event = build_usage_event(
                 user_id,
-                input_tokens: usage.prompt_tokens,
-                output_tokens: usage.completion_tokens,
-                estimated_cost: total_cost,
-                chat_time: Utc::now(),
+                usage,
+                total_cost,
                 is_api_request,
                 provider_name,
                 model_name,
-            };
+            );
+
+            debug!(
+                "Prepared SQS usage event: user_uuid={}, provider={}, model={}, input_tokens={}, output_tokens={}, cached_input_tokens={:?}",
+                event.user_id,
+                event.provider_name,
+                event.model_name,
+                event.input_tokens,
+                event.output_tokens,
+                event.cached_input_tokens
+            );
 
             match publisher.publish_event(event).await {
                 Ok(_) => debug!("published usage event successfully"),
                 Err(e) => error!("error publishing usage event: {e}"),
             }
+        } else {
+            debug!(
+                "SQS publisher not configured; usage event would include cached_input_tokens={:?}",
+                cached_input_tokens
+            );
         }
     });
+}
+
+fn build_usage_event(
+    user_id: Uuid,
+    usage: CompletionUsage,
+    estimated_cost: BigDecimal,
+    is_api_request: bool,
+    provider_name: String,
+    model_name: String,
+) -> UsageEvent {
+    UsageEvent {
+        event_id: Uuid::new_v4(),
+        user_id,
+        input_tokens: usage.prompt_tokens,
+        output_tokens: usage.completion_tokens,
+        estimated_cost,
+        chat_time: Utc::now(),
+        is_api_request,
+        provider_name,
+        model_name,
+        cached_input_tokens: usage.cached_prompt_tokens,
+    }
 }
 
 /// Helper to encrypt an SSE event
@@ -2086,6 +2137,7 @@ async fn proxy_embeddings(
             let embedding_usage = CompletionUsage {
                 prompt_tokens,
                 completion_tokens: 0, // Embeddings don't have completion tokens
+                cached_prompt_tokens: None,
             };
             publish_usage_event_internal(
                 &state,
@@ -2217,5 +2269,99 @@ mod tests {
         assert_eq!(body.get("model"), Some(&json!("kimi-k2-6")));
         assert_eq!(body.get("messages"), Some(&json!([])));
         assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
+    }
+
+    #[test]
+    fn extracts_cached_prompt_tokens_from_openai_usage_details() {
+        let response = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "prompt_tokens_details": {
+                    "cached_tokens": 42
+                }
+            }
+        });
+
+        let usage = extract_usage(&response).expect("usage should parse");
+
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 20);
+        assert_eq!(usage.cached_prompt_tokens, Some(42));
+    }
+
+    #[test]
+    fn cached_prompt_tokens_are_optional_in_usage_details() {
+        let response = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120
+            }
+        });
+
+        let usage = extract_usage(&response).expect("usage should parse");
+
+        assert_eq!(usage.cached_prompt_tokens, None);
+    }
+
+    #[test]
+    fn cached_prompt_tokens_are_clamped_to_prompt_tokens() {
+        let response = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "prompt_tokens_details": {
+                    "cached_tokens": 150
+                }
+            }
+        });
+
+        let usage = extract_usage(&response).expect("usage should parse");
+
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.cached_prompt_tokens, Some(100));
+    }
+
+    #[test]
+    fn completion_tokens_are_clamped_to_i32_range() {
+        let response = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": i64::MAX,
+                "total_tokens": i64::MAX
+            }
+        });
+
+        let usage = extract_usage(&response).expect("usage should parse");
+
+        assert_eq!(usage.completion_tokens, i32::MAX);
+    }
+
+    #[test]
+    fn cached_prompt_tokens_are_mapped_to_sqs_cached_input_tokens() {
+        let usage = CompletionUsage {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            cached_prompt_tokens: Some(42),
+        };
+
+        let event = build_usage_event(
+            Uuid::parse_str("6142db59-fc0c-413d-8792-579fc1457fe2").unwrap(),
+            usage,
+            BigDecimal::from_str("0.001").unwrap(),
+            true,
+            "continuum".to_string(),
+            "kimi-k2-6".to_string(),
+        );
+
+        assert_eq!(event.input_tokens, 100);
+        assert_eq!(event.output_tokens, 20);
+        assert_eq!(event.cached_input_tokens, Some(42));
+        assert!(event.is_api_request);
+        assert_eq!(event.provider_name, "continuum");
+        assert_eq!(event.model_name, "kimi-k2-6");
     }
 }

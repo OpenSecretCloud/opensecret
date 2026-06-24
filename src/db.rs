@@ -599,6 +599,13 @@ pub trait DBConnection {
         status: ResponseStatus,
         completed_at: Option<DateTime<Utc>>,
     ) -> Result<(), DBError>;
+    fn update_response_status_if_current(
+        &self,
+        id: i64,
+        current_status: ResponseStatus,
+        new_status: ResponseStatus,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, DBError>;
     fn cancel_response(&self, uuid: Uuid, user_id: Uuid) -> Result<Response, DBError>;
     fn delete_response(&self, uuid: Uuid, user_id: Uuid) -> Result<(), DBError>;
 
@@ -2435,6 +2442,19 @@ impl DBConnection for PostgresConnection {
     ) -> Result<(), DBError> {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         Response::update_status(conn, id, status, completed_at).map_err(DBError::from)
+    }
+
+    fn update_response_status_if_current(
+        &self,
+        id: i64,
+        current_status: ResponseStatus,
+        new_status: ResponseStatus,
+        completed_at: Option<DateTime<Utc>>,
+    ) -> Result<bool, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        Response::update_status_if_current(conn, id, current_status, new_status, completed_at)
+            .map(|rows| rows > 0)
+            .map_err(DBError::from)
     }
 
     fn cancel_response(&self, uuid: Uuid, user_id: Uuid) -> Result<Response, DBError> {

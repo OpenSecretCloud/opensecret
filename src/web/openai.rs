@@ -566,8 +566,6 @@ async fn proxy_openai(
     axum::Extension(auth_method): axum::Extension<AuthMethod>,
     axum::Extension(body): axum::Extension<Value>,
 ) -> Result<Response, ApiError> {
-    debug!("Entering proxy_openai function");
-
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
         if let Some(billing_client) = &state.billing_client {
@@ -657,7 +655,6 @@ async fn proxy_openai(
             // Billing already happened in get_chat_completion_response!
             // Just encrypt and return
             let encrypted_response = encrypt_response(&state, &session_id, &response_json).await?;
-            debug!("Exiting proxy_openai function (non-streaming)");
             return Ok(encrypted_response.into_response());
         } else {
             error!("Expected FullResponse chunk but got something else");
@@ -705,8 +702,6 @@ async fn proxy_openai(
             }
         }
     };
-
-    debug!("Exiting proxy_openai function (streaming)");
     Ok(Sse::new(stream).into_response())
 }
 
@@ -721,8 +716,6 @@ pub async fn get_chat_completion_response(
     headers: &HeaderMap,
     mut billing_context: BillingContext,
 ) -> Result<CompletionStream, ApiError> {
-    debug!("Entering get_chat_completion_response with billing context");
-
     if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
         return Err(ApiError::BadRequest);
@@ -1267,16 +1260,12 @@ async fn proxy_models(
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(_body): axum::Extension<()>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
-    debug!("Entering proxy_models function");
-
     let proxy_config = state.proxy_router.get_completion_proxy();
     let models_response = if proxy_config.provider_name == "tinfoil" {
         openai_models_response()
     } else {
         fetch_provider_models(&proxy_config).await?
     };
-
-    debug!("Exiting proxy_models function");
     encrypt_response(&state, &session_id, &models_response).await
 }
 
@@ -1354,11 +1343,7 @@ async fn proxy_model_catalog(
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(_body): axum::Extension<()>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
-    debug!("Entering proxy_model_catalog function");
-
     let catalog_response = model_catalog_response();
-
-    debug!("Exiting proxy_model_catalog function");
     encrypt_response(&state, &session_id, &catalog_response).await
 }
 
@@ -1467,8 +1452,6 @@ async fn proxy_transcription(
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(transcription_request): axum::Extension<TranscriptionRequest>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
-    debug!("Entering proxy_transcription function");
-
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
         if let Some(billing_client) = &state.billing_client {
@@ -1676,8 +1659,6 @@ async fn proxy_transcription(
         response
     };
 
-    debug!("Exiting proxy_transcription function");
-
     // TODO: Add SQS-based billing events for transcription usage
     // Should track: audio duration/size, model used, user ID, timestamp, provider
 
@@ -1835,8 +1816,6 @@ async fn proxy_tts(
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(tts_request): axum::Extension<TTSRequest>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
-    debug!("Entering proxy_tts function");
-
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
         if let Some(billing_client) = &state.billing_client {
@@ -1965,8 +1944,6 @@ async fn proxy_tts(
         },
     });
 
-    debug!("Exiting proxy_tts function");
-
     // Encrypt and return the response
     encrypt_response(&state, &session_id, &audio_response).await
 }
@@ -1979,8 +1956,6 @@ async fn proxy_embeddings(
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(embedding_request): axum::Extension<EmbeddingRequest>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
-    debug!("Entering proxy_embeddings function");
-
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
         if let Some(billing_client) = &state.billing_client {
@@ -2122,8 +2097,6 @@ async fn proxy_embeddings(
             .await;
         }
     }
-
-    debug!("Exiting proxy_embeddings function");
 
     // Encrypt and return the response
     encrypt_response(&state, &session_id, &response_json).await

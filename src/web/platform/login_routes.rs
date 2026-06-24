@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::spawn;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 use uuid::Uuid;
 use validator::Validate;
 
@@ -195,8 +195,6 @@ pub async fn login_platform_user(
     Extension(login_request): Extension<PlatformLoginRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<PlatformAuthResponse>>, ApiError> {
-    debug!("Entering login_platform_user function");
-
     // Validate request
     if let Err(errors) = login_request.validate() {
         error!("Validation error: {:?}", errors);
@@ -205,7 +203,6 @@ pub async fn login_platform_user(
 
     let auth_response = login_internal_platform(data.clone(), login_request).await?;
     let result = encrypt_response(&data, &session_id, &auth_response).await;
-    debug!("Exiting login_platform_user function");
     result
 }
 
@@ -250,8 +247,6 @@ pub async fn register_platform_user(
     Extension(register_request): Extension<PlatformRegisterRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<PlatformAuthResponse>>, ApiError> {
-    debug!("Entering register_platform_user function");
-
     // Validate request
     if let Err(errors) = register_request.validate() {
         error!("Validation error: {:?}", errors);
@@ -349,7 +344,6 @@ pub async fn register_platform_user(
     };
 
     let result = encrypt_response(&data, &session_id, &response).await;
-    debug!("Exiting register_platform_user function");
     result
 }
 
@@ -358,8 +352,6 @@ pub async fn refresh_platform_token(
     Extension(refresh_request): Extension<PlatformRefreshRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<PlatformRefreshResponse>>, ApiError> {
-    debug!("Entering refresh_platform_token function");
-
     // Validate request
     if let Err(errors) = refresh_request.validate() {
         error!("Validation error: {:?}", errors);
@@ -385,7 +377,6 @@ pub async fn refresh_platform_token(
     };
 
     let result = encrypt_response(&data, &session_id, &response).await;
-    debug!("Exiting refresh_platform_token function");
     result
 }
 
@@ -394,8 +385,6 @@ pub async fn verify_platform_email(
     Path(code): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering verify_platform_email function");
-
     // Retrieve the verification record using the code
     let verification = match data.db.get_platform_email_verification_by_code(code) {
         Ok(verification) => verification,
@@ -438,7 +427,6 @@ pub async fn verify_platform_email(
     });
 
     let result = encrypt_response(&data, &session_id, &response).await;
-    debug!("Exiting verify_platform_email function");
     result
 }
 
@@ -447,7 +435,6 @@ pub async fn logout_platform_user(
     Extension(logout_request): Extension<PlatformLogoutRequest>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering logout_platform_user function");
     info!("Platform logout request received");
 
     // TODO: Implement token invalidation logic here when needed
@@ -458,7 +445,6 @@ pub async fn logout_platform_user(
 
     let response = json!({ "message": "Logged out successfully" });
     let result = encrypt_response(&data, &session_id, &response).await;
-    debug!("Exiting logout_platform_user function");
     result
 }
 
@@ -467,8 +453,6 @@ pub async fn platform_password_reset_request(
     Extension(payload): Extension<PlatformPasswordResetRequestPayload>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering platform_password_reset_request function");
-
     // Validate request
     if let Err(errors) = payload.validate() {
         error!("Validation error: {:?}", errors);
@@ -513,7 +497,6 @@ pub async fn platform_password_reset_request(
         "message": "If an account with that email exists, we have sent a password reset link."
     });
     let result = encrypt_response(&data, &session_id, &response).await;
-    debug!("Exiting platform_password_reset_request function");
     result
 }
 
@@ -522,8 +505,6 @@ pub async fn platform_password_reset_confirm(
     Extension(payload): Extension<PlatformPasswordResetConfirmPayload>,
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    debug!("Entering platform_password_reset_confirm function");
-
     // Validate request
     if let Err(errors) = payload.validate() {
         error!("Validation error: {:?}", errors);
@@ -568,6 +549,5 @@ pub async fn platform_password_reset_confirm(
     });
 
     let result = encrypt_response(&data, &session_id, &response).await;
-    debug!("Exiting platform_password_reset_confirm function");
     result
 }

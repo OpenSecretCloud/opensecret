@@ -16,7 +16,7 @@ use serde_cbor::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tracing::{debug, error, trace};
+use tracing::{error, trace};
 use uuid::Uuid;
 use yasna::models::ObjectIdentifier;
 use yasna::{construct_der, Tag};
@@ -79,9 +79,6 @@ async fn get_attestation(
     State(data): State<Arc<AppState>>,
     axum::extract::Path(nonce): axum::extract::Path<String>,
 ) -> Result<(StatusCode, Json<AttestationResponse>), ApiError> {
-    debug!("Entering get_attestation function");
-    trace!("Entering get_attestation");
-
     // Create an ephemeral key pair for this request
     trace!("Creating ephemeral key");
     let enclave_public_key = data.create_ephemeral_key(nonce.clone()).await;
@@ -99,9 +96,6 @@ async fn get_attestation(
         AppMode::Local => generate_mock_attestation(data.clone(), request).await,
         _ => generate_real_attestation(data, request).await,
     };
-
-    trace!("Exiting get_attestation");
-    debug!("Exiting get_attestation function");
     result
 }
 
@@ -109,9 +103,6 @@ async fn generate_mock_attestation(
     data: Arc<AppState>,
     request: Request,
 ) -> Result<(StatusCode, Json<AttestationResponse>), ApiError> {
-    debug!("Entering generate_mock_attestation function");
-    trace!("Entering generate_mock_attestation");
-
     let (user_data, nonce, public_key) = match request {
         Request::Attestation {
             user_data,
@@ -160,9 +151,6 @@ async fn generate_mock_attestation(
     trace!("Converting to base64");
     let attestation_doc_base64 = general_purpose::STANDARD.encode(&final_document);
     trace!("Converted to base64");
-
-    trace!("Exiting generate_mock_attestation");
-    debug!("Exiting generate_mock_attestation function");
     Ok((
         StatusCode::OK,
         Json(AttestationResponse {
@@ -177,8 +165,6 @@ async fn create_mock_attestation_document(
     nonce: Option<ByteBuf>,
     public_key: Option<ByteBuf>,
 ) -> Value {
-    trace!("Entering create_mock_attestation_document");
-
     let mut pcrs = BTreeMap::new();
     for i in 0..3 {
         trace!("Generating random bytes for PCR {}", i);
@@ -233,14 +219,10 @@ async fn create_mock_attestation_document(
         Value::Text("nonce".into()),
         nonce.map_or(Value::Null, |n| Value::Bytes(n.into_vec())),
     );
-
-    trace!("Exiting create_mock_attestation_document");
     Value::Map(document)
 }
 
 async fn create_mock_certificate(_data: Arc<AppState>) -> Vec<u8> {
-    trace!("Entering create_mock_certificate");
-
     trace!("Generating random bytes");
     let random_8_bytes = generate_random::<8>();
     let random_32_bytes = generate_random::<32>();
@@ -327,8 +309,6 @@ async fn create_mock_certificate(_data: Arc<AppState>) -> Vec<u8> {
                 .write_bitvec_bytes(&random_32_bytes, random_32_bytes.len() * 8);
         })
     });
-
-    trace!("Exiting create_mock_certificate");
     result
 }
 
@@ -363,7 +343,6 @@ async fn generate_real_attestation(
     _data: Arc<AppState>,
     request: Request,
 ) -> Result<(StatusCode, Json<AttestationResponse>), ApiError> {
-    debug!("Entering generate_real_attestation function");
     // Initialize the Nitro Secure Module (NSM) driver
     let nsm_fd = nsm_init();
     if nsm_fd < 0 {
@@ -404,7 +383,6 @@ async fn key_exchange(
     State(data): State<Arc<AppState>>,
     Json(payload): Json<KeyExchangeRequest>,
 ) -> Result<Json<KeyExchangeResponse>, ApiError> {
-    debug!("Entering key_exchange function");
     trace!("Starting key exchange");
 
     let client_public_key_bytes = general_purpose::STANDARD
@@ -451,8 +429,6 @@ async fn key_exchange(
         .write()
         .await
         .insert(session_id, SessionState::new(session_key));
-
-    debug!("Exiting key_exchange function");
     Ok(Json(KeyExchangeResponse {
         session_id,
         encrypted_session_key: general_purpose::STANDARD.encode(&encrypted_session_key),

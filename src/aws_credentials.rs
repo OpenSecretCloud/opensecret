@@ -98,12 +98,8 @@ impl AwsCredentialManager {
     }
 
     pub async fn fetch_credentials(&self) -> Result<AwsCredentials, AwsCredentialError> {
-        tracing::debug!("Entering fetch_credentials");
-
         let creds = Self::fetch_credentials_from_vsock().await?;
         self.set_credentials(creds.clone()).await;
-
-        tracing::debug!("Exiting fetch_credentials");
         Ok(creds)
     }
 

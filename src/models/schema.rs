@@ -598,7 +598,6 @@ diesel::table! {
         name -> Nullable<Text>,
         email -> Nullable<Citext>,
         password_enc -> Nullable<Bytea>,
-        seed_enc -> Nullable<Bytea>,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
         project_id -> Int4,

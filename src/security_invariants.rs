@@ -274,7 +274,6 @@ fn destructive_password_reset_wipes_user_key_encrypted_storage_roots() {
 
     for required_pattern in [
         "users::password_enc.eq(Some(new_password_enc))",
-        "users::seed_enc.eq(None::<Vec<u8>>)",
         "new_wrapping.upsert_by_credential(conn)",
         "user_oauth_connections::table",
         "user_oauth_connections::user_id.eq(user_id)",
@@ -293,8 +292,8 @@ fn destructive_password_reset_wipes_user_key_encrypted_storage_roots() {
     }
 
     assert!(
-        !reset_body.contains("new_legacy_seed_enc"),
-        "destructive reset must clear, not rewrite, the legacy users.seed_enc bridge"
+        !reset_body.contains("users::seed_enc") && !reset_body.contains("new_legacy_seed_enc"),
+        "destructive reset must not touch the removed legacy users.seed_enc bridge"
     );
 
     assert!(
@@ -593,7 +592,7 @@ fn password_registration_and_login_issue_tokens_only_after_seed_wrap_verificatio
     for required_pattern in [
         "generate_hash(password)",
         "generate_twelve_word_seed",
-        "NewUser::new(creds.email, Some(encrypted_pw), project.id, None)",
+        "NewUser::new(creds.email, Some(encrypted_pw), project.id)",
         "create_user_with_password_seed_wrap(",
     ] {
         assert!(

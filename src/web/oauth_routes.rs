@@ -1230,7 +1230,7 @@ async fn find_or_create_user_from_oauth(
                     .to_string();
 
             // Create new user
-            let new_user = NewUser::new(Some(email), None, project_id, None)
+            let new_user = NewUser::new(Some(email), None, project_id)
                 .with_name(user_name.unwrap_or_default());
 
             let encrypted_access_token = if !access_token.is_empty() {
@@ -1520,7 +1520,6 @@ mod tests {
     use super::*;
     use crate::{
         db::setup_db,
-        encrypt::encrypt_with_key,
         models::{org_projects::OrgProject, schema::org_projects},
         seed_wrapping::CredentialKind,
         AppMode, AppStateBuilder,
@@ -1700,22 +1699,14 @@ mod tests {
         provider_name: &str,
         provider_user_id: String,
     ) -> User {
-        let secret_key = SecretKey::from_slice(&app_state.enclave_key)
-            .expect("test enclave key should be valid");
         let user_seed_words = generate_twelve_word_seed(app_state.aws_credential_manager.clone())
             .await
             .expect("test seed should generate")
             .to_string();
-        let legacy_seed_enc = encrypt_with_key(&secret_key, user_seed_words.as_bytes()).await;
 
         let user = app_state
             .db
-            .create_user(NewUser::new(
-                Some(email),
-                None,
-                project_id,
-                Some(legacy_seed_enc),
-            ))
+            .create_user(NewUser::new(Some(email), None, project_id))
             .expect("test OAuth user should insert");
 
         let provider = app_state

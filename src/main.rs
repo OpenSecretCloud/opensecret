@@ -1270,8 +1270,8 @@ impl AppState {
             .await?
             .to_string();
 
-        let new_user = NewUser::new(creds.email, Some(encrypted_pw), project.id, None)
-            .with_name_option(creds.name);
+        let new_user =
+            NewUser::new(creds.email, Some(encrypted_pw), project.id).with_name_option(creds.name);
 
         let user = self.create_user_with_password_seed_wrap(
             new_user,

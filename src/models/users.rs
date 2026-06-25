@@ -20,17 +20,12 @@ pub struct User {
     pub name: Option<String>,
     pub email: Option<String>,
     pub password_enc: Option<Vec<u8>>,
-    seed_enc: Option<Vec<u8>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub project_id: i32,
 }
 
 impl User {
-    pub fn seed_encrypted(&self) -> Option<&[u8]> {
-        self.seed_enc.as_deref()
-    }
-
     pub fn get_by_id(conn: &mut PgConnection, lookup_id: i32) -> Result<Option<User>, UserError> {
         users::table
             .filter(users::id.eq(lookup_id))
@@ -158,22 +153,15 @@ pub struct NewUser {
     pub name: Option<String>,
     pub email: Option<String>,
     pub password_enc: Option<Vec<u8>>,
-    pub seed_enc: Option<Vec<u8>>,
     pub project_id: i32,
 }
 
 impl NewUser {
-    pub fn new(
-        email: Option<String>,
-        password_enc: Option<Vec<u8>>,
-        project_id: i32,
-        seed_enc: Option<Vec<u8>>,
-    ) -> Self {
+    pub fn new(email: Option<String>, password_enc: Option<Vec<u8>>, project_id: i32) -> Self {
         NewUser {
             name: None,
             email,
             password_enc,
-            seed_enc,
             project_id,
         }
     }
@@ -204,7 +192,6 @@ impl std::fmt::Debug for NewUser {
             .field("name", &self.name)
             .field("email", &self.email)
             .field("password_enc", &"[redacted]")
-            .field("seed_enc", &"[redacted]")
             .finish()
     }
 }

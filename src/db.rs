@@ -1093,7 +1093,6 @@ impl DBConnection for PostgresConnection {
             diesel::update(users::table.filter(users::uuid.eq(user_id)))
                 .set((
                     users::password_enc.eq(Some(new_password_enc)),
-                    users::seed_enc.eq(None::<Vec<u8>>),
                     users::updated_at.eq(diesel::dsl::now),
                 ))
                 .execute(conn)?;

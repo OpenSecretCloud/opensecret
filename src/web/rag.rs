@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::jwt::AuthContext;
 use crate::models::users::User;
 use crate::rag;
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
@@ -88,6 +89,7 @@ async fn insert_archival_embedding(
     State(state): State<Arc<AppState>>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<InsertEmbeddingRequest>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
     if body.text.trim().is_empty() {
@@ -100,7 +102,7 @@ async fn insert_archival_embedding(
     }
 
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(&user, &auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -130,6 +132,7 @@ async fn search(
     State(state): State<Arc<AppState>>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<SearchRequest>,
 ) -> Result<Json<EncryptedResponse<SearchResponse>>, ApiError> {
     if body.query.trim().is_empty() {
@@ -164,7 +167,7 @@ async fn search(
     };
 
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(&user, &auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 

@@ -1,5 +1,4 @@
 use crate::encrypt::generate_random;
-use crate::models::push_devices::PushDevice;
 use crate::push::{NotificationPreviewPayload, PushError};
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -11,6 +10,7 @@ use p256::pkcs8::DecodePublicKey;
 use p256::PublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use uuid::Uuid;
 
 pub const PUSH_PREVIEW_INFO: &[u8] = b"opensecret-push-preview-v1";
 
@@ -27,10 +27,11 @@ pub struct EncryptedPreviewEnvelope {
 }
 
 pub fn encrypt_preview_payload(
-    device: &PushDevice,
+    device_uuid: Uuid,
+    notification_public_key: &[u8],
     payload: &NotificationPreviewPayload,
 ) -> Result<EncryptedPreviewEnvelope, PushError> {
-    let recipient_key = PublicKey::from_public_key_der(&device.notification_public_key)
+    let recipient_key = PublicKey::from_public_key_der(notification_public_key)
         .map_err(|e| PushError::CryptoError(e.to_string()))?;
     let ephemeral_secret = EphemeralSecret::random(&mut p256::elliptic_curve::rand_core::OsRng);
     let ephemeral_public = PublicKey::from(&ephemeral_secret);
@@ -53,7 +54,7 @@ pub fn encrypt_preview_payload(
     Ok(EncryptedPreviewEnvelope {
         enc_v: 1,
         alg: "p256-hkdf-sha256-aes256gcm".to_string(),
-        kid: device.uuid.to_string(),
+        kid: device_uuid.to_string(),
         epk: general_purpose::STANDARD.encode(ephemeral_public.to_encoded_point(false).as_bytes()),
         salt: general_purpose::STANDARD.encode(salt),
         nonce: general_purpose::STANDARD.encode(nonce_bytes),
@@ -64,10 +65,6 @@ pub fn encrypt_preview_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::push_devices::{
-        PushDevice, PUSH_ENV_PROD, PUSH_KEY_ALGORITHM_P256_ECDH_V1, PUSH_PLATFORM_IOS,
-        PUSH_PROVIDER_APNS,
-    };
     use aes_gcm::aead::{Aead, KeyInit};
     use aes_gcm::{Aes256Gcm, Nonce};
     use base64::{engine::general_purpose, Engine};
@@ -82,34 +79,24 @@ mod tests {
     fn encrypt_preview_payload_round_trips() {
         let recipient_secret = SecretKey::random(&mut OsRng);
         let recipient_public = recipient_secret.public_key();
-        let device = PushDevice {
-            id: 1,
-            uuid: Uuid::new_v4(),
-            user_id: Uuid::new_v4(),
-            installation_id: Uuid::new_v4(),
-            platform: PUSH_PLATFORM_IOS.to_string(),
-            provider: PUSH_PROVIDER_APNS.to_string(),
-            environment: PUSH_ENV_PROD.to_string(),
-            app_id: "ai.trymaple.ios".to_string(),
-            push_token_enc: vec![1, 2, 3],
-            push_token_hash: vec![4, 5, 6],
-            notification_public_key: recipient_public
-                .to_public_key_der()
-                .unwrap()
-                .as_bytes()
-                .to_vec(),
-            key_algorithm: PUSH_KEY_ALGORITHM_P256_ECDH_V1.to_string(),
-            supports_encrypted_preview: true,
-            supports_background_processing: true,
-            last_seen_at: Utc::now(),
-            revoked_at: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-        };
+        let device_uuid = Uuid::new_v4();
+        let notification_public_key = recipient_public
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec();
 
         let payload = NotificationPreviewPayload {
             v: 1,
             notification_id: Uuid::new_v4(),
+            user_uuid: Uuid::new_v4(),
+            project_id: 42,
+            source_kind: "request_continuation".to_string(),
+            source_request_id: None,
+            background_grant_uuid: None,
+            agent_uuid: None,
+            schedule_uuid: None,
+            delivery_mode: "encrypted_preview".to_string(),
             message_id: Uuid::new_v4(),
             kind: "agent.message".to_string(),
             title: "Maple".to_string(),
@@ -119,7 +106,8 @@ mod tests {
             sent_at: Utc::now().timestamp(),
         };
 
-        let envelope = encrypt_preview_payload(&device, &payload).unwrap();
+        let envelope =
+            encrypt_preview_payload(device_uuid, &notification_public_key, &payload).unwrap();
         let epk_bytes = general_purpose::STANDARD.decode(&envelope.epk).unwrap();
         let salt = general_purpose::STANDARD.decode(&envelope.salt).unwrap();
         let nonce = general_purpose::STANDARD.decode(&envelope.nonce).unwrap();
@@ -147,5 +135,6 @@ mod tests {
         assert_eq!(decoded.deep_link, payload.deep_link);
         assert_eq!(envelope.enc_v, 1);
         assert_eq!(envelope.alg, "p256-hkdf-sha256-aes256gcm");
+        assert_eq!(envelope.kid, device_uuid.to_string());
     }
 }

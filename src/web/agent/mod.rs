@@ -18,6 +18,7 @@ use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use crate::encrypt::decrypt_string;
+use crate::jwt::AuthContext;
 use crate::models::agents::{
     Agent, AGENT_CREATED_BY_AGENT, AGENT_CREATED_BY_USER, AGENT_KIND_SUBAGENT,
 };
@@ -332,9 +333,10 @@ fn validate_created_by_filter(created_by: Option<&str>) -> Result<Option<&str>, 
 async fn load_main_agent_context(
     state: &Arc<AppState>,
     user: &User,
+    auth_context: &AuthContext,
 ) -> Result<AgentConversationContext, ApiError> {
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(user, auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -358,9 +360,10 @@ async fn load_subagent_context(
     state: &Arc<AppState>,
     user: &User,
     agent_uuid: Uuid,
+    auth_context: &AuthContext,
 ) -> Result<AgentConversationContext, ApiError> {
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(user, auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -608,8 +611,9 @@ async fn get_main_agent(
     State(state): State<Arc<AppState>>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<MainAgentResponse>>, ApiError> {
-    let ctx = load_main_agent_context(&state, &user).await?;
+    let ctx = load_main_agent_context(&state, &user, &auth_context).await?;
     let response = build_main_agent_response(&ctx);
 
     encrypt_response(&state, &session_id, &response).await
@@ -619,10 +623,11 @@ async fn init_main_agent(
     State(state): State<Arc<AppState>>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<InitMainAgentRequest>,
 ) -> Result<Json<EncryptedResponse<InitMainAgentResponse>>, ApiError> {
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(&user, &auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -661,8 +666,9 @@ async fn list_main_agent_items(
     Query(params): Query<ListItemsParams>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationItemListResponse>>, ApiError> {
-    let ctx = load_main_agent_context(&state, &user).await?;
+    let ctx = load_main_agent_context(&state, &user, &auth_context).await?;
     let response =
         list_items_for_conversation(&state, ctx.conversation.id, &ctx.user_key, &params)?;
 
@@ -674,8 +680,9 @@ async fn get_main_agent_item(
     Path(item_id): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
-    let ctx = load_main_agent_context(&state, &user).await?;
+    let ctx = load_main_agent_context(&state, &user, &auth_context).await?;
     let item = get_item_from_conversation(&state, ctx.conversation.id, &ctx.user_key, item_id)?;
 
     encrypt_response(&state, &session_id, &item).await
@@ -686,10 +693,11 @@ async fn set_main_agent_item_reaction(
     Path(item_id): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<SetMessageReactionRequest>,
 ) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
     let emoji = reactions::require_valid_reaction(&body.emoji)?;
-    let ctx = load_main_agent_context(&state, &user).await?;
+    let ctx = load_main_agent_context(&state, &user, &auth_context).await?;
     let item = set_user_reaction_for_conversation(
         &state,
         ctx.conversation.id,
@@ -707,8 +715,9 @@ async fn clear_main_agent_item_reaction(
     Path(item_id): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
-    let ctx = load_main_agent_context(&state, &user).await?;
+    let ctx = load_main_agent_context(&state, &user, &auth_context).await?;
     let item = set_user_reaction_for_conversation(
         &state,
         ctx.conversation.id,
@@ -771,6 +780,7 @@ async fn list_subagents(
     Query(params): Query<ListSubagentsParams>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<SubagentListResponse>>, ApiError> {
     let limit = if params.limit <= 0 {
         DEFAULT_PAGINATION_LIMIT
@@ -781,7 +791,7 @@ async fn list_subagents(
     let created_by_filter = validate_created_by_filter(params.created_by.as_deref())?;
 
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(&user, &auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -835,8 +845,9 @@ async fn get_subagent(
     Path(agent_uuid): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<SubagentResponse>>, ApiError> {
-    let ctx = load_subagent_context(&state, &user, agent_uuid).await?;
+    let ctx = load_subagent_context(&state, &user, agent_uuid, &auth_context).await?;
     let response = build_subagent_response(&ctx.agent, &ctx.conversation, &ctx.user_key)?;
 
     encrypt_response(&state, &session_id, &response).await
@@ -848,8 +859,9 @@ async fn list_subagent_items(
     Query(params): Query<ListItemsParams>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationItemListResponse>>, ApiError> {
-    let ctx = load_subagent_context(&state, &user, agent_uuid).await?;
+    let ctx = load_subagent_context(&state, &user, agent_uuid, &auth_context).await?;
     let response =
         list_items_for_conversation(&state, ctx.conversation.id, &ctx.user_key, &params)?;
 
@@ -861,8 +873,9 @@ async fn get_subagent_item(
     Path((agent_uuid, item_id)): Path<(Uuid, Uuid)>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
-    let ctx = load_subagent_context(&state, &user, agent_uuid).await?;
+    let ctx = load_subagent_context(&state, &user, agent_uuid, &auth_context).await?;
     let item = get_item_from_conversation(&state, ctx.conversation.id, &ctx.user_key, item_id)?;
 
     encrypt_response(&state, &session_id, &item).await
@@ -873,10 +886,11 @@ async fn set_subagent_item_reaction(
     Path((agent_uuid, item_id)): Path<(Uuid, Uuid)>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<SetMessageReactionRequest>,
 ) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
     let emoji = reactions::require_valid_reaction(&body.emoji)?;
-    let ctx = load_subagent_context(&state, &user, agent_uuid).await?;
+    let ctx = load_subagent_context(&state, &user, agent_uuid, &auth_context).await?;
     let item = set_user_reaction_for_conversation(
         &state,
         ctx.conversation.id,
@@ -894,8 +908,9 @@ async fn clear_subagent_item_reaction(
     Path((agent_uuid, item_id)): Path<(Uuid, Uuid)>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
-    let ctx = load_subagent_context(&state, &user, agent_uuid).await?;
+    let ctx = load_subagent_context(&state, &user, agent_uuid, &auth_context).await?;
     let item = set_user_reaction_for_conversation(
         &state,
         ctx.conversation.id,
@@ -912,6 +927,7 @@ async fn chat_main(
     State(state): State<Arc<AppState>>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<AgentChatRequest>,
 ) -> Result<Response, ApiError> {
     let mut conn = state
@@ -924,7 +940,15 @@ async fn chat_main(
         return Err(ApiError::NotFound);
     }
 
-    chat_with_target(state, session_id, user, body, ChatTarget::Main).await
+    chat_with_target(
+        state,
+        session_id,
+        user,
+        auth_context,
+        body,
+        ChatTarget::Main,
+    )
+    .await
 }
 
 async fn chat_subagent(
@@ -932,6 +956,7 @@ async fn chat_subagent(
     Path(agent_uuid): Path<Uuid>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<AgentChatRequest>,
 ) -> Result<Response, ApiError> {
     let mut conn = state
@@ -952,6 +977,7 @@ async fn chat_subagent(
         state,
         session_id,
         user,
+        auth_context,
         body,
         ChatTarget::Subagent(agent_uuid),
     )
@@ -962,6 +988,7 @@ async fn chat_with_target(
     state: Arc<AppState>,
     session_id: Uuid,
     user: User,
+    auth_context: AuthContext,
     body: AgentChatRequest,
     target: ChatTarget,
 ) -> Result<Response, ApiError> {
@@ -974,10 +1001,19 @@ async fn chat_with_target(
     let (tx, mut rx) = mpsc::channel::<AgentClientEvent>(32);
     let worker_state = state.clone();
     let worker_user = user.clone();
+    let worker_auth_context = auth_context.clone();
     let worker_target = target.clone();
 
     tokio::spawn(async move {
-        run_agent_chat_task(worker_state, worker_user, input_content, worker_target, tx).await;
+        run_agent_chat_task(
+            worker_state,
+            worker_user,
+            worker_auth_context,
+            input_content,
+            worker_target,
+            tx,
+        )
+        .await;
     });
 
     let event_stream = async_stream::stream! {
@@ -1032,6 +1068,7 @@ async fn chat_with_target(
 async fn run_agent_chat_task(
     state: Arc<AppState>,
     user: User,
+    auth_context: AuthContext,
     input_content: MessageContent,
     target: ChatTarget,
     tx: mpsc::Sender<AgentClientEvent>,
@@ -1060,7 +1097,7 @@ async fn run_agent_chat_task(
     )
     .await;
 
-    let user_key = match state.get_user_key(user.uuid, None, None).await {
+    let user_key = match state.get_user_key(&user, &auth_context, None, None).await {
         Ok(key) => key,
         Err(_) => {
             let _ = send_agent_client_event(
@@ -1077,11 +1114,23 @@ async fn run_agent_chat_task(
 
     let runtime = match target.clone() {
         ChatTarget::Main => {
-            runtime::AgentRuntime::new_main(state.clone(), user.clone(), user_key).await
+            runtime::AgentRuntime::new_main(
+                state.clone(),
+                user.clone(),
+                user_key,
+                Some(auth_context.clone()),
+            )
+            .await
         }
         ChatTarget::Subagent(agent_uuid) => {
-            runtime::AgentRuntime::new_subagent(state.clone(), user.clone(), user_key, agent_uuid)
-                .await
+            runtime::AgentRuntime::new_subagent(
+                state.clone(),
+                user.clone(),
+                user_key,
+                agent_uuid,
+                Some(auth_context.clone()),
+            )
+            .await
         }
     };
 
@@ -1382,6 +1431,7 @@ async fn create_subagent(
     State(state): State<Arc<AppState>>,
     Extension(session_id): Extension<Uuid>,
     Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<CreateSubagentRequest>,
 ) -> Result<Json<EncryptedResponse<SubagentResponse>>, ApiError> {
     if body.purpose.trim().is_empty() {
@@ -1389,7 +1439,7 @@ async fn create_subagent(
     }
 
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key(&user, &auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 

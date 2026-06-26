@@ -1,23 +1,25 @@
 pub mod apns;
+pub mod binding;
 pub mod crypto;
 pub mod fcm;
 pub mod worker;
 
 use crate::db::DBError;
-use crate::encrypt::encrypt_with_key;
+use crate::models::agent_background_grants::AgentBackgroundGrant;
 use crate::models::notification_deliveries::{NewNotificationDelivery, NotificationDeliveryError};
 use crate::models::notification_events::{
     NewNotificationEvent, NotificationEvent, NotificationEventError,
     NOTIFICATION_DELIVERY_MODE_ENCRYPTED_PREVIEW, NOTIFICATION_DELIVERY_MODE_GENERIC,
     NOTIFICATION_KIND_AGENT_MESSAGE, NOTIFICATION_PRIORITY_HIGH, NOTIFICATION_PRIORITY_NORMAL,
+    NOTIFICATION_SOURCE_AGENT_BACKGROUND, NOTIFICATION_SOURCE_REQUEST_CONTINUATION,
 };
 use crate::models::project_settings::ProjectSettingError;
 use crate::models::push_devices::{PushDevice, PushDeviceError};
 use crate::models::users::User;
+use crate::push::binding::encrypt_notification_preview_payload_v1;
 use crate::{AppState, Error};
 use chrono::{DateTime, Duration, Utc};
 use diesel::Connection;
-use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -105,17 +107,73 @@ pub enum AgentPushTarget {
     Subagent(Uuid),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NotificationPreviewPayload {
-    pub v: i32,
-    pub notification_id: Uuid,
-    pub message_id: Uuid,
-    pub kind: String,
-    pub title: String,
-    pub body: String,
-    pub deep_link: String,
-    pub thread_id: String,
-    pub sent_at: i64,
+pub use crate::push::binding::NotificationPreviewPayloadV1 as NotificationPreviewPayload;
+
+#[derive(Debug, Clone)]
+pub enum PushNotificationSource {
+    RequestContinuation {
+        source_request_id: Option<Uuid>,
+        agent_uuid: Option<Uuid>,
+    },
+    AgentBackground {
+        grant_id: i64,
+        grant_uuid: Uuid,
+        agent_uuid: Uuid,
+        schedule_uuid: Uuid,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BackgroundAgentPushSource<'a> {
+    pub grant: &'a AgentBackgroundGrant,
+    pub agent_uuid: Uuid,
+    pub schedule_uuid: Uuid,
+}
+
+impl PushNotificationSource {
+    fn source_kind(&self) -> &'static str {
+        match self {
+            Self::RequestContinuation { .. } => NOTIFICATION_SOURCE_REQUEST_CONTINUATION,
+            Self::AgentBackground { .. } => NOTIFICATION_SOURCE_AGENT_BACKGROUND,
+        }
+    }
+
+    fn source_request_id(&self) -> Option<Uuid> {
+        match self {
+            Self::RequestContinuation {
+                source_request_id, ..
+            } => *source_request_id,
+            Self::AgentBackground { .. } => None,
+        }
+    }
+
+    fn background_grant_id(&self) -> Option<i64> {
+        match self {
+            Self::RequestContinuation { .. } => None,
+            Self::AgentBackground { grant_id, .. } => Some(*grant_id),
+        }
+    }
+
+    fn background_grant_uuid(&self) -> Option<Uuid> {
+        match self {
+            Self::RequestContinuation { .. } => None,
+            Self::AgentBackground { grant_uuid, .. } => Some(*grant_uuid),
+        }
+    }
+
+    fn agent_uuid(&self) -> Option<Uuid> {
+        match self {
+            Self::RequestContinuation { agent_uuid, .. } => *agent_uuid,
+            Self::AgentBackground { agent_uuid, .. } => Some(*agent_uuid),
+        }
+    }
+
+    fn schedule_uuid(&self) -> Option<Uuid> {
+        match self {
+            Self::RequestContinuation { .. } => None,
+            Self::AgentBackground { schedule_uuid, .. } => Some(*schedule_uuid),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +228,7 @@ pub struct EnqueueNotificationRequest {
     pub fallback_title: String,
     pub fallback_body: String,
     pub preview_payload: Option<NotificationPreviewPayloadInput>,
+    pub source: PushNotificationSource,
     pub not_before_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
 }
@@ -255,22 +314,30 @@ pub async fn enqueue_notification(
     }
 
     let notification_id = Uuid::new_v4();
-    let payload_enc = if let Some(preview_payload) = request.preview_payload {
+    let payload_enc = if let Some(preview_payload) = request.preview_payload.as_ref() {
         let payload = NotificationPreviewPayload {
             v: 1,
             notification_id,
+            user_uuid: request.user_id,
+            project_id: request.project_id,
+            source_kind: request.source.source_kind().to_string(),
+            source_request_id: request.source.source_request_id(),
+            background_grant_uuid: request.source.background_grant_uuid(),
+            agent_uuid: request.source.agent_uuid(),
+            schedule_uuid: request.source.schedule_uuid(),
+            delivery_mode: request.delivery_mode.as_str().to_string(),
             message_id: preview_payload.message_id,
-            kind: preview_payload.kind,
-            title: preview_payload.title,
-            body: preview_payload.body,
-            deep_link: preview_payload.deep_link,
-            thread_id: preview_payload.thread_id,
+            kind: preview_payload.kind.clone(),
+            title: preview_payload.title.clone(),
+            body: preview_payload.body.clone(),
+            deep_link: preview_payload.deep_link.clone(),
+            thread_id: preview_payload.thread_id.clone(),
             sent_at: preview_payload.sent_at,
         };
-        let enclave_key = SecretKey::from_slice(&state.enclave_key)
-            .map_err(|e| PushError::InvalidSecret(e.to_string()))?;
-        let payload_bytes = serde_json::to_vec(&payload)?;
-        Some(encrypt_with_key(&enclave_key, &payload_bytes).await)
+        Some(encrypt_notification_preview_payload_v1(
+            &state.enclave_key,
+            &payload,
+        )?)
     } else {
         None
     };
@@ -287,6 +354,9 @@ pub async fn enqueue_notification(
             fallback_title: request.fallback_title,
             fallback_body: request.fallback_body,
             payload_enc,
+            source_kind: request.source.source_kind().to_string(),
+            source_request_id: request.source.source_request_id(),
+            background_grant_id: request.source.background_grant_id(),
             not_before_at: request.not_before_at,
             expires_at: request.expires_at,
         }
@@ -340,7 +410,72 @@ pub async fn enqueue_agent_message_notification(
         PushDeliveryMode::Generic
     };
 
-    let (deep_link, thread_id) = match target {
+    let (deep_link, thread_id, source_agent_uuid) = match &target {
+        AgentPushTarget::Main => (
+            "opensecret://agent".to_string(),
+            "agent:main".to_string(),
+            None,
+        ),
+        AgentPushTarget::Subagent(agent_uuid) => (
+            format!("opensecret://agent/subagent/{}", agent_uuid),
+            format!("agent:subagent:{}", agent_uuid),
+            Some(*agent_uuid),
+        ),
+    };
+
+    enqueue_notification(
+        state,
+        EnqueueNotificationRequest {
+            project_id: user.project_id,
+            user_id: user.uuid,
+            kind: NOTIFICATION_KIND_AGENT_MESSAGE.to_string(),
+            delivery_mode,
+            priority: PushPriority::High,
+            fallback_title: AGENT_NOTIFICATION_FALLBACK_TITLE.to_string(),
+            fallback_body: AGENT_NOTIFICATION_FALLBACK_BODY.to_string(),
+            preview_payload: Some(NotificationPreviewPayloadInput {
+                message_id,
+                kind: NOTIFICATION_KIND_AGENT_MESSAGE.to_string(),
+                title: "Maple".to_string(),
+                body: normalize_preview_body(message_text),
+                deep_link,
+                thread_id,
+                sent_at: Utc::now().timestamp(),
+            }),
+            source: PushNotificationSource::RequestContinuation {
+                source_request_id: None,
+                agent_uuid: source_agent_uuid,
+            },
+            not_before_at: None,
+            expires_at: Some(Utc::now() + Duration::days(7)),
+        },
+    )
+    .await
+}
+
+pub async fn enqueue_background_agent_message_notification(
+    state: &Arc<AppState>,
+    user: &User,
+    target: AgentPushTarget,
+    message_id: Uuid,
+    message_text: &str,
+    source: BackgroundAgentPushSource<'_>,
+) -> Result<Option<QueuedNotification>, PushError> {
+    if message_text.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let push_settings = state
+        .db
+        .get_project_push_settings(user.project_id)?
+        .unwrap_or_default();
+    let delivery_mode = if push_settings.encrypted_preview_enabled {
+        PushDeliveryMode::EncryptedPreview
+    } else {
+        PushDeliveryMode::Generic
+    };
+
+    let (deep_link, thread_id) = match &target {
         AgentPushTarget::Main => ("opensecret://agent".to_string(), "agent:main".to_string()),
         AgentPushTarget::Subagent(agent_uuid) => (
             format!("opensecret://agent/subagent/{}", agent_uuid),
@@ -367,6 +502,12 @@ pub async fn enqueue_agent_message_notification(
                 thread_id,
                 sent_at: Utc::now().timestamp(),
             }),
+            source: PushNotificationSource::AgentBackground {
+                grant_id: source.grant.id,
+                grant_uuid: source.grant.uuid,
+                agent_uuid: source.agent_uuid,
+                schedule_uuid: source.schedule_uuid,
+            },
             not_before_at: None,
             expires_at: Some(Utc::now() + Duration::days(7)),
         },

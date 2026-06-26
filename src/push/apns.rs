@@ -1,6 +1,7 @@
 use crate::models::notification_events::NotificationEvent;
 use crate::models::project_settings::IosPushSettings;
 use crate::models::push_devices::PushDevice;
+use crate::push::binding::PushDeviceCapabilityPlaintextV1;
 use crate::push::crypto::encrypt_preview_payload;
 use crate::push::{
     CachedApnsToken, NotificationPreviewPayload, PushError, PushSendOutcome, PushTransport,
@@ -23,7 +24,7 @@ struct ApnsJwtClaims {
 pub struct ApnsSendRequest<'a> {
     pub event: &'a NotificationEvent,
     pub device: &'a PushDevice,
-    pub push_token: &'a str,
+    pub capability: &'a PushDeviceCapabilityPlaintextV1,
     pub ios_settings: &'a IosPushSettings,
     pub preview_payload: Option<&'a NotificationPreviewPayload>,
     pub send_encrypted_preview: bool,
@@ -44,15 +45,19 @@ pub async fn send_apns_notification(
     let body = build_apns_payload(
         request.event,
         request.device,
+        request.capability,
         request.preview_payload,
         request.send_encrypted_preview,
     )?;
     let endpoint = match request.ios_settings.apns_environment.as_str() {
         "dev" => format!(
             "https://api.sandbox.push.apple.com/3/device/{}",
-            request.push_token
+            request.capability.push_token
         ),
-        _ => format!("https://api.push.apple.com/3/device/{}", request.push_token),
+        _ => format!(
+            "https://api.push.apple.com/3/device/{}",
+            request.capability.push_token
+        ),
     };
 
     let mut http_request = transport
@@ -200,6 +205,7 @@ async fn invalidate_apns_cache(
 fn build_apns_payload(
     event: &NotificationEvent,
     device: &PushDevice,
+    capability: &PushDeviceCapabilityPlaintextV1,
     preview_payload: Option<&NotificationPreviewPayload>,
     send_encrypted_preview: bool,
 ) -> Result<Value, PushError> {
@@ -243,7 +249,8 @@ fn build_apns_payload(
 
     if send_encrypted_preview {
         if let Some(payload) = preview_payload {
-            let envelope = encrypt_preview_payload(device, payload)?;
+            let envelope =
+                encrypt_preview_payload(device.uuid, &capability.notification_public_key, payload)?;
             root.as_object_mut()
                 .expect("root payload must be an object")
                 .insert("os_push".to_string(), serde_json::to_value(envelope)?);

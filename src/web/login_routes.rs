@@ -559,6 +559,10 @@ mod tests {
             aud: Some(USER_REFRESH.to_string()),
             azp: None,
             role: None,
+            token_format: None,
+            auth_method: None,
+            project_id: None,
+            auth_binding: None,
         }
     }
 
@@ -587,6 +591,10 @@ mod tests {
             aud: Some(USER_REFRESH.to_string()),
             azp: None,
             role: None,
+            token_format: None,
+            auth_method: None,
+            project_id: None,
+            auth_binding: None,
         };
 
         assert_eq!(logout_push_revoke_target(&request, Ok(claims)), None);

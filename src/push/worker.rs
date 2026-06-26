@@ -1,17 +1,23 @@
-use crate::encrypt::decrypt_with_key;
+use crate::models::agent_background_grants::AgentBackgroundGrant;
 use crate::models::notification_deliveries::{
     NotificationDelivery, NotificationDeliveryWriteResult,
 };
-use crate::models::notification_events::NotificationEvent;
+use crate::models::notification_events::{
+    NotificationEvent, NOTIFICATION_SOURCE_AGENT_BACKGROUND,
+    NOTIFICATION_SOURCE_REQUEST_CONTINUATION,
+};
 use crate::models::push_devices::{PushDevice, PUSH_PLATFORM_ANDROID, PUSH_PLATFORM_IOS};
 use crate::push::apns::{send_apns_notification, ApnsSendRequest};
+use crate::push::binding::{
+    decrypt_background_grant_for_push, decrypt_notification_preview_payload_v1,
+    decrypt_push_device_capability_v1, PushDeviceCapabilityPlaintextV1,
+};
 use crate::push::fcm::send_fcm_notification;
 use crate::push::{NotificationPreviewPayload, PushError, PushSendOutcome, PushTransport};
 use crate::AppState;
 use chrono::Utc;
 use diesel::Connection;
 use futures::stream::{self, StreamExt};
-use secp256k1::SecretKey;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration as TokioDuration};
 use tracing::{debug, error};
@@ -179,17 +185,17 @@ async fn process_leased_delivery(
         }
     };
 
-    if device.user_id != event.user_id {
+    if device.user_id != event.user_id || device.project_id != event.project_id {
         if !record_delivery_transition(
             NotificationDelivery::mark_cancelled(
                 &mut conn,
                 delivery.id,
                 &lease_owner,
-                Some("device user does not match event user"),
+                Some("device principal does not match event principal"),
             )?,
             delivery.id,
             &lease_owner,
-            "cancelled (device user mismatch)",
+            "cancelled (device principal mismatch)",
         ) {
             return Ok(());
         }
@@ -337,15 +343,20 @@ async fn build_send_outcome(
     event: &NotificationEvent,
     device: &PushDevice,
 ) -> Result<PushSendOutcome, PushError> {
+    let capability = decrypt_device_capability(state, device)?;
+    if !capability.matches_device_row(device) {
+        return Err(PushError::CryptoError(
+            "push device capability does not match device row".to_string(),
+        ));
+    }
     let preview_payload = decrypt_preview_payload(state, event)?;
-    let push_token = decrypt_push_token(state, device)?;
 
     dispatch_delivery(
         state,
         transport,
         event,
         device,
-        &push_token,
+        &capability,
         preview_payload.as_ref(),
     )
     .await
@@ -356,7 +367,7 @@ async fn dispatch_delivery(
     transport: &PushTransport,
     event: &NotificationEvent,
     device: &PushDevice,
-    push_token: &str,
+    capability: &PushDeviceCapabilityPlaintextV1,
     preview_payload: Option<&NotificationPreviewPayload>,
 ) -> Result<PushSendOutcome, PushError> {
     let push_settings = state
@@ -394,7 +405,7 @@ async fn dispatch_delivery(
             let send_encrypted_preview = push_settings.encrypted_preview_enabled
                 && event.delivery_mode == "encrypted_preview"
                 && preview_payload.is_some()
-                && device.supports_encrypted_preview;
+                && capability.supports_encrypted_preview;
 
             send_apns_notification(
                 state,
@@ -402,7 +413,7 @@ async fn dispatch_delivery(
                 ApnsSendRequest {
                     event,
                     device,
-                    push_token,
+                    capability,
                     ios_settings,
                     preview_payload,
                     send_encrypted_preview,
@@ -435,7 +446,7 @@ async fn dispatch_delivery(
                 transport,
                 event,
                 device,
-                push_token,
+                &capability.push_token,
                 android_settings,
                 preview_payload,
             )
@@ -448,6 +459,14 @@ async fn dispatch_delivery(
     }
 }
 
+fn decrypt_device_capability(
+    state: &Arc<AppState>,
+    device: &PushDevice,
+) -> Result<PushDeviceCapabilityPlaintextV1, PushError> {
+    decrypt_push_device_capability_v1(&state.enclave_key, &device.capability_enc, device)
+        .map_err(|e| PushError::CryptoError(e.to_string()))
+}
+
 fn decrypt_preview_payload(
     state: &Arc<AppState>,
     event: &NotificationEvent,
@@ -456,22 +475,98 @@ fn decrypt_preview_payload(
         return Ok(None);
     };
 
-    let secret_key = SecretKey::from_slice(&state.enclave_key)
-        .map_err(|e| PushError::InvalidSecret(e.to_string()))?;
-    let plaintext = decrypt_with_key(&secret_key, payload_enc)
-        .map_err(|e| PushError::CryptoError(e.to_string()))?;
-    let payload = serde_json::from_slice::<NotificationPreviewPayload>(&plaintext)?;
+    let background_grant = load_background_grant_for_event(state, event)?;
+    let background_grant_uuid = background_grant.as_ref().map(|grant| grant.uuid);
+    let payload = decrypt_notification_preview_payload_v1(
+        &state.enclave_key,
+        payload_enc,
+        event,
+        background_grant_uuid,
+    )
+    .map_err(|e| PushError::CryptoError(e.to_string()))?;
+
+    if !payload.matches_event(event, background_grant_uuid) {
+        return Err(PushError::CryptoError(
+            "notification payload does not match event row".to_string(),
+        ));
+    }
+
+    if let Some(grant) = background_grant {
+        verify_background_push_grant(state, &grant, &payload)?;
+    } else if event.source_kind != NOTIFICATION_SOURCE_REQUEST_CONTINUATION {
+        return Err(PushError::CryptoError(format!(
+            "unsupported notification source kind: {}",
+            event.source_kind
+        )));
+    }
 
     Ok(Some(payload))
 }
 
-fn decrypt_push_token(state: &Arc<AppState>, device: &PushDevice) -> Result<String, PushError> {
-    let secret_key = SecretKey::from_slice(&state.enclave_key)
-        .map_err(|e| PushError::InvalidSecret(e.to_string()))?;
-    let plaintext = decrypt_with_key(&secret_key, &device.push_token_enc)
+fn load_background_grant_for_event(
+    state: &Arc<AppState>,
+    event: &NotificationEvent,
+) -> Result<Option<AgentBackgroundGrant>, PushError> {
+    match event.source_kind.as_str() {
+        NOTIFICATION_SOURCE_REQUEST_CONTINUATION => {
+            if event.background_grant_id.is_some() {
+                return Err(PushError::CryptoError(
+                    "request notification unexpectedly references a background grant".to_string(),
+                ));
+            }
+            Ok(None)
+        }
+        NOTIFICATION_SOURCE_AGENT_BACKGROUND => {
+            let grant_id = event.background_grant_id.ok_or_else(|| {
+                PushError::CryptoError("background notification missing grant id".to_string())
+            })?;
+            let mut conn = state
+                .db
+                .get_pool()
+                .get()
+                .map_err(|_| PushError::ConnectionError)?;
+            let grant = AgentBackgroundGrant::get_by_id(&mut conn, grant_id)
+                .map_err(|e| PushError::CryptoError(e.to_string()))?
+                .ok_or_else(|| PushError::CryptoError("background grant missing".to_string()))?;
+            if grant.revoked_at.is_some() {
+                return Err(PushError::CryptoError(
+                    "background grant is revoked".to_string(),
+                ));
+            }
+            if grant.user_id != event.user_id || grant.project_id != event.project_id {
+                return Err(PushError::CryptoError(
+                    "background grant principal does not match event".to_string(),
+                ));
+            }
+            Ok(Some(grant))
+        }
+        other => Err(PushError::CryptoError(format!(
+            "unsupported notification source kind: {other}",
+        ))),
+    }
+}
+
+fn verify_background_push_grant(
+    state: &Arc<AppState>,
+    grant: &AgentBackgroundGrant,
+    payload: &NotificationPreviewPayload,
+) -> Result<(), PushError> {
+    let grant_plaintext = decrypt_background_grant_for_push(&state.enclave_key, grant, payload)
         .map_err(|e| PushError::CryptoError(e.to_string()))?;
 
-    String::from_utf8(plaintext).map_err(|e| PushError::InvalidSecret(e.to_string()))
+    if grant_plaintext.grant_uuid != grant.uuid
+        || grant_plaintext.user_uuid != payload.user_uuid
+        || grant_plaintext.project_id != payload.project_id
+        || Some(grant_plaintext.agent_uuid) != payload.agent_uuid
+        || Some(grant_plaintext.schedule_uuid) != payload.schedule_uuid
+        || !grant_plaintext.may_send_push
+    {
+        return Err(PushError::CryptoError(
+            "background grant policy does not authorize notification".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn classify_internal_push_error(error: PushError) -> PushSendOutcome {

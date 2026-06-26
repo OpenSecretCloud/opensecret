@@ -1,10 +1,13 @@
-use crate::encrypt::encrypt_with_key;
 use crate::models::push_devices::{
     NewPushDevice, PushDevice, PushDeviceError, PUSH_ENV_DEV, PUSH_ENV_PROD,
     PUSH_KEY_ALGORITHM_P256_ECDH_V1, PUSH_PLATFORM_ANDROID, PUSH_PLATFORM_IOS, PUSH_PROVIDER_APNS,
     PUSH_PROVIDER_FCM,
 };
 use crate::models::users::User;
+use crate::push::binding::{
+    encrypt_push_device_capability_v1, hash_bytes, PushDeviceCapabilityInput,
+    PushDeviceCapabilityPlaintextV1,
+};
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
 use crate::{ApiError, AppState};
 use axum::{
@@ -18,9 +21,7 @@ use chrono::{DateTime, Utc};
 use diesel::Connection;
 use p256::pkcs8::DecodePublicKey;
 use p256::PublicKey;
-use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tracing::error;
 use uuid::Uuid;
@@ -116,10 +117,8 @@ async fn register_push_device(
         .map_err(|_| ApiError::BadRequest)?;
     validate_register_request(&body, &public_key_bytes)?;
 
-    let token_hash = Sha256::digest(body.push_token.as_bytes()).to_vec();
-    let enclave_key =
-        SecretKey::from_slice(&state.enclave_key).map_err(|_| ApiError::InternalServerError)?;
-    let push_token_enc = encrypt_with_key(&enclave_key, body.push_token.as_bytes()).await;
+    let token_hash = hash_bytes(body.push_token.as_bytes());
+    let public_key_hash = hash_bytes(&public_key_bytes);
 
     let mut conn = state
         .db
@@ -158,13 +157,19 @@ async fn register_push_device(
 
             if decision.write_mode == RegistrationWriteMode::ReuseExisting {
                 let mut existing = existing_for_user.expect("existing device should be present");
+                let capability =
+                    build_device_capability(existing.uuid, &user, &body, public_key_bytes.clone());
+                let capability_enc =
+                    encrypt_push_device_capability_v1(&state.enclave_key, &capability)
+                        .map_err(|_| diesel::result::Error::RollbackTransaction)?;
                 existing.platform = body.platform.clone();
                 existing.provider = body.provider.clone();
                 existing.environment = body.environment.clone();
                 existing.app_id = body.app_id.clone();
-                existing.push_token_enc = push_token_enc.clone();
+                existing.project_id = user.project_id;
                 existing.push_token_hash = token_hash.clone();
-                existing.notification_public_key = public_key_bytes.clone();
+                existing.capability_enc = capability_enc;
+                existing.notification_public_key_hash = public_key_hash.clone();
                 existing.key_algorithm = body.key_algorithm.clone();
                 existing.supports_encrypted_preview = body.supports_encrypted_preview;
                 existing.supports_background_processing = body.supports_background_processing;
@@ -173,16 +178,24 @@ async fn register_push_device(
                 existing.update(conn)?;
                 Ok(existing)
             } else {
+                let device_uuid = Uuid::new_v4();
+                let capability =
+                    build_device_capability(device_uuid, &user, &body, public_key_bytes.clone());
+                let capability_enc =
+                    encrypt_push_device_capability_v1(&state.enclave_key, &capability)
+                        .map_err(|_| diesel::result::Error::RollbackTransaction)?;
                 NewPushDevice {
+                    uuid: device_uuid,
                     user_id: user.uuid,
+                    project_id: user.project_id,
                     installation_id: body.installation_id,
                     platform: body.platform.clone(),
                     provider: body.provider.clone(),
                     environment: body.environment.clone(),
                     app_id: body.app_id.clone(),
-                    push_token_enc: push_token_enc.clone(),
                     push_token_hash: token_hash.clone(),
-                    notification_public_key: public_key_bytes.clone(),
+                    capability_enc,
+                    notification_public_key_hash: public_key_hash.clone(),
                     key_algorithm: body.key_algorithm.clone(),
                     supports_encrypted_preview: body.supports_encrypted_preview,
                     supports_background_processing: body.supports_background_processing,
@@ -287,6 +300,29 @@ fn validate_register_request(
     Ok(())
 }
 
+fn build_device_capability(
+    device_uuid: Uuid,
+    user: &User,
+    request: &RegisterPushDeviceRequest,
+    public_key_bytes: Vec<u8>,
+) -> PushDeviceCapabilityPlaintextV1 {
+    PushDeviceCapabilityPlaintextV1::new(PushDeviceCapabilityInput {
+        push_device_uuid: device_uuid,
+        user_uuid: user.uuid,
+        project_id: user.project_id,
+        installation_id: request.installation_id,
+        platform: request.platform.clone(),
+        provider: request.provider.clone(),
+        environment: request.environment.clone(),
+        app_id: request.app_id.clone(),
+        key_algorithm: request.key_algorithm.clone(),
+        push_token: request.push_token.clone(),
+        notification_public_key: public_key_bytes,
+        supports_encrypted_preview: request.supports_encrypted_preview,
+        supports_background_processing: request.supports_background_processing,
+    })
+}
+
 fn map_push_device_error(error: PushDeviceError) -> ApiError {
     error!("Push device database error: {:?}", error);
     ApiError::InternalServerError
@@ -364,14 +400,15 @@ mod tests {
             id: now.timestamp_nanos_opt().expect("valid timestamp nanos"),
             uuid: Uuid::new_v4(),
             user_id,
+            project_id: 42,
             installation_id,
             platform: PUSH_PLATFORM_IOS.to_string(),
             provider: PUSH_PROVIDER_APNS.to_string(),
             environment: PUSH_ENV_PROD.to_string(),
             app_id: "ai.trymaple.ios".to_string(),
-            push_token_enc: vec![1, 2, 3],
             push_token_hash: token_hash,
-            notification_public_key: vec![4, 5, 6],
+            capability_enc: vec![1, 2, 3],
+            notification_public_key_hash: vec![4, 5, 6],
             key_algorithm: PUSH_KEY_ALGORITHM_P256_ECDH_V1.to_string(),
             supports_encrypted_preview: true,
             supports_background_processing: true,

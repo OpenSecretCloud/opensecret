@@ -13,7 +13,15 @@ use tokio::time::{sleep, Duration as TokioDuration};
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
-use crate::encrypt::decrypt_string;
+use crate::agent_background::{
+    decrypt_background_grant_v1, encrypt_background_grant_v1, instruction_hash,
+    AgentBackgroundGrantPlaintextV1,
+};
+use crate::encrypt::{decrypt_string, encrypt_with_key};
+use crate::jwt::AuthContext;
+use crate::models::agent_background_grants::{
+    AgentBackgroundGrant, AgentBackgroundGrantError, NewAgentBackgroundGrant,
+};
 use crate::models::agent_schedule_runs::{
     AgentScheduleRun, AgentScheduleRunError, AgentScheduleRunWriteResult, NewAgentScheduleRun,
     AGENT_SCHEDULE_RUN_STATUS_COMPLETED,
@@ -28,7 +36,9 @@ use crate::models::agents::{Agent, AGENT_KIND_MAIN, AGENT_KIND_SUBAGENT};
 use crate::models::schema::agent_schedules;
 use crate::models::user_preferences::{UserPreference, USER_PREFERENCE_TIMEZONE};
 use crate::models::users::User;
-use crate::push::{enqueue_agent_message_notification, AgentPushTarget};
+use crate::push::{
+    enqueue_background_agent_message_notification, AgentPushTarget, BackgroundAgentPushSource,
+};
 use crate::web::openai::{get_chat_completion_response, BillingContext, CompletionChunk};
 use crate::web::openai_auth::AuthMethod;
 use crate::AppState;
@@ -139,6 +149,7 @@ pub struct ScheduleTaskTool {
     state: Arc<AppState>,
     user: Arc<User>,
     user_key: Arc<SecretKey>,
+    auth_context: Option<AuthContext>,
     agent: Agent,
 }
 
@@ -147,12 +158,14 @@ impl ScheduleTaskTool {
         state: Arc<AppState>,
         user: Arc<User>,
         user_key: Arc<SecretKey>,
+        auth_context: Option<AuthContext>,
         agent: Agent,
     ) -> Self {
         Self {
             state,
             user,
             user_key,
+            auth_context,
             agent,
         }
     }
@@ -307,25 +320,77 @@ impl Tool for ScheduleTaskTool {
             ));
         }
 
+        let Some(auth_context) = self.auth_context.as_ref() else {
+            return ToolResult::error(
+                "Schedules can only be created during a live authenticated request.",
+            );
+        };
+
+        let plaintext_seed = match self
+            .state
+            .decrypt_seed_for_auth_context(self.user.as_ref(), auth_context)
+        {
+            Ok(seed) => seed,
+            Err(e) => {
+                error!("schedule_task could not unwrap seed for background grant: {e:?}");
+                return ToolResult::error("Failed to authorize schedule");
+            }
+        };
+
         let description = args
             .get("description")
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .map(str::to_string)
-            .unwrap_or_else(|| truncate_for_description(instruction));
+            .unwrap_or_else(|| spec.summary());
 
+        let description_enc =
+            encrypt_with_key(self.user_key.as_ref(), description.as_bytes()).await;
         let instruction_enc =
-            crate::encrypt::encrypt_with_key(self.user_key.as_ref(), instruction.as_bytes()).await;
+            encrypt_with_key(self.user_key.as_ref(), instruction.as_bytes()).await;
         let schedule_spec = match spec.to_value() {
             Ok(value) => value,
             Err(e) => return ToolResult::error(e.to_string()),
         };
+        let schedule_uuid = Uuid::new_v4();
+        let grant_uuid = Uuid::new_v4();
+        let instruction_hash = instruction_hash(instruction);
+        let grant_plaintext = AgentBackgroundGrantPlaintextV1::new_scheduled(
+            grant_uuid,
+            self.user.uuid,
+            self.user.project_id,
+            self.agent.uuid,
+            schedule_uuid,
+            instruction_hash,
+            auth_context.method.as_str(),
+        );
+        let grant_enc = match encrypt_background_grant_v1(&self.state.enclave_key, &grant_plaintext)
+        {
+            Ok(grant_enc) => grant_enc,
+            Err(e) => {
+                error!("schedule_task could not seal background grant: {e:?}");
+                return ToolResult::error("Failed to authorize schedule");
+            }
+        };
+        let seed_wrapping = match self.state.new_agent_background_seed_wrapping_for_user(
+            self.user.as_ref(),
+            grant_uuid,
+            &grant_plaintext.background_secret,
+            &plaintext_seed,
+        ) {
+            Ok(seed_wrapping) => seed_wrapping,
+            Err(e) => {
+                error!("schedule_task could not create background seed wrap: {e:?}");
+                return ToolResult::error("Failed to authorize schedule");
+            }
+        };
+        let seed_wrap_lookup_hash = seed_wrapping.credential_lookup_hash.clone();
 
         let new_schedule = NewAgentSchedule {
-            uuid: Uuid::new_v4(),
+            uuid: schedule_uuid,
             user_id: self.user.uuid,
             agent_id: self.agent.id,
-            description,
+            description_enc,
             instruction_enc,
             schedule_kind: spec.schedule_kind().to_string(),
             recurrence_type: spec.recurrence_type().map(str::to_string),
@@ -347,7 +412,35 @@ impl Tool for ScheduleTaskTool {
             Err(_) => return ToolResult::error("Database connection error"),
         };
 
-        match new_schedule.insert(&mut conn) {
+        let insert_result = conn.transaction::<AgentSchedule, diesel::result::Error, _>(|conn| {
+            let schedule = new_schedule.insert(conn).map_err(|e| match e {
+                AgentScheduleError::DatabaseError(error) => error,
+                AgentScheduleError::InvalidSpec(_) => diesel::result::Error::RollbackTransaction,
+            })?;
+            NewAgentBackgroundGrant {
+                uuid: grant_uuid,
+                user_id: self.user.uuid,
+                project_id: self.user.project_id,
+                agent_id: self.agent.id,
+                schedule_id: schedule.id,
+                grant_enc: grant_enc.clone(),
+                seed_wrap_lookup_hash: seed_wrap_lookup_hash.clone(),
+            }
+            .insert(conn)
+            .map_err(|e| match e {
+                AgentBackgroundGrantError::DatabaseError(error) => error,
+            })?;
+            seed_wrapping
+                .upsert_by_credential(conn)
+                .map_err(|e| match e {
+                    crate::models::user_seed_wrappings::UserSeedWrappingError::DatabaseError(
+                        error,
+                    ) => error,
+                })?;
+            Ok(schedule)
+        });
+
+        match insert_result {
             Ok(schedule) => {
                 let spec_summary = spec.summary();
                 info!(
@@ -382,12 +475,23 @@ impl Tool for ScheduleTaskTool {
 pub struct ListSchedulesTool {
     state: Arc<AppState>,
     user: Arc<User>,
+    user_key: Arc<SecretKey>,
     agent: Agent,
 }
 
 impl ListSchedulesTool {
-    pub fn new(state: Arc<AppState>, user: Arc<User>, agent: Agent) -> Self {
-        Self { state, user, agent }
+    pub fn new(
+        state: Arc<AppState>,
+        user: Arc<User>,
+        user_key: Arc<SecretKey>,
+        agent: Agent,
+    ) -> Self {
+        Self {
+            state,
+            user,
+            user_key,
+            agent,
+        }
     }
 }
 
@@ -452,11 +556,16 @@ impl Tool for ListSchedulesTool {
                             format_local_time(dt, tz)
                         })
                         .unwrap_or_else(|| "none".to_string());
+                    let description =
+                        decrypt_string(self.user_key.as_ref(), Some(&schedule.description_enc))
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| spec_summary.clone());
                     output.push_str(&format!(
                         "- id: {}\n  status: {}\n  description: {}\n  rule: {}\n  timezone: {} ({})\n  next: {}\n\n",
                         schedule.uuid,
                         schedule.status,
-                        schedule.description.trim(),
+                        description.trim(),
                         spec_summary,
                         schedule.timezone_mode,
                         schedule.resolved_timezone,
@@ -855,6 +964,38 @@ async fn process_leased_schedule_run(
         );
         return Ok(());
     };
+
+    if run.user_id != schedule.user_id
+        || run.agent_id != schedule.agent_id
+        || agent.user_id != run.user_id
+        || agent.id != run.agent_id
+        || user.uuid != run.user_id
+    {
+        warn!(
+            "scheduled run {} failed sealed-principal row consistency check (run_user={}, schedule_user={}, run_agent={}, schedule_agent={}, agent_user={})",
+            run.uuid,
+            run.user_id,
+            schedule.user_id,
+            run.agent_id,
+            schedule.agent_id,
+            agent.user_id,
+        );
+        fail_schedule_run(&mut conn, &run, lease_owner, "schedule principal mismatch")?;
+        return Ok(());
+    }
+
+    let Some(grant) = AgentBackgroundGrant::get_active_by_schedule(&mut conn, schedule.id)
+        .map_err(|e| match e {
+            AgentBackgroundGrantError::DatabaseError(error) => error.to_string(),
+        })?
+    else {
+        warn!(
+            "scheduled run {} could not find active background grant for schedule {}",
+            run.uuid, schedule.uuid,
+        );
+        fail_schedule_run(&mut conn, &run, lease_owner, "background grant missing")?;
+        return Ok(());
+    };
     drop(conn);
 
     info!(
@@ -867,13 +1008,38 @@ async fn process_leased_schedule_run(
         run.scheduled_for.format("%Y-%m-%d %H:%M:%S UTC"),
     );
 
+    let grant_plaintext = decrypt_background_grant_v1(
+        &state.enclave_key,
+        &grant.grant_enc,
+        grant.uuid,
+        user.uuid,
+        user.project_id,
+        agent.uuid,
+        schedule.uuid,
+    )
+    .map_err(|e| format!("failed to decrypt background grant: {e:?}"))?;
+
     let user_key = state
-        .get_user_key(user.uuid, None, None)
+        .get_user_key_for_agent_background_grant(
+            &user,
+            &grant_plaintext,
+            &grant.seed_wrap_lookup_hash,
+        )
         .await
-        .map_err(|e| format!("failed to derive user key: {e:?}"))?;
+        .map_err(|e| format!("failed to derive background user key: {e:?}"))?;
     let instruction = decrypt_string(&user_key, Some(&schedule.instruction_enc))
         .map_err(|e| format!("failed to decrypt schedule instruction: {e:?}"))?
         .unwrap_or_default();
+    let actual_instruction_hash = instruction_hash(&instruction);
+    if !grant_plaintext.verify_scheduled_policy(
+        user.uuid,
+        user.project_id,
+        agent.uuid,
+        schedule.uuid,
+        &actual_instruction_hash,
+    ) {
+        return Err("background grant policy did not match scheduled run".to_string());
+    }
 
     let input = build_scheduled_turn_input(&schedule, &run, &instruction);
 
@@ -908,30 +1074,36 @@ async fn process_leased_schedule_run(
                 .get()
                 .map_err(|_| "database connection error".to_string())?;
 
-            let push_enqueued = if !outcome.persisted_messages.is_empty() {
-                let preview =
-                    compose_scheduled_preview(state, &user, &outcome.persisted_messages).await;
-                let target = agent_push_target(&agent);
-                let first_message = &outcome.persisted_messages[0];
-                match enqueue_agent_message_notification(
-                    state,
-                    &user,
-                    target,
-                    first_message.message_id,
-                    &preview,
-                )
-                .await
-                {
-                    Ok(Some(_)) => true,
-                    Ok(None) => false,
-                    Err(e) => {
-                        error!("failed to enqueue scheduled agent push: {e:?}");
-                        false
+            let push_enqueued =
+                if grant_plaintext.may_send_push && !outcome.persisted_messages.is_empty() {
+                    let preview =
+                        compose_scheduled_preview(state, &user, &outcome.persisted_messages).await;
+                    let target = agent_push_target(&agent);
+                    let first_message = &outcome.persisted_messages[0];
+                    match enqueue_background_agent_message_notification(
+                        state,
+                        &user,
+                        target,
+                        first_message.message_id,
+                        &preview,
+                        BackgroundAgentPushSource {
+                            grant: &grant,
+                            agent_uuid: agent.uuid,
+                            schedule_uuid: schedule.uuid,
+                        },
+                    )
+                    .await
+                    {
+                        Ok(Some(_)) => true,
+                        Ok(None) => false,
+                        Err(e) => {
+                            error!("failed to enqueue scheduled agent push: {e:?}");
+                            false
+                        }
                     }
-                }
-            } else {
-                false
-            };
+                } else {
+                    false
+                };
 
             let terminal_error = if outcome.had_error && !outcome.persisted_messages.is_empty() {
                 Some("scheduled turn ended after partial output; preserving existing output")
@@ -1080,9 +1252,10 @@ async fn run_scheduled_agent_turn(
     input: &str,
 ) -> Result<ScheduledTurnOutcome, String> {
     let runtime_result = if agent.kind == AGENT_KIND_MAIN {
-        runtime::AgentRuntime::new_main(state.clone(), user.clone(), user_key).await
+        runtime::AgentRuntime::new_main(state.clone(), user.clone(), user_key, None).await
     } else if agent.kind == AGENT_KIND_SUBAGENT {
-        runtime::AgentRuntime::new_subagent(state.clone(), user.clone(), user_key, agent.uuid).await
+        runtime::AgentRuntime::new_subagent(state.clone(), user.clone(), user_key, agent.uuid, None)
+            .await
     } else {
         return Err(format!(
             "unsupported agent kind for schedule: {}",
@@ -1304,10 +1477,9 @@ fn build_scheduled_turn_input(
     instruction: &str,
 ) -> String {
     format!(
-        "[SCHEDULED EVENT]\nThis is an internal scheduled wakeup, not a new live user message.\n\nSchedule ID: {}\nRun ID: {}\nDescription: {}\nScheduled for (UTC): {}\nCurrent resolved timezone: {}\nInstruction for your future self:\n{}\n\nDecide what, if anything, the user should see right now. You may send messages, call tools, or do nothing if the event is no longer relevant.",
+        "[SCHEDULED EVENT]\nThis is an internal scheduled wakeup, not a new live user message.\n\nSchedule ID: {}\nRun ID: {}\nScheduled for (UTC): {}\nCurrent resolved timezone: {}\nInstruction for your future self:\n{}\n\nDecide what, if anything, the user should see right now. You may send messages, call tools, or do nothing if the event is no longer relevant.",
         schedule.uuid,
         run.uuid,
-        schedule.description.trim(),
         run.scheduled_for.format("%Y-%m-%d %H:%M:%S UTC"),
         schedule.resolved_timezone,
         instruction.trim()
@@ -1709,19 +1881,6 @@ fn agent_push_target(agent: &Agent) -> AgentPushTarget {
     }
 }
 
-fn truncate_for_description(instruction: &str) -> String {
-    let trimmed = instruction.trim();
-    if trimmed.len() <= 80 {
-        return trimmed.to_string();
-    }
-
-    let mut end = 80;
-    while end > 0 && !trimmed.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", trimmed[..end].trim_end())
-}
-
 fn retry_backoff_seconds(attempt_count: i32) -> i32 {
     let capped_attempt = attempt_count.clamp(1, 6);
     let seconds = 15_i64 * (1_i64 << (capped_attempt - 1));
@@ -1755,6 +1914,22 @@ fn record_run_transition(
             run_id, transition, lease_owner
         );
     }
+}
+
+fn fail_schedule_run(
+    conn: &mut PgConnection,
+    run: &AgentScheduleRun,
+    lease_owner: &str,
+    reason: &'static str,
+) -> Result<(), String> {
+    record_run_transition(
+        AgentScheduleRun::mark_failed(conn, run.id, lease_owner, Some(reason))
+            .map_err(|e| e.to_string())?,
+        run.id,
+        lease_owner,
+        "failed",
+    );
+    Ok(())
 }
 
 #[cfg(test)]

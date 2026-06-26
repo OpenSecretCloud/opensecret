@@ -8,6 +8,7 @@ use uuid::Uuid;
 use diesel::prelude::*;
 
 use crate::encrypt::{decrypt_string, encrypt_with_key};
+use crate::jwt::AuthContext;
 use crate::models::agents::{
     Agent, NewAgent, AGENT_CREATED_BY_USER, AGENT_KIND_MAIN, AGENT_KIND_SUBAGENT,
 };
@@ -616,6 +617,7 @@ impl AgentRuntime {
         state: Arc<AppState>,
         user: crate::models::users::User,
         user_key: SecretKey,
+        auth_context: Option<AuthContext>,
     ) -> Result<Self, ApiError> {
         let user = Arc::new(user);
         let user_key = Arc::new(user_key);
@@ -629,7 +631,7 @@ impl AgentRuntime {
         let (agent, conversation) =
             load_main_agent(&mut conn, user.uuid)?.ok_or(ApiError::NotFound)?;
 
-        Self::from_loaded(state, user, user_key, agent, conversation).await
+        Self::from_loaded(state, user, user_key, auth_context, agent, conversation).await
     }
 
     pub async fn new_subagent(
@@ -637,6 +639,7 @@ impl AgentRuntime {
         user: crate::models::users::User,
         user_key: SecretKey,
         agent_uuid: Uuid,
+        auth_context: Option<AuthContext>,
     ) -> Result<Self, ApiError> {
         let user = Arc::new(user);
         let user_key = Arc::new(user_key);
@@ -666,13 +669,14 @@ impl AgentRuntime {
                 },
             )?;
 
-        Self::from_loaded(state, user, user_key, agent, conversation).await
+        Self::from_loaded(state, user, user_key, auth_context, agent, conversation).await
     }
 
     async fn from_loaded(
         state: Arc<AppState>,
         user: Arc<crate::models::users::User>,
         user_key: Arc<SecretKey>,
+        auth_context: Option<AuthContext>,
         agent: Agent,
         conversation: Conversation,
     ) -> Result<Self, ApiError> {
@@ -727,11 +731,13 @@ impl AgentRuntime {
             state.clone(),
             user.clone(),
             user_key.clone(),
+            auth_context.clone(),
             agent.clone(),
         )));
         tools.register(Arc::new(ListSchedulesTool::new(
             state.clone(),
             user.clone(),
+            user_key.clone(),
             agent.clone(),
         )));
         tools.register(Arc::new(CancelScheduleTool::new(

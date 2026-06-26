@@ -1,8 +1,9 @@
 pub mod account_deletion;
+pub mod agent_background_grants;
 pub mod agent_schedule_runs;
 pub mod agent_schedules;
-pub mod app_data_migrations;
 pub mod agents;
+pub mod app_data_migrations;
 pub mod conversation_summaries;
 pub mod email_verification;
 pub mod enclave_secrets;

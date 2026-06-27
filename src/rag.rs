@@ -522,6 +522,7 @@ async fn load_all_user_embeddings(
                 vector_dim,
                 id,
             } = row;
+            last_id = id;
 
             let vector_bytes = decrypt_with_key(user_key, &vector_enc)
                 .map_err(|_| ApiError::InternalServerError)?;
@@ -545,7 +546,6 @@ async fn load_all_user_embeddings(
                 content_enc,
                 token_count,
             });
-            last_id = id;
         }
     }
 
@@ -632,6 +632,7 @@ async fn load_user_embeddings_by_tags(
                 vector_dim,
                 id,
             } = row;
+            last_id = id;
 
             let vector_bytes = decrypt_with_key(user_key, &vector_enc)
                 .map_err(|_| ApiError::InternalServerError)?;
@@ -655,7 +656,6 @@ async fn load_user_embeddings_by_tags(
                 content_enc,
                 token_count,
             });
-            last_id = id;
         }
     }
 

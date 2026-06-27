@@ -98,10 +98,10 @@ mod os_flags;
 mod private_key;
 mod provider_routing;
 mod proxy_config;
+mod rag;
 #[cfg(test)]
 mod security_invariants;
 mod seed_wrapping;
-mod rag;
 mod sqs;
 mod tokens;
 mod web;

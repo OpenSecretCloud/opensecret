@@ -1200,9 +1200,7 @@ fn insert_response_storage_stack_for_user(app_state: &AppState, user_id: Uuid) {
         response_id: Some(response.id),
         user_id,
         content_enc: vec![7, 8, 9],
-        attachment_text_enc: None,
         prompt_tokens: 3,
-        assistant_reaction: None,
     }
     .insert(conn)
     .expect("test user message should insert");
@@ -1217,7 +1215,6 @@ fn insert_response_storage_stack_for_user(app_state: &AppState, user_id: Uuid) {
         status: "completed".to_string(),
         finish_reason: Some("stop".to_string()),
         created_at: Utc::now(),
-        user_reaction: None,
     }
     .insert(conn)
     .expect("test assistant message should insert");

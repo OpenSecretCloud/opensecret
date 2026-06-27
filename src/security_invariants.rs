@@ -15,6 +15,7 @@ const DESTRUCTIVE_RESET_REQUIRED_TABLES: &[&str] = &[
     "user_seed_wrappings",
     "user_embeddings",
     "agent_schedule_runs",
+    "agent_background_grants",
     "agent_schedules",
     "agents",
     "notification_events",

@@ -594,8 +594,6 @@ pub async fn validate_jwt(
         None => return ApiError::InvalidJwt.into_response(),
     };
 
-    tracing::trace!("Validating JWT");
-
     let claims = match validate_token(&token, &data, USER_ACCESS) {
         Ok(claims) => claims,
         Err(_) => return ApiError::InvalidJwt.into_response(),
@@ -655,8 +653,6 @@ pub async fn validate_platform_jwt(
         None => return ApiError::InvalidJwt.into_response(),
     };
 
-    tracing::trace!("Validating platform JWT");
-
     let claims = match validate_token(&token, &data, PLATFORM_ACCESS) {
         Ok(claims) => claims,
         Err(_) => return ApiError::InvalidJwt.into_response(),
@@ -691,8 +687,6 @@ pub(crate) fn validate_token(
     let es256k = Es256k::<Sha256>::new(data.config.jwt_keys.secp.clone());
     let public_key = data.config.jwt_keys.public_key();
 
-    tracing::trace!("Attempting to validate ES256K token");
-
     // First parse the token with the correct type
     let parsed_token = match UntrustedToken::new(original_token) {
         Ok(token) => token,
@@ -705,8 +699,6 @@ pub(crate) fn validate_token(
     // Deserialize claims first
     let token: Token<CustomClaims> = match es256k.validator(&public_key).validate(&parsed_token) {
         Ok(token) => {
-            tracing::trace!("ES256K signature validation successful");
-
             // Only validate expiration, not maturity
             let time_options = TimeOptions::default();
             if let Err(e) = token.claims().validate_expiration(&time_options) {

@@ -250,21 +250,29 @@ fn top_k_candidates(
             continue;
         }
 
-        let score = cosine_similarity(query, &e.vector)?;
-        let item = HeapItem {
-            score,
-            token_count: e.token_count,
-            content_enc: e.content_enc.clone(),
-        };
-
         if heap.len() < top_k {
+            let score = cosine_similarity(query, &e.vector)?;
+            let item = HeapItem {
+                score,
+                token_count: e.token_count,
+                content_enc: e.content_enc.clone(),
+            };
             heap.push(std::cmp::Reverse(item));
             continue;
         }
 
+        let score = cosine_similarity(query, &e.vector)?;
         if let Some(std::cmp::Reverse(min)) = heap.peek() {
-            if item.cmp(min) == Ordering::Greater {
+            let ordering = score
+                .total_cmp(&min.score)
+                .then_with(|| min.token_count.cmp(&e.token_count));
+            if ordering == Ordering::Greater {
                 heap.pop();
+                let item = HeapItem {
+                    score,
+                    token_count: e.token_count,
+                    content_enc: e.content_enc.clone(),
+                };
                 heap.push(std::cmp::Reverse(item));
             }
         }
@@ -356,6 +364,11 @@ pub async fn insert_archival_embedding(
     text: &str,
     metadata: Option<&serde_json::Value>,
 ) -> Result<crate::models::user_embeddings::UserEmbedding, ApiError> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(ApiError::BadRequest);
+    }
+
     let user_id = user.uuid;
     let (vector, token_count) = embed_text_via_tinfoil(state, user, auth_method, text).await?;
 
@@ -487,6 +500,7 @@ async fn load_all_user_embeddings(
     loop {
         let rows: Vec<EmbeddingScanRow> = user_embeddings::table
             .filter(user_embeddings::user_id.eq(user_id))
+            .filter(user_embeddings::embedding_model.eq(DEFAULT_EMBEDDING_MODEL))
             .filter(user_embeddings::id.gt(last_id))
             .order(user_embeddings::id.asc())
             .select((
@@ -585,6 +599,7 @@ async fn load_user_embeddings_by_tags(
     loop {
         let mut query = user_embeddings::table
             .filter(user_embeddings::user_id.eq(user_id))
+            .filter(user_embeddings::embedding_model.eq(DEFAULT_EMBEDDING_MODEL))
             .filter(user_embeddings::id.gt(last_id))
             .filter(user_embeddings::tags_enc.overlaps_with(tags_enc_filter.clone()))
             .into_boxed();

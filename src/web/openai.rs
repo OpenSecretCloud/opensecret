@@ -2002,7 +2002,7 @@ async fn proxy_tts(
 async fn request_embeddings_from_primary(
     state: &AppState,
     embedding_request: &EmbeddingRequest,
-) -> Result<(Value, String), ApiError> {
+) -> Result<(Value, String, String), ApiError> {
     let proxy_config = state
         .proxy_router
         .get_tinfoil_proxy()
@@ -2019,6 +2019,7 @@ async fn request_embeddings_from_primary(
     if proxy_config.provider_name == "tinfoil" {
         provider_request.model = canonicalize_tinfoil_model(&embedding_request.model);
     }
+    let effective_model = provider_request.model.clone();
 
     // Build request body
     let request_body = serde_json::to_string(&provider_request).map_err(|e| {
@@ -2086,7 +2087,7 @@ async fn request_embeddings_from_primary(
         ApiError::InternalServerError
     })?;
 
-    Ok((response_json, proxy_config.provider_name))
+    Ok((response_json, proxy_config.provider_name, effective_model))
 }
 
 async fn request_embeddings_with_billing(
@@ -2123,18 +2124,20 @@ async fn request_embeddings_with_billing(
         }
     }
 
-    let (response_json, provider_name) =
+    let (response_json, provider_name, effective_model) =
         request_embeddings_from_primary(state, embedding_request).await?;
 
     let prompt_tokens: i32 = response_json
         .get("usage")
         .and_then(|u| u.get("prompt_tokens"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(0) as i32;
+        .and_then(|n| i32::try_from(n).ok())
+        .filter(|n| *n >= 0)
+        .unwrap_or(0);
 
     // Handle billing - embeddings only have prompt_tokens (no completion_tokens)
     if prompt_tokens > 0 {
-        let billing_context = BillingContext::new(auth_method, embedding_request.model.clone());
+        let billing_context = BillingContext::new(auth_method, effective_model);
         let embedding_usage = CompletionUsage {
             prompt_tokens,
             completion_tokens: 0,

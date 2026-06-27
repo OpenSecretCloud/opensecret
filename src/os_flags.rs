@@ -11,6 +11,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const USER_FLAGS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
+#[allow(dead_code)]
+pub const AGENT_FEATURE_FLAG_KEY: &str = "agent";
+
 #[derive(Debug, thiserror::Error)]
 pub enum OsFlagsError {
     #[error("Invalid base URL: {0}")]

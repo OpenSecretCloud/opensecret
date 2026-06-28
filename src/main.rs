@@ -16,19 +16,22 @@ use crate::models::oauth::{NewUserOAuthConnection, OAuthError};
 use crate::models::password_reset::NewPasswordResetRequest;
 use crate::models::platform_password_reset::NewPlatformPasswordResetRequest;
 use crate::models::platform_users::PlatformUser;
+use crate::push::worker::start_push_worker;
 use crate::sqs::SqsEventPublisher;
+use crate::web::agent::start_schedule_worker;
 use crate::web::openai_auth::validate_openai_auth;
 use crate::web::platform_login_routes;
 use crate::web::{
-    conversation_projects_routes, conversations_routes, health_routes_with_state,
-    instructions_routes, login_routes, oauth_routes, openai_routes, protected_routes,
-    responses_routes,
+    agent_routes, conversation_projects_routes, conversations_routes, health_routes_with_state,
+    instructions_routes, login_routes, oauth_routes, openai_routes, protected_routes, push_routes,
+    rag_routes, responses_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
 use crate::jwt::{AuthContext, AuthMethod};
 use crate::models::user_seed_wrappings::{NewUserSeedWrapping, UserSeedWrappingError};
 use crate::seed_wrapping::{
+    agent_background_credential_lookup_hash, compute_agent_background_auth_binding,
     compute_oauth_auth_binding, compute_password_auth_binding, decrypt_seed_v1, encrypt_seed_v1,
     normalize_email_login_identifier, normalize_guest_login_identifier,
     oauth_credential_lookup_hash, password_credential_lookup_hash, password_reset_code_mac,
@@ -80,6 +83,7 @@ use vsock::{VsockAddr, VsockStream};
 use web::attestation_routes;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
+mod agent_background;
 mod apple_signin;
 mod aws_credentials;
 mod billing;
@@ -98,6 +102,8 @@ mod os_flags;
 mod private_key;
 mod provider_routing;
 mod proxy_config;
+mod push;
+mod rag;
 #[cfg(test)]
 mod security_invariants;
 mod seed_wrapping;
@@ -465,6 +471,7 @@ pub struct AppState {
     enclave_key: Vec<u8>,
     proxy_router: Arc<ProxyRouter>,
     provider_router: Arc<ProviderRouter>,
+    rag_cache: Arc<tokio::sync::Mutex<rag::RagCache>>,
     resend_api_key: Option<String>,
     ephemeral_keys: Arc<RwLock<HashMap<String, EphemeralSecret>>>,
     session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, SessionState>>>,
@@ -763,6 +770,7 @@ impl AppStateBuilder {
             enclave_key,
             proxy_router,
             provider_router,
+            rag_cache: Arc::new(tokio::sync::Mutex::new(rag::RagCache::default())),
             resend_api_key: self.resend_api_key,
             ephemeral_keys: Arc::new(RwLock::new(HashMap::new())),
             session_states: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -1221,6 +1229,93 @@ impl AppState {
         }
 
         Ok(())
+    }
+
+    fn new_agent_background_seed_wrapping_for_user(
+        &self,
+        user: &User,
+        grant_uuid: Uuid,
+        background_secret: &[u8; 32],
+        plaintext_seed: &[u8],
+    ) -> Result<NewUserSeedWrapping, Error> {
+        let auth_binding = compute_agent_background_auth_binding(
+            &self.enclave_key,
+            grant_uuid,
+            user.uuid,
+            user.project_id,
+            background_secret,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+        let credential_lookup_hash =
+            agent_background_credential_lookup_hash(&self.enclave_key, grant_uuid)
+                .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        let seed_enc = encrypt_seed_v1(
+            &self.enclave_key,
+            plaintext_seed,
+            user.uuid,
+            user.project_id,
+            CredentialKind::AgentBackground,
+            &auth_binding,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        Ok(NewUserSeedWrapping::new(
+            user.uuid,
+            CredentialKind::AgentBackground.as_str(),
+            credential_lookup_hash.as_bytes().to_vec(),
+            SEED_WRAP_VERSION_V1,
+            seed_enc,
+        ))
+    }
+
+    async fn get_user_key_for_agent_background_grant(
+        &self,
+        user: &User,
+        grant_plaintext: &crate::agent_background::AgentBackgroundGrantPlaintextV1,
+        seed_wrap_lookup_hash: &[u8],
+    ) -> Result<SecretKey, Error> {
+        if user.uuid != grant_plaintext.user_uuid || user.project_id != grant_plaintext.project_id {
+            return Err(Error::AuthenticationError);
+        }
+
+        let expected_lookup_hash =
+            agent_background_credential_lookup_hash(&self.enclave_key, grant_plaintext.grant_uuid)
+                .map_err(|e| Error::EncryptionError(e.to_string()))?;
+        if seed_wrap_lookup_hash != expected_lookup_hash.as_bytes() {
+            return Err(Error::AuthenticationError);
+        }
+
+        let auth_binding = compute_agent_background_auth_binding(
+            &self.enclave_key,
+            grant_plaintext.grant_uuid,
+            user.uuid,
+            user.project_id,
+            &grant_plaintext.background_secret,
+        )
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+
+        let seed_wrap = self
+            .db
+            .get_user_seed_wrapping_by_credential(
+                user.uuid,
+                CredentialKind::AgentBackground.as_str(),
+                expected_lookup_hash.as_bytes(),
+                SEED_WRAP_VERSION_V1,
+            )?
+            .ok_or(Error::AuthenticationError)?;
+
+        let plaintext_seed = decrypt_seed_v1(
+            &self.enclave_key,
+            &seed_wrap.seed_enc,
+            user.uuid,
+            user.project_id,
+            CredentialKind::AgentBackground,
+            &auth_binding,
+        )
+        .map_err(|_| Error::AuthenticationError)?;
+
+        plaintext_user_seed_to_key(&plaintext_seed, None, None)
     }
 
     async fn register_user(&self, creds: RegisterCredentials) -> Result<User, Error> {
@@ -2168,7 +2263,17 @@ impl AppState {
         project_id: i32,
         key_name: &str,
     ) -> Result<Option<String>, Error> {
-        // Get the encrypted secret
+        Ok(self
+            .get_project_secret_bytes(project_id, key_name)
+            .await?
+            .map(|bytes| general_purpose::STANDARD.encode(bytes)))
+    }
+
+    pub async fn get_project_secret_bytes(
+        &self,
+        project_id: i32,
+        key_name: &str,
+    ) -> Result<Option<Vec<u8>>, Error> {
         let secret = match self
             .db
             .get_org_project_secret_by_key_name_and_project(key_name, project_id)?
@@ -2177,15 +2282,24 @@ impl AppState {
             None => return Ok(None),
         };
 
-        // Decrypt the secret using the enclave key
         let secret_key = SecretKey::from_slice(&self.enclave_key)
             .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
         let decrypted_bytes = decrypt_with_key(&secret_key, &secret.secret_enc)
             .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
-        // Always return base64 encoded bytes
-        Ok(Some(general_purpose::STANDARD.encode(&decrypted_bytes)))
+        Ok(Some(decrypted_bytes))
+    }
+
+    pub async fn get_project_secret_string(
+        &self,
+        project_id: i32,
+        key_name: &str,
+    ) -> Result<Option<String>, Error> {
+        let secret = self.get_project_secret_bytes(project_id, key_name).await?;
+        secret
+            .map(|bytes| String::from_utf8(bytes).map_err(|_| Error::SecretParsingError))
+            .transpose()
     }
 
     pub async fn get_project_resend_api_key(
@@ -3174,6 +3288,9 @@ async fn main() -> Result<(), Error> {
     )
     .await?;
 
+    start_push_worker(app_state.clone());
+    start_schedule_worker(app_state.clone());
+
     let cors = CorsLayer::new()
         // allow all method types
         .allow_methods(Any)
@@ -3204,6 +3321,18 @@ async fn main() -> Result<(), Error> {
         )
         .merge(
             instructions_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            rag_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            agent_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            push_routes(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
         )
         .merge(attestation_routes::router(app_state.clone()))

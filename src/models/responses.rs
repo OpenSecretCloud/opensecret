@@ -771,7 +771,9 @@ impl NewConversation {
                 response_id: response_result.as_ref().map(|r| r.id),
                 user_id,
                 content_enc: first_message_content,
+                attachment_text_enc: None,
                 prompt_tokens: first_message_tokens,
+                assistant_reaction: None,
             };
             let user_message = new_message.insert(tx)?;
 
@@ -787,6 +789,7 @@ impl NewConversation {
                     status: "in_progress".to_string(),
                     finish_reason: None,
                     created_at: Utc::now(),
+                    user_reaction: None,
                 };
                 placeholder_assistant.insert(tx)?;
             }
@@ -826,6 +829,8 @@ pub struct NewUserMessage {
     pub user_id: Uuid,
     pub content_enc: Vec<u8>,
     pub prompt_tokens: i32,
+    pub attachment_text_enc: Option<Vec<u8>>,
+    pub assistant_reaction: Option<String>,
 }
 
 impl UserMessage {
@@ -857,6 +862,28 @@ impl UserMessage {
                 diesel::result::Error::NotFound => ResponsesError::UserMessageNotFound,
                 _ => ResponsesError::DatabaseError(e),
             })
+    }
+
+    pub fn set_assistant_reaction(
+        conn: &mut PgConnection,
+        message_uuid: Uuid,
+        user_id: Uuid,
+        reaction: Option<String>,
+    ) -> Result<UserMessage, ResponsesError> {
+        diesel::update(
+            user_messages::table
+                .filter(user_messages::uuid.eq(message_uuid))
+                .filter(user_messages::user_id.eq(user_id)),
+        )
+        .set((
+            user_messages::assistant_reaction.eq(reaction),
+            user_messages::updated_at.eq(diesel::dsl::now),
+        ))
+        .get_result(conn)
+        .map_err(|e| match e {
+            diesel::result::Error::NotFound => ResponsesError::UserMessageNotFound,
+            _ => ResponsesError::DatabaseError(e),
+        })
     }
 
     // Note: status is now tracked on Response, not UserMessage
@@ -1034,9 +1061,25 @@ pub struct NewAssistantMessage {
     pub status: String,
     pub finish_reason: Option<String>,
     pub created_at: DateTime<Utc>,
+    pub user_reaction: Option<String>,
 }
 
 impl AssistantMessage {
+    pub fn get_by_uuid_and_user(
+        conn: &mut PgConnection,
+        message_uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<AssistantMessage, ResponsesError> {
+        assistant_messages::table
+            .filter(assistant_messages::uuid.eq(message_uuid))
+            .filter(assistant_messages::user_id.eq(user_id))
+            .first::<AssistantMessage>(conn)
+            .map_err(|e| match e {
+                diesel::result::Error::NotFound => ResponsesError::AssistantMessageNotFound,
+                _ => ResponsesError::DatabaseError(e),
+            })
+    }
+
     pub fn update(
         conn: &mut PgConnection,
         message_uuid: Uuid,
@@ -1055,6 +1098,28 @@ impl AssistantMessage {
             ))
             .get_result(conn)
             .map_err(ResponsesError::DatabaseError)
+    }
+
+    pub fn set_user_reaction(
+        conn: &mut PgConnection,
+        message_uuid: Uuid,
+        user_id: Uuid,
+        reaction: Option<String>,
+    ) -> Result<AssistantMessage, ResponsesError> {
+        diesel::update(
+            assistant_messages::table
+                .filter(assistant_messages::uuid.eq(message_uuid))
+                .filter(assistant_messages::user_id.eq(user_id)),
+        )
+        .set((
+            assistant_messages::user_reaction.eq(reaction),
+            assistant_messages::updated_at.eq(diesel::dsl::now),
+        ))
+        .get_result(conn)
+        .map_err(|e| match e {
+            diesel::result::Error::NotFound => ResponsesError::AssistantMessageNotFound,
+            _ => ResponsesError::DatabaseError(e),
+        })
     }
 }
 
@@ -1148,6 +1213,10 @@ pub struct RawThreadMessage {
     pub uuid: Uuid,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Bytea>)]
     pub content_enc: Option<Vec<u8>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Bytea>)]
+    pub attachment_text_enc: Option<Vec<u8>>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub reaction: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     pub status: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
@@ -1190,6 +1259,8 @@ impl RawThreadMessage {
                         um.id,
                         um.uuid,
                         um.content_enc,
+                        um.attachment_text_enc,
+                        um.assistant_reaction as reaction,
                         'completed'::text as status,
                         um.created_at,
                         r.model,
@@ -1209,6 +1280,8 @@ impl RawThreadMessage {
                         am.id,
                         am.uuid,
                         am.content_enc,
+                        NULL::bytea as attachment_text_enc,
+                        am.user_reaction as reaction,
                         am.status,
                         am.created_at,
                         r.model,
@@ -1228,6 +1301,8 @@ impl RawThreadMessage {
                         tc.id,
                         tc.uuid,
                         tc.arguments_enc as content_enc,
+                        NULL::bytea as attachment_text_enc,
+                        NULL::text as reaction,
                         'completed'::text as status,
                         tc.created_at,
                         NULL::text as model,
@@ -1246,6 +1321,8 @@ impl RawThreadMessage {
                         tto.id,
                         tto.uuid,
                         tto.output_enc as content_enc,
+                        NULL::bytea as attachment_text_enc,
+                        NULL::text as reaction,
                         'completed'::text as status,
                         tto.created_at,
                         NULL::text as model,
@@ -1265,6 +1342,8 @@ impl RawThreadMessage {
                         ri.id,
                         ri.uuid,
                         ri.content_enc,
+                        NULL::bytea as attachment_text_enc,
+                        NULL::text as reaction,
                         ri.status,
                         ri.created_at,
                         NULL::text as model,
@@ -1303,6 +1382,8 @@ impl RawThreadMessage {
                         um.id,
                         um.uuid,
                         um.content_enc,
+                        um.attachment_text_enc,
+                        um.assistant_reaction as reaction,
                         'completed'::text as status,
                         um.created_at,
                         r.model,
@@ -1322,6 +1403,8 @@ impl RawThreadMessage {
                         am.id,
                         am.uuid,
                         am.content_enc,
+                        NULL::bytea as attachment_text_enc,
+                        am.user_reaction as reaction,
                         am.status,
                         am.created_at,
                         r.model,
@@ -1341,6 +1424,8 @@ impl RawThreadMessage {
                         tc.id,
                         tc.uuid,
                         tc.arguments_enc as content_enc,
+                        NULL::bytea as attachment_text_enc,
+                        NULL::text as reaction,
                         'completed'::text as status,
                         tc.created_at,
                         NULL::text as model,
@@ -1359,6 +1444,8 @@ impl RawThreadMessage {
                         tto.id,
                         tto.uuid,
                         tto.output_enc as content_enc,
+                        NULL::bytea as attachment_text_enc,
+                        NULL::text as reaction,
                         'completed'::text as status,
                         tto.created_at,
                         NULL::text as model,
@@ -1378,6 +1465,8 @@ impl RawThreadMessage {
                         ri.id,
                         ri.uuid,
                         ri.content_enc,
+                        NULL::bytea as attachment_text_enc,
+                        NULL::text as reaction,
                         ri.status,
                         ri.created_at,
                         NULL::text as model,
@@ -1425,6 +1514,8 @@ impl RawThreadMessage {
                     um.id,
                     um.uuid,
                     um.content_enc,
+                    um.attachment_text_enc,
+                    um.assistant_reaction as reaction,
                     'completed'::text as status,
                     um.created_at,
                     r.model,
@@ -1444,6 +1535,8 @@ impl RawThreadMessage {
                     am.id,
                     am.uuid,
                     am.content_enc,
+                    NULL::bytea as attachment_text_enc,
+                    am.user_reaction as reaction,
                     am.status,
                     am.created_at,
                     r.model,
@@ -1463,6 +1556,8 @@ impl RawThreadMessage {
                     tc.id,
                     tc.uuid,
                     tc.arguments_enc as content_enc,
+                    NULL::bytea as attachment_text_enc,
+                    NULL::text as reaction,
                     'completed'::text as status,
                     tc.created_at,
                     NULL::text as model,
@@ -1481,6 +1576,8 @@ impl RawThreadMessage {
                     tto.id,
                     tto.uuid,
                     tto.output_enc as content_enc,
+                    NULL::bytea as attachment_text_enc,
+                    NULL::text as reaction,
                     'completed'::text as status,
                     tto.created_at,
                     NULL::text as model,
@@ -1500,6 +1597,8 @@ impl RawThreadMessage {
                     ri.id,
                     ri.uuid,
                     ri.content_enc,
+                    NULL::bytea as attachment_text_enc,
+                    NULL::text as reaction,
                     ri.status,
                     ri.created_at,
                     NULL::text as model,
@@ -1567,6 +1666,8 @@ impl RawThreadMessage {
                     um.id,
                     um.uuid,
                     um.content_enc,
+                    um.attachment_text_enc,
+                    um.assistant_reaction as reaction,
                     'completed'::text as status,
                     um.created_at,
                     r.model,
@@ -1586,6 +1687,8 @@ impl RawThreadMessage {
                     am.id,
                     am.uuid,
                     am.content_enc,
+                    NULL::bytea as attachment_text_enc,
+                    am.user_reaction as reaction,
                     am.status,
                     am.created_at,
                     r.model,
@@ -1605,6 +1708,8 @@ impl RawThreadMessage {
                     tc.id,
                     tc.uuid,
                     tc.arguments_enc as content_enc,
+                    NULL::bytea as attachment_text_enc,
+                    NULL::text as reaction,
                     'completed'::text as status,
                     tc.created_at,
                     NULL::text as model,
@@ -1623,6 +1728,8 @@ impl RawThreadMessage {
                     tto.id,
                     tto.uuid,
                     tto.output_enc as content_enc,
+                    NULL::bytea as attachment_text_enc,
+                    NULL::text as reaction,
                     'completed'::text as status,
                     tto.created_at,
                     NULL::text as model,
@@ -1642,6 +1749,8 @@ impl RawThreadMessage {
                     ri.id,
                     ri.uuid,
                     ri.content_enc,
+                    NULL::bytea as attachment_text_enc,
+                    NULL::text as reaction,
                     ri.status,
                     ri.created_at,
                     NULL::text as model,

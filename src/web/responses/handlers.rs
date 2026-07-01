@@ -374,16 +374,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_model_turn_request_uses_deepseek_v4_pro_sampling_defaults() {
-        let body = responses_request_for_model("deepseek-v4-pro");
-        let chat_request =
-            build_model_turn_request(&body, &[json!({"role": "user", "content": "hello"})], false);
-
-        assert_eq!(chat_request["temperature"].as_f64(), Some(1.0));
-        assert_eq!(chat_request["top_p"].as_f64(), Some(1.0));
-    }
-
-    #[test]
     fn test_resolve_responses_sampling_uses_model_defaults() {
         let body = responses_request_for_model("llama3-3-70b");
         let sampling = resolve_responses_sampling(&body);
@@ -397,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_build_model_turn_request_preserves_explicit_sampling_values() {
-        let mut body = responses_request_for_model("deepseek-v4-pro");
+        let mut body = responses_request_for_model("kimi-k2-6");
         body.temperature = Some(0.5);
         body.top_p = Some(0.75);
 
@@ -960,7 +950,7 @@ pub struct ResponseOutputTextDoneEvent {
 }
 
 /// SSE Event wrapper for response.reasoning_text.delta
-/// Used for thinking/reasoning models (e.g., deepseek-r1) that emit reasoning tokens
+/// Used for thinking/reasoning models that emit reasoning tokens
 /// TODO: Consider adding reasoning to final response output (like OpenAI's reasoning summary)
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseReasoningTextDeltaEvent {

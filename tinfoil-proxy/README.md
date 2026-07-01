@@ -43,7 +43,6 @@ Run the proxy:
 
 ## Supported Models
 
-- `deepseek-r1-0528` - High-performance reasoning model
 - `llama3-3-70b` - Multilingual model optimized for dialogue
 - `nomic-embed-text` - Text embedding model
 
@@ -60,7 +59,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="deepseek-r1-0528",
+    model="llama3-3-70b",
     messages=[{"role": "user", "content": "Hello!"}],
     stream=True
 )

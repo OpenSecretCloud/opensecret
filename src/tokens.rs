@@ -52,7 +52,6 @@ mod tests {
         assert_eq!(model_max_ctx("kimi-k2-6"), 256_000);
         assert_eq!(model_max_ctx("gemma4-31b"), 256_000);
         assert_eq!(model_max_ctx("glm-5-2"), 384_000);
-        assert_eq!(model_max_ctx("deepseek-v4-pro"), 800_000);
         assert_eq!(model_max_ctx("auto:quick"), 128_000);
         assert_eq!(model_max_ctx("auto:powerful"), 256_000);
     }
@@ -69,7 +68,7 @@ mod tests {
 
     #[test]
     fn test_model_max_ctx_prefix_matching() {
-        assert_eq!(model_max_ctx("deepseek-r1-0528-instruct"), 64_000);
-        assert_eq!(model_max_ctx("deepseek-r1-70b-instruct"), 64_000);
+        assert_eq!(model_max_ctx("llama3-3-70b-instruct"), 128_000);
+        assert_eq!(model_max_ctx("unknown-r1-70b-instruct"), 64_000);
     }
 }

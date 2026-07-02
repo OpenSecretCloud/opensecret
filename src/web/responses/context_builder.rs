@@ -824,7 +824,7 @@ mod tests {
 
         let result = build_prompt_from_chat_messages(
             msgs,
-            "deepseek-r1-70b", // 64k context limit
+            "test-model", // default 64k context limit
         );
 
         let (messages, total_tokens) = result.expect("Failed to build prompt");
@@ -918,7 +918,7 @@ mod tests {
             create_chat_msg("user", "New message", Some(5)),
         ];
 
-        let result = build_prompt_from_chat_messages(msgs, "deepseek-r1-70b");
+        let result = build_prompt_from_chat_messages(msgs, "test-model");
 
         let (messages, _) = result.expect("Failed to build prompt");
 
@@ -961,7 +961,7 @@ mod tests {
             create_chat_msg("user", "Final message that barely fits", Some(58000)),
         ];
 
-        let result = build_prompt_from_chat_messages(msgs, "deepseek-r1-70b");
+        let result = build_prompt_from_chat_messages(msgs, "test-model");
 
         let (messages, _) = result.expect("Failed to build prompt");
 
@@ -989,7 +989,7 @@ mod tests {
             create_chat_msg("user", "Final", Some(58000)),
         ];
 
-        let result = build_prompt_from_chat_messages(msgs, "deepseek-r1-70b");
+        let result = build_prompt_from_chat_messages(msgs, "test-model");
 
         let (messages, _) = result.expect("Failed to build prompt");
 
@@ -1042,7 +1042,7 @@ mod tests {
 
         let result = build_prompt_from_chat_messages(
             msgs.clone(),
-            "deepseek-r1-70b", // 64k context
+            "test-model", // default 64k context
         );
 
         let (messages, _total_tokens) = result.expect("Failed to build prompt");
@@ -1367,7 +1367,7 @@ mod tests {
         msgs.push(create_chat_msg("user", "Final follow-up", Some(5)));
 
         let (messages, total_tokens) =
-            build_prompt_from_chat_messages(msgs, "deepseek-r1-70b").expect("build prompt");
+            build_prompt_from_chat_messages(msgs, "test-model").expect("build prompt");
 
         // Must end with the final follow-up user message
         assert_eq!(messages.last().unwrap()["role"], "user");

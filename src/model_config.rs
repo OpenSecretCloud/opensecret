@@ -318,15 +318,6 @@ const GEMMA4_RESPONSES_MODEL_CONFIG: ResponsesModelConfig = ResponsesModelConfig
     enable_thinking: true,
 };
 
-const DEEPSEEK_V4_PRO_RESPONSES_MODEL_CONFIG: ResponsesModelConfig = ResponsesModelConfig {
-    sampling: SamplingConfig {
-        temperature: 1.0,
-        top_p: 1.0,
-    },
-    include_reasoning: false,
-    enable_thinking: false,
-};
-
 const MODEL_CONFIGS: &[ModelConfigEntry] = &[
     ModelConfigEntry::new(
         "gpt-oss-120b",
@@ -384,21 +375,6 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         false,
         50,
         384_000,
-    ),
-    ModelConfigEntry::with_responses(
-        "deepseek-v4-pro",
-        "DeepSeek V4 Pro",
-        "DeepSeek V4 Pro",
-        "Large-context pro reasoning model.",
-        ModelAccessTier::Pro,
-        ModelCapabilities::chat(true, false),
-        &["New", "Reasoning"],
-        true,
-        true,
-        false,
-        60,
-        800_000,
-        DEEPSEEK_V4_PRO_RESPONSES_MODEL_CONFIG,
     ),
     ModelConfigEntry::new(
         "llama3-3-70b",
@@ -593,7 +569,6 @@ mod tests {
         assert_eq!(model_context_window("kimi-k2-6"), 256_000);
         assert_eq!(model_context_window("gemma4-31b"), 256_000);
         assert_eq!(model_context_window("glm-5-2"), 384_000);
-        assert_eq!(model_context_window("deepseek-v4-pro"), 800_000);
         assert_eq!(model_context_window(AUTO_QUICK_MODEL_ID), 128_000);
         assert_eq!(model_context_window(AUTO_POWERFUL_MODEL_ID), 256_000);
     }
@@ -624,15 +599,6 @@ mod tests {
     }
 
     #[test]
-    fn test_deepseek_v4_pro_responses_config() {
-        let config = model_config("deepseek-v4-pro");
-
-        assert_eq!(config.context_window, 800_000);
-        assert_eq!(config.responses.sampling.temperature, 1.0);
-        assert_eq!(config.responses.sampling.top_p, 1.0);
-    }
-
-    #[test]
     fn test_sampling_config_applies_overrides() {
         let sampling = DEFAULT_SAMPLING_CONFIG.with_overrides(Some(0.5), None);
 
@@ -653,12 +619,9 @@ mod tests {
 
     #[test]
     fn test_model_config_prefix_matching() {
+        assert_eq!(model_context_window("llama3-3-70b-instruct"), 128_000);
         assert_eq!(
-            model_context_window("deepseek-r1-0528-instruct"),
-            DEFAULT_CONTEXT_WINDOW
-        );
-        assert_eq!(
-            model_context_window("deepseek-r1-70b-instruct"),
+            model_context_window("unknown-r1-70b-instruct"),
             DEFAULT_CONTEXT_WINDOW
         );
     }

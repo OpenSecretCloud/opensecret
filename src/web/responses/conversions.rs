@@ -190,6 +190,8 @@ pub enum ConversationItem {
         role: String,
         content: Vec<ConversationContent>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        reaction: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         created_at: Option<i64>,
     },
     #[serde(rename = "function_call")]
@@ -292,6 +294,7 @@ impl ConversationItemConverter {
             status: msg.status.clone(),
             role: ROLE_USER.to_string(),
             content: Vec::<ConversationContent>::from(message_content),
+            reaction: msg.reaction.clone(),
             created_at: Some(msg.created_at.timestamp()),
         })
     }
@@ -314,6 +317,7 @@ impl ConversationItemConverter {
             status: msg.status.clone(),
             role: ROLE_ASSISTANT.to_string(),
             content: content_parts,
+            reaction: msg.reaction.clone(),
             created_at: Some(msg.created_at.timestamp()),
         })
     }

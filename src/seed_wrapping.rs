@@ -10,6 +10,7 @@ use crate::encrypt::{
 type HmacSha256 = Hmac<Sha256>;
 
 const AUTH_BINDING_MAC_INFO: &[u8] = b"os.auth-binding-mac.v1";
+const BACKGROUND_BINDING_MAC_INFO: &[u8] = b"os.agent-background-binding-mac.v1";
 const CREDENTIAL_LOOKUP_MAC_INFO: &[u8] = b"os.credential-lookup-mac.v1";
 const PASSWORD_RESET_CODE_MAC_INFO: &[u8] = b"os.password-reset-code-mac.v1";
 const SEED_WRAP_ROOT_INFO: &[u8] = b"os.seed-wrap-root.v1";
@@ -20,6 +21,8 @@ const PASSWORD_LOOKUP_DOMAIN: &str = "os.password-lookup.v1";
 const PASSWORD_RESET_CODE_DOMAIN: &str = "os.password-reset-code.v1";
 const OAUTH_AUTH_BINDING_DOMAIN: &str = "os.oauth-auth-binding.v1";
 const OAUTH_LOOKUP_DOMAIN: &str = "os.oauth-lookup.v1";
+const AGENT_BACKGROUND_AUTH_BINDING_DOMAIN: &str = "os.agent-background-auth-binding.v1";
+const AGENT_BACKGROUND_LOOKUP_DOMAIN: &str = "os.agent-background-lookup.v1";
 const SEED_WRAP_DOMAIN: &str = "os.seed-wrap.v1";
 
 pub const SEED_WRAP_VERSION_V1: i16 = 1;
@@ -28,6 +31,7 @@ pub const SEED_WRAP_VERSION_V1: i16 = 1;
 pub enum CredentialKind {
     Password,
     OAuth,
+    AgentBackground,
 }
 
 impl CredentialKind {
@@ -35,6 +39,7 @@ impl CredentialKind {
         match self {
             CredentialKind::Password => "password",
             CredentialKind::OAuth => "oauth",
+            CredentialKind::AgentBackground => "agent_background",
         }
     }
 }
@@ -160,6 +165,46 @@ pub fn oauth_credential_lookup_hash(
     Ok(CredentialLookupHash(hmac_with_root_domain_key(
         root_key,
         CREDENTIAL_LOOKUP_MAC_INFO,
+        &facts.into_bytes(),
+    )?))
+}
+
+pub fn agent_background_credential_lookup_hash(
+    root_key: &[u8],
+    grant_uuid: Uuid,
+) -> Result<CredentialLookupHash, EncryptError> {
+    let mut facts = CanonicalBytes::new(AGENT_BACKGROUND_LOOKUP_DOMAIN);
+    facts.append_uuid(grant_uuid);
+
+    Ok(CredentialLookupHash(hmac_with_root_domain_key(
+        root_key,
+        CREDENTIAL_LOOKUP_MAC_INFO,
+        &facts.into_bytes(),
+    )?))
+}
+
+pub fn compute_agent_background_auth_binding(
+    root_key: &[u8],
+    grant_uuid: Uuid,
+    user_uuid: Uuid,
+    project_id: i32,
+    background_secret: &[u8; 32],
+) -> Result<AuthBinding, EncryptError> {
+    let mut principal_context = CanonicalBytes::new("os.agent-background-principal-context.v1");
+    principal_context
+        .append_uuid(grant_uuid)
+        .append_uuid(user_uuid)
+        .append_i32(project_id)
+        .append_i16(SEED_WRAP_VERSION_V1);
+
+    let mut facts = CanonicalBytes::new(AGENT_BACKGROUND_AUTH_BINDING_DOMAIN);
+    facts
+        .append_bytes(&principal_context.into_bytes())
+        .append_bytes(background_secret);
+
+    Ok(AuthBinding(hmac_with_root_domain_key(
+        root_key,
+        BACKGROUND_BINDING_MAC_INFO,
         &facts.into_bytes(),
     )?))
 }

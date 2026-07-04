@@ -2,6 +2,7 @@
 
 use super::constants::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_USER};
 use crate::encrypt::decrypt_with_key;
+use crate::model_config::model_supports_reasoning_history;
 use crate::tokens::{count_tokens, model_max_ctx};
 use crate::DBConnection;
 use serde_json::{json, Value};
@@ -13,9 +14,37 @@ use uuid::Uuid;
 pub struct ChatMsg {
     pub role: &'static str,
     pub content: String,
+    pub reasoning: Option<String>,
     /// Only tool_output messages need an ID.
     pub tool_call_id: Option<Uuid>,
     pub tok: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PendingReasoning {
+    content: String,
+    tok: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ContextEntry {
+    message_type: String,
+    ids: Vec<(String, i64)>,
+    tok: usize,
+}
+
+impl ContextEntry {
+    fn single(message: &crate::models::responses::RawThreadMessageMetadata) -> Self {
+        Self {
+            message_type: message.message_type.clone(),
+            ids: vec![(message.message_type.clone(), message.id)],
+            tok: metadata_token_count(message),
+        }
+    }
+}
+
+fn metadata_token_count(message: &crate::models::responses::RawThreadMessageMetadata) -> usize {
+    message.token_count.map(|t| t as usize).unwrap_or(0)
 }
 
 fn decrypt_instruction(
@@ -128,15 +157,20 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
         msgs.push(ChatMsg {
             role,
             content,
+            reasoning: None,
             tool_call_id: None,
             tok,
         });
     }
 
+    let include_reasoning_history = model_supports_reasoning_history(model);
+    let mut pending_reasoning: Option<PendingReasoning> = None;
+
     // Decrypt and add the messages we fetched
     for r in raw {
         match r.message_type.as_str() {
             "user" => {
+                pending_reasoning = None;
                 // User messages have encrypted MessageContent
                 let content_enc = match &r.content_enc {
                     Some(enc) => enc,
@@ -152,6 +186,7 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
                 msgs.push(ChatMsg {
                     role: ROLE_USER,
                     content,
+                    reasoning: None,
                     tool_call_id: None,
                     tok: t,
                 });
@@ -160,18 +195,25 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
                 // Skip in_progress assistant messages (no content yet)
                 let content_enc = match &r.content_enc {
                     Some(enc) => enc,
-                    None => continue,
+                    None => {
+                        pending_reasoning = None;
+                        continue;
+                    }
                 };
                 let plain = decrypt_with_key(user_key, content_enc)
                     .map_err(|_| crate::ApiError::InternalServerError)?;
                 let content = String::from_utf8_lossy(&plain).into_owned();
+                let reasoning = pending_reasoning.take();
+                let reasoning_tokens = reasoning.as_ref().map(|r| r.tok).unwrap_or(0);
                 let t = r
                     .token_count
                     .map(|v| v as usize)
-                    .unwrap_or_else(|| count_tokens(&content));
+                    .unwrap_or_else(|| count_tokens(&content))
+                    + reasoning_tokens;
                 msgs.push(ChatMsg {
                     role: ROLE_ASSISTANT,
                     content,
+                    reasoning: reasoning.map(|r| r.content),
                     tool_call_id: None,
                     tok: t,
                 });
@@ -181,7 +223,10 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
                 // We need to format these as assistant messages with tool_calls array
                 let content_enc = match &r.content_enc {
                     Some(enc) => enc,
-                    None => continue,
+                    None => {
+                        pending_reasoning = None;
+                        continue;
+                    }
                 };
                 let plain = decrypt_with_key(user_key, content_enc)
                     .map_err(|_| crate::ApiError::InternalServerError)?;
@@ -234,19 +279,24 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
                     }
                 };
 
+                let reasoning = pending_reasoning.take();
+                let reasoning_tokens = reasoning.as_ref().map(|r| r.tok).unwrap_or(0);
                 let t = r
                     .token_count
                     .map(|v| v as usize)
-                    .unwrap_or_else(|| count_tokens(&arguments_str));
+                    .unwrap_or_else(|| count_tokens(&arguments_str))
+                    + reasoning_tokens;
 
                 msgs.push(ChatMsg {
                     role: ROLE_ASSISTANT,
                     content,
+                    reasoning: reasoning.map(|r| r.content),
                     tool_call_id: None,
                     tok: t,
                 });
             }
             "tool_output" => {
+                pending_reasoning = None;
                 // Tool outputs have encrypted output content
                 let content_enc = match &r.content_enc {
                     Some(enc) => enc,
@@ -262,18 +312,42 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
                 msgs.push(ChatMsg {
                     role: "tool",
                     content,
+                    reasoning: None,
                     tool_call_id: r.tool_call_id,
                     tok: t,
                 });
             }
             "reasoning" => {
-                // TODO: Skip reasoning items for now until we confirm how models expect
-                // reasoning to be passed back in subsequent turns. Reasoning is stored
-                // and returned via conversations/items API but not included in LLM context.
+                if !include_reasoning_history {
+                    continue;
+                }
+
+                let content_enc = match &r.content_enc {
+                    Some(enc) => enc,
+                    None => continue,
+                };
+                let plain = decrypt_with_key(user_key, content_enc)
+                    .map_err(|_| crate::ApiError::InternalServerError)?;
+                let content = String::from_utf8_lossy(&plain).into_owned();
+                if content.is_empty() {
+                    continue;
+                }
+                let t = r
+                    .token_count
+                    .map(|v| v as usize)
+                    .unwrap_or_else(|| count_tokens(&content));
+
+                if let Some(pending) = &mut pending_reasoning {
+                    pending.content.push_str(&content);
+                    pending.tok += t;
+                } else {
+                    pending_reasoning = Some(PendingReasoning { content, tok: t });
+                }
                 continue;
             }
             _ => {
                 // Unknown message type, skip
+                pending_reasoning = None;
                 continue;
             }
         }
@@ -289,6 +363,7 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
         let truncation_msg = ChatMsg {
             role: ROLE_ASSISTANT,
             content: truncation_content.to_string(),
+            reasoning: None,
             tool_call_id: None,
             tok: count_tokens(truncation_content),
         };
@@ -320,6 +395,8 @@ fn determine_needed_message_ids(
 ) -> Result<(Vec<(String, i64)>, bool), crate::ApiError> {
     use tracing::debug;
 
+    let entries = build_context_entries(metadata, model_supports_reasoning_history(model));
+
     // Calculate token budget
     let max_ctx = model_max_ctx(model);
     let response_reserve = 4096usize;
@@ -327,26 +404,20 @@ fn determine_needed_message_ids(
     let ctx_budget = max_ctx.saturating_sub(response_reserve + safety);
 
     // Calculate total tokens in all messages
-    let total_msg_tokens: usize = metadata
-        .iter()
-        .filter_map(|m| m.token_count.map(|t| t as usize))
-        .sum();
+    let total_msg_tokens: usize = entries.iter().map(|entry| entry.tok).sum();
 
     // If everything fits, return all IDs with no truncation
     if system_tokens + total_msg_tokens <= ctx_budget {
         debug!(
             "All {} messages fit in context budget ({}+ {} = {} <= {})",
-            metadata.len(),
+            entries.len(),
             system_tokens,
             total_msg_tokens,
             system_tokens + total_msg_tokens,
             ctx_budget
         );
         return Ok((
-            metadata
-                .iter()
-                .map(|m| (m.message_type.clone(), m.id))
-                .collect(),
+            entries.into_iter().flat_map(|entry| entry.ids).collect(),
             false, // did not truncate
         ));
     }
@@ -354,33 +425,25 @@ fn determine_needed_message_ids(
     // Need to truncate - apply middle truncation logic
     debug!(
         "Truncating {} messages: total tokens {}+{} = {} exceeds budget {}",
-        metadata.len(),
+        entries.len(),
         system_tokens,
         total_msg_tokens,
         system_tokens + total_msg_tokens,
         ctx_budget
     );
 
-    let mut needed_ids: Vec<(String, i64)> = Vec::new();
+    let mut needed_entries: Vec<ContextEntry> = Vec::new();
 
     // Always preserve the first system message (already accounted for in system_tokens)
     // Then keep first user message only (first assistant gets removed)
-    for m in metadata {
-        if m.message_type == "user" {
-            needed_ids.push((m.message_type.clone(), m.id));
+    for entry in &entries {
+        if entry.message_type == "user" {
+            needed_entries.push(entry.clone());
             break; // Stop after first user - don't keep first assistant
         }
     }
 
-    let head_tokens: usize = needed_ids
-        .iter()
-        .filter_map(|(msg_type, id)| {
-            metadata
-                .iter()
-                .find(|m| &m.message_type == msg_type && m.id == *id)
-                .and_then(|m| m.token_count.map(|t| t as usize))
-        })
-        .sum();
+    let head_tokens: usize = needed_entries.iter().map(|entry| entry.tok).sum();
 
     let truncation_msg_tokens = count_tokens("[Previous messages truncated due to context limits]");
 
@@ -391,39 +454,37 @@ fn determine_needed_message_ids(
     // Collect messages from the end until we hit the budget
     // CRITICAL: Always include the most recent message (even if it exceeds budget)
     // to ensure the current user query is never lost
-    let mut potential_tail: Vec<(String, i64, usize)> = Vec::new(); // (type, id, tokens)
+    let mut potential_tail: Vec<ContextEntry> = Vec::new();
     let mut potential_tail_tokens = 0usize;
 
-    for (i, m) in metadata.iter().rev().enumerate() {
-        let tok = m.token_count.map(|t| t as usize).unwrap_or(0);
-
+    for (i, entry) in entries.iter().rev().enumerate() {
         // Always include the most recent message (first iteration), even if it exceeds budget
         if i == 0 {
-            potential_tail.push((m.message_type.clone(), m.id, tok));
-            potential_tail_tokens += tok;
+            potential_tail.push(entry.clone());
+            potential_tail_tokens += entry.tok;
             continue;
         }
 
         // For subsequent messages, respect the budget
-        if potential_tail_tokens + tok > available_for_tail {
+        if potential_tail_tokens + entry.tok > available_for_tail {
             break;
         }
-        potential_tail.push((m.message_type.clone(), m.id, tok));
-        potential_tail_tokens += tok;
+        potential_tail.push(entry.clone());
+        potential_tail_tokens += entry.tok;
     }
     potential_tail.reverse();
 
     // Ensure tail starts with a user message (drop leading assistant messages if needed)
     let mut found_user = false;
-    for (msg_type, id, _tok) in potential_tail {
+    for entry in potential_tail {
         if !found_user {
-            if msg_type == "user" {
+            if entry.message_type == "user" {
                 found_user = true;
-                needed_ids.push((msg_type, id));
+                needed_entries.push(entry);
             }
             // Skip any leading non-user messages
         } else {
-            needed_ids.push((msg_type, id));
+            needed_entries.push(entry);
         }
     }
 
@@ -432,11 +493,57 @@ fn determine_needed_message_ids(
 
     debug!(
         "Truncation: keeping {} out of {} messages",
-        needed_ids.len(),
-        metadata.len()
+        needed_entries.len(),
+        entries.len()
     );
 
-    Ok((needed_ids, true)) // did truncate
+    Ok((
+        needed_entries
+            .into_iter()
+            .flat_map(|entry| entry.ids)
+            .collect(),
+        true,
+    )) // did truncate
+}
+
+fn build_context_entries(
+    metadata: &[crate::models::responses::RawThreadMessageMetadata],
+    include_reasoning_history: bool,
+) -> Vec<ContextEntry> {
+    let mut entries = Vec::new();
+    let mut pending_reasoning: Vec<crate::models::responses::RawThreadMessageMetadata> = Vec::new();
+
+    for message in metadata {
+        match message.message_type.as_str() {
+            "reasoning" if include_reasoning_history => {
+                pending_reasoning.push(message.clone());
+            }
+            "reasoning" => {}
+            "assistant" | "tool_call" if include_reasoning_history => {
+                let mut ids = Vec::new();
+                let mut tok = 0usize;
+
+                for reasoning in pending_reasoning.drain(..) {
+                    tok += metadata_token_count(&reasoning);
+                    ids.push((reasoning.message_type, reasoning.id));
+                }
+
+                tok += metadata_token_count(message);
+                ids.push((message.message_type.clone(), message.id));
+                entries.push(ContextEntry {
+                    message_type: message.message_type.clone(),
+                    ids,
+                    tok,
+                });
+            }
+            _ => {
+                pending_reasoning.clear();
+                entries.push(ContextEntry::single(message));
+            }
+        }
+    }
+
+    entries
 }
 
 /// Build prompt from chat messages - pure function for testing
@@ -532,6 +639,7 @@ pub fn build_prompt_from_chat_messages(
             msgs.push(ChatMsg {
                 role: ROLE_ASSISTANT,
                 content: "[Previous messages truncated due to context limits]".to_string(),
+                reasoning: None,
                 tool_call_id: None,
                 tok: truncation_msg_tokens,
             });
@@ -582,6 +690,7 @@ pub fn build_prompt_from_chat_messages(
 
     // 5. Convert to JSON array required by chat API
     let mut final_msgs = Vec::new();
+    let include_reasoning_history = model_supports_reasoning_history(model);
     for m in msgs {
         let msg = if m.role == "tool" {
             // tool_call_id should always be present for tool messages
@@ -601,24 +710,34 @@ pub fn build_prompt_from_chat_messages(
                     .to_string()
             })
         } else if m.role == ROLE_ASSISTANT {
+            let reasoning = include_reasoning_history
+                .then_some(m.reasoning.as_deref())
+                .flatten()
+                .filter(|reasoning| !reasoning.is_empty());
+
             // Check if this is a tool_call message (JSON with tool_calls field) or regular assistant message
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&m.content) {
+            if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(&m.content) {
                 if parsed.get("tool_calls").is_some() {
                     // This is a tool_call message - use the JSON directly
+                    attach_reasoning_to_assistant_message(&mut parsed, reasoning);
                     parsed
                 } else {
                     // Regular assistant message - plain string
-                    json!({
+                    let mut message = json!({
                         "role": ROLE_ASSISTANT,
                         "content": m.content
-                    })
+                    });
+                    attach_reasoning_to_assistant_message(&mut message, reasoning);
+                    message
                 }
             } else {
                 // Not valid JSON, treat as regular assistant message
-                json!({
+                let mut message = json!({
                     "role": ROLE_ASSISTANT,
                     "content": m.content
-                })
+                });
+                attach_reasoning_to_assistant_message(&mut message, reasoning);
+                message
             }
         } else {
             // User messages
@@ -649,6 +768,24 @@ pub fn build_prompt_from_chat_messages(
     }
 
     Ok((final_msgs, total))
+}
+
+fn attach_reasoning_to_assistant_message(message: &mut Value, reasoning: Option<&str>) {
+    let Some(reasoning) = reasoning else {
+        return;
+    };
+
+    let Some(message_obj) = message.as_object_mut() else {
+        return;
+    };
+
+    message_obj.insert(
+        "reasoning".to_string(),
+        Value::String(reasoning.to_string()),
+    );
+    message_obj
+        .entry("content".to_string())
+        .or_insert_with(|| Value::String(String::new()));
 }
 
 fn model_uses_kimi_tool_call_ids(model: &str) -> bool {
@@ -737,9 +874,21 @@ mod tests {
         ChatMsg {
             role,
             content: content_str,
+            reasoning: None,
             tool_call_id: None,
             tok: tokens.unwrap_or_else(|| count_tokens(content)),
         }
+    }
+
+    fn create_chat_msg_with_reasoning(
+        role: &'static str,
+        content: &str,
+        reasoning: &str,
+        tokens: usize,
+    ) -> ChatMsg {
+        let mut msg = create_chat_msg(role, content, Some(tokens));
+        msg.reasoning = Some(reasoning.to_string());
+        msg
     }
 
     #[test]
@@ -1101,9 +1250,22 @@ mod tests {
         ChatMsg {
             role: ROLE_ASSISTANT,
             content: serde_json::to_string(&tool_call_msg).unwrap(),
+            reasoning: None,
             tool_call_id: None,
             tok: tokens,
         }
+    }
+
+    fn create_tool_call_chat_msg_with_reasoning(
+        tool_call_id: uuid::Uuid,
+        tool_name: &str,
+        arguments_json: &str,
+        reasoning: &str,
+        tokens: usize,
+    ) -> ChatMsg {
+        let mut msg = create_tool_call_chat_msg(tool_call_id, tool_name, arguments_json, tokens);
+        msg.reasoning = Some(reasoning.to_string());
+        msg
     }
 
     fn create_tool_output_chat_msg(
@@ -1114,6 +1276,7 @@ mod tests {
         ChatMsg {
             role: "tool",
             content: output.to_string(),
+            reasoning: None,
             tool_call_id: Some(tool_call_id),
             tok: tokens,
         }
@@ -1288,6 +1451,131 @@ mod tests {
         assert_eq!(messages[3]["tool_calls"][0]["id"], "functions.web_search:1");
         assert_eq!(messages[4]["tool_call_id"], "functions.web_search:1");
         assert_eq!(total_tokens, 10 + 9 + 5 + 9 + 5 + 12);
+    }
+
+    #[test]
+    fn test_build_prompt_includes_reasoning_for_supported_assistant_messages() {
+        let msgs = vec![
+            create_chat_msg("user", "Explain the result", Some(4)),
+            create_chat_msg_with_reasoning(
+                ROLE_ASSISTANT,
+                "The answer is 42.",
+                "I checked the tool result and preserved the key fact.",
+                18,
+            ),
+        ];
+
+        let (messages, total_tokens) =
+            build_prompt_from_chat_messages(msgs, "gpt-oss-120b").expect("build prompt");
+
+        assert_eq!(messages[1]["role"], ROLE_ASSISTANT);
+        assert_eq!(messages[1]["content"], "The answer is 42.");
+        assert_eq!(
+            messages[1]["reasoning"],
+            "I checked the tool result and preserved the key fact."
+        );
+        assert_eq!(total_tokens, 4 + 18);
+    }
+
+    #[test]
+    fn test_build_prompt_omits_reasoning_for_unsupported_models() {
+        let msgs = vec![
+            create_chat_msg("user", "Explain the result", Some(4)),
+            create_chat_msg_with_reasoning(
+                ROLE_ASSISTANT,
+                "The answer is 42.",
+                "This should not be passed to Gemma history.",
+                18,
+            ),
+        ];
+
+        let (messages, total_tokens) =
+            build_prompt_from_chat_messages(msgs, "gemma4-31b").expect("build prompt");
+
+        assert_eq!(messages[1]["role"], ROLE_ASSISTANT);
+        assert_eq!(messages[1]["content"], "The answer is 42.");
+        assert!(messages[1].get("reasoning").is_none());
+        assert_eq!(total_tokens, 4 + 18);
+    }
+
+    #[test]
+    fn test_build_prompt_includes_reasoning_on_supported_tool_call_messages() {
+        let tool_call_id = uuid::Uuid::new_v4();
+        let msgs = vec![
+            create_chat_msg("user", "Search first", Some(4)),
+            create_tool_call_chat_msg_with_reasoning(
+                tool_call_id,
+                "web_search",
+                "{\"query\":\"current result\"}",
+                "I need current data, so I am calling web_search.",
+                16,
+            ),
+        ];
+
+        let (messages, total_tokens) =
+            build_prompt_from_chat_messages(msgs, "kimi-k2-6").expect("build prompt");
+
+        assert_eq!(messages[1]["role"], ROLE_ASSISTANT);
+        assert_eq!(messages[1]["content"], "");
+        assert_eq!(
+            messages[1]["reasoning"],
+            "I need current data, so I am calling web_search."
+        );
+        assert!(messages[1].get("tool_calls").is_some());
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "functions.web_search:0");
+        assert_eq!(total_tokens, 4 + 16);
+    }
+
+    fn context_metadata(
+        message_type: &str,
+        id: i64,
+        token_count: i32,
+    ) -> crate::models::responses::RawThreadMessageMetadata {
+        crate::models::responses::RawThreadMessageMetadata {
+            message_type: message_type.to_string(),
+            id,
+            uuid: uuid::Uuid::new_v4(),
+            created_at: chrono::Utc::now(),
+            token_count: Some(token_count),
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn test_context_entries_pair_reasoning_with_following_assistant_output() {
+        let metadata = vec![
+            context_metadata("user", 1, 4),
+            context_metadata("reasoning", 2, 7),
+            context_metadata("tool_call", 3, 5),
+            context_metadata("tool_output", 4, 6),
+        ];
+
+        let entries = build_context_entries(&metadata, true);
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].ids, vec![("user".to_string(), 1)]);
+        assert_eq!(
+            entries[1].ids,
+            vec![("reasoning".to_string(), 2), ("tool_call".to_string(), 3)]
+        );
+        assert_eq!(entries[1].tok, 12);
+        assert_eq!(entries[2].ids, vec![("tool_output".to_string(), 4)]);
+    }
+
+    #[test]
+    fn test_context_entries_drop_reasoning_for_unsupported_history() {
+        let metadata = vec![
+            context_metadata("user", 1, 4),
+            context_metadata("reasoning", 2, 7),
+            context_metadata("assistant", 3, 5),
+        ];
+
+        let entries = build_context_entries(&metadata, false);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].ids, vec![("user".to_string(), 1)]);
+        assert_eq!(entries[1].ids, vec![("assistant".to_string(), 3)]);
+        assert_eq!(entries[1].tok, 5);
     }
 
     #[test]

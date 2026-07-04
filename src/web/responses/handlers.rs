@@ -44,6 +44,7 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 const RESPONSES_SSE_KEEPALIVE_INTERVAL_SECS: u64 = 1;
+const MAX_WEB_SEARCH_TOOL_TURNS: usize = 30;
 
 // Default functions for serde
 fn default_store() -> bool {
@@ -92,7 +93,7 @@ fn resolve_responses_sampling(body: &ResponsesCreateRequest) -> SamplingConfig {
 }
 
 const MAPLE_SYSTEM_PROMPT: &str = "You are Maple, a friendly, concise, and helpful assistant. Give direct answers, be honest about uncertainty, and never invent tool use, search results, or sources.";
-const MAPLE_WEB_SEARCH_PROMPT: &str = "If the web_search tool is available and the user explicitly asks you to search, look something up, verify, confirm, or check the web, call web_search before answering. Also use web_search when the answer depends on current or time-sensitive information. You may use web_search repeatedly across a single response when needed, but only one tool call at a time and never more than 15 tool calls for one user request. After each tool output, decide whether you have enough information to answer or whether another search is still needed. Prefer to stop searching and answer as soon as you have enough information. After receiving tool results, you must either call another tool or provide a final user-visible answer in assistant content. Do not end the turn with reasoning only. Do not place the final answer in reasoning. Never output raw tool call syntax.";
+const MAPLE_WEB_SEARCH_PROMPT: &str = "If the web_search tool is available and the user explicitly asks you to search, look something up, verify, confirm, or check the web, call web_search before answering. Also use web_search when the answer depends on current or time-sensitive information. You may use web_search repeatedly across a single response when needed, but only one tool call at a time and never more than 30 tool calls for one user request. After each tool output, decide whether you have enough information to answer or whether another search is still needed. Prefer to stop searching and answer as soon as you have enough information. If web_search stops being available after repeated searches, answer based on what you have already learned. After receiving tool results, you must either call another tool or provide a final user-visible answer in assistant content. Do not end the turn with reasoning only. Do not place the final answer in reasoning. Never output raw tool call syntax.";
 
 #[derive(Debug, Clone)]
 struct ModelToolCall {
@@ -256,14 +257,35 @@ fn finalize_first_model_tool_call(tool_calls: &[StreamedToolCall]) -> Option<Mod
     Some(ModelToolCall { name, arguments })
 }
 
+fn assistant_turn_finished_with_tool_call(
+    saw_tool_calls: bool,
+    tools_enabled: bool,
+    finish_reason: Option<&str>,
+) -> bool {
+    saw_tool_calls || (tools_enabled && finish_reason == Some("tool_calls"))
+}
+
+fn final_assistant_finish_reason(tools_enabled: bool, finish_reason: Option<String>) -> String {
+    match finish_reason.as_deref() {
+        // Disabled tool calls are ignored as a no-op for now. If this becomes
+        // common, consider replaying the turn or feeding back a tool-unavailable
+        // error so the model can self-correct.
+        Some("tool_calls") if !tools_enabled => "stop".to_string(),
+        Some(reason) => reason.to_string(),
+        None => "stop".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         append_streamed_tool_calls, apply_responses_model_defaults,
-        build_internal_system_prompt_for_now, build_model_turn_request, build_provider_tools,
+        assistant_turn_finished_with_tool_call, build_internal_system_prompt_for_now,
+        build_model_turn_request, build_provider_tools, final_assistant_finish_reason,
         finalize_first_model_tool_call, has_streamed_tool_call_entries, resolve_responses_sampling,
         wait_for_response_cancellation, ClientResponseState, ConversationParam, InputMessage,
         ResponsesCreateRequest, StorageMessage, StreamedToolCall, MAPLE_WEB_SEARCH_PROMPT,
+        MAX_WEB_SEARCH_TOOL_TURNS,
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
@@ -411,6 +433,20 @@ mod tests {
     }
 
     #[test]
+    fn test_build_model_turn_request_omits_tools_when_disabled() {
+        let mut body = responses_request_for_model("kimi-k2-6");
+        body.tool_choice = Some("auto".to_string());
+        body.tools = Some(json!([{ "type": "web_search" }]));
+
+        let chat_request =
+            build_model_turn_request(&body, &[json!({"role": "user", "content": "hello"})], false);
+
+        assert!(chat_request.get("tools").is_none());
+        assert!(chat_request.get("tool_choice").is_none());
+        assert!(chat_request.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
     fn test_append_streamed_tool_calls_reassembles_arguments() {
         let mut tool_calls = Vec::<StreamedToolCall>::new();
 
@@ -453,6 +489,34 @@ mod tests {
     }
 
     #[test]
+    fn test_disabled_tools_do_not_treat_tool_call_finish_reason_as_tool_call() {
+        assert!(!assistant_turn_finished_with_tool_call(
+            false,
+            false,
+            Some("tool_calls")
+        ));
+        assert!(assistant_turn_finished_with_tool_call(
+            false,
+            true,
+            Some("tool_calls")
+        ));
+        assert!(assistant_turn_finished_with_tool_call(true, false, None));
+    }
+
+    #[test]
+    fn test_disabled_tools_normalize_tool_call_finish_reason_to_stop() {
+        assert_eq!(
+            final_assistant_finish_reason(false, Some("tool_calls".to_string())),
+            "stop"
+        );
+        assert_eq!(
+            final_assistant_finish_reason(true, Some("tool_calls".to_string())),
+            "tool_calls"
+        );
+        assert_eq!(final_assistant_finish_reason(false, None), "stop");
+    }
+
+    #[test]
     fn test_append_streamed_tool_calls_ignores_empty_array() {
         let mut tool_calls = Vec::<StreamedToolCall>::new();
 
@@ -484,6 +548,24 @@ mod tests {
 
         assert!(prompt.contains("Current UTC date: Wednesday, 2026-04-15."));
         assert!(prompt.contains(MAPLE_WEB_SEARCH_PROMPT));
+        assert!(prompt.contains(&format!(
+            "never more than {} tool calls",
+            MAX_WEB_SEARCH_TOOL_TURNS
+        )));
+    }
+
+    #[test]
+    fn test_build_internal_system_prompt_omits_web_search_guidance_when_disabled() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 4, 15, 12, 0, 0)
+            .single()
+            .expect("valid UTC timestamp");
+
+        let prompt = build_internal_system_prompt_for_now(now, false);
+
+        assert!(prompt.contains("Current UTC date: Wednesday, 2026-04-15."));
+        assert!(!prompt.contains(MAPLE_WEB_SEARCH_PROMPT));
+        assert!(!prompt.contains("web_search"));
     }
 
     #[test]
@@ -2241,6 +2323,7 @@ async fn stream_one_assistant_turn(
     let mut current_message_id: Option<Uuid> = None;
     let mut reasoning = ReasoningState::NotStarted;
     let mut saw_tool_calls = false;
+    let mut ignored_disabled_tool_calls = false;
 
     while let Some(chunk) = completion.stream.recv().await {
         match chunk {
@@ -2309,29 +2392,43 @@ async fn stream_one_assistant_turn(
                     }
                 }
 
-                // Tool call deltas: close any in-flight message and reasoning, then accumulate.
+                // Tool call deltas are honored only on turns where tools were advertised.
+                // Disabled-tool deltas are ignored so any assistant content in the same turn
+                // can still stream and complete normally.
                 if let Some(tool_call_delta) = delta
                     .and_then(|d| d.get("tool_calls"))
                     .filter(|tool_call_delta| has_streamed_tool_call_entries(tool_call_delta))
                 {
-                    if !saw_tool_calls {
-                        debug!("Assistant turn received first tool_call delta from model stream");
-                    }
-                    if let Some(message_id) = current_message_id.take() {
-                        send_storage_message(
-                            tx_storage,
-                            tx_client,
-                            StorageMessage::MessageDone {
-                                item_id: message_id,
-                                finish_reason: "tool_calls".to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                    close_reasoning_if_active(&mut reasoning, tx_storage, tx_client).await?;
+                    if !tools_enabled {
+                        if !ignored_disabled_tool_calls {
+                            warn!(
+                                "Ignoring tool_call deltas for response {} because tools were disabled for this assistant turn",
+                                response_uuid
+                            );
+                            ignored_disabled_tool_calls = true;
+                        }
+                    } else {
+                        if !saw_tool_calls {
+                            debug!(
+                                "Assistant turn received first tool_call delta from model stream"
+                            );
+                        }
+                        if let Some(message_id) = current_message_id.take() {
+                            send_storage_message(
+                                tx_storage,
+                                tx_client,
+                                StorageMessage::MessageDone {
+                                    item_id: message_id,
+                                    finish_reason: "tool_calls".to_string(),
+                                },
+                            )
+                            .await?;
+                        }
+                        close_reasoning_if_active(&mut reasoning, tx_storage, tx_client).await?;
 
-                    saw_tool_calls = true;
-                    append_streamed_tool_calls(&mut streamed_tool_calls, tool_call_delta);
+                        saw_tool_calls = true;
+                        append_streamed_tool_calls(&mut streamed_tool_calls, tool_call_delta);
+                    }
                 }
 
                 // Assistant text content. Some providers occasionally emit a trailing sliver of
@@ -2385,7 +2482,11 @@ async fn stream_one_assistant_turn(
             crate::web::openai::CompletionChunk::Done => {
                 close_reasoning_if_active(&mut reasoning, tx_storage, tx_client).await?;
 
-                if saw_tool_calls || finish_reason.as_deref() == Some("tool_calls") {
+                if assistant_turn_finished_with_tool_call(
+                    saw_tool_calls,
+                    tools_enabled,
+                    finish_reason.as_deref(),
+                ) {
                     debug!(
                         "Assistant turn finalized tool_call after model stream completion (finish_reason={})",
                         finish_reason.as_deref().unwrap_or("unknown")
@@ -2412,7 +2513,14 @@ async fn stream_one_assistant_turn(
                 )
                 .await?;
 
-                let final_finish_reason = finish_reason.unwrap_or_else(|| "stop".to_string());
+                if !tools_enabled && finish_reason.as_deref() == Some("tool_calls") {
+                    warn!(
+                        "Treating disabled-tool finish_reason as stop for response {}",
+                        response_uuid
+                    );
+                }
+                let final_finish_reason =
+                    final_assistant_finish_reason(tools_enabled, finish_reason);
                 send_storage_message(
                     tx_storage,
                     tx_client,
@@ -2466,10 +2574,8 @@ async fn setup_completion_processor(
     tx_storage: mpsc::Sender<StorageMessage>,
     mut rx_tool_ack: mpsc::Receiver<Result<(), String>>,
 ) -> Result<crate::models::responses::Response, ApiError> {
-    const MAX_TOOL_TURNS: usize = 15;
-
-    let tools_enabled = should_enable_web_search_tool(state.as_ref(), body);
-    let internal_system_prompt = build_internal_system_prompt(tools_enabled);
+    let tools_available = should_enable_web_search_tool(state.as_ref(), body);
+    let mut tools_enabled = tools_available;
     let mut prompt_messages = Arc::as_ref(&context.prompt_messages).clone();
     let mut prompt_token_estimate = context.total_prompt_tokens;
 
@@ -2495,19 +2601,12 @@ async fn setup_completion_processor(
             .await?
             {
                 AssistantTurnOutcome::ToolCall(tool_call) => {
-                    tool_turn_count += 1;
-                    if tool_turn_count > MAX_TOOL_TURNS {
-                        error!(
-                            "Exceeded max tool turns ({}) for response {}",
-                            MAX_TOOL_TURNS, persisted.response.uuid
-                        );
-                        return Err(ApiError::InternalServerError);
-                    }
-
                     debug!(
                         "Tool loop: assistant turn requested tool {} for response {}",
                         tool_call.name, persisted.response.uuid
                     );
+
+                    tool_turn_count += 1;
                     execute_tool_call_and_wait(
                         state,
                         persisted,
@@ -2518,6 +2617,14 @@ async fn setup_completion_processor(
                     )
                     .await?;
 
+                    tools_enabled = tools_available && tool_turn_count < MAX_WEB_SEARCH_TOOL_TURNS;
+                    if !tools_enabled && tools_available {
+                        info!(
+                            "Reached max web_search tool turns ({}) for response {}; continuing with web_search disabled",
+                            MAX_WEB_SEARCH_TOOL_TURNS, persisted.response.uuid
+                        );
+                    }
+                    let internal_system_prompt = build_internal_system_prompt(tools_enabled);
                     let (rebuilt_messages, rebuilt_tokens) = build_prompt(
                         state.db.as_ref(),
                         context.conversation.id,

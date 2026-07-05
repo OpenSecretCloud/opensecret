@@ -1466,7 +1466,7 @@ mod tests {
         ];
 
         let (messages, total_tokens) =
-            build_prompt_from_chat_messages(msgs, "gpt-oss-120b").expect("build prompt");
+            build_prompt_from_chat_messages(msgs, "glm-5-2").expect("build prompt");
 
         assert_eq!(messages[1]["role"], ROLE_ASSISTANT);
         assert_eq!(messages[1]["content"], "The answer is 42.");

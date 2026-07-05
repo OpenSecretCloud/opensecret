@@ -21,6 +21,12 @@ pub struct SamplingConfig {
     pub top_p: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningHistoryStrategy {
+    KimiPreserveThinking,
+    GlmClearThinking,
+}
+
 impl SamplingConfig {
     pub fn with_overrides(self, temperature: Option<f32>, top_p: Option<f32>) -> Self {
         Self {
@@ -471,17 +477,23 @@ pub fn model_context_window(model: &str) -> usize {
     model_config(model).context_window
 }
 
-pub fn model_supports_reasoning_history(model: &str) -> bool {
+pub fn model_reasoning_history_strategy(model: &str) -> Option<ReasoningHistoryStrategy> {
     let canonical = alias_target(model).unwrap_or(model);
-    let normalized = canonical
+    let normalized = canonical.to_ascii_lowercase();
+    let normalized = normalized
         .strip_prefix("openai/")
-        .unwrap_or(canonical)
-        .to_ascii_lowercase();
+        .or_else(|| normalized.strip_prefix("tinfoil/"))
+        .unwrap_or(&normalized);
 
-    matches!(
-        normalized.as_str(),
-        "gpt-oss-120b" | "kimi-k2-6" | "kimi-k2.6"
-    )
+    match normalized {
+        "kimi-k2-6" | "kimi-k2.6" => Some(ReasoningHistoryStrategy::KimiPreserveThinking),
+        "glm-5-2" | "glm-5.2" => Some(ReasoningHistoryStrategy::GlmClearThinking),
+        _ => None,
+    }
+}
+
+pub fn model_supports_reasoning_history(model: &str) -> bool {
+    model_reasoning_history_strategy(model).is_some()
 }
 
 pub fn model_catalog_response() -> Value {
@@ -613,17 +625,37 @@ mod tests {
 
     #[test]
     fn test_model_supports_reasoning_history_only_for_validated_models() {
-        assert!(model_supports_reasoning_history("gpt-oss-120b"));
-        assert!(model_supports_reasoning_history("openai/gpt-oss-120b"));
         assert!(model_supports_reasoning_history("kimi-k2-6"));
         assert!(model_supports_reasoning_history("kimi-k2.6"));
-        assert!(model_supports_reasoning_history(AUTO_QUICK_MODEL_ID));
+        assert!(model_supports_reasoning_history("glm-5-2"));
+        assert!(model_supports_reasoning_history("glm-5.2"));
         assert!(model_supports_reasoning_history(AUTO_POWERFUL_MODEL_ID));
 
+        assert!(!model_supports_reasoning_history("gpt-oss-120b"));
+        assert!(!model_supports_reasoning_history("openai/gpt-oss-120b"));
+        assert!(!model_supports_reasoning_history(AUTO_QUICK_MODEL_ID));
+        assert!(!model_supports_reasoning_history("gpt-oss-safeguard-120b"));
         assert!(!model_supports_reasoning_history("gemma4-31b"));
-        assert!(!model_supports_reasoning_history("glm-5-2"));
+        assert!(!model_supports_reasoning_history("deepseek-v4-pro"));
         assert!(!model_supports_reasoning_history("llama3-3-70b"));
         assert!(!model_supports_reasoning_history("unknown-model"));
+    }
+
+    #[test]
+    fn test_model_reasoning_history_strategy_by_model_family() {
+        assert_eq!(
+            model_reasoning_history_strategy("kimi-k2-6"),
+            Some(ReasoningHistoryStrategy::KimiPreserveThinking)
+        );
+        assert_eq!(
+            model_reasoning_history_strategy("kimi-k2.6"),
+            Some(ReasoningHistoryStrategy::KimiPreserveThinking)
+        );
+        assert_eq!(
+            model_reasoning_history_strategy("glm-5-2"),
+            Some(ReasoningHistoryStrategy::GlmClearThinking)
+        );
+        assert_eq!(model_reasoning_history_strategy("gemma4-31b"), None);
     }
 
     #[test]

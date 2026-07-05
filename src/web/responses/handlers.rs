@@ -6,7 +6,10 @@ use crate::{
     db::DBError,
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
     jwt::AuthContext,
-    model_config::{model_config, resolve_public_model_id, ResponsesModelConfig, SamplingConfig},
+    model_config::{
+        model_config, model_reasoning_history_strategy, resolve_public_model_id,
+        ReasoningHistoryStrategy, ResponsesModelConfig, SamplingConfig,
+    },
     models::responses::{NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
     tokens::{count_tokens, model_max_ctx},
@@ -55,8 +58,46 @@ fn default_stream() -> bool {
     true
 }
 
-fn apply_responses_model_defaults(chat_request: &mut Value, config: ResponsesModelConfig) {
-    if !config.include_reasoning && !config.enable_thinking {
+fn set_chat_template_kwarg(chat_request: &mut Value, key: &str, value: Value) {
+    let Some(obj) = chat_request.as_object_mut() else {
+        return;
+    };
+
+    let chat_template_kwargs = obj
+        .entry("chat_template_kwargs".to_string())
+        .or_insert_with(|| json!({}));
+
+    if let Some(kwargs) = chat_template_kwargs.as_object_mut() {
+        kwargs.insert(key.to_string(), value);
+    } else {
+        *chat_template_kwargs = json!({});
+        if let Some(kwargs) = chat_template_kwargs.as_object_mut() {
+            kwargs.insert(key.to_string(), value);
+        }
+    }
+}
+
+fn apply_reasoning_history_strategy(chat_request: &mut Value, model: &str) {
+    match model_reasoning_history_strategy(model) {
+        Some(ReasoningHistoryStrategy::KimiPreserveThinking) => {
+            set_chat_template_kwarg(chat_request, "preserve_thinking", json!(true));
+        }
+        Some(ReasoningHistoryStrategy::GlmClearThinking) => {
+            set_chat_template_kwarg(chat_request, "clear_thinking", json!(false));
+        }
+        None => {}
+    }
+}
+
+fn apply_responses_model_defaults(
+    chat_request: &mut Value,
+    config: ResponsesModelConfig,
+    model: &str,
+) {
+    if !config.include_reasoning
+        && !config.enable_thinking
+        && model_reasoning_history_strategy(model).is_none()
+    {
         return;
     }
 
@@ -68,21 +109,11 @@ fn apply_responses_model_defaults(chat_request: &mut Value, config: ResponsesMod
         obj.insert("include_reasoning".to_string(), json!(true));
     }
 
-    if !config.enable_thinking {
-        return;
+    if config.enable_thinking {
+        set_chat_template_kwarg(chat_request, "enable_thinking", json!(true));
     }
 
-    let chat_template_kwargs = obj
-        .entry("chat_template_kwargs".to_string())
-        .or_insert_with(|| json!({}));
-
-    if let Some(kwargs) = chat_template_kwargs.as_object_mut() {
-        kwargs.insert("enable_thinking".to_string(), json!(true));
-    } else {
-        *chat_template_kwargs = json!({
-            "enable_thinking": true
-        });
-    }
+    apply_reasoning_history_strategy(chat_request, model);
 }
 
 fn resolve_responses_sampling(body: &ResponsesCreateRequest) -> SamplingConfig {
@@ -196,7 +227,7 @@ fn build_model_turn_request(
         }
     }
 
-    apply_responses_model_defaults(&mut chat_request, responses_config);
+    apply_responses_model_defaults(&mut chat_request, responses_config, config_model);
     chat_request
 }
 
@@ -307,6 +338,7 @@ mod tests {
         apply_responses_model_defaults(
             &mut chat_request,
             crate::model_config::model_config("gemma4-31b").responses,
+            "gemma4-31b",
         );
 
         assert_eq!(chat_request["include_reasoning"], true);
@@ -326,10 +358,53 @@ mod tests {
         apply_responses_model_defaults(
             &mut chat_request,
             crate::model_config::model_config("gpt-oss-120b").responses,
+            "gpt-oss-120b",
         );
 
         assert!(chat_request.get("include_reasoning").is_none());
         assert!(chat_request.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
+    fn test_apply_responses_model_defaults_preserves_kimi_reasoning_history() {
+        let mut chat_request = json!({
+            "model": "kimi-k2-6",
+            "chat_template_kwargs": {
+                "foo": "bar"
+            }
+        });
+
+        apply_responses_model_defaults(
+            &mut chat_request,
+            crate::model_config::model_config("kimi-k2-6").responses,
+            "kimi-k2-6",
+        );
+
+        assert_eq!(
+            chat_request["chat_template_kwargs"]["preserve_thinking"],
+            true
+        );
+        assert_eq!(chat_request["chat_template_kwargs"]["foo"], "bar");
+        assert!(chat_request.get("include_reasoning").is_none());
+    }
+
+    #[test]
+    fn test_apply_responses_model_defaults_preserves_glm_reasoning_history() {
+        let mut chat_request = json!({
+            "model": "glm-5-2"
+        });
+
+        apply_responses_model_defaults(
+            &mut chat_request,
+            crate::model_config::model_config("glm-5-2").responses,
+            "glm-5-2",
+        );
+
+        assert_eq!(
+            chat_request["chat_template_kwargs"]["clear_thinking"],
+            false
+        );
+        assert!(chat_request.get("include_reasoning").is_none());
     }
 
     fn responses_request_for_model(model: &str) -> ResponsesCreateRequest {
@@ -429,6 +504,34 @@ mod tests {
         assert_eq!(
             chat_request["model"],
             crate::model_config::AUTO_QUICK_MODEL_ID
+        );
+    }
+
+    #[test]
+    fn test_build_model_turn_request_applies_reasoning_history_template_kwargs() {
+        let kimi = responses_request_for_model("kimi-k2-6");
+        let kimi_request =
+            build_model_turn_request(&kimi, &[json!({"role": "user", "content": "hello"})], false);
+        assert_eq!(
+            kimi_request["chat_template_kwargs"]["preserve_thinking"],
+            true
+        );
+
+        let glm = responses_request_for_model("glm-5-2");
+        let glm_request =
+            build_model_turn_request(&glm, &[json!({"role": "user", "content": "hello"})], false);
+        assert_eq!(glm_request["chat_template_kwargs"]["clear_thinking"], false);
+
+        let auto_powerful =
+            responses_request_for_model(crate::model_config::AUTO_POWERFUL_MODEL_ID);
+        let auto_request = build_model_turn_request(
+            &auto_powerful,
+            &[json!({"role": "user", "content": "hello"})],
+            false,
+        );
+        assert_eq!(
+            auto_request["chat_template_kwargs"]["preserve_thinking"],
+            true
         );
     }
 

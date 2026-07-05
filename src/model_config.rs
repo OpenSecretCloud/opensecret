@@ -471,6 +471,19 @@ pub fn model_context_window(model: &str) -> usize {
     model_config(model).context_window
 }
 
+pub fn model_supports_reasoning_history(model: &str) -> bool {
+    let canonical = alias_target(model).unwrap_or(model);
+    let normalized = canonical
+        .strip_prefix("openai/")
+        .unwrap_or(canonical)
+        .to_ascii_lowercase();
+
+    matches!(
+        normalized.as_str(),
+        "gpt-oss-120b" | "kimi-k2-6" | "kimi-k2.6"
+    )
+}
+
 pub fn model_catalog_response() -> Value {
     let data = MODEL_CONFIGS
         .iter()
@@ -596,6 +609,21 @@ mod tests {
 
         assert!(responses_config.include_reasoning);
         assert!(responses_config.enable_thinking);
+    }
+
+    #[test]
+    fn test_model_supports_reasoning_history_only_for_validated_models() {
+        assert!(model_supports_reasoning_history("gpt-oss-120b"));
+        assert!(model_supports_reasoning_history("openai/gpt-oss-120b"));
+        assert!(model_supports_reasoning_history("kimi-k2-6"));
+        assert!(model_supports_reasoning_history("kimi-k2.6"));
+        assert!(model_supports_reasoning_history(AUTO_QUICK_MODEL_ID));
+        assert!(model_supports_reasoning_history(AUTO_POWERFUL_MODEL_ID));
+
+        assert!(!model_supports_reasoning_history("gemma4-31b"));
+        assert!(!model_supports_reasoning_history("glm-5-2"));
+        assert!(!model_supports_reasoning_history("llama3-3-70b"));
+        assert!(!model_supports_reasoning_history("unknown-model"));
     }
 
     #[test]

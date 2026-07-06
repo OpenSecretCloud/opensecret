@@ -22,7 +22,8 @@ pub mod types;
 pub use builders::{
     build_usage, ContentPartBuilder, ConversationBuilder, OutputItemBuilder, ResponseBuilder,
 };
-pub use context_builder::build_prompt;
+pub(crate) use context_builder::prompt_token_budget;
+pub use context_builder::{build_prompt, build_prompt_with_token_reserve};
 pub use conversions::{ConversationItem, ConversationItemConverter, MessageContentConverter};
 pub use errors::error_mapping;
 pub use events::{ResponseEvent, SseEventEmitter};

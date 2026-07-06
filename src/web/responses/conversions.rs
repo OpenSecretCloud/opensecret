@@ -3,6 +3,7 @@
 use crate::{
     encrypt::decrypt_string,
     models::responses::RawThreadMessage,
+    tokens::count_tokens,
     web::responses::{constants::*, error_mapping, types::*},
     ApiError,
 };
@@ -20,6 +21,8 @@ use uuid::Uuid;
 /// - Conversation API format conversion
 /// - Token counting text extraction
 pub struct MessageContentConverter;
+
+const INPUT_IMAGE_TOKEN_ESTIMATE: usize = 1024;
 
 impl MessageContentConverter {
     /// Validate MessageContent parts to ensure unsupported features are rejected
@@ -167,6 +170,30 @@ impl MessageContentConverter {
                 })
                 .collect::<Vec<_>>()
                 .join(" "),
+        }
+    }
+
+    /// Estimate prompt tokens for a user message, including multimodal parts.
+    ///
+    /// Provider tokenizers count image parts even though their data URLs should
+    /// not be counted as plain text. Use a conservative fixed image estimate so
+    /// context truncation leaves enough room for vision-token expansion.
+    pub fn estimate_prompt_tokens(content: &MessageContent) -> usize {
+        match content {
+            MessageContent::Text(text) => count_tokens(text),
+            MessageContent::Parts(parts) => parts.iter().fold(0usize, |total, part| {
+                total.saturating_add(Self::estimate_content_part_tokens(part))
+            }),
+        }
+    }
+
+    fn estimate_content_part_tokens(part: &MessageContentPart) -> usize {
+        match part {
+            MessageContentPart::Text { text } | MessageContentPart::InputText { text } => {
+                count_tokens(text)
+            }
+            MessageContentPart::InputImage { .. } => INPUT_IMAGE_TOKEN_ESTIMATE,
+            MessageContentPart::InputFile { filename, .. } => count_tokens(filename),
         }
     }
 }
@@ -478,6 +505,31 @@ mod tests {
 
         let text = MessageContentConverter::extract_text_for_token_counting(&content);
         assert_eq!(text, "hello world");
+    }
+
+    #[test]
+    fn test_estimate_prompt_tokens_counts_images() {
+        let content = MessageContent::Parts(vec![
+            MessageContentPart::InputText {
+                text: "hello world".to_string(),
+            },
+            MessageContentPart::InputImage {
+                image_url: Some("data:image/png;base64,abcd".to_string()),
+                file_id: None,
+                detail: None,
+            },
+            MessageContentPart::InputImage {
+                image_url: Some("data:image/png;base64,efgh".to_string()),
+                file_id: None,
+                detail: None,
+            },
+        ]);
+
+        let tokens = MessageContentConverter::estimate_prompt_tokens(&content);
+        assert_eq!(
+            tokens,
+            count_tokens("hello world") + (2 * INPUT_IMAGE_TOKEN_ESTIMATE)
+        );
     }
 
     #[test]

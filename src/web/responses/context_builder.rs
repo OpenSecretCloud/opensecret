@@ -1,6 +1,10 @@
 //! Build the ChatCompletion prompt array respecting token limits.
 
-use super::constants::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_USER};
+use super::{
+    constants::{ROLE_ASSISTANT, ROLE_SYSTEM, ROLE_USER},
+    conversions::MessageContentConverter,
+    types::MessageContent,
+};
 use crate::encrypt::decrypt_with_key;
 use crate::model_config::model_supports_reasoning_history;
 use crate::tokens::{count_tokens, model_max_ctx};
@@ -47,6 +51,23 @@ fn metadata_token_count(message: &crate::models::responses::RawThreadMessageMeta
     message.token_count.map(|t| t as usize).unwrap_or(0)
 }
 
+fn stored_token_count(token_count: Option<i32>) -> Option<usize> {
+    token_count.and_then(|count| usize::try_from(count).ok())
+}
+
+fn user_message_prompt_token_count(content_json: &str, token_count: Option<i32>) -> usize {
+    let stored = stored_token_count(token_count).unwrap_or_else(|| count_tokens(content_json));
+    if !content_json.contains(r#""input_image""#) {
+        return stored;
+    }
+
+    let estimated = serde_json::from_str::<MessageContent>(content_json)
+        .map(|content| MessageContentConverter::estimate_prompt_tokens(&content))
+        .unwrap_or(0);
+
+    stored.max(estimated)
+}
+
 fn decrypt_instruction(
     user_key: &secp256k1::SecretKey,
     prompt_enc: &[u8],
@@ -56,6 +77,13 @@ fn decrypt_instruction(
         decrypt_with_key(user_key, prompt_enc).map_err(|_| crate::ApiError::InternalServerError)?;
     let content = String::from_utf8_lossy(&plain).into_owned();
     Ok((content, prompt_tokens as usize))
+}
+
+pub(crate) fn prompt_token_budget(model: &str) -> usize {
+    let max_ctx = model_max_ctx(model);
+    let response_reserve = 4096usize;
+    let safety = 500usize;
+    max_ctx.saturating_sub(response_reserve + safety)
 }
 
 /// Return (messages, total_prompt_tokens)
@@ -72,6 +100,31 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
     model: &str,
     override_instructions: Option<&str>,
     internal_instructions: Option<&str>,
+) -> Result<(Vec<serde_json::Value>, usize), crate::ApiError> {
+    build_prompt_with_token_reserve(
+        db,
+        conversation_id,
+        user_id,
+        user_key,
+        model,
+        override_instructions,
+        internal_instructions,
+        0,
+    )
+}
+
+/// Build persisted conversation context while reserving room for a message that
+/// will be appended after history truncation, such as the current user input.
+#[allow(clippy::too_many_arguments)]
+pub fn build_prompt_with_token_reserve<D: DBConnection + ?Sized>(
+    db: &D,
+    conversation_id: i64,
+    user_id: uuid::Uuid,
+    user_key: &secp256k1::SecretKey,
+    model: &str,
+    override_instructions: Option<&str>,
+    internal_instructions: Option<&str>,
+    token_reserve: usize,
 ) -> Result<(Vec<serde_json::Value>, usize), crate::ApiError> {
     // 1. Get default user instructions if they exist (unless override provided)
     let mut system_tokens = 0usize;
@@ -136,7 +189,8 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
         .map_err(|_| crate::ApiError::InternalServerError)?;
 
     // 3. Run truncation logic on metadata to determine which messages we need
-    let (needed_ids, did_truncate) = determine_needed_message_ids(&metadata, model, system_tokens)?;
+    let (needed_ids, did_truncate) =
+        determine_needed_message_ids(&metadata, model, system_tokens, token_reserve)?;
 
     // 4. PASS 2: Fetch and decrypt ONLY the messages we need
     let raw = if needed_ids.is_empty() {
@@ -179,10 +233,7 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
                 let plain = decrypt_with_key(user_key, content_enc)
                     .map_err(|_| crate::ApiError::InternalServerError)?;
                 let content = String::from_utf8_lossy(&plain).into_owned();
-                let t = r
-                    .token_count
-                    .map(|v| v as usize)
-                    .unwrap_or_else(|| count_tokens(&content));
+                let t = user_message_prompt_token_count(&content, r.token_count);
                 msgs.push(ChatMsg {
                     role: ROLE_USER,
                     content,
@@ -379,7 +430,11 @@ pub fn build_prompt<D: DBConnection + ?Sized>(
     // get_conversation_context_metadata result above.
 
     // 6. Format for LLM API (no further truncation needed - already done in step 3)
-    build_prompt_from_chat_messages(msgs, model)
+    if token_reserve == 0 {
+        build_prompt_from_chat_messages(msgs, model)
+    } else {
+        build_prompt_from_chat_messages_with_token_reserve(msgs, model, token_reserve)
+    }
 }
 
 /// Determine which message IDs are needed based on truncation logic
@@ -392,16 +447,14 @@ fn determine_needed_message_ids(
     metadata: &[crate::models::responses::RawThreadMessageMetadata],
     model: &str,
     system_tokens: usize,
+    token_reserve: usize,
 ) -> Result<(Vec<(String, i64)>, bool), crate::ApiError> {
     use tracing::debug;
 
     let entries = build_context_entries(metadata, model_supports_reasoning_history(model));
 
     // Calculate token budget
-    let max_ctx = model_max_ctx(model);
-    let response_reserve = 4096usize;
-    let safety = 500usize;
-    let ctx_budget = max_ctx.saturating_sub(response_reserve + safety);
+    let ctx_budget = prompt_token_budget(model).saturating_sub(token_reserve);
 
     // Calculate total tokens in all messages
     let total_msg_tokens: usize = entries.iter().map(|entry| entry.tok).sum();
@@ -548,14 +601,19 @@ fn build_context_entries(
 
 /// Build prompt from chat messages - pure function for testing
 pub fn build_prompt_from_chat_messages(
-    mut msgs: Vec<ChatMsg>,
+    msgs: Vec<ChatMsg>,
     model: &str,
 ) -> Result<(Vec<serde_json::Value>, usize), crate::ApiError> {
+    build_prompt_from_chat_messages_with_token_reserve(msgs, model, 0)
+}
+
+pub fn build_prompt_from_chat_messages_with_token_reserve(
+    mut msgs: Vec<ChatMsg>,
+    model: &str,
+    token_reserve: usize,
+) -> Result<(Vec<serde_json::Value>, usize), crate::ApiError> {
     // 4. Truncation
-    let max_ctx = model_max_ctx(model);
-    let response_reserve = 4096usize;
-    let safety = 500usize;
-    let ctx_budget = max_ctx.saturating_sub(response_reserve + safety);
+    let ctx_budget = prompt_token_budget(model).saturating_sub(token_reserve);
 
     let raw_msg_count = msgs.len();
     let mut total: usize = msgs.iter().map(|m| m.tok).sum();
@@ -889,6 +947,119 @@ mod tests {
         let mut msg = create_chat_msg(role, content, Some(tokens));
         msg.reasoning = Some(reasoning.to_string());
         msg
+    }
+
+    fn create_mixed_user_chat_msg(text: &str, image_count: usize) -> ChatMsg {
+        use crate::web::responses::MessageContentPart;
+
+        let mut parts = vec![MessageContentPart::InputText {
+            text: text.to_string(),
+        }];
+
+        for index in 0..image_count {
+            parts.push(MessageContentPart::InputImage {
+                image_url: Some(format!("data:image/png;base64,image-{index}")),
+                file_id: None,
+                detail: None,
+            });
+        }
+
+        let content = MessageContent::Parts(parts);
+        let tok = MessageContentConverter::estimate_prompt_tokens(&content);
+
+        ChatMsg {
+            role: ROLE_USER,
+            content: serde_json::to_string(&content).unwrap(),
+            reasoning: None,
+            tool_call_id: None,
+            tok,
+        }
+    }
+
+    #[test]
+    fn test_user_message_prompt_token_count_reestimates_images() {
+        use crate::web::responses::MessageContentPart;
+
+        let content = MessageContent::Parts(vec![
+            MessageContentPart::InputText {
+                text: "describe this".to_string(),
+            },
+            MessageContentPart::InputImage {
+                image_url: Some("data:image/png;base64,abcd".to_string()),
+                file_id: None,
+                detail: None,
+            },
+        ]);
+        let content_json = serde_json::to_string(&content).unwrap();
+        let expected = MessageContentConverter::estimate_prompt_tokens(&content);
+
+        assert_eq!(
+            user_message_prompt_token_count(&content_json, Some(1)),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_user_message_prompt_token_count_uses_stored_count_for_text_only() {
+        let content = MessageContent::Text("text-only stored message".to_string());
+        let content_json = serde_json::to_string(&content).unwrap();
+
+        assert_eq!(user_message_prompt_token_count(&content_json, Some(7)), 7);
+    }
+
+    #[test]
+    fn test_build_prompt_keeps_text_and_image_parts_together() {
+        let mixed_user = create_mixed_user_chat_msg("please inspect this", 1);
+        let expected_tokens = mixed_user.tok;
+
+        let (messages, total_tokens) =
+            build_prompt_from_chat_messages(vec![mixed_user], "unknown-model-xyz")
+                .expect("build prompt");
+
+        assert_eq!(total_tokens, expected_tokens);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], ROLE_USER);
+
+        let content = messages[0]["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "please inspect this");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,image-0"
+        );
+    }
+
+    #[test]
+    fn test_token_reserve_truncates_mixed_text_image_message_as_whole() {
+        let incoming_user_reserve = 40_000usize;
+        let msgs = vec![
+            create_chat_msg(ROLE_SYSTEM, "system", Some(100)),
+            create_chat_msg(ROLE_USER, "first user", Some(100)),
+            create_chat_msg(ROLE_ASSISTANT, "first assistant", Some(100)),
+            create_mixed_user_chat_msg("expensive mixed image turn", 30),
+            create_chat_msg(ROLE_ASSISTANT, "assistant after images", Some(100)),
+            create_chat_msg(ROLE_USER, "recent tail user", Some(100)),
+        ];
+
+        let (messages, total_tokens) = build_prompt_from_chat_messages_with_token_reserve(
+            msgs,
+            "unknown-model-xyz",
+            incoming_user_reserve,
+        )
+        .expect("build prompt with reserve");
+
+        assert!(total_tokens + incoming_user_reserve <= prompt_token_budget("unknown-model-xyz"));
+        assert!(messages.iter().any(|message| {
+            message["role"] == ROLE_ASSISTANT
+                && message["content"] == "[Previous messages truncated due to context limits]"
+        }));
+
+        let serialized = serde_json::to_string(&messages).unwrap();
+        assert!(!serialized.contains("expensive mixed image turn"));
+        assert!(!serialized.contains("image-29"));
+        assert!(serialized.contains("recent tail user"));
     }
 
     #[test]

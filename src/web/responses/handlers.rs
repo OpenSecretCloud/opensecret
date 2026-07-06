@@ -12,14 +12,14 @@ use crate::{
     },
     models::responses::{NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
-    tokens::{count_tokens, model_max_ctx},
     web::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::get_chat_completion_response,
         responses::{
-            build_prompt, build_usage, constants::*, error_mapping, storage_task, tools,
-            ContentPartBuilder, DeletedObjectResponse, MessageContent, MessageContentConverter,
-            MessageContentPart, OutputItemBuilder, ResponseBuilder, ResponseEvent, SseEventEmitter,
+            build_prompt, build_prompt_with_token_reserve, build_usage, constants::*,
+            error_mapping, prompt_token_budget, storage_task, tools, ContentPartBuilder,
+            DeletedObjectResponse, MessageContent, MessageContentConverter, MessageContentPart,
+            OutputItemBuilder, ResponseBuilder, ResponseEvent, SseEventEmitter,
         },
     },
     ApiError, AppState,
@@ -1844,10 +1844,8 @@ async fn validate_and_normalize_input(
         .content
         .clone();
 
-    // Count tokens for the user's input message (text only for token counting)
-    let input_text_for_tokens =
-        MessageContentConverter::extract_text_for_token_counting(&message_content);
-    let token_count = count_tokens(&input_text_for_tokens);
+    // Estimate prompt tokens for the user's input message, including images.
+    let token_count = MessageContentConverter::estimate_prompt_tokens(&message_content);
     let user_message_tokens = if token_count > i32::MAX as usize {
         warn!(
             "Token count {} exceeds i32::MAX, clamping to i32::MAX",
@@ -1860,10 +1858,7 @@ async fn validate_and_normalize_input(
 
     // Validate that the user message doesn't exceed the context budget
     // Even if we drop everything else, we need to fit at least the user's message
-    let max_ctx = model_max_ctx(&body.model);
-    let response_reserve = 4096usize;
-    let safety = 500usize;
-    let ctx_budget = max_ctx.saturating_sub(response_reserve + safety);
+    let ctx_budget = prompt_token_budget(&body.model);
 
     if user_message_tokens as usize >= ctx_budget {
         error!(
@@ -1928,7 +1923,7 @@ async fn build_context_and_check_billing(
 
     // Build the conversation context from all persisted messages
     // Pass instructions from request (if provided) to override default user instructions
-    let (mut prompt_messages, mut total_prompt_tokens) = build_prompt(
+    let (mut prompt_messages, mut total_prompt_tokens) = build_prompt_with_token_reserve(
         state.db.as_ref(),
         conversation.id,
         user.uuid,
@@ -1936,6 +1931,7 @@ async fn build_context_and_check_billing(
         &body.model,
         body.instructions.as_deref(),
         Some(&internal_system_prompt),
+        prepared.user_message_tokens as usize,
     )?;
 
     // Add the NEW user message to the context (not yet persisted)

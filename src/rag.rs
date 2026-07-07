@@ -17,6 +17,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
+use tokio::task;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -436,6 +437,22 @@ struct RagLimits {
     max_project_stored_bytes: i64,
 }
 
+async fn run_blocking_rag<T, F>(task_name: &'static str, f: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+{
+    task::spawn_blocking(f).await.map_err(|e| {
+        error!(
+            target: "rag",
+            task = task_name,
+            error = ?e,
+            "RAG blocking task failed"
+        );
+        ApiError::InternalServerError
+    })?
+}
+
 impl RagLimits {
     fn from_env() -> Self {
         Self {
@@ -643,6 +660,25 @@ fn top_k_candidates(
     let mut out: Vec<HeapItem> = heap.into_iter().map(|r| r.0).collect();
     out.sort_by(|a, b| b.cmp(a));
     Ok(out)
+}
+
+async fn top_k_candidates_blocking(
+    query: Vec<f32>,
+    embeddings: Arc<Vec<CachedEmbedding>>,
+    top_k: usize,
+    source_types: Option<Vec<String>>,
+    conversation_id: Option<i64>,
+) -> Result<Vec<HeapItem>, ApiError> {
+    run_blocking_rag("rag_top_k_candidates", move || {
+        top_k_candidates(
+            &query,
+            embeddings.as_slice(),
+            top_k,
+            source_types.as_deref(),
+            conversation_id,
+        )
+    })
+    .await
 }
 
 fn apply_token_budget(results: Vec<RagSearchResult>, budget: i32) -> Vec<RagSearchResult> {
@@ -924,6 +960,56 @@ fn cached_embedding_from_inserted(
     }
 }
 
+async fn ensure_pre_embedding_limits_blocking(
+    state: &AppState,
+    user: &User,
+    limits: RagLimits,
+) -> Result<(), ApiError> {
+    let db = state.db.clone();
+    let user = user.clone();
+
+    run_blocking_rag("rag_pre_embedding_limits", move || {
+        let mut conn = db
+            .get_pool()
+            .get()
+            .map_err(|_| ApiError::InternalServerError)?;
+        ensure_pre_embedding_limits(&mut conn, &user, limits)?;
+        Ok(())
+    })
+    .await
+}
+
+async fn insert_embedding_row_with_limits(
+    state: &AppState,
+    user: &User,
+    new_embedding: NewUserEmbedding,
+    projected_new_bytes: i64,
+    limits: RagLimits,
+    task_name: &'static str,
+) -> Result<crate::models::user_embeddings::UserEmbedding, ApiError> {
+    let db = state.db.clone();
+    let user = user.clone();
+
+    run_blocking_rag(task_name, move || {
+        let mut conn = db
+            .get_pool()
+            .get()
+            .map_err(|_| ApiError::InternalServerError)?;
+        ensure_storage_limits(&mut conn, &user, projected_new_bytes, limits)?;
+
+        new_embedding.insert(&mut conn).map_err(|e| {
+            error!(
+                target: "rag",
+                task = task_name,
+                error = ?e,
+                "Failed to insert RAG embedding"
+            );
+            ApiError::InternalServerError
+        })
+    })
+    .await
+}
+
 pub async fn insert_archival_embedding(
     state: &Arc<AppState>,
     user: &User,
@@ -938,14 +1024,7 @@ pub async fn insert_archival_embedding(
     }
     let limits = RagLimits::from_env();
     validate_text_size(text, limits.max_insert_text_bytes, "insert")?;
-    {
-        let mut conn = state
-            .db
-            .get_pool()
-            .get()
-            .map_err(|_| ApiError::InternalServerError)?;
-        ensure_pre_embedding_limits(&mut conn, user, limits)?;
-    }
+    ensure_pre_embedding_limits_blocking(state, user, limits).await?;
 
     let user_id = user.uuid;
     let (vector, token_count) = embed_text_via_tinfoil(state, user, auth_method, text).await?;
@@ -966,14 +1045,7 @@ pub async fn insert_archival_embedding(
     let projected_new_bytes =
         encrypted_embedding_bytes(&vector_enc, &content_enc, metadata_enc.as_ref());
 
-    let mut conn = state
-        .db
-        .get_pool()
-        .get()
-        .map_err(|_| ApiError::InternalServerError)?;
-    ensure_storage_limits(&mut conn, user, projected_new_bytes, limits)?;
-
-    let inserted = NewUserEmbedding {
+    let new_embedding = NewUserEmbedding {
         uuid: Uuid::new_v4(),
         user_id,
         source_type: SOURCE_TYPE_ARCHIVAL.to_string(),
@@ -987,12 +1059,16 @@ pub async fn insert_archival_embedding(
         metadata_enc,
         tags_enc,
         token_count,
-    }
-    .insert(&mut conn)
-    .map_err(|e| {
-        error!("Failed to insert archival embedding: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    };
+    let inserted = insert_embedding_row_with_limits(
+        state,
+        user,
+        new_embedding,
+        projected_new_bytes,
+        limits,
+        "rag_insert_archival_embedding",
+    )
+    .await?;
 
     let cached = cached_embedding_from_inserted(&inserted, vector);
     let append_result = state.rag_cache.lock().await.append(user_id, cached);
@@ -1025,14 +1101,7 @@ pub async fn insert_message_embedding(
     }
     let limits = RagLimits::from_env();
     validate_text_size(text, limits.max_insert_text_bytes, "insert")?;
-    {
-        let mut conn = state
-            .db
-            .get_pool()
-            .get()
-            .map_err(|_| ApiError::InternalServerError)?;
-        ensure_pre_embedding_limits(&mut conn, user, limits)?;
-    }
+    ensure_pre_embedding_limits_blocking(state, user, limits).await?;
 
     let (vector, token_count) = embed_text_via_tinfoil(state, user, auth_method, text).await?;
 
@@ -1041,14 +1110,7 @@ pub async fn insert_message_embedding(
     let content_enc = encrypt_with_key(user_key, text.as_bytes()).await;
     let projected_new_bytes = encrypted_embedding_bytes(&vector_enc, &content_enc, None);
 
-    let mut conn = state
-        .db
-        .get_pool()
-        .get()
-        .map_err(|_| ApiError::InternalServerError)?;
-    ensure_storage_limits(&mut conn, user, projected_new_bytes, limits)?;
-
-    let inserted = NewUserEmbedding {
+    let new_embedding = NewUserEmbedding {
         uuid: Uuid::new_v4(),
         user_id,
         source_type: SOURCE_TYPE_MESSAGE.to_string(),
@@ -1062,12 +1124,16 @@ pub async fn insert_message_embedding(
         metadata_enc: None,
         tags_enc: Vec::new(),
         token_count,
-    }
-    .insert(&mut conn)
-    .map_err(|e| {
-        error!("Failed to insert message embedding: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    };
+    let inserted = insert_embedding_row_with_limits(
+        state,
+        user,
+        new_embedding,
+        projected_new_bytes,
+        limits,
+        "rag_insert_message_embedding",
+    )
+    .await?;
 
     let cached = cached_embedding_from_inserted(&inserted, vector);
     let append_result = state.rag_cache.lock().await.append(user_id, cached);
@@ -1107,6 +1173,35 @@ impl LoadFilters<'_> {
             && self.begin_date.is_none()
             && self.end_date.is_none()
     }
+
+    fn to_owned_filters(self) -> OwnedLoadFilters {
+        OwnedLoadFilters {
+            source_types: self.source_types.map(|source_types| source_types.to_vec()),
+            conversation_id: self.conversation_id,
+            tags_enc_filter: self.tags_enc_filter.map(|tags| tags.to_vec()),
+            begin_date: self.begin_date,
+            end_date: self.end_date,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OwnedLoadFilters {
+    source_types: Option<Vec<String>>,
+    conversation_id: Option<i64>,
+    tags_enc_filter: Option<Vec<Option<String>>>,
+    begin_date: Option<DateTime<Utc>>,
+    end_date: Option<DateTime<Utc>>,
+}
+
+impl OwnedLoadFilters {
+    fn is_cacheable_broad_load(&self) -> bool {
+        self.source_types.is_none()
+            && self.conversation_id.is_none()
+            && self.tags_enc_filter.is_none()
+            && self.begin_date.is_none()
+            && self.end_date.is_none()
+    }
 }
 
 #[derive(Queryable)]
@@ -1129,28 +1224,43 @@ async fn load_user_embeddings_for_search(
     filters: LoadFilters<'_>,
     scan_limit: i64,
 ) -> Result<LoadedEmbeddings, ApiError> {
-    let mut conn = state
-        .db
+    let db = state.db.clone();
+    let user_key = *user_key;
+    let filters = filters.to_owned_filters();
+
+    run_blocking_rag("rag_load_user_embeddings_for_search", move || {
+        load_user_embeddings_for_search_blocking(db, user_id, &user_key, filters, scan_limit)
+    })
+    .await
+}
+
+fn load_user_embeddings_for_search_blocking(
+    db: Arc<dyn crate::db::DBConnection + Send + Sync>,
+    user_id: Uuid,
+    user_key: &SecretKey,
+    filters: OwnedLoadFilters,
+    scan_limit: i64,
+) -> Result<LoadedEmbeddings, ApiError> {
+    let mut conn = db
         .get_pool()
         .get()
         .map_err(|_| ApiError::InternalServerError)?;
-
     let started_at = Instant::now();
     let mut query = user_embeddings::table
         .filter(user_embeddings::user_id.eq(user_id))
         .filter(user_embeddings::embedding_model.eq(DEFAULT_EMBEDDING_MODEL))
         .into_boxed();
 
-    if let Some(source_types) = filters.source_types {
-        query = query.filter(user_embeddings::source_type.eq_any(source_types));
+    if let Some(source_types) = filters.source_types.as_ref() {
+        query = query.filter(user_embeddings::source_type.eq_any(source_types.as_slice()));
     }
 
     if let Some(conversation_id) = filters.conversation_id {
         query = query.filter(user_embeddings::conversation_id.eq(Some(conversation_id)));
     }
 
-    if let Some(tags_enc_filter) = filters.tags_enc_filter {
-        query = query.filter(user_embeddings::tags_enc.overlaps_with(tags_enc_filter.to_vec()));
+    if let Some(tags_enc_filter) = filters.tags_enc_filter.as_ref() {
+        query = query.filter(user_embeddings::tags_enc.overlaps_with(tags_enc_filter.clone()));
     }
 
     if let Some(begin_date) = filters.begin_date {
@@ -1460,9 +1570,24 @@ async fn fetch_ranked_content(
         return Ok((Vec::new(), 0));
     }
 
+    let db = state.db.clone();
+    let user_key = *user_key;
+
+    run_blocking_rag("rag_fetch_ranked_content", move || {
+        fetch_ranked_content_blocking(db, user_id, &user_key, candidates, limit)
+    })
+    .await
+}
+
+fn fetch_ranked_content_blocking(
+    db: Arc<dyn crate::db::DBConnection + Send + Sync>,
+    user_id: Uuid,
+    user_key: &SecretKey,
+    candidates: Vec<HeapItem>,
+    limit: usize,
+) -> Result<(Vec<RagSearchResult>, usize), ApiError> {
     let ids: Vec<i64> = candidates.iter().map(|candidate| candidate.id).collect();
-    let mut conn = state
-        .db
+    let mut conn = db
         .get_pool()
         .get()
         .map_err(|_| ApiError::InternalServerError)?;
@@ -1596,13 +1721,14 @@ pub async fn search_user_embeddings_with_options(
     };
 
     let score_started_at = Instant::now();
-    let candidates = top_k_candidates(
-        &query_vec,
-        &loaded.embeddings,
+    let candidates = top_k_candidates_blocking(
+        query_vec,
+        loaded.embeddings.clone(),
         candidate_limit,
-        options.filters.source_types.as_deref(),
+        options.filters.source_types.clone(),
         options.filters.conversation_id,
-    )?;
+    )
+    .await?;
 
     let score_ms = score_started_at.elapsed().as_millis() as u64;
     let content_started_at = Instant::now();
@@ -1679,21 +1805,25 @@ pub async fn search_user_embeddings(
 }
 
 pub async fn delete_all_user_embeddings(state: &AppState, user_id: Uuid) -> Result<(), ApiError> {
-    let mut conn = state
-        .db
-        .get_pool()
-        .get()
-        .map_err(|_| ApiError::InternalServerError)?;
+    let db = state.db.clone();
+    run_blocking_rag("rag_delete_all_user_embeddings", move || {
+        let mut conn = db
+            .get_pool()
+            .get()
+            .map_err(|_| ApiError::InternalServerError)?;
 
-    diesel::delete(user_embeddings::table.filter(user_embeddings::user_id.eq(user_id)))
-        .execute(&mut conn)
-        .map_err(|e| {
-            error!(
-                "Failed to delete all embeddings for user={}: {:?}",
-                user_id, e
-            );
-            ApiError::InternalServerError
-        })?;
+        diesel::delete(user_embeddings::table.filter(user_embeddings::user_id.eq(user_id)))
+            .execute(&mut conn)
+            .map_err(|e| {
+                error!(
+                    "Failed to delete all embeddings for user={}: {:?}",
+                    user_id, e
+                );
+                ApiError::InternalServerError
+            })?;
+        Ok(())
+    })
+    .await?;
 
     state.rag_cache.lock().await.evict_user(user_id);
     Ok(())
@@ -1704,25 +1834,28 @@ pub async fn delete_user_embedding_by_uuid(
     user_id: Uuid,
     embedding_uuid: Uuid,
 ) -> Result<(), ApiError> {
-    let mut conn = state
-        .db
-        .get_pool()
-        .get()
-        .map_err(|_| ApiError::InternalServerError)?;
+    let db = state.db.clone();
+    let affected = run_blocking_rag("rag_delete_user_embedding_by_uuid", move || {
+        let mut conn = db
+            .get_pool()
+            .get()
+            .map_err(|_| ApiError::InternalServerError)?;
 
-    let affected = diesel::delete(
-        user_embeddings::table
-            .filter(user_embeddings::user_id.eq(user_id))
-            .filter(user_embeddings::uuid.eq(embedding_uuid)),
-    )
-    .execute(&mut conn)
-    .map_err(|e| {
-        error!(
-            "Failed to delete embedding user={} uuid={}: {:?}",
-            user_id, embedding_uuid, e
-        );
-        ApiError::InternalServerError
-    })?;
+        diesel::delete(
+            user_embeddings::table
+                .filter(user_embeddings::user_id.eq(user_id))
+                .filter(user_embeddings::uuid.eq(embedding_uuid)),
+        )
+        .execute(&mut conn)
+        .map_err(|e| {
+            error!(
+                "Failed to delete embedding user={} uuid={}: {:?}",
+                user_id, embedding_uuid, e
+            );
+            ApiError::InternalServerError
+        })
+    })
+    .await?;
 
     if affected == 0 {
         return Err(ApiError::NotFound);
@@ -1740,62 +1873,65 @@ pub async fn embeddings_status(
     state: &AppState,
     user_id: Uuid,
 ) -> Result<RagEmbeddingsStatus, ApiError> {
-    use diesel::dsl::count_star;
+    let db = state.db.clone();
+    run_blocking_rag("rag_embeddings_status", move || {
+        use diesel::dsl::count_star;
 
-    let mut conn = state
-        .db
-        .get_pool()
-        .get()
-        .map_err(|_| ApiError::InternalServerError)?;
+        let mut conn = db
+            .get_pool()
+            .get()
+            .map_err(|_| ApiError::InternalServerError)?;
 
-    let total_embeddings: i64 = user_embeddings::table
-        .filter(user_embeddings::user_id.eq(user_id))
-        .select(count_star())
-        .first(&mut conn)
-        .map_err(|e| {
-            error!(
-                "Failed to count embeddings for user={} (total): {:?}",
-                user_id, e
-            );
-            ApiError::InternalServerError
-        })?;
+        let total_embeddings: i64 = user_embeddings::table
+            .filter(user_embeddings::user_id.eq(user_id))
+            .select(count_star())
+            .first(&mut conn)
+            .map_err(|e| {
+                error!(
+                    "Failed to count embeddings for user={} (total): {:?}",
+                    user_id, e
+                );
+                ApiError::InternalServerError
+            })?;
 
-    let grouped: Vec<(String, i64)> = user_embeddings::table
-        .filter(user_embeddings::user_id.eq(user_id))
-        .group_by(user_embeddings::embedding_model)
-        .select((user_embeddings::embedding_model, count_star()))
-        .load(&mut conn)
-        .map_err(|e| {
-            error!(
-                "Failed to group embeddings by model for user={}: {:?}",
-                user_id, e
-            );
-            ApiError::InternalServerError
-        })?;
+        let grouped: Vec<(String, i64)> = user_embeddings::table
+            .filter(user_embeddings::user_id.eq(user_id))
+            .group_by(user_embeddings::embedding_model)
+            .select((user_embeddings::embedding_model, count_star()))
+            .load(&mut conn)
+            .map_err(|e| {
+                error!(
+                    "Failed to group embeddings by model for user={}: {:?}",
+                    user_id, e
+                );
+                ApiError::InternalServerError
+            })?;
 
-    let mut by_model: HashMap<String, i64> = HashMap::new();
-    for (model, count) in grouped {
-        by_model.insert(model, count);
-    }
+        let mut by_model: HashMap<String, i64> = HashMap::new();
+        for (model, count) in grouped {
+            by_model.insert(model, count);
+        }
 
-    let stale_count: i64 = user_embeddings::table
-        .filter(user_embeddings::user_id.eq(user_id))
-        .filter(user_embeddings::embedding_model.ne(DEFAULT_EMBEDDING_MODEL))
-        .select(count_star())
-        .first(&mut conn)
-        .map_err(|e| {
-            error!(
-                "Failed to count stale embeddings for user={}: {:?}",
-                user_id, e
-            );
-            ApiError::InternalServerError
-        })?;
+        let stale_count: i64 = user_embeddings::table
+            .filter(user_embeddings::user_id.eq(user_id))
+            .filter(user_embeddings::embedding_model.ne(DEFAULT_EMBEDDING_MODEL))
+            .select(count_star())
+            .first(&mut conn)
+            .map_err(|e| {
+                error!(
+                    "Failed to count stale embeddings for user={}: {:?}",
+                    user_id, e
+                );
+                ApiError::InternalServerError
+            })?;
 
-    Ok(RagEmbeddingsStatus {
-        total_embeddings,
-        by_model,
-        stale_count,
+        Ok(RagEmbeddingsStatus {
+            total_embeddings,
+            by_model,
+            stale_count,
+        })
     })
+    .await
 }
 
 #[cfg(test)]

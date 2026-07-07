@@ -391,7 +391,7 @@ fn stable_account_bucket(account_uuid: Uuid) -> u8 {
 
 fn proxy_for_provider(proxy_router: &ProxyRouter, provider: ProviderName) -> Option<ProxyConfig> {
     match provider {
-        ProviderName::Tinfoil => proxy_router.get_tinfoil_proxy(),
+        ProviderName::Tinfoil => Some(proxy_router.get_tinfoil_proxy()),
         ProviderName::Continuum => {
             let proxy = proxy_router.get_default_proxy();
             (proxy.provider_name == ProviderName::Continuum.as_str()).then_some(proxy)
@@ -407,7 +407,7 @@ mod tests {
         ProxyRouter::new(
             "http://continuum.example.com".to_string(),
             None,
-            Some("http://tinfoil.example.com".to_string()),
+            "http://tinfoil.example.com".to_string(),
         )
     }
 
@@ -555,7 +555,7 @@ mod tests {
         let proxy_router = ProxyRouter::new(
             "http://continuum.example.com".to_string(),
             None,
-            Some("http://tinfoil.example.com".to_string()),
+            "http://tinfoil.example.com".to_string(),
         );
 
         let selected = router
@@ -576,7 +576,7 @@ mod tests {
         let tinfoil_only = ProxyRouter::new(
             "https://api.openai.com".to_string(),
             None,
-            Some("http://tinfoil.example.com".to_string()),
+            "http://tinfoil.example.com".to_string(),
         );
         let selected = router
             .select_completion_route_with_preference(
@@ -593,18 +593,25 @@ mod tests {
     }
 
     #[test]
-    fn test_kimi_uses_only_eligible_provider_when_other_proxy_is_missing() {
+    fn test_kimi_uses_tinfoil_when_continuum_proxy_is_missing() {
         let router = ProviderRouter::default();
-        let proxy_router = ProxyRouter::new("http://continuum.example.com".to_string(), None, None);
+        let proxy_router = ProxyRouter::new(
+            "https://api.openai.com".to_string(),
+            None,
+            "http://tinfoil.example.com".to_string(),
+        );
 
         let selected = router
             .select_completion_route(&proxy_router, uuid_for_bucket(1), "kimi-k2-6")
             .expect("route");
 
-        assert_eq!(selected.proxy.provider_name, "continuum");
-        assert_eq!(selected.provider_model_id, "kimi-k2.6");
-        assert_eq!(selected.bucket, Some(1));
-        assert_eq!(selected.selection_source, ProviderSelectionSource::Fallback);
+        assert_eq!(selected.proxy.provider_name, "tinfoil");
+        assert_eq!(selected.provider_model_id, "kimi-k2-6");
+        assert_eq!(selected.bucket, None);
+        assert_eq!(
+            selected.selection_source,
+            ProviderSelectionSource::DefaultProvider
+        );
     }
 
     #[test]
@@ -624,9 +631,13 @@ mod tests {
     }
 
     #[test]
-    fn test_non_tinfoil_fallback_resolves_known_alias_before_provider_request() {
+    fn test_tinfoil_fallback_resolves_known_alias_before_provider_request() {
         let router = ProviderRouter::default();
-        let proxy_router = ProxyRouter::new("http://continuum.example.com".to_string(), None, None);
+        let proxy_router = ProxyRouter::new(
+            "http://continuum.example.com".to_string(),
+            None,
+            "http://tinfoil.example.com".to_string(),
+        );
 
         let selected = router
             .select_completion_route(
@@ -636,7 +647,7 @@ mod tests {
             )
             .expect("route");
 
-        assert_eq!(selected.proxy.provider_name, "continuum");
+        assert_eq!(selected.proxy.provider_name, "tinfoil");
         assert_eq!(
             selected.public_model_id,
             crate::model_config::QUICK_MODEL_ID
@@ -653,19 +664,22 @@ mod tests {
     }
 
     #[test]
-    fn test_non_tinfoil_fallback_preserves_unknown_model_passthrough() {
+    fn test_tinfoil_fallback_rejects_unknown_model_passthrough() {
         let router = ProviderRouter::default();
-        let proxy_router = ProxyRouter::new("http://continuum.example.com".to_string(), None, None);
+        let proxy_router = ProxyRouter::new(
+            "http://continuum.example.com".to_string(),
+            None,
+            "http://tinfoil.example.com".to_string(),
+        );
 
-        let selected = router
+        let error = router
             .select_completion_route(&proxy_router, uuid_for_bucket(50), "provider-native-model")
-            .expect("route");
+            .expect_err("unsupported model");
 
-        assert_eq!(selected.proxy.provider_name, "continuum");
-        assert_eq!(selected.public_model_id, "provider-native-model");
-        assert_eq!(selected.provider_model_id, "provider-native-model");
-        assert_eq!(selected.response_model_id, "provider-native-model");
-        assert_eq!(selected.bucket, None);
+        assert_eq!(
+            error,
+            ProviderRoutingError::UnsupportedModel("provider-native-model".to_string())
+        );
     }
 
     #[test]
@@ -684,17 +698,23 @@ mod tests {
     }
 
     #[test]
-    fn test_configured_model_errors_when_no_provider_route_is_eligible() {
+    fn test_configured_model_uses_tinfoil_when_continuum_is_missing() {
         let router = ProviderRouter::default();
-        let proxy_router = ProxyRouter::new("https://api.openai.com".to_string(), None, None);
+        let proxy_router = ProxyRouter::new(
+            "https://api.openai.com".to_string(),
+            None,
+            "http://tinfoil.example.com".to_string(),
+        );
 
-        let error = router
+        let selected = router
             .select_completion_route(&proxy_router, uuid_for_bucket(50), "kimi-k2-6")
-            .expect_err("no route");
+            .expect("route");
 
+        assert_eq!(selected.proxy.provider_name, "tinfoil");
+        assert_eq!(selected.provider_model_id, "kimi-k2-6");
         assert_eq!(
-            error,
-            ProviderRoutingError::NoEligibleRoute("kimi-k2-6".to_string())
+            selected.selection_source,
+            ProviderSelectionSource::DefaultProvider
         );
     }
 }

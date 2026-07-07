@@ -1599,15 +1599,8 @@ async fn proxy_transcription(
                 chunk.index, chunk_size
             );
 
-            let mut primary_provider = match &tinfoil_proxy {
-                Some(proxy) => proxy.clone(),
-                None => default_proxy.clone(),
-            };
-            let mut fallback_provider = if tinfoil_proxy.is_some() {
-                Some(default_proxy.clone())
-            } else {
-                None
-            };
+            let mut primary_provider = tinfoil_proxy.clone();
+            let mut fallback_provider = Some(default_proxy.clone());
 
             if chunk_size > TINFOIL_MAX_SIZE && primary_provider.provider_name == "tinfoil" {
                 info!(
@@ -1921,10 +1914,7 @@ async fn proxy_tts(
 
     // Use the tinfoil proxy configuration
     // For now, we'll hardcode to use tinfoil proxy - in future could route based on model
-    let base_url = state.proxy_router.get_tinfoil_base_url().ok_or_else(|| {
-        error!("Tinfoil proxy not configured for TTS");
-        ApiError::InternalServerError
-    })?;
+    let base_url = state.proxy_router.get_tinfoil_base_url();
 
     let proxy_config = ProxyConfig {
         base_url,
@@ -2046,10 +2036,7 @@ async fn proxy_embeddings(
         return Err(ApiError::BadRequest);
     }
 
-    let proxy_config = state
-        .proxy_router
-        .get_tinfoil_proxy()
-        .unwrap_or_else(|| state.proxy_router.get_default_proxy());
+    let proxy_config = state.proxy_router.get_tinfoil_proxy();
 
     // Create a new hyper client
     let https = HttpsConnector::new();

@@ -2,14 +2,15 @@ CREATE TABLE push_devices (
     id BIGSERIAL PRIMARY KEY,
     uuid UUID NOT NULL DEFAULT uuid_generate_v4() UNIQUE,
     user_id UUID NOT NULL REFERENCES users(uuid) ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES org_projects(id) ON DELETE CASCADE,
     installation_id UUID NOT NULL,
     platform TEXT NOT NULL CHECK (platform IN ('ios', 'android')),
     provider TEXT NOT NULL CHECK (provider IN ('apns', 'fcm')),
     environment TEXT NOT NULL CHECK (environment IN ('dev', 'prod')),
     app_id TEXT NOT NULL,
-    push_token_enc BYTEA NOT NULL,
     push_token_hash BYTEA NOT NULL,
-    notification_public_key BYTEA NOT NULL,
+    capability_enc BYTEA NOT NULL,
+    notification_public_key_hash BYTEA NOT NULL,
     key_algorithm TEXT NOT NULL CHECK (key_algorithm IN ('p256_ecdh_v1')),
     supports_encrypted_preview BOOLEAN NOT NULL DEFAULT false,
     supports_background_processing BOOLEAN NOT NULL DEFAULT false,
@@ -38,7 +39,10 @@ CREATE TABLE notification_events (
     not_before_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     expires_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    cancelled_at TIMESTAMP WITH TIME ZONE
+    cancelled_at TIMESTAMP WITH TIME ZONE,
+    source_kind TEXT NOT NULL DEFAULT 'request_continuation'
+        CHECK (source_kind IN ('request_continuation')),
+    source_request_id UUID
 );
 
 CREATE TABLE notification_deliveries (
@@ -64,6 +68,9 @@ CREATE TABLE notification_deliveries (
 
 CREATE INDEX idx_push_devices_user_active
     ON push_devices(user_id, revoked_at);
+
+CREATE INDEX idx_push_devices_project_active
+    ON push_devices(project_id, revoked_at);
 
 CREATE UNIQUE INDEX idx_push_devices_installation_active
     ON push_devices(installation_id, environment)

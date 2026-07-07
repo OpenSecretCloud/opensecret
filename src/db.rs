@@ -27,10 +27,10 @@ use crate::models::platform_password_reset::{
     NewPlatformPasswordResetRequest, PlatformPasswordResetError, PlatformPasswordResetRequest,
 };
 use crate::models::platform_users::{NewPlatformUser, PlatformUser, PlatformUserError};
-use crate::models::project_settings::OAuthSettings;
 use crate::models::project_settings::{
     EmailSettings, NewProjectSetting, ProjectSetting, ProjectSettingError, SettingCategory,
 };
+use crate::models::project_settings::{OAuthSettings, PushSettings};
 use crate::models::responses::{
     validate_conversation_project_limit, AssistantMessage, Conversation, ConversationProject,
     ConversationProjectFilter, NewAssistantMessage, NewConversation, NewConversationProject,
@@ -443,6 +443,14 @@ pub trait DBConnection {
         &self,
         project_id: i32,
         settings: OAuthSettings,
+    ) -> Result<ProjectSetting, DBError>;
+
+    fn get_project_push_settings(&self, project_id: i32) -> Result<Option<PushSettings>, DBError>;
+
+    fn update_project_push_settings(
+        &self,
+        project_id: i32,
+        settings: PushSettings,
     ) -> Result<ProjectSetting, DBError>;
 
     // Platform email verification methods
@@ -1010,10 +1018,11 @@ impl DBConnection for PostgresConnection {
         new_wrapping: NewUserSeedWrapping,
     ) -> Result<(), DBError> {
         use crate::models::schema::{
-            agent_schedule_runs, agent_schedules, agents, conversation_projects,
-            conversation_summaries, conversations, memory_blocks, notification_events,
-            password_reset_requests, push_devices, user_embeddings, user_instructions, user_kv,
-            user_oauth_connections, user_preferences, user_seed_wrappings, users,
+            agent_background_grants, agent_schedule_runs, agent_schedules, agents,
+            conversation_projects, conversation_summaries, conversations, memory_blocks,
+            notification_events, password_reset_requests, push_devices, user_embeddings,
+            user_instructions, user_kv, user_oauth_connections, user_preferences,
+            user_seed_wrappings, users,
         };
 
         debug!("Completing destructive password reset");
@@ -1061,6 +1070,10 @@ impl DBConnection for PostgresConnection {
                 .execute(conn)?;
             diesel::delete(
                 agent_schedule_runs::table.filter(agent_schedule_runs::user_id.eq(user_id)),
+            )
+            .execute(conn)?;
+            diesel::delete(
+                agent_background_grants::table.filter(agent_background_grants::user_id.eq(user_id)),
             )
             .execute(conn)?;
             diesel::delete(agent_schedules::table.filter(agent_schedules::user_id.eq(user_id)))
@@ -1875,6 +1888,36 @@ impl DBConnection for PostgresConnection {
             Ok(existing)
         } else {
             // Create new settings
+            new_settings.insert(conn).map_err(DBError::from)
+        }
+    }
+
+    fn get_project_push_settings(&self, project_id: i32) -> Result<Option<PushSettings>, DBError> {
+        debug!("Getting project push settings");
+        let settings = self.get_project_settings(project_id, SettingCategory::Push)?;
+
+        match settings {
+            Some(s) => s.get_push_settings().map(Some).map_err(DBError::from),
+            None => Ok(None),
+        }
+    }
+
+    fn update_project_push_settings(
+        &self,
+        project_id: i32,
+        settings: PushSettings,
+    ) -> Result<ProjectSetting, DBError> {
+        debug!("Updating project push settings");
+        let new_settings = NewProjectSetting::new_push_settings(project_id, settings)?;
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+
+        if let Some(mut existing) =
+            ProjectSetting::get_by_project_and_category(conn, project_id, SettingCategory::Push)?
+        {
+            existing.settings = new_settings.settings;
+            existing.update(conn)?;
+            Ok(existing)
+        } else {
             new_settings.insert(conn).map_err(DBError::from)
         }
     }

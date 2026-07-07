@@ -11,7 +11,8 @@ pub use login_routes::router as login_routes;
 
 // Re-export constants for backward compatibility
 pub use common::{
-    PROJECT_GITHUB_OAUTH_SECRET, PROJECT_GOOGLE_OAUTH_SECRET, PROJECT_RESEND_API_KEY,
+    PROJECT_APNS_AUTH_KEY_P8, PROJECT_FCM_SERVICE_ACCOUNT_JSON, PROJECT_GITHUB_OAUTH_SECRET,
+    PROJECT_GOOGLE_OAUTH_SECRET, PROJECT_RESEND_API_KEY,
 };
 
 // Export the composite router

@@ -21,7 +21,7 @@ use crate::web::openai_auth::validate_openai_auth;
 use crate::web::platform_login_routes;
 use crate::web::{
     conversation_projects_routes, conversations_routes, health_routes_with_state,
-    instructions_routes, login_routes, oauth_routes, openai_routes, protected_routes, rag_routes,
+    instructions_routes, login_routes, oauth_routes, openai_routes, protected_routes,
     responses_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
@@ -1709,6 +1709,7 @@ impl AppState {
                     encrypted_password,
                     new_wrapping,
                 )?;
+                self.rag_cache.lock().await.evict_user(user.uuid);
 
                 // Send confirmation email in the background
                 let app_state = self.clone();
@@ -2099,6 +2100,7 @@ impl AppState {
                 // Secret verification succeeded, proceed with account deletion
                 // Use the transaction-based method for atomicity
                 self.db.mark_and_delete_user(&user, &deletion_request)?;
+                self.rag_cache.lock().await.evict_user(user.uuid);
 
                 // Send confirmation email in the background if the user has an email
                 if let Some(email) = user.email.clone() {
@@ -3212,10 +3214,6 @@ async fn main() -> Result<(), Error> {
         )
         .merge(
             instructions_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
-        )
-        .merge(
-            rag_routes(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
         )
         .merge(attestation_routes::router(app_state.clone()))

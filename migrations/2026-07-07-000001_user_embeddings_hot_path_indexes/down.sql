@@ -1,0 +1,3 @@
+DROP INDEX IF EXISTS idx_user_embeddings_user_model_conversation_created_id;
+DROP INDEX IF EXISTS idx_user_embeddings_user_model_source_created_id;
+DROP INDEX IF EXISTS idx_user_embeddings_user_model_created_id;

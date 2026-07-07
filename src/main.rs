@@ -543,8 +543,8 @@ impl AppStateBuilder {
         self
     }
 
-    pub fn tinfoil_api_base(mut self, tinfoil_api_base: Option<String>) -> Self {
-        self.tinfoil_api_base = tinfoil_api_base;
+    pub fn tinfoil_api_base(mut self, tinfoil_api_base: String) -> Self {
+        self.tinfoil_api_base = Some(tinfoil_api_base);
         self
     }
 
@@ -726,10 +726,15 @@ impl AppStateBuilder {
         let apple_jwt_verifier = Arc::new(AppleJwtVerifier::new());
 
         // Initialize the ProxyRouter
+        let tinfoil_api_base = self
+            .tinfoil_api_base
+            .clone()
+            .expect("Tinfoil API base must be configured");
+
         let proxy_router = Arc::new(ProxyRouter::new(
             openai_api_base.clone(),
             self.openai_api_key.clone(),
-            self.tinfoil_api_base.clone(),
+            tinfoil_api_base,
         ));
         let provider_router = Arc::new(ProviderRouter::default());
 
@@ -3017,8 +3022,8 @@ async fn main() -> Result<(), Error> {
         None // No API key needed if not using OpenAI's domain
     };
 
-    // Tinfoil API base is always from environment (like OpenAI API base)
-    let tinfoil_api_base = env::var("TINFOIL_API_BASE").ok();
+    // Tinfoil is a hard runtime requirement for OpenSecret.
+    let tinfoil_api_base = env::var("TINFOIL_API_BASE").expect("TINFOIL_API_BASE must be set");
 
     let jwt_secret = get_or_create_jwt_secret(
         &app_mode,

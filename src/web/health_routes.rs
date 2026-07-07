@@ -64,10 +64,7 @@ pub async fn health_check_extended(
     // Try to fetch models directly from the tinfoil proxy with a timeout
     let timeout_duration = Duration::from_secs(5);
 
-    let tinfoil_proxy = state.proxy_router.get_tinfoil_proxy().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Tinfoil proxy is not configured".to_string(),
-    ))?;
+    let tinfoil_proxy = state.proxy_router.get_tinfoil_proxy();
 
     let result = timeout(
         timeout_duration,

@@ -1672,6 +1672,7 @@ mod tests {
             .enclave_key([42u8; 32].to_vec())
             .aws_credential_manager(Arc::new(RwLock::new(None)))
             .openai_api_base("http://localhost:9".to_string())
+            .tinfoil_api_base("http://localhost:9".to_string())
             .jwt_secret([24u8; 32].to_vec())
             .build()
             .await

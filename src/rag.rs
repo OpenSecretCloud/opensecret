@@ -625,7 +625,8 @@ fn top_k_candidates(
         if let Some(std::cmp::Reverse(min)) = heap.peek() {
             let ordering = score
                 .total_cmp(&min.score)
-                .then_with(|| min.token_count.cmp(&e.token_count));
+                .then_with(|| min.token_count.cmp(&e.token_count))
+                .then_with(|| min.id.cmp(&e.id));
             if ordering == Ordering::Greater {
                 heap.pop();
                 let item = HeapItem {
@@ -805,6 +806,48 @@ fn ensure_storage_limits(
     projected_new_bytes: i64,
     limits: RagLimits,
 ) -> Result<(), ApiError> {
+    let user_stats = ensure_pre_embedding_limits(conn, user, limits)?;
+    if user_stats.stored_bytes.saturating_add(projected_new_bytes) > limits.max_user_stored_bytes {
+        warn!(
+            target: "rag",
+            user_id = %user.uuid,
+            rows = user_stats.row_count,
+            stored_bytes = user_stats.stored_bytes,
+            projected_new_bytes,
+            max_rows = limits.max_user_embeddings,
+            max_bytes = limits.max_user_stored_bytes,
+            "RAG user storage limit reached"
+        );
+        return Err(ApiError::BadRequest);
+    }
+
+    let project_stats = load_project_embedding_storage_stats(conn, user.project_id)?;
+    if project_stats
+        .stored_bytes
+        .saturating_add(projected_new_bytes)
+        > limits.max_project_stored_bytes
+    {
+        warn!(
+            target: "rag",
+            project_id = user.project_id,
+            rows = project_stats.row_count,
+            stored_bytes = project_stats.stored_bytes,
+            projected_new_bytes,
+            max_rows = limits.max_project_embeddings,
+            max_bytes = limits.max_project_stored_bytes,
+            "RAG project storage limit reached"
+        );
+        return Err(ApiError::BadRequest);
+    }
+
+    Ok(())
+}
+
+fn ensure_pre_embedding_limits(
+    conn: &mut diesel::PgConnection,
+    user: &User,
+    limits: RagLimits,
+) -> Result<StorageStats, ApiError> {
     use diesel::dsl::count_star;
 
     let recent_insert_count: i64 = user_embeddings::table
@@ -832,15 +875,13 @@ fn ensure_storage_limits(
 
     let user_stats = load_user_embedding_storage_stats(conn, user.uuid)?;
     if user_stats.row_count.saturating_add(1) > limits.max_user_embeddings
-        || user_stats.stored_bytes.saturating_add(projected_new_bytes)
-            > limits.max_user_stored_bytes
+        || user_stats.stored_bytes >= limits.max_user_stored_bytes
     {
         warn!(
             target: "rag",
             user_id = %user.uuid,
             rows = user_stats.row_count,
             stored_bytes = user_stats.stored_bytes,
-            projected_new_bytes,
             max_rows = limits.max_user_embeddings,
             max_bytes = limits.max_user_stored_bytes,
             "RAG user storage limit reached"
@@ -850,17 +891,13 @@ fn ensure_storage_limits(
 
     let project_stats = load_project_embedding_storage_stats(conn, user.project_id)?;
     if project_stats.row_count.saturating_add(1) > limits.max_project_embeddings
-        || project_stats
-            .stored_bytes
-            .saturating_add(projected_new_bytes)
-            > limits.max_project_stored_bytes
+        || project_stats.stored_bytes >= limits.max_project_stored_bytes
     {
         warn!(
             target: "rag",
             project_id = user.project_id,
             rows = project_stats.row_count,
             stored_bytes = project_stats.stored_bytes,
-            projected_new_bytes,
             max_rows = limits.max_project_embeddings,
             max_bytes = limits.max_project_stored_bytes,
             "RAG project storage limit reached"
@@ -868,7 +905,7 @@ fn ensure_storage_limits(
         return Err(ApiError::BadRequest);
     }
 
-    Ok(())
+    Ok(user_stats)
 }
 
 fn cached_embedding_from_inserted(
@@ -901,6 +938,14 @@ pub async fn insert_archival_embedding(
     }
     let limits = RagLimits::from_env();
     validate_text_size(text, limits.max_insert_text_bytes, "insert")?;
+    {
+        let mut conn = state
+            .db
+            .get_pool()
+            .get()
+            .map_err(|_| ApiError::InternalServerError)?;
+        ensure_pre_embedding_limits(&mut conn, user, limits)?;
+    }
 
     let user_id = user.uuid;
     let (vector, token_count) = embed_text_via_tinfoil(state, user, auth_method, text).await?;
@@ -980,6 +1025,14 @@ pub async fn insert_message_embedding(
     }
     let limits = RagLimits::from_env();
     validate_text_size(text, limits.max_insert_text_bytes, "insert")?;
+    {
+        let mut conn = state
+            .db
+            .get_pool()
+            .get()
+            .map_err(|_| ApiError::InternalServerError)?;
+        ensure_pre_embedding_limits(&mut conn, user, limits)?;
+    }
 
     let (vector, token_count) = embed_text_via_tinfoil(state, user, auth_method, text).await?;
 
@@ -1364,23 +1417,33 @@ async fn load_cacheable_embeddings_with_coordination(
                     filters,
                     limits.scan_limit,
                 )
-                .await?;
+                .await;
 
                 let mut cache = state.rag_cache.lock().await;
-                let cached = cache.put(user_id, loaded.embeddings.clone(), loaded.scan_limit_hit);
+                if let Ok(loaded) = &loaded {
+                    let cached =
+                        cache.put(user_id, loaded.embeddings.clone(), loaded.scan_limit_hit);
+                    info!(
+                        target: "rag",
+                        user_id = %user_id,
+                        cached,
+                        loaded_rows = loaded.embeddings.len(),
+                        cache_bytes_per_user = cached_embeddings_bytes(&loaded.embeddings),
+                        total_cache_bytes = cache.total_bytes,
+                        scan_limit_hit = loaded.scan_limit_hit,
+                        reason = "timeout_duplicate",
+                        "rag_cache_store_after_load"
+                    );
+                } else {
+                    warn!(
+                        target: "rag",
+                        user_id = %user_id,
+                        reason = "timeout_duplicate",
+                        "RAG duplicate cacheable load failed"
+                    );
+                }
                 cache.finish_load(user_id);
-                info!(
-                    target: "rag",
-                    user_id = %user_id,
-                    cached,
-                    loaded_rows = loaded.embeddings.len(),
-                    cache_bytes_per_user = cached_embeddings_bytes(&loaded.embeddings),
-                    total_cache_bytes = cache.total_bytes,
-                    scan_limit_hit = loaded.scan_limit_hit,
-                    reason = "timeout_duplicate",
-                    "rag_cache_store_after_load"
-                );
-                return Ok(loaded);
+                return loaded;
             }
         }
     }
@@ -1917,6 +1980,20 @@ mod tests {
         let items = top_k_candidates(&query, &embeddings, 1, None, None).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, 2);
+    }
+
+    #[test]
+    fn top_k_tie_break_prefers_lower_id_after_score_and_tokens() {
+        let query = vec![1.0f32, 0.0];
+
+        let embeddings = vec![
+            cached_embedding(2, SOURCE_TYPE_ARCHIVAL, None, vec![1.0, 0.0], 5),
+            cached_embedding(1, SOURCE_TYPE_ARCHIVAL, None, vec![1.0, 0.0], 5),
+        ];
+
+        let items = top_k_candidates(&query, &embeddings, 1, None, None).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, 1);
     }
 
     #[test]

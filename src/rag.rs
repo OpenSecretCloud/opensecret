@@ -193,15 +193,16 @@ impl RagCache {
         self.lru.retain(|u| *u != user_id);
     }
 
-    pub fn get(&mut self, user_id: Uuid) -> Option<(Arc<Vec<CachedEmbedding>>, bool)> {
+    pub fn get(&mut self, user_id: Uuid) -> Option<(Arc<Vec<CachedEmbedding>>, bool, usize)> {
         self.evict_expired();
 
-        let (loaded_at, embeddings, scan_limit_hit) = {
+        let (loaded_at, embeddings, scan_limit_hit, bytes) = {
             let entry = self.entries.get(&user_id)?;
             (
                 entry.loaded_at,
                 entry.embeddings.clone(),
                 entry.scan_limit_hit,
+                entry.bytes,
             )
         };
 
@@ -211,7 +212,7 @@ impl RagCache {
         }
 
         self.touch(user_id);
-        Some((embeddings, scan_limit_hit))
+        Some((embeddings, scan_limit_hit, bytes))
     }
 
     pub fn put(
@@ -762,6 +763,12 @@ struct StorageStats {
     stored_bytes: i64,
 }
 
+#[derive(Debug)]
+struct StorageLimitStats {
+    user: StorageStats,
+    project: StorageStats,
+}
+
 fn encrypted_embedding_bytes(
     vector_enc: &[u8],
     content_enc: &[u8],
@@ -842,13 +849,13 @@ fn ensure_storage_limits(
     projected_new_bytes: i64,
     limits: RagLimits,
 ) -> Result<(), ApiError> {
-    let user_stats = ensure_pre_embedding_limits(conn, user, limits)?;
-    if user_stats.stored_bytes.saturating_add(projected_new_bytes) > limits.max_user_stored_bytes {
+    let stats = ensure_pre_embedding_limits(conn, user, limits)?;
+    if stats.user.stored_bytes.saturating_add(projected_new_bytes) > limits.max_user_stored_bytes {
         warn!(
             target: "rag",
             user_id = %user.uuid,
-            rows = user_stats.row_count,
-            stored_bytes = user_stats.stored_bytes,
+            rows = stats.user.row_count,
+            stored_bytes = stats.user.stored_bytes,
             projected_new_bytes,
             max_rows = limits.max_user_embeddings,
             max_bytes = limits.max_user_stored_bytes,
@@ -857,8 +864,8 @@ fn ensure_storage_limits(
         return Err(ApiError::BadRequest);
     }
 
-    let project_stats = load_project_embedding_storage_stats(conn, user.project_id)?;
-    if project_stats
+    if stats
+        .project
         .stored_bytes
         .saturating_add(projected_new_bytes)
         > limits.max_project_stored_bytes
@@ -866,8 +873,8 @@ fn ensure_storage_limits(
         warn!(
             target: "rag",
             project_id = user.project_id,
-            rows = project_stats.row_count,
-            stored_bytes = project_stats.stored_bytes,
+            rows = stats.project.row_count,
+            stored_bytes = stats.project.stored_bytes,
             projected_new_bytes,
             max_rows = limits.max_project_embeddings,
             max_bytes = limits.max_project_stored_bytes,
@@ -883,7 +890,7 @@ fn ensure_pre_embedding_limits(
     conn: &mut diesel::PgConnection,
     user: &User,
     limits: RagLimits,
-) -> Result<StorageStats, ApiError> {
+) -> Result<StorageLimitStats, ApiError> {
     use diesel::dsl::count_star;
 
     let recent_insert_count: i64 = user_embeddings::table
@@ -941,7 +948,10 @@ fn ensure_pre_embedding_limits(
         return Err(ApiError::BadRequest);
     }
 
-    Ok(user_stats)
+    Ok(StorageLimitStats {
+        user: user_stats,
+        project: project_stats,
+    })
 }
 
 fn cached_embedding_from_inserted(
@@ -1412,13 +1422,13 @@ async fn load_cacheable_embeddings_with_coordination(
     loop {
         let permit = {
             let mut cache = state.rag_cache.lock().await;
-            if let Some((embeddings, scan_limit_hit)) = cache.get(user_id) {
+            if let Some((embeddings, scan_limit_hit, cache_bytes_per_user)) = cache.get(user_id) {
                 info!(
                     target: "rag",
                     user_id = %user_id,
                     cache_hit = true,
                     loaded_rows = embeddings.len(),
-                    cache_bytes_per_user = cached_embeddings_bytes(&embeddings),
+                    cache_bytes_per_user,
                     total_cache_bytes = cache.total_bytes,
                     scan_limit_hit,
                     "rag_cache_lookup"
@@ -2213,7 +2223,7 @@ mod tests {
         assert!(cache.put(user, Arc::new(vec![first]), false));
         assert_eq!(cache.append(user, second), CacheAppendResult::Appended);
 
-        let (cached, _) = cache.get(user).unwrap();
+        let (cached, _, _) = cache.get(user).unwrap();
         assert_eq!(cached.len(), 2);
         assert_eq!(cached[1].id, 2);
     }
@@ -2245,7 +2255,7 @@ mod tests {
         assert!(cache.put(user, Arc::new(vec![first, second]), false));
         cache.remove_embedding_by_uuid(user, second_uuid);
 
-        let (cached, _) = cache.get(user).unwrap();
+        let (cached, _, _) = cache.get(user).unwrap();
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].id, 1);
     }

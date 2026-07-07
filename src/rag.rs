@@ -1738,6 +1738,13 @@ pub async fn embeddings_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        db::setup_db,
+        models::{org_projects::OrgProject, schema::org_projects, users::NewUser},
+        AppMode, AppState, AppStateBuilder,
+    };
+    use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
+    use tokio::sync::RwLock;
 
     fn cached_embedding(
         id: i64,
@@ -2028,5 +2035,245 @@ mod tests {
         let (cached, _) = cache.get(user).unwrap();
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].id, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires RAG_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+    async fn db_copied_rag_row_does_not_decrypt_under_attacker_key() {
+        let Some(database_url) = rag_test_database_url() else {
+            eprintln!("skipping: RAG_TAMPER_TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let app_state = build_rag_db_test_app_state(database_url).await;
+        let project = first_active_project(&app_state);
+        let victim = create_rag_test_user(&app_state, project.id, "victim");
+        let attacker = create_rag_test_user(&app_state, project.id, "attacker");
+        let victim_key = SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let attacker_key = SecretKey::from_slice(&[2u8; 32]).unwrap();
+
+        let victim_row =
+            insert_direct_archival_embedding(&app_state, victim.uuid, &victim_key, "victim secret")
+                .await;
+        copy_embedding_ciphertext_to_user(&app_state, &victim_row, attacker.uuid);
+
+        let victim_loaded =
+            load_direct_test_embeddings(&app_state, victim.uuid, &victim_key, 25).await;
+        assert_eq!(victim_loaded.embeddings.len(), 1);
+        assert_eq!(victim_loaded.skipped_rows, 0);
+
+        let attacker_loaded =
+            load_direct_test_embeddings(&app_state, attacker.uuid, &attacker_key, 25).await;
+        assert_eq!(attacker_loaded.scanned_rows, 1);
+        assert_eq!(attacker_loaded.embeddings.len(), 0);
+        assert_eq!(attacker_loaded.skipped_rows, 1);
+
+        let _ = app_state.db.delete_user(&victim);
+        let _ = app_state.db.delete_user(&attacker);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires RAG_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+    async fn db_corrupt_rag_vector_skips_row_without_failing_search_load() {
+        let Some(database_url) = rag_test_database_url() else {
+            eprintln!("skipping: RAG_TAMPER_TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let app_state = build_rag_db_test_app_state(database_url).await;
+        let project = first_active_project(&app_state);
+        let user = create_rag_test_user(&app_state, project.id, "corrupt-vector");
+        let key = SecretKey::from_slice(&[3u8; 32]).unwrap();
+
+        insert_direct_archival_embedding_with_ciphertext(
+            &app_state,
+            user.uuid,
+            vec![1, 2, 3],
+            encrypt_with_key(&key, b"still encrypted").await,
+        );
+
+        let loaded = load_direct_test_embeddings(&app_state, user.uuid, &key, 25).await;
+        assert_eq!(loaded.scanned_rows, 1);
+        assert_eq!(loaded.embeddings.len(), 0);
+        assert_eq!(loaded.skipped_rows, 1);
+
+        let _ = app_state.db.delete_user(&user);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires RAG_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+    async fn db_corrupt_top_candidate_content_is_skipped_and_next_candidate_fills() {
+        let Some(database_url) = rag_test_database_url() else {
+            eprintln!("skipping: RAG_TAMPER_TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let app_state = build_rag_db_test_app_state(database_url).await;
+        let project = first_active_project(&app_state);
+        let user = create_rag_test_user(&app_state, project.id, "corrupt-content");
+        let key = SecretKey::from_slice(&[4u8; 32]).unwrap();
+
+        let bad_content = insert_direct_archival_embedding_with_ciphertext(
+            &app_state,
+            user.uuid,
+            encrypt_with_key(&key, &serialize_f32_le(&[1.0, 0.0])).await,
+            vec![9, 9, 9],
+        );
+        let good_content =
+            insert_direct_archival_embedding(&app_state, user.uuid, &key, "recoverable memory")
+                .await;
+
+        let candidates = vec![
+            HeapItem {
+                id: bad_content.id,
+                uuid: bad_content.uuid,
+                score: 1.0,
+                token_count: 1,
+            },
+            HeapItem {
+                id: good_content.id,
+                uuid: good_content.uuid,
+                score: 0.9,
+                token_count: 1,
+            },
+        ];
+
+        let (results, skipped_rows) =
+            fetch_ranked_content(&app_state, user.uuid, &key, candidates, 1)
+                .await
+                .unwrap();
+        assert_eq!(skipped_rows, 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].content, "recoverable memory");
+
+        let _ = app_state.db.delete_user(&user);
+    }
+
+    fn rag_test_database_url() -> Option<String> {
+        std::env::var("RAG_TAMPER_TEST_DATABASE_URL")
+            .ok()
+            .or_else(|| std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok())
+    }
+
+    async fn build_rag_db_test_app_state(database_url: String) -> AppState {
+        let db = setup_db(database_url);
+        AppStateBuilder::default()
+            .app_mode(AppMode::Local)
+            .db(db)
+            .enclave_key([42u8; 32].to_vec())
+            .aws_credential_manager(Arc::new(RwLock::new(None)))
+            .openai_api_base("http://localhost:9".to_string())
+            .tinfoil_api_base("http://localhost:9".to_string())
+            .jwt_secret([24u8; 32].to_vec())
+            .build()
+            .await
+            .expect("local RAG test app state should build")
+    }
+
+    fn first_active_project(app_state: &AppState) -> OrgProject {
+        let conn = &mut app_state
+            .db
+            .get_pool()
+            .get()
+            .expect("test database connection should be available");
+
+        org_projects::table
+            .filter(org_projects::status.eq("active"))
+            .order(org_projects::id.asc())
+            .first::<OrgProject>(conn)
+            .expect("test database should contain at least one active project")
+    }
+
+    fn create_rag_test_user(app_state: &AppState, project_id: i32, label: &str) -> User {
+        let marker = Uuid::new_v4();
+        app_state
+            .db
+            .create_user(NewUser::new(
+                Some(format!("rag-{label}-{marker}@example.com")),
+                None,
+                project_id,
+            ))
+            .expect("RAG test user should insert")
+    }
+
+    async fn insert_direct_archival_embedding(
+        app_state: &AppState,
+        user_id: Uuid,
+        user_key: &SecretKey,
+        content: &str,
+    ) -> crate::models::user_embeddings::UserEmbedding {
+        insert_direct_archival_embedding_with_ciphertext(
+            app_state,
+            user_id,
+            encrypt_with_key(user_key, &serialize_f32_le(&[1.0, 0.0])).await,
+            encrypt_with_key(user_key, content.as_bytes()).await,
+        )
+    }
+
+    fn insert_direct_archival_embedding_with_ciphertext(
+        app_state: &AppState,
+        user_id: Uuid,
+        vector_enc: Vec<u8>,
+        content_enc: Vec<u8>,
+    ) -> crate::models::user_embeddings::UserEmbedding {
+        let conn = &mut app_state
+            .db
+            .get_pool()
+            .get()
+            .expect("test database connection should be available");
+
+        NewUserEmbedding {
+            uuid: Uuid::new_v4(),
+            user_id,
+            source_type: SOURCE_TYPE_ARCHIVAL.to_string(),
+            user_message_id: None,
+            assistant_message_id: None,
+            conversation_id: None,
+            vector_enc,
+            embedding_model: DEFAULT_EMBEDDING_MODEL.to_string(),
+            vector_dim: 2,
+            content_enc,
+            metadata_enc: None,
+            tags_enc: Vec::new(),
+            token_count: 1,
+        }
+        .insert(conn)
+        .expect("direct RAG embedding should insert")
+    }
+
+    fn copy_embedding_ciphertext_to_user(
+        app_state: &AppState,
+        source: &crate::models::user_embeddings::UserEmbedding,
+        target_user_id: Uuid,
+    ) -> crate::models::user_embeddings::UserEmbedding {
+        insert_direct_archival_embedding_with_ciphertext(
+            app_state,
+            target_user_id,
+            source.vector_enc.clone(),
+            source.content_enc.clone(),
+        )
+    }
+
+    async fn load_direct_test_embeddings(
+        app_state: &AppState,
+        user_id: Uuid,
+        user_key: &SecretKey,
+        scan_limit: i64,
+    ) -> LoadedEmbeddings {
+        load_user_embeddings_for_search(
+            app_state,
+            user_id,
+            user_key,
+            LoadFilters {
+                source_types: None,
+                conversation_id: None,
+                tags_enc_filter: None,
+                begin_date: None,
+                end_date: None,
+            },
+            scan_limit,
+        )
+        .await
+        .expect("direct RAG load should not hard-fail on row-local corruption")
     }
 }

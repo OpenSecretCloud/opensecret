@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 // Maximum audio file size (100MB) - sanity check, CF already limits to 50MB
@@ -481,6 +481,112 @@ pub struct CompletionUsage {
     pub cached_prompt_tokens: Option<i32>,
 }
 
+#[derive(Debug, Default)]
+struct CompletionUsageObservation {
+    prompt_tokens: Option<i32>,
+    completion_tokens: Option<i32>,
+    cached_prompt_tokens: Option<i32>,
+}
+
+impl CompletionUsageObservation {
+    fn is_empty(&self) -> bool {
+        self.prompt_tokens.is_none()
+            && self.completion_tokens.is_none()
+            && self.cached_prompt_tokens.is_none()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamUsageFinalization {
+    ProviderDone,
+    EndOfStream,
+    TransportError,
+    Timeout,
+    ConsumerDropped,
+    InvalidData,
+}
+
+impl StreamUsageFinalization {
+    fn is_provider_done(self) -> bool {
+        self == Self::ProviderDone
+    }
+}
+
+#[derive(Debug, Default)]
+struct StreamUsageAccumulator {
+    latest_usage: Option<CompletionUsage>,
+    saw_terminal_signal: bool,
+    finalized: bool,
+}
+
+impl StreamUsageAccumulator {
+    fn observe(&mut self, json: &Value) {
+        self.saw_terminal_signal |= has_terminal_stream_signal(json);
+
+        let Some(observed) = extract_usage_observation(json) else {
+            return;
+        };
+        if observed.is_empty() {
+            return;
+        }
+
+        if let Some(previous) = &self.latest_usage {
+            if observed
+                .prompt_tokens
+                .is_some_and(|tokens| tokens < previous.prompt_tokens)
+                || observed
+                    .completion_tokens
+                    .is_some_and(|tokens| tokens < previous.completion_tokens)
+            {
+                warn!(
+                    "Streaming usage totals regressed: previous_prompt_tokens={}, previous_completion_tokens={}, observed_prompt_tokens={:?}, observed_completion_tokens={:?}; using the latest explicit provider values",
+                    previous.prompt_tokens,
+                    previous.completion_tokens,
+                    observed.prompt_tokens,
+                    observed.completion_tokens
+                );
+            }
+        }
+
+        self.latest_usage = Some(CompletionUsage {
+            prompt_tokens: observed
+                .prompt_tokens
+                .or_else(|| self.latest_usage.as_ref().map(|usage| usage.prompt_tokens))
+                .unwrap_or(0),
+            completion_tokens: observed
+                .completion_tokens
+                .or_else(|| {
+                    self.latest_usage
+                        .as_ref()
+                        .map(|usage| usage.completion_tokens)
+                })
+                .unwrap_or(0),
+            cached_prompt_tokens: observed.cached_prompt_tokens.or_else(|| {
+                self.latest_usage
+                    .as_ref()
+                    .and_then(|usage| usage.cached_prompt_tokens)
+            }),
+        });
+    }
+
+    fn take_final_usage(
+        &mut self,
+        finalization: StreamUsageFinalization,
+    ) -> Option<CompletionUsage> {
+        let can_finalize = finalization.is_provider_done() || self.saw_terminal_signal;
+        if self.finalized || !can_finalize {
+            return None;
+        }
+
+        self.finalized = true;
+        let mut usage = self.latest_usage.take()?;
+        usage.cached_prompt_tokens = usage
+            .cached_prompt_tokens
+            .map(|cached| cached.min(usage.prompt_tokens));
+        (usage.prompt_tokens > 0 || usage.completion_tokens > 0).then_some(usage)
+    }
+}
+
 /// A chunk from the completion stream
 #[derive(Clone, Debug)]
 pub enum CompletionChunk {
@@ -510,6 +616,33 @@ pub struct CompletionStream {
     pub stream: mpsc::Receiver<CompletionChunk>,
     /// Metadata about the completion
     pub metadata: CompletionMetadata,
+}
+
+async fn finalize_stream_usage(
+    accumulator: &mut StreamUsageAccumulator,
+    finalization: StreamUsageFinalization,
+    state: &Arc<AppState>,
+    user: &User,
+    billing_context: &BillingContext,
+    provider: &str,
+    tx_consumer: &mpsc::Sender<CompletionChunk>,
+) {
+    let Some(usage) = accumulator.take_final_usage(finalization) else {
+        return;
+    };
+
+    if !finalization.is_provider_done() {
+        warn!(
+            "Finalizing streaming usage from terminal fallback: trigger={:?}, provider={}, model={}",
+            finalization, provider, billing_context.model_name
+        );
+    }
+
+    publish_usage_event_internal(state, user, billing_context, usage.clone(), provider).await;
+
+    // Billing is independent from the consumer. If it has gone away after a
+    // terminal provider signal, the usage event must still be emitted once.
+    let _ = tx_consumer.send(CompletionChunk::Usage(usage)).await;
 }
 
 pub fn router(app_state: Arc<AppState>) -> Router<()> {
@@ -911,7 +1044,7 @@ pub async fn get_chat_completion_response(
     tokio::spawn(async move {
         let mut body_stream = res.into_body().into_stream();
         let mut buffer = String::new();
-        let mut usage_sent = false; // Track if we've already published usage for this stream
+        let mut usage_accumulator = StreamUsageAccumulator::default();
 
         loop {
             match timeout(
@@ -929,51 +1062,27 @@ pub async fn get_chat_completion_response(
                             // Parse SSE frames
                             while let Some(frame) = extract_sse_frame(&mut buffer) {
                                 if frame == "[DONE]" {
-                                    if tx_consumer.send(CompletionChunk::Done).await.is_err() {
-                                        // Receiver dropped, stop processing
-                                        return;
-                                    }
+                                    finalize_stream_usage(
+                                        &mut usage_accumulator,
+                                        StreamUsageFinalization::ProviderDone,
+                                        &state_clone,
+                                        &user_clone,
+                                        &billing_ctx,
+                                        &provider,
+                                        &tx_consumer,
+                                    )
+                                    .await;
+                                    let _ = tx_consumer.send(CompletionChunk::Done).await;
                                     return;
                                 }
 
                                 match serde_json::from_str::<Value>(&frame) {
                                     Ok(mut json) => {
-                                        // ✅ Extract and publish billing HERE - but ONLY on final chunk
-                                        // This prevents sending usage data on intermediate chunks that vLLM now includes
-                                        let is_terminal = is_terminal_stream_chunk(&json);
-
-                                        if let Some(usage) = extract_usage(&json) {
-                                            // Only publish usage on the terminal chunk with actual completion tokens
-                                            // Also ensure we only send usage once per stream
-                                            if is_terminal
-                                                && usage.completion_tokens > 0
-                                                && !usage_sent
-                                            {
-                                                publish_usage_event_internal(
-                                                    &state_clone,
-                                                    &user_clone,
-                                                    &billing_ctx,
-                                                    usage.clone(),
-                                                    &provider,
-                                                )
-                                                .await;
-                                                usage_sent = true;
-
-                                                // Also send usage to consumer
-                                                if tx_consumer
-                                                    .send(CompletionChunk::Usage(usage))
-                                                    .await
-                                                    .is_err()
-                                                {
-                                                    return;
-                                                }
-                                            } else {
-                                                trace!(
-                                                    "Skipping usage publish: is_terminal={}, completion_tokens={}, usage_sent={}",
-                                                    is_terminal, usage.completion_tokens, usage_sent
-                                                );
-                                            }
-                                        }
+                                        // vLLM can report cumulative usage on every delta, while
+                                        // providers may add cache details after finish_reason.
+                                        // Accumulate observations and publish only when the stream
+                                        // lifecycle confirms completion.
+                                        usage_accumulator.observe(&json);
 
                                         canonicalize_response_model(&mut json, &response_model_id);
 
@@ -983,56 +1092,92 @@ pub async fn get_chat_completion_response(
                                             .await
                                             .is_err()
                                         {
+                                            finalize_stream_usage(
+                                                &mut usage_accumulator,
+                                                StreamUsageFinalization::ConsumerDropped,
+                                                &state_clone,
+                                                &user_clone,
+                                                &billing_ctx,
+                                                &provider,
+                                                &tx_consumer,
+                                            )
+                                            .await;
                                             return;
                                         }
                                     }
                                     Err(e) => {
                                         error!("Received non-JSON data event. Error: {:?}", e);
-                                        if tx_consumer
+                                        finalize_stream_usage(
+                                            &mut usage_accumulator,
+                                            StreamUsageFinalization::InvalidData,
+                                            &state_clone,
+                                            &user_clone,
+                                            &billing_ctx,
+                                            &provider,
+                                            &tx_consumer,
+                                        )
+                                        .await;
+                                        let _ = tx_consumer
                                             .send(CompletionChunk::Error(
                                                 "Invalid JSON".to_string(),
                                             ))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
-                                        break;
+                                            .await;
+                                        return;
                                     }
                                 }
                             }
                         }
                         Err(e) => {
                             error!("Stream error: {:?}", e);
-                            if tx_consumer
+                            finalize_stream_usage(
+                                &mut usage_accumulator,
+                                StreamUsageFinalization::TransportError,
+                                &state_clone,
+                                &user_clone,
+                                &billing_ctx,
+                                &provider,
+                                &tx_consumer,
+                            )
+                            .await;
+                            let _ = tx_consumer
                                 .send(CompletionChunk::Error(e.to_string()))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            break;
+                                .await;
+                            return;
                         }
                     }
                 }
                 Ok(None) => {
                     // Stream ended without explicit [DONE]
-                    if tx_consumer.send(CompletionChunk::Done).await.is_err() {
-                        return;
-                    }
-                    break;
+                    finalize_stream_usage(
+                        &mut usage_accumulator,
+                        StreamUsageFinalization::EndOfStream,
+                        &state_clone,
+                        &user_clone,
+                        &billing_ctx,
+                        &provider,
+                        &tx_consumer,
+                    )
+                    .await;
+                    let _ = tx_consumer.send(CompletionChunk::Done).await;
+                    return;
                 }
                 Err(_) => {
                     // Timeout waiting for next chunk
                     error!("Stream chunk timeout after {}s", STREAM_CHUNK_TIMEOUT_SECS);
-                    if tx_consumer
+                    finalize_stream_usage(
+                        &mut usage_accumulator,
+                        StreamUsageFinalization::Timeout,
+                        &state_clone,
+                        &user_clone,
+                        &billing_ctx,
+                        &provider,
+                        &tx_consumer,
+                    )
+                    .await;
+                    let _ = tx_consumer
                         .send(CompletionChunk::Error("Stream timeout".to_string()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    break;
+                        .await;
+                    return;
                 }
             }
         }
@@ -1054,30 +1199,37 @@ pub async fn get_chat_completion_response(
 
 /// Helper to extract usage from response JSON
 fn extract_usage(json: &Value) -> Option<CompletionUsage> {
-    let usage_json = json.get("usage")?;
-    if usage_json.is_null() || !usage_json.is_object() {
-        return None;
-    }
+    let observed = extract_usage_observation(json)?;
+    let prompt_tokens = observed.prompt_tokens.unwrap_or(0);
 
+    Some(CompletionUsage {
+        prompt_tokens,
+        completion_tokens: observed.completion_tokens.unwrap_or(0),
+        cached_prompt_tokens: observed
+            .cached_prompt_tokens
+            .map(|tokens| tokens.min(prompt_tokens)),
+    })
+}
+
+fn extract_usage_observation(json: &Value) -> Option<CompletionUsageObservation> {
+    let usage_json = json.get("usage")?.as_object()?;
     let prompt_tokens = usage_json
         .get("prompt_tokens")
         .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        .clamp(0, i32::MAX as i64) as i32;
+        .map(|tokens| tokens.clamp(0, i32::MAX as i64) as i32);
 
     let cached_prompt_tokens = usage_json
         .get("prompt_tokens_details")
         .and_then(|details| details.get("cached_tokens"))
         .and_then(|v| v.as_i64())
-        .map(|tokens| tokens.clamp(0, prompt_tokens as i64) as i32);
+        .map(|tokens| tokens.clamp(0, i32::MAX as i64) as i32);
 
-    Some(CompletionUsage {
+    Some(CompletionUsageObservation {
         prompt_tokens,
         completion_tokens: usage_json
             .get("completion_tokens")
             .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            .clamp(0, i32::MAX as i64) as i32,
+            .map(|tokens| tokens.clamp(0, i32::MAX as i64) as i32),
         cached_prompt_tokens,
     })
 }
@@ -1112,8 +1264,8 @@ fn strip_provider_managed_request_fields(body: &mut serde_json::Map<String, Valu
     }
 }
 
-/// Helper to check if a streaming chunk has a finish_reason
-/// This indicates it's the final chunk in the stream
+/// A finish reason marks model completion, but providers may send a richer
+/// usage-only frame after it and before the SSE [DONE] marker.
 fn has_finish_reason(json: &Value) -> bool {
     if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
         for choice in choices {
@@ -1128,7 +1280,9 @@ fn has_finish_reason(json: &Value) -> bool {
     false
 }
 
-fn is_terminal_stream_chunk(json: &Value) -> bool {
+/// Records enough terminal evidence to safely fall back when a provider omits
+/// [DONE]. This does not imply that no additional usage frame can follow.
+fn has_terminal_stream_signal(json: &Value) -> bool {
     if has_finish_reason(json) {
         return true;
     }
@@ -2350,5 +2504,241 @@ mod tests {
         assert!(event.is_api_request);
         assert_eq!(event.provider_name, "continuum");
         assert_eq!(event.model_name, "kimi-k2-6");
+    }
+
+    fn stream_usage_chunk(
+        prompt_tokens: i32,
+        completion_tokens: i32,
+        cached_prompt_tokens: Option<i32>,
+        finish_reason: Option<&str>,
+        usage_only: bool,
+    ) -> Value {
+        let mut usage = json!({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        });
+        if let Some(cached_prompt_tokens) = cached_prompt_tokens {
+            usage["prompt_tokens_details"] = json!({
+                "cached_tokens": cached_prompt_tokens,
+            });
+        }
+
+        let choices = if usage_only {
+            json!([])
+        } else {
+            json!([{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason,
+            }])
+        };
+
+        json!({
+            "choices": choices,
+            "usage": usage,
+        })
+    }
+
+    fn assert_usage(
+        usage: CompletionUsage,
+        prompt_tokens: i32,
+        completion_tokens: i32,
+        cached_prompt_tokens: Option<i32>,
+    ) {
+        assert_eq!(usage.prompt_tokens, prompt_tokens);
+        assert_eq!(usage.completion_tokens, completion_tokens);
+        assert_eq!(usage.cached_prompt_tokens, cached_prompt_tokens);
+    }
+
+    #[test]
+    fn continuum_cache_details_after_finish_reason_are_preserved() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(20_208, 43, None, None, false));
+        accumulator.observe(&stream_usage_chunk(20_208, 44, None, Some("stop"), false));
+        accumulator.observe(&stream_usage_chunk(20_208, 44, Some(20_128), None, true));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("provider [DONE] should finalize usage");
+        assert_usage(usage, 20_208, 44, Some(20_128));
+        assert!(accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .is_none());
+    }
+
+    #[test]
+    fn tinfoil_usage_only_frame_without_cache_finalizes_once() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(30_823, 64, None, Some("length"), false));
+        accumulator.observe(&stream_usage_chunk(30_823, 64, None, None, true));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("provider [DONE] should finalize usage");
+        assert_usage(usage, 30_823, 64, None);
+        assert!(accumulator
+            .take_final_usage(StreamUsageFinalization::EndOfStream)
+            .is_none());
+    }
+
+    #[test]
+    fn cumulative_delta_usage_is_not_summed_or_finalized_more_than_once() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        for completion_tokens in 0..=100 {
+            accumulator.observe(&stream_usage_chunk(
+                500,
+                completion_tokens,
+                None,
+                None,
+                false,
+            ));
+        }
+        accumulator.observe(&stream_usage_chunk(500, 100, None, Some("stop"), false));
+        accumulator.observe(&stream_usage_chunk(500, 100, Some(480), None, true));
+        accumulator.observe(&stream_usage_chunk(500, 100, Some(480), None, true));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("provider [DONE] should finalize usage");
+        assert_usage(usage, 500, 100, Some(480));
+        assert!(accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .is_none());
+        assert!(accumulator
+            .take_final_usage(StreamUsageFinalization::ConsumerDropped)
+            .is_none());
+    }
+
+    #[test]
+    fn provider_done_uses_finish_usage_when_usage_only_frame_is_missing() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(400, 20, None, Some("stop"), false));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("[DONE] should use the latest available totals");
+        assert_usage(usage, 400, 20, None);
+    }
+
+    #[test]
+    fn end_of_stream_after_finish_reason_uses_terminal_fallback() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(400, 20, None, Some("stop"), false));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::EndOfStream)
+            .expect("terminal EOF should preserve existing billing behavior");
+        assert_usage(usage, 400, 20, None);
+    }
+
+    #[test]
+    fn interruption_before_terminal_signal_does_not_finalize_usage() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(400, 19, None, None, false));
+
+        assert!(accumulator
+            .take_final_usage(StreamUsageFinalization::TransportError)
+            .is_none());
+        assert!(accumulator
+            .take_final_usage(StreamUsageFinalization::Timeout)
+            .is_none());
+    }
+
+    #[test]
+    fn interruption_after_terminal_signal_finalizes_once() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(400, 20, None, Some("stop"), false));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::TransportError)
+            .expect("terminal transport failure should retain usage");
+        assert_usage(usage, 400, 20, None);
+        assert!(accumulator
+            .take_final_usage(StreamUsageFinalization::InvalidData)
+            .is_none());
+    }
+
+    #[test]
+    fn cached_tokens_survive_later_usage_that_omits_details() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(120, 1, Some(96), None, false));
+        accumulator.observe(&stream_usage_chunk(120, 2, None, Some("stop"), false));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("provider [DONE] should finalize usage");
+        assert_usage(usage, 120, 2, Some(96));
+    }
+
+    #[test]
+    fn later_explicit_zero_cached_tokens_is_authoritative() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(120, 1, Some(96), None, false));
+        accumulator.observe(&stream_usage_chunk(120, 1, Some(0), None, true));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("provider [DONE] should finalize usage");
+        assert_usage(usage, 120, 1, Some(0));
+    }
+
+    #[test]
+    fn partial_usage_observation_does_not_erase_final_totals() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(400, 20, None, Some("stop"), false));
+        accumulator.observe(&json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens_details": {
+                    "cached_tokens": 300,
+                }
+            }
+        }));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("partial final usage should merge with prior totals");
+        assert_usage(usage, 400, 20, Some(300));
+    }
+
+    #[test]
+    fn empty_usage_observation_does_not_erase_final_totals() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(400, 20, None, Some("stop"), false));
+        accumulator.observe(&json!({
+            "choices": [],
+            "usage": {},
+        }));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("empty final usage should not erase prior totals");
+        assert_usage(usage, 400, 20, None);
+    }
+
+    #[test]
+    fn prompt_only_usage_is_not_dropped() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(33, 0, None, None, true));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("non-zero prompt usage should be retained");
+        assert_usage(usage, 33, 0, None);
+    }
+
+    #[test]
+    fn provider_done_is_authoritative_without_finish_reason() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(80, 3, None, None, false));
+
+        assert!(accumulator
+            .take_final_usage(StreamUsageFinalization::EndOfStream)
+            .is_none());
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("explicit [DONE] should finalize the latest usage");
+        assert_usage(usage, 80, 3, None);
     }
 }

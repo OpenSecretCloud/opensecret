@@ -13,6 +13,7 @@ pub mod responses;
 pub use health_routes::router_with_state as health_routes_with_state;
 pub use login_routes::router as login_routes;
 pub use oauth_routes::router as oauth_routes;
+pub use openai::get_embedding_vector;
 pub use openai::router as openai_routes;
 pub use platform::router as platform_routes;
 pub use protected_routes::router as protected_routes;

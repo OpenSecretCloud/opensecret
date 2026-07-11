@@ -98,6 +98,7 @@ mod os_flags;
 mod private_key;
 mod provider_routing;
 mod proxy_config;
+mod rag;
 #[cfg(test)]
 mod security_invariants;
 mod seed_wrapping;
@@ -465,6 +466,7 @@ pub struct AppState {
     enclave_key: Vec<u8>,
     proxy_router: Arc<ProxyRouter>,
     provider_router: Arc<ProviderRouter>,
+    rag_cache: Arc<tokio::sync::Mutex<rag::RagCache>>,
     resend_api_key: Option<String>,
     ephemeral_keys: Arc<RwLock<HashMap<String, EphemeralSecret>>>,
     session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, SessionState>>>,
@@ -768,6 +770,7 @@ impl AppStateBuilder {
             enclave_key,
             proxy_router,
             provider_router,
+            rag_cache: Arc::new(tokio::sync::Mutex::new(rag::RagCache::default())),
             resend_api_key: self.resend_api_key,
             ephemeral_keys: Arc::new(RwLock::new(HashMap::new())),
             session_states: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -1706,6 +1709,7 @@ impl AppState {
                     encrypted_password,
                     new_wrapping,
                 )?;
+                self.rag_cache.lock().await.evict_user(user.uuid);
 
                 // Send confirmation email in the background
                 let app_state = self.clone();
@@ -2096,6 +2100,7 @@ impl AppState {
                 // Secret verification succeeded, proceed with account deletion
                 // Use the transaction-based method for atomicity
                 self.db.mark_and_delete_user(&user, &deletion_request)?;
+                self.rag_cache.lock().await.evict_user(user.uuid);
 
                 // Send confirmation email in the background if the user has an email
                 if let Some(email) = user.email.clone() {

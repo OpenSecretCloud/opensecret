@@ -505,8 +505,9 @@ pub async fn oauth_callback(
             ApiError::InternalServerError
         })?;
 
-    // Validate the complete state (both CSRF token and client_id)
-    let is_valid = oauth_provider.validate_state(&state).await;
+    // Validate and atomically consume the complete state so a successful match is one-time.
+    // A mismatched state is left in the store for the legitimate callback.
+    let is_valid = oauth_provider.consume_state(&state).await;
 
     if !is_valid {
         error!("Invalid state in {} callback", provider_name);

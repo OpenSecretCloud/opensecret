@@ -2532,6 +2532,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
+ "syn 2.0.106",
  "thiserror",
  "tiktoken-rs",
  "tokio",

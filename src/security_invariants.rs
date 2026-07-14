@@ -1,6 +1,32 @@
 use std::{collections::BTreeSet, fs, path::Path};
+use syn::visit::{self, Visit};
 
 const REQUEST_TIME_SCAN_ROOTS: &[&str] = &["src/main.rs", "src/web"];
+
+const SENSITIVE_LOG_IDENTIFIERS: &[&str] = &["session_key", "refresh_token", "alphanumeric_code"];
+
+const SENSITIVE_LOG_MESSAGES: &[&str] = &[
+    "session key:",
+    "Generated session key",
+    "Logout request for refresh token:",
+    "Platform logout request for refresh token:",
+    "with code {alphanumeric_code}",
+];
+
+const LOG_MACROS: &[&str] = &[
+    "trace",
+    "debug",
+    "info",
+    "warn",
+    "error",
+    "event",
+    "span",
+    "trace_span",
+    "debug_span",
+    "info_span",
+    "warn_span",
+    "error_span",
+];
 
 const LEGACY_SEED_PATTERNS: &[&str] = &[
     "get_seed_encrypted",
@@ -71,34 +97,74 @@ fn request_time_paths_do_not_use_legacy_seed_decrypt_helpers() {
 #[test]
 fn request_time_logs_do_not_include_session_keys_tokens_or_reset_codes() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut findings = Vec::new();
 
-    for (relative_path, forbidden_patterns) in [
-        (
-            "src/web/attestation_routes.rs",
-            &["session key:", "Generated session key"][..],
-        ),
-        (
-            "src/web/login_routes.rs",
-            &["Logout request for refresh token:"][..],
-        ),
-        (
-            "src/web/platform/login_routes.rs",
-            &["Platform logout request for refresh token:"][..],
-        ),
-        ("src/main.rs", &["with code {alphanumeric_code}"][..]),
+    for relative_path in [
+        "src/web/attestation_routes.rs",
+        "src/web/login_routes.rs",
+        "src/web/platform/login_routes.rs",
+        "src/main.rs",
     ] {
         let source_path = manifest_dir.join(relative_path);
         let contents = fs::read_to_string(&source_path)
             .unwrap_or_else(|_| panic!("{} should be readable", source_path.display()));
 
-        for forbidden_pattern in forbidden_patterns {
-            assert!(
-                !contents.contains(forbidden_pattern),
-                "{} must not log sensitive data via `{forbidden_pattern}`",
-                source_path.display()
-            );
-        }
+        findings.extend(collect_sensitive_log_findings(relative_path, &contents));
     }
+
+    assert!(
+        findings.is_empty(),
+        "request-time logs must not include sensitive data:\n{}",
+        findings.join("\n")
+    );
+}
+
+#[test]
+fn sensitive_log_scanner_detects_multiline_fields_and_formatted_identifiers() {
+    let source = r#"
+fn example(request: Request, session_key: [u8; 32], alphanumeric_code: String) {
+    tracing::warn!(
+        refresh_token = %request.refresh_token,
+        "logout failed"
+    );
+    debug!("generated key: {session_key:?}");
+    tracing::event!(Level::WARN, alphanumeric_code, "reset failed");
+    trace!("Generated session key: redacted");
+}
+"#;
+
+    let findings = collect_sensitive_log_findings("example.rs", source);
+
+    assert_eq!(findings.len(), 4, "unexpected findings: {findings:#?}");
+    for expected in ["refresh_token", "session_key", "alphanumeric_code"] {
+        assert!(
+            findings.iter().any(|finding| finding.contains(expected)),
+            "expected a finding for `{expected}`"
+        );
+    }
+    assert!(
+        findings
+            .iter()
+            .any(|finding| finding.contains("Generated session key")),
+        "expected the legacy exact message to remain forbidden"
+    );
+}
+
+#[test]
+fn sensitive_log_scanner_ignores_identifiers_outside_logging_macros() {
+    let source = r#"
+fn example(refresh_token: String, session_key: [u8; 32], alphanumeric_code: String) {
+    let response = json!({
+        "refresh_token": refresh_token,
+        "session_key": session_key,
+        "alphanumeric_code": alphanumeric_code,
+    });
+    info!(refresh_token_hash = "redacted", "token revoked");
+    consume(response);
+}
+"#;
+
+    assert!(collect_sensitive_log_findings("example.rs", source).is_empty());
 }
 
 #[test]
@@ -733,6 +799,73 @@ fn password_registration_and_login_issue_tokens_only_after_seed_wrap_verificatio
             "password login must contain `{required_pattern}`"
         );
     }
+}
+
+fn collect_sensitive_log_findings(source_path: &str, source: &str) -> Vec<String> {
+    let syntax = syn::parse_file(source)
+        .unwrap_or_else(|error| panic!("{source_path} should parse as Rust source: {error}"));
+    let mut visitor = SensitiveLogVisitor {
+        source_path,
+        findings: Vec::new(),
+    };
+    visitor.visit_file(&syntax);
+    visitor.findings
+}
+
+struct SensitiveLogVisitor<'a> {
+    source_path: &'a str,
+    findings: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for SensitiveLogVisitor<'_> {
+    fn visit_macro(&mut self, log_macro: &'ast syn::Macro) {
+        let Some(macro_name) = log_macro
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string())
+        else {
+            return;
+        };
+
+        if LOG_MACROS.contains(&macro_name.as_str()) {
+            let body = log_macro.tokens.to_string();
+            let mut sensitive_references = SENSITIVE_LOG_IDENTIFIERS
+                .iter()
+                .filter(|identifier| contains_identifier(&body, identifier))
+                .map(|identifier| format!("identifier `{identifier}`"))
+                .collect::<Vec<_>>();
+            sensitive_references.extend(
+                SENSITIVE_LOG_MESSAGES
+                    .iter()
+                    .filter(|message| body.contains(*message))
+                    .map(|message| format!("message `{message}`")),
+            );
+
+            if !sensitive_references.is_empty() {
+                self.findings.push(format!(
+                    "{}: `{}!` references {}",
+                    self.source_path,
+                    macro_name,
+                    sensitive_references.join(", ")
+                ));
+            }
+        }
+
+        visit::visit_macro(self, log_macro);
+    }
+}
+
+fn contains_identifier(source: &str, identifier: &str) -> bool {
+    source.match_indices(identifier).any(|(start, _)| {
+        let before = source[..start].chars().next_back();
+        let after = source[start + identifier.len()..].chars().next();
+        !before.is_some_and(is_identifier_character) && !after.is_some_and(is_identifier_character)
+    })
+}
+
+fn is_identifier_character(character: char) -> bool {
+    character == '_' || character.is_alphanumeric()
 }
 
 fn collect_forbidden_legacy_seed_matches(

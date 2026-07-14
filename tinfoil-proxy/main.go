@@ -45,7 +45,13 @@ func newProxyServer() (*proxyServer, error) {
 		return nil, errMissingAPIKey
 	}
 
-	client, err := tinfoil.NewClient(option.WithAPIKey(apiKey))
+	// Preserve the proxy's direct pinned-TLS transport and tenant-wide cache
+	// behavior rather than adopting new SDK defaults implicitly.
+	client, err := tinfoil.NewClientWithOptions(
+		tinfoil.WithTransport(tinfoil.TransportTLS),
+		tinfoil.WithUserCacheSecret(""),
+		tinfoil.WithOpenAIOptions(option.WithAPIKey(apiKey)),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +136,36 @@ type proxyResult struct {
 	err  error
 }
 
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (r *cancelOnCloseReadCloser) Close() error {
+	defer r.cancel()
+	return r.ReadCloser.Close()
+}
+
+func responseWithCancelOnClose(
+	result proxyResult,
+	cancel context.CancelFunc,
+) (*http.Response, error) {
+	if result.err != nil {
+		cancel()
+		return result.resp, result.err
+	}
+	if result.resp == nil || result.resp.Body == nil {
+		cancel()
+		return result.resp, nil
+	}
+
+	result.resp.Body = &cancelOnCloseReadCloser{
+		ReadCloser: result.resp.Body,
+		cancel:     cancel,
+	}
+	return result.resp, nil
+}
+
 func doWithResponseStartTimeout(
 	client *http.Client,
 	req *http.Request,
@@ -153,11 +189,11 @@ func doWithResponseStartTimeout(
 
 	select {
 	case result := <-resultCh:
-		return result.resp, result.err
+		return responseWithCancelOnClose(result, cancel)
 	case <-timer.C:
 		select {
 		case result := <-resultCh:
-			return result.resp, result.err
+			return responseWithCancelOnClose(result, cancel)
 		default:
 		}
 

@@ -327,6 +327,9 @@ pub enum ApiError {
 
     #[error("Payload too large")]
     PayloadTooLarge,
+
+    #[error("Too many requests")]
+    TooManyRequests,
 }
 
 impl IntoResponse for ApiError {
@@ -352,6 +355,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
         };
         (
             status,

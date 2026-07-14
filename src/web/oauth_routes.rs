@@ -455,7 +455,8 @@ pub async fn initiate_oauth(
     // Store the complete state in the provider
     oauth_provider
         .store_state(csrf_token.secret(), state.clone())
-        .await;
+        .await
+        .map_err(|_| ApiError::TooManyRequests)?;
 
     let state_json = serde_json::to_string(&state).map_err(|_| ApiError::InternalServerError)?;
     let state_base64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(state_json);

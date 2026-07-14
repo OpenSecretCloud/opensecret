@@ -35,15 +35,17 @@ struct OAuthStateStore {
 #[derive(Debug, Default)]
 struct OAuthStateStoreInner {
     entries: HashMap<String, StoredOAuthState>,
-    next_sequence: u64,
 }
 
 #[derive(Debug)]
 struct StoredOAuthState {
     state: OAuthState,
     expires_at: Instant,
-    sequence: u64,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("OAuth state capacity reached")]
+pub struct OAuthStateCapacityError;
 
 impl OAuthStateStore {
     fn new() -> Self {
@@ -59,29 +61,29 @@ impl OAuthStateStore {
         }
     }
 
-    async fn store(&self, csrf_token: &str, state: OAuthState) {
-        self.store_at(csrf_token, state, Instant::now()).await;
+    async fn store(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.store_at(csrf_token, state, Instant::now()).await
     }
 
-    async fn store_at(&self, csrf_token: &str, state: OAuthState, now: Instant) {
+    async fn store_at(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        now: Instant,
+    ) -> Result<(), OAuthStateCapacityError> {
         let mut inner = self.inner.lock().await;
         inner
             .entries
             .retain(|_, stored_state| stored_state.expires_at > now);
 
         if !inner.entries.contains_key(csrf_token) && inner.entries.len() >= self.capacity {
-            let oldest_key = inner
-                .entries
-                .iter()
-                .min_by_key(|(_, stored_state)| stored_state.sequence)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest_key) = oldest_key {
-                inner.entries.remove(&oldest_key);
-            }
+            return Err(OAuthStateCapacityError);
         }
 
-        let sequence = inner.next_sequence;
-        inner.next_sequence = inner.next_sequence.saturating_add(1);
         inner.entries.insert(
             csrf_token.to_string(),
             StoredOAuthState {
@@ -89,9 +91,9 @@ impl OAuthStateStore {
                 expires_at: now
                     .checked_add(self.ttl)
                     .expect("OAuth state TTL must fit in Instant"),
-                sequence,
             },
         );
+        Ok(())
     }
 
     async fn consume(&self, state: &OAuthState) -> bool {
@@ -184,8 +186,12 @@ impl GithubProvider {
         (auth_url.to_string(), csrf_token)
     }
 
-    pub async fn store_state(&self, csrf_token: &str, state: OAuthState) {
-        self.state_store.store(csrf_token, state).await;
+    pub async fn store_state(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.state_store.store(csrf_token, state).await
     }
 
     pub async fn consume_state(&self, state: &OAuthState) -> bool {
@@ -287,8 +293,12 @@ impl GoogleProvider {
         (auth_url.to_string(), csrf_token)
     }
 
-    pub async fn store_state(&self, csrf_token: &str, state: OAuthState) {
-        self.state_store.store(csrf_token, state).await;
+    pub async fn store_state(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.state_store.store(csrf_token, state).await
     }
 
     pub async fn consume_state(&self, state: &OAuthState) -> bool {
@@ -395,8 +405,12 @@ impl AppleProvider {
         (auth_url.to_string(), csrf_token)
     }
 
-    pub async fn store_state(&self, csrf_token: &str, state: OAuthState) {
-        self.state_store.store(csrf_token, state).await;
+    pub async fn store_state(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.state_store.store(csrf_token, state).await
     }
 
     pub async fn consume_state(&self, state: &OAuthState) -> bool {
@@ -450,7 +464,11 @@ pub trait OAuthProvider: Send + Sync + 'static {
     }
 
     async fn generate_authorize_url(&self, client: &BasicClient) -> (String, CsrfToken);
-    async fn store_state(&self, csrf_token: &str, state: OAuthState);
+    async fn store_state(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+    ) -> Result<(), OAuthStateCapacityError>;
     async fn consume_state(&self, state: &OAuthState) -> bool;
     async fn build_client(
         &self,
@@ -490,7 +508,11 @@ impl OAuthProvider for GithubProvider {
         self.generate_authorize_url(client).await
     }
 
-    async fn store_state(&self, csrf_token: &str, state: OAuthState) {
+    async fn store_state(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+    ) -> Result<(), OAuthStateCapacityError> {
         self.store_state(csrf_token, state).await
     }
 
@@ -519,7 +541,11 @@ impl OAuthProvider for GoogleProvider {
         self.generate_authorize_url(client).await
     }
 
-    async fn store_state(&self, csrf_token: &str, state: OAuthState) {
+    async fn store_state(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+    ) -> Result<(), OAuthStateCapacityError> {
         self.store_state(csrf_token, state).await
     }
 
@@ -548,7 +574,11 @@ impl OAuthProvider for AppleProvider {
         self.generate_authorize_url(client).await
     }
 
-    async fn store_state(&self, csrf_token: &str, state: OAuthState) {
+    async fn store_state(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+    ) -> Result<(), OAuthStateCapacityError> {
         self.store_state(csrf_token, state).await
     }
 
@@ -588,34 +618,64 @@ mod tests {
 
         store
             .store_at(&oauth_state.csrf_token, oauth_state.clone(), now)
-            .await;
+            .await
+            .unwrap();
 
         assert!(!store.consume_at(&oauth_state, now + ttl).await);
         assert_eq!(store.len_at(now + ttl).await, 0);
     }
 
     #[tokio::test]
-    async fn oauth_state_store_evicts_oldest_entry_at_capacity() {
+    async fn oauth_state_store_rejects_new_entry_at_capacity() {
         let store = OAuthStateStore::with_limits(Duration::from_secs(60), 2);
         let now = Instant::now();
         let first = state("first", 1);
         let second = state("second", 2);
         let third = state("third", 3);
 
-        store.store_at(&first.csrf_token, first.clone(), now).await;
+        store
+            .store_at(&first.csrf_token, first.clone(), now)
+            .await
+            .unwrap();
         store
             .store_at(&second.csrf_token, second.clone(), now)
-            .await;
-        store.store_at(&third.csrf_token, third.clone(), now).await;
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.store_at(&third.csrf_token, third.clone(), now).await,
+            Err(OAuthStateCapacityError)
+        );
 
         assert_eq!(store.len_at(now).await, 2);
-        assert!(!store.consume_at(&first, now).await);
+        assert!(store.consume_at(&first, now).await);
         assert!(store.consume_at(&second, now).await);
-        assert!(store.consume_at(&third, now).await);
+        assert!(!store.consume_at(&third, now).await);
     }
 
     #[tokio::test]
-    async fn oauth_state_store_prunes_expired_entries_before_eviction() {
+    async fn oauth_state_store_replaces_existing_entry_at_capacity() {
+        let store = OAuthStateStore::with_limits(Duration::from_secs(60), 1);
+        let now = Instant::now();
+        let original = state("shared", 1);
+        let replacement = state("shared", 2);
+
+        store
+            .store_at(&original.csrf_token, original.clone(), now)
+            .await
+            .unwrap();
+        store
+            .store_at(&replacement.csrf_token, replacement.clone(), now)
+            .await
+            .unwrap();
+
+        assert_eq!(store.len_at(now).await, 1);
+        assert!(!store.consume_at(&original, now).await);
+        assert!(store.consume_at(&replacement, now).await);
+    }
+
+    #[tokio::test]
+    async fn oauth_state_store_prunes_expired_entries_before_capacity_check() {
         let ttl = Duration::from_secs(10);
         let store = OAuthStateStore::with_limits(ttl, 2);
         let now = Instant::now();
@@ -625,13 +685,16 @@ mod tests {
 
         store
             .store_at(&expired.csrf_token, expired.clone(), now)
-            .await;
+            .await
+            .unwrap();
         store
             .store_at(&live.csrf_token, live.clone(), now + Duration::from_secs(5))
-            .await;
+            .await
+            .unwrap();
         store
             .store_at(&newest.csrf_token, newest.clone(), now + ttl)
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(store.len_at(now + ttl).await, 2);
         assert!(!store.consume_at(&expired, now + ttl).await);
@@ -646,7 +709,10 @@ mod tests {
         let valid = state("csrf-token", 1);
         let mismatched = state("csrf-token", 2);
 
-        store.store_at(&valid.csrf_token, valid.clone(), now).await;
+        store
+            .store_at(&valid.csrf_token, valid.clone(), now)
+            .await
+            .unwrap();
 
         assert!(!store.consume_at(&mismatched, now).await);
         assert!(store.consume_at(&valid, now).await);
@@ -660,7 +726,8 @@ mod tests {
 
         store
             .store_at(&oauth_state.csrf_token, oauth_state.clone(), now)
-            .await;
+            .await
+            .unwrap();
 
         assert!(store.consume_at(&oauth_state, now).await);
         assert!(!store.consume_at(&oauth_state, now).await);
@@ -673,7 +740,8 @@ mod tests {
         let oauth_state = state("raced", 1);
         store
             .store_at(&oauth_state.csrf_token, oauth_state.clone(), now)
-            .await;
+            .await
+            .unwrap();
 
         let barrier = Arc::new(Barrier::new(3));
         let first = {

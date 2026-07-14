@@ -41,7 +41,7 @@ const MAX_AUDIO_SIZE: usize = 100 * 1024 * 1024;
 // documented memory budget instead of relying on the provider or edge proxy to
 // terminate oversized bodies.
 const MAX_COMPLETION_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_MODELS_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+pub(super) const MAX_MODELS_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 // Dense embedding arrays and verbose transcription segments can legitimately be
 // much larger than ordinary chat JSON.
 const MAX_EMBEDDINGS_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
@@ -50,7 +50,7 @@ const MAX_TRANSCRIPTION_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 // budget rather than one of the smaller JSON limits.
 const MAX_TTS_RESPONSE_BYTES: usize = MAX_AUDIO_SIZE;
 // Error bodies are only used to produce a short diagnostic preview.
-const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 64 * 1024;
+pub(super) const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 64 * 1024;
 // OpenAI-compatible streaming deltas are expected to be small. This cap applies
 // to the delimiter-free buffer retained between chunks, not to the full stream.
 const MAX_SSE_FRAME_BUFFER_BYTES: usize = 1024 * 1024;
@@ -64,14 +64,14 @@ const PROVIDER_MANAGED_CACHE_SALT_FIELD: &str = "cache_salt";
 const LOG_PREVIEW_CHARS: usize = 150;
 
 #[derive(Debug, thiserror::Error)]
-enum ProviderBodyReadError {
+pub(super) enum ProviderBodyReadError {
     #[error("provider response body exceeded the {limit}-byte limit")]
     TooLarge { limit: usize },
     #[error("failed to read provider response body: {0}")]
     Read(#[from] hyper::Error),
 }
 
-async fn read_provider_body_limited(
+pub(super) async fn read_provider_body_limited(
     body: HyperBody,
     limit: usize,
 ) -> Result<Bytes, ProviderBodyReadError> {
@@ -456,7 +456,7 @@ fn image_part_url(part: &Value) -> Option<&str> {
         .or_else(|| part.get("image").and_then(Value::as_str))
 }
 
-fn safe_log_preview(value: &str) -> String {
+pub(super) fn safe_log_preview(value: &str) -> String {
     let mut chars = value.chars();
     let preview = chars
         .by_ref()

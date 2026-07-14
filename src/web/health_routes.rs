@@ -1,3 +1,7 @@
+use super::openai::{
+    read_provider_body_limited, safe_log_preview, MAX_MODELS_RESPONSE_BYTES,
+    MAX_PROVIDER_ERROR_BODY_BYTES,
+};
 use crate::AppState;
 use axum::{http::StatusCode, Router};
 use axum::{routing::get, Json};
@@ -128,12 +132,24 @@ async fn fetch_models_directly(
 
     if !res.status().is_success() {
         let status = res.status();
-        let body_bytes = hyper::body::to_bytes(res.into_body()).await?;
-        let body_str = String::from_utf8_lossy(&body_bytes);
-        return Err(format!("HTTP {}: {}", status, body_str).into());
+        let body_excerpt = read_provider_error_excerpt(res.into_body()).await?;
+        return Err(format!("HTTP {}: {}", status, body_excerpt).into());
     }
 
-    let body_bytes = hyper::body::to_bytes(res.into_body()).await?;
+    count_models_in_body(res.into_body()).await
+}
+
+async fn count_models_in_body(
+    body: hyper::Body,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    count_models_in_body_with_limit(body, MAX_MODELS_RESPONSE_BYTES).await
+}
+
+async fn count_models_in_body_with_limit(
+    body: hyper::Body,
+    limit: usize,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let body_bytes = read_provider_body_limited(body, limit).await?;
     let models_response: serde_json::Value = serde_json::from_slice(&body_bytes)?;
 
     // Count the models
@@ -144,4 +160,95 @@ async fn fetch_models_directly(
         .unwrap_or(0);
 
     Ok(model_count)
+}
+
+async fn read_provider_error_excerpt(
+    body: hyper::Body,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    read_provider_error_excerpt_with_limit(body, MAX_PROVIDER_ERROR_BODY_BYTES).await
+}
+
+async fn read_provider_error_excerpt_with_limit(
+    body: hyper::Body,
+    limit: usize,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let body_bytes = read_provider_body_limited(body, limit).await?;
+    Ok(safe_log_preview(&String::from_utf8_lossy(&body_bytes)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn body_from_chunks(chunks: Vec<Bytes>) -> hyper::Body {
+        hyper::Body::wrap_stream(futures::stream::iter(
+            chunks.into_iter().map(Result::<Bytes, std::io::Error>::Ok),
+        ))
+    }
+
+    #[tokio::test]
+    async fn chunked_models_response_is_counted_within_limit() {
+        let body = body_from_chunks(vec![
+            Bytes::from_static(br#"{"data":[{"id":"one"},"#),
+            Bytes::from_static(br#"{"id":"two"}]}"#),
+        ]);
+
+        let model_count = count_models_in_body_with_limit(body, 64)
+            .await
+            .expect("a chunked models response within the limit should be accepted");
+
+        assert_eq!(model_count, 2);
+    }
+
+    #[tokio::test]
+    async fn chunked_models_response_is_rejected_over_limit() {
+        let body = body_from_chunks(vec![
+            Bytes::from_static(b"abcd"),
+            Bytes::from_static(b"efghi"),
+        ]);
+
+        let error = count_models_in_body_with_limit(body, 8)
+            .await
+            .expect_err("a models response over the aggregate limit should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "provider response body exceeded the 8-byte limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_provider_error_is_rejected_over_limit() {
+        let body = body_from_chunks(vec![
+            Bytes::from_static(b"abcd"),
+            Bytes::from_static(b"efghi"),
+        ]);
+
+        let error = read_provider_error_excerpt_with_limit(body, 8)
+            .await
+            .expect_err("an error response over the aggregate limit should be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "provider response body exceeded the 8-byte limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_provider_error_is_reduced_to_a_safe_excerpt() {
+        let body = body_from_chunks(vec![
+            Bytes::from(vec![b'a'; 100]),
+            Bytes::from(vec![b'b'; 51]),
+            Bytes::from_static(b"\nignored"),
+        ]);
+
+        let excerpt = read_provider_error_excerpt_with_limit(body, 256)
+            .await
+            .expect("a bounded error response should produce an excerpt");
+
+        assert_eq!(excerpt.chars().count(), 153);
+        assert!(excerpt.ends_with("..."));
+        assert!(!excerpt.contains('\n'));
+    }
 }

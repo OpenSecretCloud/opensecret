@@ -95,12 +95,17 @@ proptest! {
     #[test]
     fn seed_wrap_round_trips_and_rejects_changed_context(
         root_key in any::<[u8; 32]>(),
+        alternate_root_key in any::<[u8; 32]>(),
         plaintext_seed in vec(any::<u8>(), 0..257),
         user_id in any::<u128>(),
         project_id in any::<i32>(),
         kind in credential_kind(),
         auth_binding_bytes in any::<[u8; 32]>(),
+        alternate_auth_binding_bytes in any::<[u8; 32]>(),
     ) {
+        prop_assume!(alternate_root_key != root_key);
+        prop_assume!(alternate_auth_binding_bytes != auth_binding_bytes);
+
         let user_uuid = Uuid::from_u128(user_id);
         let auth_binding = AuthBinding::from_bytes(auth_binding_bytes);
         let encrypted = encrypt_seed_v1(
@@ -159,9 +164,7 @@ proptest! {
         )
         .is_err());
 
-        let mut changed_auth_binding_bytes = auth_binding_bytes;
-        changed_auth_binding_bytes[0] ^= 1;
-        let changed_auth_binding = AuthBinding::from_bytes(changed_auth_binding_bytes);
+        let changed_auth_binding = AuthBinding::from_bytes(alternate_auth_binding_bytes);
         prop_assert!(decrypt_seed_v1(
             &root_key,
             &encrypted,
@@ -172,10 +175,8 @@ proptest! {
         )
         .is_err());
 
-        let mut changed_root_key = root_key;
-        changed_root_key[0] ^= 1;
         prop_assert!(decrypt_seed_v1(
-            &changed_root_key,
+            &alternate_root_key,
             &encrypted,
             user_uuid,
             project_id,

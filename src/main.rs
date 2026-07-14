@@ -60,7 +60,6 @@ use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::io::Write;
@@ -83,6 +82,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 mod apple_signin;
 mod aws_credentials;
 mod billing;
+mod bounded_ttl_map;
 mod brave;
 mod db;
 mod email;
@@ -109,6 +109,7 @@ mod web;
 mod aead_db_tamper_tests;
 
 use apple_signin::AppleJwtVerifier;
+use bounded_ttl_map::BoundedTtlMap;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
 use provider_routing::{ProviderName, ProviderPreference, ProviderRouter};
 use proxy_config::ProxyRouter;
@@ -116,6 +117,21 @@ use proxy_config::ProxyRouter;
 const ENCLAVE_KEY_NAME: &str = "enclave_key";
 const OPENAI_API_KEY_NAME: &str = "openai_api_key";
 const JWT_SECRET_KEY_NAME: &str = "jwt_secret";
+
+// Attestation nonces are only needed between the attestation request and key
+// exchange. Nitro attestation documents permit at most 512 nonce bytes. That
+// size limit, a short TTL, and a fixed entry cap bound abandoned handshakes.
+const MAX_ATTESTATION_NONCE_BYTES: usize = 512;
+const EPHEMERAL_KEY_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_EPHEMERAL_KEYS: usize = 4_096;
+
+// JWT refresh does not rotate encryption sessions. This 65-minute idle TTL is
+// an independent in-memory lifecycle choice: official clients re-attest when a
+// session is missing, while successful use extends the TTL so long-running
+// streams are not interrupted. The fixed cap, rather than the TTL, is the hard
+// memory bound.
+const SESSION_STATE_IDLE_TTL: Duration = Duration::from_secs(65 * 60);
+const MAX_SESSION_STATES: usize = 65_536;
 
 // General secret key names
 const GITHUB_CLIENT_ID_NAME: &str = "github_client_id";
@@ -327,6 +343,9 @@ pub enum ApiError {
 
     #[error("Payload too large")]
     PayloadTooLarge,
+
+    #[error("Too many requests")]
+    TooManyRequests,
 }
 
 impl IntoResponse for ApiError {
@@ -352,6 +371,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
         };
         (
             status,
@@ -361,6 +381,63 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response()
+    }
+}
+
+fn live_session_state_at(
+    session_states: &mut BoundedTtlMap<Uuid, Arc<SessionState>>,
+    session_id: &Uuid,
+    now: tokio::time::Instant,
+) -> Result<Arc<SessionState>, ApiError> {
+    session_states
+        .get_cloned_and_touch_at(session_id, now)
+        // The official SDKs use 400 as the signal to establish a fresh
+        // attestation session. This also covers GET/DELETE routes, where the
+        // first session lookup may happen while encrypting the response.
+        .ok_or(ApiError::BadRequest)
+}
+
+fn validate_attestation_nonce(nonce: &str) -> Result<(), ApiError> {
+    if nonce.len() > MAX_ATTESTATION_NONCE_BYTES {
+        return Err(ApiError::BadRequest);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod attestation_session_state_tests {
+    use super::*;
+
+    #[test]
+    fn missing_and_expired_sessions_use_the_reattest_response() {
+        let now = tokio::time::Instant::now();
+        let session_id = Uuid::new_v4();
+        let mut sessions = BoundedTtlMap::new(1, Duration::from_secs(10));
+
+        let missing = live_session_state_at(&mut sessions, &session_id, now)
+            .err()
+            .expect("missing session should fail");
+        assert_eq!(missing.into_response().status(), StatusCode::BAD_REQUEST);
+
+        sessions
+            .try_insert_at(session_id, Arc::new(SessionState::new([7_u8; 32])), now)
+            .unwrap();
+        assert!(
+            live_session_state_at(&mut sessions, &session_id, now + Duration::from_secs(9)).is_ok()
+        );
+        assert!(
+            live_session_state_at(&mut sessions, &session_id, now + Duration::from_secs(19))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn attestation_nonce_size_is_bounded_in_bytes() {
+        assert!(validate_attestation_nonce(&"a".repeat(MAX_ATTESTATION_NONCE_BYTES)).is_ok());
+
+        let oversized = validate_attestation_nonce(&"a".repeat(MAX_ATTESTATION_NONCE_BYTES + 1))
+            .expect_err("oversized nonce should fail");
+        assert_eq!(oversized.into_response().status(), StatusCode::BAD_REQUEST);
     }
 }
 
@@ -466,8 +543,8 @@ pub struct AppState {
     proxy_router: Arc<ProxyRouter>,
     provider_router: Arc<ProviderRouter>,
     resend_api_key: Option<String>,
-    ephemeral_keys: Arc<RwLock<HashMap<String, EphemeralSecret>>>,
-    session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, SessionState>>>,
+    ephemeral_keys: Arc<RwLock<BoundedTtlMap<String, EphemeralSecret>>>,
+    session_states: Arc<RwLock<BoundedTtlMap<Uuid, Arc<SessionState>>>>,
     oauth_manager: Arc<OAuthManager>,
     sqs_publisher: Option<Arc<SqsEventPublisher>>,
     billing_client: Option<BillingClient>,
@@ -769,8 +846,14 @@ impl AppStateBuilder {
             proxy_router,
             provider_router,
             resend_api_key: self.resend_api_key,
-            ephemeral_keys: Arc::new(RwLock::new(HashMap::new())),
-            session_states: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            ephemeral_keys: Arc::new(RwLock::new(BoundedTtlMap::new(
+                MAX_EPHEMERAL_KEYS,
+                EPHEMERAL_KEY_TTL,
+            ))),
+            session_states: Arc::new(RwLock::new(BoundedTtlMap::new(
+                MAX_SESSION_STATES,
+                SESSION_STATE_IDLE_TTL,
+            ))),
             oauth_manager,
             sqs_publisher,
             billing_client,
@@ -1486,7 +1569,9 @@ impl AppState {
         self.enclave_key.clone()
     }
 
-    pub async fn create_ephemeral_key(&self, nonce: String) -> PublicKey {
+    pub async fn create_ephemeral_key(&self, nonce: String) -> Result<PublicKey, ApiError> {
+        validate_attestation_nonce(&nonce)?;
+
         let custom_rng = CustomRng::new();
 
         // Use a wrapper that implements RngCore and CryptoRng
@@ -1499,13 +1584,39 @@ impl AppState {
         self.ephemeral_keys
             .write()
             .await
-            .insert(nonce, ephemeral_secret);
+            .try_insert(nonce, ephemeral_secret)
+            .map_err(|_| {
+                warn!(
+                    max_entries = MAX_EPHEMERAL_KEYS,
+                    "Attestation ephemeral-key capacity reached"
+                );
+                ApiError::TooManyRequests
+            })?;
 
-        public_key
+        Ok(public_key)
     }
 
     pub async fn get_and_remove_ephemeral_secret(&self, nonce: &str) -> Option<EphemeralSecret> {
-        self.ephemeral_keys.write().await.remove(nonce)
+        self.ephemeral_keys.write().await.remove_live(nonce)
+    }
+
+    pub async fn store_session_state(
+        &self,
+        session_id: Uuid,
+        session_state: Arc<SessionState>,
+    ) -> Result<(), ApiError> {
+        self.session_states
+            .write()
+            .await
+            .try_insert(session_id, session_state)
+            .map(|_| ())
+            .map_err(|_| {
+                warn!(
+                    max_entries = MAX_SESSION_STATES,
+                    "Attestation session capacity reached"
+                );
+                ApiError::TooManyRequests
+            })
     }
 
     pub async fn decrypt_session_data(
@@ -1538,19 +1649,19 @@ impl AppState {
         tracing::trace!("nonce: {:?}", nonce_array);
         tracing::trace!("ciphertext length: {}", ciphertext.len());
 
-        self.session_states
-            .read()
-            .await
-            .get(session_id)
-            .ok_or_else(|| {
-                tracing::error!("Session not found: {}", session_id);
-                ApiError::Unauthorized
-            })
-            .and_then(|state| {
-                state.decrypt(ciphertext, &nonce_array).map_err(|e| {
-                    tracing::error!("Decryption failed: {:?}", e);
-                    e
-                })
+        let session_state = {
+            let mut session_states = self.session_states.write().await;
+            live_session_state_at(&mut session_states, session_id, tokio::time::Instant::now())
+        }
+        .inspect_err(|_| {
+            tracing::warn!("Session missing or expired: {}", session_id);
+        })?;
+
+        session_state
+            .decrypt(ciphertext, &nonce_array)
+            .map_err(|e| {
+                tracing::error!("Decryption failed: {:?}", e);
+                e
             })
     }
 
@@ -1559,13 +1670,13 @@ impl AppState {
         session_id: &Uuid,
         data: &[u8],
     ) -> Result<Vec<u8>, ApiError> {
-        let session_states = self.session_states.read().await;
-        let session_state = session_states
-            .get(session_id)
-            .ok_or(ApiError::Unauthorized)?;
+        let session_state = {
+            let mut session_states = self.session_states.write().await;
+            live_session_state_at(&mut session_states, session_id, tokio::time::Instant::now())
+        }?;
 
         let session_key = session_state.get_session_key();
-        let key = Key::from_slice(session_key.as_ref());
+        let key = Key::from_slice(session_key);
 
         let nonce_bytes: [u8; 12] = crate::encrypt::generate_random();
         let nonce = Nonce::from_slice(&nonce_bytes);

@@ -340,28 +340,39 @@ fn append_streamed_tool_calls(tool_calls: &mut Vec<StreamedToolCall>, tool_call_
         );
     }
 
+    let mut ignored_nonzero_index = false;
     for tool_call in tool_call_entries {
         let index = tool_call
             .get("index")
             .and_then(|index| index.as_u64())
-            .unwrap_or(0) as usize;
+            .unwrap_or(0);
 
-        while tool_calls.len() <= index {
+        if index != 0 {
+            ignored_nonzero_index = true;
+            continue;
+        }
+
+        if tool_calls.is_empty() {
             tool_calls.push(StreamedToolCall::default());
         }
 
+        let tool_call_state = &mut tool_calls[0];
         if let Some(function) = tool_call.get("function") {
             if let Some(name) = function.get("name").and_then(|name| name.as_str()) {
-                tool_calls[index].name = Some(name.to_string());
+                tool_call_state.name = Some(name.to_string());
             }
 
             if let Some(arguments) = function
                 .get("arguments")
                 .and_then(|arguments| arguments.as_str())
             {
-                tool_calls[index].arguments.push_str(arguments);
+                tool_call_state.arguments.push_str(arguments);
             }
         }
+    }
+
+    if ignored_nonzero_index {
+        warn!("Ignoring streamed tool calls with nonzero indices; only index 0 is supported in v1");
     }
 }
 
@@ -696,6 +707,85 @@ mod tests {
         let tool_call = finalize_first_model_tool_call(&tool_calls).expect("tool call");
         assert_eq!(tool_call.name, "web_search");
         assert_eq!(tool_call.arguments["query"], "Donald Trump birthday");
+    }
+
+    #[test]
+    fn test_append_streamed_tool_calls_ignores_max_index_without_allocating() {
+        let mut tool_calls = Vec::<StreamedToolCall>::new();
+        let initial_capacity = tool_calls.capacity();
+
+        append_streamed_tool_calls(
+            &mut tool_calls,
+            &json!([{
+                "index": u64::MAX,
+                "function": {
+                    "name": "web_search",
+                    "arguments": "{}"
+                }
+            }]),
+        );
+
+        assert!(tool_calls.is_empty());
+        assert_eq!(tool_calls.capacity(), initial_capacity);
+    }
+
+    #[test]
+    fn test_append_streamed_tool_calls_ignores_sparse_nonzero_index() {
+        let mut tool_calls = Vec::<StreamedToolCall>::new();
+
+        append_streamed_tool_calls(
+            &mut tool_calls,
+            &json!([{
+                "index": 42,
+                "function": {
+                    "name": "web_search",
+                    "arguments": "{}"
+                }
+            }]),
+        );
+
+        assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn test_append_streamed_tool_calls_ignores_multiple_unsupported_indices_without_growth() {
+        let mut tool_calls = vec![StreamedToolCall {
+            name: Some("web_search".to_string()),
+            arguments: "{\"query\":\"existing\"}".to_string(),
+        }];
+        let initial_capacity = tool_calls.capacity();
+
+        append_streamed_tool_calls(
+            &mut tool_calls,
+            &json!([
+                {
+                    "index": 1,
+                    "function": {
+                        "name": "ignored_one",
+                        "arguments": "{}"
+                    }
+                },
+                {
+                    "index": 9,
+                    "function": {
+                        "name": "ignored_nine",
+                        "arguments": "{}"
+                    }
+                },
+                {
+                    "index": u64::MAX,
+                    "function": {
+                        "name": "ignored_max",
+                        "arguments": "{}"
+                    }
+                }
+            ]),
+        );
+
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls.capacity(), initial_capacity);
+        assert_eq!(tool_calls[0].name.as_deref(), Some("web_search"));
+        assert_eq!(tool_calls[0].arguments, "{\"query\":\"existing\"}");
     }
 
     #[test]

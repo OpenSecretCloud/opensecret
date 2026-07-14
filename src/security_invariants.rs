@@ -69,6 +69,39 @@ fn request_time_paths_do_not_use_legacy_seed_decrypt_helpers() {
 }
 
 #[test]
+fn request_time_logs_do_not_include_session_keys_tokens_or_reset_codes() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    for (relative_path, forbidden_patterns) in [
+        (
+            "src/web/attestation_routes.rs",
+            &["session key:", "Generated session key"][..],
+        ),
+        (
+            "src/web/login_routes.rs",
+            &["Logout request for refresh token:"][..],
+        ),
+        (
+            "src/web/platform/login_routes.rs",
+            &["Platform logout request for refresh token:"][..],
+        ),
+        ("src/main.rs", &["with code {alphanumeric_code}"][..]),
+    ] {
+        let source_path = manifest_dir.join(relative_path);
+        let contents = fs::read_to_string(&source_path)
+            .unwrap_or_else(|_| panic!("{} should be readable", source_path.display()));
+
+        for forbidden_pattern in forbidden_patterns {
+            assert!(
+                !contents.contains(forbidden_pattern),
+                "{} must not log sensitive data via `{forbidden_pattern}`",
+                source_path.display()
+            );
+        }
+    }
+}
+
+#[test]
 fn openai_compatible_routes_do_not_request_user_storage_keys() {
     let openai_routes = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web/openai.rs");
     let contents =

@@ -438,11 +438,7 @@ pub async fn logout_platform_user(
     info!("Platform logout request received");
 
     // TODO: Implement token invalidation logic here when needed
-    tracing::trace!(
-        "Platform logout request for refresh token: {}",
-        logout_request.refresh_token
-    );
-
+    drop(logout_request.refresh_token);
     let response = json!({ "message": "Logged out successfully" });
     let result = encrypt_response(&data, &session_id, &response).await;
     result

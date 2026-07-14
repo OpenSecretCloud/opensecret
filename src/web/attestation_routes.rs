@@ -36,7 +36,6 @@ impl SessionState {
 
     pub fn decrypt(&self, encrypted_data: &[u8], nonce: &[u8; 12]) -> Result<Vec<u8>, ApiError> {
         tracing::trace!("decrypting encrypted data");
-        tracing::trace!("session key: {:?}", self.session_key);
         tracing::trace!("nonce: {:?}", nonce);
         tracing::trace!("encrypted data length: {}", encrypted_data.len());
 
@@ -417,12 +416,6 @@ async fn key_exchange(
 
     // Generate a new UUID for the session
     let session_id = Uuid::new_v4();
-
-    trace!(
-        "Generated session key {:?} for nonce {:?}",
-        session_key,
-        nonce
-    );
 
     // Store the session state
     data.session_states

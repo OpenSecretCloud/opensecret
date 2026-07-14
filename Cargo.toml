@@ -78,3 +78,4 @@ once_cell = "1.19"
 
 [dev-dependencies]
 openssl = "0.10.78"
+proptest = { version = "=1.6.0", default-features = false, features = ["std"] }

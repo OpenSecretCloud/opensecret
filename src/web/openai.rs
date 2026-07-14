@@ -18,9 +18,9 @@ use axum::{
 };
 use base64::{engine::general_purpose, Engine as _};
 use bigdecimal::BigDecimal;
+use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use futures::{StreamExt, TryStreamExt};
-use hyper::body::to_bytes;
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Body as HyperBody, Client, Request};
 use hyper_tls::HttpsConnector;
@@ -37,6 +37,24 @@ use uuid::Uuid;
 // Maximum audio file size (100MB) - sanity check, CF already limits to 50MB
 const MAX_AUDIO_SIZE: usize = 100 * 1024 * 1024;
 
+// Provider responses are untrusted. Keep each aggregate response class within a
+// documented memory budget instead of relying on the provider or edge proxy to
+// terminate oversized bodies.
+const MAX_COMPLETION_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MAX_MODELS_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+// Dense embedding arrays and verbose transcription segments can legitimately be
+// much larger than ordinary chat JSON.
+const MAX_EMBEDDINGS_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TRANSCRIPTION_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+// Speech is binary output, so it intentionally uses the existing 100 MiB audio
+// budget rather than one of the smaller JSON limits.
+const MAX_TTS_RESPONSE_BYTES: usize = MAX_AUDIO_SIZE;
+// Error bodies are only used to produce a short diagnostic preview.
+pub(super) const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 64 * 1024;
+// OpenAI-compatible streaming deltas are expected to be small. This cap applies
+// to the delimiter-free buffer retained between chunks, not to the full stream.
+const MAX_SSE_FRAME_BUFFER_BYTES: usize = 1024 * 1024;
+
 // Timeout constants for provider requests
 const REQUEST_TIMEOUT_SECS: u64 = 120; // Request timeout (generous for large non-streaming responses)
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming reads
@@ -44,6 +62,98 @@ const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming r
 const PROVIDER_MANAGED_CACHE_SALT_FIELD: &str = "cache_salt";
 
 const LOG_PREVIEW_CHARS: usize = 150;
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ProviderBodyReadError {
+    #[error("provider response body exceeded the {limit}-byte limit")]
+    TooLarge { limit: usize },
+    #[error("failed to read provider response body: {0}")]
+    Read(#[from] hyper::Error),
+}
+
+pub(super) async fn read_provider_body_limited(
+    body: HyperBody,
+    limit: usize,
+) -> Result<Bytes, ProviderBodyReadError> {
+    let mut body_stream = body.into_stream();
+    let mut collected = BytesMut::new();
+
+    while let Some(chunk) = body_stream.next().await {
+        let chunk = chunk?;
+        let next_len = collected
+            .len()
+            .checked_add(chunk.len())
+            .filter(|next_len| *next_len <= limit)
+            .ok_or(ProviderBodyReadError::TooLarge { limit })?;
+
+        collected.reserve(next_len - collected.len());
+        collected.extend_from_slice(&chunk);
+    }
+
+    Ok(collected.freeze())
+}
+
+#[derive(Default)]
+struct SseFrameBuffer {
+    frame: Vec<u8>,
+    pending_newline: bool,
+}
+
+impl SseFrameBuffer {
+    fn push_byte(
+        &mut self,
+        byte: u8,
+        limit: usize,
+    ) -> Result<Option<String>, ProviderBodyReadError> {
+        if self.pending_newline {
+            self.pending_newline = false;
+
+            if byte == b'\n' {
+                return Ok(self.take_data_frame());
+            }
+
+            self.push_frame_byte(b'\n', limit)?;
+        }
+
+        if byte == b'\n' {
+            self.pending_newline = true;
+        } else {
+            self.push_frame_byte(byte, limit)?;
+        }
+
+        Ok(None)
+    }
+
+    fn push_frame_byte(&mut self, byte: u8, limit: usize) -> Result<(), ProviderBodyReadError> {
+        if self.frame.len() >= limit {
+            return Err(ProviderBodyReadError::TooLarge { limit });
+        }
+
+        self.frame.push(byte);
+        Ok(())
+    }
+
+    fn take_data_frame(&mut self) -> Option<String> {
+        let frame = String::from_utf8_lossy(&self.frame);
+        let data = if frame.trim().is_empty() {
+            None
+        } else {
+            frame.strip_prefix("data: ").map(ToOwned::to_owned)
+        };
+        self.frame.clear();
+        data
+    }
+}
+
+async fn provider_error_body_preview(body: HyperBody) -> Option<String> {
+    match read_provider_body_limited(body, MAX_PROVIDER_ERROR_BODY_BYTES).await {
+        Ok(bytes) => Some(safe_log_preview(&String::from_utf8_lossy(&bytes))),
+        Err(error) => {
+            warn!("Could not read provider error body preview: {error}");
+            None
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 struct CompletionRequestLogMetadata {
@@ -346,7 +456,7 @@ fn image_part_url(part: &Value) -> Option<&str> {
         .or_else(|| part.get("image").and_then(Value::as_str))
 }
 
-fn safe_log_preview(value: &str) -> String {
+pub(super) fn safe_log_preview(value: &str) -> String {
     let mut chars = value.chars();
     let preview = chars
         .by_ref()
@@ -990,10 +1100,12 @@ pub async fn get_chat_completion_response(
     if !is_streaming {
         // NON-STREAMING: Simple case
         debug!("Processing non-streaming response with internal billing");
-        let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
-            error!("Failed to read response body: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        let body_bytes = read_provider_body_limited(res.into_body(), MAX_COMPLETION_RESPONSE_BYTES)
+            .await
+            .map_err(|e| {
+                error!("Failed to read completion response body: {e}");
+                ApiError::InternalServerError
+            })?;
 
         let mut response_json: Value = serde_json::from_str(&String::from_utf8_lossy(&body_bytes))
             .map_err(|e| {
@@ -1043,7 +1155,7 @@ pub async fn get_chat_completion_response(
 
     tokio::spawn(async move {
         let mut body_stream = res.into_body().into_stream();
-        let mut buffer = String::new();
+        let mut frame_buffer = SseFrameBuffer::default();
         let mut usage_accumulator = StreamUsageAccumulator::default();
 
         loop {
@@ -1056,11 +1168,39 @@ pub async fn get_chat_completion_response(
                 Ok(Some(chunk_result)) => {
                     match chunk_result {
                         Ok(bytes) => {
-                            let chunk_str = String::from_utf8_lossy(bytes.as_ref());
-                            buffer.push_str(&chunk_str);
+                            for &byte in bytes.as_ref() {
+                                let frame = match frame_buffer
+                                    .push_byte(byte, MAX_SSE_FRAME_BUFFER_BYTES)
+                                {
+                                    Ok(frame) => frame,
+                                    Err(e) => {
+                                        error!(
+                                            "Provider stream frame buffer exceeded its limit: {e}"
+                                        );
+                                        finalize_stream_usage(
+                                            &mut usage_accumulator,
+                                            StreamUsageFinalization::InvalidData,
+                                            &state_clone,
+                                            &user_clone,
+                                            &billing_ctx,
+                                            &provider,
+                                            &tx_consumer,
+                                        )
+                                        .await;
+                                        let _ = tx_consumer
+                                            .send(CompletionChunk::Error(
+                                                "Provider stream response exceeded size limit"
+                                                    .to_string(),
+                                            ))
+                                            .await;
+                                        return;
+                                    }
+                                };
 
-                            // Parse SSE frames
-                            while let Some(frame) = extract_sse_frame(&mut buffer) {
+                                let Some(frame) = frame else {
+                                    continue;
+                                };
+
                                 if frame == "[DONE]" {
                                     finalize_stream_usage(
                                         &mut usage_accumulator,
@@ -1300,33 +1440,6 @@ fn canonicalize_response_model(json: &mut Value, response_model_id: &str) {
     }
 }
 
-/// Helper to extract SSE frame from buffer
-/// Returns the data portion of "data: <content>" frames, None if no complete frame available
-fn extract_sse_frame(buffer: &mut String) -> Option<String> {
-    loop {
-        // Look for a complete SSE frame (ends with \n\n)
-        if let Some(pos) = buffer.find("\n\n") {
-            let frame = buffer[..pos].to_string();
-            *buffer = buffer[pos + 2..].to_string();
-
-            // Skip empty frames
-            if frame.trim().is_empty() {
-                continue;
-            }
-
-            // Return data content if it's a data frame, otherwise keep looking
-            if let Some(data) = frame.strip_prefix("data: ") {
-                return Some(data.to_string());
-            }
-            // Skip non-data frames (comments, etc.) and continue looking
-            continue;
-        }
-
-        // No complete frame available
-        return None;
-    }
-}
-
 /// Internal billing function - NEVER exposed outside this module
 /// This function publishes usage events to both the database and SQS
 async fn publish_usage_event_internal(
@@ -1518,9 +1631,8 @@ async fn fetch_provider_models(proxy_config: &ProxyConfig) -> Result<Value, ApiE
 
     if !res.status().is_success() {
         let status = res.status();
-        let body_bytes = to_bytes(res.into_body()).await.ok();
-        let error_msg = body_bytes
-            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        let error_msg = provider_error_body_preview(res.into_body())
+            .await
             .unwrap_or_else(|| status.to_string());
         error!(
             "Provider {} returned non-success status for models: {} - {}",
@@ -1529,10 +1641,12 @@ async fn fetch_provider_models(proxy_config: &ProxyConfig) -> Result<Value, ApiE
         return Err(ApiError::InternalServerError);
     }
 
-    let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
-        error!("Failed to read models response body: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    let body_bytes = read_provider_body_limited(res.into_body(), MAX_MODELS_RESPONSE_BYTES)
+        .await
+        .map_err(|e| {
+            error!("Failed to read models response body: {e}");
+            ApiError::InternalServerError
+        })?;
 
     serde_json::from_slice(&body_bytes).map_err(|e| {
         error!("Failed to parse models response: {:?}", e);
@@ -1974,9 +2088,10 @@ async fn send_transcription_request(
     {
         Ok(Ok(res)) => {
             if res.status().is_success() {
-                let body_bytes = to_bytes(res.into_body())
-                    .await
-                    .map_err(|e| format!("Failed to read response body: {:?}", e))?;
+                let body_bytes =
+                    read_provider_body_limited(res.into_body(), MAX_TRANSCRIPTION_RESPONSE_BYTES)
+                        .await
+                        .map_err(|e| format!("Failed to read transcription response body: {e}"))?;
 
                 let response_json: Value = serde_json::from_slice(&body_bytes)
                     .map_err(|e| format!("Failed to parse response: {:?}", e))?;
@@ -1984,9 +2099,8 @@ async fn send_transcription_request(
                 Ok(response_json)
             } else {
                 let status = res.status();
-                let body_bytes = to_bytes(res.into_body()).await.ok();
-                let error_msg = body_bytes
-                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                let error_msg = provider_error_body_preview(res.into_body())
+                    .await
                     .unwrap_or_else(|| status.to_string());
 
                 Err(format!(
@@ -2120,10 +2234,12 @@ async fn proxy_tts(
     }
 
     // Get response body as bytes
-    let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
-        error!("Failed to read TTS response body: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    let body_bytes = read_provider_body_limited(res.into_body(), MAX_TTS_RESPONSE_BYTES)
+        .await
+        .map_err(|e| {
+            error!("Failed to read TTS response body: {e}");
+            ApiError::InternalServerError
+        })?;
 
     // Create a response object with the audio data and metadata
     let audio_response = json!({
@@ -2243,9 +2359,8 @@ async fn proxy_embeddings(
 
     if !res.status().is_success() {
         let status = res.status();
-        let body_bytes = to_bytes(res.into_body()).await.ok();
-        let error_msg = body_bytes
-            .map(|b| String::from_utf8_lossy(&b).to_string())
+        let error_msg = provider_error_body_preview(res.into_body())
+            .await
             .unwrap_or_else(|| status.to_string());
         error!(
             "Embeddings proxy returned non-success status: {} - {}",
@@ -2255,10 +2370,12 @@ async fn proxy_embeddings(
     }
 
     // Parse response
-    let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
-        error!("Failed to read embeddings response body: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    let body_bytes = read_provider_body_limited(res.into_body(), MAX_EMBEDDINGS_RESPONSE_BYTES)
+        .await
+        .map_err(|e| {
+            error!("Failed to read embeddings response body: {e}");
+            ApiError::InternalServerError
+        })?;
 
     let response_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
         error!("Failed to parse embeddings response: {:?}", e);
@@ -2353,10 +2470,9 @@ async fn try_provider(
                 );
                 debug!("Response headers: {:?}", response.headers());
 
-                // Try to get error body for logging
-                if let Ok(body_bytes) = to_bytes(response.into_body()).await {
-                    let body_str = String::from_utf8_lossy(&body_bytes);
-                    let body_preview = safe_log_preview(&body_str);
+                // Try to get a bounded error body preview for logging.
+                if let Some(body_preview) = provider_error_body_preview(response.into_body()).await
+                {
                     error!("Response body preview: {}", body_preview);
                     Err(format!(
                         "Provider {} returned status {}; body_preview={}",
@@ -2396,6 +2512,122 @@ async fn try_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn body_from_chunks(chunks: Vec<Bytes>) -> HyperBody {
+        HyperBody::wrap_stream(futures::stream::iter(
+            chunks.into_iter().map(Result::<Bytes, std::io::Error>::Ok),
+        ))
+    }
+
+    fn push_sse_chunk_for_test(
+        buffer: &mut SseFrameBuffer,
+        chunk: &[u8],
+        limit: usize,
+    ) -> Result<Vec<String>, ProviderBodyReadError> {
+        let mut frames = Vec::new();
+        for &byte in chunk {
+            if let Some(frame) = buffer.push_byte(byte, limit)? {
+                frames.push(frame);
+            }
+        }
+        Ok(frames)
+    }
+
+    #[tokio::test]
+    async fn provider_body_limit_accepts_exact_aggregate_boundary() {
+        let body = body_from_chunks(vec![
+            Bytes::from_static(b"abc"),
+            Bytes::from_static(b"defgh"),
+        ]);
+
+        let collected = read_provider_body_limited(body, 8)
+            .await
+            .expect("the exact limit should be accepted");
+
+        assert_eq!(collected.as_ref(), b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn provider_body_limit_rejects_one_byte_over_across_chunks() {
+        let body = body_from_chunks(vec![
+            Bytes::from_static(b"abcd"),
+            Bytes::from_static(b"efghi"),
+        ]);
+
+        let error = read_provider_body_limited(body, 8)
+            .await
+            .expect_err("one byte over the aggregate limit should be rejected");
+
+        assert!(matches!(
+            error,
+            ProviderBodyReadError::TooLarge { limit: 8 }
+        ));
+    }
+
+    #[test]
+    fn sse_buffer_rejects_endless_delimiter_free_accumulation() {
+        let mut buffer = SseFrameBuffer::default();
+
+        for _ in 0..4 {
+            let frames = push_sse_chunk_for_test(&mut buffer, b"ab", 8)
+                .expect("delimiter-free data should be accepted through the exact limit");
+            assert!(frames.is_empty());
+        }
+
+        let error = push_sse_chunk_for_test(&mut buffer, b"x", 8)
+            .expect_err("the next delimiter-free byte should exceed the limit");
+        assert!(matches!(
+            error,
+            ProviderBodyReadError::TooLarge { limit: 8 }
+        ));
+        assert_eq!(buffer.frame, b"abababab");
+    }
+
+    #[test]
+    fn sse_buffer_rejects_single_delimiter_free_frame_over_limit() {
+        let mut buffer = SseFrameBuffer::default();
+
+        let error = push_sse_chunk_for_test(&mut buffer, b"abcdefghi", 8)
+            .expect_err("a single oversized frame should be rejected");
+
+        assert!(matches!(
+            error,
+            ProviderBodyReadError::TooLarge { limit: 8 }
+        ));
+        assert_eq!(buffer.frame, b"abcdefgh");
+    }
+
+    #[test]
+    fn sse_frames_are_reassembled_across_normal_chunk_boundaries() {
+        let chunks: &[&[u8]] = &[b"data: {\"choices\":", b"[]}\n\ndata: [DO", b"NE]\n\n"];
+        let mut buffer = SseFrameBuffer::default();
+        let mut frames = Vec::new();
+
+        for chunk in chunks {
+            frames.extend(
+                push_sse_chunk_for_test(&mut buffer, chunk, 128)
+                    .expect("normal streaming chunks should remain below the buffer limit"),
+            );
+        }
+
+        assert_eq!(frames, vec![r#"{"choices":[]}"#, "[DONE]"]);
+        assert!(buffer.frame.is_empty());
+        assert!(!buffer.pending_newline);
+    }
+
+    #[test]
+    fn sse_chunk_larger_than_limit_accepts_many_small_frames() {
+        let chunk = b"data: x\n\n".repeat(100);
+        assert!(chunk.len() > 8);
+        let mut buffer = SseFrameBuffer::default();
+
+        let frames = push_sse_chunk_for_test(&mut buffer, &chunk, 8)
+            .expect("the limit applies per frame, not to a coalesced transport chunk");
+
+        assert_eq!(frames, vec!["x"; 100]);
+        assert!(buffer.frame.is_empty());
+        assert!(!buffer.pending_newline);
+    }
 
     #[test]
     fn strips_provider_managed_cache_salt_field() {

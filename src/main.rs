@@ -1826,7 +1826,7 @@ impl AppState {
         plaintext_secret: String,
         new_password: String,
     ) -> Result<(), Error> {
-        trace!("Confirm platform password reset for {email} with code {alphanumeric_code}");
+        trace!("Confirm platform password reset for {email}");
 
         let platform_user = match self.db.get_platform_user_by_email(&email) {
             Ok(Some(user)) => user,

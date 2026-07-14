@@ -25,8 +25,10 @@ pub enum EncryptError {
     FailedToDecrypt,
     #[error("Bad data")]
     BadData,
-    #[error("KMS encryption failed: {0}")]
+    #[error("KMS operation failed: {0}")]
     KmsError(String),
+    #[error("Random generation failed: {0}")]
+    RandomGenerationFailed(String),
     #[error("No content to decrypt")]
     NoContent,
     #[error("Deserialization failed: {0}")]
@@ -352,30 +354,18 @@ pub fn decrypt_with_kms(
         .arg(ciphertext)
         .output()
         .map_err(|e| {
-            tracing::error!(
-                "Failed to execute kmstool_enclave_cli for decryption: {}",
-                e
-            );
-            EncryptError::KmsError(e.to_string())
+            let error = kms_execution_error("decrypt", &e);
+            tracing::error!("{error}");
+            error
         })?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::error!("kmstool_enclave_cli decryption failed: {}", stderr);
-        return Err(EncryptError::KmsError(stderr.to_string()));
+        let error = kms_command_error("decrypt", &output.stderr);
+        tracing::error!("{error}");
+        return Err(error);
     }
 
-    let output_str =
-        String::from_utf8(output.stdout).map_err(|e| EncryptError::KmsError(e.to_string()))?;
-
-    let plaintext_b64 = output_str
-        .strip_prefix("PLAINTEXT: ")
-        .ok_or_else(|| EncryptError::KmsError("Failed to parse plaintext".to_string()))?
-        .trim();
-
-    STANDARD
-        .decode(plaintext_b64)
-        .map_err(|e| EncryptError::KmsError(format!("Failed to decode base64: {}", e)))
+    parse_kms_plaintext_output(&output.stdout, "decrypt")
 }
 
 #[derive(Debug)]
@@ -411,40 +401,95 @@ pub fn create_new_encryption_key(
         .arg("AES-256")
         .output()
         .map_err(|e| {
-            tracing::error!("Failed to execute kmstool_enclave_cli: {}", e);
-            EncryptError::KmsError(e.to_string())
+            let error = kms_execution_error("genkey", &e);
+            tracing::error!("{error}");
+            error
         })?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::error!("kmstool_enclave_cli failed: {}", stderr);
-        return Err(EncryptError::KmsError(stderr.to_string()));
+        let error = kms_command_error("genkey", &output.stderr);
+        tracing::error!("{error}");
+        return Err(error);
     }
 
-    let output_str =
-        String::from_utf8(output.stdout).map_err(|e| EncryptError::KmsError(e.to_string()))?;
-    let lines: Vec<&str> = output_str.lines().collect();
+    parse_kms_genkey_output(&output.stdout)
+}
 
-    let encrypted_key_b64 = lines[0]
-        .split(": ")
-        .nth(1)
-        .ok_or_else(|| EncryptError::KmsError("Failed to parse encrypted key".to_string()))?;
-    let plaintext_key_b64 = lines[1]
-        .split(": ")
-        .nth(1)
-        .ok_or_else(|| EncryptError::KmsError("Failed to parse plaintext key".to_string()))?;
+fn kms_execution_error(operation: &str, error: &std::io::Error) -> EncryptError {
+    EncryptError::KmsError(format!(
+        "kmstool_enclave_cli {operation} could not be executed: {error}"
+    ))
+}
 
-    let encrypted_key = STANDARD
-        .decode(encrypted_key_b64)
-        .map_err(|e| EncryptError::KmsError(format!("Failed to decode encrypted key: {}", e)))?;
+fn kms_command_error(operation: &str, stderr: &[u8]) -> EncryptError {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = stderr.trim();
+    let detail = if stderr.is_empty() {
+        "no error output".to_string()
+    } else {
+        stderr.to_string()
+    };
 
-    let plaintext_key = STANDARD
-        .decode(plaintext_key_b64)
-        .map_err(|e| EncryptError::KmsError(e.to_string()))?;
+    EncryptError::KmsError(format!(
+        "kmstool_enclave_cli {operation} exited unsuccessfully: {detail}"
+    ))
+}
 
-    Ok(GenKeyResult {
-        encrypted_key,
-        key: plaintext_key,
+fn parse_kms_plaintext_output(stdout: &[u8], operation: &str) -> Result<Vec<u8>, EncryptError> {
+    let output = parse_kms_stdout(stdout, operation)?;
+    decode_kms_output_field(output, "PLAINTEXT", operation)
+}
+
+fn parse_kms_genkey_output(stdout: &[u8]) -> Result<GenKeyResult, EncryptError> {
+    const OPERATION: &str = "genkey";
+
+    let output = parse_kms_stdout(stdout, OPERATION)?;
+    let encrypted_key = decode_kms_output_field(output, "CIPHERTEXT", OPERATION)?;
+    let key = decode_kms_output_field(output, "PLAINTEXT", OPERATION)?;
+
+    Ok(GenKeyResult { key, encrypted_key })
+}
+
+fn parse_kms_random_output(stdout: &[u8], expected_length: usize) -> Result<Vec<u8>, EncryptError> {
+    let bytes = parse_kms_plaintext_output(stdout, "genrandom")?;
+    if bytes.len() != expected_length {
+        return Err(EncryptError::KmsError(format!(
+            "kmstool_enclave_cli genrandom returned {} bytes; expected {expected_length}",
+            bytes.len()
+        )));
+    }
+
+    Ok(bytes)
+}
+
+fn parse_kms_stdout<'a>(stdout: &'a [u8], operation: &str) -> Result<&'a str, EncryptError> {
+    std::str::from_utf8(stdout).map_err(|error| {
+        EncryptError::KmsError(format!(
+            "kmstool_enclave_cli {operation} returned non-UTF-8 output: {error}"
+        ))
+    })
+}
+
+fn decode_kms_output_field(
+    output: &str,
+    field: &str,
+    operation: &str,
+) -> Result<Vec<u8>, EncryptError> {
+    let prefix = format!("{field}:");
+    let encoded = output
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix).map(str::trim))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            EncryptError::KmsError(format!(
+                "kmstool_enclave_cli {operation} output is missing {field}"
+            ))
+        })?;
+
+    STANDARD.decode(encoded).map_err(|error| {
+        EncryptError::KmsError(format!(
+            "kmstool_enclave_cli {operation} returned invalid base64 for {field}: {error}"
+        ))
     })
 }
 
@@ -456,29 +501,39 @@ pub fn generate_random<const LENGTH: usize>() -> [u8; LENGTH] {
 
 pub async fn generate_random_enclave<const LENGTH: usize>(
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
-) -> [u8; LENGTH] {
-    let nonce = if let Some(cred_manager) = aws_credential_manager.read().await.as_ref().cloned() {
-        let aws_creds = cred_manager
-            .get_credentials()
-            .await
-            .expect("should have creds");
+) -> Result<[u8; LENGTH], EncryptError> {
+    if let Some(cred_manager) = aws_credential_manager.read().await.as_ref().cloned() {
+        let aws_creds = cred_manager.get_credentials().await.ok_or_else(|| {
+            EncryptError::KmsError(
+                "AWS credentials are unavailable for kmstool_enclave_cli genrandom".to_string(),
+            )
+        })?;
 
-        generate_random_bytes_from_enclave(
+        let bytes = generate_random_bytes_from_enclave(
             &aws_creds.region,
             &aws_creds.access_key_id,
             &aws_creds.secret_access_key,
             &aws_creds.token,
             LENGTH,
         )
-        .await
-        .expect("should generate random bytes")
+        .await?;
+
+        bytes.try_into().map_err(|bytes: Vec<u8>| {
+            EncryptError::KmsError(format!(
+                "kmstool_enclave_cli genrandom returned {} bytes; expected {LENGTH}",
+                bytes.len()
+            ))
+        })
     } else {
         // Use OS random if aws_credential_manager is None
         let mut nonce = [0u8; LENGTH];
-        OsRng.fill_bytes(&mut nonce);
-        nonce.to_vec()
-    };
-    nonce.try_into().expect("Length mismatch")
+        OsRng.try_fill_bytes(&mut nonce).map_err(|error| {
+            EncryptError::RandomGenerationFailed(format!(
+                "OS entropy source could not fill {LENGTH} bytes: {error}"
+            ))
+        })?;
+        Ok(nonce)
+    }
 }
 
 pub async fn generate_random_bytes_from_enclave(
@@ -505,33 +560,18 @@ pub async fn generate_random_bytes_from_enclave(
         .arg(length.to_string())
         .output()
         .map_err(|e| {
-            tracing::error!(
-                "Failed to execute kmstool_enclave_cli for random byte generation: {}",
-                e
-            );
-            EncryptError::KmsError(e.to_string())
+            let error = kms_execution_error("genrandom", &e);
+            tracing::error!("{error}");
+            error
         })?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::error!(
-            "kmstool_enclave_cli random byte generation failed: {}",
-            stderr
-        );
-        return Err(EncryptError::KmsError(stderr.to_string()));
+        let error = kms_command_error("genrandom", &output.stderr);
+        tracing::error!("{error}");
+        return Err(error);
     }
 
-    let output_str =
-        String::from_utf8(output.stdout).map_err(|e| EncryptError::KmsError(e.to_string()))?;
-
-    let plaintext_b64 = output_str
-        .strip_prefix("PLAINTEXT: ")
-        .ok_or_else(|| EncryptError::KmsError("Failed to parse plaintext".to_string()))?
-        .trim();
-
-    STANDARD
-        .decode(plaintext_b64)
-        .map_err(|e| EncryptError::KmsError(format!("Failed to decode base64: {}", e)))
+    parse_kms_random_output(&output.stdout, length)
 }
 
 pub struct CustomRng {
@@ -644,5 +684,90 @@ mod tests {
         let encrypted = encrypt_key_deterministic(&key, content);
         let decrypted = decrypt_key_deterministic(&key, &encrypted).unwrap();
         assert_eq!(content.to_vec(), decrypted);
+    }
+
+    #[test]
+    fn parses_labeled_genkey_output_without_assuming_line_order() {
+        let output = b"PLAINTEXT: cGxhaW50ZXh0\nCIPHERTEXT: Y2lwaGVydGV4dA==\n";
+
+        let result = parse_kms_genkey_output(output).unwrap();
+
+        assert_eq!(result.key, b"plaintext");
+        assert_eq!(result.encrypted_key, b"ciphertext");
+    }
+
+    #[test]
+    fn truncated_genkey_output_returns_contextual_errors() {
+        let missing_ciphertext = parse_kms_genkey_output(b"PLAINTEXT: cGxhaW50ZXh0\n")
+            .unwrap_err()
+            .to_string();
+        assert!(missing_ciphertext.contains("genkey output is missing CIPHERTEXT"));
+
+        let missing_plaintext = parse_kms_genkey_output(b"CIPHERTEXT: Y2lwaGVydGV4dA==\n")
+            .unwrap_err()
+            .to_string();
+        assert!(missing_plaintext.contains("genkey output is missing PLAINTEXT"));
+    }
+
+    #[test]
+    fn non_utf8_kms_output_returns_contextual_error() {
+        let error = parse_kms_plaintext_output(&[0xff], "decrypt")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("kmstool_enclave_cli decrypt returned non-UTF-8 output"));
+    }
+
+    #[test]
+    fn malformed_base64_returns_field_and_operation_context() {
+        let error = parse_kms_plaintext_output(b"PLAINTEXT: not-base64!\n", "genrandom")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("genrandom returned invalid base64 for PLAINTEXT"));
+    }
+
+    #[test]
+    fn unexpected_random_output_length_returns_contextual_error() {
+        let error = parse_kms_random_output(b"PLAINTEXT: AQI=\n", 16)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("genrandom returned 2 bytes; expected 16"));
+    }
+
+    #[tokio::test]
+    async fn missing_aws_credentials_are_propagated() {
+        let credential_manager =
+            Arc::new(tokio::sync::RwLock::new(Some(AwsCredentialManager::new())));
+
+        let error = generate_random_enclave::<16>(credential_manager)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("AWS credentials are unavailable"));
+        assert!(error.contains("genrandom"));
+    }
+
+    #[tokio::test]
+    async fn local_random_fallback_returns_requested_length() {
+        let no_credential_manager = Arc::new(tokio::sync::RwLock::new(None));
+
+        let random = generate_random_enclave::<16>(no_credential_manager)
+            .await
+            .unwrap();
+
+        assert_eq!(random.len(), 16);
+    }
+
+    #[test]
+    fn unsuccessful_command_errors_include_operation_and_lossy_stderr() {
+        let error = kms_command_error("genkey", &[b'f', 0x80]).to_string();
+        assert!(error.contains("kmstool_enclave_cli genkey exited unsuccessfully"));
+        assert!(error.contains('f'));
+
+        let empty_error = kms_command_error("decrypt", b" \n").to_string();
+        assert!(empty_error.contains("decrypt exited unsuccessfully: no error output"));
     }
 }

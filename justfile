@@ -830,16 +830,10 @@ clean-eif:
 
 ### Tinfoil Proxy Commands ###
 
-# Build tinfoil-proxy binary using Go
+# Rebuild both checked-in Linux tinfoil-proxy binaries with pinned Go
 build-tinfoil-proxy:
-    {{container}} build --platform linux/arm64 -t tinfoil-proxy-builder -f tinfoil-proxy/Dockerfile tinfoil-proxy
-    {{container}} create --name tinfoil-proxy-extract tinfoil-proxy-builder
-    mkdir -p tinfoil-proxy/dist
-    {{container}} cp tinfoil-proxy-extract:/tinfoil-proxy tinfoil-proxy/dist/
-    {{container}} rm tinfoil-proxy-extract
-    echo "Go binary created at: tinfoil-proxy/dist/tinfoil-proxy"
-    echo "Size: $(du -h tinfoil-proxy/dist/tinfoil-proxy | cut -f1)"
-    file tinfoil-proxy/dist/tinfoil-proxy
+    tinfoil-proxy/build.sh
+    file tinfoil-proxy/dist/tinfoil-proxy tinfoil-proxy/dist/tinfoil-proxy-x86_64
 
 # Clean tinfoil-proxy build artifacts
 clean-tinfoil-proxy:

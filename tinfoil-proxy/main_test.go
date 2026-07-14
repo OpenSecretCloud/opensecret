@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -137,5 +138,46 @@ func TestDoWithResponseStartTimeoutAllowsLongBodyReads(t *testing.T) {
 	}
 	if string(body) != "ok" {
 		t.Fatalf("expected body %q, got %q", "ok", string(body))
+	}
+}
+
+func TestDoWithResponseStartTimeoutCancelsWhenBodyCloses(t *testing.T) {
+	canceled := make(chan struct{})
+	client := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			go func() {
+				<-req.Context().Done()
+				close(canceled)
+			}()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{},
+				Body:       io.NopCloser(strings.NewReader("ok")),
+			}, nil
+		}),
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://example.com", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	resp, err := doWithResponseStartTimeout(client, req, time.Second)
+	if err != nil {
+		t.Fatalf("expected response, got %v", err)
+	}
+	select {
+	case <-canceled:
+		t.Fatal("request context canceled before the response body closed")
+	default:
+	}
+
+	if err := resp.Body.Close(); err != nil {
+		t.Fatalf("failed to close response body: %v", err)
+	}
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("request context was not canceled after the response body closed")
 	}
 }

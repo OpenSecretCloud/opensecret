@@ -11,19 +11,34 @@ An OpenAI-compatible API proxy server for Tinfoil's secure enclave models, writt
 
 ## Building
 
-### Using Docker (recommended)
+### Reproducible Linux binaries
 
 ```bash
 ./build.sh
 ```
 
-This will build the Docker image and extract the binary to `dist/tinfoil-proxy`.
+The script enters the nested Nix development shell and uses its pinned Go
+toolchain to build both checked-in static Linux binaries:
+
+- `dist/tinfoil-proxy` (`linux/arm64`)
+- `dist/tinfoil-proxy-x86_64` (`linux/amd64`)
 
 ### Building directly
 
 ```bash
 go mod download
 CGO_ENABLED=0 go build -o tinfoil-proxy .
+```
+
+## Checks
+
+Run the tests, static analysis, and Go vulnerability scan with the same pinned
+toolchain:
+
+```bash
+nix develop -c go test ./...
+nix develop -c go vet ./...
+nix develop -c govulncheck ./...
 ```
 
 ## Running

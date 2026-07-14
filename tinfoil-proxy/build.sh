@@ -1,26 +1,45 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-# Build the tinfoil-proxy Docker image and extract the binary
+set -euo pipefail
 
-set -e
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-echo "Building tinfoil-proxy Docker image..."
-docker build -t tinfoil-proxy:latest .
+if [[ ${TINFOIL_PROXY_NIX_SHELL:-} != 1 ]]; then
+  exec nix develop "$script_dir" --command \
+    env TINFOIL_PROXY_NIX_SHELL=1 "$script_dir/build.sh"
+fi
 
-echo "Extracting binary from Docker image..."
+cd "$script_dir"
+
+if [[ $(go env GOVERSION) != go1.26.5 ]]; then
+  echo "expected the pinned Go 1.26.5 toolchain, found $(go env GOVERSION)" >&2
+  exit 1
+fi
+
+export CGO_ENABLED=0
+export GOTOOLCHAIN=local
+
 mkdir -p dist
+build_dir=$(mktemp -d "${TMPDIR:-/tmp}/tinfoil-proxy-build.XXXXXX")
+trap 'rm -rf "$build_dir"' EXIT
 
-# Create a container from the image (don't run it)
-CONTAINER_ID=$(docker create tinfoil-proxy:latest)
+build_linux() {
+  local arch=$1
+  local output=$2
 
-# Copy the binary out
-docker cp $CONTAINER_ID:/tinfoil-proxy dist/tinfoil-proxy
+  echo "Building Linux/$arch $output..."
+  GOOS=linux GOARCH="$arch" go build \
+    -buildvcs=false \
+    -ldflags="-s -w" \
+    -mod=readonly \
+    -trimpath \
+    -o "$build_dir/$output" \
+    .
+  install -m 0755 "$build_dir/$output" "dist/$output"
+}
 
-# Remove the container
-docker rm $CONTAINER_ID
+build_linux arm64 tinfoil-proxy
+build_linux amd64 tinfoil-proxy-x86_64
 
-# Make it executable
-chmod +x dist/tinfoil-proxy
-
-echo "Binary extracted to: dist/tinfoil-proxy"
-echo "Done!"
+go version -m dist/tinfoil-proxy | sed -n '1,8p'
+go version -m dist/tinfoil-proxy-x86_64 | sed -n '1,8p'

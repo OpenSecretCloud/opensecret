@@ -84,6 +84,8 @@ mod apple_signin;
 mod aws_credentials;
 mod billing;
 mod brave;
+#[cfg(test)]
+mod crypto_property_tests;
 mod db;
 mod email;
 mod encrypt;

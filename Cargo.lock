@@ -3070,6 +3070,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.8",
  "subtle",
+ "syn 2.0.106",
  "thiserror 1.0.63",
  "tiktoken-rs",
  "tinfoil",

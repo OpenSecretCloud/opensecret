@@ -2546,6 +2546,7 @@ dependencies = [
  "x25519-dalek",
  "x509-parser",
  "yasna",
+ "zeroize",
 ]
 
 [[package]]

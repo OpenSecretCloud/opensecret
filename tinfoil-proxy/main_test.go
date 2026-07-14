@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 )
@@ -13,6 +13,21 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+type contextCheckingBody struct {
+	ctx                 context.Context
+	closeErr            error
+	canceledBeforeClose bool
+}
+
+func (b *contextCheckingBody) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (b *contextCheckingBody) Close() error {
+	b.canceledBeforeClose = b.ctx.Err() != nil
+	return b.closeErr
 }
 
 func TestShouldSkipHeader(t *testing.T) {
@@ -143,16 +158,19 @@ func TestDoWithResponseStartTimeoutAllowsLongBodyReads(t *testing.T) {
 
 func TestDoWithResponseStartTimeoutCancelsWhenBodyCloses(t *testing.T) {
 	canceled := make(chan struct{})
+	closeErr := errors.New("close failed")
+	var body *contextCheckingBody
 	client := &http.Client{
 		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 			go func() {
 				<-req.Context().Done()
 				close(canceled)
 			}()
+			body = &contextCheckingBody{ctx: req.Context(), closeErr: closeErr}
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header:     http.Header{},
-				Body:       io.NopCloser(strings.NewReader("ok")),
+				Body:       body,
 			}, nil
 		}),
 	}
@@ -172,8 +190,11 @@ func TestDoWithResponseStartTimeoutCancelsWhenBodyCloses(t *testing.T) {
 	default:
 	}
 
-	if err := resp.Body.Close(); err != nil {
-		t.Fatalf("failed to close response body: %v", err)
+	if err := resp.Body.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("expected wrapped close error, got %v", err)
+	}
+	if body.canceledBeforeClose {
+		t.Fatal("request context canceled before the wrapped response body closed")
 	}
 	select {
 	case <-canceled:

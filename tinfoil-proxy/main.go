@@ -142,7 +142,7 @@ type cancelOnCloseReadCloser struct {
 }
 
 func (r *cancelOnCloseReadCloser) Close() error {
-	r.cancel()
+	defer r.cancel()
 	return r.ReadCloser.Close()
 }
 

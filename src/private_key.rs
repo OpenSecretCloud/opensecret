@@ -24,7 +24,9 @@ pub async fn generate_twelve_word_seed(
 ) -> Result<Mnemonic, Error> {
     // the bip39 library supports 12. 15, 18, 21, and 24 word mnemonics
     // we only support 12 words, which is 16 bytes of entropy
-    let random_bytes: [u8; 16] = generate_random_enclave::<16>(aws_credential_manager).await;
+    let random_bytes: [u8; 16] = generate_random_enclave::<16>(aws_credential_manager)
+        .await
+        .map_err(|error| Error::EncryptionError(error.to_string()))?;
 
     let mnemonic =
         Mnemonic::from_entropy(&random_bytes).map_err(|_| Error::PrivateKeyGenerationFailure)?;

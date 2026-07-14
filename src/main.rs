@@ -6,7 +6,8 @@ use crate::email::{
 use crate::encrypt::encrypt_key_deterministic;
 use crate::encrypt::generate_random;
 use crate::encrypt::{
-    decrypt_with_key, decrypt_with_kms, encrypt_with_key, CustomRng, GenKeyResult,
+    decrypt_with_key, decrypt_with_kms, encrypt_with_key, validate_enclave_root_key, CustomRng,
+    GenKeyResult,
 };
 use crate::jwt::validate_platform_jwt;
 use crate::login_routes::RegisterCredentials;
@@ -2461,12 +2462,16 @@ async fn get_or_create_enclave_key(
         let base64_encrypted_key = general_purpose::STANDARD.encode(&encrypted_key.value);
 
         // Decrypt the existing key
-        let decrypted_key = decrypt_with_kms(
-            &creds.region,
-            &creds.access_key_id,
-            &creds.secret_access_key,
-            &creds.token,
-            &base64_encrypted_key,
+        let decrypted_key = validate_enclave_root_key(
+            decrypt_with_kms(
+                &creds.region,
+                &creds.access_key_id,
+                &creds.secret_access_key,
+                &creds.token,
+                &base64_encrypted_key,
+            )
+            .map_err(|e| Error::EncryptionError(e.to_string()))?,
+            "decrypt",
         )
         .map_err(|e| Error::EncryptionError(e.to_string()))?;
 

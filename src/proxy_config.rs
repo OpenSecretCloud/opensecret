@@ -1,3 +1,5 @@
+use url::Url;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProxyConfig {
     pub base_url: String,
@@ -18,6 +20,18 @@ pub fn canonicalize_tinfoil_model(model: &str) -> String {
     }
 }
 
+pub(crate) fn is_openai_api_origin(base_url: &str) -> bool {
+    let Ok(url) = Url::parse(base_url) else {
+        return false;
+    };
+
+    url.scheme() == "https"
+        && url.host_str() == Some("api.openai.com")
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+}
+
 impl ProxyRouter {
     pub fn new(openai_base: String, openai_key: Option<String>, tinfoil_base: String) -> Self {
         assert!(
@@ -25,14 +39,11 @@ impl ProxyRouter {
             "Tinfoil API base must be configured"
         );
 
+        let is_openai = is_openai_api_origin(&openai_base);
         let default_proxy = ProxyConfig {
             base_url: openai_base.clone(),
-            api_key: if openai_base.contains("api.openai.com") {
-                openai_key
-            } else {
-                None
-            },
-            provider_name: if openai_base.contains("api.openai.com") {
+            api_key: if is_openai { openai_key } else { None },
+            provider_name: if is_openai {
                 "openai".to_string()
             } else {
                 "continuum".to_string()
@@ -73,30 +84,71 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_proxy_router_uses_openai_api_key_only_for_openai() {
-        let router = ProxyRouter::new(
-            "https://api.openai.com".to_string(),
-            Some("test-key".to_string()),
-            "http://tinfoil.example.com".to_string(),
-        );
+    fn recognizes_only_the_openai_api_https_origin() {
+        for base_url in [
+            "https://api.openai.com",
+            "https://api.openai.com/",
+            "https://api.openai.com/v1",
+            "https://api.openai.com:443/v1/",
+            "https://API.OPENAI.COM/v1",
+            "https://api.openai.com/v1/users/@me?email=user@example.com#@profile",
+        ] {
+            assert!(
+                is_openai_api_origin(base_url),
+                "expected OpenAI origin: {base_url}"
+            );
+        }
 
-        assert_eq!(router.get_default_proxy().provider_name, "openai");
-        assert_eq!(
-            router.get_default_proxy().api_key,
-            Some("test-key".to_string())
-        );
+        for base_url in [
+            "http://api.openai.com",
+            "https://api.openai.com:8443",
+            "https://api.openai.com.attacker.example",
+            "https://notapi.openai.com",
+            "https://attacker.example/api.openai.com",
+            "https://api.openai.com@attacker.example",
+            "https://attacker@api.openai.com",
+            "https://attacker:password@api.openai.com",
+            "https://api.openai.com.",
+            "api.openai.com",
+            "not a url containing api.openai.com",
+        ] {
+            assert!(
+                !is_openai_api_origin(base_url),
+                "expected non-OpenAI origin: {base_url}"
+            );
+        }
+    }
 
-        let continuum_router = ProxyRouter::new(
-            "http://continuum.example.com".to_string(),
-            Some("ignored".to_string()),
-            "http://tinfoil.example.com".to_string(),
-        );
+    #[test]
+    fn proxy_router_attaches_openai_api_key_only_to_openai_origin() {
+        for base_url in ["https://api.openai.com", "https://api.openai.com:443/v1/"] {
+            let router = ProxyRouter::new(
+                base_url.to_string(),
+                Some("test-key".to_string()),
+                "http://tinfoil.example.com".to_string(),
+            );
+            let default_proxy = router.get_default_proxy();
 
-        assert_eq!(
-            continuum_router.get_default_proxy().provider_name,
-            "continuum"
-        );
-        assert_eq!(continuum_router.get_default_proxy().api_key, None);
+            assert_eq!(default_proxy.provider_name, "openai");
+            assert_eq!(default_proxy.api_key.as_deref(), Some("test-key"));
+        }
+
+        for base_url in [
+            "http://continuum.example.com",
+            "https://api.openai.com.attacker.example",
+            "https://api.openai.com@attacker.example",
+            "https://attacker.example/api.openai.com",
+        ] {
+            let router = ProxyRouter::new(
+                base_url.to_string(),
+                Some("must-not-be-forwarded".to_string()),
+                "http://tinfoil.example.com".to_string(),
+            );
+            let default_proxy = router.get_default_proxy();
+
+            assert_eq!(default_proxy.provider_name, "continuum");
+            assert_eq!(default_proxy.api_key, None);
+        }
     }
 
     #[test]

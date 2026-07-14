@@ -111,7 +111,7 @@ mod aead_db_tamper_tests;
 use apple_signin::AppleJwtVerifier;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
 use provider_routing::{ProviderName, ProviderPreference, ProviderRouter};
-use proxy_config::ProxyRouter;
+use proxy_config::{is_openai_api_origin, ProxyRouter};
 
 const ENCLAVE_KEY_NAME: &str = "enclave_key";
 const OPENAI_API_KEY_NAME: &str = "openai_api_key";
@@ -2390,10 +2390,6 @@ fn get_kms_key_id(app_mode: &AppMode) -> String {
     }
 }
 
-fn is_default_openai_domain(domain: &str) -> bool {
-    domain.contains("openai.com")
-}
-
 fn default_os_flags_base_url(app_mode: &AppMode) -> String {
     match app_mode {
         AppMode::Prod => "https://flags.opensecret.cloud".to_string(),
@@ -3005,7 +3001,7 @@ async fn main() -> Result<(), Error> {
     let openai_api_base =
         env::var("OPENAI_API_BASE").unwrap_or_else(|_| "https://api.openai.com".to_string());
 
-    let openai_api_key = if is_default_openai_domain(&openai_api_base) {
+    let openai_api_key = if is_openai_api_origin(&openai_api_base) {
         if app_mode != AppMode::Local {
             Some(
                 retrieve_openai_api_key(aws_credential_manager.clone(), db.clone())

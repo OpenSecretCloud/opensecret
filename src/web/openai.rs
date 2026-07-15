@@ -1,7 +1,7 @@
 use crate::model_config::{model_catalog_response, openai_models_response};
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
-use crate::provider_routing::ProviderRoutingError;
+use crate::provider_routing::{ProviderName, ProviderRoutingError};
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
@@ -25,6 +25,7 @@ use hyper::header::{HeaderName, HeaderValue};
 use hyper::{Body as HyperBody, Client, Request};
 use hyper_tls::HttpsConnector;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -42,6 +43,7 @@ const REQUEST_TIMEOUT_SECS: u64 = 120; // Request timeout (generous for large no
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming reads
 
 const PROVIDER_MANAGED_CACHE_SALT_FIELD: &str = "cache_salt";
+const PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD: &str = "user_cache_secret";
 
 const LOG_PREVIEW_CHARS: usize = 150;
 
@@ -917,7 +919,11 @@ pub async fn get_chat_completion_response(
         "model".to_string(),
         json!(selected_route.provider_model_id.clone()),
     );
-    strip_provider_managed_request_fields(&mut modified_body);
+    apply_provider_managed_request_fields(
+        &mut modified_body,
+        &selected_route.proxy.provider_name,
+        user.uuid,
+    );
     billing_context.model_name = selected_route.public_model_id.clone();
 
     // Create a new hyper client with better timeout configuration
@@ -1258,9 +1264,34 @@ fn ensure_stream_usage(body: &mut serde_json::Map<String, Value>) {
     }
 }
 
-fn strip_provider_managed_request_fields(body: &mut serde_json::Map<String, Value>) {
+fn tinfoil_user_cache_secret(user_uuid: Uuid) -> String {
+    // Keep the cache namespace stable without exposing the raw user identifier.
+    hex::encode(Sha256::digest(user_uuid.as_bytes()))
+}
+
+fn apply_provider_managed_request_fields(
+    body: &mut serde_json::Map<String, Value>,
+    provider_name: &str,
+    user_uuid: Uuid,
+) {
     if body.remove(PROVIDER_MANAGED_CACHE_SALT_FIELD).is_some() {
         debug!("Stripped provider-managed completion request field: cache_salt");
+    }
+
+    let replaced_user_cache_secret = body
+        .remove(PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD)
+        .is_some();
+
+    if provider_name == ProviderName::Tinfoil.as_str() {
+        body.insert(
+            PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD.to_string(),
+            json!(tinfoil_user_cache_secret(user_uuid)),
+        );
+        if replaced_user_cache_secret {
+            debug!("Replaced provider-managed completion request field: user_cache_secret");
+        }
+    } else if replaced_user_cache_secret {
+        debug!("Stripped provider-managed completion request field: user_cache_secret");
     }
 }
 
@@ -2398,18 +2429,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strips_provider_managed_cache_salt_field() {
+    fn tinfoil_user_cache_secret_is_stable_and_unique_per_user() {
+        let first_user = Uuid::nil();
+        let second_user = Uuid::from_u128(1);
+
+        assert_eq!(
+            tinfoil_user_cache_secret(first_user),
+            "374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb"
+        );
+        assert_eq!(
+            tinfoil_user_cache_secret(first_user),
+            tinfoil_user_cache_secret(first_user)
+        );
+        assert_ne!(
+            tinfoil_user_cache_secret(first_user),
+            tinfoil_user_cache_secret(second_user)
+        );
+    }
+
+    #[test]
+    fn applies_tinfoil_user_cache_secret_and_overwrites_client_value() {
+        let user_uuid = Uuid::from_u128(42);
         let mut body = serde_json::Map::from_iter([
             ("model".to_string(), json!("kimi-k2-6")),
             ("cache_salt".to_string(), json!("user-supplied")),
+            ("user_cache_secret".to_string(), json!("client-controlled")),
             ("messages".to_string(), json!([])),
         ]);
 
-        strip_provider_managed_request_fields(&mut body);
+        apply_provider_managed_request_fields(&mut body, ProviderName::Tinfoil.as_str(), user_uuid);
 
         assert_eq!(body.get("model"), Some(&json!("kimi-k2-6")));
         assert_eq!(body.get("messages"), Some(&json!([])));
         assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
+        assert_eq!(
+            body.get(PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD),
+            Some(&json!(tinfoil_user_cache_secret(user_uuid)))
+        );
+    }
+
+    #[test]
+    fn strips_tinfoil_cache_fields_from_non_tinfoil_requests() {
+        let mut body = serde_json::Map::from_iter([
+            ("cache_salt".to_string(), json!("user-supplied")),
+            ("user_cache_secret".to_string(), json!("client-controlled")),
+        ]);
+
+        apply_provider_managed_request_fields(
+            &mut body,
+            ProviderName::Continuum.as_str(),
+            Uuid::from_u128(42),
+        );
+
+        assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
+        assert!(!body.contains_key(PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD));
     }
 
     #[test]

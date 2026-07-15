@@ -1094,6 +1094,8 @@ sudo vim /etc/nitro_enclaves/vsock-proxy.yaml
 Add these lines:
 ```
 - {address: github-proxy.tinfoil.sh, port: 443}
+# Legacy compatibility only; tinfoil-rs v0.1.3 embeds its trust root.
+- {address: tuf-repo-cdn.sigstore.dev, port: 443}
 - {address: kds-proxy.tinfoil.sh, port: 443}
 - {address: atc.tinfoil.sh, port: 443}
 - {address: inference.tinfoil.sh, port: 443}
@@ -1114,17 +1116,9 @@ Add these lines:
 - {address: router.inf10.tinfoil.sh, port: 443}
 ```
 
-`tinfoil-rs` v0.1.3 embeds its trust root, so the enclave does not need runtime
-egress to the Sigstore TUF repository CDN.
-
-When upgrading an existing host, retire the old dedicated forwarder after
-removing its allowlist entry:
-
-```sh
-sudo systemctl disable --now vsock-tuf-repo-cdn.service
-sudo rm -f /etc/systemd/system/vsock-tuf-repo-cdn.service
-sudo systemctl daemon-reload
-```
+The TUF CDN entry and service below are retained to keep existing entrypoint
+and host behavior unchanged during this minimal migration. The in-process SDK
+does not use them.
 
 Restart the nitro vsock proxy service:
 ```
@@ -1149,6 +1143,27 @@ After=network.target
 [Service]
 User=root
 ExecStart=/usr/bin/vsock-proxy --num_workers 128 8019 github-proxy.tinfoil.sh 443
+Restart=always
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### TUF Repository CDN
+```sh
+sudo vim /etc/systemd/system/vsock-tuf-repo-cdn.service
+```
+
+Add the following content:
+```
+[Unit]
+Description=Vsock TUF Repository CDN Service
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/vsock-proxy --num_workers 128 8020 tuf-repo-cdn.sigstore.dev 443
 Restart=always
 LimitNOFILE=65536
 
@@ -1501,6 +1516,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable vsock-tinfoil-api-github-proxy.service
 sudo systemctl start vsock-tinfoil-api-github-proxy.service
 sudo systemctl status vsock-tinfoil-api-github-proxy.service
+sudo systemctl enable vsock-tuf-repo-cdn.service
+sudo systemctl start vsock-tuf-repo-cdn.service
+sudo systemctl status vsock-tuf-repo-cdn.service
 sudo systemctl enable vsock-tinfoil-kds-proxy.service
 sudo systemctl start vsock-tinfoil-kds-proxy.service
 sudo systemctl status vsock-tinfoil-kds-proxy.service
@@ -1554,6 +1572,7 @@ sudo systemctl status vsock-tinfoil-router-inf10.service
 If you need to restart these services:
 ```sh
 sudo systemctl restart vsock-tinfoil-api-github-proxy.service
+sudo systemctl restart vsock-tuf-repo-cdn.service
 sudo systemctl restart vsock-tinfoil-kds-proxy.service
 sudo systemctl restart vsock-tinfoil-atc.service
 sudo systemctl restart vsock-tinfoil-inference.service

@@ -108,17 +108,15 @@ captures; the credential itself and its fingerprint are never written.
 
 `entrypoint.sh` still decrypts the historical `tinfoil_proxy_*` Secrets Manager
 value, but exports it as `TINFOIL_API_KEY` to the backend instead of launching a
-second binary. The backend is supervised through transient startup failures,
-and the VSOCK listener opens only after a bounded basic health check. Tinfoil
-discovery and attestation retry in a single background loop, so an outage at
-that boundary does not prevent login, billing, stored-conversation, or
-non-Tinfoil routes from starting. Tinfoil-dependent routes return HTTP 503
-until an attested client is ready. Each discovery or attestation attempt is
-bounded to 30 seconds before the background loop backs off and retries. The
-decrypted key is scoped to the backend supervisor and is removed before
-`socat` starts. The EIF root filesystem no longer contains the Go proxy.
-Tinfoil router, attestation, GitHub, and AMD KDS egress forwarders remain
-because the Rust SDK uses them directly.
+second binary. The existing OpenSecret startup, five-second wait, VSOCK
+exposure, and traffic-forwarder behavior are otherwise unchanged. Tinfoil
+discovery and attestation retry in a single background loop inside OpenSecret,
+so an outage at that boundary does not prevent login, billing,
+stored-conversation, or non-Tinfoil routes from starting. Tinfoil-dependent
+routes return HTTP 503 until an attested client is ready. Each discovery or
+attestation attempt is bounded to 30 seconds before the background loop backs
+off and retries. The EIF root filesystem no longer contains the Go proxy.
+Existing Tinfoil egress forwarders remain unchanged for this minimal migration.
 
 The shared attested client reuses connections. A typed DNS/TCP/TLS connection
 failure triggers a single-flight router rediscovery and attestation, then one

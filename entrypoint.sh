@@ -7,20 +7,6 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
-# Pure helper kept separate so the supervisor's stability rule is shell-testable:
-# `test "$(reset_backoff_after_sustained_run 60 30 60)" = 1`.
-reset_backoff_after_sustained_run() {
-    local runtime_s="$1"
-    local current_backoff_s="$2"
-    local stable_runtime_s="$3"
-
-    if [ "$runtime_s" -ge "$stable_runtime_s" ]; then
-        echo 1
-    else
-        echo "$current_backoff_s"
-    fi
-}
-
 # Restart-on-exit wrapper for long-running helpers started from this script.
 run_forever() {
     local name="$1"
@@ -29,13 +15,10 @@ run_forever() {
     local attempt=0
     local backoff_s=1
     local max_backoff_s=30
-    local stable_runtime_s=60
 
     set +e
     while true; do
         attempt=$((attempt + 1))
-        local start_ts
-        start_ts="$(date +%s)"
 
         "$@" &
         local pid=$!
@@ -44,15 +27,8 @@ run_forever() {
 
         wait "$pid"
         local ec=$?
-        local end_ts
-        end_ts="$(date +%s)"
-        local runtime_s=$((end_ts - start_ts))
 
-        # A process that ran stably should recover promptly from a later crash;
-        # old crash-loop history must not leave its supervisor at the 30s cap.
-        backoff_s="$(reset_backoff_after_sustained_run "$runtime_s" "$backoff_s" "$stable_runtime_s")"
-
-        log "MONITOR restarting=${name} reason=exit_code code=${ec} old_pid=${pid} attempt=${attempt} runtime_s=${runtime_s} backoff_s=${backoff_s}"
+        log "MONITOR restarting=${name} reason=exit_code code=${ec} old_pid=${pid} attempt=${attempt} backoff_s=${backoff_s}"
         sleep "$backoff_s"
 
         if [ "$backoff_s" -lt "$max_backoff_s" ]; then
@@ -206,9 +182,8 @@ get_continuum_proxy_api_key_secret() {
     vsock_request $cid $port "$request"
 }
 
-# Function to get the Tinfoil API key from Secrets Manager. The deployed
-# secret names retain their historical "proxy" prefix.
-get_tinfoil_api_key_secret() {
+# Function to get tinfoil proxy API key from Secrets Manager
+get_tinfoil_proxy_api_key_secret() {
     local cid=3
     local port=8003
 
@@ -372,8 +347,9 @@ else
     log "Added development os-flags domain to /etc/hosts"
 fi
 
-# Add hostnames used by the in-process Tinfoil SDK to /etc/hosts
+# Add Tinfoil proxy hostnames to /etc/hosts
 echo "127.0.0.16 github-proxy.tinfoil.sh" >> /etc/hosts
+echo "127.0.0.17 tuf-repo-cdn.sigstore.dev" >> /etc/hosts
 echo "127.0.0.19 kds-proxy.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.25 atc.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.33 inference.tinfoil.sh" >> /etc/hosts
@@ -392,7 +368,7 @@ echo "127.0.0.29 router.inf7.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.30 router.inf8.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.31 router.inf9.tinfoil.sh" >> /etc/hosts
 echo "127.0.0.32 router.inf10.tinfoil.sh" >> /etc/hosts
-log "Added Tinfoil SDK domains (including legacy router domains) to /etc/hosts"
+log "Added Tinfoil proxy domains (including legacy router domains) to /etc/hosts"
 
 # Add Kagi Search hostname to /etc/hosts
 echo "127.0.0.23 kagi.com" >> /etc/hosts
@@ -483,9 +459,12 @@ run_forever tf_os_flags python3 /app/traffic_forwarder.py 127.0.0.18 443 3 8028 
 log "Starting Apple OAuth traffic forwarder"
 run_forever tf_apple_oauth python3 /app/traffic_forwarder.py 127.0.0.15 443 3 8018 &
 
-# Start the traffic forwarders used by the in-process Tinfoil SDK
+# Start the traffic forwarders for Tinfoil proxy in the background
 log "Starting Tinfoil GitHub proxy traffic forwarder"
 run_forever tf_tinfoil_github_proxy python3 /app/traffic_forwarder.py 127.0.0.16 443 3 8019 &
+
+log "Starting TUF Repository CDN traffic forwarder"
+run_forever tf_tuf_repo_cdn python3 /app/traffic_forwarder.py 127.0.0.17 443 3 8020 &
 
 log "Starting Tinfoil KDS proxy traffic forwarder"
 run_forever tf_tinfoil_kds_proxy python3 /app/traffic_forwarder.py 127.0.0.19 443 3 8022 &
@@ -678,12 +657,19 @@ else
     log "Apple OAuth connection failed"
 fi
 
-# Test the Tinfoil Rust SDK's required egress services
+# Test the connections to Tinfoil proxy services
 log "Testing connection to Tinfoil GitHub proxy:"
 if timeout 5 bash -c '</dev/tcp/127.0.0.16/443'; then
     log "Tinfoil GitHub proxy connection successful"
 else
     log "Tinfoil GitHub proxy connection failed"
+fi
+
+log "Testing connection to TUF Repository CDN:"
+if timeout 5 bash -c '</dev/tcp/127.0.0.17/443'; then
+    log "TUF Repository CDN connection successful"
+else
+    log "TUF Repository CDN connection failed"
 fi
 
 log "Testing connection to Tinfoil KDS proxy:"
@@ -874,89 +860,67 @@ if [ "$APP_MODE" != "local" ]; then
     # Set OPENAI_API_BASE to point to the local proxy
     export OPENAI_API_BASE="http://127.0.0.1:8092"
     
-    # Get the API key consumed directly by the in-process Tinfoil Rust SDK.
-    log "Fetching Tinfoil API key"
-    tinfoil_api_key_response=$(get_tinfoil_api_key_secret)
-    log "Retrieved Tinfoil API key response"
+    # Get Tinfoil Proxy API key from Secrets Manager
+    log "Fetching Tinfoil Proxy API key"
+    tinfoil_proxy_api_key_response=$(get_tinfoil_proxy_api_key_secret)
+    log "Retrieved raw Tinfoil Proxy API key response"
 
     # Check if the response is an error
-    if echo "$tinfoil_api_key_response" | jq -e '.response_type == "error"' > /dev/null; then
-        error_message=$(echo "$tinfoil_api_key_response" | jq -r '.response_value')
-        log "Error: Failed to get Tinfoil API key. Error message: $error_message"
+    if echo "$tinfoil_proxy_api_key_response" | jq -e '.response_type == "error"' > /dev/null; then
+        error_message=$(echo "$tinfoil_proxy_api_key_response" | jq -r '.response_value')
+        log "Error: Failed to get Tinfoil Proxy API key. Error message: $error_message"
         exit 1
     fi
 
     # Extract the encrypted API key value from the JSON structure
-    tinfoil_api_key_encrypted=$(echo "$tinfoil_api_key_response" | jq -r '.response_value | fromjson | .api_key')
-    if [ -z "$tinfoil_api_key_encrypted" ]; then
-        log "Error: Failed to extract Tinfoil API key from the response"
+    tinfoil_proxy_api_key_encrypted=$(echo "$tinfoil_proxy_api_key_response" | jq -r '.response_value | fromjson | .api_key')
+    if [ -z "$tinfoil_proxy_api_key_encrypted" ]; then
+        log "Error: Failed to extract Tinfoil Proxy API key from the response"
+        log "Secret response: $tinfoil_proxy_api_key_response"
         exit 1
     fi
 
     # Decrypt the API key using kmstool_enclave_cli
-    log "Decrypting Tinfoil API key"
+    log "Decrypting Tinfoil Proxy API key"
     decryption_output=$(kmstool_enclave_cli decrypt \
         --region "$region" \
         --proxy-port 8000 \
         --aws-access-key-id "$access_key_id" \
         --aws-secret-access-key "$secret_access_key" \
         --aws-session-token "$session_token" \
-        --ciphertext "$tinfoil_api_key_encrypted" 2>&1)
+        --ciphertext "$tinfoil_proxy_api_key_encrypted" 2>&1)
 
     decrypted_api_key=$(echo "$decryption_output" | sed -n 's/PLAINTEXT: //p')
 
     if [ -z "$decrypted_api_key" ]; then
-        log "Error: Failed to decrypt Tinfoil API key"
+        log "Error: Failed to decrypt Tinfoil Proxy API key"
+        log "Decryption output: $decryption_output"
         exit 1
     fi
 
     # Base64 decode the decrypted API key
-    TINFOIL_API_KEY=$(echo "$decrypted_api_key" | base64 -d)
+    tinfoil_proxy_api_key=$(echo "$decrypted_api_key" | base64 -d)
 
-    if [ -z "$TINFOIL_API_KEY" ]; then
-        log "Error: Failed to base64 decode Tinfoil API key"
+    if [ -z "$tinfoil_proxy_api_key" ]; then
+        log "Error: Failed to base64 decode Tinfoil Proxy API key"
         exit 1
     fi
 
-    log "Tinfoil API key retrieved for the in-process SDK"
+    log "Tinfoil Proxy API key retrieved, decrypted, and decoded successfully"
 else
     # For local mode, use the default OpenAI API base or the one set in the environment
     export OPENAI_API_BASE=${OPENAI_API_BASE:-"https://api.openai.com"}
-    if [ -z "${TINFOIL_API_KEY:-}" ]; then
-        log "Error: TINFOIL_API_KEY must be set in local mode"
-        exit 1
-    fi
+    # No tinfoil proxy in local mode
+    tinfoil_proxy_api_key="${TINFOIL_API_KEY:-}"
 fi
 
-# Capture the Tinfoil key in the backend supervisor only. The parent immediately
-# clears all plaintext/decryption variables so later processes, including socat,
-# do not inherit the key.
-log "Starting supervised opensecret backend"
-(
-    unset tinfoil_api_key_response tinfoil_api_key_encrypted decrypted_api_key decryption_output
-    export TINFOIL_API_KEY
-    export RUST_LOG_STYLE=never
-    export RUST_LOG="${RUST_LOG:-debug,hyper=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sdk_sqs=info,aws_config=info}"
-    run_forever opensecret /app/opensecret
-) &
-opensecret_supervisor_pid=$!
-unset TINFOIL_API_KEY tinfoil_api_key_response tinfoil_api_key_encrypted decrypted_api_key decryption_output
+# Start the opensecret
+log "Starting opensecret..."
+RUST_LOG_STYLE=never RUST_LOG="${RUST_LOG:-debug,hyper=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sdk_sqs=info,aws_config=info}" APP_MODE="$APP_MODE" OPENAI_API_BASE="$OPENAI_API_BASE" TINFOIL_API_KEY="$tinfoil_proxy_api_key" /app/opensecret &
 
-# Do not expose the enclave's public VSOCK listener until the backend is ready.
-# Tinfoil discovery and attestation retry inside the healthy backend, so an
-# external Tinfoil outage no longer forces backend supervisor restarts here.
-readiness_timeout_s=120
-readiness_deadline=$(( $(date +%s) + readiness_timeout_s ))
-log "Waiting up to ${readiness_timeout_s}s for opensecret readiness"
-while ! curl --fail --silent --max-time 2 http://127.0.0.1:3000/health-check >/dev/null; do
-    if [ "$(date +%s)" -ge "$readiness_deadline" ]; then
-        log "ERROR: opensecret did not become ready within ${readiness_timeout_s}s (supervisor pid ${opensecret_supervisor_pid})"
-        exit 1
-    fi
-
-    sleep 1
-done
-log "opensecret is ready"
+# Wait for the opensecret to start
+log "Waiting for opensecret to start"
+sleep 5
 
 # Start socat to forward from vsock to the opensecret
 log "Starting socat..."

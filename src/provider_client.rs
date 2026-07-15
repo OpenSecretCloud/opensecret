@@ -1,6 +1,6 @@
 use crate::provider_routing::ProviderName;
 use crate::proxy_config::ProxyConfig;
-use axum::http::{header, HeaderMap, HeaderName};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use hyper::client::HttpConnector;
@@ -491,7 +491,6 @@ impl TinfoilTransport {
 /// Continuum/OpenAI-compatible providers.
 #[derive(Clone)]
 pub struct ProviderClient {
-    request_builder: reqwest_tinfoil::Client,
     tinfoil: TinfoilTransport,
     standard: StandardHttpClient,
 }
@@ -500,7 +499,6 @@ impl ProviderClient {
     pub async fn new(tinfoil_api_key: String) -> Result<Self, ProviderClientError> {
         install_crypto_provider();
 
-        let request_builder = request_builder_client()?;
         let secure_transport = Arc::new(SecureTinfoilTransport {
             api_key: tinfoil_api_key,
             client: RwLock::new(SecureClientSlot {
@@ -513,7 +511,6 @@ impl ProviderClient {
         secure_transport.start_background_initialization();
 
         Ok(Self {
-            request_builder,
             tinfoil: TinfoilTransport::Secure(secure_transport),
             standard: standard_http_client(),
         })
@@ -522,10 +519,8 @@ impl ProviderClient {
     #[cfg(test)]
     fn uninitialized_for_test() -> Result<Self, ProviderClientError> {
         install_crypto_provider();
-        let request_builder = request_builder_client()?;
 
         Ok(Self {
-            request_builder,
             tinfoil: TinfoilTransport::Secure(Arc::new(SecureTinfoilTransport {
                 api_key: "unused-test-key".to_string(),
                 client: RwLock::new(SecureClientSlot {
@@ -544,12 +539,11 @@ impl ProviderClient {
     #[cfg(test)]
     pub fn for_test(base_url: String) -> Result<Self, ProviderClientError> {
         install_crypto_provider();
-        let request_builder = request_builder_client()?;
+        let client = test_http_client()?;
 
         Ok(Self {
-            request_builder: request_builder.clone(),
             tinfoil: TinfoilTransport::Plain {
-                client: request_builder,
+                client,
                 base_url,
                 api_key: "test-tinfoil-key".to_string(),
             },
@@ -583,9 +577,8 @@ impl ProviderClient {
         // the atomic claim prevents discovery herds.
         self.tinfoil.start_background_initialization();
         let attempt = self.tinfoil.snapshot()?;
-        let first_request = self
-            .build_tinfoil_request_for_attempt(provider, request.clone(), &attempt)
-            .map_err(|error| ProviderRequestError::Build(error.to_string()))?;
+        let first_request =
+            self.build_tinfoil_request_for_attempt(provider, request.clone(), &attempt)?;
 
         let send = async {
             match attempt {
@@ -611,13 +604,11 @@ impl ProviderClient {
                             // failure; do not expose JoinError internals.
                             .map_err(|_| ProviderRequestError::TinfoilUnavailable)??;
                             let retry_attempt = TinfoilAttempt::Secure(refreshed.clone());
-                            let retry_request = self
-                                .build_tinfoil_request_for_attempt(
-                                    provider,
-                                    request,
-                                    &retry_attempt,
-                                )
-                                .map_err(|error| ProviderRequestError::Build(error.to_string()))?;
+                            let retry_request = self.build_tinfoil_request_for_attempt(
+                                provider,
+                                request,
+                                &retry_attempt,
+                            )?;
                             refreshed
                                 .client
                                 .http_client()
@@ -648,7 +639,7 @@ impl ProviderClient {
         &self,
         provider: &ProxyConfig,
         request: ProviderRequest<'_>,
-    ) -> Result<ReqwestRequest, reqwest_tinfoil::Error> {
+    ) -> Result<ReqwestRequest, ProviderRequestError> {
         self.build_tinfoil_request_for_attempt(
             provider,
             request,
@@ -664,7 +655,7 @@ impl ProviderClient {
         provider: &ProxyConfig,
         request: ProviderRequest<'_>,
         attempt: &TinfoilAttempt,
-    ) -> Result<ReqwestRequest, reqwest_tinfoil::Error> {
+    ) -> Result<ReqwestRequest, ProviderRequestError> {
         debug_assert_eq!(provider.provider_name, ProviderName::Tinfoil.as_str());
         let ProviderRequest {
             method,
@@ -690,22 +681,33 @@ impl ProviderClient {
             base_url.trim_end_matches('/'),
             path.trim_start_matches('/')
         );
-        let mut request = self.request_builder.request(method, url);
+        let url = reqwest_tinfoil::Url::parse(&url)
+            .map_err(|error| ProviderRequestError::Build(error.to_string()))?;
+        let mut request = ReqwestRequest::new(method, url);
 
         if let Some(headers) = source_headers {
-            request = request.headers(forwarded_headers(headers));
+            *request.headers_mut() = forwarded_headers(headers);
         }
         if let Some(content_type) = content_type {
-            request = request.header(header::CONTENT_TYPE, content_type);
+            let content_type = HeaderValue::from_str(content_type)
+                .map_err(|error| ProviderRequestError::Build(error.to_string()))?;
+            request
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, content_type);
         }
         if !api_key.is_empty() {
-            request = request.bearer_auth(api_key);
+            let mut authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .map_err(|error| ProviderRequestError::Build(error.to_string()))?;
+            authorization.set_sensitive(true);
+            request
+                .headers_mut()
+                .insert(header::AUTHORIZATION, authorization);
         }
         if let Some(body) = body {
-            request = request.body(body);
+            *request.body_mut() = Some(body.into());
         }
 
-        request.build()
+        Ok(request)
     }
 
     async fn send_standard(
@@ -762,8 +764,13 @@ impl ProviderClient {
     }
 }
 
-fn request_builder_client() -> Result<reqwest_tinfoil::Client, reqwest_tinfoil::Error> {
+#[cfg(test)]
+fn test_http_client() -> Result<reqwest_tinfoil::Client, reqwest_tinfoil::Error> {
     reqwest_tinfoil::Client::builder()
+        // Plain transport exists only for loopback contract tests. Supplying an
+        // empty trust store keeps client construction independent of host CA
+        // files while ensuring an accidental HTTPS test request trusts no CA.
+        .tls_certs_only(std::iter::empty::<reqwest_tinfoil::Certificate>())
         .pool_idle_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(10)
         .build()
@@ -1181,13 +1188,17 @@ mod tests {
     #[test]
     fn retry_rebuild_preserves_request_contract_for_a_new_router() {
         let client = ProviderClient::for_test("http://unused.invalid".to_string()).unwrap();
+        let test_client = match &client.tinfoil {
+            TinfoilTransport::Plain { client, .. } => client.clone(),
+            TinfoilTransport::Secure(_) => unreachable!("for_test uses the plain transport"),
+        };
         let old_router = TinfoilAttempt::Plain {
-            client: client.request_builder.clone(),
+            client: test_client.clone(),
             base_url: "https://old-router.example".to_string(),
             api_key: "same-key".to_string(),
         };
         let new_router = TinfoilAttempt::Plain {
-            client: client.request_builder.clone(),
+            client: test_client,
             base_url: "https://new-router.example".to_string(),
             api_key: "same-key".to_string(),
         };

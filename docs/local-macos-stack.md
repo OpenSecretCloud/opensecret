@@ -75,9 +75,10 @@ nix develop
 When `.env` does not already exist, `nix develop` starts from `.env.sample`,
 fills in the local Postgres URL, and generates local-only secret values.
 
-The `run-local-backend-macos` recipe injects the local proxy URLs when it starts
-the backend. If creating `.env` by hand and running `cargo run` directly,
-generate local-only secrets with OpenSSL and set the proxy settings yourself:
+The `run-local-backend-macos` recipe injects the local Continuum proxy URL and
+direct Tinfoil API key when it starts the backend. If creating `.env` by hand
+and running `cargo run` directly, generate local-only secrets with OpenSSL and
+set these provider values yourself:
 
 ```dotenv
 APP_MODE=local

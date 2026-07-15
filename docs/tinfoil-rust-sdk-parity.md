@@ -134,9 +134,11 @@ vendored Continuum proxy build. All Tinfoil-specific Go source, module files,
 build recipes, nested flake, binary artifacts, and root-filesystem wiring are
 removed.
 
-The companion `OpenSecretCloud/opensecret-workspaces` compatibility change must
-be rolled out first. The updated manager supports both sidecar and SDK backend
-branches, while the legacy manager still expects the recipes removed here.
+The companion `OpenSecretCloud/opensecret-workspaces` change must merge with
+this backend change. The updated manager intentionally supports only the SDK
+backend. Existing workspaces must stop services with the old manager, then
+rebase both repositories before starting again; the old manager still expects
+the recipes removed here.
 
 The released Rust SDK currently verifies AMD SEV-SNP enclaves; its TDX verifier
 is not implemented. This matches the Tinfoil deployment selected by the current

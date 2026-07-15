@@ -1156,7 +1156,7 @@ sudo vim /etc/systemd/system/vsock-tuf-repo-cdn.service
 ```
 
 Add the following content:
-```
+```ini
 [Unit]
 Description=Vsock TUF Repository CDN Service
 After=network.target

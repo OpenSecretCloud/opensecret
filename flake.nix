@@ -174,11 +174,10 @@
               # Set up Python environment
               export PYTHONPATH="$(find ${pkgs.python3}/lib -name site-packages):$PYTHONPATH"
 
-              # Copy opensecret and continuum-proxy to their locations
+              # Copy opensecret and the remaining Continuum sidecar.
               mkdir -p /app
               install -m 755 ${opensecretPkg}/bin/opensecret /app/
               install -m 755 ${continuum-proxy}/bin/continuum-proxy /app/
-              install -m 755 ${tinfoil-proxy}/bin/tinfoil-proxy /app/
 
               ${builtins.readFile ./entrypoint.sh}
             '')
@@ -210,7 +209,6 @@
             pkgs.curl
             nitro-bins
             continuum-proxy
-            tinfoil-proxy
           ];
           pathsToLink = [ "/bin" "/lib" "/app" "/usr/bin" "/usr/sbin" "/sbin" ];
         };
@@ -272,6 +270,9 @@
           };
           cargoLock = {
             lockFile = ./Cargo.lock;
+            outputHashes = {
+              "tinfoil-0.1.0" = "sha256-ViCg20dzw61r1k740xQpyJjfBthv6yXHzBAhxH7OC8Y=";
+            };
           };
           nativeBuildInputs = [
             pkgs.pkg-config
@@ -432,13 +433,6 @@
           mkdir -p $out/bin
           cp ${./continuum-proxy} $out/bin/continuum-proxy
           chmod +x $out/bin/continuum-proxy
-        '';
-
-        # Copy tinfoil-proxy from local filesystem
-        tinfoil-proxy = pkgs.runCommand "tinfoil-proxy" {} ''
-          mkdir -p $out/bin
-          cp ${./tinfoil-proxy/dist/tinfoil-proxy} $out/bin/tinfoil-proxy
-          chmod +x $out/bin/tinfoil-proxy
         '';
 
         arch = pkgs.stdenv.hostPlatform.uname.processor;

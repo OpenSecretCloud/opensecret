@@ -96,6 +96,7 @@ mod models;
 mod oauth;
 mod os_flags;
 mod private_key;
+mod provider_client;
 mod provider_routing;
 mod proxy_config;
 #[cfg(test)]
@@ -110,6 +111,7 @@ mod aead_db_tamper_tests;
 
 use apple_signin::AppleJwtVerifier;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
+use provider_client::{ProviderClient, ProviderRequestError};
 use provider_routing::{ProviderName, ProviderPreference, ProviderRouter};
 use proxy_config::ProxyRouter;
 
@@ -277,6 +279,9 @@ pub enum ApiError {
     #[error("Internal server error")]
     InternalServerError,
 
+    #[error("Upstream provider temporarily unavailable")]
+    ServiceUnavailable,
+
     #[error("Bad Request")]
     BadRequest,
 
@@ -336,6 +341,7 @@ impl IntoResponse for ApiError {
             ApiError::InvalidJwt => StatusCode::UNAUTHORIZED,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::InternalServerError => StatusCode::INTERNAL_SERVER_ERROR,
+            ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::BadRequest => StatusCode::BAD_REQUEST,
             ApiError::Conflict => StatusCode::CONFLICT,
             ApiError::InvalidInviteCode => StatusCode::UNAUTHORIZED,
@@ -361,6 +367,17 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response()
+    }
+}
+
+impl From<ProviderRequestError> for ApiError {
+    fn from(error: ProviderRequestError) -> Self {
+        match error {
+            ProviderRequestError::TinfoilUnavailable => Self::ServiceUnavailable,
+            ProviderRequestError::Timeout(_)
+            | ProviderRequestError::Build(_)
+            | ProviderRequestError::Send(_) => Self::InternalServerError,
+        }
     }
 }
 
@@ -463,6 +480,7 @@ pub struct AppState {
     config: Config,
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
     enclave_key: Vec<u8>,
+    provider_client: Arc<ProviderClient>,
     proxy_router: Arc<ProxyRouter>,
     provider_router: Arc<ProviderRouter>,
     resend_api_key: Option<String>,
@@ -491,6 +509,8 @@ pub struct AppStateBuilder {
     aws_credential_manager: Option<Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>>,
     openai_api_key: Option<String>,
     openai_api_base: Option<String>,
+    tinfoil_api_key: Option<String>,
+    #[cfg(test)]
     tinfoil_api_base: Option<String>,
     jwt_secret: Option<Vec<u8>>,
     resend_api_key: Option<String>,
@@ -543,6 +563,12 @@ impl AppStateBuilder {
         self
     }
 
+    pub fn tinfoil_api_key(mut self, tinfoil_api_key: String) -> Self {
+        self.tinfoil_api_key = Some(tinfoil_api_key);
+        self
+    }
+
+    #[cfg(test)]
     pub fn tinfoil_api_base(mut self, tinfoil_api_base: String) -> Self {
         self.tinfoil_api_base = Some(tinfoil_api_base);
         self
@@ -646,6 +672,32 @@ impl AppStateBuilder {
             .jwt_secret
             .ok_or(Error::BuilderError("jwt_secret is required".to_string()))?;
 
+        #[cfg(test)]
+        let provider_client = if let Some(tinfoil_api_base) = self.tinfoil_api_base {
+            ProviderClient::for_test(tinfoil_api_base)
+        } else {
+            let tinfoil_api_key = self.tinfoil_api_key.ok_or(Error::BuilderError(
+                "tinfoil_api_key is required".to_string(),
+            ))?;
+            ProviderClient::new(tinfoil_api_key).await
+        }
+        .map_err(|error| {
+            Error::BuilderError(format!("Failed to initialize provider client: {error}"))
+        })?;
+
+        #[cfg(not(test))]
+        let provider_client = {
+            let tinfoil_api_key = self.tinfoil_api_key.ok_or(Error::BuilderError(
+                "tinfoil_api_key is required".to_string(),
+            ))?;
+            ProviderClient::new(tinfoil_api_key)
+                .await
+                .map_err(|error| {
+                    Error::BuilderError(format!("Failed to initialize provider client: {error}"))
+                })?
+        };
+        let provider_client = Arc::new(provider_client);
+
         let config = Config {
             jwt_keys: jwt::JwtKeys::new(jwt_secret)?,
             access_token_maxage: 60,  // 60 minutes
@@ -725,16 +777,13 @@ impl AppStateBuilder {
         // Initialize the AppleJwtVerifier
         let apple_jwt_verifier = Arc::new(AppleJwtVerifier::new());
 
-        // Initialize the ProxyRouter
-        let tinfoil_api_base = self
-            .tinfoil_api_base
-            .clone()
-            .expect("Tinfoil API base must be configured");
-
+        // Tinfoil routing is identified here, but the in-process SDK resolves
+        // and attests its enclave independently in the background. Its control
+        // plane therefore cannot gate AppState construction or non-Tinfoil routes.
         let proxy_router = Arc::new(ProxyRouter::new(
             openai_api_base.clone(),
             self.openai_api_key.clone(),
-            tinfoil_api_base,
+            provider_client.tinfoil_base_url(),
         ));
         let provider_router = Arc::new(ProviderRouter::default());
 
@@ -766,6 +815,7 @@ impl AppStateBuilder {
             config,
             aws_credential_manager,
             enclave_key,
+            provider_client,
             proxy_router,
             provider_router,
             resend_api_key: self.resend_api_key,
@@ -3022,8 +3072,30 @@ async fn main() -> Result<(), Error> {
         None // No API key needed if not using OpenAI's domain
     };
 
-    // Tinfoil is a hard runtime requirement for OpenSecret.
-    let tinfoil_api_base = env::var("TINFOIL_API_BASE").expect("TINFOIL_API_BASE must be set");
+    // Tinfoil is a hard runtime requirement for OpenSecret. In local mode the
+    // managed workspace symlinks the shared key into this gitignored path.
+    let tinfoil_api_key = match env::var("TINFOIL_API_KEY") {
+        Ok(key) if !key.trim().is_empty() => key.trim().to_string(),
+        _ if app_mode == AppMode::Local => std::fs::read_to_string(
+            ".local/secrets/tinfoil_api_key",
+        )
+        .map(|key| key.trim().to_string())
+        .map_err(|error| {
+            Error::BuilderError(format!(
+                "TINFOIL_API_KEY is required (or write .local/secrets/tinfoil_api_key in local mode): {error}"
+            ))
+        })?,
+        _ => {
+            return Err(Error::BuilderError(
+                "TINFOIL_API_KEY is required".to_string(),
+            ))
+        }
+    };
+    if tinfoil_api_key.is_empty() {
+        return Err(Error::BuilderError(
+            "TINFOIL_API_KEY must not be empty".to_string(),
+        ));
+    }
 
     let jwt_secret = get_or_create_jwt_secret(
         &app_mode,
@@ -3150,7 +3222,7 @@ async fn main() -> Result<(), Error> {
         .aws_credential_manager(aws_credential_manager)
         .openai_api_key(openai_api_key)
         .openai_api_base(openai_api_base)
-        .tinfoil_api_base(tinfoil_api_base)
+        .tinfoil_api_key(tinfoil_api_key)
         .jwt_secret(jwt_secret)
         .resend_api_key(resend_api_key)
         .github_client_secret(github_client_secret.clone())

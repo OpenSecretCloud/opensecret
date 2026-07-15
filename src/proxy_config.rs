@@ -63,6 +63,7 @@ impl ProxyRouter {
         self.tinfoil_proxy.clone()
     }
 
+    #[cfg(test)]
     pub fn get_tinfoil_base_url(&self) -> String {
         self.tinfoil_proxy.base_url.clone()
     }

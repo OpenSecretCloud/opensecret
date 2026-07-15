@@ -1,6 +1,9 @@
 use crate::model_config::{model_catalog_response, openai_models_response};
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
+use crate::provider_client::{
+    ProviderClient, ProviderRequest, ProviderRequestError, ProviderResponse,
+};
 use crate::provider_routing::{ProviderName, ProviderRoutingError};
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
@@ -8,7 +11,7 @@ use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_S
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
 use crate::web::openai_auth::AuthMethod;
 use crate::{ApiError, AppState};
-use axum::http::{header, HeaderMap};
+use axum::http::HeaderMap;
 use axum::{
     extract::State,
     response::sse::{Event, Sse},
@@ -19,11 +22,8 @@ use axum::{
 use base64::{engine::general_purpose, Engine as _};
 use bigdecimal::BigDecimal;
 use chrono::Utc;
-use futures::{StreamExt, TryStreamExt};
-use hyper::body::to_bytes;
-use hyper::header::{HeaderName, HeaderValue};
-use hyper::{Body as HyperBody, Client, Request};
-use hyper_tls::HttpsConnector;
+use futures::StreamExt;
+use reqwest_tinfoil::Method;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -926,13 +926,6 @@ pub async fn get_chat_completion_response(
     );
     billing_context.model_name = selected_route.public_model_id.clone();
 
-    // Create a new hyper client with better timeout configuration
-    let https = HttpsConnector::new();
-    let client = Client::builder()
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(10)
-        .build::<_, HyperBody>(https);
-
     // Prepare the request to proxies
     debug!(
         "Sending request for public model {} as provider model {} via {}",
@@ -961,7 +954,14 @@ pub async fn get_chat_completion_response(
             user.uuid, proxy_config.provider_name, provider_model_name, request_log_metadata
         );
 
-        match try_provider(&client, &proxy_config, &request_body_json, headers).await {
+        match try_provider(
+            &state.provider_client,
+            &proxy_config,
+            request_body_json,
+            headers,
+        )
+        .await
+        {
             Ok(response) => {
                 info!(
                     "Successfully got response from provider {} for model {}",
@@ -982,7 +982,7 @@ pub async fn get_chat_completion_response(
                     "Chat completion request failed for provider {} and model {}: {}",
                     proxy_config.provider_name, provider_model_name, err
                 );
-                return Err(ApiError::InternalServerError);
+                return Err(ApiError::from(err));
             }
         }
     };
@@ -996,7 +996,7 @@ pub async fn get_chat_completion_response(
     if !is_streaming {
         // NON-STREAMING: Simple case
         debug!("Processing non-streaming response with internal billing");
-        let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
+        let body_bytes = res.bytes().await.map_err(|e| {
             error!("Failed to read response body: {:?}", e);
             ApiError::InternalServerError
         })?;
@@ -1048,8 +1048,8 @@ pub async fn get_chat_completion_response(
     let response_model_id = selected_route.response_model_id.clone();
 
     tokio::spawn(async move {
-        let mut body_stream = res.into_body().into_stream();
-        let mut buffer = String::new();
+        let mut body_stream = res.bytes_stream();
+        let mut buffer = Vec::new();
         let mut usage_accumulator = StreamUsageAccumulator::default();
 
         loop {
@@ -1062,12 +1062,11 @@ pub async fn get_chat_completion_response(
                 Ok(Some(chunk_result)) => {
                     match chunk_result {
                         Ok(bytes) => {
-                            let chunk_str = String::from_utf8_lossy(bytes.as_ref());
-                            buffer.push_str(&chunk_str);
+                            buffer.extend_from_slice(bytes.as_ref());
 
                             // Parse SSE frames
                             while let Some(frame) = extract_sse_frame(&mut buffer) {
-                                if frame == "[DONE]" {
+                                if frame == b"[DONE]" {
                                     finalize_stream_usage(
                                         &mut usage_accumulator,
                                         StreamUsageFinalization::ProviderDone,
@@ -1082,7 +1081,7 @@ pub async fn get_chat_completion_response(
                                     return;
                                 }
 
-                                match serde_json::from_str::<Value>(&frame) {
+                                match serde_json::from_slice::<Value>(&frame) {
                                     Ok(mut json) => {
                                         // vLLM can report cumulative usage on every delta, while
                                         // providers may add cache details after finish_reason.
@@ -1331,30 +1330,48 @@ fn canonicalize_response_model(json: &mut Value, response_model_id: &str) {
     }
 }
 
-/// Helper to extract SSE frame from buffer
-/// Returns the data portion of "data: <content>" frames, None if no complete frame available
-fn extract_sse_frame(buffer: &mut String) -> Option<String> {
+/// Returns the joined data payload of the next complete SSE frame.
+///
+/// Buffering bytes until the frame boundary avoids corrupting a UTF-8 code
+/// point when the network splits it across chunks.
+fn extract_sse_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
     loop {
-        // Look for a complete SSE frame (ends with \n\n)
-        if let Some(pos) = buffer.find("\n\n") {
-            let frame = buffer[..pos].to_string();
-            *buffer = buffer[pos + 2..].to_string();
+        let (frame_end, delimiter_len) = find_sse_frame_boundary(buffer)?;
+        let frame = buffer[..frame_end].to_vec();
+        buffer.drain(..frame_end + delimiter_len);
 
-            // Skip empty frames
-            if frame.trim().is_empty() {
-                continue;
-            }
-
-            // Return data content if it's a data frame, otherwise keep looking
-            if let Some(data) = frame.strip_prefix("data: ") {
-                return Some(data.to_string());
-            }
-            // Skip non-data frames (comments, etc.) and continue looking
+        if frame.iter().all(|byte| byte.is_ascii_whitespace()) {
             continue;
         }
 
-        // No complete frame available
-        return None;
+        let mut data = Vec::new();
+        for line in frame.split(|byte| *byte == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let Some(value) = line.strip_prefix(b"data:") else {
+                continue;
+            };
+            let value = value.strip_prefix(b" ").unwrap_or(value);
+            if !data.is_empty() {
+                data.push(b'\n');
+            }
+            data.extend_from_slice(value);
+        }
+
+        if !data.is_empty() {
+            return Some(data);
+        }
+    }
+}
+
+fn find_sse_frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+
+    match (lf, crlf) {
+        (Some(lf), Some(crlf)) if lf < crlf => Some((lf, 2)),
+        (Some(_), Some(crlf)) | (None, Some(crlf)) => Some((crlf, 4)),
+        (Some(lf), None) => Some((lf, 2)),
+        (None, None) => None,
     }
 }
 
@@ -1500,56 +1517,36 @@ async fn proxy_models(
     let models_response = if proxy_config.provider_name == "tinfoil" {
         openai_models_response()
     } else {
-        fetch_provider_models(&proxy_config).await?
+        fetch_provider_models(&state.provider_client, &proxy_config).await?
     };
     encrypt_response(&state, &session_id, &models_response).await
 }
 
-async fn fetch_provider_models(proxy_config: &ProxyConfig) -> Result<Value, ApiError> {
-    let https = HttpsConnector::new();
-    let client = Client::builder()
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(10)
-        .build::<_, HyperBody>(https);
+async fn fetch_provider_models(
+    client: &ProviderClient,
+    proxy_config: &ProxyConfig,
+) -> Result<Value, ApiError> {
+    let res = client
+        .send(
+            proxy_config,
+            ProviderRequest::new(
+                Method::GET,
+                "/v1/models",
+                Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            ),
+        )
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to fetch models from provider {}: {:?}",
+                proxy_config.provider_name, e
+            );
+            ApiError::from(e)
+        })?;
 
-    let mut req = Request::builder()
-        .method("GET")
-        .uri(format!("{}/v1/models", proxy_config.base_url));
-
-    if let Some(api_key) = &proxy_config.api_key {
-        if !api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", api_key));
-        }
-    }
-
-    let req = req.body(HyperBody::empty()).map_err(|e| {
-        error!("Failed to create models request: {:?}", e);
-        ApiError::InternalServerError
-    })?;
-
-    let res = timeout(
-        Duration::from_secs(REQUEST_TIMEOUT_SECS),
-        client.request(req),
-    )
-    .await
-    .map_err(|_| {
-        error!(
-            "Model listing request timed out for provider {}",
-            proxy_config.provider_name
-        );
-        ApiError::InternalServerError
-    })?
-    .map_err(|e| {
-        error!(
-            "Failed to fetch models from provider {}: {:?}",
-            proxy_config.provider_name, e
-        );
-        ApiError::InternalServerError
-    })?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let body_bytes = to_bytes(res.into_body()).await.ok();
+    if !res.is_success() {
+        let status = res.status_code();
+        let body_bytes = res.bytes().await.ok();
         let error_msg = body_bytes
             .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
             .unwrap_or_else(|| status.to_string());
@@ -1560,7 +1557,7 @@ async fn fetch_provider_models(proxy_config: &ProxyConfig) -> Result<Value, ApiE
         return Err(ApiError::InternalServerError);
     }
 
-    let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
+    let body_bytes = res.bytes().await.map_err(|e| {
         error!("Failed to read models response body: {:?}", e);
         ApiError::InternalServerError
     })?;
@@ -1595,12 +1592,12 @@ fn transcription_model_for_provider(model_name: &str, provider_name: &str) -> St
 
 /// Helper function to send transcription request with retries to primary and fallback providers
 async fn send_transcription_with_retries(
-    client: &Client<HttpsConnector<hyper::client::HttpConnector>, HyperBody>,
+    client: &ProviderClient,
     primary_provider: &ProxyConfig,
     fallback_provider: Option<&ProxyConfig>,
     model_name: &str,
     params: &TranscriptionParams<'_>,
-) -> Result<Value, String> {
+) -> Result<Value, ApiError> {
     let max_cycles = 3;
     let mut last_error = None;
 
@@ -1674,10 +1671,11 @@ async fn send_transcription_with_retries(
         }
     }
 
-    Err(format!(
-        "All providers failed after {} cycles. Last error: {:?}",
+    error!(
+        "All transcription providers failed after {} cycles. Last error: {:?}",
         max_cycles, last_error
-    ))
+    );
+    Err(last_error.unwrap_or(ApiError::InternalServerError))
 }
 
 async fn proxy_transcription(
@@ -1745,12 +1743,7 @@ async fn proxy_transcription(
     let default_proxy = state.proxy_router.get_default_proxy();
     let tinfoil_proxy = state.proxy_router.get_tinfoil_proxy();
 
-    // Create a new hyper client
-    let https = HttpsConnector::new();
-    let client = Client::builder()
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(10)
-        .build::<_, HyperBody>(https);
+    let client = state.provider_client.clone();
 
     // Always split the audio (returns single chunk if no splitting needed)
     let chunks = splitter
@@ -1796,10 +1789,11 @@ async fn proxy_transcription(
                 if let Some(fallback) = fallback_provider.take() {
                     primary_provider = fallback;
                 } else {
-                    return Err(format!(
-                        "Chunk {} size {} bytes exceeds Tinfoil's limit and no fallback available",
+                    error!(
+                        "Chunk {} size {} bytes exceeds Tinfoil's limit and no fallback is available",
                         chunk.index, chunk_size
-                    ));
+                    );
+                    return Err(ApiError::InternalServerError);
                 }
             }
 
@@ -1828,7 +1822,7 @@ async fn proxy_transcription(
                 }
                 Err(err) => {
                     error!("Chunk {} failed: {}", chunk.index, err);
-                    Err(format!("Chunk {} failed: {}", chunk.index, err))
+                    Err(err)
                 }
             }
         };
@@ -1837,7 +1831,7 @@ async fn proxy_transcription(
     }
 
     // Execute all futures in parallel
-    let results: Vec<Result<(usize, Value), String>> = futures::future::join_all(futures).await;
+    let results: Vec<Result<(usize, Value), ApiError>> = futures::future::join_all(futures).await;
 
     // Check if all chunks succeeded
     let mut successful_results = Vec::new();
@@ -1846,7 +1840,7 @@ async fn proxy_transcription(
             Ok(r) => successful_results.push(r),
             Err(e) => {
                 error!("Chunk processing failed: {}", e);
-                return Err(ApiError::InternalServerError);
+                return Err(e);
             }
         }
     }
@@ -1905,11 +1899,11 @@ fn sanitize_form_field(value: &str) -> String {
 }
 
 async fn send_transcription_request(
-    client: &Client<HttpsConnector<hyper::client::HttpConnector>, HyperBody>,
+    client: &ProviderClient,
     provider: &ProxyConfig,
     model: &str,
     params: &TranscriptionParams<'_>,
-) -> Result<Value, String> {
+) -> Result<Value, ApiError> {
     // Build multipart form data
     let boundary = format!("----FormBoundary{}", Uuid::new_v4().simple());
     let mut form_data = Vec::new();
@@ -1979,61 +1973,54 @@ async fn send_transcription_request(
     // End boundary
     form_data.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
 
-    // Build request
-    let endpoint = format!("{}/v1/audio/transcriptions", provider.base_url);
-    let mut req = Request::builder().method("POST").uri(&endpoint).header(
-        "Content-Type",
-        format!("multipart/form-data; boundary={}", boundary),
-    );
-
-    if let Some(api_key) = &provider.api_key {
-        if !api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", api_key));
-        }
-    }
-
-    let req = req
-        .body(HyperBody::from(form_data))
-        .map_err(|e| format!("Failed to create request: {:?}", e))?;
-
-    // Send request with timeout
-    match timeout(
-        Duration::from_secs(REQUEST_TIMEOUT_SECS),
-        client.request(req),
-    )
-    .await
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+    match client
+        .send(
+            provider,
+            ProviderRequest::new(
+                Method::POST,
+                "/v1/audio/transcriptions",
+                Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            )
+            .content_type(&content_type)
+            .body(form_data),
+        )
+        .await
     {
-        Ok(Ok(res)) => {
-            if res.status().is_success() {
-                let body_bytes = to_bytes(res.into_body())
-                    .await
-                    .map_err(|e| format!("Failed to read response body: {:?}", e))?;
+        Ok(res) => {
+            if res.is_success() {
+                let body_bytes = res.bytes().await.map_err(|e| {
+                    error!("Failed to read transcription response body: {:?}", e);
+                    ApiError::InternalServerError
+                })?;
 
-                let response_json: Value = serde_json::from_slice(&body_bytes)
-                    .map_err(|e| format!("Failed to parse response: {:?}", e))?;
+                let response_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+                    error!("Failed to parse transcription response: {:?}", e);
+                    ApiError::InternalServerError
+                })?;
 
                 Ok(response_json)
             } else {
-                let status = res.status();
-                let body_bytes = to_bytes(res.into_body()).await.ok();
+                let status = res.status_code();
+                let body_bytes = res.bytes().await.ok();
                 let error_msg = body_bytes
                     .map(|b| String::from_utf8_lossy(&b).to_string())
                     .unwrap_or_else(|| status.to_string());
 
-                Err(format!(
-                    "Provider {} returned error: {} - {}",
+                error!(
+                    "Provider {} returned transcription error: {} - {}",
                     provider.provider_name, status, error_msg
-                ))
+                );
+                Err(ApiError::InternalServerError)
             }
         }
-        Ok(Err(e)) => Err(format!(
-            "Failed to send request to {}: {:?}",
-            provider.provider_name, e
-        )),
-        Err(_) => Err(format!(
-            "Request to {} timed out after {}s",
-            provider.provider_name, REQUEST_TIMEOUT_SECS
-        )),
+        Err(e) => {
+            error!(
+                "Failed to send transcription request to {}: {:?}",
+                provider.provider_name, e
+            );
+            Err(ApiError::from(e))
+        }
     }
 }
 
@@ -2097,61 +2084,40 @@ async fn proxy_tts(
         speed: tts_request.speed,
     };
 
-    // Use the tinfoil proxy configuration
-    // For now, we'll hardcode to use tinfoil proxy - in future could route based on model
-    let base_url = state.proxy_router.get_tinfoil_base_url();
-
-    let proxy_config = ProxyConfig {
-        base_url,
-        api_key: None, // Tinfoil proxy handles auth internally
-        provider_name: "tinfoil".to_string(),
-    };
-
-    // Create a new hyper client
-    let https = HttpsConnector::new();
-    let client = Client::builder()
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(10)
-        .build::<_, HyperBody>(https);
-
-    // Build request
-    let req = Request::builder()
-        .method("POST")
-        .uri(format!("{}/v1/audio/speech", proxy_config.base_url))
-        .header("Content-Type", "application/json")
-        .body(HyperBody::from(
-            serde_json::to_string(&tts_api_request).map_err(|e| {
-                error!("Failed to serialize TTS request: {:?}", e);
-                ApiError::InternalServerError
-            })?,
-        ))
-        .map_err(|e| {
-            error!("Failed to create request: {:?}", e);
-            ApiError::InternalServerError
-        })?;
-
-    // Send request with timeout
-    let res = timeout(
-        Duration::from_secs(REQUEST_TIMEOUT_SECS),
-        client.request(req),
-    )
-    .await
-    .map_err(|_| {
-        error!("TTS request timed out after {}s", REQUEST_TIMEOUT_SECS);
-        ApiError::InternalServerError
-    })?
-    .map_err(|e| {
-        error!("Failed to send TTS request: {:?}", e);
+    let proxy_config = state.proxy_router.get_tinfoil_proxy();
+    let request_body = serde_json::to_vec(&tts_api_request).map_err(|e| {
+        error!("Failed to serialize TTS request: {:?}", e);
         ApiError::InternalServerError
     })?;
 
-    if !res.status().is_success() {
-        error!("TTS proxy returned non-success status: {}", res.status());
+    let res = state
+        .provider_client
+        .send(
+            &proxy_config,
+            ProviderRequest::new(
+                Method::POST,
+                "/v1/audio/speech",
+                Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            )
+            .content_type("application/json")
+            .body(request_body),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to create request: {:?}", e);
+            ApiError::from(e)
+        })?;
+
+    if !res.is_success() {
+        error!(
+            "TTS provider returned non-success status: {}",
+            res.status_code()
+        );
         return Err(ApiError::InternalServerError);
     }
 
     // Get response body as bytes
-    let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
+    let body_bytes = res.bytes().await.map_err(|e| {
         error!("Failed to read TTS response body: {:?}", e);
         ApiError::InternalServerError
     })?;
@@ -2223,58 +2189,33 @@ async fn proxy_embeddings(
 
     let proxy_config = state.proxy_router.get_tinfoil_proxy();
 
-    // Create a new hyper client
-    let https = HttpsConnector::new();
-    let client = Client::builder()
-        .pool_idle_timeout(Duration::from_secs(30))
-        .pool_max_idle_per_host(10)
-        .build::<_, HyperBody>(https);
-
     // Build request body
     let request_body = serde_json::to_string(&embedding_request).map_err(|e| {
         error!("Failed to serialize embedding request: {:?}", e);
         ApiError::InternalServerError
     })?;
 
-    // Build request to provider
-    let endpoint = format!("{}/v1/embeddings", proxy_config.base_url);
-    let mut req = Request::builder()
-        .method("POST")
-        .uri(&endpoint)
-        .header("Content-Type", "application/json");
+    let res = state
+        .provider_client
+        .send(
+            &proxy_config,
+            ProviderRequest::new(
+                Method::POST,
+                "/v1/embeddings",
+                Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            )
+            .content_type("application/json")
+            .body(request_body.into_bytes()),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to send embeddings request: {:?}", e);
+            ApiError::from(e)
+        })?;
 
-    if let Some(api_key) = &proxy_config.api_key {
-        if !api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", api_key));
-        }
-    }
-
-    let req = req.body(HyperBody::from(request_body)).map_err(|e| {
-        error!("Failed to create request: {:?}", e);
-        ApiError::InternalServerError
-    })?;
-
-    // Send request with timeout
-    let res = timeout(
-        Duration::from_secs(REQUEST_TIMEOUT_SECS),
-        client.request(req),
-    )
-    .await
-    .map_err(|_| {
-        error!(
-            "Embeddings request timed out after {}s",
-            REQUEST_TIMEOUT_SECS
-        );
-        ApiError::InternalServerError
-    })?
-    .map_err(|e| {
-        error!("Failed to send embeddings request: {:?}", e);
-        ApiError::InternalServerError
-    })?;
-
-    if !res.status().is_success() {
-        let status = res.status();
-        let body_bytes = to_bytes(res.into_body()).await.ok();
+    if !res.is_success() {
+        let status = res.status_code();
+        let body_bytes = res.bytes().await.ok();
         let error_msg = body_bytes
             .map(|b| String::from_utf8_lossy(&b).to_string())
             .unwrap_or_else(|| status.to_string());
@@ -2286,7 +2227,7 @@ async fn proxy_embeddings(
     }
 
     // Parse response
-    let body_bytes = to_bytes(res.into_body()).await.map_err(|e| {
+    let body_bytes = res.bytes().await.map_err(|e| {
         error!("Failed to read embeddings response body: {:?}", e);
         ApiError::InternalServerError
     })?;
@@ -2328,98 +2269,63 @@ async fn proxy_embeddings(
 
 /// Helper function to try a provider once
 async fn try_provider(
-    client: &Client<HttpsConnector<hyper::client::HttpConnector>, HyperBody>,
+    client: &ProviderClient,
     proxy_config: &ProxyConfig,
-    body_json: &str,
+    body_json: String,
     headers: &HeaderMap,
-) -> Result<hyper::Response<HyperBody>, String> {
+) -> Result<ProviderResponse, ProviderRequestError> {
     debug!("Making request to {}", proxy_config.provider_name);
 
-    // Build request
-    let mut req = Request::builder()
-        .method("POST")
-        .uri(format!("{}/v1/chat/completions", proxy_config.base_url))
-        .header("Content-Type", "application/json");
-
-    if let Some(api_key) = &proxy_config.api_key {
-        if !api_key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", api_key));
-        }
-    }
-
-    // Forward relevant headers from the original request
-    for (key, value) in headers.iter() {
-        if key != header::HOST
-            && key != header::AUTHORIZATION
-            && key != header::CONTENT_LENGTH
-            && key != header::CONTENT_TYPE
-        {
-            if let (Ok(name), Ok(val)) = (
-                HeaderName::from_bytes(key.as_ref()),
-                HeaderValue::from_str(value.to_str().unwrap_or_default()),
-            ) {
-                req = req.header(name, val);
-            }
-        }
-    }
-
-    let req = req
-        .body(HyperBody::from(body_json.to_string()))
-        .map_err(|e| format!("Failed to create request body: {:?}", e))?;
-
-    match timeout(
-        Duration::from_secs(REQUEST_TIMEOUT_SECS),
-        client.request(req),
-    )
-    .await
+    match client
+        .send(
+            proxy_config,
+            ProviderRequest::new(
+                Method::POST,
+                "/v1/chat/completions",
+                Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            )
+            .source_headers(headers)
+            .content_type("application/json")
+            // `Bytes::from(String)` reuses the serialized request allocation;
+            // retry templates then clone that buffer by reference.
+            .body(body_json),
+        )
+        .await
     {
-        Ok(Ok(response)) => {
-            if response.status().is_success() {
+        Ok(response) => {
+            if response.is_success() {
                 Ok(response)
             } else {
-                let status = response.status();
+                let status = response.status_code();
                 error!(
                     "Provider {} returned non-success status: {}",
                     proxy_config.provider_name, status
                 );
-                debug!("Response headers: {:?}", response.headers());
+                debug!("Response headers: {}", response.headers_debug());
 
                 // Try to get error body for logging
-                if let Ok(body_bytes) = to_bytes(response.into_body()).await {
+                if let Ok(body_bytes) = response.bytes().await {
                     let body_str = String::from_utf8_lossy(&body_bytes);
                     let body_preview = safe_log_preview(&body_str);
                     error!("Response body preview: {}", body_preview);
-                    Err(format!(
+                    Err(ProviderRequestError::Send(format!(
                         "Provider {} returned status {}; body_preview={}",
                         proxy_config.provider_name, status, body_preview
-                    ))
+                    )))
                 } else {
-                    Err(format!(
+                    Err(ProviderRequestError::Send(format!(
                         "Provider {} returned status {}",
                         proxy_config.provider_name, status
-                    ))
+                    )))
                 }
             }
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             error!(
                 "Failed to send request to {}: {:?}",
                 proxy_config.provider_name, e
             );
-            Err(format!(
-                "Failed to connect to {}: {}",
-                proxy_config.provider_name, e
-            ))
-        }
-        Err(_) => {
-            error!(
-                "Request to {} timed out after {}s",
-                proxy_config.provider_name, REQUEST_TIMEOUT_SECS
-            );
-            Err(format!(
-                "Request to {} timed out",
-                proxy_config.provider_name
-            ))
+            Err(e)
         }
     }
 }
@@ -2427,6 +2333,42 @@ async fn try_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_sse_after_utf8_code_point_is_split_across_chunks() {
+        let json = "{\"choices\":[{\"delta\":{\"content\":\"café\"}}]}";
+        let event = format!("data: {json}\n\n").into_bytes();
+        let split = event
+            .windows(2)
+            .position(|window| window == "é".as_bytes())
+            .unwrap()
+            + 1;
+        let mut buffer = event[..split].to_vec();
+
+        assert_eq!(extract_sse_frame(&mut buffer), None);
+
+        buffer.extend_from_slice(&event[split..]);
+        let frame = extract_sse_frame(&mut buffer).expect("complete SSE frame");
+
+        assert_eq!(
+            serde_json::from_slice::<Value>(&frame).unwrap(),
+            json!(
+                {"choices": [{"delta": {"content": "café"}}]}
+            )
+        );
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn extracts_crlf_and_multiline_sse_data() {
+        let mut buffer = b": keepalive\r\ndata: first\r\ndata: second\r\n\r\n".to_vec();
+
+        assert_eq!(
+            extract_sse_frame(&mut buffer),
+            Some(b"first\nsecond".to_vec())
+        );
+        assert!(buffer.is_empty());
+    }
 
     #[test]
     fn tinfoil_user_cache_secret_is_stable_and_unique_per_user() {

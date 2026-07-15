@@ -1,5 +1,0 @@
-# Ignore the binary if it's built in the root directory
-tinfoil-proxy
-
-# Only the dist directory should contain the binary
-# dist/tinfoil-proxy is intentionally not ignored

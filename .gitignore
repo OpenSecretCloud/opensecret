@@ -49,14 +49,7 @@ manifests/
 **/pcr_*.b64
 **/pcr_private*
 **/pcr_public*
-tinfoil-proxy/venv/
 __pycache__/
-tinfoil-proxy/build/
-tinfoil-proxy/*.spec
-tuf-repo-cdn.sigstore.dev.json
-# Keep the binaries
-!tinfoil-proxy/dist/tinfoil-proxy
-!tinfoil-proxy/dist/tinfoil-proxy-x86_64
 
 thirdparty/
 

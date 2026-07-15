@@ -860,7 +860,6 @@ if [ "$APP_MODE" != "local" ]; then
     # Set OPENAI_API_BASE to point to the local proxy
     export OPENAI_API_BASE="http://127.0.0.1:8092"
     
-    # Also start tinfoil-proxy
     # Get Tinfoil Proxy API key from Secrets Manager
     log "Fetching Tinfoil Proxy API key"
     tinfoil_proxy_api_key_response=$(get_tinfoil_proxy_api_key_secret)
@@ -908,26 +907,16 @@ if [ "$APP_MODE" != "local" ]; then
     fi
 
     log "Tinfoil Proxy API key retrieved, decrypted, and decoded successfully"
-
-    # Set environment variable for tinfoil-proxy and start it
-    log "Starting tinfoil-proxy on port 8093"
-    run_forever tinfoil_proxy env TINFOIL_API_KEY="$tinfoil_proxy_api_key" TINFOIL_PROXY_PORT=8093 /app/tinfoil-proxy &
-
-    # Wait for the proxy to start
-    sleep 5
-    
-    # Set TINFOIL_API_BASE for nitro mode
-    export TINFOIL_API_BASE="http://127.0.0.1:8093"
 else
     # For local mode, use the default OpenAI API base or the one set in the environment
     export OPENAI_API_BASE=${OPENAI_API_BASE:-"https://api.openai.com"}
     # No tinfoil proxy in local mode
-    export TINFOIL_API_BASE=""
+    tinfoil_proxy_api_key="${TINFOIL_API_KEY:-}"
 fi
 
 # Start the opensecret
 log "Starting opensecret..."
-RUST_LOG_STYLE=never RUST_LOG="${RUST_LOG:-debug,hyper=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sdk_sqs=info,aws_config=info}" APP_MODE="$APP_MODE" OPENAI_API_BASE="$OPENAI_API_BASE" TINFOIL_API_BASE="$TINFOIL_API_BASE" /app/opensecret &
+RUST_LOG_STYLE=never RUST_LOG="${RUST_LOG:-debug,hyper=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sdk_sqs=info,aws_config=info}" APP_MODE="$APP_MODE" OPENAI_API_BASE="$OPENAI_API_BASE" TINFOIL_API_KEY="$tinfoil_proxy_api_key" /app/opensecret &
 
 # Wait for the opensecret to start
 log "Waiting for opensecret to start"

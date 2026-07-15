@@ -146,7 +146,8 @@ For custom environments, you must also set the `ENV_NAME` environment variable. 
 - Form the KMS key alias (`alias/open-secret-{env_name}-enclave`)
 - Form the database URL secret name (`opensecret_{env_name}_database_url`)
 - Form the Continuum proxy API key secret name (`continuum_proxy_{env_name}_api_key`)
-- Form the Tinfoil proxy API key secret name (`tinfoil_proxy_{env_name}_api_key`)
+- Form the Tinfoil API key secret name (`tinfoil_proxy_{env_name}_api_key`;
+  the historical secret name is retained for deployment compatibility)
 
 For example, to deploy a custom environment named "staging":
 ```sh
@@ -1082,7 +1083,7 @@ sudo systemctl restart vsock-brave-proxy.service
 ```
 
 ## Vsock Tinfoil proxies
-Create vsock proxy services so that tinfoil-proxy can talk to Tinfoil services:
+Create vsock proxy services so that the in-process Tinfoil Rust SDK can talk to Tinfoil services:
 
 First configure the endpoints into their allowlist:
 
@@ -1093,6 +1094,7 @@ sudo vim /etc/nitro_enclaves/vsock-proxy.yaml
 Add these lines:
 ```
 - {address: github-proxy.tinfoil.sh, port: 443}
+# Retained unchanged by this minimal migration; tinfoil-rs v0.1.3 embeds its trust root.
 - {address: tuf-repo-cdn.sigstore.dev, port: 443}
 - {address: kds-proxy.tinfoil.sh, port: 443}
 - {address: atc.tinfoil.sh, port: 443}
@@ -1113,6 +1115,10 @@ Add these lines:
 - {address: router.inf9.tinfoil.sh, port: 443}
 - {address: router.inf10.tinfoil.sh, port: 443}
 ```
+
+The TUF CDN entry and service below are retained to keep existing entrypoint
+and host behavior unchanged during this minimal migration. The in-process SDK
+does not use them.
 
 Restart the nitro vsock proxy service:
 ```
@@ -1150,7 +1156,7 @@ sudo vim /etc/systemd/system/vsock-tuf-repo-cdn.service
 ```
 
 Add the following content:
-```
+```ini
 [Unit]
 Description=Vsock TUF Repository CDN Service
 After=network.target
@@ -1994,8 +2000,11 @@ Take that value and insert into SecretsManager with the appropriate name:
 - `continuum_proxy_preview1_api_key` for preview environment
 - `continuum_proxy_prod_api_key` for prod environment
 
-#### Tinfoil Proxy API Key
-Need to store the tinfoil proxy api key encrypted to the enclave.
+#### Tinfoil API Key
+
+Store the Tinfoil API key encrypted to the enclave. The existing
+`tinfoil_proxy_*` secret names remain unchanged for deployment compatibility,
+but the backend now consumes the key directly through the in-process Rust SDK.
 
 ```sh
 echo -n "TINFOIL_API_KEY" | base64 -w 0

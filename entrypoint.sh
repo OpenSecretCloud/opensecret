@@ -877,7 +877,7 @@ if [ "$APP_MODE" != "local" ]; then
     # Get the API key consumed directly by the in-process Tinfoil Rust SDK.
     log "Fetching Tinfoil API key"
     tinfoil_api_key_response=$(get_tinfoil_api_key_secret)
-    log "Retrieved raw Tinfoil API key response"
+    log "Retrieved Tinfoil API key response"
 
     # Check if the response is an error
     if echo "$tinfoil_api_key_response" | jq -e '.response_type == "error"' > /dev/null; then
@@ -890,7 +890,6 @@ if [ "$APP_MODE" != "local" ]; then
     tinfoil_api_key_encrypted=$(echo "$tinfoil_api_key_response" | jq -r '.response_value | fromjson | .api_key')
     if [ -z "$tinfoil_api_key_encrypted" ]; then
         log "Error: Failed to extract Tinfoil API key from the response"
-        log "Secret response: $tinfoil_api_key_response"
         exit 1
     fi
 
@@ -908,7 +907,6 @@ if [ "$APP_MODE" != "local" ]; then
 
     if [ -z "$decrypted_api_key" ]; then
         log "Error: Failed to decrypt Tinfoil API key"
-        log "Decryption output: $decryption_output"
         exit 1
     fi
 

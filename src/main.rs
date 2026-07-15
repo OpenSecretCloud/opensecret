@@ -3075,7 +3075,7 @@ async fn main() -> Result<(), Error> {
     // Tinfoil is a hard runtime requirement for OpenSecret. In local mode the
     // managed workspace symlinks the shared key into this gitignored path.
     let tinfoil_api_key = match env::var("TINFOIL_API_KEY") {
-        Ok(key) if !key.trim().is_empty() => key,
+        Ok(key) if !key.trim().is_empty() => key.trim().to_string(),
         _ if app_mode == AppMode::Local => std::fs::read_to_string(
             ".local/secrets/tinfoil_api_key",
         )

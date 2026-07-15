@@ -737,15 +737,12 @@ impl ProviderClient {
             request = request.header("Authorization", format!("Bearer {api_key}"));
         }
         if let Some(headers) = source_headers {
+            let skipped = skipped_forward_headers(headers);
             for (name, value) in headers {
-                if name != header::HOST
-                    && name != header::AUTHORIZATION
-                    && name != header::CONTENT_LENGTH
-                    && name != header::CONTENT_TYPE
-                {
+                if !skipped.contains(name) {
                     if let (Ok(name), Ok(value)) = (
                         HyperHeaderName::from_bytes(name.as_ref()),
-                        HyperHeaderValue::from_str(value.to_str().unwrap_or_default()),
+                        HyperHeaderValue::from_bytes(value.as_bytes()),
                     ) {
                         request = request.header(name, value);
                     }
@@ -787,7 +784,7 @@ fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-fn forwarded_headers(source: &HeaderMap) -> HeaderMap {
+fn skipped_forward_headers(source: &HeaderMap) -> HashSet<HeaderName> {
     let mut skipped = HashSet::from([
         header::AUTHORIZATION,
         header::CONNECTION,
@@ -802,6 +799,7 @@ fn forwarded_headers(source: &HeaderMap) -> HeaderMap {
         header::UPGRADE,
     ]);
     skipped.insert(HeaderName::from_static("keep-alive"));
+    skipped.insert(HeaderName::from_static("proxy-connection"));
 
     for value in source.get_all(header::CONNECTION) {
         for token in value.as_bytes().split(|byte| *byte == b',') {
@@ -813,6 +811,12 @@ fn forwarded_headers(source: &HeaderMap) -> HeaderMap {
             }
         }
     }
+
+    skipped
+}
+
+fn forwarded_headers(source: &HeaderMap) -> HeaderMap {
+    let skipped = skipped_forward_headers(source);
 
     let mut forwarded = HeaderMap::new();
     for (name, value) in source {
@@ -993,9 +997,14 @@ mod tests {
     }
 
     #[test]
-    fn forwarded_headers_match_go_hop_by_hop_filtering() {
+    fn forwarded_headers_strip_hop_by_hop_fields() {
         let mut source = HeaderMap::new();
         source.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        source.insert("proxy-connection", HeaderValue::from_static("keep-alive"));
+        source.insert(
+            header::PROXY_AUTHORIZATION,
+            HeaderValue::from_static("Basic caller-proxy-secret"),
+        );
         source.insert(header::TE, HeaderValue::from_static("trailers"));
         source.insert(header::TRAILER, HeaderValue::from_static("x-checksum"));
         source.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
@@ -1005,6 +1014,8 @@ mod tests {
 
         assert_eq!(forwarded.get("x-safe").unwrap(), "yes");
         assert!(!forwarded.contains_key("keep-alive"));
+        assert!(!forwarded.contains_key("proxy-connection"));
+        assert!(!forwarded.contains_key(header::PROXY_AUTHORIZATION));
         assert!(!forwarded.contains_key(header::TE));
         assert!(!forwarded.contains_key(header::TRAILER));
         assert!(!forwarded.contains_key(header::UPGRADE));
@@ -1183,6 +1194,88 @@ mod tests {
 
         assert!(response.is_success());
         assert_eq!(response.bytes().await.unwrap(), "standard-provider-ok");
+    }
+
+    #[tokio::test]
+    async fn standard_request_strips_hop_headers_and_preserves_opaque_values() {
+        let (capture_tx, mut capture_rx) = mpsc::channel(1);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            any(move |headers: HeaderMap, body: Bytes| {
+                let capture_tx = capture_tx.clone();
+                async move {
+                    capture_tx.send((headers, body)).await.unwrap();
+                    (StatusCode::OK, "{}")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = ProviderClient::uninitialized_for_test().unwrap();
+        let provider = ProxyConfig {
+            base_url: format!("http://{address}"),
+            api_key: Some("provider-key".to_string()),
+            provider_name: ProviderName::Continuum.as_str().to_string(),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer caller-secret"),
+        );
+        headers.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("keep-alive, x-hop"),
+        );
+        headers.insert("keep-alive", HeaderValue::from_static("timeout=5"));
+        headers.insert("proxy-connection", HeaderValue::from_static("keep-alive"));
+        headers.insert("x-hop", HeaderValue::from_static("remove-me"));
+        headers.insert(
+            header::PROXY_AUTHORIZATION,
+            HeaderValue::from_static("Basic caller-proxy-secret"),
+        );
+        headers.insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        headers.insert("x-safe", HeaderValue::from_static("yes"));
+        headers.insert(
+            "x-opaque",
+            HeaderValue::from_bytes(b"\x80raw").expect("opaque header value"),
+        );
+        let body = Bytes::from_static(br#"{"model":"glm-5-2"}"#);
+
+        let response = client
+            .send(
+                &provider,
+                ProviderRequest::new(Method::POST, "/v1/chat/completions", Duration::from_secs(5))
+                    .source_headers(&headers)
+                    .content_type("application/json")
+                    .body(body.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(response.is_success());
+
+        let (captured_headers, captured_body) = capture_rx.recv().await.unwrap();
+        server.abort();
+
+        assert_eq!(
+            captured_headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer provider-key"
+        );
+        assert_eq!(captured_headers.get("x-safe").unwrap(), "yes");
+        assert_eq!(
+            captured_headers.get("x-opaque").unwrap().as_bytes(),
+            b"\x80raw"
+        );
+        assert!(!captured_headers.contains_key(header::CONNECTION));
+        assert!(!captured_headers.contains_key("keep-alive"));
+        assert!(!captured_headers.contains_key("proxy-connection"));
+        assert!(!captured_headers.contains_key("x-hop"));
+        assert!(!captured_headers.contains_key(header::PROXY_AUTHORIZATION));
+        assert!(!captured_headers.contains_key(header::TRANSFER_ENCODING));
+        assert_eq!(captured_body, body);
     }
 
     #[test]

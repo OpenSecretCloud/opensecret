@@ -475,6 +475,11 @@ fn normalize_public_https_url(raw_url: &str, index: usize) -> Result<String, Str
 fn validate_public_host(host: Option<Host<&str>>, index: usize) -> Result<(), String> {
     match host {
         Some(Host::Domain(domain)) => {
+            // Kagi's remote Extract service performs the fetch. Resolving the
+            // name here would inspect OpenSecret's network instead of Kagi's
+            // and would still be vulnerable to DNS changes between checks.
+            // The request-scoped Kagi result allowlist is the primary boundary;
+            // these lexical checks are defense in depth.
             let domain = domain.trim_end_matches('.').to_ascii_lowercase();
             let private_name = matches!(domain.as_str(), "localhost" | "localdomain")
                 || domain.ends_with(".localhost")
@@ -527,12 +532,40 @@ fn is_non_public_ipv4(address: Ipv4Addr) -> bool {
 fn is_non_public_ipv6(address: Ipv6Addr) -> bool {
     let segments = address.segments();
     address.to_ipv4().is_some_and(is_non_public_ipv4)
+        || embedded_6to4_ipv4(address).is_some_and(is_non_public_ipv4)
+        || embedded_well_known_nat64_ipv4(address).is_some_and(is_non_public_ipv4)
         || address.is_loopback()
         || address.is_unspecified()
         || address.is_unique_local()
         || address.is_unicast_link_local()
         || address.is_multicast()
         || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+}
+
+fn embedded_6to4_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
+    let segments = address.segments();
+    if segments[0] != 0x2002 {
+        return None;
+    }
+
+    let high = segments[1].to_be_bytes();
+    let low = segments[2].to_be_bytes();
+    Some(Ipv4Addr::new(high[0], high[1], low[0], low[1]))
+}
+
+fn embedded_well_known_nat64_ipv4(address: Ipv6Addr) -> Option<Ipv4Addr> {
+    const WELL_KNOWN_PREFIX: [u8; 12] = [
+        0x00, 0x64, 0xff, 0x9b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    let octets = address.octets();
+    if !octets.starts_with(&WELL_KNOWN_PREFIX) {
+        return None;
+    }
+
+    Some(Ipv4Addr::new(
+        octets[12], octets[13], octets[14], octets[15],
+    ))
 }
 
 fn format_kagi_extract_results(urls: &[String], response: ExtractResponse) -> String {
@@ -627,6 +660,13 @@ fn bound_tool_output(output: String) -> String {
     bounded.push_str(TOOL_OUTPUT_TRUNCATION_MARKER);
     bounded
 }
+
+fn bound_provider_tool_output(provider: WebSearchProvider, output: String) -> String {
+    match provider {
+        WebSearchProvider::Brave => output,
+        WebSearchProvider::Kagi => bound_tool_output(output),
+    }
+}
 /// Execute a tool by name with the given arguments
 ///
 /// This is the main entry point for tool execution. It routes to the appropriate
@@ -689,7 +729,7 @@ pub async fn execute_tool(
         }
     };
 
-    result.map(bound_tool_output)
+    result.map(|output| bound_provider_tool_output(provider, output))
 }
 
 /// Tool registry for managing available tools and their schemas
@@ -858,6 +898,8 @@ mod tests {
             "https://localhost/page",
             "https://127.0.0.1/page",
             "https://[::1]/page",
+            "https://[2002:7f00:1::]/page",
+            "https://[64:ff9b::7f00:1]/page",
             "https://user:password@example.com/page",
         ] {
             assert!(
@@ -961,5 +1003,21 @@ mod tests {
         let output = bound_tool_output("x".repeat(MAX_TOOL_OUTPUT_CHARS + 10));
         assert_eq!(output.chars().count(), MAX_TOOL_OUTPUT_CHARS);
         assert!(output.ends_with(TOOL_OUTPUT_TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn test_tool_output_bound_is_kagi_only() {
+        let original = "x".repeat(MAX_TOOL_OUTPUT_CHARS + 10);
+        assert_eq!(
+            bound_provider_tool_output(WebSearchProvider::Brave, original.clone()),
+            original
+        );
+
+        let kagi_output = bound_provider_tool_output(
+            WebSearchProvider::Kagi,
+            "x".repeat(MAX_TOOL_OUTPUT_CHARS + 10),
+        );
+        assert_eq!(kagi_output.chars().count(), MAX_TOOL_OUTPUT_CHARS);
+        assert!(kagi_output.ends_with(TOOL_OUTPUT_TRUNCATION_MARKER));
     }
 }

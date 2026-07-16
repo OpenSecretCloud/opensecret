@@ -652,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_model_turn_request_omits_tools_when_disabled() {
+    fn test_build_model_turn_request_omits_tools_with_provider_retained() {
         let mut body = responses_request_for_model("kimi-k2-6");
         body.tool_choice = Some("auto".to_string());
         body.tools = Some(json!([{ "type": "web_search" }]));
@@ -661,7 +661,7 @@ mod tests {
             &body,
             &[json!({"role": "user", "content": "hello"})],
             false,
-            None,
+            Some(WebSearchProvider::Kagi),
         );
 
         assert!(chat_request.get("tools").is_none());
@@ -2906,11 +2906,10 @@ async fn setup_completion_processor(
                             MAX_WEB_SEARCH_TOOL_TURNS, persisted.response.uuid
                         );
                     }
-                    let internal_system_prompt = build_internal_system_prompt(
-                        tools_enabled.then_some(
-                            web_search_provider.expect("tools are available only with a provider"),
-                        ),
-                    );
+                    // Tool schemas stop at the turn limit, but provider guidance
+                    // must remain while prior untrusted tool output is in context.
+                    let internal_system_prompt =
+                        build_internal_system_prompt(web_search_provider);
                     let (rebuilt_messages, rebuilt_tokens) = build_prompt(
                         state.db.as_ref(),
                         context.conversation.id,

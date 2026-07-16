@@ -28,7 +28,7 @@ const MAX_SEARCH_SNIPPET_CHARS: usize = 800;
 const MAX_EXTRACTED_PAGE_CHARS: usize = 32_000;
 const MAX_EXTRACTED_TOTAL_CHARS: usize = 64_000;
 const MAX_TOOL_OUTPUT_CHARS: usize = 70_000;
-const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "\n[Tool output truncated by OpenSecret.]\n";
+const TOOL_OUTPUT_TRUNCATION_MARKER: &str = "\n[Tool output truncated by Maple.]\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WebSearchProvider {
@@ -609,7 +609,7 @@ fn format_kagi_extract_results(urls: &[String], response: ExtractResponse) -> St
                         output.push('\n');
                     }
                     if truncated {
-                        output.push_str("[Page content truncated by OpenSecret.]\n");
+                        output.push_str("[Page content truncated by Maple.]\n");
                     }
                     output.push_str("--- END UNTRUSTED PAGE CONTENT ---\n\n");
                 } else {
@@ -992,7 +992,7 @@ mod tests {
 
         let output = format_kagi_extract_results(&[first_url, second_url], response);
         assert!(output.contains("BEGIN UNTRUSTED PAGE CONTENT"));
-        assert!(output.contains("Page content truncated by OpenSecret"));
+        assert!(output.contains("Page content truncated by Maple"));
         assert!(output.contains("No data returned from crawlers"));
         assert!(output.contains("crawler.empty: One page failed"));
         assert!(output.contains("trace ID: extract-trace"));

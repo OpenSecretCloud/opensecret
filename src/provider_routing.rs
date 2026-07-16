@@ -1,4 +1,5 @@
 use crate::model_config::{resolve_completion_model_id, resolve_public_model_id};
+use crate::os_flags::KIMI_K2_6_CONTINUUM_FLAG_KEY;
 use crate::proxy_config::{canonicalize_tinfoil_model, ProxyConfig, ProxyRouter};
 use uuid::Uuid;
 
@@ -104,8 +105,6 @@ struct EligibleRoute {
     provider_model_id: &'static str,
     effective_weight: u32,
 }
-
-pub(crate) const KIMI_K2_6_CONTINUUM_FLAG_KEY: &str = "provider-routing.kimi-k2-6.continuum";
 
 const PROVIDERS: &[ProviderConfig] = &[
     ProviderConfig {

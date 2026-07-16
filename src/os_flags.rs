@@ -11,8 +11,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const USER_FLAGS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
+// Keep canonical feature-flag keys together so callers do not duplicate
+// externally configured identifiers.
 #[allow(dead_code)]
 pub const AGENT_FEATURE_FLAG_KEY: &str = "agent";
+pub const KAGI_WEB_SEARCH_FLAG_KEY: &str = "web-search.kagi";
+pub const KIMI_K2_6_CONTINUUM_FLAG_KEY: &str = "provider-routing.kimi-k2-6.continuum";
 
 #[derive(Debug, thiserror::Error)]
 pub enum OsFlagsError {

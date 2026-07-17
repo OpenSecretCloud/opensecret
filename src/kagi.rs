@@ -5,17 +5,18 @@
 
 use reqwest::{header, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
-use std::{fmt, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 use url::Url;
+
+use crate::web::web_safety::normalize_public_https_url;
 
 const KAGI_API_BASE: &str = "https://kagi.com/api/v1/";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const EXTRACT_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
+const KAGI_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const SEARCH_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
 const EXTRACT_RESPONSE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
 const ERROR_MESSAGE_LIMIT_CHARS: usize = 4 * 1024;
-const MAX_EXTRACT_URLS: usize = 3;
+pub(crate) const MAX_EXTRACT_URLS: usize = 10;
 const TRACE_HEADER: &str = "x-kagi-trace";
 const TRACE_ID_LIMIT_CHARS: usize = 128;
 
@@ -26,6 +27,9 @@ pub enum KagiError {
 
     #[error("Kagi search query cannot be empty")]
     InvalidQuery,
+
+    #[error("Kagi search parameter `{field}` is invalid")]
+    InvalidSearchParameter { field: &'static str },
 
     #[error("Kagi extract requires between 1 and {MAX_EXTRACT_URLS} URLs (received {count})")]
     InvalidUrlCount { count: usize },
@@ -74,13 +78,96 @@ pub struct KagiClient {
     base_url: Url,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SearchWorkflow {
+    #[default]
+    Search,
+    Images,
+    Videos,
+    News,
+    Podcasts,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SearchTimeRelative {
+    Day,
+    Week,
+    Month,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct SearchLens {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sites_included: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sites_excluded: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keywords_included: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keywords_excluded: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_before: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_relative: Option<SearchTimeRelative>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_region: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub(crate) struct SearchFilters {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SearchOptions {
+    pub query: String,
+    pub workflow: SearchWorkflow,
+    pub lens_id: Option<String>,
+    pub lens: Option<SearchLens>,
+    pub timeout: Option<f32>,
+    pub page: Option<u8>,
+    pub limit: u16,
+    pub filters: Option<SearchFilters>,
+    pub safe_search: bool,
+}
+
+impl SearchOptions {
+    pub fn basic(query: impl Into<String>) -> Self {
+        Self {
+            query: query.into(),
+            workflow: SearchWorkflow::Search,
+            lens_id: None,
+            lens: None,
+            timeout: None,
+            page: None,
+            limit: 10,
+            filters: None,
+            safe_search: true,
+        }
+    }
+}
+
 impl KagiClient {
     pub fn new(api_key: String) -> Result<Self, KagiError> {
         Self::new_with_base_url_inner(api_key, KAGI_API_BASE)
     }
 
     #[cfg(test)]
-    fn new_with_base_url(api_key: String, base_url: &str) -> Result<Self, KagiError> {
+    pub(crate) fn new_with_base_url_for_test(
+        api_key: String,
+        base_url: &str,
+    ) -> Result<Self, KagiError> {
         Self::new_with_base_url_inner(api_key, base_url)
     }
 
@@ -93,7 +180,7 @@ impl KagiClient {
         let base_url = Url::parse(&format!("{}/", base_url.trim_end_matches('/')))?;
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(EXTRACT_REQUEST_TIMEOUT)
+            .timeout(KAGI_REQUEST_TIMEOUT)
             .pool_max_idle_per_host(100)
             .user_agent("OpenSecret/0.1.0")
             .build()
@@ -111,60 +198,86 @@ impl KagiClient {
 
     /// Search Kagi for web and news results without fetching page contents.
     pub async fn search(&self, query: &str) -> Result<SearchResponse, KagiError> {
-        let query = query.trim();
+        self.search_with_options(&SearchOptions::basic(query)).await
+    }
+
+    /// Search Kagi with validated options while always requesting stable JSON
+    /// output and never enabling inline page extraction.
+    pub(crate) async fn search_with_options(
+        &self,
+        options: &SearchOptions,
+    ) -> Result<SearchResponse, KagiError> {
+        let query = options.query.trim();
         if query.is_empty() {
             return Err(KagiError::InvalidQuery);
         }
+        validate_search_options(options)?;
 
         let request = SearchRequest {
             query,
-            workflow: "search",
+            workflow: options.workflow,
             format: "json",
-            limit: 10,
-            safe_search: true,
+            lens_id: options.lens_id.as_deref(),
+            lens: options.lens.as_ref(),
+            timeout: options.timeout,
+            page: options.page,
+            limit: options.limit,
+            filters: options.filters.as_ref(),
+            safe_search: options.safe_search,
         };
 
         let response = self
-            .client
-            .post(self.endpoint("search")?)
-            .bearer_auth(self.api_key.as_ref())
-            .header(header::ACCEPT, "application/json")
-            .json(&request)
-            .timeout(SEARCH_REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|source| KagiError::Request {
-                operation: "search",
-                source,
-            })?;
+            .send_json("search", self.endpoint("search")?, &request)
+            .await?;
 
         parse_response(response, "search", SEARCH_RESPONSE_LIMIT_BYTES).await
     }
 
-    /// Extract Markdown from one to three HTTPS URLs.
+    /// Extract Markdown from one to ten public HTTPS URLs.
     pub async fn extract(&self, urls: &[String]) -> Result<ExtractResponse, KagiError> {
-        validate_extract_urls(urls)?;
+        self.extract_with_timeout(urls, None).await
+    }
+
+    pub(crate) async fn extract_with_timeout(
+        &self,
+        urls: &[String],
+        timeout: Option<f32>,
+    ) -> Result<ExtractResponse, KagiError> {
+        let urls = normalize_extract_urls(urls)?;
+        if timeout.is_some_and(|value| !(0.5..=10.0).contains(&value) || !value.is_finite()) {
+            return Err(KagiError::InvalidSearchParameter {
+                field: "extract.timeout",
+            });
+        }
 
         let request = ExtractRequest {
             pages: urls.iter().map(|url| PageInput { url }).collect(),
+            timeout,
             format: "json",
         };
 
         let response = self
-            .client
-            .post(self.endpoint("extract")?)
-            .bearer_auth(self.api_key.as_ref())
-            .header(header::ACCEPT, "application/json")
-            .json(&request)
-            .timeout(EXTRACT_REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|source| KagiError::Request {
-                operation: "extract",
-                source,
-            })?;
+            .send_json("extract", self.endpoint("extract")?, &request)
+            .await?;
 
         parse_response(response, "extract", EXTRACT_RESPONSE_LIMIT_BYTES).await
+    }
+
+    async fn send_json<T: Serialize + ?Sized>(
+        &self,
+        operation: &'static str,
+        endpoint: Url,
+        payload: &T,
+    ) -> Result<reqwest::Response, KagiError> {
+        self.client
+            .post(endpoint)
+            .bearer_auth(self.api_key.as_ref())
+            .header(header::ACCEPT, "application/json")
+            .json(payload)
+            .timeout(KAGI_REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|source| KagiError::Request { operation, source })
     }
 
     fn endpoint(&self, path: &'static str) -> Result<Url, KagiError> {
@@ -195,12 +308,60 @@ pub struct SearchResponse {
     pub data: SearchData,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct SearchData {
-    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub search: Vec<SearchResult>,
-    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub news: Vec<SearchResult>,
+    pub categories: BTreeMap<String, Vec<SearchResult>>,
+}
+
+impl SearchData {
+    pub(crate) fn into_categories(self) -> Vec<(String, Vec<SearchResult>)> {
+        let mut categories = Vec::with_capacity(self.categories.len() + 2);
+        if !self.search.is_empty() {
+            categories.push(("search".to_owned(), self.search));
+        }
+        if !self.news.is_empty() {
+            categories.push(("news".to_owned(), self.news));
+        }
+        categories.extend(self.categories);
+        categories
+    }
+}
+
+impl<'de> Deserialize<'de> for SearchData {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let Some(object) = value.as_object() else {
+            return Err(serde::de::Error::custom(
+                "Kagi search data must be an object",
+            ));
+        };
+
+        let mut data = Self::default();
+        for (category, value) in object {
+            let results = value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|item| serde_json::from_value::<SearchResult>(item.clone()).ok())
+                .collect::<Vec<_>>();
+
+            match category.as_str() {
+                "search" => data.search = results,
+                "news" => data.news = results,
+                _ if !results.is_empty() => {
+                    data.categories.insert(category.clone(), results);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(data)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -213,14 +374,42 @@ pub struct SearchResult {
     pub time: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct ExtractResponse {
-    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub meta: Meta,
-    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub data: Vec<ExtractPage>,
-    #[serde(default, deserialize_with = "deserialize_null_default")]
     pub errors: Vec<ErrorDetail>,
+}
+
+impl<'de> Deserialize<'de> for ExtractResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireResponse {
+            #[serde(default, deserialize_with = "deserialize_null_default")]
+            meta: Meta,
+            #[serde(default, deserialize_with = "deserialize_null_default")]
+            data: Vec<ExtractPage>,
+            #[serde(default, deserialize_with = "deserialize_null_default")]
+            errors: Vec<ErrorDetail>,
+            #[serde(
+                default,
+                rename = "error",
+                deserialize_with = "deserialize_null_default"
+            )]
+            error: Vec<ErrorDetail>,
+        }
+
+        let mut wire = WireResponse::deserialize(deserializer)?;
+        wire.errors.append(&mut wire.error);
+        Ok(Self {
+            meta: wire.meta,
+            data: wire.data,
+            errors: wire.errors,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -247,15 +436,27 @@ pub struct ErrorDetail {
 #[derive(Serialize)]
 struct SearchRequest<'a> {
     query: &'a str,
-    workflow: &'static str,
+    workflow: SearchWorkflow,
     format: &'static str,
-    limit: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lens_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lens: Option<&'a SearchLens>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page: Option<u8>,
+    limit: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filters: Option<&'a SearchFilters>,
     safe_search: bool,
 }
 
 #[derive(Serialize)]
 struct ExtractRequest<'a> {
     pages: Vec<PageInput<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timeout: Option<f32>,
     format: &'static str,
 }
 
@@ -294,38 +495,39 @@ pub(crate) fn sanitize_trace_id(value: &str) -> String {
     }
 }
 
-fn validate_extract_urls(urls: &[String]) -> Result<(), KagiError> {
+fn validate_search_options(options: &SearchOptions) -> Result<(), KagiError> {
+    if options.limit == 0 || options.limit > 1_024 {
+        return Err(KagiError::InvalidSearchParameter { field: "limit" });
+    }
+    if options.page.is_some_and(|page| !(1..=10).contains(&page)) {
+        return Err(KagiError::InvalidSearchParameter { field: "page" });
+    }
+    if options
+        .timeout
+        .is_some_and(|timeout| !(0.5..=4.0).contains(&timeout) || !timeout.is_finite())
+    {
+        return Err(KagiError::InvalidSearchParameter { field: "timeout" });
+    }
+    if options.lens_id.is_some() && options.lens.is_some() {
+        return Err(KagiError::InvalidSearchParameter { field: "lens" });
+    }
+    Ok(())
+}
+
+fn normalize_extract_urls(urls: &[String]) -> Result<Vec<String>, KagiError> {
     if urls.is_empty() || urls.len() > MAX_EXTRACT_URLS {
         return Err(KagiError::InvalidUrlCount { count: urls.len() });
     }
 
-    for (index, raw_url) in urls.iter().enumerate() {
-        let url = Url::parse(raw_url).map_err(|error| KagiError::InvalidUrl {
-            index,
-            reason: error.to_string(),
-        })?;
-
-        if url.scheme() != "https" {
-            return Err(KagiError::InvalidUrl {
+    urls.iter()
+        .enumerate()
+        .map(|(index, raw_url)| {
+            normalize_public_https_url(raw_url).map_err(|error| KagiError::InvalidUrl {
                 index,
-                reason: "URL must use HTTPS".to_owned(),
-            });
-        }
-        if url.host_str().is_none() {
-            return Err(KagiError::InvalidUrl {
-                index,
-                reason: "URL must include a host".to_owned(),
-            });
-        }
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(KagiError::InvalidUrl {
-                index,
-                reason: "URL must not contain credentials".to_owned(),
-            });
-        }
-    }
-
-    Ok(())
+                reason: error.to_string(),
+            })
+        })
+        .collect()
 }
 
 async fn parse_response<T: DeserializeOwned>(
@@ -492,6 +694,7 @@ mod tests {
         Json, Router,
     };
     use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
     async fn test_server(router: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -536,9 +739,11 @@ mod tests {
 
         let router = Router::new().route("/api/v1/search", post(handler));
         let (base_url, server) = test_server(router).await;
-        let client =
-            KagiClient::new_with_base_url("secret".to_owned(), &format!("{base_url}/api/v1"))
-                .unwrap();
+        let client = KagiClient::new_with_base_url_for_test(
+            "secret".to_owned(),
+            &format!("{base_url}/api/v1"),
+        )
+        .unwrap();
 
         let response = client.search(" current rust release ").await.unwrap();
         assert_eq!(response.meta.trace.as_deref(), Some("search-trace"));
@@ -586,9 +791,11 @@ mod tests {
 
         let router = Router::new().route("/api/v1/extract", post(handler));
         let (base_url, server) = test_server(router).await;
-        let client =
-            KagiClient::new_with_base_url("secret".to_owned(), &format!("{base_url}/api/v1"))
-                .unwrap();
+        let client = KagiClient::new_with_base_url_for_test(
+            "secret".to_owned(),
+            &format!("{base_url}/api/v1"),
+        )
+        .unwrap();
         let urls = vec![
             "https://example.com/one".to_owned(),
             "https://example.com/two".to_owned(),
@@ -622,9 +829,11 @@ mod tests {
 
         let router = Router::new().route("/api/v1/search", post(handler));
         let (base_url, server) = test_server(router).await;
-        let client =
-            KagiClient::new_with_base_url("secret".to_owned(), &format!("{base_url}/api/v1"))
-                .unwrap();
+        let client = KagiClient::new_with_base_url_for_test(
+            "secret".to_owned(),
+            &format!("{base_url}/api/v1"),
+        )
+        .unwrap();
 
         let error = client.search("anything").await.unwrap_err();
         match error {
@@ -660,9 +869,11 @@ mod tests {
             .route("/api/v1/search", post(handler))
             .with_state(body);
         let (base_url, server) = test_server(router).await;
-        let client =
-            KagiClient::new_with_base_url("secret".to_owned(), &format!("{base_url}/api/v1"))
-                .unwrap();
+        let client = KagiClient::new_with_base_url_for_test(
+            "secret".to_owned(),
+            &format!("{base_url}/api/v1"),
+        )
+        .unwrap();
 
         let error = client.search("anything").await.unwrap_err();
         match error {
@@ -681,9 +892,11 @@ mod tests {
 
     #[tokio::test]
     async fn extract_rejects_invalid_urls_before_sending() {
-        let client =
-            KagiClient::new_with_base_url("secret".to_owned(), "http://127.0.0.1:1/api/v1")
-                .unwrap();
+        let client = KagiClient::new_with_base_url_for_test(
+            "secret".to_owned(),
+            "http://127.0.0.1:1/api/v1",
+        )
+        .unwrap();
 
         assert!(matches!(
             client.extract(&[]).await,
@@ -699,6 +912,42 @@ mod tests {
                 .await,
             Err(KagiError::InvalidUrl { .. })
         ));
+        assert!(matches!(
+            client
+                .extract(&["https://169.254.169.254/latest/meta-data".to_owned()])
+                .await,
+            Err(KagiError::InvalidUrl { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn transient_status_is_returned_after_one_attempt() {
+        async fn transient_handler(State(attempts): State<Arc<AtomicUsize>>) -> Response {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Response::builder()
+                .status(AxumStatusCode::SERVICE_UNAVAILABLE)
+                .header("retry-after", "0")
+                .body(Body::from(r#"{"error":[{"code":"temporary"}]}"#))
+                .unwrap()
+        }
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let router = Router::new()
+            .route("/api/v1/search", post(transient_handler))
+            .with_state(attempts.clone());
+        let (base_url, server) = test_server(router).await;
+        let client = KagiClient::new_with_base_url_for_test(
+            "secret".to_owned(),
+            &format!("{base_url}/api/v1"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            client.search("anything").await,
+            Err(KagiError::Api { .. })
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        server.abort();
     }
 
     #[test]
@@ -727,6 +976,17 @@ mod tests {
         .unwrap();
         assert!(extract.data.is_empty());
         assert!(extract.errors.is_empty());
+    }
+
+    #[test]
+    fn non_object_search_data_is_rejected() {
+        for data in [json!("broken"), json!([]), json!(42)] {
+            assert!(serde_json::from_value::<SearchResponse>(json!({
+                "meta": {},
+                "data": data
+            }))
+            .is_err());
+        }
     }
 
     #[test]

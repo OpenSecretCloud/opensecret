@@ -82,6 +82,43 @@ fn openai_compatible_routes_do_not_request_user_storage_keys() {
 }
 
 #[test]
+fn web_routes_remain_jwt_authenticated_and_e2ee_wrapped() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let main_source = fs::read_to_string(manifest_dir.join("src/main.rs"))
+        .expect("main source should be readable");
+    let web_source = fs::read_to_string(manifest_dir.join("src/web/web_routes.rs"))
+        .expect("web route source should be readable");
+
+    assert!(
+        main_source.contains(
+            "web_routes(app_state.clone())\n                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt))"
+        ),
+        "provider-neutral web routes must remain behind user JWT validation"
+    );
+
+    let router_body = extract_function_body(&web_source, "pub fn router");
+    assert_eq!(
+        router_body.matches("decrypt_request::<Value>").count(),
+        2,
+        "both web routes must decrypt request bodies through session E2EE"
+    );
+    assert_eq!(
+        web_source
+            .matches("Extension(user): Extension<User>")
+            .count(),
+        2,
+        "both web handlers must require the JWT-injected user"
+    );
+    for handler in ["async fn search_web", "async fn extract_web"] {
+        let handler_body = extract_function_body(&web_source, handler);
+        assert!(
+            handler_body.contains("encrypt_response(&state, &session_id, &response)"),
+            "{handler} must encrypt successful responses through session E2EE"
+        );
+    }
+}
+
+#[test]
 fn user_jwt_middleware_requires_active_seed_wrap_before_request_extensions() {
     let jwt_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/jwt.rs");
     let contents = fs::read_to_string(&jwt_source).expect("JWT source should be readable");

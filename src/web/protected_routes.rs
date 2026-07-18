@@ -1293,7 +1293,12 @@ pub async fn create_api_key(
 
     // Generate a random UUID for the API key
     let random_bytes: [u8; 16] =
-        crate::encrypt::generate_random_enclave::<16>(data.aws_credential_manager.clone()).await;
+        crate::encrypt::generate_random_enclave::<16>(data.aws_credential_manager.clone())
+            .await
+            .map_err(|error| {
+                tracing::error!("Failed to generate API key randomness: {error}");
+                ApiError::InternalServerError
+            })?;
     let api_key_uuid = Uuid::from_bytes(random_bytes);
 
     // Hash the UUID string (with dashes) using SHA-256

@@ -1,388 +1,526 @@
-# PCR Verification System
+# Nitro EIF Release Verification
 
-This document describes the PCR (Platform Configuration Register) verification system used to validate Nitro Enclave measurements.
+OpenSecret publishes AWS Nitro EIF measurements at deliberate, manually approved
+release boundaries. Each release contains deterministic manifests signed
+keylessly by the tagged GitHub Actions workflow and recorded in Sigstore's
+transparency infrastructure.
 
-## Overview
+Sigstore is the provenance and transparency layer. It is not the artifact
+transport, a software-safety oracle, a reproducibility proof, a revocation
+service, or a source of truth for the newest approved release.
 
-The system uses an append-only history of signed PCR measurements that allows the frontend to verify enclave measurements even when they're not in the default list. This provides:
+## The Short Version
 
-1. **Transparency**: Full history of all deployed enclave measurements
-2. **Security**: Each PCR measurement is cryptographically signed
-3. **Auditability**: Changes to PCR values over time are tracked
-4. **Flexibility**: New PCR values can be added without requiring frontend updates
+The old release metadata could answer, "Does this enclave's PCR0 appear in a
+hardcoded list or a JSON history fetched from GitHub?" More importantly, that
+PCR0 check did not gate the normal TypeScript key exchange, and the normal Rust
+client supplied no expected-PCR policy. The new design makes release
+authorization part of the security gate and asks a stronger, compound
+question:
 
-## Signature Format
+> Did the expected, manually approved, tag-only OpenSecret release workflow
+> sign this exact canonical manifest; was that signature publicly witnessed;
+> does the manifest bind the tagged source to this exact EIF and complete
+> PCR0/PCR1/PCR2 tuple; is this release locally approved for the requested
+> environment; and does a fresh Nitro attestation present that same tuple
+> before its session key is trusted?
 
-The system uses ECDSA with the P-384 curve and SHA-384 hash function:
+Sigstore does not store the EIF or act as a package registry. GitHub Releases
+still transports the EIF, manifest, and verification bundle. Those downloads
+are treated as untrusted bytes. Sigstore makes the manifest independently
+verifiable by binding its exact bytes to a short-lived GitHub Actions identity
+and an append-only transparency-log record.
 
-- **Simplified approach**: Only the PCR0 string value is signed (not the entire JSON object)
-- Signatures are created using ECDSA with the P-384 curve and SHA-384 hash
-- The signature is produced in raw P1363 format (r and s concatenated in fixed 48-byte form)
-- The signature is base64-encoded for storage in the history file
-- No conversion is needed in the browser - the format is directly compatible with Web Crypto API
+The SDKs do not contact GitHub, Fulcio, or Rekor during an application
+handshake. A maintainer runs the SDK snapshot updater at release/update time;
+it verifies the downloaded Sigstore evidence and embeds the resulting approved
+release records into TypeScript and Rust. Runtime verification is therefore
+offline, deterministic, and unavailable network services cannot cause a
+fallback to weaker trust data.
 
-## Backend Commands
+## Before and After
 
-The following commands are available in the justfile:
+| Concern | Before | Now | Security effect |
+| --- | --- | --- | --- |
+| Release boundary | Ordinary builds ran on `master` pushes, pull requests, and manual runs; trusted history changed through a manual Git update | An existing stable `vMAJOR.MINOR.PATCH` tag, manually dispatched through the `production-release` environment after its external protections are configured | Production trust changes become deliberate review events |
+| Signer | One long-lived custom P-384 private key | One short-lived keyless certificate issued for the exact tagged GitHub Actions workflow through GitHub OIDC and Fulcio | No repository signing key needs to be stored or rotated |
+| Signed statement | Only the PCR0 string | Exact canonical manifest bytes binding source tag and commit, repository IDs, environment, build derivation, EIF SHA-256 and size, PCR0/PCR1/PCR2, and workflow run attempt | A valid signature cannot be transplanted to another artifact, environment, tuple, or build |
+| Public audit trail | Mutable Git history | Sigstore bundle with Rekor transparency evidence | Signing events are independently witnessed and tamper-evident |
+| Client input | Hardcoded PCR0 lists were checked first; an unmatched PCR0 caused a runtime download of mutable `raw.githubusercontent.com` history | Reviewed, Sigstore-verified snapshot embedded identically in TypeScript and Rust | Runtime has no GitHub dependency and errors fail closed |
+| Enclave policy | TypeScript checked PCR0 later in its display path; the normal Rust client supplied no expected PCR map | Atomic same-release PCR0/PCR1/PCR2 match for an explicitly selected environment in both languages | Measurement authorization becomes mandatory rather than informational |
+| Origin binding | Environment could be inferred by trying both lists | Known service origins map to exactly one environment; unknown remote origins require an explicit choice | A development measurement cannot satisfy a production connection |
+| Key acceptance | A valid AWS Nitro document and nonce were enough for the normal handshake to accept the attested key | Nitro document, nonce, environment, full tuple, and approved release are checked before accepting the enclave key or starting key exchange | A genuine but unapproved Nitro enclave cannot receive secrets |
+| Reproducibility | Nix build existed but was not bound to a signed release statement | Locked Nix inputs and derivation metadata are bound into the manifest; independent rebuilding remains a separate check | Provenance and reproducibility evidence can be compared without conflating them |
+| Rollback | Old entries remained usable | Old signed entries also remain cryptographically valid; the embedded approved snapshot supplies the current local policy | Sigstore improves history integrity but does not itself solve rollback or revocation |
 
-### Generate Keys
+### Previous Flow
 
-```bash
-./pcr_sign.js generate-keys
+```mermaid
+flowchart TB
+    source["Source on master"] --> build["CI / manual Nix build"]
+    build --> pcrs["PCR0, PCR1, PCR2"]
+    pcrs --> history["Manually maintained Git JSON history"]
+    legacyKey["Long-lived P-384 key"] -->|"signs PCR0 only"| history
+    history --> raw["raw.githubusercontent.com"]
+
+    client["SDK client"] -->|"fresh nonce"| enclave["Nitro enclave"]
+    enclave -->|"AWS-signed document<br/>nonce + key + PCRs"| aws["Verify AWS chain,<br/>signature and nonce"]
+    aws --> key["Accept enclave key"]
+    key --> exchange["Begin key exchange"]
+
+    enclave -.->|separate TypeScript proof/display path| view["Read PCR0"]
+    raw --> runtime["Fetch history at runtime"]
+    view --> local{"PCR0 in hardcoded list?"}
+    local -->|yes| badge["Show PCR0 match result"]
+    local -->|no| runtime
+    runtime --> remote{"PCR0 in valid signed history entry?"}
+    remote -->|yes| badge
+    remote -->|"no or fetch / parse error"| noMatch["Show no match"]
 ```
 
-This generates an ECDSA key pair (using the P-384 curve) for signing PCR measurements and outputs them to the console:
-- Private key in PKCS#8 DER format (base64-encoded)
-- Public key in SPKI DER format (base64-encoded for Web Crypto API)
-- Private key in PEM format (for human readability)
-- Public key in PEM format (for human readability)
+PCR1, PCR2, the source commit, build identity, and actual EIF digest were not
+covered by the legacy signature. Git authenticated changes only as ordinary
+repository history; it did not provide a separately witnessed append-only
+signing record. The diagram's dashed path is the most consequential old
+boundary: TypeScript displayed a PCR0 result after the key had already been
+accepted, while the normal Rust path did not install a PCR allowlist.
 
-It also outputs ready-to-use commands for:
-- Setting the SIGNING_PRIVATE_KEY and SIGNING_PUBLIC_KEY environment variables
-- Verifying PCR history signatures
+### New Release and Distribution Flow
 
-No files are created on disk - all keys are generated in memory and output to the console.
+```mermaid
+flowchart TB
+    subgraph release["1. Deliberate backend release"]
+        tag["Protected stable tag"] --> dispatch["Manual workflow dispatch"]
+        dispatch --> nix["Locked Nix dev + prod builds"]
+        nix --> manifest["Canonical manifests<br/>EIF hash + size, full PCR tuple,<br/>source and workflow identity"]
+        manifest --> approval["production-release approval"]
+        oidc["GitHub OIDC identity"] --> fulcio["Short-lived Fulcio certificate"]
+        fulcio --> sign["Cosign signs exact manifest bytes"]
+        approval --> sign
+        sign --> rekor["Rekor transparency record"]
+        rekor --> bundle["Portable Sigstore bundle"]
+        manifest --> publish["Untrusted GitHub Release transport"]
+        bundle --> publish
+        nix --> publish
+    end
 
-### Sign and Append PCR Measurements
+    subgraph update["2. SDK update time"]
+        publish --> updater["SDK snapshot updater"]
+        updater --> verify["Verify signature, certificate chain,<br/>Rekor evidence, exact workflow claims,<br/>canonical schema and artifact binding"]
+        policy["Local approved tag / digest policy"] --> verify
+        verify --> snapshot["Identical generated snapshot<br/>for TypeScript + Rust"]
+        snapshot --> review["Review and publish SDK"]
+    end
 
-```bash
-# First set the environment variable with the base64-encoded private key
-export SIGNING_PRIVATE_KEY='your-base64-encoded-private-key'
-
-# Then run one of these commands
-just append-pcr-dev     # For development PCRs
-just append-pcr-prod    # For production PCRs
+    subgraph downstream["3. Downstream adoption"]
+        review --> ts["Published TypeScript SDK"]
+        ts --> mapleFrontend["Maple frontend"]
+        review --> rust["Published Rust SDK"]
+        rust --> proxy["maple-proxy exact SDK pin"]
+        proxy --> mapleAgent["Maple embedded proxy / Agent Mode"]
+    end
 ```
 
-These commands:
-1. Read the PCR measurements from the latest build
-2. Sign the PCR0 value with your private key
-3. Append all PCR values and the signature to the history file (if they don't already exist)
+The signing job can obtain an OIDC identity but cannot write a GitHub Release.
+The separate publishing job can write the Release but cannot obtain an OIDC
+identity. It re-verifies the candidate before publication. This separation
+reduces the authority held by either job.
 
-Duplicate PCR0 values are automatically detected and skipped to prevent redundancy.
+### New Runtime Handshake
 
-### Verify PCR History
+```mermaid
+sequenceDiagram
+    participant App as Maple / SDK caller
+    participant SDK as TypeScript or Rust SDK
+    participant Enclave as OpenSecret Nitro enclave
+    participant Snapshot as Embedded approved snapshot
 
-```bash
-# First set the environment variable with the base64-encoded public key
-export SIGNING_PUBLIC_KEY='your-base64-encoded-public-key'
-
-# Then run one of these commands
-just verify-pcr-history dev     # For development PCRs
-just verify-pcr-history prod    # For production PCRs
+    App->>SDK: Connect to service with expected environment
+    SDK->>Enclave: Fresh challenge / nonce
+    Enclave-->>SDK: AWS Nitro attestation document<br/>nonce + ephemeral key + PCR0/1/2
+    SDK->>SDK: Verify AWS certificate chain, signature,<br/>and exact challenge nonce
+    SDK->>Snapshot: Find one approved release whose<br/>environment and PCR0/1/2 all match
+    alt complete tuple is approved
+        Snapshot-->>SDK: Release identity and provenance metadata
+        SDK->>SDK: Trust attested ephemeral key
+        SDK->>Enclave: Begin key exchange
+        SDK-->>App: Authenticated encrypted session
+    else no complete match or snapshot is empty
+        Snapshot-->>SDK: No approved release
+        SDK-->>App: Fail closed before key exchange
+    end
 ```
 
-This verifies all signatures in a PCR history file against the public key in the SIGNING_PUBLIC_KEY environment variable.
+This creates two distinct verification moments:
 
-## Deployment Workflow
+1. **Update time:** verify who released the software and which exact artifact
+   and measurements they released.
+2. **Connection time:** verify which software measurement is running now and
+   that the presented session key belongs to that fresh attestation.
 
-1. Generate keys:
-   ```bash
-   ./pcr_sign.js generate-keys
-   ```
+Neither moment substitutes for the other.
 
-2. Set the environment variables for the private and public keys:
-   ```bash
-   export SIGNING_PRIVATE_KEY='base64-encoded-private-key-from-previous-step'
-   export SIGNING_PUBLIC_KEY='base64-encoded-public-key-from-previous-step'
-   ```
+Runtime validates the embedded snapshot's strict schema and self-consistency
+hash, but it does not re-run Sigstore verification. The `snapshotId` is not a
+second signature. Snapshot authenticity comes from reviewing the updater's
+Sigstore-verified output and then trusting the SDK/package/application
+distribution channel that delivers those embedded bytes.
 
-3. Build and append PCR values:
-   ```bash
-   just build-eif-dev  # Build the EIF for dev
-   just append-pcr-dev # Sign and append to history
-   ```
+There is one deliberate local-development exception. TypeScript permits its
+local path only for exact HTTP loopback origins. Rust mock attestation requires
+a compile-time feature, and `maple-proxy` exposes it only through the explicitly
+named `insecure-local-mock-attestation` feature used by `just run-local`.
+Ordinary, default, and release builds do not enable it. Selecting the `dev`
+environment for a remote service is not an attestation bypass.
 
-4. Commit and push `pcrDevHistory.json` to your repository:
-   ```bash
-   git add pcrDevHistory.json
-   git commit -m "Update PCR history with latest measurements"
-   git push
-   ```
+## Trust Layers
 
-5. Deploy as usual:
-   ```bash
-   just deploy-dev-nix
-   ```
+The complete trust decision has separate layers:
 
-## Frontend Integration
+1. **AWS Nitro attestation** authenticates a fresh NSM document and binds its
+   PCRs, caller nonce, and ephemeral session public key.
+2. **OpenSecret release policy** decides which tagged manifest is approved for
+   the expected `dev` or `prod` environment.
+3. **Sigstore verification** proves the exact manifest bytes were signed by the
+   authorized OpenSecret release workflow and included in the transparency log.
+4. **Artifact verification** checks that the released EIF has the SHA-256 and
+   size recorded in the verified manifest.
+5. **Reproducibility** is established separately by rebuilding the same tagged,
+   locked source and comparing the EIF digest and PCR tuple.
+6. **Rollback and revocation policy** decides whether an older, correctly signed
+   release remains acceptable.
 
-The frontend integration uses the Web Crypto API to verify PCR signatures in a simplified way by only verifying the PCR0 value.
+All six concerns matter. A valid Sigstore bundle for an old release remains
+cryptographically valid after that release is withdrawn.
 
-### 1. Public Key Storage
+## What Sigstore Proves
 
-Store the SPKI base64-encoded public key in your frontend code:
+For this design, successful verification proves that:
 
-```javascript
-// The public key in SPKI DER format, base64-encoded (from ./pcr_sign.js generate-keys)
-const PCR_VERIFICATION_PUBLIC_KEY_B64 = "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE...";
+- the exact canonical manifest bytes were signed;
+- Fulcio issued the signing certificate to GitHub's OIDC identity for the exact
+  OpenSecret repository, workflow, tagged ref, commit, trigger, required
+  environment name, hosted runner, and run attempt required by local policy;
+- the signing event has valid Sigstore transparency evidence; and
+- the manifest itself binds the source/build identity to an EIF digest and one
+  complete, environment-specific PCR tuple.
+
+More precisely, a portable bundle proves inclusion in a signed Rekor
+checkpoint. The stronger ecosystem guarantee that all observers see one
+consistent append-only history depends on transparency-log monitoring and
+witnessing. The bundle is independently verifiable evidence; it is not a
+reason to stop monitoring the log.
+
+It does **not** prove that:
+
+- the source code is safe, the workflow is bug-free, or GitHub's builder was
+  uncompromised;
+- a Nix expression is reproducible or an independent party reproduced it;
+- the signed release is the newest release or still approved; or
+- GitHub Releases will remain available.
+
+Those properties require source review and CI hardening, independent rebuilds,
+an explicit approved-snapshot policy, and artifact mirroring or availability
+planning respectively.
+
+## Failure and Attack Scenarios
+
+| Scenario | Result |
+| --- | --- |
+| A release asset or manifest is modified in transit or on GitHub | The manifest signature, EIF digest/size, or checksums fail |
+| A different repository, branch, workflow, runner type, or differently named environment signs a valid bundle | Exact Fulcio identity and extension policy rejects it |
+| Required reviewers or deployment restrictions are removed from the same-named `production-release` environment | Fulcio cannot detect this; environment protections are separate repository-admin controls that must be configured and audited |
+| A development EIF is presented by the production service | Origin-to-environment binding and the environment-specific full tuple reject it |
+| PCR0 comes from one approved release while PCR1/PCR2 come from another | Atomic same-release tuple matching rejects it |
+| Rekor or GitHub is unavailable during an application handshake | No effect; runtime uses the already reviewed embedded snapshot |
+| No signed release has populated the SDK snapshot | Remote attestation fails closed before key exchange |
+| An attacker replays an older release that was once valid | Sigstore alone does not reject it; the shipped approved snapshot, and later a stronger minimum-version or TUF policy, must do so |
+| The authorized release workflow or its reviewed source is malicious before signing | Sigstore preserves attributable evidence but cannot declare the software safe; repository controls, review, and independent reproduction remain necessary |
+| A user installs an older SDK containing an older approved snapshot | This remains a downstream rollback problem; distribution/version policy must prevent SDK downgrade |
+
+## Activation and Rollout
+
+Merging this code does not silently trust an unreleased build. Until the first
+approved tag is signed and deliberately imported, the generated SDK snapshot
+contains no releases and real remote handshakes fail closed.
+
+```mermaid
+flowchart TD
+    backend["Merge backend release machinery<br/>and configure repository controls"]
+    release["Manually approve and publish<br/>the first signed stable tag"]
+    sdk["Run updater, review populated snapshot,<br/>publish TypeScript + Rust SDKs"]
+    proxy["Repin, test, and publish maple-proxy"]
+    mapleFrontend["Update Maple frontend<br/>TypeScript SDK"]
+    mapleAgent["Update Maple embedded proxy<br/>Rust SDK path"]
+    live["Run live attestation tests<br/>and promote consumers"]
+
+    backend --> release --> sdk
+    sdk --> mapleFrontend
+    sdk --> proxy --> mapleAgent
+    mapleFrontend --> live
+    mapleAgent --> live
 ```
 
-### 2. Import the Public Key
+Both Maple dependency paths must advance:
 
-Create a function to import the public key into the Web Crypto API:
+- the frontend consumes the TypeScript SDK; and
+- Agent Mode consumes the Rust SDK through the embedded `maple-proxy`.
 
-```javascript
-async function importVerificationKey() {
-  // Decode the base64 key to binary
-  const binaryKey = Uint8Array.from(
-    atob(PCR_VERIFICATION_PUBLIC_KEY_B64),
-    c => c.charCodeAt(0)
-  );
-  
-  // Import as SPKI format
-  return await crypto.subtle.importKey(
-    "spki",                  // The format: SubjectPublicKeyInfo
-    binaryKey.buffer,        // The binary key data
-    {
-      name: "ECDSA",         // The algorithm
-      namedCurve: "P-384"    // The curve (must be P-384 to match our backend)
+Updating only one path would leave the other on the previous trust behavior.
+The consumer pull requests therefore remain staging changes until a real
+signed release populates the snapshot and the corresponding packages and
+commit pins exist.
+
+## Manual Tagged Release
+
+The release workflow is
+`.github/workflows/release-nitro-eif.yml` (`Nitro EIF Release`).
+
+Before using it, repository administrators must configure controls that cannot
+be expressed in this repository:
+
+- Protect the `production-release` GitHub Environment with required reviewers,
+  prevent self-review, and restrict deployment refs to stable `v*` tags.
+- Protect `v*` tags against unauthorized creation, update, and deletion.
+- Require CODEOWNERS review for the release workflow and manifest generator.
+- Enable immutable GitHub Releases.
+
+To publish:
+
+1. Merge the intended source to protected `master`.
+2. Create an existing tag whose name matches exactly `vMAJOR.MINOR.PATCH`.
+   Prerelease suffixes and leading zeroes are intentionally rejected.
+3. Dispatch the workflow with that tag as its workflow ref:
+
+   ```sh
+   gh workflow run release-nitro-eif.yml \
+     --repo OpenSecretCloud/opensecret \
+     --ref vMAJOR.MINOR.PATCH
+   ```
+
+4. Approve the `production-release` deployment after reviewing the selected tag
+   and commit.
+
+Dispatching the workflow from `master` and supplying a tag as free-form text is
+not supported. The selected workflow ref must itself be the tag so the Fulcio
+certificate binds the signature to `refs/tags/vMAJOR.MINOR.PATCH`.
+
+If a run must be retried, use **Re-run all jobs**. The manifests and artifact
+names deliberately bind the run attempt, so **Re-run failed jobs** cannot reuse
+successful outputs from an earlier attempt.
+
+The workflow:
+
+1. Validates the repository identity, owner identity, tag syntax, tag object,
+   checked-out commit, and master ancestry.
+2. Builds `eif-dev` and `eif-prod` from the exact tagged source on the ARM64 Nix
+   runner.
+3. Generates and independently revalidates one strict manifest per environment.
+4. Uses Cosign 3.1.2 keyless signing to create a Sigstore v0.3 message-signature
+   bundle over each manifest's exact bytes.
+5. Creates SHA-256 checksums for the runtime assets.
+6. Generates an additional GitHub SLSA/DSSE audit bundle covering both EIFs,
+   both manifests, and the checksum file.
+7. Transfers the signed release candidate to a separate publication job.
+8. The publication job has no OIDC permission. It revalidates the manifests,
+   independently verifies both Cosign bundles, checks every checksum and SLSA
+   subject, attaches the explicit public assets to one draft GitHub Release,
+   and only then publishes it.
+
+OIDC signing permission exists only in the `production-release`-gated signing
+job, which has no GitHub Release write permission. The publication job has
+GitHub Release write permission but no OIDC permission. Ordinary pull-request
+and master builds cannot mint release signatures.
+
+## Release Assets
+
+For tag `v1.2.3`, the published assets are:
+
+```text
+opensecret-v1.2.3-dev.eif
+opensecret-nitro-v1.2.3-dev.manifest.json
+opensecret-nitro-v1.2.3-dev.manifest.sigstore.json
+opensecret-v1.2.3-prod.eif
+opensecret-nitro-v1.2.3-prod.manifest.json
+opensecret-nitro-v1.2.3-prod.manifest.sigstore.json
+opensecret-nitro-v1.2.3.sha256
+opensecret-nitro-v1.2.3.slsa.sigstore.json
+```
+
+GitHub Releases are an untrusted byte transport. Consumers authenticate a
+manifest with its adjacent `manifest.sigstore.json` bundle before parsing or
+using any manifest field.
+
+The Cosign message-signature bundle is the cross-language runtime/update
+contract. The SLSA/DSSE bundle is additional audit provenance and is not a
+substitute for the simpler message-signature verification path.
+
+## Manifest Contract
+
+The schema identifier is:
+
+```text
+https://opensecret.cloud/attestations/nitro-eif-release/v1
+```
+
+The generator emits sorted, two-space-indented UTF-8 JSON followed by exactly
+one line feed. It rejects duplicate keys, unknown fields, missing fields,
+noncanonical tags and commits, malformed hashes, missing PCRs, and all-zero PCR
+measurements. No wall-clock timestamp or mutable download URL is included.
+
+A representative production manifest is:
+
+```json
+{
+  "artifact": {
+    "mediaType": "application/vnd.aws.nitro.eif",
+    "name": "opensecret-v1.2.3-prod.eif",
+    "sha256": "<64 lowercase hexadecimal characters>",
+    "size": 123456789
+  },
+  "build": {
+    "derivation": "eif-prod",
+    "flakeLockSha256": "<64 lowercase hexadecimal characters>",
+    "system": "nix",
+    "workflowRun": "https://github.com/OpenSecretCloud/opensecret/actions/runs/123456789/attempts/1"
+  },
+  "environment": "prod",
+  "measurements": {
+    "algorithm": "sha384",
+    "pcrs": {
+      "0": "<96 lowercase hexadecimal characters>",
+      "1": "<96 lowercase hexadecimal characters>",
+      "2": "<96 lowercase hexadecimal characters>"
     },
-    false,                   // Not extractable
-    ["verify"]               // Only for verification
-  );
-}
-```
-
-### 3. Fetch PCR History
-
-Add a helper function to fetch the PCR history from your repository:
-
-```javascript
-async function fetchPcrHistory(env) {
-  // Replace with your actual repository URL
-  const baseUrl = "https://raw.githubusercontent.com/YourOrg/YourRepo/main";
-  const url = env === 'dev' ? 
-    `${baseUrl}/pcrDevHistory.json` : 
-    `${baseUrl}/pcrProdHistory.json`;
-  
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch PCR history: ${response.status}`);
-  }
-  
-  return await response.json();
-}
-```
-
-### 4. Verify a Signature
-
-This is the function for verifying a PCR0 signature:
-
-```javascript
-async function verifyPcr0Signature(pcr0, signatureBase64, publicKey) {
-  try {
-    // 1. Create the verifier with the correct hash algorithm
-    const encoder = new TextEncoder();
-    const pcr0Binary = encoder.encode(pcr0);
-    
-    // 2. Convert the base64 signature to binary
-    const signatureBinary = Uint8Array.from(
-      atob(signatureBase64),
-      c => c.charCodeAt(0)
-    );
-    
-    // 3. Verify using Web Crypto API
-    return await crypto.subtle.verify(
-      {
-        name: "ECDSA",
-        hash: { name: "SHA-384" }  // Must match the hash used for signing
-      },
-      publicKey,
-      signatureBinary,
-      pcr0Binary
-    );
-  } catch (error) {
-    console.error("Signature verification error:", error);
-    return false;
+    "requiredPcrs": [
+      0,
+      1,
+      2
+    ]
+  },
+  "release": {
+    "tag": "v1.2.3"
+  },
+  "schema": "https://opensecret.cloud/attestations/nitro-eif-release/v1",
+  "source": {
+    "commit": "<40 lowercase hexadecimal characters>",
+    "ownerId": 185423582,
+    "ref": "refs/tags/v1.2.3",
+    "repository": "OpenSecretCloud/opensecret",
+    "repositoryId": 921901924
   }
 }
 ```
 
-### 5. PCR Validation Function
+PCR0 is not the raw EIF SHA-256. The manifest records both values and the full
+PCR0/PCR1/PCR2 tuple.
 
-Create a function to check if a PCR is valid:
+## Consumer Verification Policy
 
-```javascript
-async function validatePcr(pcr, env = 'prod') {
-  try {
-    // 1. Import the verification key
-    const publicKey = await importVerificationKey();
-    
-    // 2. Fetch the PCR history
-    const history = await fetchPcrHistory(env);
-    
-    // 3. Find a matching entry in the history
-    for (const entry of history) {
-      // Check if PCR values match
-      if (entry.PCR0 === pcr.PCR0 &&
-          entry.PCR1 === pcr.PCR1 &&
-          entry.PCR2 === pcr.PCR2) {
-        
-        // 4. Verify the signature (only of PCR0)
-        const isValid = await verifyPcr0Signature(entry.PCR0, entry.signature, publicKey);
-        if (isValid) {
-          return {
-            valid: true,
-            timestamp: entry.timestamp,
-            message: `Verified PCR with signature from ${new Date(entry.timestamp * 1000).toLocaleString()}`
-          };
-        }
-      }
-    }
-    
-    // No match found
-    return {
-      valid: false,
-      message: "PCR not found in verified history"
-    };
-  } catch (error) {
-    console.error("PCR validation error:", error);
-    return {
-      valid: false,
-      message: `Error validating PCR: ${error.message}`
-    };
-  }
-}
+A relying SDK or update tool must:
+
+1. Obtain the manifest and message-signature bundle as untrusted bytes.
+2. Require Sigstore bundle media type
+   `application/vnd.dev.sigstore.bundle.v0.3+json`.
+3. Load the Sigstore trust root independently rather than trusting roots
+   supplied by the release transport.
+4. Verify the Fulcio chain, transparency evidence, timestamp evidence, and the
+   message signature over the exact manifest bytes.
+5. Require issuer exactly `https://token.actions.githubusercontent.com`.
+6. Require the signer identity to match exactly:
+
+   ```text
+   https://github.com/OpenSecretCloud/opensecret/.github/workflows/release-nitro-eif.yml@refs/tags/vMAJOR.MINOR.PATCH
+   ```
+
+7. Require the Fulcio extensions for the exact workflow name, repository,
+   tag ref, source commit, `workflow_dispatch` trigger, GitHub-hosted runner,
+   `production-release` environment, and run-invocation URI. The run-invocation
+   URI must equal the manifest's immutable `build.workflowRun` attempt URL.
+8. Strictly parse the already verified bytes and enforce repository ID
+   `921901924`, owner ID `185423582`, source repository, tag/ref/commit,
+   environment, schema, build derivation, and digest formats.
+9. Apply a local approved-release or pinned-manifest policy. A Rekor inclusion
+   proof does not mean "current" or "approved."
+10. Verify a fresh AWS Nitro document and compare its full PCR0/PCR1/PCR2 tuple
+   with the environment-specific manifest.
+11. Only after every check succeeds, trust the attested ephemeral key and begin
+    `/key_exchange`.
+
+Production must never fall back to accepting a `dev` manifest. Verification
+errors and missing evidence fail closed. A previously verified, pinned bundle
+may be cached by digest so normal attestation does not require an online Rekor
+lookup.
+
+## Reproducibility
+
+The tagged build uses the locked Nix flake, Cargo lockfile, pinned submodules,
+and environment-specific EIF derivations. This is good reproducibility
+groundwork, but the release signature still represents a builder claim.
+
+Independent reproduction requires another trusted builder to check out the same
+tag and locked inputs, run:
+
+```sh
+nix build '.?submodules=1#eif-dev'
+nix build '.?submodules=1#eif-prod'
 ```
 
-### 6. Complete Example
+and compare the raw EIF SHA-256 plus PCR0/PCR1/PCR2 with the release manifest.
+Two builds on the same runner are repeatability evidence, not independent
+reproduction.
 
-Here's a complete example showing how to validate PCRs in a web application:
+## Rollback and Revocation
 
-```javascript
-// PCR Verification Module
+Transparency logs retain old, valid records. They intentionally do not delete a
+release when OpenSecret stops approving it.
 
-// The public key from pcr_sign.js generate-keys output
-const PCR_VERIFICATION_PUBLIC_KEY_B64 = "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE...";
+Phase one consumers must ship or otherwise authenticate an explicit set of
+approved manifest digests/tags. Moving to a different approved release is a new
+SDK/update-policy decision. If dynamically updated authorization is needed
+later, use a separate OpenSecret TUF repository; Sigstore's own TUF repository
+distributes Sigstore trust roots, not OpenSecret release policy.
 
-// Import the public key into Web Crypto API
-async function importVerificationKey() {
-  const binaryKey = Uint8Array.from(
-    atob(PCR_VERIFICATION_PUBLIC_KEY_B64),
-    c => c.charCodeAt(0)
-  );
-  
-  return await crypto.subtle.importKey(
-    "spki",
-    binaryKey.buffer,
-    {
-      name: "ECDSA",
-      namedCurve: "P-384"
-    },
-    false,
-    ["verify"]
-  );
-}
+Never use a signed mutable `latest.json` as the sole current-release mechanism:
+an attacker can replay an older correctly signed copy.
 
-// Fetch PCR history from repository
-async function fetchPcrHistory(env) {
-  const baseUrl = "https://raw.githubusercontent.com/YourOrg/YourRepo/main";
-  const url = `${baseUrl}/pcr${env.charAt(0).toUpperCase() + env.slice(1)}History.json`;
-  
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch PCR history: ${response.status}`);
-  }
-  
-  return await response.json();
-}
+## Frozen Legacy PCR History
 
-// Verify a single PCR0 signature
-async function verifyPcr0Signature(pcr0, signatureBase64, publicKey) {
-  // Convert PCR0 string to binary
-  const encoder = new TextEncoder();
-  const pcr0Binary = encoder.encode(pcr0);
-  
-  // Convert signature from base64 to binary
-  const signatureBinary = Uint8Array.from(
-    atob(signatureBase64),
-    c => c.charCodeAt(0)
-  );
-  
-  // Verify
-  try {
-    return await crypto.subtle.verify(
-      {
-        name: "ECDSA",
-        hash: { name: "SHA-384" }
-      },
-      publicKey,
-      signatureBinary,
-      pcr0Binary
-    );
-  } catch (error) {
-    console.error("Verification error:", error);
-    return false;
-  }
-}
+`pcrDevHistory.json` and `pcrProdHistory.json` are frozen, deprecated
+compatibility data for already released clients. They are Git-hosted arrays
+whose P-384 signatures cover only PCR0; they do not provide append-only
+transparency or tagged CI provenance.
 
-// Main validation function
-async function validatePcr(pcr, env = 'prod') {
-  try {
-    // Load key and history
-    const [publicKey, history] = await Promise.all([
-      importVerificationKey(),
-      fetchPcrHistory(env)
-    ]);
-    
-    // Check for matches
-    for (const entry of history) {
-      if (entry.PCR0 === pcr.PCR0 &&
-          entry.PCR1 === pcr.PCR1 &&
-          entry.PCR2 === pcr.PCR2) {
-        
-        const isValid = await verifyPcr0Signature(entry.PCR0, entry.signature, publicKey);
-        if (isValid) {
-          return {
-            valid: true,
-            timestamp: entry.timestamp,
-            verifiedAt: new Date(entry.timestamp * 1000).toLocaleString()
-          };
-        }
-      }
-    }
-    
-    return { valid: false };
-  } catch (error) {
-    console.error("PCR validation failed:", error);
-    return { valid: false, error: error.message };
-  }
-}
+Do not append, rewrite, reorder, or remove legacy entries. The legacy `just
+append-pcr-*` and `just update-pcr-*` commands now fail deliberately.
+`pcr_sign.js` is deprecated. `pcr_verify.js` remains only for forensic
+verification of old PCR0 signatures.
 
-// Example usage:
-async function checkPcr() {
-  const pcr = {
-    PCR0: "cc88f0edbccb5c92a46a2c4ba542c624123a793b002d1150153def94e34f3daa288f70162a8d163c5d36b31269624cb7", 
-    PCR1: "e45de6f4e9809176f6adc68df999f87f32a602361247d5819d1edf11ac5a403cfbb609943705844251af85713a17c83a",
-    PCR2: "7f3c7df92680edd708d19a25784d18883381cc34e16d3fe9079f7f117970ccb2eb4f403875f1340558f86a58edcdcea9"
-  };
-  
-  const result = await validatePcr(pcr, 'dev');
-  console.log("PCR valid?", result.valid);
-  if (result.valid) {
-    console.log("Verified at:", result.verifiedAt);
-  }
-}
+`pcrDev.json` and `pcrProd.json` remain temporary build-regression references
+for the ordinary reproducible-build workflow. They are not release approval
+metadata and must not be used by new clients.
+
+## Further Reading
+
+- [Sigstore transparency-log overview](https://docs.sigstore.dev/logging/overview/)
+- [Sigstore bundle format and offline verification model](https://docs.sigstore.dev/about/bundle/)
+- [Fulcio GitHub Actions certificate claims](https://github.com/sigstore/fulcio/blob/main/docs/oid-info.md)
+- [Rekor v2 client guidance](https://github.com/sigstore/rekor-tiles/blob/main/CLIENTS.md#removing-online-verification-and-search)
+- [GitHub artifact attestations](https://docs.github.com/en/enterprise-cloud@latest/actions/concepts/security/artifact-attestations)
+- [GitHub immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
+
+## Local Generator Tests
+
+The generator and verifier have no third-party Python dependencies:
+
+```sh
+python3 -m unittest discover -s scripts/tests -p 'test_*.py' -v
+python3 -m py_compile \
+  scripts/generate_nitro_release_manifest.py \
+  scripts/tests/test_generate_nitro_release_manifest.py
 ```
 
-### Key Advantages of this Approach
-
-1. **Simplicity**: By signing only the PCR0 string value rather than a JSON object, we eliminate issues with JSON formatting, whitespace, and field ordering.
-
-2. **Reliability**: The signature verification is much more reliable since it's based on a simple string rather than a complex JSON structure that could vary between signing and verification.
-
-3. **Performance**: Signing and verifying a simple string is more efficient than working with JSON objects.
-
-4. **Security**: The PCR0 value is the most important measurement that identifies the enclave. By signing it directly, we maintain the security guarantee while simplifying the implementation.
-
-## Testing
-
-During development, you can verify that signatures in a PCR history file are valid by running:
-
-```bash
-export SIGNING_PUBLIC_KEY='your-base64-encoded-public-key'
-just verify-pcr-history dev
-```
-
-This will check all signatures in the history file and report any invalid entries.
+Live Fulcio/Rekor publication cannot be tested without dispatching an approved
+tagged release. The offline tests cover deterministic serialization, the full
+contract, duplicate/unknown keys, malformed tags, zero PCRs, PCR substitution,
+and EIF tampering.

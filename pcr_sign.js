@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// DEPRECATED: pcrDevHistory.json and pcrProdHistory.json are frozen legacy data.
+// New measurements are published by .github/workflows/release-nitro-eif.yml.
+
 const fs = require('fs');
 const crypto = require('crypto');
 
@@ -104,83 +107,10 @@ function signData(privateKeyData, dataToSign) {
  * Main function to handle CLI commands
  */
 function main() {
-  const command = process.argv[2];
-
-  if (!command) {
-    console.log("Usage:");
-    console.log("  pcr_sign.js generate-keys");
-    console.log("  pcr_sign.js sign-pcr0 <pcr0-value>");
-    process.exit(1);
-  }
-
-  if (command === "generate-keys") {
-    const keys = generateKeypair();
-    
-    console.log("===== IMPORTANT: SAVE THESE KEYS SECURELY =====");
-    console.log("Generate these keys once and securely store them for all future operations.");
-    console.log("The private key is SENSITIVE and should be protected!\n");
-    
-    console.log("===== SET THESE ENVIRONMENT VARIABLES NOW =====");
-    console.log(`export SIGNING_PRIVATE_KEY='${keys.privateKeyBase64}'`);
-    console.log(`export SIGNING_PUBLIC_KEY='${keys.publicKeyBase64}'`);
-    console.log("\nRun the above commands to set your environment variables.");
-    console.log("Consider adding them to your .env file for persistence.\n");
-    
-    console.log("===== FOR FRONTEND INTEGRATION =====");
-    console.log("// Add this constant to your frontend code for PCR signature verification");
-    console.log(`const PCR_VERIFICATION_PUBLIC_KEY_B64 = "${keys.publicKeyBase64}";`);
-    console.log("");
-    
-    console.log("===== KEY FORMATS (FOR REFERENCE) =====");
-    console.log("PRIVATE KEY (PKCS#8 DER BASE64):");
-    console.log(keys.privateKeyBase64);
-    console.log("\nPUBLIC KEY (SPKI DER BASE64):");
-    console.log(keys.publicKeyBase64);
-    console.log("\nPRIVATE KEY (PEM):\n" + keys.privatePem);
-    console.log("\nPUBLIC KEY (PEM):\n" + keys.publicPem);
-    
-    console.log("\n===== VERIFICATION COMMANDS =====");
-    console.log("# Sign and append PCR measurements:");
-    console.log("just append-pcr-dev");
-    console.log("just append-pcr-prod");
-    console.log("");
-    console.log("# Verify PCR history signatures:");
-    console.log("just verify-pcr-history dev");
-    console.log("just verify-pcr-history prod");
-    console.log("");
-  }
-  else if (command === "sign-pcr0") {
-    // Get PCR0 value from argument or environment
-    const pcr0 = process.argv[3];
-    if (!pcr0) {
-      console.error("Error: PCR0 value is required");
-      console.log("Usage: pcr_sign.js sign-pcr0 <pcr0-value>");
-      process.exit(1);
-    }
-
-    // Get private key from environment
-    const privateKeyBase64 = process.env.SIGNING_PRIVATE_KEY;
-    if (!privateKeyBase64) {
-      console.error("Error: SIGNING_PRIVATE_KEY environment variable is not set");
-      console.log("Set it with: export SIGNING_PRIVATE_KEY='your-base64-private-key'");
-      process.exit(1);
-    }
-
-    try {
-      // Sign just the PCR0 string
-      const signature = signData(privateKeyBase64, pcr0);
-      
-      // Output only the signature (no comments or extra text)
-      console.log(signature);
-    } catch (error) {
-      console.error("Error signing PCR0:", error.message);
-      process.exit(1);
-    }
-  }
-  else {
-    console.log("Unknown command:", command);
-    process.exit(1);
-  }
+  console.error(
+    "Legacy PCR0 signing is disabled. Publish measurements with the manually approved Nitro EIF release workflow."
+  );
+  process.exit(1);
 }
 
 // Run the main function if this script is executed directly
@@ -192,4 +122,4 @@ if (require.main === module) {
 module.exports = {
   generateKeypair,
   signData
-}; 
+};

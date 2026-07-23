@@ -371,271 +371,27 @@ copy-pcr-prod:
     cat result/pcr.json
     cp -f result/pcr.json ./pcrProd.json
 
-# Sign and append PCR measurements for dev environment
-append-pcr-dev:
-    #!/usr/bin/env bash
-    set -e
-    
-    # Check for required environment variable
-    if [ -z "${SIGNING_PRIVATE_KEY}" ]; then
-        echo "❌ Error: SIGNING_PRIVATE_KEY environment variable is not set"
-        echo "Please generate keys with: ./pcr_sign.js generate-keys"
-        echo "Then set the environment variables with:"
-        echo "export SIGNING_PRIVATE_KEY='...'"
-        echo "export SIGNING_PUBLIC_KEY='...'"
-        exit 1
-    fi
-    
-    # Check if the Node.js script exists and is executable
-    if [ ! -x "./pcr_sign.js" ]; then
-        chmod +x ./pcr_sign.js
-    fi
-    
-    # Initialize empty history file if it doesn't exist
-    if [ ! -f "./pcrDevHistory.json" ]; then
-        echo "[]" > ./pcrDevHistory.json
-    fi
-    
-    # Get current PCR values
-    PCR_CONTENT=$(cat ./pcrDev.json)
-    CURRENT_PCR0=$(echo $PCR_CONTENT | jq -r '.PCR0')
-    CURRENT_PCR1=$(echo $PCR_CONTENT | jq -r '.PCR1')
-    CURRENT_PCR2=$(echo $PCR_CONTENT | jq -r '.PCR2')
-    
-    # Check if this PCR0 already exists in the history
-    HISTORY=$(cat ./pcrDevHistory.json)
-    PCR0_EXISTS=$(echo $HISTORY | jq --arg pcr0 "$CURRENT_PCR0" 'map(select(.PCR0 == $pcr0)) | length')
-    
-    if [ "$PCR0_EXISTS" -gt "0" ]; then
-        echo "⚠️  PCR0 value already exists in pcrDevHistory.json"
-        echo "    Skipping append operation to avoid duplicates."
-        exit 0
-    fi
-    
-    # Generate a timestamp
-    TIMESTAMP=$(date +%s)
-    
-    # Sign just the PCR0 value
-    echo "Signing PCR0: $CURRENT_PCR0"
-    SIGNATURE=$(./pcr_sign.js sign-pcr0 "$CURRENT_PCR0")
-    
-    if [ -z "$SIGNATURE" ]; then
-        echo "❌ Error: Failed to create signature"
-        exit 1
-    fi
-    
-    # Create a new history entry
-    NEW_ENTRY=$(jq -n \
-      --arg pcr0 "$CURRENT_PCR0" \
-      --arg pcr1 "$CURRENT_PCR1" \
-      --arg pcr2 "$CURRENT_PCR2" \
-      --arg sig "$SIGNATURE" \
-      --arg ts "$TIMESTAMP" \
-      '{
-        "PCR0": $pcr0, 
-        "PCR1": $pcr1, 
-        "PCR2": $pcr2, 
-        "timestamp": ($ts | tonumber),
-        "signature": $sig
-      }')
-    
-    # Append to history file
-    echo $HISTORY | jq --argjson entry "$NEW_ENTRY" '. + [$entry]' > ./pcrDevHistory.json
-    
-    echo "✅ Successfully appended signed PCR entry to pcrDevHistory.json"
-    echo "   PCR0: $CURRENT_PCR0"
-    echo "   Timestamp: $TIMESTAMP"
+# Legacy PCR histories are frozen. Keep the public recipe names so old
+# automation fails closed with an actionable message instead of mutating them.
+_legacy-pcr-history-frozen:
+    @echo "❌ Legacy PCR history updates are frozen; use the Nitro EIF release workflow." >&2
+    @exit 1
 
-# Sign and append PCR measurements for prod environment
-append-pcr-prod:
-    #!/usr/bin/env bash
-    set -e
-    
-    # Check for required environment variable
-    if [ -z "${SIGNING_PRIVATE_KEY}" ]; then
-        echo "❌ Error: SIGNING_PRIVATE_KEY environment variable is not set"
-        echo "Please generate keys with: ./pcr_sign.js generate-keys"
-        echo "Then set the environment variables with:"
-        echo "export SIGNING_PRIVATE_KEY='...'"
-        echo "export SIGNING_PUBLIC_KEY='...'"
-        exit 1
-    fi
-    
-    # Check if the Node.js script exists and is executable
-    if [ ! -x "./pcr_sign.js" ]; then
-        chmod +x ./pcr_sign.js
-    fi
-    
-    # Initialize empty history file if it doesn't exist
-    if [ ! -f "./pcrProdHistory.json" ]; then
-        echo "[]" > ./pcrProdHistory.json
-    fi
-    
-    # Get current PCR values
-    PCR_CONTENT=$(cat ./pcrProd.json)
-    CURRENT_PCR0=$(echo $PCR_CONTENT | jq -r '.PCR0')
-    CURRENT_PCR1=$(echo $PCR_CONTENT | jq -r '.PCR1')
-    CURRENT_PCR2=$(echo $PCR_CONTENT | jq -r '.PCR2')
-    
-    # Check if this PCR0 already exists in the history
-    HISTORY=$(cat ./pcrProdHistory.json)
-    PCR0_EXISTS=$(echo $HISTORY | jq --arg pcr0 "$CURRENT_PCR0" 'map(select(.PCR0 == $pcr0)) | length')
-    
-    if [ "$PCR0_EXISTS" -gt "0" ]; then
-        echo "⚠️  PCR0 value already exists in pcrProdHistory.json"
-        echo "    Skipping append operation to avoid duplicates."
-        exit 0
-    fi
-    
-    # Generate a timestamp
-    TIMESTAMP=$(date +%s)
-    
-    # Sign just the PCR0 value
-    echo "Signing PCR0: $CURRENT_PCR0"
-    SIGNATURE=$(./pcr_sign.js sign-pcr0 "$CURRENT_PCR0")
-    
-    if [ -z "$SIGNATURE" ]; then
-        echo "❌ Error: Failed to create signature"
-        exit 1
-    fi
-    
-    # Create a new history entry
-    NEW_ENTRY=$(jq -n \
-      --arg pcr0 "$CURRENT_PCR0" \
-      --arg pcr1 "$CURRENT_PCR1" \
-      --arg pcr2 "$CURRENT_PCR2" \
-      --arg sig "$SIGNATURE" \
-      --arg ts "$TIMESTAMP" \
-      '{
-        "PCR0": $pcr0, 
-        "PCR1": $pcr1, 
-        "PCR2": $pcr2, 
-        "timestamp": ($ts | tonumber),
-        "signature": $sig
-      }')
-    
-    # Append to history file
-    echo $HISTORY | jq --argjson entry "$NEW_ENTRY" '. + [$entry]' > ./pcrProdHistory.json
-    
-    echo "✅ Successfully appended signed PCR entry to pcrProdHistory.json"
-    echo "   PCR0: $CURRENT_PCR0"
-    echo "   Timestamp: $TIMESTAMP"
+append-pcr-dev: _legacy-pcr-history-frozen
 
-# Sign and append PCR measurements from a specific PCR file into a history file.
-_append-pcr-file pcr_file history_file label:
-    #!/usr/bin/env bash
-    set -e
+append-pcr-prod: _legacy-pcr-history-frozen
 
-    PCR_FILE="./{{pcr_file}}"
-    HISTORY_FILE="./{{history_file}}"
+_append-pcr-file pcr_file history_file label: _legacy-pcr-history-frozen
 
-    # Check for required environment variable
-    if [ -z "${SIGNING_PRIVATE_KEY}" ]; then
-        echo "❌ Error: SIGNING_PRIVATE_KEY environment variable is not set"
-        echo "Please generate keys with: ./pcr_sign.js generate-keys"
-        echo "Then set the environment variables with:"
-        echo "export SIGNING_PRIVATE_KEY='...'"
-        echo "export SIGNING_PUBLIC_KEY='...'"
-        exit 1
-    fi
+update-pcr-dev: _legacy-pcr-history-frozen
 
-    # Check if the Node.js script exists and is executable
-    if [ ! -x "./pcr_sign.js" ]; then
-        chmod +x ./pcr_sign.js
-    fi
+update-pcr-prod: _legacy-pcr-history-frozen
 
-    if [ ! -f "$PCR_FILE" ]; then
-        echo "❌ Error: $PCR_FILE does not exist"
-        exit 1
-    fi
-
-    # Initialize empty history file if it doesn't exist
-    if [ ! -f "$HISTORY_FILE" ]; then
-        echo "[]" > "$HISTORY_FILE"
-    fi
-
-    # Get current PCR values
-    PCR_CONTENT=$(cat "$PCR_FILE")
-    CURRENT_PCR0=$(echo "$PCR_CONTENT" | jq -r '.PCR0')
-    CURRENT_PCR1=$(echo "$PCR_CONTENT" | jq -r '.PCR1')
-    CURRENT_PCR2=$(echo "$PCR_CONTENT" | jq -r '.PCR2')
-
-    # Check if this PCR0 already exists in the history
-    HISTORY=$(cat "$HISTORY_FILE")
-    PCR0_EXISTS=$(echo "$HISTORY" | jq --arg pcr0 "$CURRENT_PCR0" 'map(select(.PCR0 == $pcr0)) | length')
-
-    if [ "$PCR0_EXISTS" -gt "0" ]; then
-        echo "⚠️  PCR0 value already exists in {{history_file}} for {{label}}"
-        echo "    Skipping append operation to avoid duplicates."
-        exit 0
-    fi
-
-    # Generate a timestamp
-    TIMESTAMP=$(date +%s)
-
-    # Sign just the PCR0 value
-    echo "Signing {{label}} PCR0: $CURRENT_PCR0"
-    SIGNATURE=$(./pcr_sign.js sign-pcr0 "$CURRENT_PCR0")
-
-    if [ -z "$SIGNATURE" ]; then
-        echo "❌ Error: Failed to create signature"
-        exit 1
-    fi
-
-    # Create a new history entry. Keep the existing history schema stable.
-    NEW_ENTRY=$(jq -n \
-      --arg pcr0 "$CURRENT_PCR0" \
-      --arg pcr1 "$CURRENT_PCR1" \
-      --arg pcr2 "$CURRENT_PCR2" \
-      --arg sig "$SIGNATURE" \
-      --arg ts "$TIMESTAMP" \
-      '{
-        "PCR0": $pcr0,
-        "PCR1": $pcr1,
-        "PCR2": $pcr2,
-        "timestamp": ($ts | tonumber),
-        "signature": $sig
-      }')
-
-    # Append to history file
-    echo "$HISTORY" | jq --argjson entry "$NEW_ENTRY" '. + [$entry]' > "$HISTORY_FILE"
-
-    echo "✅ Successfully appended signed PCR entry to {{history_file}}"
-    echo "   Label: {{label}}"
-    echo "   PCR0: $CURRENT_PCR0"
-    echo "   Timestamp: $TIMESTAMP"
-
-# Update PCR dev with signature and append to history
-update-pcr-dev:
-    just copy-pcr-dev
-    just append-pcr-dev
-    echo "✅ PCR dev values updated and history appended"
-
-# Update PCR prod with signature and append to history
-update-pcr-prod:
-    just copy-pcr-prod
-    just append-pcr-prod
-    echo "✅ PCR prod values updated and history appended"
-
-# Update all PCR values for both dev and prod environments
-update-pcr-all:
-    just update-pcr-dev
-    just update-pcr-prod
-    echo "✅ All PCR values updated and history appended for dev and prod"
+update-pcr-all: _legacy-pcr-history-frozen
 
 
-# Generate a key pair for PCR signing and output to terminal (no files created)
-generate-pcr-keys:
-    #!/usr/bin/env bash
-    set -e
-    
-    # Check if the Node.js script exists and is executable
-    if [ ! -x "./pcr_sign.js" ]; then
-        chmod +x ./pcr_sign.js
-    fi
-    
-    # Generate the keys using the Node.js script
-    ./pcr_sign.js generate-keys
+# Legacy key generation is frozen along with legacy PCR history mutation.
+generate-pcr-keys: _legacy-pcr-history-frozen
 
 # Verify signatures in a PCR history file using the SIGNING_PUBLIC_KEY environment variable
 verify-pcr-history env:
@@ -650,10 +406,8 @@ verify-pcr-history env:
     # Check for required environment variable
     if [ -z "${SIGNING_PUBLIC_KEY}" ]; then
         echo "❌ Error: SIGNING_PUBLIC_KEY environment variable is not set"
-        echo "Please generate keys with: ./pcr_sign.js generate-keys"
-        echo "Then set the environment variables with:"
-        echo "export SIGNING_PRIVATE_KEY='...'"
-        echo "export SIGNING_PUBLIC_KEY='...'"
+        echo "Retrieve the historical public key used for these frozen records."
+        echo "Generating a new key cannot verify existing history."
         exit 1
     fi
     

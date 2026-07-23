@@ -1,0 +1,450 @@
+name: Nitro EIF Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nitro-eif-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      EXPECTED_REPOSITORY: OpenSecretCloud/opensecret
+      EXPECTED_REPOSITORY_ID: "921901924"
+      EXPECTED_OWNER_ID: "185423582"
+      REPOSITORY_ID: ${{ github.repository_id }}
+      OWNER_ID: ${{ github.repository_owner_id }}
+    steps:
+      - name: Check out the selected tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Require an existing stable semver tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REPOSITORY" != "$EXPECTED_REPOSITORY" ]]; then
+            echo "Unexpected repository: $GITHUB_REPOSITORY" >&2
+            exit 1
+          fi
+          if [[ "$REPOSITORY_ID" != "$EXPECTED_REPOSITORY_ID" ]]; then
+            echo "Unexpected repository ID: $REPOSITORY_ID" >&2
+            exit 1
+          fi
+          if [[ "$OWNER_ID" != "$EXPECTED_OWNER_ID" ]]; then
+            echo "Unexpected repository owner ID: $OWNER_ID" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            echo "Dispatch this workflow with an existing tag selected as the workflow ref." >&2
+            exit 1
+          fi
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tag must match exactly vMAJOR.MINOR.PATCH: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+
+          tag_ref="refs/tags/$GITHUB_REF_NAME"
+          git show-ref --verify --quiet "$tag_ref"
+          tag_commit="$(git rev-parse "$tag_ref^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          if [[ "$tag_commit" != "$GITHUB_SHA" || "$head_commit" != "$GITHUB_SHA" ]]; then
+            echo "Selected tag, checkout, and GITHUB_SHA do not identify the same commit." >&2
+            exit 1
+          fi
+          git fetch --no-tags origin \
+            "+refs/heads/master:refs/remotes/origin/master"
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/master
+
+          if git submodule status --recursive | grep -Eq '^[+-U]'; then
+            echo "Submodules do not match the commits recorded by the release tag." >&2
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.environment }} EIF
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - dev
+          - prod
+    runs-on: ubuntu-22.04-arm64-4core
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      ENVIRONMENT: ${{ matrix.environment }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      WORKFLOW_RUN: https://github.com/OpenSecretCloud/opensecret/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+    steps:
+      - name: Check out the exact tagged source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@bafaa638b9d5ec0e7e3ac1a7fc80453ef1fd265f # v3
+
+      - name: Enable FlakeHub Cache
+        uses: DeterminateSystems/flakehub-cache-action@1f9a51a2959d3e26c7838c6f3bf9f48acae525ea # v3
+
+      - name: Check flake.lock health
+        uses: DeterminateSystems/flake-checker-action@0af51e37404acfb298f7e2eec77470be27eb57c5 # v10
+        with:
+          flake-lock-path: flake.lock
+
+      - name: Build and describe the tagged EIF
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          nix build --no-update-lock-file ".?submodules=1#eif-$ENVIRONMENT"
+          git diff --exit-code -- flake.lock
+          test -s result/image.eif
+          test -s result/pcr.json
+
+          asset_dir="release-assets"
+          eif_name="opensecret-$RELEASE_TAG-$ENVIRONMENT.eif"
+          pcr_name="opensecret-nitro-$RELEASE_TAG-$ENVIRONMENT.pcr.json"
+          manifest_name="opensecret-nitro-$RELEASE_TAG-$ENVIRONMENT.manifest.json"
+          mkdir -p "$asset_dir"
+          install -m 0644 result/image.eif "$asset_dir/$eif_name"
+          install -m 0644 result/pcr.json "$asset_dir/$pcr_name"
+
+          python3 scripts/generate_nitro_release_manifest.py generate \
+            --environment "$ENVIRONMENT" \
+            --commit "$GITHUB_SHA" \
+            --tag "$RELEASE_TAG" \
+            --workflow-run "$WORKFLOW_RUN" \
+            --pcr "$asset_dir/$pcr_name" \
+            --eif "$asset_dir/$eif_name" \
+            --flake-lock flake.lock \
+            --output "$asset_dir/$manifest_name"
+
+          python3 scripts/generate_nitro_release_manifest.py verify \
+            --environment "$ENVIRONMENT" \
+            --commit "$GITHUB_SHA" \
+            --tag "$RELEASE_TAG" \
+            --workflow-run "$WORKFLOW_RUN" \
+            --pcr "$asset_dir/$pcr_name" \
+            --eif "$asset_dir/$eif_name" \
+            --flake-lock flake.lock \
+            --manifest "$asset_dir/$manifest_name"
+
+      - name: Upload unsigned release inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nitro-eif-${{ matrix.environment }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  sign:
+    name: Sign and attest Nitro EIF release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: production-release
+    permissions:
+      actions: read
+      artifact-metadata: write
+      attestations: write
+      contents: read
+      id-token: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      WORKFLOW_RUN: https://github.com/OpenSecretCloud/opensecret/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+    steps:
+      - name: Check out release tooling from the exact tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+
+      - name: Download both tagged EIF builds
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: nitro-eif-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets
+          merge-multiple: true
+
+      - name: Revalidate downloaded build outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for environment in dev prod; do
+            eif="release-assets/opensecret-$RELEASE_TAG-$environment.eif"
+            pcr="release-assets/opensecret-nitro-$RELEASE_TAG-$environment.pcr.json"
+            manifest="release-assets/opensecret-nitro-$RELEASE_TAG-$environment.manifest.json"
+            test -s "$eif"
+            test -s "$pcr"
+            test -s "$manifest"
+
+            python3 scripts/generate_nitro_release_manifest.py verify \
+              --environment "$environment" \
+              --commit "$GITHUB_SHA" \
+              --tag "$RELEASE_TAG" \
+              --workflow-run "$WORKFLOW_RUN" \
+              --pcr "$pcr" \
+              --eif "$eif" \
+              --flake-lock flake.lock \
+              --manifest "$manifest"
+          done
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+        with:
+          cosign-release: v3.1.2
+
+      - name: Keylessly sign the exact manifest bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          certificate_identity="https://github.com/OpenSecretCloud/opensecret/.github/workflows/release-nitro-eif.yml@refs/tags/$RELEASE_TAG"
+
+          for environment in dev prod; do
+            manifest="release-assets/opensecret-nitro-$RELEASE_TAG-$environment.manifest.json"
+            bundle="release-assets/opensecret-nitro-$RELEASE_TAG-$environment.manifest.sigstore.json"
+
+            cosign sign-blob \
+              --yes \
+              --bundle "$bundle" \
+              "$manifest"
+
+            jq -e \
+              '.mediaType == "application/vnd.dev.sigstore.bundle.v0.3+json"' \
+              "$bundle" >/dev/null
+
+            cosign verify-blob \
+              --bundle "$bundle" \
+              --certificate-github-workflow-name "Nitro EIF Release" \
+              --certificate-github-workflow-ref "refs/tags/$RELEASE_TAG" \
+              --certificate-github-workflow-repository "OpenSecretCloud/opensecret" \
+              --certificate-github-workflow-sha "$GITHUB_SHA" \
+              --certificate-github-workflow-trigger "workflow_dispatch" \
+              --certificate-identity "$certificate_identity" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "$manifest"
+          done
+
+      - name: Create checksums for runtime release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          checksum_file="opensecret-nitro-$RELEASE_TAG.sha256"
+
+          (
+            cd release-assets
+            sha256sum \
+              "opensecret-$RELEASE_TAG-dev.eif" \
+              "opensecret-nitro-$RELEASE_TAG-dev.manifest.json" \
+              "opensecret-nitro-$RELEASE_TAG-dev.manifest.sigstore.json" \
+              "opensecret-$RELEASE_TAG-prod.eif" \
+              "opensecret-nitro-$RELEASE_TAG-prod.manifest.json" \
+              "opensecret-nitro-$RELEASE_TAG-prod.manifest.sigstore.json" \
+              > "$checksum_file"
+            sha256sum --check "$checksum_file"
+          )
+
+      - name: Generate GitHub SLSA audit attestation
+        id: attest
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            release-assets/opensecret-${{ github.ref_name }}-dev.eif
+            release-assets/opensecret-nitro-${{ github.ref_name }}-dev.manifest.json
+            release-assets/opensecret-${{ github.ref_name }}-prod.eif
+            release-assets/opensecret-nitro-${{ github.ref_name }}-prod.manifest.json
+            release-assets/opensecret-nitro-${{ github.ref_name }}.sha256
+
+      - name: Stage the SLSA bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 0644 \
+            "${{ steps.attest.outputs.bundle-path }}" \
+            "release-assets/opensecret-nitro-$RELEASE_TAG.slsa.sigstore.json"
+
+      - name: Upload signed release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: signed-nitro-eif-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    name: Verify and publish Nitro EIF release
+    needs:
+      - validate
+      - sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      WORKFLOW_RUN: https://github.com/OpenSecretCloud/opensecret/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+    steps:
+      - name: Check out publication tooling from the exact tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+
+      - name: Download the signed release candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: signed-nitro-eif-release-${{ github.run_id }}-${{ github.run_attempt }}
+          path: release-assets
+
+      - name: Install Cosign for verification
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+        with:
+          cosign-release: v3.1.2
+
+      - name: Verify the signed candidate and its audit provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          certificate_identity="https://github.com/OpenSecretCloud/opensecret/.github/workflows/release-nitro-eif.yml@refs/tags/$RELEASE_TAG"
+          signer_workflow="OpenSecretCloud/opensecret/.github/workflows/release-nitro-eif.yml"
+          slsa_bundle="release-assets/opensecret-nitro-$RELEASE_TAG.slsa.sigstore.json"
+          checksum_file="release-assets/opensecret-nitro-$RELEASE_TAG.sha256"
+
+          test -s "$slsa_bundle"
+          test -s "$checksum_file"
+          jq -e \
+            '.mediaType == "application/vnd.dev.sigstore.bundle.v0.3+json"' \
+            "$slsa_bundle" >/dev/null
+
+          for environment in dev prod; do
+            eif="release-assets/opensecret-$RELEASE_TAG-$environment.eif"
+            pcr="release-assets/opensecret-nitro-$RELEASE_TAG-$environment.pcr.json"
+            manifest="release-assets/opensecret-nitro-$RELEASE_TAG-$environment.manifest.json"
+            bundle="release-assets/opensecret-nitro-$RELEASE_TAG-$environment.manifest.sigstore.json"
+
+            test -s "$bundle"
+            jq -e \
+              '.mediaType == "application/vnd.dev.sigstore.bundle.v0.3+json"' \
+              "$bundle" >/dev/null
+
+            python3 scripts/generate_nitro_release_manifest.py verify \
+              --environment "$environment" \
+              --commit "$GITHUB_SHA" \
+              --tag "$RELEASE_TAG" \
+              --workflow-run "$WORKFLOW_RUN" \
+              --pcr "$pcr" \
+              --eif "$eif" \
+              --flake-lock flake.lock \
+              --manifest "$manifest"
+
+            cosign verify-blob \
+              --bundle "$bundle" \
+              --certificate-github-workflow-name "Nitro EIF Release" \
+              --certificate-github-workflow-ref "refs/tags/$RELEASE_TAG" \
+              --certificate-github-workflow-repository "OpenSecretCloud/opensecret" \
+              --certificate-github-workflow-sha "$GITHUB_SHA" \
+              --certificate-github-workflow-trigger "workflow_dispatch" \
+              --certificate-identity "$certificate_identity" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "$manifest"
+          done
+
+          (
+            cd release-assets
+            sha256sum --check "opensecret-nitro-$RELEASE_TAG.sha256"
+          )
+
+          verify_slsa_subject() {
+            gh attestation verify "$1" \
+              --bundle "$slsa_bundle" \
+              --repo "OpenSecretCloud/opensecret" \
+              --cert-identity "$certificate_identity" \
+              --cert-oidc-issuer "https://token.actions.githubusercontent.com" \
+              --signer-workflow "$signer_workflow" \
+              --source-ref "refs/tags/$RELEASE_TAG" \
+              --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners
+          }
+
+          verify_slsa_subject "release-assets/opensecret-$RELEASE_TAG-dev.eif"
+          verify_slsa_subject "release-assets/opensecret-nitro-$RELEASE_TAG-dev.manifest.json"
+          verify_slsa_subject "release-assets/opensecret-$RELEASE_TAG-prod.eif"
+          verify_slsa_subject "release-assets/opensecret-nitro-$RELEASE_TAG-prod.manifest.json"
+          verify_slsa_subject "$checksum_file"
+
+      - name: Create a complete draft release, then publish it
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          require_current_tag() {
+            local remote_tag_commit
+            remote_tag_commit="$(
+              gh api \
+                "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" \
+                --jq .sha
+            )"
+            if [[ "$remote_tag_commit" != "$GITHUB_SHA" ]]; then
+              echo "The remote tag no longer identifies the dispatched commit." >&2
+              exit 1
+            fi
+          }
+
+          require_current_tag
+          if gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists for $RELEASE_TAG; refusing to replace it." >&2
+            exit 1
+          fi
+
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --title "OpenSecret Nitro EIF $RELEASE_TAG" \
+            --notes "Manually approved Nitro EIF release. Sigstore/Rekor proves provenance; clients must apply their own release-approval and rollback policy." \
+            "release-assets/opensecret-$RELEASE_TAG-dev.eif" \
+            "release-assets/opensecret-nitro-$RELEASE_TAG-dev.manifest.json" \
+            "release-assets/opensecret-nitro-$RELEASE_TAG-dev.manifest.sigstore.json" \
+            "release-assets/opensecret-$RELEASE_TAG-prod.eif" \
+            "release-assets/opensecret-nitro-$RELEASE_TAG-prod.manifest.json" \
+            "release-assets/opensecret-nitro-$RELEASE_TAG-prod.manifest.sigstore.json" \
+            "release-assets/opensecret-nitro-$RELEASE_TAG.sha256" \
+            "release-assets/opensecret-nitro-$RELEASE_TAG.slsa.sigstore.json"
+
+          require_current_tag
+          gh release edit "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false

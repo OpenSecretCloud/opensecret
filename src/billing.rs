@@ -9,6 +9,10 @@ pub struct UsageResponse {
     pub is_free: bool,
 }
 
+fn paid_feature_access(usage: &UsageResponse) -> bool {
+    !usage.is_free && usage.can_use
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BillingError {
     #[error("Request failed: {0}")]
@@ -109,5 +113,34 @@ impl BillingClient {
     pub async fn is_user_paid(&self, user_id: Uuid) -> Result<bool, BillingError> {
         let usage = self.check_usage(user_id, false).await?;
         Ok(!usage.is_free)
+    }
+
+    /// Check whether a paid-plan user may currently use a metered upstream
+    /// feature. Unlike `is_user_paid`, this also honors the billing service's
+    /// current usage/entitlement decision without making a second request.
+    pub async fn can_user_use_paid_features(&self, user_id: Uuid) -> Result<bool, BillingError> {
+        let usage = self.check_usage(user_id, false).await?;
+        Ok(paid_feature_access(&usage))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paid_feature_access_requires_paid_plan_and_current_usage_access() {
+        assert!(paid_feature_access(&UsageResponse {
+            can_use: true,
+            is_free: false,
+        }));
+        assert!(!paid_feature_access(&UsageResponse {
+            can_use: false,
+            is_free: false,
+        }));
+        assert!(!paid_feature_access(&UsageResponse {
+            can_use: true,
+            is_free: true,
+        }));
     }
 }

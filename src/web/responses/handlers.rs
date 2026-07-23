@@ -2356,7 +2356,7 @@ async fn execute_tool_call_and_wait(
         tool_call_id, tool_call.name, persisted.response.uuid
     );
 
-    let tool_output = match tools::execute_tool(
+    let tool_result = tools::execute_tool(
         &tool_call.name,
         &tool_call.arguments,
         web_search_provider,
@@ -2364,17 +2364,14 @@ async fn execute_tool_call_and_wait(
         state.kagi_client.as_ref(),
         kagi_allowed_urls,
     )
-    .await
-    {
-        Ok(output) => output,
-        Err(e) => {
-            warn!(
-                "Tool execution failed for tool_call {} ({}) on response {}",
-                tool_call_id, tool_call.name, persisted.response.uuid
-            );
-            format!("Error: {}", e)
-        }
-    };
+    .await;
+    if tool_result.is_err() {
+        warn!(
+            "Tool execution failed for tool_call {} ({}) on response {}",
+            tool_call_id, tool_call.name, persisted.response.uuid
+        );
+    }
+    let tool_output = tools::format_tool_result(tool_result);
     debug!(
         "Tool loop: finished execution for tool_call {} ({}) on response {} in {} ms",
         tool_call_id,

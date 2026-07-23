@@ -22,7 +22,7 @@ use crate::web::platform_login_routes;
 use crate::web::{
     conversation_projects_routes, conversations_routes, health_routes_with_state,
     instructions_routes, login_routes, oauth_routes, openai_routes, protected_routes,
-    responses_routes,
+    responses_routes, web_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 
@@ -3348,6 +3348,10 @@ async fn main() -> Result<(), Error> {
         )
         .merge(
             responses_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            web_routes(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
         )
         .merge(

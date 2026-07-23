@@ -9,6 +9,8 @@ pub mod openai_auth;
 pub mod platform;
 pub mod protected_routes;
 pub mod responses;
+pub mod web_routes;
+pub(crate) mod web_safety;
 
 pub use health_routes::router_with_state as health_routes_with_state;
 pub use login_routes::router as login_routes;
@@ -20,5 +22,6 @@ pub use responses::conversation_projects_router as conversation_projects_routes;
 pub use responses::conversations_router as conversations_routes;
 pub use responses::instructions_router as instructions_routes;
 pub use responses::responses_router as responses_routes;
+pub use web_routes::router as web_routes;
 
 pub use platform::login_routes as platform_login_routes;

@@ -109,6 +109,8 @@ mod web;
 
 #[cfg(test)]
 mod aead_db_tamper_tests;
+#[cfg(test)]
+mod parent_secret_response_tests;
 
 use apple_signin::AppleJwtVerifier;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
@@ -2303,20 +2305,33 @@ async fn get_secret(key_name: &str) -> Result<String, Error> {
         crate::aws_credentials::MAX_VSOCK_RESPONSE_BYTES,
     )?;
 
-    let parent_response: ParentResponse = serde_json::from_str(&response)?;
-    if parent_response.response_type == "secret" {
-        let secret_json: Value =
-            serde_json::from_str(parent_response.response_value.as_str().unwrap())?;
+    parse_parent_secret_response(&response)
+}
 
-        // Assuming the secret is always a JSON object with a single key-value pair
-        if let Some((_, value)) = secret_json.as_object().and_then(|obj| obj.iter().next()) {
-            Ok(value.as_str().unwrap_or_default().to_string())
-        } else {
-            Err(Error::SecretParsingError)
-        }
-    } else {
-        Err(Error::AuthenticationError)
+fn parse_parent_secret_response(response: &str) -> Result<String, Error> {
+    let parent_response: ParentResponse = serde_json::from_str(response)?;
+    if parent_response.response_type != "secret" {
+        return Err(Error::AuthenticationError);
     }
+
+    let response_value = parent_response
+        .response_value
+        .as_str()
+        .ok_or(Error::SecretParsingError)?;
+    let secret_json: Value = serde_json::from_str(response_value)?;
+
+    // The parent returns a JSON object containing exactly the requested secret value.
+    let secret_object = secret_json.as_object().ok_or(Error::SecretParsingError)?;
+    if secret_object.len() != 1 {
+        return Err(Error::SecretParsingError);
+    }
+
+    secret_object
+        .values()
+        .next()
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or(Error::SecretParsingError)
 }
 
 async fn get_or_create_enclave_key(

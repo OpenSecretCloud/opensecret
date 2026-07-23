@@ -8,17 +8,20 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     nixpkgs.url = "nixpkgs/nixos-unstable";
+    # Keep dev security tools current without moving the application or Nitro build pin.
+    security-tools-nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     nitro-util = {
       url = "github:monzo/aws-nitro-util/7d755578b0b0b9850c0d7c4738a6c8daf3ff55c0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay, nitro-util }:
+  outputs = { self, nixpkgs, security-tools-nixpkgs, flake-utils, rust-overlay, nitro-util }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ rust-overlay.overlays.default ];
         pkgs = import nixpkgs { inherit system overlays; };
+        securityToolsPkgs = import security-tools-nixpkgs { inherit system; };
         rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         nitro = nitro-util.lib.${system};
 
@@ -56,7 +59,13 @@
           pkgs.libiconv
           pkgs.apple-sdk
         ];
+        securityToolInputs = [
+          securityToolsPkgs.cargo-audit
+          securityToolsPkgs.cargo-deny
+          securityToolsPkgs.cargo-machete
+        ];
         inputs = commonInputs
+          ++ securityToolInputs
           ++ pkgs.lib.optionals pkgs.stdenv.isLinux linuxOnlyInputs
           ++ pkgs.lib.optionals pkgs.stdenv.isDarwin darwinOnlyInputs;
 

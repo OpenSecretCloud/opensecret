@@ -98,6 +98,11 @@ Changing PCR references or KMS policy, copying artifacts, starting or stopping
 enclaves, restarting remote services, staging, and deployment require explicit
 authorization for the named environment.
 
+The proposed tagged Sigstore provenance flow and its temporary compatibility
+with the existing signed PCR histories are documented in
+[`docs/PCR_VERIFICATION.md`](docs/PCR_VERIFICATION.md). Repository changes do
+not themselves authorize a tag, release, history update, or deployment.
+
 ## Contributing
 
 Keep changes focused, add regression coverage at the owning boundary, and

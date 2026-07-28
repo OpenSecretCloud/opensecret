@@ -523,8 +523,8 @@ pub fn model_catalog_response() -> Value {
             },
             "speech": {
                 "available": true,
-                "model": "qwen3-tts",
-                "display_name": "Qwen3 TTS"
+                "model": "voxtral-tts",
+                "display_name": "Voxtral TTS"
             }
         }
     })
@@ -566,13 +566,13 @@ pub fn openai_models_response() -> Value {
             "short_name": "Nomic Embed",
         }),
         json!({
-            "id": "qwen3-tts",
+            "id": "voxtral-tts",
             "object": "model",
             "created": 0,
             "owned_by": "opensecret",
             "tasks": ["speech"],
-            "display_name": "Qwen3 TTS",
-            "short_name": "Qwen3 TTS",
+            "display_name": "Voxtral TTS",
+            "short_name": "Voxtral TTS",
         }),
     ]);
 
@@ -752,6 +752,16 @@ mod tests {
             .iter()
             .any(|model| model["id"] == "gpt-oss-safeguard-120b"));
         assert!(data.iter().any(|model| model["id"] == "voxtral-small-24b"));
-        assert!(data.iter().any(|model| model["id"] == "qwen3-tts"));
+        assert!(!data.iter().any(|model| model["id"] == "qwen3-tts"));
+        assert!(data.iter().any(|model| model["id"] == "voxtral-tts"));
+    }
+
+    #[test]
+    fn test_catalog_advertises_voxtral_as_default_speech_model() {
+        let response = model_catalog_response();
+
+        assert_eq!(response["audio"]["speech"]["available"], true);
+        assert_eq!(response["audio"]["speech"]["model"], "voxtral-tts");
+        assert_eq!(response["audio"]["speech"]["display_name"], "Voxtral TTS");
     }
 }

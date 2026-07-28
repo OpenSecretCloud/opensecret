@@ -41,6 +41,9 @@ const MAX_AUDIO_SIZE: usize = 100 * 1024 * 1024;
 // Timeout constants for provider requests
 const REQUEST_TIMEOUT_SECS: u64 = 120; // Request timeout (generous for large non-streaming responses)
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming reads
+const TTS_BILLING_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+const TTS_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_TTS_INPUT_CHARS: usize = 100_000;
 
 const PROVIDER_MANAGED_CACHE_SALT_FIELD: &str = "cache_salt";
 const PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD: &str = "user_cache_secret";
@@ -375,33 +378,95 @@ struct TranscriptionParams<'a> {
 }
 
 /// Request structure for TTS (Text-to-Speech) endpoints
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(transparent)]
 struct TTSRequest {
-    input: String,
-    #[serde(default = "default_tts_model")]
+    provider_payload: serde_json::Map<String, Value>,
+}
+
+const VOXTRAL_TTS_MODEL: &str = "voxtral-tts";
+const DEFAULT_VOXTRAL_TTS_VOICE: &str = "neutral_female";
+const VOXTRAL_TTS_VOICE_CONDITIONING_FIELDS: [&str; 4] =
+    ["voice", "speaker", "ref_audio", "references"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum TTSRequestValidationError {
+    #[error("input text is empty")]
+    EmptyInput,
+    #[error("input text exceeds the maximum length")]
+    InputTooLong,
+    #[error("unsupported TTS model")]
+    UnsupportedModel,
+}
+
+#[derive(Debug, PartialEq)]
+struct PreparedTTSRequest {
     model: String,
-    #[serde(default = "default_tts_voice")]
-    voice: String,
-    #[serde(default = "default_tts_response_format")]
-    response_format: String,
-    #[serde(default = "default_tts_speed")]
-    speed: f32,
+    voice_for_log: String,
+    provider_payload: Value,
 }
 
-fn default_tts_model() -> String {
-    "qwen3-tts".to_string()
+fn prepare_tts_request(
+    mut request: TTSRequest,
+) -> Result<PreparedTTSRequest, TTSRequestValidationError> {
+    let Some(input) = request
+        .provider_payload
+        .get("input")
+        .and_then(Value::as_str)
+    else {
+        return Err(TTSRequestValidationError::EmptyInput);
+    };
+    if input.trim().is_empty() {
+        return Err(TTSRequestValidationError::EmptyInput);
+    }
+    if input.chars().count() > MAX_TTS_INPUT_CHARS {
+        return Err(TTSRequestValidationError::InputTooLong);
+    }
+
+    if let Some(model) = request.provider_payload.get("model") {
+        if model.as_str() != Some(VOXTRAL_TTS_MODEL) {
+            return Err(TTSRequestValidationError::UnsupportedModel);
+        }
+    }
+
+    let provider_payload = &mut request.provider_payload;
+    provider_payload
+        .entry("model".to_string())
+        .or_insert_with(|| Value::String(VOXTRAL_TTS_MODEL.to_string()));
+
+    if !VOXTRAL_TTS_VOICE_CONDITIONING_FIELDS
+        .iter()
+        .any(|field| provider_payload.contains_key(*field))
+    {
+        provider_payload.insert(
+            "voice".to_string(),
+            Value::String(DEFAULT_VOXTRAL_TTS_VOICE.to_string()),
+        );
+    }
+
+    let voice_for_log = match provider_payload.get("voice") {
+        Some(Value::String(voice)) => voice.clone(),
+        Some(Value::Null) => "<null>".to_string(),
+        Some(_) => "<non-string>".to_string(),
+        None => "<provider-conditioned>".to_string(),
+    };
+
+    Ok(PreparedTTSRequest {
+        model: VOXTRAL_TTS_MODEL.to_string(),
+        voice_for_log,
+        provider_payload: Value::Object(request.provider_payload),
+    })
 }
 
-fn default_tts_voice() -> String {
-    "af_sky".to_string()
-}
-
-fn default_tts_response_format() -> String {
-    "mp3".to_string()
-}
-
-fn default_tts_speed() -> f32 {
-    1.0
+fn build_tts_response_payload(body_bytes: &[u8], content_type: &str) -> (Value, bool) {
+    let is_json_response = serde_json::from_slice::<Value>(body_bytes).is_ok();
+    (
+        json!({
+            "content_base64": general_purpose::STANDARD.encode(body_bytes),
+            "content_type": content_type,
+        }),
+        is_json_response,
+    )
 }
 
 /// Request structure for transcription endpoints
@@ -996,6 +1061,8 @@ pub async fn get_chat_completion_response(
     if !is_streaming {
         // NON-STREAMING: Simple case
         debug!("Processing non-streaming response with internal billing");
+        // The request's streaming fields are forwarded unchanged, but this
+        // encrypted endpoint currently buffers one byte-exact response carrier.
         let body_bytes = res.bytes().await.map_err(|e| {
             error!("Failed to read response body: {:?}", e);
             ApiError::InternalServerError
@@ -2024,120 +2091,156 @@ async fn send_transcription_request(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TTSBillingAccess {
+    Allowed,
+    FreeOrExhausted,
+    Unavailable,
+}
+
+fn tts_billing_access_decision(access: TTSBillingAccess) -> Result<(), ApiError> {
+    match access {
+        TTSBillingAccess::Allowed => Ok(()),
+        TTSBillingAccess::FreeOrExhausted => Err(ApiError::UsageLimitReached),
+        TTSBillingAccess::Unavailable => Err(ApiError::ServiceUnavailable),
+    }
+}
+
+async fn ensure_paid_tts_access(state: &AppState, user: &User) -> Result<(), ApiError> {
+    let access = if let Some(billing_client) = &state.billing_client {
+        match timeout(
+            TTS_BILLING_CHECK_TIMEOUT,
+            billing_client.can_user_use_paid_features(user.uuid),
+        )
+        .await
+        {
+            Ok(Ok(true)) => TTSBillingAccess::Allowed,
+            Ok(Ok(false)) => TTSBillingAccess::FreeOrExhausted,
+            Ok(Err(_)) => {
+                warn!(
+                    user_uuid = %user.uuid,
+                    "TTS billing entitlement check failed"
+                );
+                TTSBillingAccess::Unavailable
+            }
+            Err(_) => {
+                warn!(
+                    user_uuid = %user.uuid,
+                    timeout_seconds = TTS_BILLING_CHECK_TIMEOUT.as_secs(),
+                    "TTS billing entitlement check timed out"
+                );
+                TTSBillingAccess::Unavailable
+            }
+        }
+    } else {
+        warn!(
+            user_uuid = %user.uuid,
+            "TTS requested while the billing client is unavailable"
+        );
+        TTSBillingAccess::Unavailable
+    };
+
+    let result = tts_billing_access_decision(access);
+    if result.is_err() {
+        warn!(
+            user_uuid = %user.uuid,
+            access = ?access,
+            "Denied paid TTS access"
+        );
+    }
+    result
+}
+
 async fn proxy_tts(
     State(state): State<Arc<AppState>>,
-    _headers: HeaderMap,
     axum::Extension(session_id): axum::Extension<Uuid>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(tts_request): axum::Extension<TTSRequest>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
-    // Check if guest user is allowed (paid guests are allowed, free guests are not)
-    if user.is_guest() {
-        if let Some(billing_client) = &state.billing_client {
-            match billing_client.is_user_paid(user.uuid).await {
-                Ok(true) => {
-                    debug!("Paid guest user allowed for TTS: {}", user.uuid);
-                }
-                Ok(false) => {
-                    error!(
-                        "Free guest user attempted to use TTS feature: {}",
-                        user.uuid
-                    );
-                    return Err(ApiError::Unauthorized);
-                }
-                Err(e) => {
-                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
-                    return Err(ApiError::Unauthorized);
-                }
-            }
-        } else {
-            error!(
-                "Guest user attempted to use TTS without billing client: {}",
-                user.uuid
-            );
-            return Err(ApiError::Unauthorized);
-        }
-    }
-
-    // Validate input is not empty
-    if tts_request.input.trim().is_empty() {
-        error!("Input text is empty");
-        return Err(ApiError::BadRequest);
-    }
-
-    // Only qwen3-tts is supported for TTS
-    if tts_request.model != "qwen3-tts" {
-        error!(
-            "Unsupported TTS model: {}. Only 'qwen3-tts' is supported",
-            tts_request.model
+    let prepared = prepare_tts_request(tts_request).map_err(|validation_error| {
+        warn!(
+            error = %validation_error,
+            "Rejected invalid TTS request"
         );
-        return Err(ApiError::BadRequest);
-    }
-
-    // Build request for Tinfoil TTS
-    let tts_api_request = TTSRequest {
-        model: "qwen3-tts".to_string(),
-        voice: tts_request.voice.clone(),
-        input: tts_request.input.clone(),
-        response_format: tts_request.response_format.clone(),
-        speed: tts_request.speed,
-    };
+        match validation_error {
+            TTSRequestValidationError::InputTooLong => ApiError::PayloadTooLarge,
+            _ => ApiError::BadRequest,
+        }
+    })?;
+    ensure_paid_tts_access(&state, &user).await?;
 
     let proxy_config = state.proxy_router.get_tinfoil_proxy();
-    let request_body = serde_json::to_vec(&tts_api_request).map_err(|e| {
+    let request_body = serde_json::to_vec(&prepared.provider_payload).map_err(|e| {
         error!("Failed to serialize TTS request: {:?}", e);
         ApiError::InternalServerError
     })?;
 
-    let res = state
-        .provider_client
-        .send(
-            &proxy_config,
-            ProviderRequest::new(
-                Method::POST,
-                "/v1/audio/speech",
-                Duration::from_secs(REQUEST_TIMEOUT_SECS),
+    let (body_bytes, response_content_type) = timeout(TTS_PROVIDER_TIMEOUT, async {
+        let res = state
+            .provider_client
+            .send(
+                &proxy_config,
+                ProviderRequest::new(Method::POST, "/v1/audio/speech", TTS_PROVIDER_TIMEOUT)
+                    .content_type("application/json")
+                    .body(request_body),
             )
-            .content_type("application/json")
-            .body(request_body),
-        )
-        .await
-        .map_err(|e| {
-            error!("Failed to create request: {:?}", e);
-            ApiError::from(e)
-        })?;
+            .await
+            .map_err(|e| {
+                error!("Failed to create TTS request: {:?}", e);
+                ApiError::from(e)
+            })?;
 
-    if !res.is_success() {
+        if !res.is_success() {
+            error!(
+                model = %prepared.model,
+                status = res.status_code(),
+                "TTS provider returned a non-success status"
+            );
+            return Err(ApiError::InternalServerError);
+        }
+
+        let content_type = res
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let body_bytes = res.bytes().await.map_err(|e| {
+            error!("Failed to read TTS response body: {:?}", e);
+            ApiError::InternalServerError
+        })?;
+        Ok((body_bytes, content_type))
+    })
+    .await
+    .map_err(|_| {
         error!(
-            "TTS provider returned non-success status: {}",
-            res.status_code()
+            model = %prepared.model,
+            timeout_seconds = TTS_PROVIDER_TIMEOUT.as_secs(),
+            "TTS provider request timed out"
         );
-        return Err(ApiError::InternalServerError);
+        ApiError::InternalServerError
+    })??;
+
+    let (response_payload, is_json_response) =
+        build_tts_response_payload(&body_bytes, &response_content_type);
+    if is_json_response {
+        warn!(
+            model = %prepared.model,
+            voice = %prepared.voice_for_log,
+            response_bytes = body_bytes.len(),
+            "TTS provider returned a successful JSON response"
+        );
+    } else {
+        info!(
+            model = %prepared.model,
+            voice = %prepared.voice_for_log,
+            content_type = %response_content_type,
+            audio_bytes = body_bytes.len(),
+            "TTS synthesis succeeded"
+        );
     }
 
-    // Get response body as bytes
-    let body_bytes = res.bytes().await.map_err(|e| {
-        error!("Failed to read TTS response body: {:?}", e);
-        ApiError::InternalServerError
-    })?;
-
-    // Create a response object with the audio data and metadata
-    let audio_response = json!({
-        "content_base64": general_purpose::STANDARD.encode(&body_bytes),
-        "content_type": match tts_request.response_format.as_str() {
-            "mp3" => "audio/mpeg",
-            "opus" => "audio/opus",
-            "aac" => "audio/aac",
-            "flac" => "audio/flac",
-            "wav" => "audio/wav",
-            "pcm" => "audio/pcm",
-            _ => "audio/mpeg", // Default to MP3
-        },
-    });
-
     // Encrypt and return the response
-    encrypt_response(&state, &session_id, &audio_response).await
+    encrypt_response(&state, &session_id, &response_payload).await
 }
 
 async fn proxy_embeddings(
@@ -2333,6 +2436,256 @@ async fn try_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tts_request(payload: Value) -> TTSRequest {
+        serde_json::from_value(payload).unwrap()
+    }
+
+    #[test]
+    fn voxtral_is_the_default_tts_model_with_a_minimal_payload() {
+        let request = tts_request(json!({
+            "input": "Privacy-safe speech",
+        }));
+
+        let prepared = prepare_tts_request(request).unwrap();
+        assert_eq!(prepared.model, VOXTRAL_TTS_MODEL);
+        assert_eq!(prepared.voice_for_log, DEFAULT_VOXTRAL_TTS_VOICE);
+        assert_eq!(
+            prepared.provider_payload,
+            json!({
+                "model": VOXTRAL_TTS_MODEL,
+                "voice": DEFAULT_VOXTRAL_TTS_VOICE,
+                "input": "Privacy-safe speech",
+            })
+        );
+        assert_eq!(
+            prepared.provider_payload.as_object().unwrap().len(),
+            3,
+            "Voxtral payloads should contain only model, voice, and input"
+        );
+    }
+
+    #[test]
+    fn tts_request_is_an_exact_passthrough_when_defaults_are_present() {
+        let payload = json!({
+            "input": "Privacy-safe speech",
+            "model": VOXTRAL_TTS_MODEL,
+            "voice": "neutral_male",
+            "speed": 1.2,
+            "response_format": "flac",
+            "stream": false,
+            "stream_format": "audio",
+            "task_type": "CustomVoice",
+            "max_new_tokens": 2048,
+            "seed": 42,
+            "language": "fr",
+            "instructions": "Speak warmly",
+            "ref_audio": "data:audio/wav;base64,UklGRg==",
+            "ref_text": "Reference text",
+            "ref_audio_2": "data:audio/wav;base64,UklGRg==",
+            "ambient_sound": "quiet room",
+            "duration_seconds": 4.5,
+            "x_vector_only_mode": false,
+            "speaker_embedding": [0.1, 0.2],
+            "initial_codec_chunk_frames": 4,
+            "non_streaming_mode": true,
+            "word_timestamps": false,
+            "extra_params": {"cfg_alpha": 0.5},
+        });
+        let prepared = prepare_tts_request(tts_request(payload.clone())).unwrap();
+
+        assert_eq!(prepared.voice_for_log, "neutral_male");
+        assert_eq!(prepared.provider_payload, payload);
+    }
+
+    #[test]
+    fn tts_preserves_unknown_future_parameters_and_provider_validates_voice() {
+        let payload = json!({
+            "input": "Privacy-safe speech",
+            "model": VOXTRAL_TTS_MODEL,
+            "voice": "future_provider_voice",
+            "future_top_level": {"nested": [1, true, "value"]},
+        });
+        let prepared = prepare_tts_request(tts_request(payload.clone())).unwrap();
+
+        assert_eq!(prepared.voice_for_log, "future_provider_voice");
+        assert_eq!(prepared.provider_payload, payload);
+    }
+
+    #[test]
+    fn tts_preserves_speed_and_explicit_nulls() {
+        let payload = json!({
+            "input": "Privacy-safe speech",
+            "model": VOXTRAL_TTS_MODEL,
+            "voice": null,
+            "speed": 1.2,
+            "language": null,
+            "instructions": null,
+            "ref_audio": null,
+            "ref_text": null,
+            "speaker_embedding": null,
+            "max_new_tokens": null,
+            "seed": null,
+            "extra_params": null,
+            "future_optional": null,
+        });
+        let prepared = prepare_tts_request(tts_request(payload.clone())).unwrap();
+
+        assert_eq!(prepared.voice_for_log, "<null>");
+        assert_eq!(prepared.provider_payload, payload);
+    }
+
+    #[test]
+    fn tts_defaults_voice_only_without_voice_conditioning() {
+        for payload in [
+            json!({
+                "input": "Privacy-safe speech",
+                "speaker": "provider-speaker-id",
+            }),
+            json!({
+                "input": "Privacy-safe speech",
+                "ref_audio": "data:audio/wav;base64,UklGRg==",
+            }),
+            json!({
+                "input": "Privacy-safe speech",
+                "references": [{
+                    "audio_path": "data:audio/wav;base64,UklGRg==",
+                    "text": "Reference text",
+                }],
+            }),
+            json!({
+                "input": "Privacy-safe speech",
+                "speaker": null,
+            }),
+        ] {
+            let prepared = prepare_tts_request(tts_request(payload.clone())).unwrap();
+            let provider_payload = prepared.provider_payload.as_object().unwrap();
+
+            assert_eq!(
+                provider_payload.get("model"),
+                Some(&json!(VOXTRAL_TTS_MODEL))
+            );
+            assert!(!provider_payload.contains_key("voice"));
+            for (key, value) in payload.as_object().unwrap() {
+                assert_eq!(provider_payload.get(key), Some(value));
+            }
+        }
+    }
+
+    #[test]
+    fn tts_stream_fields_are_passed_through_for_the_buffered_encrypted_response() {
+        let payload = json!({
+            "input": "Privacy-safe speech",
+            "model": VOXTRAL_TTS_MODEL,
+            "voice": "neutral_female",
+            "stream": true,
+            "stream_format": "sse",
+        });
+
+        let prepared = prepare_tts_request(tts_request(payload.clone())).unwrap();
+
+        assert_eq!(prepared.provider_payload, payload);
+    }
+
+    #[test]
+    fn tts_validation_rejects_empty_input_and_non_voxtral_models() {
+        assert_eq!(
+            prepare_tts_request(tts_request(json!({
+                "input": " \n\t",
+                "model": VOXTRAL_TTS_MODEL,
+            }))),
+            Err(TTSRequestValidationError::EmptyInput)
+        );
+        assert_eq!(
+            prepare_tts_request(tts_request(json!({
+                "input": "Privacy-safe speech",
+                "model": "qwen3-tts",
+            }))),
+            Err(TTSRequestValidationError::UnsupportedModel)
+        );
+        assert_eq!(
+            prepare_tts_request(tts_request(json!({
+                "input": "Privacy-safe speech",
+                "model": "unknown-tts",
+            }))),
+            Err(TTSRequestValidationError::UnsupportedModel)
+        );
+        assert_eq!(
+            prepare_tts_request(tts_request(json!({
+                "input": "Privacy-safe speech",
+                "model": null,
+            }))),
+            Err(TTSRequestValidationError::UnsupportedModel)
+        );
+        assert_eq!(
+            prepare_tts_request(tts_request(json!({"input": 123}))),
+            Err(TTSRequestValidationError::EmptyInput)
+        );
+        assert_eq!(
+            prepare_tts_request(tts_request(json!({"voice": "neutral_female"}))),
+            Err(TTSRequestValidationError::EmptyInput)
+        );
+    }
+
+    #[test]
+    fn tts_input_length_has_a_high_sanity_ceiling() {
+        let at_limit = tts_request(json!({
+            "input": "a".repeat(MAX_TTS_INPUT_CHARS),
+        }));
+        assert!(prepare_tts_request(at_limit).is_ok());
+
+        let over_limit = tts_request(json!({
+            "input": "a".repeat(MAX_TTS_INPUT_CHARS + 1),
+        }));
+        assert_eq!(
+            prepare_tts_request(over_limit),
+            Err(TTSRequestValidationError::InputTooLong)
+        );
+    }
+
+    #[test]
+    fn tts_entitlement_decision_is_fail_closed() {
+        assert!(tts_billing_access_decision(TTSBillingAccess::Allowed).is_ok());
+        assert!(matches!(
+            tts_billing_access_decision(TTSBillingAccess::FreeOrExhausted),
+            Err(ApiError::UsageLimitReached)
+        ));
+        assert!(matches!(
+            tts_billing_access_decision(TTSBillingAccess::Unavailable),
+            Err(ApiError::ServiceUnavailable)
+        ));
+    }
+
+    #[test]
+    fn tts_binary_response_preserves_bytes_and_mime_type() {
+        let audio_bytes = [b'R', b'I', b'F', b'F', 0, 0xff, b'W', b'A', b'V', b'E'];
+        let (response, is_json_response) = build_tts_response_payload(&audio_bytes, "audio/flac");
+        let decoded = general_purpose::STANDARD
+            .decode(response["content_base64"].as_str().unwrap())
+            .unwrap();
+
+        assert!(!is_json_response);
+        assert_eq!(decoded, audio_bytes);
+        assert_eq!(response["content_type"], "audio/flac");
+    }
+
+    #[test]
+    fn tts_json_response_preserves_exact_bytes_and_problem_mime_type() {
+        let body = br#"{ "error" : { "message" : "voice generation failed" } }"#;
+
+        let (response, is_json_response) =
+            build_tts_response_payload(body, "application/problem+json; charset=utf-8");
+        let decoded = general_purpose::STANDARD
+            .decode(response["content_base64"].as_str().unwrap())
+            .unwrap();
+
+        assert!(is_json_response);
+        assert_eq!(decoded, body);
+        assert_eq!(
+            response["content_type"],
+            "application/problem+json; charset=utf-8"
+        );
+    }
 
     #[test]
     fn extracts_sse_after_utf8_code_point_is_split_across_chunks() {

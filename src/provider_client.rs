@@ -113,6 +113,19 @@ impl ProviderResponse {
         }
     }
 
+    pub fn content_type(&self) -> Option<&str> {
+        match self {
+            Self::Tinfoil(response) => response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Self::Standard(response) => response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+        }
+    }
+
     pub async fn bytes(self) -> Result<Bytes, String> {
         match self {
             Self::Tinfoil(response) => response.bytes().await.map_err(|error| error.to_string()),
@@ -940,6 +953,19 @@ mod tests {
     }
 
     #[test]
+    fn provider_response_exposes_the_upstream_content_type() {
+        let response = hyper::Response::builder()
+            .header("content-type", "audio/flac")
+            .body(HyperBody::empty())
+            .unwrap();
+
+        assert_eq!(
+            ProviderResponse::Standard(response).content_type(),
+            Some("audio/flac")
+        );
+    }
+
+    #[test]
     fn tinfoil_request_matches_the_removed_go_proxy_upstream_contract() {
         let client = ProviderClient::for_test("https://router.example.test".to_string()).unwrap();
         let mut headers = HeaderMap::new();
@@ -1341,7 +1367,7 @@ mod tests {
                     let capture_tx = capture_tx.clone();
                     async move {
                         capture_tx.send((method, uri, headers, body)).await.unwrap();
-                        (StatusCode::OK, "{}")
+                        (StatusCode::OK, [(header::CONTENT_TYPE, "audio/flac")], "{}")
                     }
                 }
             }),
@@ -1379,6 +1405,7 @@ mod tests {
             .await
             .unwrap();
         assert!(response.is_success());
+        assert_eq!(response.content_type(), Some("audio/flac"));
 
         let (method, uri, captured_headers, captured_body) = capture_rx.recv().await.unwrap();
         server.abort();

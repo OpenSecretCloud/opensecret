@@ -82,7 +82,7 @@ async fn get_attestation(
 ) -> Result<(StatusCode, Json<AttestationResponse>), ApiError> {
     // Create an ephemeral key pair for this request
     trace!("Creating ephemeral key");
-    let enclave_public_key = data.create_ephemeral_key(nonce.clone()).await;
+    let enclave_public_key = data.create_ephemeral_key(&nonce).await?;
     trace!("Ephemeral key created");
 
     // Create a request for the attestation document
@@ -397,7 +397,7 @@ async fn key_exchange(
 
     let ephemeral_secret = data
         .get_and_remove_ephemeral_secret(&payload.nonce)
-        .await
+        .await?
         .ok_or(ApiError::BadRequest)?;
 
     let shared_secret = ephemeral_secret.diffie_hellman(&client_public_key);

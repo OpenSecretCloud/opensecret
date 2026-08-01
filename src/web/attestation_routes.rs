@@ -419,11 +419,9 @@ async fn key_exchange(
     // Generate a new UUID for the session
     let session_id = Uuid::new_v4();
 
-    // Store the session state
-    data.session_states
-        .write()
-        .await
-        .insert(session_id, Arc::new(session_state));
+    // Store the session state, evicting the least-recently-used unleased
+    // session if the cache is full.
+    data.store_session_state(session_id, session_state).await?;
     Ok(Json(KeyExchangeResponse {
         session_id,
         encrypted_session_key: general_purpose::STANDARD.encode(&encrypted_session_key),

@@ -26,6 +26,7 @@ use crate::web::{
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 use bounded_ttl_cache::BoundedTtlCache;
+use lease_aware_cache::{CacheLease, InsertError as SessionInsertError, LeaseAwareTtlCache};
 
 use crate::jwt::{AuthContext, AuthMethod};
 use crate::models::user_seed_wrappings::{NewUserSeedWrapping, UserSeedWrappingError};
@@ -61,7 +62,6 @@ use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::io::Write;
@@ -93,6 +93,7 @@ mod encrypt;
 mod jwt;
 mod kagi;
 mod kv;
+mod lease_aware_cache;
 mod message_signing;
 mod migrations;
 mod model_config;
@@ -140,16 +141,11 @@ const PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS: u64 = 5;
 const MAX_ATTESTATION_NONCE_BYTES: usize = 512;
 const MAX_PENDING_ATTESTATIONS: usize = 65_536;
 const PENDING_ATTESTATION_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_ENCRYPTION_SESSIONS: usize = 2_097_152;
+const ENCRYPTION_SESSION_IDLE_TTL: Duration = Duration::from_secs(65 * 60);
 
 type PendingAttestationKey = [u8; 32];
-
-pub(crate) struct SessionLease(Arc<SessionState>);
-
-impl SessionLease {
-    pub(crate) fn value(&self) -> &SessionState {
-        &self.0
-    }
-}
+pub(crate) type SessionLease = CacheLease<SessionState>;
 
 fn validate_attestation_nonce(nonce: &str) -> Result<(), ApiError> {
     if nonce.len() > MAX_ATTESTATION_NONCE_BYTES {
@@ -552,7 +548,7 @@ pub struct AppState {
     provider_router: Arc<ProviderRouter>,
     resend_api_key: Option<String>,
     ephemeral_keys: Arc<RwLock<BoundedTtlCache<PendingAttestationKey, EphemeralSecret>>>,
-    session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, Arc<SessionState>>>>,
+    session_states: Arc<tokio::sync::Mutex<LeaseAwareTtlCache<Uuid, SessionState>>>,
     oauth_manager: Arc<OAuthManager>,
     sqs_publisher: Option<Arc<SqsEventPublisher>>,
     billing_client: Option<BillingClient>,
@@ -918,7 +914,11 @@ impl AppStateBuilder {
                     .expect("pending attestation capacity must be non-zero"),
                 PENDING_ATTESTATION_TTL,
             ))),
-            session_states: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            session_states: Arc::new(tokio::sync::Mutex::new(LeaseAwareTtlCache::new(
+                NonZeroUsize::new(MAX_ENCRYPTION_SESSIONS)
+                    .expect("encryption session capacity must be non-zero"),
+                ENCRYPTION_SESSION_IDLE_TTL,
+            ))),
             oauth_manager,
             sqs_publisher,
             billing_client,
@@ -1666,17 +1666,40 @@ impl AppState {
             .take_live(&attestation_nonce_key(nonce)))
     }
 
+    pub(crate) async fn store_session_state(
+        &self,
+        session_id: Uuid,
+        session_state: SessionState,
+    ) -> Result<(), ApiError> {
+        match self
+            .session_states
+            .lock()
+            .await
+            .insert_evicting(session_id, session_state)
+        {
+            Ok(_) => Ok(()),
+            Err(SessionInsertError::DuplicateKey) => Err(ApiError::InternalServerError),
+            Err(SessionInsertError::AllEntriesLeased) => Err(ApiError::TooManyRequests),
+        }
+    }
+
     pub(crate) async fn acquire_session(
         &self,
         session_id: &Uuid,
     ) -> Result<SessionLease, ApiError> {
         self.session_states
-            .read()
+            .lock()
             .await
-            .get(session_id)
-            .cloned()
-            .map(SessionLease)
+            .acquire(session_id)
             .ok_or(ApiError::BadRequest)
+    }
+
+    pub(crate) async fn touch_session(&self, session_id: &Uuid) -> Result<(), ApiError> {
+        if self.session_states.lock().await.touch(session_id) {
+            Ok(())
+        } else {
+            Err(ApiError::BadRequest)
+        }
     }
 
     pub(crate) async fn decrypt_session_data(
@@ -1710,13 +1733,17 @@ impl AppState {
         tracing::trace!("nonce: {:?}", nonce_array);
         tracing::trace!("ciphertext length: {}", ciphertext.len());
 
-        session_lease
+        let decrypted = session_lease
             .value()
             .decrypt(ciphertext, &nonce_array)
             .map_err(|e| {
                 tracing::error!("Decryption failed: {:?}", e);
                 e
-            })
+            })?;
+
+        // Invalid ciphertext must not extend an attacker's retained session.
+        self.touch_session(session_id).await?;
+        Ok(decrypted)
     }
 
     pub async fn encrypt_session_data(
@@ -1724,15 +1751,14 @@ impl AppState {
         session_id: &Uuid,
         data: &[u8],
     ) -> Result<Vec<u8>, ApiError> {
-        let session_state = self
+        let session_lease = self
             .session_states
-            .read()
+            .lock()
             .await
-            .get(session_id)
-            .cloned()
-            .ok_or(ApiError::Unauthorized)?;
+            .acquire(session_id)
+            .ok_or(ApiError::BadRequest)?;
 
-        let session_key = session_state.get_session_key();
+        let session_key = session_lease.value().get_session_key();
         let key = Key::from_slice(session_key.as_ref());
 
         let nonce_bytes: [u8; 12] = crate::encrypt::generate_random();
@@ -1747,6 +1773,9 @@ impl AppState {
                 .map_err(|_| ApiError::InternalServerError)?,
         );
 
+        if !self.session_states.lock().await.touch(session_id) {
+            return Err(ApiError::BadRequest);
+        }
         Ok(encrypted_data)
     }
 

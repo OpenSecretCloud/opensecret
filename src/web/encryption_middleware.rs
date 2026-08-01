@@ -90,7 +90,11 @@ where
         // Bodyless requests cannot prove possession by decrypting a payload.
         // Reject an unknown session before a handler can perform side effects.
         return forward_bodyless_request::<T, _, _, _, _>(
-            state.acquire_session(&session_id),
+            async {
+                let session_lease = state.acquire_session(&session_id).await?;
+                state.touch_session(&session_id).await?;
+                Ok(session_lease)
+            },
             session_id,
             request,
             move |request| next.run(request),
@@ -106,7 +110,7 @@ where
     let encrypted_request: EncryptedRequest =
         serde_json::from_slice(&body_bytes).map_err(|_| ApiError::BadRequest)?;
 
-    // Acquire only after the request body has arrived. A slow or abandoned
+    // Pin only after the request body has arrived. A slow or abandoned
     // upload therefore cannot retain a session indefinitely.
     let session_lease = state.acquire_session(&session_id).await?;
     let decrypted_data = state
@@ -182,6 +186,7 @@ pub async fn encrypt_response<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lease_aware_cache::{InsertError, LeaseAwareTtlCache};
     use axum::{
         http::{HeaderMap, HeaderValue},
         response::IntoResponse,
@@ -189,7 +194,9 @@ mod tests {
     use std::convert::Infallible;
     use std::future::{poll_fn, ready};
     use std::io;
+    use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn classifies_every_bodyless_disjunct() {
@@ -276,6 +283,25 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn streaming_response_lease_blocks_eviction_until_body_drop() {
+        let mut cache =
+            LeaseAwareTtlCache::new(NonZeroUsize::new(1).unwrap(), Duration::from_secs(60));
+        cache.insert_evicting(1, "active stream").unwrap();
+        let lease = cache.acquire(&1).unwrap();
+
+        let stream = futures::stream::pending::<Result<Bytes, io::Error>>();
+        let response = Response::new(Body::from_stream(stream));
+        let response = hold_resource_through_response_body(response, lease);
+
+        assert_eq!(
+            cache.insert_evicting(2, "new session"),
+            Err(InsertError::AllEntriesLeased)
+        );
+        drop(response);
+        assert!(cache.insert_evicting(2, "new session").is_ok());
+    }
+
     #[tokio::test]
     async fn wrapped_body_preserves_payload_and_exact_size_hint() {
         let drops = Arc::new(AtomicUsize::new(0));
@@ -325,7 +351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrapped_body_preserves_trailers_and_resource_through_end_of_stream() {
+    async fn wrapped_body_preserves_trailers_and_lease_through_end_of_stream() {
         let drops = Arc::new(AtomicUsize::new(0));
         let response = Response::new(Body::new(DataThenTrailersBody { next_frame: 0 }));
         let response = hold_resource_through_response_body(response, DropSpy(drops.clone()));

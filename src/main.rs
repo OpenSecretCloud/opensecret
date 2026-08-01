@@ -143,6 +143,14 @@ const PENDING_ATTESTATION_TTL: Duration = Duration::from_secs(5 * 60);
 
 type PendingAttestationKey = [u8; 32];
 
+pub(crate) struct SessionLease(Arc<SessionState>);
+
+impl SessionLease {
+    pub(crate) fn value(&self) -> &SessionState {
+        &self.0
+    }
+}
+
 fn validate_attestation_nonce(nonce: &str) -> Result<(), ApiError> {
     if nonce.len() > MAX_ATTESTATION_NONCE_BYTES {
         return Err(ApiError::BadRequest);
@@ -544,7 +552,7 @@ pub struct AppState {
     provider_router: Arc<ProviderRouter>,
     resend_api_key: Option<String>,
     ephemeral_keys: Arc<RwLock<BoundedTtlCache<PendingAttestationKey, EphemeralSecret>>>,
-    session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, SessionState>>>,
+    session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, Arc<SessionState>>>>,
     oauth_manager: Arc<OAuthManager>,
     sqs_publisher: Option<Arc<SqsEventPublisher>>,
     billing_client: Option<BillingClient>,
@@ -1658,17 +1666,23 @@ impl AppState {
             .take_live(&attestation_nonce_key(nonce)))
     }
 
-    pub(crate) async fn require_session(&self, session_id: &Uuid) -> Result<(), ApiError> {
-        if self.session_states.read().await.contains_key(session_id) {
-            Ok(())
-        } else {
-            Err(ApiError::BadRequest)
-        }
-    }
-
-    pub async fn decrypt_session_data(
+    pub(crate) async fn acquire_session(
         &self,
         session_id: &Uuid,
+    ) -> Result<SessionLease, ApiError> {
+        self.session_states
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .map(SessionLease)
+            .ok_or(ApiError::BadRequest)
+    }
+
+    pub(crate) async fn decrypt_session_data(
+        &self,
+        session_id: &Uuid,
+        session_lease: &SessionLease,
         encrypted_data: &str,
     ) -> Result<Vec<u8>, ApiError> {
         tracing::trace!("decrypting session data for session_id: {}", session_id);
@@ -1696,19 +1710,12 @@ impl AppState {
         tracing::trace!("nonce: {:?}", nonce_array);
         tracing::trace!("ciphertext length: {}", ciphertext.len());
 
-        self.session_states
-            .read()
-            .await
-            .get(session_id)
-            .ok_or_else(|| {
-                tracing::error!("Session not found: {}", session_id);
-                ApiError::Unauthorized
-            })
-            .and_then(|state| {
-                state.decrypt(ciphertext, &nonce_array).map_err(|e| {
-                    tracing::error!("Decryption failed: {:?}", e);
-                    e
-                })
+        session_lease
+            .value()
+            .decrypt(ciphertext, &nonce_array)
+            .map_err(|e| {
+                tracing::error!("Decryption failed: {:?}", e);
+                e
             })
     }
 
@@ -1717,9 +1724,12 @@ impl AppState {
         session_id: &Uuid,
         data: &[u8],
     ) -> Result<Vec<u8>, ApiError> {
-        let session_states = self.session_states.read().await;
-        let session_state = session_states
+        let session_state = self
+            .session_states
+            .read()
+            .await
             .get(session_id)
+            .cloned()
             .ok_or(ApiError::Unauthorized)?;
 
         let session_key = session_state.get_session_key();

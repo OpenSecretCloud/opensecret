@@ -1,5 +1,5 @@
 use axum::{
-    body::Body,
+    body::{Body, Bytes, HttpBody},
     extract::State,
     http::{HeaderMap, Method, Request},
     middleware::Next,
@@ -7,9 +7,13 @@ use axum::{
     Json,
 };
 use base64::Engine;
+use http_body::{Frame, SizeHint};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::{future::Future, sync::Arc};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use uuid::Uuid;
 
 use crate::{ApiError, AppState};
@@ -43,7 +47,7 @@ fn skips_encrypted_body<T: 'static>(method: &Method) -> bool {
         || std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>()
 }
 
-async fn forward_bodyless_request<T, SessionCheck, RunNext, RunNextFuture>(
+async fn forward_bodyless_request<T, Resource, SessionCheck, RunNext, RunNextFuture>(
     session_check: SessionCheck,
     session_id: Uuid,
     mut request: Request<Body>,
@@ -51,17 +55,19 @@ async fn forward_bodyless_request<T, SessionCheck, RunNext, RunNextFuture>(
 ) -> Result<Response, ApiError>
 where
     T: 'static,
-    SessionCheck: Future<Output = Result<(), ApiError>>,
+    Resource: Send + Unpin + 'static,
+    SessionCheck: Future<Output = Result<Resource, ApiError>>,
     RunNext: FnOnce(Request<Body>) -> RunNextFuture,
     RunNextFuture: Future<Output = Response>,
 {
-    session_check.await?;
+    let resource = session_check.await?;
 
     if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>() {
         request.extensions_mut().insert(());
     }
     request.extensions_mut().insert(session_id);
-    Ok(run_next(request).await)
+    let response = run_next(request).await;
+    Ok(hold_resource_through_response_body(response, resource))
 }
 
 pub async fn decrypt_request<T>(
@@ -83,8 +89,8 @@ where
     if skips_encrypted_body::<T>(request.method()) {
         // Bodyless requests cannot prove possession by decrypting a payload.
         // Reject an unknown session before a handler can perform side effects.
-        return forward_bodyless_request::<T, _, _, _>(
-            state.require_session(&session_id),
+        return forward_bodyless_request::<T, _, _, _, _>(
+            state.acquire_session(&session_id),
             session_id,
             request,
             move |request| next.run(request),
@@ -100,8 +106,11 @@ where
     let encrypted_request: EncryptedRequest =
         serde_json::from_slice(&body_bytes).map_err(|_| ApiError::BadRequest)?;
 
+    // Acquire only after the request body has arrived. A slow or abandoned
+    // upload therefore cannot retain a session indefinitely.
+    let session_lease = state.acquire_session(&session_id).await?;
     let decrypted_data = state
-        .decrypt_session_data(&session_id, &encrypted_request.encrypted)
+        .decrypt_session_data(&session_id, &session_lease, &encrypted_request.encrypted)
         .await
         .map_err(|_| ApiError::BadRequest)?;
 
@@ -112,7 +121,48 @@ where
 
     request.extensions_mut().insert(decrypted);
     request.extensions_mut().insert(session_id);
-    Ok(next.run(request).await)
+    let response = next.run(request).await;
+    Ok(hold_resource_through_response_body(response, session_lease))
+}
+
+fn hold_resource_through_response_body<T>(mut response: Response, resource: T) -> Response
+where
+    T: Send + Unpin + 'static,
+{
+    let body = std::mem::replace(response.body_mut(), Body::empty());
+    *response.body_mut() = Body::new(ResourceBody {
+        inner: body,
+        _resource: resource,
+    });
+    response
+}
+
+struct ResourceBody<T> {
+    inner: Body,
+    _resource: T,
+}
+
+impl<T> HttpBody for ResourceBody<T>
+where
+    T: Send + Unpin + 'static,
+{
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.get_mut().inner).poll_frame(context)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 pub async fn encrypt_response<T: Serialize>(
@@ -132,8 +182,13 @@ pub async fn encrypt_response<T: Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::response::IntoResponse;
-    use std::future::ready;
+    use axum::{
+        http::{HeaderMap, HeaderValue},
+        response::IntoResponse,
+    };
+    use std::convert::Infallible;
+    use std::future::{poll_fn, ready};
+    use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -149,8 +204,8 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed_calls = calls.clone();
 
-        let result = forward_bodyless_request::<(), _, _, _>(
-            ready(Err(ApiError::BadRequest)),
+        let result = forward_bodyless_request::<(), _, _, _, _>(
+            ready(Err::<(), ApiError>(ApiError::BadRequest)),
             Uuid::new_v4(),
             Request::builder()
                 .method(Method::POST)
@@ -182,8 +237,8 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed_calls = calls.clone();
 
-        forward_bodyless_request::<(), _, _, _>(
-            ready(Ok(())),
+        forward_bodyless_request::<(), _, _, _, _>(
+            ready(Ok::<(), ApiError>(())),
             session_id,
             Request::builder()
                 .method(Method::POST)
@@ -200,5 +255,152 @@ mod tests {
         .unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct DropSpy(Arc<AtomicUsize>);
+
+    impl Drop for DropSpy {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn unpolled_response_holds_resource_until_body_drop() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let response = Response::new(Body::from("encrypted response"));
+        let response = hold_resource_through_response_body(response, DropSpy(drops.clone()));
+
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(response);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn wrapped_body_preserves_payload_and_exact_size_hint() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let response = Response::new(Body::from("encrypted response"));
+        let response = hold_resource_through_response_body(response, DropSpy(drops.clone()));
+
+        assert_eq!(response.body().size_hint().exact(), Some(18));
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"encrypted response");
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    struct DataThenTrailersBody {
+        next_frame: u8,
+    }
+
+    impl HttpBody for DataThenTrailersBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let frame = match self.next_frame {
+                0 => Some(Frame::data(Bytes::from_static(b"x"))),
+                1 => {
+                    let mut trailers = HeaderMap::new();
+                    trailers.insert("x-test-trailer", HeaderValue::from_static("preserved"));
+                    Some(Frame::trailers(trailers))
+                }
+                _ => None,
+            };
+            self.next_frame += 1;
+            Poll::Ready(frame.map(Ok))
+        }
+
+        fn is_end_stream(&self) -> bool {
+            self.next_frame > 1
+        }
+
+        fn size_hint(&self) -> SizeHint {
+            SizeHint::with_exact(1)
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapped_body_preserves_trailers_and_resource_through_end_of_stream() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let response = Response::new(Body::new(DataThenTrailersBody { next_frame: 0 }));
+        let response = hold_resource_through_response_body(response, DropSpy(drops.clone()));
+        let mut body = Box::pin(response.into_body());
+
+        let data = poll_fn(|context| body.as_mut().poll_frame(context))
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(&data[..], b"x");
+
+        let trailers = poll_fn(|context| body.as_mut().poll_frame(context))
+            .await
+            .unwrap()
+            .unwrap()
+            .into_trailers()
+            .unwrap();
+        assert_eq!(trailers["x-test-trailer"], "preserved");
+        assert!(poll_fn(|context| body.as_mut().poll_frame(context))
+            .await
+            .is_none());
+        assert!(body.is_end_stream());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        drop(body);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    struct DataThenErrorBody {
+        next_frame: u8,
+    }
+
+    impl HttpBody for DataThenErrorBody {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            let frame = match self.next_frame {
+                0 => Some(Ok(Frame::data(Bytes::from_static(b"x")))),
+                1 => Some(Err(io::Error::other("test body failure"))),
+                _ => None,
+            };
+            self.next_frame += 1;
+            Poll::Ready(frame)
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapped_body_preserves_errors_and_resource_until_drop() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let response = Response::new(Body::new(DataThenErrorBody { next_frame: 0 }));
+        let response = hold_resource_through_response_body(response, DropSpy(drops.clone()));
+        let mut body = Box::pin(response.into_body());
+
+        let data = poll_fn(|context| body.as_mut().poll_frame(context))
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .unwrap();
+        assert_eq!(&data[..], b"x");
+
+        let error = poll_fn(|context| body.as_mut().poll_frame(context))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("test body failure"));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        drop(body);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

@@ -423,7 +423,7 @@ async fn key_exchange(
     data.session_states
         .write()
         .await
-        .insert(session_id, session_state);
+        .insert(session_id, Arc::new(session_state));
     Ok(Json(KeyExchangeResponse {
         session_id,
         encrypted_session_key: general_purpose::STANDARD.encode(&encrypted_session_key),

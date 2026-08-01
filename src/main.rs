@@ -1658,6 +1658,14 @@ impl AppState {
             .take_live(&attestation_nonce_key(nonce)))
     }
 
+    pub(crate) async fn require_session(&self, session_id: &Uuid) -> Result<(), ApiError> {
+        if self.session_states.read().await.contains_key(session_id) {
+            Ok(())
+        } else {
+            Err(ApiError::BadRequest)
+        }
+    }
+
     pub async fn decrypt_session_data(
         &self,
         session_id: &Uuid,

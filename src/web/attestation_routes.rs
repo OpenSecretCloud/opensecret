@@ -20,7 +20,9 @@ use tracing::{error, trace};
 use uuid::Uuid;
 use yasna::models::ObjectIdentifier;
 use yasna::{construct_der, Tag};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SessionState {
     session_key: [u8; 32],
 }
@@ -30,13 +32,12 @@ impl SessionState {
         Self { session_key }
     }
 
-    pub fn get_session_key(&self) -> [u8; 32] {
-        self.session_key
+    pub fn get_session_key(&self) -> &[u8; 32] {
+        &self.session_key
     }
 
     pub fn decrypt(&self, encrypted_data: &[u8], nonce: &[u8; 12]) -> Result<Vec<u8>, ApiError> {
         tracing::trace!("decrypting encrypted data");
-        tracing::trace!("session key: {:?}", self.session_key);
         tracing::trace!("nonce: {:?}", nonce);
         tracing::trace!("encrypted data length: {}", encrypted_data.len());
 
@@ -81,7 +82,7 @@ async fn get_attestation(
 ) -> Result<(StatusCode, Json<AttestationResponse>), ApiError> {
     // Create an ephemeral key pair for this request
     trace!("Creating ephemeral key");
-    let enclave_public_key = data.create_ephemeral_key(nonce.clone()).await;
+    let enclave_public_key = data.create_ephemeral_key(&nonce).await?;
     trace!("Ephemeral key created");
 
     // Create a request for the attestation document
@@ -396,13 +397,13 @@ async fn key_exchange(
 
     let ephemeral_secret = data
         .get_and_remove_ephemeral_secret(&payload.nonce)
-        .await
+        .await?
         .ok_or(ApiError::BadRequest)?;
 
     let shared_secret = ephemeral_secret.diffie_hellman(&client_public_key);
 
     // Generate a random session key using your secure random function
-    let session_key: [u8; 32] = crate::encrypt::generate_random();
+    let session_state = SessionState::new(crate::encrypt::generate_random());
 
     // Encrypt the session key using the shared secret
     let nonce_bytes: [u8; 12] = crate::encrypt::generate_random();
@@ -411,26 +412,34 @@ async fn key_exchange(
     let mut encrypted_session_key = nonce_bytes.to_vec();
     encrypted_session_key.extend_from_slice(
         &cipher
-            .encrypt(nonce, session_key.as_ref())
+            .encrypt(nonce, session_state.get_session_key().as_ref())
             .map_err(|_| ApiError::InternalServerError)?,
     );
 
     // Generate a new UUID for the session
     let session_id = Uuid::new_v4();
 
-    trace!(
-        "Generated session key {:?} for nonce {:?}",
-        session_key,
-        nonce
-    );
-
-    // Store the session state
-    data.session_states
-        .write()
-        .await
-        .insert(session_id, SessionState::new(session_key));
+    // Store the session state, evicting the least-recently-used unleased
+    // session if the cache is full.
+    data.store_session_state(session_id, session_state).await?;
     Ok(Json(KeyExchangeResponse {
         session_id,
         encrypted_session_key: general_purpose::STANDARD.encode(&encrypted_session_key),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_state_zeroizes_key_material() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+        assert_zeroize_on_drop::<SessionState>();
+
+        let mut state = SessionState::new([0xA5; 32]);
+        state.zeroize();
+        assert_eq!(state.get_session_key(), &[0; 32]);
+    }
 }

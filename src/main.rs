@@ -25,6 +25,8 @@ use crate::web::{
     responses_routes, web_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
+use bounded_ttl_cache::BoundedTtlCache;
+use lease_aware_cache::{CacheLease, InsertError as SessionInsertError, LeaseAwareTtlCache};
 
 use crate::jwt::{AuthContext, AuthMethod};
 use crate::models::user_seed_wrappings::{NewUserSeedWrapping, UserSeedWrappingError};
@@ -60,10 +62,10 @@ use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -83,6 +85,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 mod apple_signin;
 mod aws_credentials;
 mod billing;
+mod bounded_ttl_cache;
 mod brave;
 mod db;
 mod email;
@@ -90,6 +93,7 @@ mod encrypt;
 mod jwt;
 mod kagi;
 mod kv;
+mod lease_aware_cache;
 mod message_signing;
 mod migrations;
 mod model_config;
@@ -100,6 +104,7 @@ mod private_key;
 mod provider_client;
 mod provider_routing;
 mod proxy_config;
+mod secret_cache_maintenance;
 #[cfg(test)]
 mod security_invariants;
 mod seed_wrapping;
@@ -134,6 +139,59 @@ const KAGI_API_KEY_NAME: &str = "kagi_api_key";
 const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
 const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
 const PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS: u64 = 5;
+const MAX_ATTESTATION_NONCE_BYTES: usize = 512;
+const MAX_PENDING_ATTESTATIONS: usize = 65_536;
+const PENDING_ATTESTATION_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_ENCRYPTION_SESSIONS: usize = 2_097_152;
+const ENCRYPTION_SESSION_IDLE_TTL: Duration = Duration::from_secs(65 * 60);
+
+type PendingAttestationKey = [u8; 32];
+pub(crate) type SessionLease = CacheLease<SessionState>;
+
+fn validate_attestation_nonce(nonce: &str) -> Result<(), ApiError> {
+    if nonce.len() > MAX_ATTESTATION_NONCE_BYTES {
+        return Err(ApiError::BadRequest);
+    }
+    Ok(())
+}
+
+fn attestation_nonce_key(nonce: &str) -> PendingAttestationKey {
+    Sha256::digest(nonce.as_bytes()).into()
+}
+
+#[cfg(test)]
+mod pending_attestation_key_tests {
+    use super::*;
+
+    #[test]
+    fn nonce_limit_is_measured_in_bytes() {
+        assert!(validate_attestation_nonce(&"a".repeat(512)).is_ok());
+        assert!(matches!(
+            validate_attestation_nonce(&"a".repeat(513)),
+            Err(ApiError::BadRequest)
+        ));
+
+        assert!(validate_attestation_nonce(&"é".repeat(256)).is_ok());
+        assert!(matches!(
+            validate_attestation_nonce(&"é".repeat(257)),
+            Err(ApiError::BadRequest)
+        ));
+    }
+
+    #[test]
+    fn cache_key_is_a_fixed_sha256_digest() {
+        let first_nonce = Uuid::new_v4().to_string();
+        let different_nonce = Uuid::new_v4().to_string();
+        let first = attestation_nonce_key(&first_nonce);
+
+        assert_eq!(first, attestation_nonce_key(&first_nonce));
+        assert_ne!(first, attestation_nonce_key(&different_nonce));
+        assert_eq!(std::mem::size_of_val(&first), 32);
+
+        let expected: PendingAttestationKey = Sha256::digest(first_nonce.as_bytes()).into();
+        assert_eq!(first, expected);
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EnclaveRequest {
@@ -490,8 +548,8 @@ pub struct AppState {
     proxy_router: Arc<ProxyRouter>,
     provider_router: Arc<ProviderRouter>,
     resend_api_key: Option<String>,
-    ephemeral_keys: Arc<RwLock<HashMap<String, EphemeralSecret>>>,
-    session_states: Arc<tokio::sync::RwLock<HashMap<Uuid, SessionState>>>,
+    ephemeral_keys: Arc<RwLock<BoundedTtlCache<PendingAttestationKey, EphemeralSecret>>>,
+    session_states: Arc<tokio::sync::Mutex<LeaseAwareTtlCache<Uuid, SessionState>>>,
     oauth_manager: Arc<OAuthManager>,
     sqs_publisher: Option<Arc<SqsEventPublisher>>,
     billing_client: Option<BillingClient>,
@@ -852,8 +910,16 @@ impl AppStateBuilder {
             proxy_router,
             provider_router,
             resend_api_key: self.resend_api_key,
-            ephemeral_keys: Arc::new(RwLock::new(HashMap::new())),
-            session_states: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            ephemeral_keys: Arc::new(RwLock::new(BoundedTtlCache::new(
+                NonZeroUsize::new(MAX_PENDING_ATTESTATIONS)
+                    .expect("pending attestation capacity must be non-zero"),
+                PENDING_ATTESTATION_TTL,
+            ))),
+            session_states: Arc::new(tokio::sync::Mutex::new(LeaseAwareTtlCache::new(
+                NonZeroUsize::new(MAX_ENCRYPTION_SESSIONS)
+                    .expect("encryption session capacity must be non-zero"),
+                ENCRYPTION_SESSION_IDLE_TTL,
+            ))),
             oauth_manager,
             sqs_publisher,
             billing_client,
@@ -1570,7 +1636,8 @@ impl AppState {
         self.enclave_key.clone()
     }
 
-    pub async fn create_ephemeral_key(&self, nonce: String) -> PublicKey {
+    pub async fn create_ephemeral_key(&self, nonce: &str) -> Result<PublicKey, ApiError> {
+        validate_attestation_nonce(nonce)?;
         let custom_rng = CustomRng::new();
 
         // Use a wrapper that implements RngCore and CryptoRng
@@ -1583,18 +1650,63 @@ impl AppState {
         self.ephemeral_keys
             .write()
             .await
-            .insert(nonce, ephemeral_secret);
+            .insert_evicting(attestation_nonce_key(nonce), ephemeral_secret);
 
-        public_key
+        Ok(public_key)
     }
 
-    pub async fn get_and_remove_ephemeral_secret(&self, nonce: &str) -> Option<EphemeralSecret> {
-        self.ephemeral_keys.write().await.remove(nonce)
+    pub async fn get_and_remove_ephemeral_secret(
+        &self,
+        nonce: &str,
+    ) -> Result<Option<EphemeralSecret>, ApiError> {
+        validate_attestation_nonce(nonce)?;
+        Ok(self
+            .ephemeral_keys
+            .write()
+            .await
+            .take_live(&attestation_nonce_key(nonce)))
     }
 
-    pub async fn decrypt_session_data(
+    pub(crate) async fn store_session_state(
+        &self,
+        session_id: Uuid,
+        session_state: SessionState,
+    ) -> Result<(), ApiError> {
+        match self
+            .session_states
+            .lock()
+            .await
+            .insert_evicting(session_id, session_state)
+        {
+            Ok(_) => Ok(()),
+            Err(SessionInsertError::DuplicateKey) => Err(ApiError::InternalServerError),
+            Err(SessionInsertError::AllEntriesLeased) => Err(ApiError::TooManyRequests),
+        }
+    }
+
+    pub(crate) async fn acquire_session(
         &self,
         session_id: &Uuid,
+    ) -> Result<SessionLease, ApiError> {
+        self.session_states
+            .lock()
+            .await
+            .acquire(session_id)
+            .ok_or(ApiError::BadRequest)
+    }
+
+    pub(crate) async fn touch_session(&self, session_id: &Uuid) -> Result<(), ApiError> {
+        if self.session_states.lock().await.touch(session_id) {
+            Ok(())
+        } else {
+            Err(ApiError::BadRequest)
+        }
+    }
+
+    pub(crate) async fn decrypt_session_data(
+        &self,
+        session_id: &Uuid,
+        session_lease: &SessionLease,
         encrypted_data: &str,
     ) -> Result<Vec<u8>, ApiError> {
         tracing::trace!("decrypting session data for session_id: {}", session_id);
@@ -1622,20 +1734,17 @@ impl AppState {
         tracing::trace!("nonce: {:?}", nonce_array);
         tracing::trace!("ciphertext length: {}", ciphertext.len());
 
-        self.session_states
-            .read()
-            .await
-            .get(session_id)
-            .ok_or_else(|| {
-                tracing::error!("Session not found: {}", session_id);
-                ApiError::Unauthorized
-            })
-            .and_then(|state| {
-                state.decrypt(ciphertext, &nonce_array).map_err(|e| {
-                    tracing::error!("Decryption failed: {:?}", e);
-                    e
-                })
-            })
+        let decrypted = session_lease
+            .value()
+            .decrypt(ciphertext, &nonce_array)
+            .map_err(|e| {
+                tracing::error!("Decryption failed: {:?}", e);
+                e
+            })?;
+
+        // Invalid ciphertext must not extend an attacker's retained session.
+        self.touch_session(session_id).await?;
+        Ok(decrypted)
     }
 
     pub async fn encrypt_session_data(
@@ -1643,12 +1752,14 @@ impl AppState {
         session_id: &Uuid,
         data: &[u8],
     ) -> Result<Vec<u8>, ApiError> {
-        let session_states = self.session_states.read().await;
-        let session_state = session_states
-            .get(session_id)
-            .ok_or(ApiError::Unauthorized)?;
+        let session_lease = self
+            .session_states
+            .lock()
+            .await
+            .acquire(session_id)
+            .ok_or(ApiError::BadRequest)?;
 
-        let session_key = session_state.get_session_key();
+        let session_key = session_lease.value().get_session_key();
         let key = Key::from_slice(session_key.as_ref());
 
         let nonce_bytes: [u8; 12] = crate::encrypt::generate_random();
@@ -1663,6 +1774,9 @@ impl AppState {
                 .map_err(|_| ApiError::InternalServerError)?,
         );
 
+        if !self.session_states.lock().await.touch(session_id) {
+            return Err(ApiError::BadRequest);
+        }
         Ok(encrypted_data)
     }
 
@@ -3385,5 +3499,10 @@ async fn main() -> Result<(), Error> {
 
     tracing::info!("Listening on http://{}", bind_addr);
 
-    Ok(axum::serve(listener, app.into_make_service()).await?)
+    tokio::select! {
+        result = axum::serve(listener, app.into_make_service()) => Ok(result?),
+        _ = secret_cache_maintenance::run(app_state) => {
+            unreachable!("secret cache maintenance runs until the server stops")
+        }
+    }
 }

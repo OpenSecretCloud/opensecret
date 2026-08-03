@@ -56,6 +56,19 @@ impl<V> CachedValue<V> {
     }
 }
 
+/// Cache-owned slots detached for destruction after the caller releases the
+/// session-cache mutex.
+#[must_use = "keep retired values alive until after releasing the cache lock"]
+pub(crate) struct RetiredLeaseValues<V> {
+    slots: Vec<Arc<LeaseSlot<V>>>,
+}
+
+impl<V> RetiredLeaseValues<V> {
+    pub(crate) fn removed_count(&self) -> usize {
+        self.slots.len()
+    }
+}
+
 /// An RAII lease that prevents its cached value from being expired or evicted.
 pub(crate) struct CacheLease<V> {
     slot: Arc<LeaseSlot<V>>,
@@ -225,6 +238,57 @@ where
         debug_assert!(self.entries.len() <= self.entries.capacity());
     }
 
+    /// Takes one LRU-to-MRU snapshot of expired, currently unleased keys.
+    ///
+    /// A fresh deadline always moves an entry to MRU, while acquisition alone
+    /// changes neither deadline nor recency. Expired entries therefore form an
+    /// LRU suffix and this scan can stop at the first live entry. The caller can
+    /// process the snapshot in bounded batches without repeatedly rescanning
+    /// expired leased entries.
+    pub(crate) fn expired_unleased_keys_at(&self, now: Instant) -> Vec<K> {
+        let mut keys = Vec::new();
+        for (key, entry) in self.entries.iter().rev() {
+            if entry.expires_at > now {
+                break;
+            }
+            if !entry.has_external_lease() {
+                keys.push(key.clone());
+            }
+        }
+        keys
+    }
+
+    /// Revalidates and detaches a bounded candidate batch.
+    ///
+    /// Revalidation protects a newly inserted value if another operation
+    /// removed an expired candidate while the mutex was released. Returned
+    /// slots retain their values so secret destruction occurs outside the
+    /// mutex.
+    pub(crate) fn retire_expired_candidates_at(
+        &mut self,
+        keys: &[K],
+        now: Instant,
+    ) -> RetiredLeaseValues<V> {
+        let mut slots = Vec::with_capacity(keys.len());
+        for key in keys {
+            let should_retire = self
+                .entries
+                .peek(key)
+                .is_some_and(|entry| entry.expires_at <= now && !entry.has_external_lease());
+            if !should_retire {
+                continue;
+            }
+
+            let retired = self
+                .entries
+                .pop(key)
+                .expect("revalidated cache entry must remain present");
+            debug_assert_eq!(Arc::strong_count(&retired.slot), 1);
+            slots.push(retired.slot);
+        }
+        RetiredLeaseValues { slots }
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
@@ -271,6 +335,19 @@ mod tests {
             assert_eq!(std::mem::size_of::<LeaseSlot<SessionState>>(), 40);
             assert_eq!(std::mem::size_of::<CachedValue<SessionState>>(), 24);
             assert_eq!(std::mem::size_of::<CacheLease<SessionState>>(), 8);
+
+            // Cleanup can temporarily hold a UUID candidate snapshot while the
+            // fixed CLru backing allocation stays reserved. Budget for twice
+            // the final Vec payload to cover geometric growth/reallocation,
+            // plus one detached batch of Arc handles.
+            assert_eq!(std::mem::size_of::<uuid::Uuid>(), 16);
+            let cleanup_snapshot_peak =
+                crate::MAX_ENCRYPTION_SESSIONS * std::mem::size_of::<uuid::Uuid>() * 2;
+            let detached_batch = crate::secret_cache_maintenance::SESSION_RETIREMENT_BATCH_SIZE
+                * std::mem::size_of::<Arc<LeaseSlot<SessionState>>>();
+            let peak_accounted_bytes = accounted_bytes + cleanup_snapshot_peak + detached_batch;
+            assert!(peak_accounted_bytes <= 500 * 1024 * 1024);
+            assert_eq!(500 * 1024 * 1024 - peak_accounted_bytes, 41_910_272);
         }
     }
 
@@ -360,6 +437,148 @@ mod tests {
             .acquire_at(&1, start + Duration::from_secs(5))
             .is_none());
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn retires_untouched_expired_values_below_capacity_and_drops_outside_cache() {
+        struct DropSpy(Arc<AtomicUsize>);
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let start = Instant::now();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut cache = cache(4, Duration::from_secs(5));
+        cache
+            .insert_evicting_at(1, DropSpy(drops.clone()), start)
+            .unwrap();
+        cache
+            .insert_evicting_at(2, DropSpy(drops.clone()), start + Duration::from_secs(4))
+            .unwrap();
+
+        let candidates = cache.expired_unleased_keys_at(start + Duration::from_secs(5));
+        assert_eq!(candidates, vec![1]);
+        let retired =
+            cache.retire_expired_candidates_at(&candidates, start + Duration::from_secs(5));
+        assert_eq!(retired.removed_count(), 1);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        drop(retired);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(cache
+            .acquire_at(&2, start + Duration::from_secs(5))
+            .is_some());
+    }
+
+    #[test]
+    fn touched_value_survives_its_original_expiry_snapshot() {
+        let start = Instant::now();
+        let mut cache = cache(2, Duration::from_secs(5));
+        cache.insert_evicting_at(1, "one", start).unwrap();
+        assert!(cache.touch_at(&1, start + Duration::from_secs(4)));
+
+        assert!(cache
+            .expired_unleased_keys_at(start + Duration::from_secs(5))
+            .is_empty());
+        assert_eq!(
+            cache.expired_unleased_keys_at(start + Duration::from_secs(9)),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn leased_expired_value_waits_for_a_later_cleanup_pass() {
+        struct DropSpy(Arc<AtomicUsize>);
+        impl Drop for DropSpy {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let start = Instant::now();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut cache = cache(2, Duration::from_secs(5));
+        cache
+            .insert_evicting_at(1, DropSpy(drops.clone()), start)
+            .unwrap();
+        let lease = cache.acquire_at(&1, start).unwrap();
+
+        let expired_at = start + Duration::from_secs(5);
+        assert!(cache.expired_unleased_keys_at(expired_at).is_empty());
+        assert_eq!(cache.len(), 1);
+        drop(lease);
+
+        let candidates = cache.expired_unleased_keys_at(expired_at);
+        let retired = cache.retire_expired_candidates_at(&candidates, expired_at);
+        assert_eq!(retired.removed_count(), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(retired);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cleanup_skips_leased_expiry_holes_and_preserves_survivor_order() {
+        let start = Instant::now();
+        let mut cache = cache(4, Duration::from_secs(5));
+        cache.insert_evicting_at(1, "leased", start).unwrap();
+        cache
+            .insert_evicting_at(2, "expired", start + Duration::from_secs(1))
+            .unwrap();
+        cache
+            .insert_evicting_at(3, "live", start + Duration::from_secs(2))
+            .unwrap();
+        let lease = cache
+            .acquire_at(&1, start + Duration::from_secs(2))
+            .unwrap();
+
+        let cutoff = start + Duration::from_secs(6);
+        let candidates = cache.expired_unleased_keys_at(cutoff);
+        assert_eq!(candidates, vec![2]);
+        drop(cache.retire_expired_candidates_at(&candidates, cutoff));
+
+        cache.insert_evicting_at(4, "new", cutoff).unwrap();
+        cache.insert_evicting_at(5, "newest", cutoff).unwrap();
+        assert_eq!(
+            cache.insert_evicting_at(6, "overflow", cutoff),
+            Ok(InsertOutcome::EvictedLeastRecentlyUsed)
+        );
+        assert!(cache.acquire_at(&3, cutoff).is_none());
+        assert_eq!(lease.value(), &"leased");
+        drop(lease);
+    }
+
+    #[test]
+    fn stale_cleanup_candidate_cannot_remove_a_replacement() {
+        let start = Instant::now();
+        let cutoff = start + Duration::from_secs(5);
+        let mut cache = cache(1, Duration::from_secs(5));
+        cache.insert_evicting_at(1, "old", start).unwrap();
+        let candidates = cache.expired_unleased_keys_at(cutoff);
+
+        assert!(cache.acquire_at(&1, cutoff).is_none());
+        cache.insert_evicting_at(1, "replacement", cutoff).unwrap();
+        let retired = cache.retire_expired_candidates_at(&candidates, cutoff);
+        assert_eq!(retired.removed_count(), 0);
+        assert_eq!(
+            cache.acquire_at(&1, cutoff).unwrap().value(),
+            &"replacement"
+        );
+    }
+
+    #[test]
+    fn lingering_arc_excludes_expired_value_from_cleanup_snapshot() {
+        let start = Instant::now();
+        let cutoff = start + Duration::from_secs(5);
+        let mut cache = cache(1, Duration::from_secs(5));
+        cache.insert_evicting_at(1, "one", start).unwrap();
+        let lingering_arc = Arc::clone(&cache.entries.peek(&1).unwrap().slot);
+
+        assert!(cache.expired_unleased_keys_at(cutoff).is_empty());
+        drop(lingering_arc);
+        assert_eq!(cache.expired_unleased_keys_at(cutoff), vec![1]);
     }
 
     #[test]

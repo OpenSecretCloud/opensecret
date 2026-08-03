@@ -3,6 +3,7 @@ use std::collections::hash_map::RandomState;
 use std::hash::Hash;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
+use zeroize::Zeroize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InsertOutcome {
@@ -15,6 +16,19 @@ pub(crate) enum InsertOutcome {
 struct TimedEntry<V> {
     value: V,
     expires_at: Instant,
+}
+
+/// Values detached from the cache so their destructors and deallocation can
+/// run after the caller releases the cache lock.
+#[must_use = "keep retired values alive until after releasing the cache lock"]
+pub(crate) struct RetiredValues<V> {
+    entries: Vec<TimedEntry<V>>,
+}
+
+impl<V> RetiredValues<V> {
+    pub(crate) fn removed_count(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 /// A private, fixed-capacity TTL cache with oldest-first admission.
@@ -95,6 +109,42 @@ where
         } else {
             Some(entry.value)
         }
+    }
+
+    /// Detaches the oldest expired values without scanning live entries.
+    ///
+    /// Insertion and replacement both move a value to MRU with a fresh fixed
+    /// TTL, so expiry order matches LRU order. Each value is zeroized in place
+    /// before removal so a Rust move cannot leave secret bytes in CLru's
+    /// preallocated backing storage. Returning the zeroized values lets the
+    /// caller release its lock before their destructors and deallocation run.
+    pub(crate) fn retire_expired_at(&mut self, now: Instant) -> RetiredValues<V>
+    where
+        V: Zeroize,
+    {
+        let expired_count = self
+            .entries
+            .iter()
+            .rev()
+            .take_while(|(_, entry)| entry.expires_at <= now)
+            .count();
+        // Allocate once so secret-bearing values are not repeatedly relocated
+        // as the retirement buffer grows.
+        let mut entries = Vec::with_capacity(expired_count);
+        for _ in 0..expired_count {
+            self.entries
+                .back_mut()
+                .expect("counted oldest cache entry must remain present")
+                .1
+                .value
+                .zeroize();
+            let (_, entry) = self
+                .entries
+                .pop_back()
+                .expect("peeked oldest cache entry must remain present");
+            entries.push(entry);
+        }
+        RetiredValues { entries }
     }
 
     #[cfg(test)]
@@ -234,6 +284,55 @@ mod tests {
     }
 
     #[test]
+    fn retires_untouched_expired_values_below_capacity_and_drops_outside_cache() {
+        let start = Instant::now();
+        let zeroizes = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut cache = cache(4, Duration::from_secs(5));
+
+        let spy = || ZeroizingDropSpy {
+            zeroizes: zeroizes.clone(),
+            drops: drops.clone(),
+        };
+        cache.insert_evicting_at(1, spy(), start);
+        cache.insert_evicting_at(2, spy(), start + Duration::from_secs(4));
+
+        let retired = cache.retire_expired_at(start + Duration::from_secs(5));
+        assert_eq!(retired.removed_count(), 1);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(zeroizes.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        drop(retired);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(cache
+            .take_live_at(&2, start + Duration::from_secs(5))
+            .is_some());
+    }
+
+    #[test]
+    fn expiry_retirement_preserves_survivor_order() {
+        let start = Instant::now();
+        let mut cache = cache(3, Duration::from_secs(5));
+        cache.insert_evicting_at(1, 1_u8, start);
+        cache.insert_evicting_at(2, 2_u8, start + Duration::from_secs(4));
+        cache.insert_evicting_at(3, 3_u8, start + Duration::from_secs(4));
+
+        drop(cache.retire_expired_at(start + Duration::from_secs(5)));
+        cache.insert_evicting_at(4, 4_u8, start + Duration::from_secs(5));
+        assert_eq!(
+            cache.insert_evicting_at(5, 5_u8, start + Duration::from_secs(5)),
+            InsertOutcome::EvictedOldest
+        );
+
+        assert_eq!(cache.take_live_at(&2, start + Duration::from_secs(5)), None);
+        assert_eq!(
+            cache.take_live_at(&3, start + Duration::from_secs(5)),
+            Some(3)
+        );
+    }
+
+    #[test]
     fn full_cache_reclaims_expired_oldest_before_live_entries() {
         let start = Instant::now();
         let mut cache = cache(2, Duration::from_secs(5));
@@ -259,6 +358,23 @@ mod tests {
     impl Drop for DropSpy {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ZeroizingDropSpy {
+        zeroizes: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Zeroize for ZeroizingDropSpy {
+        fn zeroize(&mut self) {
+            self.zeroizes.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for ZeroizingDropSpy {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
         }
     }
 

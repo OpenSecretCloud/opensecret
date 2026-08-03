@@ -104,6 +104,7 @@ mod private_key;
 mod provider_client;
 mod provider_routing;
 mod proxy_config;
+mod secret_cache_maintenance;
 #[cfg(test)]
 mod security_invariants;
 mod seed_wrapping;
@@ -3498,5 +3499,10 @@ async fn main() -> Result<(), Error> {
 
     tracing::info!("Listening on http://{}", bind_addr);
 
-    Ok(axum::serve(listener, app.into_make_service()).await?)
+    tokio::select! {
+        result = axum::serve(listener, app.into_make_service()) => Ok(result?),
+        _ = secret_cache_maintenance::run(app_state) => {
+            unreachable!("secret cache maintenance runs until the server stops")
+        }
+    }
 }

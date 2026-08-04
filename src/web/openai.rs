@@ -38,6 +38,17 @@ use uuid::Uuid;
 // Maximum audio file size (100MB) - sanity check, CF already limits to 50MB
 const MAX_AUDIO_SIZE: usize = 100 * 1024 * 1024;
 
+// Provider responses cross an untrusted boundary. These limits bound the raw
+// body retained before JSON parsing, base64 encoding, and response encryption.
+const MAX_COMPLETION_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MAX_MODELS_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_EMBEDDINGS_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_TRANSCRIPTION_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+// TTS bytes are base64-encoded into JSON and then encrypted, so keep the raw
+// provider-body ceiling separate from the larger inbound audio-upload limit.
+const MAX_TTS_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 64 * 1024;
+
 // Timeout constants for provider requests
 const REQUEST_TIMEOUT_SECS: u64 = 120; // Request timeout (generous for large non-streaming responses)
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming reads
@@ -351,7 +362,7 @@ fn image_part_url(part: &Value) -> Option<&str> {
         .or_else(|| part.get("image").and_then(Value::as_str))
 }
 
-fn safe_log_preview(value: &str) -> String {
+pub(super) fn safe_log_preview(value: &str) -> String {
     let mut chars = value.chars();
     let preview = chars
         .by_ref()
@@ -364,6 +375,14 @@ fn safe_log_preview(value: &str) -> String {
     } else {
         preview
     }
+}
+
+async fn provider_error_preview(response: ProviderResponse) -> Option<String> {
+    response
+        .bytes_limited(MAX_PROVIDER_ERROR_BODY_BYTES)
+        .await
+        .ok()
+        .map(|body| safe_log_preview(&String::from_utf8_lossy(&body)))
 }
 
 /// Parameters for transcription requests
@@ -1063,10 +1082,13 @@ pub async fn get_chat_completion_response(
         debug!("Processing non-streaming response with internal billing");
         // The request's streaming fields are forwarded unchanged, but this
         // encrypted endpoint currently buffers one byte-exact response carrier.
-        let body_bytes = res.bytes().await.map_err(|e| {
-            error!("Failed to read response body: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        let body_bytes = res
+            .bytes_limited(MAX_COMPLETION_RESPONSE_BYTES)
+            .await
+            .map_err(|e| {
+                error!("Failed to read response body: {:?}", e);
+                ApiError::InternalServerError
+            })?;
 
         let mut response_json: Value = serde_json::from_str(&String::from_utf8_lossy(&body_bytes))
             .map_err(|e| {
@@ -1613,9 +1635,8 @@ async fn fetch_provider_models(
 
     if !res.is_success() {
         let status = res.status_code();
-        let body_bytes = res.bytes().await.ok();
-        let error_msg = body_bytes
-            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        let error_msg = provider_error_preview(res)
+            .await
             .unwrap_or_else(|| status.to_string());
         error!(
             "Provider {} returned non-success status for models: {} - {}",
@@ -1624,10 +1645,13 @@ async fn fetch_provider_models(
         return Err(ApiError::InternalServerError);
     }
 
-    let body_bytes = res.bytes().await.map_err(|e| {
-        error!("Failed to read models response body: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    let body_bytes = res
+        .bytes_limited(MAX_MODELS_RESPONSE_BYTES)
+        .await
+        .map_err(|e| {
+            error!("Failed to read models response body: {:?}", e);
+            ApiError::InternalServerError
+        })?;
 
     serde_json::from_slice(&body_bytes).map_err(|e| {
         error!("Failed to parse models response: {:?}", e);
@@ -2056,10 +2080,13 @@ async fn send_transcription_request(
     {
         Ok(res) => {
             if res.is_success() {
-                let body_bytes = res.bytes().await.map_err(|e| {
-                    error!("Failed to read transcription response body: {:?}", e);
-                    ApiError::InternalServerError
-                })?;
+                let body_bytes = res
+                    .bytes_limited(MAX_TRANSCRIPTION_RESPONSE_BYTES)
+                    .await
+                    .map_err(|e| {
+                        error!("Failed to read transcription response body: {:?}", e);
+                        ApiError::InternalServerError
+                    })?;
 
                 let response_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
                     error!("Failed to parse transcription response: {:?}", e);
@@ -2069,9 +2096,8 @@ async fn send_transcription_request(
                 Ok(response_json)
             } else {
                 let status = res.status_code();
-                let body_bytes = res.bytes().await.ok();
-                let error_msg = body_bytes
-                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                let error_msg = provider_error_preview(res)
+                    .await
                     .unwrap_or_else(|| status.to_string());
 
                 error!(
@@ -2204,10 +2230,13 @@ async fn proxy_tts(
             .content_type()
             .unwrap_or("application/octet-stream")
             .to_string();
-        let body_bytes = res.bytes().await.map_err(|e| {
-            error!("Failed to read TTS response body: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        let body_bytes = res
+            .bytes_limited(MAX_TTS_RESPONSE_BYTES)
+            .await
+            .map_err(|e| {
+                error!("Failed to read TTS response body: {:?}", e);
+                ApiError::InternalServerError
+            })?;
         Ok((body_bytes, content_type))
     })
     .await
@@ -2318,9 +2347,8 @@ async fn proxy_embeddings(
 
     if !res.is_success() {
         let status = res.status_code();
-        let body_bytes = res.bytes().await.ok();
-        let error_msg = body_bytes
-            .map(|b| String::from_utf8_lossy(&b).to_string())
+        let error_msg = provider_error_preview(res)
+            .await
             .unwrap_or_else(|| status.to_string());
         error!(
             "Embeddings proxy returned non-success status: {} - {}",
@@ -2330,10 +2358,13 @@ async fn proxy_embeddings(
     }
 
     // Parse response
-    let body_bytes = res.bytes().await.map_err(|e| {
-        error!("Failed to read embeddings response body: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    let body_bytes = res
+        .bytes_limited(MAX_EMBEDDINGS_RESPONSE_BYTES)
+        .await
+        .map_err(|e| {
+            error!("Failed to read embeddings response body: {:?}", e);
+            ApiError::InternalServerError
+        })?;
 
     let response_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
         error!("Failed to parse embeddings response: {:?}", e);
@@ -2407,9 +2438,7 @@ async fn try_provider(
                 debug!("Response headers: {}", response.headers_debug());
 
                 // Try to get error body for logging
-                if let Ok(body_bytes) = response.bytes().await {
-                    let body_str = String::from_utf8_lossy(&body_bytes);
-                    let body_preview = safe_log_preview(&body_str);
+                if let Some(body_preview) = provider_error_preview(response).await {
                     error!("Response body preview: {}", body_preview);
                     Err(ProviderRequestError::Send(format!(
                         "Provider {} returned status {}; body_preview={}",

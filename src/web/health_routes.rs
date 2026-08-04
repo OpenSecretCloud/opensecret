@@ -1,3 +1,4 @@
+use super::openai::{safe_log_preview, MAX_MODELS_RESPONSE_BYTES, MAX_PROVIDER_ERROR_BODY_BYTES};
 use crate::{
     provider_client::{ProviderClient, ProviderRequest},
     AppState,
@@ -107,12 +108,12 @@ async fn fetch_models_directly(
 
     if !res.is_success() {
         let status = res.status_code();
-        let body_bytes = res.bytes().await?;
-        let body_str = String::from_utf8_lossy(&body_bytes);
-        return Err(format!("HTTP {}: {}", status, body_str).into());
+        let body_bytes = res.bytes_limited(MAX_PROVIDER_ERROR_BODY_BYTES).await?;
+        let body_preview = safe_log_preview(&String::from_utf8_lossy(&body_bytes));
+        return Err(format!("HTTP {}: {}", status, body_preview).into());
     }
 
-    let body_bytes = res.bytes().await?;
+    let body_bytes = res.bytes_limited(MAX_MODELS_RESPONSE_BYTES).await?;
     let models_response: serde_json::Value = serde_json::from_slice(&body_bytes)?;
 
     // Count the models

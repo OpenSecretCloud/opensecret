@@ -852,5 +852,12 @@
     "PCR2": "c75d8ef1273af3b6588b59699008a525edc24a9cd04d34a402cc2908cc3825a7a7871f2ccf503fef2cb4e4f556d0fa0f",
     "timestamp": 1785263310,
     "signature": "WusPI1dxJDLasZKo9uTH40MBwyBQhC16l1nGdRGW9dF3Ho0WfnI1el+7g2pJoA7G5zUR1gbDCxDxEPIeuHZjYrXFEAbym3cK2Mp51Vnhrh5AVYVrDatMfWpOTQjuc3Qo"
+  },
+  {
+    "PCR0": "52805d709538758e5e7a6f5ac124bc46b85e9bb8e832ecd2ff81ed75d8e6303aeefb4662e5557fab26bd8fdc8c76c155",
+    "PCR1": "5ecc5151d681c53c455898da9cd67db547cebdd0e59021accd9d0729e9bc6f566f682003a2d010a34ec7da4c6379a8df",
+    "PCR2": "a9f16ed44c4ba41861afa25a54c51e75d6ffdc5b683661ac7627ddf523056cd2c78b4c611b1b0535f7d02d64e7c0df71",
+    "timestamp": 1785804286,
+    "signature": "qBCKQySqzGiHq6pep0xh5tY87Gxx1/zS7dM74wI8SCoI+snCfibEuXihyti2Xle5+2GTMDwdjzoEbSXIwCxBFlj8NMNH5ZTITgWWBE4a0oIkVoXcld6MM+VFneB5WAOS"
   }
 ]

@@ -1,0 +1,82 @@
+--- a/elf/Makefile
++++ b/elf/Makefile
+@@ -1734,17 +1734,17 @@
+ 
+ $(objpfx)ldconfig: $(ldconfig-modules:%=$(objpfx)%.o)
+ 
+-SYSCONF-FLAGS := -D'SYSCONFDIR="$(sysconfdir)"'
+-CFLAGS-ldconfig.c += $(SYSCONF-FLAGS) -D'LIBDIR="$(libdir)"' \
++PREFIX-FLAGS := -D'PREFIX="$(prefix)"'
++CFLAGS-ldconfig.c += $(PREFIX-FLAGS) -D'LIBDIR="$(libdir)"' \
+ 		    -D'SLIBDIR="$(slibdir)"'
+ libof-ldconfig = ldconfig
+-CFLAGS-dl-cache.c += $(SYSCONF-FLAGS)
+-CFLAGS-cache.c += $(SYSCONF-FLAGS)
+-CFLAGS-rtld.c += $(SYSCONF-FLAGS)
+-CFLAGS-dl-usage.c += $(SYSCONF-FLAGS) \
++CFLAGS-tunconf.c += $(PREFIX-FLAGS)
++CFLAGS-dl-cache.c += $(PREFIX-FLAGS)
++CFLAGS-cache.c += $(PREFIX-FLAGS)
++CFLAGS-rtld.c += $(PREFIX-FLAGS)
++CFLAGS-dl-usage.c += $(PREFIX-FLAGS) \
+   -D'RTLD="$(rtlddir)/$(rtld-installed-name)"'
+-CFLAGS-dl-diagnostics.c += $(SYSCONF-FLAGS) \
+-  -D'PREFIX="$(prefix)"' \
++CFLAGS-dl-diagnostics.c += $(PREFIX-FLAGS) \
+   -D'RTLD="$(rtlddir)/$(rtld-installed-name)"'
+ 
+ cpp-srcs-left := $(all-rtld-routines:=.os)
+--- a/elf/dl-diagnostics.c
++++ b/elf/dl-diagnostics.c
+@@ -204,7 +204,7 @@
+ {
+   _dl_diagnostics_print_labeled_string ("path.prefix", PREFIX);
+   _dl_diagnostics_print_labeled_string ("path.rtld", RTLD);
+-  _dl_diagnostics_print_labeled_string ("path.sysconfdir", SYSCONFDIR);
++  _dl_diagnostics_print_labeled_string ("path.sysconfdir", PREFIX "/etc");
+ 
+   unsigned int index = 0;
+   static const char *system_dirs = SYSTEM_DIRS "\0";
+--- a/elf/ldconfig.c
++++ b/elf/ldconfig.c
+@@ -48,11 +48,11 @@
+ 
+ 
+ #ifndef LD_SO_CONF
+-# define LD_SO_CONF SYSCONFDIR "/ld.so.conf"
++# define LD_SO_CONF PREFIX "/etc/ld.so.conf"
+ #endif
+ 
+ #ifndef TUNABLES_CONF
+-# define TUNABLES_CONF SYSCONFDIR "/tunables.conf"
++# define TUNABLES_CONF PREFIX "/etc/tunables.conf"
+ #endif
+ 
+ /* Get libc version number.  */
+--- a/elf/tunconf.c
++++ b/elf/tunconf.c
+@@ -45,11 +45,11 @@
+ /*----------------------------------------------------------------------*/
+ 
+ #ifndef TUNABLES_CONF
+-# define TUNABLES_CONF SYSCONFDIR "/tunables.conf"
++# define TUNABLES_CONF PREFIX "/etc/tunables.conf"
+ #endif
+ 
+ #ifndef TUNABLES_CACHE
+-# define TUNABLES_CACHE SYSCONFDIR "/tunables.cache"
++# define TUNABLES_CACHE PREFIX "/etc/tunables.cache"
+ #endif
+ 
+ /* Tunable Override Policies.  */
+--- a/sysdeps/generic/dl-cache.h
++++ b/sysdeps/generic/dl-cache.h
+@@ -35,7 +35,7 @@
+ #endif
+ 
+ #ifndef LD_SO_CACHE
+-# define LD_SO_CACHE SYSCONFDIR "/ld.so.cache"
++# define LD_SO_CACHE PREFIX "/etc/ld.so.cache"
+ #endif
+ 
+ #ifndef add_system_dir

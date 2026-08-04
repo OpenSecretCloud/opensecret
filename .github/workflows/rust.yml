@@ -25,17 +25,17 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
-        with:
-          toolchain: 1.90.0
-          components: rustfmt
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@bafaa638b9d5ec0e7e3ac1a7fc80453ef1fd265f # v3
 
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Enable FlakeHub Cache
+        uses: DeterminateSystems/flakehub-cache-action@1f9a51a2959d3e26c7838c6f3bf9f48acae525ea # v3
 
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        env:
+          OPENSECRET_DEV_ENV: "0"
+          OPENSECRET_DEV_POSTGRES: "0"
+        run: nix develop --no-write-lock-file -c cargo fmt --all -- --check
 
   clippy:
     name: Clippy
@@ -46,22 +46,17 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
-        with:
-          toolchain: 1.90.0
-          components: clippy
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@bafaa638b9d5ec0e7e3ac1a7fc80453ef1fd265f # v3
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libpq-dev pkg-config libssl-dev
-
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: Enable FlakeHub Cache
+        uses: DeterminateSystems/flakehub-cache-action@1f9a51a2959d3e26c7838c6f3bf9f48acae525ea # v3
 
       - name: Run clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        env:
+          OPENSECRET_DEV_ENV: "0"
+          OPENSECRET_DEV_POSTGRES: "0"
+        run: nix develop --no-write-lock-file -c cargo clippy --locked --all-targets --all-features -- -D warnings
 
   test:
     name: Test Suite
@@ -72,18 +67,25 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
-        with:
-          toolchain: 1.90.0
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@bafaa638b9d5ec0e7e3ac1a7fc80453ef1fd265f # v3
 
-      - name: Install system dependencies
+      - name: Enable FlakeHub Cache
+        uses: DeterminateSystems/flakehub-cache-action@1f9a51a2959d3e26c7838c6f3bf9f48acae525ea # v3
+
+      - name: Verify pinned stack, migrations, and tests
+        env:
+          OPENSECRET_DEV_ENV: "0"
+          PGDATA: ${{ runner.temp }}/opensecret-pg
+          PGPORT: "55432"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libpq-dev pkg-config libssl-dev
-
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-
-      - name: Run tests
-        run: cargo test --locked --all-features
+          nix develop --no-write-lock-file -c bash -euo pipefail -c '
+            rustc --version
+            openssl version
+            postgres --version
+            diesel migration run --database-url "$OPENSECRET_DEV_DATABASE_URL"
+            cargo test --locked --all-features
+            export AEAD_TAMPER_TEST_DATABASE_URL="$OPENSECRET_DEV_DATABASE_URL"
+            cargo test --locked --all-features aead_db_tamper_tests:: -- --ignored --test-threads=1
+            cargo test --locked --all-features web::oauth_routes::tests::db_oauth_ -- --ignored --test-threads=1
+          '

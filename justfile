@@ -8,18 +8,22 @@ container := "podman"
 default:
     @just --list
 
-# Build the enclave base image
+# Retired: the mutable Docker helper path used stale, unaudited Nitro sources.
+# Keep the recipe name so old operator muscle memory fails closed with a clear
+# migration path instead of silently producing a different helper artifact.
 build-enclave-base:
-    {{container}} build ./nitro-toolkit/enclave-base-image/ -t enclave_base
+    @echo "ERROR: build-enclave-base is retired and cannot produce an enclave artifact." >&2
+    @echo "Use 'just build-nitro-bins' and a Nix EIF target instead." >&2
+    @exit 1
 
-# Build Nitro binaries from enclave base image (NSM and KMS tools)
+# Build the pinned NSM/KMS helper source closure (aarch64 Linux)
 build-nitro-bins:
-    nix run .#write-nitro-bins
+    nix build .#nitro-bins
 
 # Build the main Docker image for local
 build-docker-local:
     {{container}} rmi opensecret:latest || true
-    {{container}} build -t opensecret \
+    {{container}} build -f Dockerfile.local -t opensecret \
     --build-arg APP_MODE=local \
     .
 
@@ -175,25 +179,21 @@ diesel-migration-run-preview:
 
 ### Continuum Proxy Commands ###
 
-# Update continuum-proxy submodule to a specific version
+# Partial proxy updates can silently desynchronize the gitlink, reviewed
+# version, and Nix vendor hash. Keep this old entry point fail-closed.
 update-continuum-proxy-version version:
-    cd privatemode-public && git fetch --tags && git checkout {{version}}
+    @echo "ERROR: partial Continuum updates are retired." >&2
+    @echo "Update the submodule gitlink, nix/security-upstreams.nix version/rev/vendorHash, and freshness evidence atomically." >&2
+    @exit 1
 
-# Build continuum-proxy from source using Nix (produces statically linked binary)
+# Build the pinned Continuum proxy for the current platform without rewriting a
+# checked-in binary. The EIF consumes the statically checked Linux output.
 build-continuum-proxy:
-    nix build ./privatemode-public#privatemode-proxy.bin -o continuum-proxy-build
-    chmod u+w continuum-proxy || true
-    cp continuum-proxy-build/bin/privatemode-proxy continuum-proxy
-    chmod +x continuum-proxy
-    rm continuum-proxy-build
-    @echo "Built continuum-proxy:"
-    @file continuum-proxy
-    @./continuum-proxy --version
+    nix build .?submodules=1#continuum-proxy
 
-# Update continuum-proxy to a specific version and rebuild
-update-continuum-proxy version="v1.39.1":
-    just update-continuum-proxy-version {{version}}
-    just build-continuum-proxy
+# Retained as a fail-closed migration aid for existing operator muscle memory.
+update-continuum-proxy version="v1.50.0":
+    @just update-continuum-proxy-version {{version}}
 
 ### Local macOS Proxy Commands ###
 
@@ -201,7 +201,7 @@ update-continuum-proxy version="v1.39.1":
 # Run from a Nix dev shell, for example: nix develop -c just build-local-proxies-macos
 build-local-proxies-macos: build-continuum-proxy-macos
 
-# Build a macOS-native Continuum proxy without replacing the checked-in Linux binary.
+# Build a macOS-native Continuum proxy without modifying the source-built EIF artifact.
 build-continuum-proxy-macos:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -326,47 +326,50 @@ run-stage-preview: terminate-enclave-preview run-eif-preview restart-socat-previ
 
 ### EIF Building ###
 
-# Build the EIF using Nix
+# Realize every security-sensitive check on native ARM before producing a
+# deployable EIF. This is shared with CI to keep the release gate identical.
+arm-native-security-gate:
+    bash scripts/run-arm-native-security-gate.sh
+
+# Retired ambiguous target: select the environment explicitly.
 build-eif:
-    nix build .?submodules=1#eif
-    echo "EIF build completed. PCR:"
-    cat result/pcr.json
+    @echo "ERROR: select build-eif-dev, build-eif-preview, or build-eif-prod explicitly." >&2
+    @exit 1
 
 # Build EIF for development environment
-build-eif-dev:
-    nix build .?submodules=1#eif-dev
+build-eif-dev: arm-native-security-gate
+    nix build '.?submodules=1#eif-dev' --no-write-lock-file
     echo "EIF build completed. PCR:"
     cat result/pcr.json
 
 # Build EIF for production environment
-build-eif-prod:
-    nix build .?submodules=1#eif-prod
+build-eif-prod: arm-native-security-gate
+    nix build '.?submodules=1#eif-prod' --no-write-lock-file
     echo "EIF build completed. PCR:"
     cat result/pcr.json
 
 # Build EIF for preview environment
-build-eif-preview:
-    nix build .?submodules=1#eif-preview
+build-eif-preview: arm-native-security-gate
+    nix build '.?submodules=1#eif-preview' --no-write-lock-file
     echo "EIF build completed. PCR:"
     cat result/pcr.json
 
-# Build EIF with custom environment variables
+# Custom EIFs require a named, reviewed flake output; ambient env injection is retired.
 build-eif-custom env_vars:
-    #!/usr/bin/env bash
-    eval "{{env_vars}}" nix build .?submodules=1#eif
-    echo "EIF build completed. PCR:"
-    cat result/pcr.json
+    @echo "ERROR: the current flake has no reviewed custom EIF output." >&2
+    @echo "Add and stage-test a named output; do not use ambient env_vars or Docker." >&2
+    @exit 1
 
 # Build EIF for development environment
-copy-pcr-dev:
-    nix build .?submodules=1#eif-dev
+copy-pcr-dev: arm-native-security-gate
+    nix build '.?submodules=1#eif-dev' --no-write-lock-file
     echo "EIF build completed. PCR:"
     cat result/pcr.json
     cp -f result/pcr.json ./pcrDev.json
 
 # Build EIF for production environment
-copy-pcr-prod:
-    nix build .?submodules=1#eif-prod
+copy-pcr-prod: arm-native-security-gate
+    nix build '.?submodules=1#eif-prod' --no-write-lock-file
     echo "EIF build completed. PCR:"
     cat result/pcr.json
     cp -f result/pcr.json ./pcrProd.json
@@ -668,9 +671,8 @@ verify-pcr-history env:
 _verify-pcr-internal env pcr_file:
     #!/usr/bin/env bash
     if [ ! -f "./{{pcr_file}}" ]; then
-        echo "No {{pcr_file}} found. Building {{env}} EIF first..."
-        just build-eif-{{env}}
-        exit 0
+        echo "❌ No {{pcr_file}} found. A reviewed, checked-in measurement is required." >&2
+        exit 1
     fi
     
     if [ ! -f result/pcr.json ]; then
@@ -703,27 +705,8 @@ verify-pcr-preview:
 
 # Verify PCR values for custom environment
 verify-pcr-custom:
-    #!/usr/bin/env bash
-    if [ ! -f ./pcrCustom.json ]; then
-        echo "No pcrCustom.json found. Please run build-eif-custom first"
-        exit 1
-    fi
-    
-    if [ ! -f result/pcr.json ]; then
-        echo "No result/pcr.json found. Please rebuild with the same environment variables"
-        exit 1
-    fi
-    
-    if diff -q ./pcrCustom.json result/pcr.json > /dev/null; then
-        echo "✅ Custom PCR values match!"
-    else
-        echo "❌ Custom PCR values do not match!"
-        echo "Expected (./pcrCustom.json):"
-        cat ./pcrCustom.json
-        echo "Got (result/pcr.json):"
-        cat result/pcr.json
-        exit 1
-    fi
+    @echo "ERROR: no reviewed custom EIF output exists to verify." >&2
+    @exit 1
 
 # SCP the Nix-built EIF to AWS parent instance (dev)
 scp-eif-to-aws-dev:

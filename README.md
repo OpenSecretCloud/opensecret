@@ -16,25 +16,30 @@ Each environment has its own configuration, secrets, and infrastructure. Make su
 
 The new deployment process uses Nix to create reproducible builds:
 
-1. First, build the required Nitro binaries (only needed once):
+1. Optionally build the pinned Nitro helper closure on Linux as a standalone check:
 ```bash
 just build-nitro-bins
 ```
 
+The EIF build performs this source build automatically; it never consumes the
+checked-in legacy helper blobs.
+
 2. Build the EIF for your target environment:
 ```bash
 # For development
-nix build .#eif-dev
+nix build '.?submodules=1#eif-dev'
 
 # For production
-nix build .#eif-prod
+nix build '.?submodules=1#eif-prod'
 
 # For preview
-nix build .#eif-preview
+nix build '.?submodules=1#eif-preview'
 
-# For custom environments
-ENV_NAME=your_env_name nix build .#eif
 ```
+
+Custom EIFs are not exported by the current flake. Add a named, reviewed output
+for a custom environment and validate it in the dev enclave before use; do not
+fall back to the retired Docker path.
 
 This will create a symlink `result` pointing to the built EIF file.
 
@@ -92,35 +97,15 @@ This ensures the build is reproducible and matches the expected configuration.
 
 ### Deprecated Docker-based Deployment
 
-This method is deprecated as it does not provide reproducible builds. Here are the raw commands for reference:
-
-```sh
-# Build the Docker image
-docker build -t opensecret --build-arg APP_MODE=dev .
-
-# Save the image to a tar file
-docker save -o opensecret.tar opensecret
-
-# Copy to AWS parent instance
-scp opensecret.tar ec2-user@[aws-parent-instance-ip]:~/
-
-# Load the image on the parent instance
-ssh ec2-user@[aws-parent-instance-ip]
-docker load -i opensecret.tar && docker tag localhost/opensecret:latest opensecret:latest
-
-# Build the EIF file
-nitro-cli build-enclave --docker-uri opensecret:latest --output-file opensecret.eif
-
-# Run the EIF file
-nitro-cli run-enclave --eif-path opensecret.eif --memory 16384 --cpu-count 4
-
-# Or run in debug mode
-nitro-cli run-enclave --eif-path opensecret.eif --memory 16384 --cpu-count 4 --debug-mode
-```
+Docker-based enclave deployment is retired. There is no root `Dockerfile`, the
+local image definition rejects every `APP_MODE` except `local`, and the legacy
+enclave-base recipe fails closed. Build all staging and production EIFs with
+the Nix targets above.
 
 ## Nitro Enclaves Setup
 
-The project uses AWS Nitro Enclaves and requires two pre-built binaries:
+The project uses AWS Nitro Enclaves and builds two helper artifacts from pinned
+upstream sources as part of the Nix closure:
 - `libnsm.so` - NSM (Nitro Security Module) library
 - `kmstool_enclave_cli` - KMS tool for key operations
 
@@ -130,32 +115,29 @@ These binaries are built from the official AWS repositories:
 
 ### Building Nitro Binaries
 
-The binaries are built using Docker to ensure a consistent build environment. To build them:
+Nix fetches every helper dependency by immutable commit and hash, then builds
+the crypto/TLS/CRT closure without build-time network access. To build the
+helper closure independently on aarch64 Linux:
 
 ```bash
 just build-nitro-bins
 ```
 
-This will:
-1. Create a `nitro-bins` directory
-2. Build the binaries in an Amazon Linux 2 container
-3. Extract them to the `nitro-bins` directory
-
-You only need to do this once, or when you want to update the binaries to a new version.
-The built binaries are used by the Nix build process to create the EIF (Enclave Image Format).
+This is an optional validation target. EIF builds consume the same derivation
+directly and do not copy or overwrite repository binaries.
 
 ## Building and Deploying with Nix
 
 ### Building the EIF
 
-1. First, build the required Nitro binaries (only needed once):
+1. Optionally build the Nitro helper closure independently:
 ```bash
 just build-nitro-bins
 ```
 
-2. Build the EIF using Nix:
+2. Build an explicit EIF target using Nix (development shown):
 ```bash
-nix build .#eif
+nix build '.?submodules=1#eif-dev'
 ```
 
 This will create a symlink `result` pointing to the built EIF file.
@@ -164,7 +146,7 @@ This will create a symlink `result` pointing to the built EIF file.
 
 The Nix-based build:
 - Creates a more reproducible build environment
-- Uses pre-built Nitro binaries for consistency
+- Builds Nitro helper binaries from immutable, directly pinned upstream sources
 - Integrates with the Monzo aws-nitro-util for EIF creation
 - Produces the same functionality as the Docker-based build
 
@@ -193,57 +175,20 @@ This project can be built and run using Docker. Follow these steps to build and 
 1. Ensure you have Docker installed on your system.
 2. Navigate to the project root directory in your terminal.
 
-3. Build the enclave base image:
+3. `Dockerfile.local` remains a local application-development artifact; it is
+   not an enclave release path, contains no NSM/KMS helper, and launches the
+   backend directly. Release and staging EIFs must use the Nix targets
+   described above.
+
+4. Build the local-only application image:
 
 ```sh
-docker build ./nitro-toolkit/enclave-base-image/ -t enclave_base
+just build-docker-local
 ```
 
-4. Build the main Docker image using the following command:
-
-DEV:
-
-```sh
-docker build -t opensecret \
---build-arg DATABASE_URL={PROD_DB_CONNECTION} \
---build-arg OPENAI_API_KEY={YOUR_OPENAI_API_KEY} \
---build-arg APP_MODE=local \
-.
-```
-
-If building for the nitro image (use `dev` [default], `preview`, `prod`, or `custom` depending on the env):
-
-```sh
-docker rmi opensecret:latest && docker build -t opensecret \
---build-arg APP_MODE=dev \
-.
-```
-
-```sh
-docker rmi opensecret:latest && docker build -t opensecret \
---build-arg APP_MODE=preview \
-.
-```
-
-```sh
-docker rmi opensecret:latest && docker build -t opensecret \
---build-arg APP_MODE=prod \
-.
-```
-
-For custom environments, you must also provide an `ENV_NAME`:
-```sh
-docker rmi opensecret:latest && docker build -t opensecret \
---build-arg APP_MODE=custom \
---build-arg ENV_NAME=your_env_name \
-.
-```
-
-This command builds the Docker image and tags it as `opensecret`. The `--build-arg` flags are used to pass the environment variables to the Docker build process:
-- `DATABASE_URL`: Your production database connection string
-- `OPENAI_API_KEY`: Your OpenAI API key
-- `APP_MODE`: The deployment environment (`dev`, `preview`, `prod`, or `custom`)
-- `ENV_NAME`: Required when `APP_MODE` is `custom`, specifies the custom environment name
+This command builds the local image and tags it as `opensecret`. The build
+rejects `dev`, `preview`, `prod`, and `custom`; those are enclave modes and must
+go through Nix.
 
 ### Running the Docker Container
 
@@ -271,4 +216,3 @@ To remove the container, use:
 ```sh
 docker rm opensecret-container
 ```
-

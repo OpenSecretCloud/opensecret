@@ -1,0 +1,41 @@
+####################################################################################################
+## Builder for the local, non-enclave backend image
+####################################################################################################
+FROM docker.io/library/rust:latest AS builder
+
+RUN update-ca-certificates
+
+WORKDIR /app
+COPY ./ .
+RUN cargo build --release --locked
+
+####################################################################################################
+## Local runtime. This is deliberately not an EIF or Nitro build input.
+####################################################################################################
+FROM public.ecr.aws/amazonlinux/amazonlinux:minimal
+
+ARG APP_MODE=local
+RUN if [ "$APP_MODE" != "local" ]; then \
+      echo "ERROR: Dockerfile.local only supports APP_MODE=local; build Nitro EIFs with Nix" >&2; \
+      exit 1; \
+    fi
+
+RUN dnf update -y && \
+    dnf install -y ca-certificates postgresql-libs && \
+    dnf clean all
+
+ENV APP_MODE=local
+ENV RUST_LOG_STYLE=never
+ENV RUST_LOG=info
+
+WORKDIR /app
+COPY --from=builder /app/target/release/opensecret /app/opensecret
+RUN chmod +x /app/opensecret
+
+ARG DATABASE_URL
+ENV DATABASE_URL=${DATABASE_URL}
+ARG OPENAI_API_KEY
+ENV OPENAI_API_KEY=${OPENAI_API_KEY}
+
+EXPOSE 3000
+ENTRYPOINT ["/app/opensecret"]

@@ -1,0 +1,37 @@
+--- a/vsock_helper.py
++++ b/vsock_helper.py
+@@ -4,6 +4,8 @@ import json
+ import select
+ from contextlib import closing
+ 
++MAX_RESPONSE_BYTES = 1024 * 1024
++
+ def vsock_request(cid, port, request, max_retries=5, retry_delay=10, initial_delay=5):
+     print(f"Waiting {initial_delay} seconds before first attempt...", file=sys.stderr)
+     time.sleep(initial_delay)
+@@ -33,6 +35,12 @@ def vsock_request(cid, port, request, max_retries=5, retry_delay=10, initial_del
+                             chunk_count += 1
+                             print(f"Received chunk {chunk_count} of length {len(chunk)}", file=sys.stderr)
+                             if chunk:
++                                if len(response) + len(chunk) > MAX_RESPONSE_BYTES:
++                                    print(
++                                        f"Response exceeded {MAX_RESPONSE_BYTES} byte limit",
++                                        file=sys.stderr,
++                                    )
++                                    return json.dumps({"error": "VSOCK response exceeded size limit"})
+                                 response += chunk
+                                 print(f"Total response length after chunk {chunk_count}: {len(response)}", file=sys.stderr)
+                             else:
+@@ -65,9 +72,9 @@ def vsock_request(cid, port, request, max_retries=5, retry_delay=10, initial_del
+         if attempt < max_retries - 1:
+             print(f"Retrying in {retry_delay} seconds...", file=sys.stderr)
+             time.sleep(retry_delay)
+-        else:
+-            print("Max retries reached. Returning error JSON.", file=sys.stderr)
+-            return json.dumps({"error": f"VSOCK connection failed after {max_retries} attempts"})
++
++    print("Max retries reached. Returning error JSON.", file=sys.stderr)
++    return json.dumps({"error": f"VSOCK connection failed after {max_retries} attempts"})
+ 
+ if __name__ == "__main__":
+     if len(sys.argv) != 4:

@@ -42,7 +42,8 @@ This writes the generated binary under `.local/bin/`, which is gitignored:
 .local/bin/continuum-proxy-darwin
 ```
 
-The checked-in Linux Continuum proxy binary is not replaced.
+No Continuum proxy binary is checked in. The Linux EIF proxy is built by Nix
+from the reviewed `privatemode-public` submodule gitlink.
 
 ## Secrets
 

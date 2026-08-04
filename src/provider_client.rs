@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -29,6 +29,9 @@ const TINFOIL_UNINITIALIZED_BASE_URL: &str = "https://in-process.tinfoil.invalid
 pub enum ProviderClientError {
     #[error("failed to build provider HTTP client: {0}")]
     Client(#[from] reqwest_tinfoil::Error),
+
+    #[error("failed to install the required Ring crypto provider")]
+    CryptoProvider,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -510,7 +513,7 @@ pub struct ProviderClient {
 
 impl ProviderClient {
     pub async fn new(tinfoil_api_key: String) -> Result<Self, ProviderClientError> {
-        install_crypto_provider();
+        install_crypto_provider()?;
 
         let secure_transport = Arc::new(SecureTinfoilTransport {
             api_key: tinfoil_api_key,
@@ -531,7 +534,7 @@ impl ProviderClient {
 
     #[cfg(test)]
     fn uninitialized_for_test() -> Result<Self, ProviderClientError> {
-        install_crypto_provider();
+        install_crypto_provider()?;
 
         Ok(Self {
             tinfoil: TinfoilTransport::Secure(Arc::new(SecureTinfoilTransport {
@@ -551,7 +554,7 @@ impl ProviderClient {
 
     #[cfg(test)]
     pub fn for_test(base_url: String) -> Result<Self, ProviderClientError> {
-        install_crypto_provider();
+        install_crypto_provider()?;
         let client = test_http_client()?;
 
         Ok(Self {
@@ -793,8 +796,21 @@ fn standard_http_client() -> StandardHttpClient {
         .build::<_, HyperBody>(HttpsConnector::new())
 }
 
-fn install_crypto_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
+fn install_crypto_provider() -> Result<(), ProviderClientError> {
+    static INSTALLATION: OnceLock<Result<(), ()>> = OnceLock::new();
+
+    if INSTALLATION
+        .get_or_init(|| {
+            rustls::crypto::ring::default_provider()
+                .install_default()
+                .map_err(|_| ())
+        })
+        .is_err()
+    {
+        Err(ProviderClientError::CryptoProvider)
+    } else {
+        Ok(())
+    }
 }
 
 fn skipped_forward_headers(source: &HeaderMap) -> HashSet<HeaderName> {

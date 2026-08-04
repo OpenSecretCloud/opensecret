@@ -149,36 +149,33 @@ For custom environments, you must also set the `ENV_NAME` environment variable. 
 - Form the Tinfoil API key secret name (`tinfoil_proxy_{env_name}_api_key`;
   the historical secret name is retained for deployment compatibility)
 
-For example, to deploy a custom environment named "staging":
-```sh
-docker build -t opensecret \
---build-arg APP_MODE=custom \
---build-arg ENV_NAME=staging \
-.
-```
+The current flake does not export a custom EIF. Add a named, reviewed output
+for the custom environment and validate it in the dev enclave before use.
+Docker-based enclave images are retired and must not be used as a fallback.
 
 ### Building and Deploying with Nix (Recommended)
 
 The recommended way to build and deploy the enclave is using Nix, which provides reproducible builds:
 
-1. First, build the required Nitro binaries (only needed once):
+1. Optionally build the pinned Nitro helper closure independently on Linux:
 ```bash
 just build-nitro-bins
 ```
 
+The EIF derivation builds and consumes this same source closure automatically;
+it does not rely on checked-in helper binaries.
+
 2. Build the EIF for your target environment:
 ```bash
 # For development
-nix build .#eif-dev
+nix build '.?submodules=1#eif-dev'
 
 # For production
-nix build .#eif-prod
+nix build '.?submodules=1#eif-prod'
 
 # For preview
-nix build .#eif-preview
+nix build '.?submodules=1#eif-preview'
 
-# For custom environments
-ENV_NAME=your_env_name nix build .#eif
 ```
 
 This will create a symlink `result` pointing to the built EIF file.

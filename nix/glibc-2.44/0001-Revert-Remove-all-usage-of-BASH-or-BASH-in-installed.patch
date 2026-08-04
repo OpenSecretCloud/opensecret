@@ -1,0 +1,133 @@
+From c1c36f73aa3085a856c7cf36d69c21d18d3ef5ac Mon Sep 17 00:00:00 2001
+From: Bernardo Meurer <bernardo@meurer.org>
+Date: Fri, 22 Jul 2022 22:11:07 -0700
+Subject: [PATCH] Revert "Remove all usage of @BASH@ or ${BASH} in installed
+ files, and hardcode /bin/bash instead"
+
+We need the ability to override to use `/bin/sh` here to avoid having
+some bootstrap tools in a final build product.
+
+This reverts commit 5188a9d0265cc6f7235a8af1d31ab02e4a24853d.
+
+Co-authored-by: Maximilian Bosch <maximilian@mbosch.me>
+---
+ debug/Makefile     | 5 +++--
+ debug/xtrace.sh    | 2 +-
+ elf/Makefile       | 4 +++-
+ elf/ldd.bash.in    | 2 +-
+ elf/sotruss.sh     | 2 +-
+ malloc/Makefile    | 5 +++--
+ malloc/memusage.sh | 2 +-
+ timezone/Makefile  | 3 ++-
+ 8 files changed, 15 insertions(+), 10 deletions(-)
+
+diff --git i/debug/Makefile w/debug/Makefile
+index c6c1069b..ccecf6b7 100644
+--- i/debug/Makefile
++++ w/debug/Makefile
+@@ -407,8 +407,9 @@ $(objpfx)pcprofiledump: $(objpfx)pcprofiledump.o
+ 
+ $(objpfx)xtrace: xtrace.sh
+ 	rm -f $@.new
+-	sed -e 's|@VERSION@|$(version)|' -e 's|@SLIBDIR@|$(sLIBdir)|' \
+-	    -e 's|@BINDIR@|$(bindir)|' -e 's|@PKGVERSION@|$(PKGVERSION)|' \
++	sed -e 's|@BASH@|$(BASH)|' -e 's|@VERSION@|$(version)|' \
++	    -e 's|@SLIBDIR@|$(sLIBdir)|' -e 's|@BINDIR@|$(bindir)|' \
++	    -e 's|@PKGVERSION@|$(PKGVERSION)|' \
+ 	    -e 's|@REPORT_BUGS_TO@|$(REPORT_BUGS_TO)|' $^ > $@.new \
+ 	&& rm -f $@ && mv $@.new $@ && chmod +x $@
+ 
+diff --git i/debug/xtrace.sh w/debug/xtrace.sh
+index a1bb50ee..01383c7c 100755
+--- i/debug/xtrace.sh
++++ w/debug/xtrace.sh
+@@ -1,4 +1,4 @@
+-#!/bin/bash
++#! @BASH@
+ # Copyright (C) 1999-2026 Free Software Foundation, Inc.
+ # This file is part of the GNU C Library.
+ 
+diff --git i/elf/Makefile w/elf/Makefile
+index 01cc5163..0bb7edd4 100644
+--- i/elf/Makefile
++++ w/elf/Makefile
+@@ -253,7 +253,8 @@ $(objpfx)sotruss-lib.so: $(common-objpfx)libc.so $(objpfx)ld.so \
+ 	$(common-objpfx)libc_nonshared.a
+ 
+ $(objpfx)sotruss: sotruss.sh $(common-objpfx)config.make
+-	sed -e 's%@VERSION@%$(version)%g' \
++	sed -e 's%@BASH@%$(BASH)%g' \
++	    -e 's%@VERSION@%$(version)%g' \
+ 	    -e 's%@TEXTDOMAINDIR@%$(localedir)%g' \
+ 	    -e 's%@PREFIX@%$(prefix)%g' \
+ 	    -e 's|@PKGVERSION@|$(PKGVERSION)|g' \
+@@ -1617,6 +1618,7 @@ ldd-rewrite = -e 's%@RTLD@%$(rtlddir)/$(rtld-installed-name)%g' \
+ 	      -e 's%@VERSION@%$(version)%g' \
+ 	      -e 's|@PKGVERSION@|$(PKGVERSION)|g' \
+ 	      -e 's|@REPORT_BUGS_TO@|$(REPORT_BUGS_TO)|g' \
++	      -e 's%@BASH@%$(BASH)%g' \
+ 	      -e 's%@TEXTDOMAINDIR@%$(localedir)%g'
+ 
+ ifeq ($(ldd-rewrite-script),no)
+diff --git i/elf/ldd.bash.in w/elf/ldd.bash.in
+index bfc40f65..59ca54e2 100644
+--- i/elf/ldd.bash.in
++++ w/elf/ldd.bash.in
+@@ -1,4 +1,4 @@
+-#!/bin/bash
++#! @BASH@
+ # Copyright (C) 1996-2026 Free Software Foundation, Inc.
+ # This file is part of the GNU C Library.
+ 
+diff --git i/elf/sotruss.sh w/elf/sotruss.sh
+index 06216e61..6038a6e9 100755
+--- i/elf/sotruss.sh
++++ w/elf/sotruss.sh
+@@ -1,4 +1,4 @@
+-#!/bin/bash
++#! @BASH@
+ # Copyright (C) 2011-2026 Free Software Foundation, Inc.
+ # This file is part of the GNU C Library.
+ 
+diff --git i/malloc/Makefile w/malloc/Makefile
+index bd7383dc..0f42cc3a 100644
+--- i/malloc/Makefile
++++ w/malloc/Makefile
+@@ -465,8 +465,9 @@ $(objpfx)mtrace: mtrace.pl
+ 
+ $(objpfx)memusage: memusage.sh
+ 	rm -f $@.new
+-	sed -e 's|@VERSION@|$(version)|' -e 's|@SLIBDIR@|$(sLIBdir)|' \
+-	    -e 's|@BINDIR@|$(bindir)|' -e 's|@PKGVERSION@|$(PKGVERSION)|' \
++	sed -e 's|@BASH@|$(BASH)|' -e 's|@VERSION@|$(version)|' \
++	    -e 's|@SLIBDIR@|$(sLIBdir)|' -e 's|@BINDIR@|$(bindir)|' \
++	    -e 's|@PKGVERSION@|$(PKGVERSION)|' \
+ 	    -e 's|@REPORT_BUGS_TO@|$(REPORT_BUGS_TO)|' $^ > $@.new \
+ 	&& rm -f $@ && mv $@.new $@ && chmod +x $@
+ 
+diff --git i/malloc/memusage.sh w/malloc/memusage.sh
+index 309991a7..28117c45 100755
+--- i/malloc/memusage.sh
++++ w/malloc/memusage.sh
+@@ -1,4 +1,4 @@
+-#!/bin/bash
++#! @BASH@
+ # Copyright (C) 1999-2026 Free Software Foundation, Inc.
+ # This file is part of the GNU C Library.
+ 
+diff --git i/timezone/Makefile w/timezone/Makefile
+index 386731ab..4f910bb1 100644
+--- i/timezone/Makefile
++++ w/timezone/Makefile
+@@ -141,7 +141,8 @@ $(testdata)/XT5: testdata/gen-XT5.sh
+ 	mv $@.tmp $@
+ 
+ $(objpfx)tzselect: tzselect.ksh $(common-objpfx)config.make
+-	sed -e 's|TZDIR=[^}]*|TZDIR=$(zonedir)|' \
++	sed -e 's|/bin/bash|$(BASH)|' \
++	    -e 's|TZDIR=[^}]*|TZDIR=$(zonedir)|' \
+ 	    -e '/TZVERSION=/s|see_Makefile|"$(version)"|' \
+ 	    -e '/PKGVERSION=/s|=.*|="$(PKGVERSION)"|' \
+ 	    -e '/REPORT_BUGS_TO=/s|=.*|="$(REPORT_BUGS_TO)"|' \
+-- 
+2.47.2

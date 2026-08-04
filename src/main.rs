@@ -87,6 +87,8 @@ mod aws_credentials;
 mod billing;
 mod bounded_ttl_cache;
 mod brave;
+#[cfg(test)]
+mod crypto_property_tests;
 mod db;
 mod email;
 mod encrypt;

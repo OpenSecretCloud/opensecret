@@ -28,7 +28,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
@@ -394,6 +397,8 @@ async fn provider_error_preview(response: ProviderResponse) -> Option<String> {
 enum ProviderStreamLimitError {
     #[error("provider stream exceeded the {limit}-byte total limit")]
     BodyTooLarge { limit: usize },
+    #[error("provider streams exceeded the {limit}-byte request-wide limit")]
+    RequestBudgetExceeded { limit: usize },
     #[error("provider SSE frame exceeded the {limit}-byte limit")]
     FrameTooLarge { limit: usize },
 }
@@ -407,6 +412,52 @@ fn add_stream_bytes(
         .checked_add(chunk_len)
         .filter(|next_total| *next_total <= limit)
         .ok_or(ProviderStreamLimitError::BodyTooLarge { limit })
+}
+
+/// Optional request-scoped budget shared by multiple sequential provider
+/// streams, such as the assistant turns in one Responses API request.
+#[derive(Clone, Debug)]
+pub(crate) struct CompletionStreamBudget {
+    consumed: Arc<AtomicUsize>,
+    limit: usize,
+}
+
+impl CompletionStreamBudget {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            consumed: Arc::new(AtomicUsize::new(0)),
+            limit,
+        }
+    }
+
+    fn try_reserve(&self, bytes: usize) -> Result<(), ProviderStreamLimitError> {
+        self.consumed
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |consumed| {
+                consumed
+                    .checked_add(bytes)
+                    .filter(|next_consumed| *next_consumed <= self.limit)
+            })
+            .map(|_| ())
+            .map_err(|_| ProviderStreamLimitError::RequestBudgetExceeded { limit: self.limit })
+    }
+
+    #[cfg(test)]
+    fn consumed(&self) -> usize {
+        self.consumed.load(Ordering::Relaxed)
+    }
+}
+
+fn account_stream_bytes(
+    stream_total: usize,
+    chunk_len: usize,
+    stream_limit: usize,
+    request_budget: Option<&CompletionStreamBudget>,
+) -> Result<usize, ProviderStreamLimitError> {
+    let next_total = add_stream_bytes(stream_total, chunk_len, stream_limit)?;
+    if let Some(request_budget) = request_budget {
+        request_budget.try_reserve(chunk_len)?;
+    }
+    Ok(next_total)
 }
 
 #[derive(Default)]
@@ -1001,7 +1052,40 @@ pub async fn get_chat_completion_response(
     user: &User,
     body: Value,
     headers: &HeaderMap,
+    billing_context: BillingContext,
+) -> Result<CompletionStream, ApiError> {
+    get_chat_completion_response_inner(state, user, body, headers, billing_context, None).await
+}
+
+/// Responses API entry point for sharing one raw-stream budget across multiple
+/// sequential assistant turns. Direct chat completions retain their existing
+/// independent per-response limit through `get_chat_completion_response`.
+pub(crate) async fn get_chat_completion_response_with_stream_budget(
+    state: &Arc<AppState>,
+    user: &User,
+    body: Value,
+    headers: &HeaderMap,
+    billing_context: BillingContext,
+    stream_budget: CompletionStreamBudget,
+) -> Result<CompletionStream, ApiError> {
+    get_chat_completion_response_inner(
+        state,
+        user,
+        body,
+        headers,
+        billing_context,
+        Some(stream_budget),
+    )
+    .await
+}
+
+async fn get_chat_completion_response_inner(
+    state: &Arc<AppState>,
+    user: &User,
+    body: Value,
+    headers: &HeaderMap,
     mut billing_context: BillingContext,
+    stream_budget: Option<CompletionStreamBudget>,
 ) -> Result<CompletionStream, ApiError> {
     if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
@@ -1219,10 +1303,11 @@ pub async fn get_chat_completion_response(
                 Ok(Some(chunk_result)) => {
                     match chunk_result {
                         Ok(bytes) => {
-                            stream_bytes = match add_stream_bytes(
+                            stream_bytes = match account_stream_bytes(
                                 stream_bytes,
                                 bytes.len(),
                                 MAX_COMPLETION_STREAM_BYTES,
+                                stream_budget.as_ref(),
                             ) {
                                 Ok(next_total) => next_total,
                                 Err(e) => {
@@ -2908,6 +2993,59 @@ mod tests {
             add_stream_bytes(usize::MAX, 1, usize::MAX),
             Err(ProviderStreamLimitError::BodyTooLarge { limit: usize::MAX })
         );
+    }
+
+    #[test]
+    fn request_stream_budget_is_shared_across_turns_and_failures_do_not_consume_it() {
+        let budget = CompletionStreamBudget::new(8);
+
+        assert_eq!(account_stream_bytes(0, 4, 8, Some(&budget)), Ok(4));
+        assert_eq!(account_stream_bytes(0, 4, 8, Some(&budget.clone())), Ok(4));
+        assert_eq!(budget.consumed(), 8);
+        assert_eq!(
+            account_stream_bytes(0, 1, 8, Some(&budget)),
+            Err(ProviderStreamLimitError::RequestBudgetExceeded { limit: 8 })
+        );
+        assert_eq!(budget.consumed(), 8);
+    }
+
+    #[test]
+    fn per_stream_limit_fails_before_charging_request_budget() {
+        let budget = CompletionStreamBudget::new(8);
+
+        assert_eq!(
+            account_stream_bytes(8, 1, 8, Some(&budget)),
+            Err(ProviderStreamLimitError::BodyTooLarge { limit: 8 })
+        );
+        assert_eq!(budget.consumed(), 0);
+    }
+
+    #[test]
+    fn request_stream_budget_rejects_overflow_and_clone_oversubscription() {
+        let overflow_budget = CompletionStreamBudget::new(usize::MAX);
+        assert!(overflow_budget.try_reserve(usize::MAX).is_ok());
+        assert_eq!(
+            overflow_budget.try_reserve(1),
+            Err(ProviderStreamLimitError::RequestBudgetExceeded { limit: usize::MAX })
+        );
+        assert_eq!(overflow_budget.consumed(), usize::MAX);
+
+        let shared_budget = CompletionStreamBudget::new(32);
+        let successful_reservations = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..64 {
+                let budget = shared_budget.clone();
+                let successes = &successful_reservations;
+                scope.spawn(move || {
+                    if budget.try_reserve(1).is_ok() {
+                        successes.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(successful_reservations.load(Ordering::Relaxed), 32);
+        assert_eq!(shared_budget.consumed(), 32);
     }
 
     #[tokio::test]

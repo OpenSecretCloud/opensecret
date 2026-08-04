@@ -15,7 +15,10 @@ use crate::{
     os_flags::KAGI_WEB_SEARCH_FLAG_KEY,
     web::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
-        openai::get_chat_completion_response,
+        openai::{
+            get_chat_completion_response, get_chat_completion_response_with_stream_budget,
+            CompletionStreamBudget,
+        },
         responses::{
             build_prompt, build_prompt_with_token_reserve, build_usage, constants::*,
             error_mapping, prompt_token_budget, storage_task, tools, ContentPartBuilder,
@@ -54,6 +57,8 @@ use uuid::Uuid;
 
 const RESPONSES_SSE_KEEPALIVE_INTERVAL_SECS: u64 = 1;
 const MAX_WEB_SEARCH_TOOL_TURNS: usize = 30;
+const MAX_RESPONSES_PROVIDER_STREAM_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RESPONSES_TOOL_ARGUMENT_BYTES_PER_TURN: usize = 256 * 1024;
 
 // Default functions for serde
 fn default_store() -> bool {
@@ -328,6 +333,53 @@ fn build_model_turn_request(
     chat_request
 }
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum ResponsesOutputLimitError {
+    #[error("streamed tool-call arguments exceeded the {limit}-byte per-turn limit")]
+    ToolArgumentsTooLarge { limit: usize },
+}
+
+fn add_bounded_output_bytes(
+    total: usize,
+    added: usize,
+    limit: usize,
+) -> Result<usize, ResponsesOutputLimitError> {
+    total
+        .checked_add(added)
+        .filter(|next_total| *next_total <= limit)
+        .ok_or(ResponsesOutputLimitError::ToolArgumentsTooLarge { limit })
+}
+
+fn account_streamed_tool_argument_bytes(
+    total: usize,
+    tool_call_delta: &Value,
+    limit: usize,
+) -> Result<usize, ResponsesOutputLimitError> {
+    let Some(tool_call_entries) = tool_call_delta.as_array() else {
+        return Ok(total);
+    };
+
+    tool_call_entries
+        .iter()
+        .try_fold(total, |total, tool_call| {
+            let index = tool_call
+                .get("index")
+                .and_then(|index| index.as_u64())
+                .unwrap_or(0);
+            if index != 0 {
+                return Ok(total);
+            }
+
+            let arguments = tool_call
+                .get("function")
+                .and_then(|function| function.get("arguments"))
+                .and_then(Value::as_str)
+                .map(str::len)
+                .unwrap_or_default();
+            add_bounded_output_bytes(total, arguments, limit)
+        })
+}
+
 fn append_streamed_tool_calls(tool_calls: &mut Vec<StreamedToolCall>, tool_call_delta: &Value) {
     let Some(tool_call_entries) = tool_call_delta.as_array() else {
         return;
@@ -418,13 +470,14 @@ fn final_assistant_finish_reason(tools_enabled: bool, finish_reason: Option<Stri
 #[cfg(test)]
 mod tests {
     use super::{
-        append_streamed_tool_calls, apply_responses_model_defaults,
-        assistant_turn_finished_with_tool_call, build_internal_system_prompt_for_now,
-        build_model_turn_request, build_provider_tools, choose_web_search_provider,
-        final_assistant_finish_reason, finalize_first_model_tool_call,
+        account_streamed_tool_argument_bytes, add_bounded_output_bytes, append_streamed_tool_calls,
+        apply_responses_model_defaults, assistant_turn_finished_with_tool_call,
+        build_internal_system_prompt_for_now, build_model_turn_request, build_provider_tools,
+        choose_web_search_provider, final_assistant_finish_reason, finalize_first_model_tool_call,
         has_streamed_tool_call_entries, resolve_responses_sampling, wait_for_response_cancellation,
         ClientResponseState, ConversationParam, InputMessage, ResponsesCreateRequest,
-        StorageMessage, StreamedToolCall, MAPLE_KAGI_WEB_SEARCH_PROMPT, MAPLE_WEB_SEARCH_PROMPT,
+        ResponsesOutputLimitError, StorageMessage, StreamedToolCall, MAPLE_KAGI_WEB_SEARCH_PROMPT,
+        MAPLE_WEB_SEARCH_PROMPT, MAX_RESPONSES_TOOL_ARGUMENT_BYTES_PER_TURN,
         MAX_WEB_SEARCH_TOOL_TURNS,
     };
     use crate::web::responses::tools::WebSearchProvider;
@@ -786,6 +839,65 @@ mod tests {
         assert_eq!(tool_calls.capacity(), initial_capacity);
         assert_eq!(tool_calls[0].name.as_deref(), Some("web_search"));
         assert_eq!(tool_calls[0].arguments, "{\"query\":\"existing\"}");
+    }
+
+    #[test]
+    fn streamed_tool_argument_budget_spans_fragments_and_accepts_exact_limit() {
+        let limit = MAX_RESPONSES_TOOL_ARGUMENT_BYTES_PER_TURN;
+        let first = json!([{
+            "index": 0,
+            "function": { "arguments": "x".repeat(limit - 1) }
+        }]);
+        let second = json!([{
+            "index": 0,
+            "function": { "arguments": "y" }
+        }]);
+
+        let total = account_streamed_tool_argument_bytes(0, &first, limit).unwrap();
+        assert_eq!(
+            account_streamed_tool_argument_bytes(total, &second, limit),
+            Ok(limit)
+        );
+    }
+
+    #[test]
+    fn streamed_tool_argument_budget_rejects_supported_entries_over_limit() {
+        let limit = 8;
+        let delta = json!([
+            { "index": 0, "function": { "arguments": "1234" } },
+            { "index": 0, "function": { "arguments": "56789" } }
+        ]);
+
+        assert_eq!(
+            account_streamed_tool_argument_bytes(0, &delta, limit),
+            Err(ResponsesOutputLimitError::ToolArgumentsTooLarge { limit })
+        );
+        assert_eq!(
+            account_streamed_tool_argument_bytes(7, &json!(null), limit),
+            Ok(7)
+        );
+    }
+
+    #[test]
+    fn streamed_tool_argument_budget_ignores_unsupported_indices() {
+        let limit = 8;
+        let delta = json!([
+            { "index": u64::MAX, "function": { "arguments": "x".repeat(limit + 1) } },
+            { "index": 0, "function": { "arguments": "1234" } }
+        ]);
+
+        assert_eq!(
+            account_streamed_tool_argument_bytes(0, &delta, limit),
+            Ok(4)
+        );
+    }
+
+    #[test]
+    fn bounded_output_byte_accounting_rejects_integer_overflow() {
+        assert_eq!(
+            add_bounded_output_bytes(usize::MAX, 1, usize::MAX),
+            Err(ResponsesOutputLimitError::ToolArgumentsTooLarge { limit: usize::MAX })
+        );
     }
 
     #[test]
@@ -2633,6 +2745,7 @@ async fn stream_one_assistant_turn(
     headers: &HeaderMap,
     prompt_messages: &[Value],
     tools_enabled: bool,
+    stream_budget: &CompletionStreamBudget,
     web_search_provider: Option<tools::WebSearchProvider>,
     tx_client: &mpsc::Sender<StorageMessage>,
     tx_storage: &mpsc::Sender<StorageMessage>,
@@ -2674,9 +2787,15 @@ async fn stream_one_assistant_turn(
         body.model.clone(),
     );
 
-    let mut completion =
-        get_chat_completion_response(state, user, chat_request.take(), headers, billing_context)
-            .await?;
+    let mut completion = get_chat_completion_response_with_stream_budget(
+        state,
+        user,
+        chat_request.take(),
+        headers,
+        billing_context,
+        stream_budget.clone(),
+    )
+    .await?;
 
     debug!(
         "Received completion from provider: {} (model: {})",
@@ -2689,6 +2808,7 @@ async fn stream_one_assistant_turn(
     let mut reasoning = ReasoningState::NotStarted;
     let mut saw_tool_calls = false;
     let mut ignored_disabled_tool_calls = false;
+    let mut streamed_tool_argument_bytes = 0usize;
 
     while let Some(chunk) = completion.stream.recv().await {
         match chunk {
@@ -2773,6 +2893,19 @@ async fn stream_one_assistant_turn(
                             ignored_disabled_tool_calls = true;
                         }
                     } else {
+                        streamed_tool_argument_bytes = account_streamed_tool_argument_bytes(
+                            streamed_tool_argument_bytes,
+                            tool_call_delta,
+                            MAX_RESPONSES_TOOL_ARGUMENT_BYTES_PER_TURN,
+                        )
+                        .map_err(|e| {
+                            warn!(
+                                "Rejecting oversized streamed tool-call arguments for response {}: {}",
+                                response_uuid, e
+                            );
+                            ApiError::InternalServerError
+                        })?;
+
                         if !saw_tool_calls {
                             debug!(
                                 "Assistant turn received first tool_call delta from model stream"
@@ -2945,6 +3078,7 @@ async fn setup_completion_processor(
     let mut prompt_messages = Arc::as_ref(&context.prompt_messages).clone();
     let mut prompt_token_estimate = context.total_prompt_tokens;
     let mut kagi_allowed_urls = tools::collect_kagi_allowed_urls_from_prompt(&prompt_messages);
+    let stream_budget = CompletionStreamBudget::new(MAX_RESPONSES_PROVIDER_STREAM_BYTES);
 
     let loop_result: Result<(), ApiError> = async {
         let mut next_message_id = Some(prepared.assistant_message_id);
@@ -2957,6 +3091,7 @@ async fn setup_completion_processor(
                 headers,
                 &prompt_messages,
                 tools_enabled,
+                &stream_budget,
                 web_search_provider,
                 &tx_client,
                 &tx_storage,

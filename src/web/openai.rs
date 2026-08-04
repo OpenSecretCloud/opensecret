@@ -48,6 +48,11 @@ const MAX_TRANSCRIPTION_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 // provider-body ceiling separate from the larger inbound audio-upload limit.
 const MAX_TTS_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 pub(super) const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_COMPLETION_STREAM_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SSE_FRAME_BUFFER_BYTES: usize = 1024 * 1024;
+// Keep at most one parsed provider frame queued while the encrypted client
+// response is being consumed. Parsed JSON can be much larger than its wire form.
+const COMPLETION_STREAM_CHANNEL_CAPACITY: usize = 1;
 
 // Timeout constants for provider requests
 const REQUEST_TIMEOUT_SECS: u64 = 120; // Request timeout (generous for large non-streaming responses)
@@ -383,6 +388,68 @@ async fn provider_error_preview(response: ProviderResponse) -> Option<String> {
         .await
         .ok()
         .map(|body| safe_log_preview(&String::from_utf8_lossy(&body)))
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum ProviderStreamLimitError {
+    #[error("provider stream exceeded the {limit}-byte total limit")]
+    BodyTooLarge { limit: usize },
+    #[error("provider SSE frame exceeded the {limit}-byte limit")]
+    FrameTooLarge { limit: usize },
+}
+
+fn add_stream_bytes(
+    total: usize,
+    chunk_len: usize,
+    limit: usize,
+) -> Result<usize, ProviderStreamLimitError> {
+    total
+        .checked_add(chunk_len)
+        .filter(|next_total| *next_total <= limit)
+        .ok_or(ProviderStreamLimitError::BodyTooLarge { limit })
+}
+
+#[derive(Default)]
+struct SseFrameBuffer {
+    bytes: Vec<u8>,
+}
+
+impl SseFrameBuffer {
+    fn push_byte(
+        &mut self,
+        byte: u8,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, ProviderStreamLimitError> {
+        self.bytes.push(byte);
+
+        let delimiter_len = if self.bytes.ends_with(b"\r\n\r\n") {
+            4
+        } else if self.bytes.ends_with(b"\n\n") {
+            2
+        } else {
+            0
+        };
+
+        if delimiter_len != 0 {
+            let frame_end = self.bytes.len() - delimiter_len;
+            if frame_end > limit {
+                return Err(ProviderStreamLimitError::FrameTooLarge { limit });
+            }
+
+            let frame = self.bytes[..frame_end].to_vec();
+            self.bytes.clear();
+            return Ok(extract_sse_data(&frame));
+        }
+
+        // A CRLF delimiter can straddle at most three retained bytes. Once the
+        // buffer grows beyond that allowance, no future delimiter can make the
+        // current frame fit within the configured payload limit.
+        if self.bytes.len() > limit.saturating_add(3) {
+            return Err(ProviderStreamLimitError::FrameTooLarge { limit });
+        }
+
+        Ok(None)
+    }
 }
 
 /// Parameters for transcription requests
@@ -1127,7 +1194,7 @@ pub async fn get_chat_completion_response(
 
     // STREAMING: Complex case - spawn internal processor
     debug!("Processing streaming response with internal billing");
-    let (tx_consumer, rx_consumer) = mpsc::channel(100);
+    let (tx_consumer, rx_consumer) = mpsc::channel(COMPLETION_STREAM_CHANNEL_CAPACITY);
 
     // Spawn INTERNAL task that handles billing
     let state_clone = state.clone();
@@ -1138,7 +1205,8 @@ pub async fn get_chat_completion_response(
 
     tokio::spawn(async move {
         let mut body_stream = res.bytes_stream();
-        let mut buffer = Vec::new();
+        let mut frame_buffer = SseFrameBuffer::default();
+        let mut stream_bytes = 0usize;
         let mut usage_accumulator = StreamUsageAccumulator::default();
 
         loop {
@@ -1151,10 +1219,64 @@ pub async fn get_chat_completion_response(
                 Ok(Some(chunk_result)) => {
                     match chunk_result {
                         Ok(bytes) => {
-                            buffer.extend_from_slice(bytes.as_ref());
+                            stream_bytes = match add_stream_bytes(
+                                stream_bytes,
+                                bytes.len(),
+                                MAX_COMPLETION_STREAM_BYTES,
+                            ) {
+                                Ok(next_total) => next_total,
+                                Err(e) => {
+                                    error!("Provider stream response exceeded size limit: {e}");
+                                    finalize_stream_usage(
+                                        &mut usage_accumulator,
+                                        StreamUsageFinalization::InvalidData,
+                                        &state_clone,
+                                        &user_clone,
+                                        &billing_ctx,
+                                        &provider,
+                                        &tx_consumer,
+                                    )
+                                    .await;
+                                    let _ = tx_consumer
+                                        .send(CompletionChunk::Error(
+                                            "Provider stream exceeded size limit".to_string(),
+                                        ))
+                                        .await;
+                                    return;
+                                }
+                            };
 
-                            // Parse SSE frames
-                            while let Some(frame) = extract_sse_frame(&mut buffer) {
+                            for &byte in bytes.iter() {
+                                let frame = match frame_buffer
+                                    .push_byte(byte, MAX_SSE_FRAME_BUFFER_BYTES)
+                                {
+                                    Ok(frame) => frame,
+                                    Err(e) => {
+                                        error!("Provider stream frame exceeded size limit: {e}");
+                                        finalize_stream_usage(
+                                            &mut usage_accumulator,
+                                            StreamUsageFinalization::InvalidData,
+                                            &state_clone,
+                                            &user_clone,
+                                            &billing_ctx,
+                                            &provider,
+                                            &tx_consumer,
+                                        )
+                                        .await;
+                                        let _ = tx_consumer
+                                            .send(CompletionChunk::Error(
+                                                "Provider stream frame exceeded size limit"
+                                                    .to_string(),
+                                            ))
+                                            .await;
+                                        return;
+                                    }
+                                };
+
+                                let Some(frame) = frame else {
+                                    continue;
+                                };
+
                                 if frame == b"[DONE]" {
                                     finalize_stream_usage(
                                         &mut usage_accumulator,
@@ -1419,49 +1541,26 @@ fn canonicalize_response_model(json: &mut Value, response_model_id: &str) {
     }
 }
 
-/// Returns the joined data payload of the next complete SSE frame.
-///
-/// Buffering bytes until the frame boundary avoids corrupting a UTF-8 code
-/// point when the network splits it across chunks.
-fn extract_sse_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
-    loop {
-        let (frame_end, delimiter_len) = find_sse_frame_boundary(buffer)?;
-        let frame = buffer[..frame_end].to_vec();
-        buffer.drain(..frame_end + delimiter_len);
+/// Returns the joined data payload for one complete SSE frame.
+fn extract_sse_data(frame: &[u8]) -> Option<Vec<u8>> {
+    if frame.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return None;
+    }
 
-        if frame.iter().all(|byte| byte.is_ascii_whitespace()) {
+    let mut data = Vec::new();
+    for line in frame.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(value) = line.strip_prefix(b"data:") else {
             continue;
-        }
-
-        let mut data = Vec::new();
-        for line in frame.split(|byte| *byte == b'\n') {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            let Some(value) = line.strip_prefix(b"data:") else {
-                continue;
-            };
-            let value = value.strip_prefix(b" ").unwrap_or(value);
-            if !data.is_empty() {
-                data.push(b'\n');
-            }
-            data.extend_from_slice(value);
-        }
-
+        };
+        let value = value.strip_prefix(b" ").unwrap_or(value);
         if !data.is_empty() {
-            return Some(data);
+            data.push(b'\n');
         }
+        data.extend_from_slice(value);
     }
-}
 
-fn find_sse_frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) if lf < crlf => Some((lf, 2)),
-        (Some(_), Some(crlf)) | (None, Some(crlf)) => Some((crlf, 4)),
-        (Some(lf), None) => Some((lf, 2)),
-        (None, None) => None,
-    }
+    (!data.is_empty()).then_some(data)
 }
 
 /// Internal billing function - NEVER exposed outside this module
@@ -2466,6 +2565,20 @@ async fn try_provider(
 mod tests {
     use super::*;
 
+    fn push_sse_chunk(
+        buffer: &mut SseFrameBuffer,
+        chunk: &[u8],
+        limit: usize,
+    ) -> Result<Vec<Vec<u8>>, ProviderStreamLimitError> {
+        let mut frames = Vec::new();
+        for &byte in chunk {
+            if let Some(frame) = buffer.push_byte(byte, limit)? {
+                frames.push(frame);
+            }
+        }
+        Ok(frames)
+    }
+
     fn tts_request(payload: Value) -> TTSRequest {
         serde_json::from_value(payload).unwrap()
     }
@@ -2725,31 +2838,94 @@ mod tests {
             .position(|window| window == "é".as_bytes())
             .unwrap()
             + 1;
-        let mut buffer = event[..split].to_vec();
+        let mut buffer = SseFrameBuffer::default();
 
-        assert_eq!(extract_sse_frame(&mut buffer), None);
+        assert!(push_sse_chunk(&mut buffer, &event[..split], 1024)
+            .unwrap()
+            .is_empty());
 
-        buffer.extend_from_slice(&event[split..]);
-        let frame = extract_sse_frame(&mut buffer).expect("complete SSE frame");
+        let frames = push_sse_chunk(&mut buffer, &event[split..], 1024).unwrap();
+        let [frame] = frames.as_slice() else {
+            panic!("expected exactly one complete SSE frame")
+        };
 
         assert_eq!(
-            serde_json::from_slice::<Value>(&frame).unwrap(),
+            serde_json::from_slice::<Value>(frame).unwrap(),
             json!(
                 {"choices": [{"delta": {"content": "café"}}]}
             )
         );
-        assert!(buffer.is_empty());
+        assert!(buffer.bytes.is_empty());
     }
 
     #[test]
     fn extracts_crlf_and_multiline_sse_data() {
-        let mut buffer = b": keepalive\r\ndata: first\r\ndata: second\r\n\r\n".to_vec();
+        let mut buffer = SseFrameBuffer::default();
 
         assert_eq!(
-            extract_sse_frame(&mut buffer),
-            Some(b"first\nsecond".to_vec())
+            push_sse_chunk(
+                &mut buffer,
+                b": keepalive\r\ndata: first\r\ndata: second\r\n\r\n",
+                1024,
+            )
+            .unwrap(),
+            vec![b"first\nsecond".to_vec()]
         );
-        assert!(buffer.is_empty());
+        assert!(buffer.bytes.is_empty());
+    }
+
+    #[test]
+    fn sse_frame_limit_accepts_exact_frame_and_many_small_frames() {
+        let mut buffer = SseFrameBuffer::default();
+        let frames = push_sse_chunk(
+            &mut buffer,
+            b"data: x\r\n\r\ndata: y\n\ndata: z\n\n",
+            b"data: x".len(),
+        )
+        .unwrap();
+
+        assert_eq!(frames, vec![b"x".to_vec(), b"y".to_vec(), b"z".to_vec()]);
+        assert!(buffer.bytes.is_empty());
+    }
+
+    #[test]
+    fn sse_frame_limit_rejects_delimiter_free_input() {
+        let mut buffer = SseFrameBuffer::default();
+        let error = push_sse_chunk(&mut buffer, b"abcdefghijkl", 8).unwrap_err();
+
+        assert_eq!(error, ProviderStreamLimitError::FrameTooLarge { limit: 8 });
+        assert!(buffer.bytes.len() <= 12);
+    }
+
+    #[test]
+    fn stream_total_limit_is_checked_without_overflow() {
+        assert_eq!(add_stream_bytes(4, 4, 8), Ok(8));
+        assert_eq!(
+            add_stream_bytes(8, 1, 8),
+            Err(ProviderStreamLimitError::BodyTooLarge { limit: 8 })
+        );
+        assert_eq!(
+            add_stream_bytes(usize::MAX, 1, usize::MAX),
+            Err(ProviderStreamLimitError::BodyTooLarge { limit: usize::MAX })
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_stream_channel_backpressures_after_one_queued_frame() {
+        let (tx, mut rx) = mpsc::channel(COMPLETION_STREAM_CHANNEL_CAPACITY);
+        tx.send(CompletionChunk::Done).await.unwrap();
+
+        let mut blocked_send = Box::pin(tx.send(CompletionChunk::Done));
+        assert!(timeout(Duration::from_millis(10), &mut blocked_send)
+            .await
+            .is_err());
+
+        assert!(matches!(rx.recv().await, Some(CompletionChunk::Done)));
+        timeout(Duration::from_secs(1), &mut blocked_send)
+            .await
+            .expect("second send should resume after the receiver drains the queue")
+            .expect("completion stream receiver should remain open");
+        assert!(matches!(rx.recv().await, Some(CompletionChunk::Done)));
     }
 
     #[test]

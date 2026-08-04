@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// LEGACY FORENSICS ONLY: this verifies frozen pre-Sigstore PCR0 signatures.
+// It is not the verifier for tagged Nitro EIF release manifests.
+
 const fs = require('fs');
 const crypto = require('crypto');
 
@@ -174,4 +177,4 @@ if (require.main === module) {
 module.exports = {
   verifyPcr0Signature,
   extractPublicKey
-}; 
+};

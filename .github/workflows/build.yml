@@ -1,5 +1,6 @@
 # This workflow handles Nix-based reproducible builds for opensecret
-# It requires a custom ARM64 runner for AWS Nitro Enclave compatibility
+# It requires the configured GitHub-hosted ARM64 larger runner for AWS Nitro
+# Enclave compatibility.
 name: "Nix Reproducible Builds"
 
 on:
@@ -20,7 +21,6 @@ jobs:
     # 4 cores needed for efficient builds and PCR verification
     runs-on: ubuntu-22.04-arm64-4core
     permissions:
-      id-token: write
       contents: read
     steps:
       - name: Check out repository
@@ -47,7 +47,8 @@ jobs:
         id: build-dev
         run: |
           set -euo pipefail
-          nix build .?submodules=1#eif-dev
+          nix build --no-update-lock-file '.?submodules=1#eif-dev'
+          git diff --exit-code -- flake.lock
           echo "Build completed successfully"
 
       # Verify PCR values match the reference
@@ -84,10 +85,9 @@ jobs:
     name: "Production Reproducible Build"
     # Only run on master pushes or manual triggers for production safety
     if: (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') || (github.event_name == 'push' && github.ref == 'refs/heads/master')
-    # Same custom runner requirements as dev build
+    # Same GitHub-hosted ARM64 runner requirements as the dev build
     runs-on: ubuntu-22.04-arm64-4core
     permissions:
-      id-token: write
       contents: read
     steps:
       - name: Check out repository
@@ -114,7 +114,8 @@ jobs:
         id: build-prod
         run: |
           set -euo pipefail
-          nix build .?submodules=1#eif-prod
+          nix build --no-update-lock-file '.?submodules=1#eif-prod'
+          git diff --exit-code -- flake.lock
           echo "Build completed successfully"
 
       # Verify PCR values match the reference

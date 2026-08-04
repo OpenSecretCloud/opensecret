@@ -233,7 +233,10 @@ just verify-pcr-prod   # For production
 just verify-pcr-preview # For preview
 ```
 
-This ensures the build is reproducible and matches the expected configuration.
+This is a local regression check against mutable reference files; it does not
+authenticate a release or prove reproducibility by itself. New dev/prod release
+measurements are published only by the manually approved tagged Sigstore
+workflow described in [PCR_VERIFICATION.md](PCR_VERIFICATION.md).
 
 ## Setup SSL
 

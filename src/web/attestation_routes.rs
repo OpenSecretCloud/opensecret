@@ -400,7 +400,7 @@ async fn key_exchange(
         .await?
         .ok_or(ApiError::BadRequest)?;
 
-    let shared_secret = ephemeral_secret.diffie_hellman(&client_public_key);
+    let shared_secret = derive_contributory_shared_secret(ephemeral_secret, &client_public_key)?;
 
     // Generate a random session key using your secure random function
     let session_state = SessionState::new(crate::encrypt::generate_random());
@@ -428,6 +428,18 @@ async fn key_exchange(
     }))
 }
 
+fn derive_contributory_shared_secret(
+    ephemeral_secret: x25519_dalek::EphemeralSecret,
+    client_public_key: &x25519_dalek::PublicKey,
+) -> Result<x25519_dalek::SharedSecret, ApiError> {
+    let shared_secret = ephemeral_secret.diffie_hellman(client_public_key);
+    if !shared_secret.was_contributory() {
+        return Err(ApiError::BadRequest);
+    }
+
+    Ok(shared_secret)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,5 +453,25 @@ mod tests {
         let mut state = SessionState::new([0xA5; 32]);
         state.zeroize();
         assert_eq!(state.get_session_key(), &[0; 32]);
+    }
+
+    #[test]
+    fn key_exchange_rejects_non_contributory_x25519_public_key() {
+        let ephemeral_secret = x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
+        let low_order_public_key = x25519_dalek::PublicKey::from([0u8; 32]);
+
+        assert!(matches!(
+            derive_contributory_shared_secret(ephemeral_secret, &low_order_public_key),
+            Err(ApiError::BadRequest)
+        ));
+    }
+
+    #[test]
+    fn key_exchange_accepts_honest_x25519_public_key() {
+        let ephemeral_secret = x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
+        let client_secret = x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
+        let client_public_key = x25519_dalek::PublicKey::from(&client_secret);
+
+        assert!(derive_contributory_shared_secret(ephemeral_secret, &client_public_key).is_ok());
     }
 }

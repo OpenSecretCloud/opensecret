@@ -19,8 +19,9 @@ jobs:
     # Custom runner required: ARM64 architecture needed for AWS Nitro Enclaves
     # 4 cores needed for efficient builds and PCR verification
     runs-on: ubuntu-22.04-arm64-4core
+    # This job executes pull-request code. It intentionally has no OIDC token,
+    # authenticated cache, signing key, deployment authority, or KMS access.
     permissions:
-      id-token: write
       contents: read
     steps:
       - name: Check out repository
@@ -34,20 +35,28 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@bafaa638b9d5ec0e7e3ac1a7fc80453ef1fd265f # v3
       
-      - name: Enable FlakeHub Cache
-        uses: DeterminateSystems/flakehub-cache-action@1f9a51a2959d3e26c7838c6f3bf9f48acae525ea # v3
-
       - name: Check flake.lock health
         uses: DeterminateSystems/flake-checker-action@0af51e37404acfb298f7e2eec77470be27eb57c5 # v10
         with:
           flake-lock-path: flake.lock
 
-      # Build development EIF directly using Nix package
-      - name: Build dev EIF
+      - name: Validate security pin coupling
+        run: bash scripts/check-security-upstreams.sh --offline
+
+      - name: Check live security upstream freshness
+        if: github.event_name != 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/check-security-upstreams.sh --live
+
+      # Realize native security checks before producing a deployable EIF.
+      - name: Gate and build dev EIF
         id: build-dev
         run: |
           set -euo pipefail
-          nix build .?submodules=1#eif-dev
+          bash scripts/run-arm-native-security-gate.sh
+          nix build '.?submodules=1#eif-dev' --no-write-lock-file
+          git diff --exit-code -- flake.lock
           echo "Build completed successfully"
 
       # Verify PCR values match the reference
@@ -73,7 +82,6 @@ jobs:
 
       # Store artifacts for 7 days
       - name: Upload dev artifacts
-        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dev-artifacts
@@ -109,12 +117,24 @@ jobs:
         with:
           flake-lock-path: flake.lock
 
-      # Build production EIF directly using Nix package
-      - name: Build prod EIF
+      - name: Validate security pin coupling
+        run: bash scripts/check-security-upstreams.sh --offline
+
+      - name: Check live security upstream freshness
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/check-security-upstreams.sh --live
+
+      # Realize native security checks before producing a deployable EIF.
+      - name: Gate and build prod EIF
         id: build-prod
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          nix build .?submodules=1#eif-prod
+          bash scripts/run-arm-native-security-gate.sh
+          nix build '.?submodules=1#eif-prod' --no-write-lock-file
+          git diff --exit-code -- flake.lock
           echo "Build completed successfully"
 
       # Verify PCR values match the reference
@@ -140,7 +160,6 @@ jobs:
 
       # Store production artifacts for 30 days
       - name: Upload prod artifacts
-        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: prod-artifacts

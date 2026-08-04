@@ -6,7 +6,8 @@ use crate::email::{
 use crate::encrypt::encrypt_key_deterministic;
 use crate::encrypt::generate_random;
 use crate::encrypt::{
-    decrypt_with_key, decrypt_with_kms, encrypt_with_key, CustomRng, GenKeyResult,
+    decrypt_with_key, decrypt_with_kms, encrypt_with_key, validate_aes_256_key_length, CustomRng,
+    GenKeyResult,
 };
 use crate::jwt::validate_platform_jwt;
 use crate::login_routes::RegisterCredentials;
@@ -2458,44 +2459,216 @@ async fn get_or_create_enclave_key(
     // Check if the key has been initialized before
     let existing_key = db.get_enclave_secret_by_key(ENCLAVE_KEY_NAME)?;
 
-    let key_res = if let Some(ref encrypted_key) = existing_key {
-        // Convert the stored bytes back to base64
-        let base64_encrypted_key = general_purpose::STANDARD.encode(&encrypted_key.value);
+    resolve_enclave_key_material(
+        existing_key.as_ref().map(|secret| secret.value.as_slice()),
+        |encrypted_key| {
+            let base64_encrypted_key = general_purpose::STANDARD.encode(encrypted_key);
+            decrypt_with_kms(
+                &creds.region,
+                &creds.access_key_id,
+                &creds.secret_access_key,
+                &creds.token,
+                &base64_encrypted_key,
+            )
+            .map_err(|e| Error::EncryptionError(e.to_string()))
+        },
+        || {
+            create_new_encryption_key(
+                &creds.region,
+                &creds.access_key_id,
+                &creds.secret_access_key,
+                &creds.token,
+                &aws_kms_key_id,
+            )
+            .map_err(|e| Error::EncryptionError(e.to_string()))
+        },
+        |encrypted_key| {
+            let new_secret =
+                NewEnclaveSecret::new(ENCLAVE_KEY_NAME.to_string(), encrypted_key.to_vec());
+            db.create_enclave_secret(new_secret)?;
+            Ok(())
+        },
+    )
+}
 
-        // Decrypt the existing key
-        let decrypted_key = decrypt_with_kms(
-            &creds.region,
-            &creds.access_key_id,
-            &creds.secret_access_key,
-            &creds.token,
-            &base64_encrypted_key,
-        )
-        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+fn resolve_enclave_key_material<Decrypt, Generate, Persist>(
+    existing_encrypted_key: Option<&[u8]>,
+    decrypt_existing: Decrypt,
+    generate_new: Generate,
+    persist_new: Persist,
+) -> Result<GenKeyResult, Error>
+where
+    Decrypt: FnOnce(&[u8]) -> Result<Vec<u8>, Error>,
+    Generate: FnOnce() -> Result<GenKeyResult, Error>,
+    Persist: FnOnce(&[u8]) -> Result<(), Error>,
+{
+    if let Some(encrypted_key) = existing_encrypted_key {
+        let key = decrypt_existing(encrypted_key)?;
+        validate_aes_256_key_length(&key).map_err(|e| Error::EncryptionError(e.to_string()))?;
 
-        GenKeyResult {
-            key: decrypted_key,
-            encrypted_key: encrypted_key.value.clone(),
-        }
-    } else {
-        // Create a new encryption key
-        create_new_encryption_key(
-            &creds.region,
-            &creds.access_key_id,
-            &creds.secret_access_key,
-            &creds.token,
-            &aws_kms_key_id,
-        )
-        .map_err(|e| Error::EncryptionError(e.to_string()))?
-    };
-
-    // Store the encrypted version of the key if it's new
-    if existing_key.is_none() {
-        let new_secret =
-            NewEnclaveSecret::new(ENCLAVE_KEY_NAME.to_string(), key_res.encrypted_key.clone());
-        db.create_enclave_secret(new_secret)?;
+        return Ok(GenKeyResult {
+            key,
+            encrypted_key: encrypted_key.to_vec(),
+        });
     }
 
-    Ok(key_res)
+    let key_result = generate_new()?;
+    validate_aes_256_key_length(&key_result.key)
+        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+    persist_new(&key_result.encrypted_key)?;
+    Ok(key_result)
+}
+
+#[cfg(test)]
+mod enclave_key_compatibility_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn existing_enclave_key_is_decrypted_without_generation_or_write() {
+        let encrypted_key = vec![3u8; 48];
+        let decrypt_calls = Cell::new(0);
+        let generate_calls = Cell::new(0);
+        let persist_calls = Cell::new(0);
+
+        let result = resolve_enclave_key_material(
+            Some(&encrypted_key),
+            |stored| {
+                decrypt_calls.set(decrypt_calls.get() + 1);
+                assert_eq!(stored, encrypted_key);
+                Ok(vec![7u8; 32])
+            },
+            || {
+                generate_calls.set(generate_calls.get() + 1);
+                Err(Error::EncryptionError(
+                    "generation must not run for an existing key".to_string(),
+                ))
+            },
+            |_| {
+                persist_calls.set(persist_calls.get() + 1);
+                Err(Error::EncryptionError(
+                    "persistence must not run for an existing key".to_string(),
+                ))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.key, vec![7u8; 32]);
+        assert_eq!(result.encrypted_key, encrypted_key);
+        assert_eq!(decrypt_calls.get(), 1);
+        assert_eq!(generate_calls.get(), 0);
+        assert_eq!(persist_calls.get(), 0);
+    }
+
+    #[test]
+    fn existing_enclave_key_decrypt_failure_fails_before_generation_or_write() {
+        let encrypted_key = vec![3u8; 48];
+        let generate_calls = Cell::new(0);
+        let persist_calls = Cell::new(0);
+
+        let result = resolve_enclave_key_material(
+            Some(&encrypted_key),
+            |_| {
+                Err(Error::EncryptionError(
+                    "synthetic decrypt failure".to_string(),
+                ))
+            },
+            || {
+                generate_calls.set(generate_calls.get() + 1);
+                Err(Error::EncryptionError(
+                    "generation must not follow a decrypt failure".to_string(),
+                ))
+            },
+            |_| {
+                persist_calls.set(persist_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(generate_calls.get(), 0);
+        assert_eq!(persist_calls.get(), 0);
+    }
+
+    #[test]
+    fn invalid_existing_enclave_key_length_fails_before_write() {
+        let encrypted_key = vec![3u8; 48];
+        let persist_calls = Cell::new(0);
+
+        let result = resolve_enclave_key_material(
+            Some(&encrypted_key),
+            |_| Ok(vec![7u8; 31]),
+            || {
+                Err(Error::EncryptionError(
+                    "generation must not run for an existing key".to_string(),
+                ))
+            },
+            |_| {
+                persist_calls.set(persist_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(persist_calls.get(), 0);
+    }
+
+    #[test]
+    fn new_enclave_key_is_written_only_after_successful_generation() {
+        let persist_calls = Cell::new(0);
+        let expected_encrypted_key = vec![3u8; 48];
+
+        let result = resolve_enclave_key_material(
+            None,
+            |_| {
+                Err(Error::EncryptionError(
+                    "decrypt must not run without an existing key".to_string(),
+                ))
+            },
+            || {
+                Ok(GenKeyResult {
+                    key: vec![7u8; 32],
+                    encrypted_key: expected_encrypted_key.clone(),
+                })
+            },
+            |encrypted_key| {
+                persist_calls.set(persist_calls.get() + 1);
+                assert_eq!(encrypted_key, expected_encrypted_key);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.key, vec![7u8; 32]);
+        assert_eq!(result.encrypted_key, expected_encrypted_key);
+        assert_eq!(persist_calls.get(), 1);
+    }
+
+    #[test]
+    fn failed_new_enclave_key_generation_does_not_write() {
+        let persist_calls = Cell::new(0);
+
+        let result = resolve_enclave_key_material(
+            None,
+            |_| {
+                Err(Error::EncryptionError(
+                    "decrypt must not run without an existing key".to_string(),
+                ))
+            },
+            || {
+                Err(Error::EncryptionError(
+                    "synthetic generation failure".to_string(),
+                ))
+            },
+            |_| {
+                persist_calls.set(persist_calls.get() + 1);
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(persist_calls.get(), 0);
+    }
 }
 
 async fn retrieve_openai_api_key(

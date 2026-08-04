@@ -247,10 +247,7 @@ pub async fn logout(
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     info!("Logout request received");
     // TODO actually delete the refresh token
-    tracing::trace!(
-        "Logout request for refresh token: {}",
-        logout_request.refresh_token
-    );
+    drop(logout_request.refresh_token);
     let response = json!({ "message": "Logged out successfully" });
     let result = encrypt_response(&data, &session_id, &response).await;
     result

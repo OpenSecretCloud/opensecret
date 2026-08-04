@@ -1,7 +1,7 @@
 use crate::provider_routing::ProviderName;
 use crate::proxy_config::ProxyConfig;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use futures::{Stream, StreamExt};
 use hyper::client::HttpConnector;
 use hyper::header::{HeaderName as HyperHeaderName, HeaderValue as HyperHeaderValue};
@@ -46,6 +46,15 @@ pub enum ProviderRequestError {
 
     #[error("provider request failed: {0}")]
     Send(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderBodyReadError {
+    #[error("provider response body exceeded the {limit}-byte limit")]
+    TooLarge { limit: usize },
+
+    #[error("failed to read provider response body: {0}")]
+    Read(String),
 }
 
 pub enum ProviderResponse {
@@ -126,6 +135,46 @@ impl ProviderResponse {
         }
     }
 
+    fn content_length(&self) -> Option<u64> {
+        match self {
+            Self::Tinfoil(response) => response
+                .headers()
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok()),
+            Self::Standard(response) => response
+                .headers()
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok()),
+        }
+    }
+
+    pub async fn bytes_limited(self, limit: usize) -> Result<Bytes, ProviderBodyReadError> {
+        if self
+            .content_length()
+            .is_some_and(|content_length| content_length > limit as u64)
+        {
+            return Err(ProviderBodyReadError::TooLarge { limit });
+        }
+
+        let mut body_stream = self.bytes_stream();
+        let mut collected = BytesMut::new();
+
+        while let Some(chunk) = body_stream.next().await {
+            let chunk = chunk.map_err(ProviderBodyReadError::Read)?;
+            collected
+                .len()
+                .checked_add(chunk.len())
+                .filter(|next_len| *next_len <= limit)
+                .ok_or(ProviderBodyReadError::TooLarge { limit })?;
+            collected.extend_from_slice(&chunk);
+        }
+
+        Ok(collected.freeze())
+    }
+
+    #[cfg(test)]
     pub async fn bytes(self) -> Result<Bytes, String> {
         match self {
             Self::Tinfoil(response) => response.bytes().await.map_err(|error| error.to_string()),
@@ -862,6 +911,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
 
+    fn standard_response_from_chunks(chunks: Vec<Bytes>) -> ProviderResponse {
+        let body = HyperBody::wrap_stream(futures::stream::iter(
+            chunks.into_iter().map(Result::<Bytes, std::io::Error>::Ok),
+        ));
+        ProviderResponse::Standard(hyper::Response::new(body))
+    }
+
     fn tinfoil_proxy() -> ProxyConfig {
         ProxyConfig {
             base_url: "http://ignored.invalid".to_string(),
@@ -1220,6 +1276,42 @@ mod tests {
 
         assert!(response.is_success());
         assert_eq!(response.bytes().await.unwrap(), "standard-provider-ok");
+    }
+
+    #[tokio::test]
+    async fn limited_body_reader_accepts_chunked_body_at_limit() {
+        let response = standard_response_from_chunks(vec![
+            Bytes::from_static(b"abcd"),
+            Bytes::from_static(b"efgh"),
+        ]);
+
+        assert_eq!(response.bytes_limited(8).await.unwrap(), "abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn limited_body_reader_rejects_chunked_body_over_limit() {
+        let response = standard_response_from_chunks(vec![
+            Bytes::from_static(b"abcd"),
+            Bytes::from_static(b"efghi"),
+        ]);
+
+        assert!(matches!(
+            response.bytes_limited(8).await,
+            Err(ProviderBodyReadError::TooLarge { limit: 8 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn limited_body_reader_rejects_oversized_content_length_before_reading() {
+        let response = hyper::Response::builder()
+            .header("content-length", "9")
+            .body(HyperBody::empty())
+            .unwrap();
+
+        assert!(matches!(
+            ProviderResponse::Standard(response).bytes_limited(8).await,
+            Err(ProviderBodyReadError::TooLarge { limit: 8 })
+        ));
     }
 
     #[tokio::test]

@@ -42,7 +42,7 @@ This writes the generated binary under `.local/bin/`, which is gitignored:
 .local/bin/continuum-proxy-darwin
 ```
 
-The checked-in Linux Continuum proxy binary is not replaced.
+The source-built Linux EIF artifact is not modified.
 
 ## Secrets
 

@@ -53,6 +53,7 @@
         rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         nitro = nitro-util.lib.${system};
         kernelUpstream = import ./nix/kernel-upstream.nix;
+        continuumProxyUpstream = import ./nix/continuum-proxy.nix;
         nitroHelperUpstreams = import ./nix/nitro-bins/upstreams.nix;
         nitroRustToolchainVersion = nitroHelperUpstreams.rust.version;
         nitroRustToolchain = nitroRustPkgs.rust-bin.stable."${nitroRustToolchainVersion}".minimal;
@@ -511,19 +512,114 @@
           rustToolchainVersion = nitroRustToolchainVersion;
         };
 
+        continuumProxySrc = pkgs.fetchFromGitHub {
+          inherit (continuumProxyUpstream) owner repo rev hash;
+        };
+        continuum-proxy =
+          assert pkgs.lib.assertMsg (
+            continuumProxyUpstream.version == "1.47.0"
+          ) "This layer must preserve the deployed Continuum 1.47.0 release";
+          assert pkgs.lib.assertMsg (
+            continuumProxyUpstream.tag == "v${continuumProxyUpstream.version}"
+          ) "The Continuum tag must match its reviewed version";
+          assert pkgs.lib.assertMsg (
+            builtins.match "[0-9a-f]{40}" continuumProxyUpstream.rev != null
+          ) "The Continuum source must use an immutable commit revision";
+          assert pkgs.lib.assertMsg (
+            pkgs.lib.hasPrefix "sha256-" continuumProxyUpstream.hash
+            && pkgs.lib.hasPrefix "sha256-" continuumProxyUpstream.vendorHash
+          ) "Continuum source and Go dependencies must use immutable SRI hashes";
+          assert pkgs.lib.assertMsg (
+            pkgs.lib.versions.majorMinor pkgs.go_1_26.version == "1.26"
+          ) "Continuum 1.47.0 must be built with the reviewed Go 1.26 toolchain";
+          pkgs.buildGo126Module {
+            pname = "continuum-proxy";
+            inherit (continuumProxyUpstream) version;
+            src = continuumProxySrc;
+            vendorHash = continuumProxyUpstream.vendorHash;
+            proxyVendor = true;
+            doCheck = true;
+            __darwinAllowLocalNetworking = true;
+            env.CGO_ENABLED = "0";
+            tags = [ "contrast_unstable_api" ];
+            ldflags = [
+              "-s"
+              "-w"
+              "-X github.com/edgelesssys/continuum/internal/oss/constants.version=v${continuumProxyUpstream.version}"
+            ];
+            subPackages = [ "privatemode-proxy" ];
+            preBuild = ''
+              source_version="$(sed -n 's/.*version = "\([^"]*\)".*/\1/p' version.nix)"
+              if [ "$source_version" != "${continuumProxyUpstream.tag}" ]; then
+                echo "Continuum source version $source_version differs from ${continuumProxyUpstream.tag}" >&2
+                exit 1
+              fi
 
-        # Copy continuum-proxy from local filesystem
-        continuum-proxy = pkgs.runCommand "continuum-proxy" {} ''
-          mkdir -p $out/bin
-          cp ${./continuum-proxy} $out/bin/continuum-proxy
-          chmod +x $out/bin/continuum-proxy
-        '';
+              source_vendor_hash="$(sed -n 's/.*vendorHash = "\([^"]*\)".*/\1/p' \
+                nix/packages/by-name/continuum-canonical-go-package/package.nix)"
+              if [ "$source_vendor_hash" != "${continuumProxyUpstream.vendorHash}" ]; then
+                echo "Continuum vendor hash differs from the reviewed v1.47.0 source" >&2
+                exit 1
+              fi
+            '';
+            checkPhase = ''
+              runHook preCheck
+              go test -count=1 -tags=contrast_unstable_api \
+                ./privatemode-proxy/... \
+                ./internal/oss/...
+              runHook postCheck
+            '';
+            postInstall = ''
+              mv "$out/bin/privatemode-proxy" "$out/bin/continuum-proxy"
+            '';
+            doInstallCheck = true;
+            installCheckPhase = ''
+              runHook preInstallCheck
+
+              actual_version="$($out/bin/continuum-proxy --version)"
+              expected_version="privatemode-proxy version ${continuumProxyUpstream.tag}"
+              if [ "$actual_version" != "$expected_version" ]; then
+                echo "Unexpected Continuum proxy version output: $actual_version" >&2
+                exit 1
+              fi
+
+              help="$($out/bin/continuum-proxy --help)"
+              for flag in --apiKey --port --sharedPromptCache; do
+                if ! grep -Fq -- "$flag" <<<"$help"; then
+                  echo "Continuum proxy is missing required runtime flag $flag" >&2
+                  exit 1
+                fi
+              done
+
+              build_info="$(${pkgs.go_1_26}/bin/go version -m "$out/bin/continuum-proxy")"
+              grep -Eq '^[[:space:]]*path[[:space:]]+github.com/edgelesssys/continuum/privatemode-proxy$' <<<"$build_info"
+              grep -Eq '^[[:space:]]*build[[:space:]]+-tags=contrast_unstable_api$' <<<"$build_info"
+              grep -Eq '^[[:space:]]*build[[:space:]]+CGO_ENABLED=0$' <<<"$build_info"
+
+              runHook postInstallCheck
+            '';
+            postFixup = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+              dynamic_info="$(${pkgs.binutils}/bin/readelf -d "$out/bin/continuum-proxy")"
+              if grep -Fq NEEDED <<<"$dynamic_info"; then
+                echo "continuum-proxy must remain statically linked" >&2
+                exit 1
+              fi
+
+              program_headers="$(${pkgs.binutils}/bin/readelf -l "$out/bin/continuum-proxy")"
+              if grep -Fq INTERP <<<"$program_headers"; then
+                echo "continuum-proxy must not contain a dynamic interpreter" >&2
+                exit 1
+              fi
+            '';
+            meta.mainProgram = "continuum-proxy";
+          };
 
         arch = pkgs.stdenv.hostPlatform.uname.processor;
       in
       {
         packages = {
           default = opensecret;
+          continuum-proxy = continuum-proxy;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           nitro-init = nitroInit;
           inherit nitro-bins;
@@ -535,7 +631,21 @@
         checks = {
           entrypoint-entropy-preflight = entrypointEntropyPreflight;
           kernel-source-pin = kernelSourcePin;
+          continuum-proxy-source-build = pkgs.runCommand
+            "opensecret-continuum-proxy-source-build"
+            {
+              nativeBuildInputs = [
+                pkgs.bash
+                pkgs.gnugrep
+              ];
+            }
+            ''
+              REPO_ROOT_UNDER_TEST=${self} \
+               bash ${./tests/continuum_proxy_source_build.sh}
+              touch "$out"
+            '';
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          continuum-proxy = continuum-proxy;
           kernel-security-invariants = kernelSecurityInvariants;
           nitro-helper = nitro-bins;
         };

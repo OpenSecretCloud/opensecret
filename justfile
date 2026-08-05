@@ -164,25 +164,20 @@ diesel-migration-run-preview:
 
 ### Continuum Proxy Commands ###
 
-# Update continuum-proxy submodule to a specific version
+# Partial proxy updates can silently desynchronize the reviewed source and
+# vendor hashes. Keep this old entry point fail-closed.
 update-continuum-proxy-version version:
-    cd privatemode-public && git fetch --tags && git checkout {{version}}
+    @echo "ERROR: partial Continuum updates are retired." >&2
+    @echo "Update the gitlink and nix/continuum-proxy.nix pins atomically in a reviewed PR." >&2
+    @exit 1
 
-# Build continuum-proxy from source using Nix (produces statically linked binary)
+# Build the pinned Continuum proxy without rewriting a checked-in binary.
 build-continuum-proxy:
-    nix build ./privatemode-public#privatemode-proxy.bin -o continuum-proxy-build
-    chmod u+w continuum-proxy || true
-    cp continuum-proxy-build/bin/privatemode-proxy continuum-proxy
-    chmod +x continuum-proxy
-    rm continuum-proxy-build
-    @echo "Built continuum-proxy:"
-    @file continuum-proxy
-    @./continuum-proxy --version
+    nix build .#continuum-proxy --no-link --print-out-paths
 
-# Update continuum-proxy to a specific version and rebuild
-update-continuum-proxy version="v1.39.1":
-    just update-continuum-proxy-version {{version}}
-    just build-continuum-proxy
+# Retained as a fail-closed migration aid for existing operator muscle memory.
+update-continuum-proxy version="v1.47.0":
+    @just update-continuum-proxy-version {{version}}
 
 ### Local macOS Proxy Commands ###
 
@@ -190,7 +185,7 @@ update-continuum-proxy version="v1.39.1":
 # Run from a Nix dev shell, for example: nix develop -c just build-local-proxies-macos
 build-local-proxies-macos: build-continuum-proxy-macos
 
-# Build a macOS-native Continuum proxy without replacing the checked-in Linux binary.
+# Build a macOS-native Continuum proxy without modifying the EIF artifact.
 build-continuum-proxy-macos:
     #!/usr/bin/env bash
     set -euo pipefail

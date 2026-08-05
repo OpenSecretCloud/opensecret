@@ -1,0 +1,9 @@
+--- a/vsock_helper.py
++++ b/vsock_helper.py
+@@ -68,3 +68,3 @@ def vsock_request(cid, port, request, max_retries=5, retry_delay=10, initial_del
+-        else:
+-            print("Max retries reached. Returning error JSON.", file=sys.stderr)
+-            return json.dumps({"error": f"VSOCK connection failed after {max_retries} attempts"})
++
++    print("Max retries reached. Returning error JSON.", file=sys.stderr)
++    return json.dumps({"error": f"VSOCK connection failed after {max_retries} attempts"})

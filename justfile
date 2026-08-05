@@ -176,7 +176,7 @@ build-continuum-proxy:
     nix build .#continuum-proxy --no-link --print-out-paths
 
 # Retained as a fail-closed migration aid for existing operator muscle memory.
-update-continuum-proxy version="v1.47.0":
+update-continuum-proxy version="v1.51.0":
     @just update-continuum-proxy-version {{version}}
 
 ### Local macOS Proxy Commands ###

@@ -8,7 +8,9 @@ When deploying to AWS Nitro, you'll need to choose the appropriate environment:
 - `dev` for development environment
 - `preview` for preview/staging environment  
 - `prod` for production environment
-- `custom` for custom environment (requires `ENV_NAME` to be set)
+
+The current flake exports only those three named EIFs. Supporting another
+environment requires adding and reviewing another named flake output.
 
 Each environment has its own configuration, secrets, and infrastructure. Make sure to use the correct environment variables and AWS resources for your target environment.
 
@@ -25,16 +27,13 @@ just build-nitro-bins
 2. Build the EIF for your target environment:
 ```bash
 # For development
-nix build .#eif-dev
+nix build '.?submodules=1#eif-dev'
 
 # For production
-nix build .#eif-prod
+nix build '.?submodules=1#eif-prod'
 
 # For preview
-nix build .#eif-preview
-
-# For custom environments
-ENV_NAME=your_env_name nix build .#eif
+nix build '.?submodules=1#eif-preview'
 ```
 
 This will create a symlink `result` pointing to the built EIF file.
@@ -91,12 +90,6 @@ just verify-pcr-preview # For preview
 
 This ensures the build is reproducible and matches the expected configuration.
 
-### Deprecated Docker-based Deployment
-
-Docker-based enclave deployment is retired. The repository root no longer
-contains an enclave `Dockerfile`; build development, preview, and production
-EIFs with the Nix targets above.
-
 ## Nitro Enclaves Setup
 
 The project uses AWS Nitro Enclaves and requires two helper artifacts:
@@ -124,9 +117,10 @@ builds consume this derivation automatically.
 
 ### Building the EIF
 
-1. Build the EIF using Nix; its helper closure is built automatically:
+1. Build an explicit EIF target using Nix; its helper closure is built
+   automatically (development shown):
 ```bash
-nix build .#eif
+nix build '.?submodules=1#eif-dev'
 ```
 
 This will create a symlink `result` pointing to the built EIF file.
@@ -143,7 +137,7 @@ The Nix-based build:
 - Integrates with the Monzo aws-nitro-util for EIF creation
 - Preserves the application-facing helper CLI contract
 
-The resulting EIF can be deployed and managed exactly like the Docker-built version.
+The resulting EIF is deployed with the environment-specific commands above.
 
 ## CI/CD Requirements
 

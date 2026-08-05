@@ -140,21 +140,15 @@ When deploying the app in the Nitro enclave, make sure to set the `APP_MODE` to 
 - `dev` for development environment
 - `preview` for preview/staging environment
 - `prod` for production environment
-- `custom` for custom environment (requires `ENV_NAME` to be set)
 
-For custom environments, you must also set the `ENV_NAME` environment variable. This name will be used to:
+The application also supports a `custom` mode with `ENV_NAME`, but the current
+flake does not export a custom EIF. Supporting one requires adding and reviewing
+a named flake output. `ENV_NAME` is used to:
 - Form the KMS key alias (`alias/open-secret-{env_name}-enclave`)
 - Form the database URL secret name (`opensecret_{env_name}_database_url`)
 - Form the Continuum proxy API key secret name (`continuum_proxy_{env_name}_api_key`)
 - Form the Tinfoil API key secret name (`tinfoil_proxy_{env_name}_api_key`;
   the historical secret name is retained for deployment compatibility)
-
-For example, to build the existing custom Nix output for an environment named
-"staging":
-
-```sh
-ENV_NAME=staging nix build '.?submodules=1#eif'
-```
 
 The named Nix outputs are the only supported OpenSecret application EIF build
 path. The parent-instance credential requester and logging containers described
@@ -173,16 +167,13 @@ just build-nitro-bins
 2. Build the EIF for your target environment:
 ```bash
 # For development
-nix build .#eif-dev
+nix build '.?submodules=1#eif-dev'
 
 # For production
-nix build .#eif-prod
+nix build '.?submodules=1#eif-prod'
 
 # For preview
-nix build .#eif-preview
-
-# For custom environments
-ENV_NAME=your_env_name nix build .#eif
+nix build '.?submodules=1#eif-preview'
 ```
 
 This will create a symlink `result` pointing to the built EIF file.

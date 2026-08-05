@@ -8,9 +8,11 @@ container := "podman"
 default:
     @just --list
 
-# Build the enclave base image
+# The root Docker-to-EIF path is retired. The submodule image remains an input
+# to the separately supported Nitro-helper reproduction command below.
 build-enclave-base:
-    {{container}} build ./nitro-toolkit/enclave-base-image/ -t enclave_base
+    @echo "ERROR: the root Docker-based EIF workflow is retired; build EIFs with Nix." >&2
+    @exit 1
 
 # Build Nitro binaries from enclave base image (NSM and KMS tools)
 build-nitro-bins:
@@ -19,7 +21,7 @@ build-nitro-bins:
 # Build the main Docker image for local
 build-docker-local:
     {{container}} rmi opensecret:latest || true
-    {{container}} build -t opensecret \
+    {{container}} build -f Dockerfile.local -t opensecret \
     --build-arg APP_MODE=local \
     .
 

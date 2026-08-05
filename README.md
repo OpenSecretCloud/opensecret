@@ -92,31 +92,9 @@ This ensures the build is reproducible and matches the expected configuration.
 
 ### Deprecated Docker-based Deployment
 
-This method is deprecated as it does not provide reproducible builds. Here are the raw commands for reference:
-
-```sh
-# Build the Docker image
-docker build -t opensecret --build-arg APP_MODE=dev .
-
-# Save the image to a tar file
-docker save -o opensecret.tar opensecret
-
-# Copy to AWS parent instance
-scp opensecret.tar ec2-user@[aws-parent-instance-ip]:~/
-
-# Load the image on the parent instance
-ssh ec2-user@[aws-parent-instance-ip]
-docker load -i opensecret.tar && docker tag localhost/opensecret:latest opensecret:latest
-
-# Build the EIF file
-nitro-cli build-enclave --docker-uri opensecret:latest --output-file opensecret.eif
-
-# Run the EIF file
-nitro-cli run-enclave --eif-path opensecret.eif --memory 16384 --cpu-count 4
-
-# Or run in debug mode
-nitro-cli run-enclave --eif-path opensecret.eif --memory 16384 --cpu-count 4 --debug-mode
-```
+Docker-based enclave deployment is retired. The repository root no longer
+contains an enclave `Dockerfile`; build development, preview, and production
+EIFs with the Nix targets above.
 
 ## Nitro Enclaves Setup
 
@@ -186,64 +164,23 @@ The workflow uses this custom runner for both development and production builds.
 
 ## Development
 
-This project can be built and run using Docker. Follow these steps to build and run the Docker container:
+The backend can still be built and run locally with Docker. This local image is
+not an EIF build input and cannot be built in an enclave deployment mode.
 
 ### Building the Docker Image
 
 1. Ensure you have Docker installed on your system.
 2. Navigate to the project root directory in your terminal.
 
-3. Build the enclave base image:
+3. Build the explicitly local-only image:
 
 ```sh
-docker build ./nitro-toolkit/enclave-base-image/ -t enclave_base
+just build-docker-local
 ```
 
-4. Build the main Docker image using the following command:
-
-DEV:
-
-```sh
-docker build -t opensecret \
---build-arg DATABASE_URL={PROD_DB_CONNECTION} \
---build-arg OPENAI_API_KEY={YOUR_OPENAI_API_KEY} \
---build-arg APP_MODE=local \
-.
-```
-
-If building for the nitro image (use `dev` [default], `preview`, `prod`, or `custom` depending on the env):
-
-```sh
-docker rmi opensecret:latest && docker build -t opensecret \
---build-arg APP_MODE=dev \
-.
-```
-
-```sh
-docker rmi opensecret:latest && docker build -t opensecret \
---build-arg APP_MODE=preview \
-.
-```
-
-```sh
-docker rmi opensecret:latest && docker build -t opensecret \
---build-arg APP_MODE=prod \
-.
-```
-
-For custom environments, you must also provide an `ENV_NAME`:
-```sh
-docker rmi opensecret:latest && docker build -t opensecret \
---build-arg APP_MODE=custom \
---build-arg ENV_NAME=your_env_name \
-.
-```
-
-This command builds the Docker image and tags it as `opensecret`. The `--build-arg` flags are used to pass the environment variables to the Docker build process:
-- `DATABASE_URL`: Your production database connection string
-- `OPENAI_API_KEY`: Your OpenAI API key
-- `APP_MODE`: The deployment environment (`dev`, `preview`, `prod`, or `custom`)
-- `ENV_NAME`: Required when `APP_MODE` is `custom`, specifies the custom environment name
+`Dockerfile.local` launches the backend directly with `APP_MODE=local`. It does
+not contain the NSM/KMS helper, enclave entrypoint, or VSOCK forwarders, and it
+rejects enclave application modes. Use Nix for every EIF build.
 
 ### Running the Docker Container
 
@@ -271,4 +208,3 @@ To remove the container, use:
 ```sh
 docker rm opensecret-container
 ```
-

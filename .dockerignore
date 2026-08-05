@@ -1,0 +1,11 @@
+.git
+.env
+.env.*
+.local
+.pgdata
+build
+result
+result-*
+target
+nitro-bins
+nitro-toolkit/enclave-base-image

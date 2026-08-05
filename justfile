@@ -8,20 +8,9 @@ container := "podman"
 default:
     @just --list
 
-# Build the enclave base image
-build-enclave-base:
-    {{container}} build ./nitro-toolkit/enclave-base-image/ -t enclave_base
-
 # Build Nitro binaries from enclave base image (NSM and KMS tools)
 build-nitro-bins:
     nix run .#write-nitro-bins
-
-# Build the main Docker image for local
-build-docker-local:
-    {{container}} rmi opensecret:latest || true
-    {{container}} build -t opensecret \
-    --build-arg APP_MODE=local \
-    .
 
 ### Credential Requester Commands ###
 

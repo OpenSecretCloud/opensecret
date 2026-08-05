@@ -149,13 +149,16 @@ For custom environments, you must also set the `ENV_NAME` environment variable. 
 - Form the Tinfoil API key secret name (`tinfoil_proxy_{env_name}_api_key`;
   the historical secret name is retained for deployment compatibility)
 
-For example, to deploy a custom environment named "staging":
+For example, to build the existing custom Nix output for an environment named
+"staging":
+
 ```sh
-docker build -t opensecret \
---build-arg APP_MODE=custom \
---build-arg ENV_NAME=staging \
-.
+ENV_NAME=staging nix build '.?submodules=1#eif'
 ```
+
+The named Nix outputs are the only supported OpenSecret application EIF build
+path. The parent-instance credential requester and logging containers described
+later in this guide are operational services, not EIF build inputs.
 
 ### Building and Deploying with Nix (Recommended)
 

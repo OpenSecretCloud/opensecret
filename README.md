@@ -92,31 +92,9 @@ This ensures the build is reproducible and matches the expected configuration.
 
 ### Deprecated Docker-based Deployment
 
-This method is deprecated as it does not provide reproducible builds. Here are the raw commands for reference:
-
-```sh
-# Build the Docker image
-docker build -t opensecret --build-arg APP_MODE=dev .
-
-# Save the image to a tar file
-docker save -o opensecret.tar opensecret
-
-# Copy to AWS parent instance
-scp opensecret.tar ec2-user@[aws-parent-instance-ip]:~/
-
-# Load the image on the parent instance
-ssh ec2-user@[aws-parent-instance-ip]
-docker load -i opensecret.tar && docker tag localhost/opensecret:latest opensecret:latest
-
-# Build the EIF file
-nitro-cli build-enclave --docker-uri opensecret:latest --output-file opensecret.eif
-
-# Run the EIF file
-nitro-cli run-enclave --eif-path opensecret.eif --memory 16384 --cpu-count 4
-
-# Or run in debug mode
-nitro-cli run-enclave --eif-path opensecret.eif --memory 16384 --cpu-count 4 --debug-mode
-```
+Docker-based enclave deployment is retired. The repository root no longer
+contains an enclave `Dockerfile`; build development, preview, and production
+EIFs with the Nix targets above.
 
 ## Nitro Enclaves Setup
 
@@ -160,15 +138,11 @@ nix build .#eif
 
 This will create a symlink `result` pointing to the built EIF file.
 
-### Differences from Docker-based Build
+### EIF construction contract
 
-The Nix-based build:
-- Creates a more reproducible build environment
-- Uses pre-built Nitro binaries for consistency
-- Integrates with the Monzo aws-nitro-util for EIF creation
-- Produces the same functionality as the Docker-based build
-
-The resulting EIF can be deployed and managed exactly like the Docker-built version.
+The named Nix outputs are the only supported way to assemble the OpenSecret
+application root filesystem and EIF. The parent-instance credential requester
+and logging containers are operational services, not EIF build inputs.
 
 ## CI/CD Requirements
 
@@ -182,93 +156,3 @@ This project requires a custom GitHub Actions runner with the following specific
 - Resources: 4 CPU cores
 
 The workflow uses this custom runner for both development and production builds. For more information about setting up custom GitHub Actions runners, see [GitHub's documentation](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners).
-
-
-## Development
-
-This project can be built and run using Docker. Follow these steps to build and run the Docker container:
-
-### Building the Docker Image
-
-1. Ensure you have Docker installed on your system.
-2. Navigate to the project root directory in your terminal.
-
-3. Build the enclave base image:
-
-```sh
-docker build ./nitro-toolkit/enclave-base-image/ -t enclave_base
-```
-
-4. Build the main Docker image using the following command:
-
-DEV:
-
-```sh
-docker build -t opensecret \
---build-arg DATABASE_URL={PROD_DB_CONNECTION} \
---build-arg OPENAI_API_KEY={YOUR_OPENAI_API_KEY} \
---build-arg APP_MODE=local \
-.
-```
-
-If building for the nitro image (use `dev` [default], `preview`, `prod`, or `custom` depending on the env):
-
-```sh
-docker rmi opensecret:latest && docker build -t opensecret \
---build-arg APP_MODE=dev \
-.
-```
-
-```sh
-docker rmi opensecret:latest && docker build -t opensecret \
---build-arg APP_MODE=preview \
-.
-```
-
-```sh
-docker rmi opensecret:latest && docker build -t opensecret \
---build-arg APP_MODE=prod \
-.
-```
-
-For custom environments, you must also provide an `ENV_NAME`:
-```sh
-docker rmi opensecret:latest && docker build -t opensecret \
---build-arg APP_MODE=custom \
---build-arg ENV_NAME=your_env_name \
-.
-```
-
-This command builds the Docker image and tags it as `opensecret`. The `--build-arg` flags are used to pass the environment variables to the Docker build process:
-- `DATABASE_URL`: Your production database connection string
-- `OPENAI_API_KEY`: Your OpenAI API key
-- `APP_MODE`: The deployment environment (`dev`, `preview`, `prod`, or `custom`)
-- `ENV_NAME`: Required when `APP_MODE` is `custom`, specifies the custom environment name
-
-### Running the Docker Container
-
-After building the image, you can run the container using:
-
-```sh
-docker run -p 3000:3000 -p 5000:5000 --name opensecret-container opensecret
-```
-
-This command starts a new container from the `opensecret` image and maps port 3000 on the host machine to port 3000 in the container.
-
-```sh
-sh
-docker run -p 3000:3000 -p 5000:5000 --name opensecret-container opensecret
-```
-
-To stop the container, use:
-
-```sh
-docker stop opensecret-container
-```
-
-To remove the container, use:
-
-```sh
-docker rm opensecret-container
-```
-

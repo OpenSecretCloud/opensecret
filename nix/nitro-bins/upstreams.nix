@@ -1,91 +1,102 @@
-# Exact source matrix used by the currently deployed Nitro KMS/NSM helper
-# generation. Revisions are peeled commits and hashes are Nix unpacked-source
-# hashes. Dependency modernization belongs in a separate stacked layer.
+# Reviewed modern Nitro KMS/NSM helper source matrix. Revisions are peeled
+# release-tag commits and hashes are Nix unpacked-source hashes.
 {
-  rust.version = "1.63.0";
+  rust.version = "1.97.1";
 
   sdkC = {
-    version = "0.4.0-8-g00c6048";
+    version = "0.4.5";
+    tag = "v0.4.5";
     owner = "aws";
     repo = "aws-nitro-enclaves-sdk-c";
-    rev = "00c6048945a3adbb84bd269f8388282d81110499";
-    hash = "sha256-tlit8ROuZ4CUNuT+jrcPLZoORG4bRPZiszMieGFvCzk=";
+    rev = "cd61b6187c8b20867ba4368d1ae62c5790c0269a";
+    hash = "sha256-w+/D1uL5A2DLn0+b0kEcYcO3RmFL0mi/U83c4bfn+bE=";
   };
   nsmApi = {
-    version = "0.4.0";
+    version = "0.5.2";
+    tag = "v0.5.2";
     owner = "aws";
     repo = "aws-nitro-enclaves-nsm-api";
-    rev = "4b851f3006c6fa98f23dcffb2cba03b39de9b8af";
-    hash = "sha256-HxgQilQpKCRy8lmcjALIpwyAr1m1dcaUqcCL3D9JaCU=";
+    rev = "1993eeb0620d35f5cefc50b17638b432325328f9";
+    hash = "sha256-aG8bWZ1LRPbPy5whMC0eLJkwZyObz3yKhDr7ZBpqNUY=";
   };
   awsLc = {
-    version = "1.12.0";
+    version = "5.4.0";
+    tag = "v5.4.0";
     owner = "aws";
     repo = "aws-lc";
-    rev = "cb7712dfa896d32d55992e2cb13d5fa54fb77002";
-    hash = "sha256-AqA0fIbBFk6SD533oTSXy9Kc7Fja8vgiiPTF00+V2MY=";
+    rev = "f6acf748df0ea6157d55e640730b38d21a7751cd";
+    hash = "sha256-5++GRDTi2BQKEMyvPGm/+C3jKhyB0djUbUmI43107/c=";
   };
   s2nTls = {
-    version = "1.3.46";
+    version = "1.7.7";
+    tag = "v1.7.7";
     owner = "aws";
     repo = "s2n-tls";
-    rev = "e954ee5dc878c5c343d35574e7d07246a1e59314";
-    hash = "sha256-X+ZwM53ensCeUoxNa8cBO4KcWxWbb7iKxIRysImvKxw=";
+    rev = "853d1943bbbd7f782a159e77830cdaaf520d68ed";
+    hash = "sha256-e9qi7I8eg4CRVdjXIHnwDnl13RN9KQBor+UOiAEm8mg=";
   };
   awsCCommon = {
-    version = "0.8.0";
+    version = "0.14.4";
+    tag = "v0.14.4";
     owner = "awslabs";
     repo = "aws-c-common";
-    rev = "be35e65a6c67ae2ffd126516c9783ac1dd2e8910";
-    hash = "sha256-zxV+Rf0bUrWao5ALnqgAWMVsuGfLKQbQXvw/ppDMd28=";
+    rev = "3a5e638aee99c9f1d65696f7df8c4e5d3dc5805c";
+    hash = "sha256-15nidQkcaWzkRSHuqWrD980cMSHcXP9snLjrgThNSdU=";
   };
   awsCSdkutils = {
-    version = "0.1.2";
+    version = "0.2.9";
+    tag = "v0.2.9";
     owner = "awslabs";
     repo = "aws-c-sdkutils";
-    rev = "e3c23f4aca31d9e66df25827645f72cbcbfb657a";
-    hash = "sha256-G+ykP39EmI8BCeulTsZ/OSFKRzXVbEK0+mtJ3tugl5M=";
+    rev = "a1cc19f53b63658f1b1400b36f199eafeeb895a6";
+    hash = "sha256-VxQB0KOtzkjV6n47E5x+/EeSZbWI+nZ4M2oJk0vWvL4=";
   };
   awsCCal = {
-    version = "0.5.18";
+    version = "0.9.15";
+    tag = "v0.9.15";
     owner = "awslabs";
     repo = "aws-c-cal";
-    rev = "1458c70a26877345ca28e333a092096afd410774";
-    hash = "sha256-sT5ahf8MuIhqDV6RrRU+RgsLdwVUDEFWRZJpzQJOPGA=";
+    rev = "8aa2a48a09f93c65d4cf06388e143a6584de6321";
+    hash = "sha256-n4FWrj3ssl64zrYHA1JJhFGmXH3uUziOfdEwjvruGeE=";
   };
   awsCIo = {
-    version = "0.11.0";
+    version = "0.27.5";
+    tag = "v0.27.5";
     owner = "awslabs";
     repo = "aws-c-io";
-    rev = "8f4508f5ec7d2949d5545e2b1ddcd1beb47a76a8";
-    hash = "sha256-LIrAA3+Yd0lhCMQ9R4HT/ZFKm3y9iSm3h5vcn0ghiPA=";
+    rev = "e2946c99521fa12d285c9a0829c92b1bf713922b";
+    hash = "sha256-baeoEZMiEdchgOgCeVjSAbh6XfOVwDNPanDFMXKemQY=";
   };
   awsCCompression = {
-    version = "0.2.14";
+    version = "0.3.2";
+    tag = "v0.3.2";
     owner = "awslabs";
     repo = "aws-c-compression";
-    rev = "5fab8bc5ab5321d86f6d153b06062419080820ec";
-    hash = "sha256-bRNHjKhIpaWYToAFFUXUhyqYDmbL7SuZs2np/iH8Qzs=";
+    rev = "d8264e64f698341eb03039b96b4f44702a9b3f83";
+    hash = "sha256-YckyQZNk+48g5jrT4q8Clmy4LRwswKONvFbVtJxgpYQ=";
   };
   awsCHttp = {
-    version = "0.7.6";
+    version = "0.11.0";
+    tag = "v0.11.0";
     owner = "awslabs";
     repo = "aws-c-http";
-    rev = "0600662610aa871a11aebe6ed67a11997317cbef";
-    hash = "sha256-pJGzGbIuz8UJkfmTQEZgXSOMuYixMezNZmgaRlcnmfg=";
+    rev = "8aefd899fc3210bfd0e3fd414011a3cb708bf6e4";
+    hash = "sha256-SCdZfGIIHU6f0OArygZm0yY0wE6Hdx/JWvHZcK1DQOw=";
   };
   awsCAuth = {
-    version = "0.6.15";
+    version = "0.10.4";
+    tag = "v0.10.4";
     owner = "awslabs";
     repo = "aws-c-auth";
-    rev = "831fa583b83574db29cbae139b42e0d7a1d1ebb8";
-    hash = "sha256-oLX/evqtKbs5/WpSUBdLdKWKD8tdWwP0iRONuMCVu/E=";
+    rev = "4b5d524bf1a511b05e0fffe5bdc51800770b9427";
+    hash = "sha256-qxZRGH+jHSrWAgKBMDdJQTn3bS23z94tgw/gO2IsSw4=";
   };
   jsonC = {
-    version = "0.16";
+    version = "0.19";
+    tag = "json-c-0.19-20260627";
     owner = "json-c";
     repo = "json-c";
-    rev = "2f2ddc1f2dbca56c874e8f9c31b5b963202d80e7";
-    hash = "sha256-KbnUWLgpg6/1wvXhUoYswyqDcgiwEcvgaWCPjNcX20o=";
+    rev = "aa716cd8d663c976b99b0f30f102ee1d8ef63146";
+    hash = "sha256-ZfwVOU6PJKHSj7XVZh5BUb3VJ+lHXZVMPdHh5fgrock=";
   };
 }

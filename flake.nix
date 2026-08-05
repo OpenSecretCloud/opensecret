@@ -7,6 +7,12 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Keep the Nitro helper compiler independent from the application's pinned
+    # Rust toolchain. NSM API v0.5.2 requires a newer compiler than the backend.
+    nitro-rust-overlay = {
+      url = "github:oxalica/rust-overlay/b6916ba032e02122d6ed3064f40cabe937363d43";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     nixpkgs.url = "nixpkgs/nixos-unstable";
     # Keep dev security tools current without moving the application or Nitro build pin.
     security-tools-nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
@@ -16,18 +22,22 @@
     };
   };
 
-  outputs = { self, nixpkgs, security-tools-nixpkgs, flake-utils, rust-overlay, nitro-util }:
+  outputs = { self, nixpkgs, security-tools-nixpkgs, flake-utils, rust-overlay, nitro-rust-overlay, nitro-util }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ rust-overlay.overlays.default ];
         pkgs = import nixpkgs { inherit system overlays; };
+        nitroRustPkgs = import nixpkgs {
+          inherit system;
+          overlays = [ nitro-rust-overlay.overlays.default ];
+        };
         securityToolsPkgs = import security-tools-nixpkgs { inherit system; };
         rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         nitro = nitro-util.lib.${system};
         kernelUpstream = import ./nix/kernel-upstream.nix;
         nitroHelperUpstreams = import ./nix/nitro-bins/upstreams.nix;
         nitroRustToolchainVersion = nitroHelperUpstreams.rust.version;
-        nitroRustToolchain = pkgs.rust-bin.stable."${nitroRustToolchainVersion}".minimal;
+        nitroRustToolchain = nitroRustPkgs.rust-bin.stable."${nitroRustToolchainVersion}".minimal;
 
         # Development environment setup
         # Get rust-analyzer matching the channel in rust-toolchain.toml
@@ -172,7 +182,9 @@
               # Copy required libraries and tools
               mkdir -p /lib
               export LD_LIBRARY_PATH="/lib:$LD_LIBRARY_PATH"
-              install -m 755 ${nitro-bins}/lib/libnsm.so /lib/
+              # NSM v0.5.2 uses SONAME libnsm.so.0. Preserve the complete
+              # linker/runtime symlink chain in the enclave rootfs.
+              cp -P ${nitro-bins}/lib/libnsm.so* /lib/
               install -m 755 ${nitro-bins}/lib/libgcc_s.so.1 /lib/
 
               install -m 755 ${nitro-bins}/bin/kmstool_enclave_cli /bin/
@@ -470,8 +482,8 @@
           LIBPQ_LIB_DIR = "${pkgs.postgresql.lib}/lib";
         };
 
-        # Build the exact deployed-generation helper source matrix with Nix.
-        # A later layer owns dependency and SDK behavior changes.
+        # Build the reviewed modern NSM and KMS helper closure from pinned
+        # sources without moving the application's Rust toolchain.
         nitro-bins = import ./nix/nitro-bins {
           inherit pkgs;
           rustToolchain = nitroRustToolchain;

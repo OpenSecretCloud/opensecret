@@ -156,8 +156,9 @@ For example, to build the existing custom Nix output for an environment named
 ENV_NAME=staging nix build '.?submodules=1#eif'
 ```
 
-The root Docker-based EIF workflow is retired and must not be used as a
-fallback.
+The named Nix outputs are the only supported OpenSecret application EIF build
+path. The parent-instance credential requester and logging containers described
+later in this guide are operational services, not EIF build inputs.
 
 ### Building and Deploying with Nix (Recommended)
 

@@ -138,15 +138,11 @@ nix build .#eif
 
 This will create a symlink `result` pointing to the built EIF file.
 
-### Differences from Docker-based Build
+### EIF construction contract
 
-The Nix-based build:
-- Creates a more reproducible build environment
-- Uses pre-built Nitro binaries for consistency
-- Integrates with the Monzo aws-nitro-util for EIF creation
-- Produces the same functionality as the Docker-based build
-
-The resulting EIF can be deployed and managed exactly like the Docker-built version.
+The named Nix outputs are the only supported way to assemble the OpenSecret
+application root filesystem and EIF. The parent-instance credential requester
+and logging containers are operational services, not EIF build inputs.
 
 ## CI/CD Requirements
 
@@ -160,51 +156,3 @@ This project requires a custom GitHub Actions runner with the following specific
 - Resources: 4 CPU cores
 
 The workflow uses this custom runner for both development and production builds. For more information about setting up custom GitHub Actions runners, see [GitHub's documentation](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners).
-
-
-## Development
-
-The backend can still be built and run locally with Docker. This local image is
-not an EIF build input and cannot be built in an enclave deployment mode.
-
-### Building the Docker Image
-
-1. Ensure you have Docker installed on your system.
-2. Navigate to the project root directory in your terminal.
-
-3. Build the explicitly local-only image:
-
-```sh
-just build-docker-local
-```
-
-`Dockerfile.local` launches the backend directly with `APP_MODE=local`. It does
-not contain the NSM/KMS helper, enclave entrypoint, or VSOCK forwarders, and it
-rejects enclave application modes. Use Nix for every EIF build.
-
-### Running the Docker Container
-
-After building the image, you can run the container using:
-
-```sh
-docker run -p 3000:3000 -p 5000:5000 --name opensecret-container opensecret
-```
-
-This command starts a new container from the `opensecret` image and maps port 3000 on the host machine to port 3000 in the container.
-
-```sh
-sh
-docker run -p 3000:3000 -p 5000:5000 --name opensecret-container opensecret
-```
-
-To stop the container, use:
-
-```sh
-docker stop opensecret-container
-```
-
-To remove the container, use:
-
-```sh
-docker rm opensecret-container
-```

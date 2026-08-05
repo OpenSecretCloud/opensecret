@@ -18,6 +18,9 @@ Each environment has its own configuration, secrets, and infrastructure. Make su
 
 The new deployment process uses Nix to create reproducible builds:
 
+For the layer-by-layer Linux ARM and development-enclave acceptance procedure,
+see [RNG hardening stack staging and compatibility](docs/rng-hardening-staging.md).
+
 1. Nix builds the pinned Nitro KMS/NSM helper sources as part of the EIF.
    To inspect that helper closure independently on Linux ARM:
 ```bash

@@ -381,6 +381,25 @@
             touch "$out"
           '';
 
+        # aws-nitro-util already source-builds this init by default. Keep the
+        # same source and build flags explicit while using the current
+        # buildGoModule API, so a Nixpkgs refresh cannot revive the deprecated
+        # top-level CGO_ENABLED argument.
+        nitroInitSrc = builtins.path {
+          path = "${nitro-util}/init";
+          name = "init";
+        };
+        nitroInit = pkgs.buildGoModule {
+          name = "eif-init";
+          src = nitroInitSrc;
+          vendorHash = null;
+          env.CGO_ENABLED = "0";
+          ldflags = [
+            "-s"
+            "-w"
+          ];
+        };
+
         # Preserve the currently deployed Nitro boot behavior explicitly. A
         # trust-policy experiment belongs in its own held draft PR.
         enclaveKernelCmdline =
@@ -402,6 +421,7 @@
           nsmKo = null;
           copyToRoot = mkRootfs { inherit appMode opensecretPkg; };
           entrypoint = "/bin/entrypoint";
+          init = "${nitroInit}/bin/init";
         };
 
         opensecret = pkgs.rustPlatform.buildRustPackage {
@@ -598,6 +618,7 @@
         packages = {
           default = opensecret;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          nitro-init = nitroInit;
           eif-dev = mkEif { appMode = "dev"; };
           eif-prod = mkEif { appMode = "prod"; };
           eif-preview = mkEif { appMode = "preview"; };

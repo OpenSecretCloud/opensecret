@@ -16,7 +16,8 @@ Each environment has its own configuration, secrets, and infrastructure. Make su
 
 The new deployment process uses Nix to create reproducible builds:
 
-1. First, build the required Nitro binaries (only needed once):
+1. Nix builds the pinned Nitro KMS/NSM helper sources as part of the EIF.
+   To inspect that helper closure independently on Linux ARM:
 ```bash
 just build-nitro-bins
 ```
@@ -98,40 +99,32 @@ EIFs with the Nix targets above.
 
 ## Nitro Enclaves Setup
 
-The project uses AWS Nitro Enclaves and requires two pre-built binaries:
+The project uses AWS Nitro Enclaves and requires two helper artifacts:
 - `libnsm.so` - NSM (Nitro Security Module) library
 - `kmstool_enclave_cli` - KMS tool for key operations
 
-These binaries are built from the official AWS repositories:
+Nix builds both from fixed commits and hashes declared in
+`nix/nitro-bins/upstreams.nix`. The source repositories are:
 - [aws-nitro-enclaves-nsm-api](https://github.com/aws/aws-nitro-enclaves-nsm-api)
 - [aws-nitro-enclaves-sdk-c](https://github.com/aws/aws-nitro-enclaves-sdk-c)
 
 ### Building Nitro Binaries
 
-The binaries are built using Docker to ensure a consistent build environment. To build them:
+To build the same helper derivation consumed by the EIF:
 
 ```bash
 just build-nitro-bins
 ```
 
-This will:
-1. Create a `nitro-bins` directory
-2. Build the binaries in an Amazon Linux 2 container
-3. Extract them to the `nitro-bins` directory
-
-You only need to do this once, or when you want to update the binaries to a new version.
-The built binaries are used by the Nix build process to create the EIF (Enclave Image Format).
+The build fetches only the reviewed, immutable sources and produces a Nix
+result; it never writes ELF binaries back into the repository. Normal EIF
+builds consume this derivation automatically.
 
 ## Building and Deploying with Nix
 
 ### Building the EIF
 
-1. First, build the required Nitro binaries (only needed once):
-```bash
-just build-nitro-bins
-```
-
-2. Build the EIF using Nix:
+1. Build the EIF using Nix; its helper closure is built automatically:
 ```bash
 nix build .#eif
 ```
@@ -143,6 +136,14 @@ This will create a symlink `result` pointing to the built EIF file.
 The named Nix outputs are the only supported way to assemble the OpenSecret
 application root filesystem and EIF. The parent-instance credential requester
 and logging containers are operational services, not EIF build inputs.
+
+The Nix-based build:
+- Creates a more reproducible build environment
+- Source-builds Nitro helper artifacts from reviewed commits and hashes
+- Integrates with the Monzo aws-nitro-util for EIF creation
+- Preserves the application-facing helper CLI contract
+
+The resulting EIF can be deployed and managed exactly like the Docker-built version.
 
 ## CI/CD Requirements
 

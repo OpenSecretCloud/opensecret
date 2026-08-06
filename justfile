@@ -8,9 +8,9 @@ container := "podman"
 default:
     @just --list
 
-# Build Nitro binaries from enclave base image (NSM and KMS tools)
+# Build the pinned NSM and KMS helper sources with Nix
 build-nitro-bins:
-    nix run .#write-nitro-bins
+    nix build .#nitro-bins
 
 ### Credential Requester Commands ###
 

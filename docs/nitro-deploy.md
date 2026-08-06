@@ -164,7 +164,8 @@ later in this guide are operational services, not EIF build inputs.
 
 The recommended way to build and deploy the enclave is using Nix, which provides reproducible builds:
 
-1. First, build the required Nitro binaries (only needed once):
+1. Nix builds the fixed-source Nitro helper closure automatically. To inspect
+   it independently on Linux ARM:
 ```bash
 just build-nitro-bins
 ```

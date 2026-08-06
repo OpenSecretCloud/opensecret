@@ -24,6 +24,7 @@
         securityToolsPkgs = import security-tools-nixpkgs { inherit system; };
         rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         nitro = nitro-util.lib.${system};
+        kernelUpstream = import ./nix/kernel-upstream.nix;
 
         # Development environment setup
         # Get rust-analyzer matching the channel in rust-toolchain.toml
@@ -222,22 +223,153 @@
           pathsToLink = [ "/bin" "/lib" "/app" "/usr/bin" "/usr/sbin" "/sbin" ];
         };
 
-        # Build custom kernel - use kernel 6.12 which has NSM driver (merged in 6.8)
-        customKernel = pkgs.linuxPackages_6_12.kernel.override {
-          structuredExtraConfig = with pkgs.lib.kernel; {
-            VIRTIO_MMIO = yes;
-            VIRTIO_MENU = yes;
-            VIRTIO_MMIO_CMDLINE_DEVICES = yes;
-            NET = yes;
-            VSOCKETS = yes;
-            VIRTIO_VSOCKETS = yes;
-            NSM = yes;  # Enable NSM driver for KMS operations (merged in 6.8+)
-            # Disable algif_aead, the AF_ALG AEAD interface abused by CVE-2026-31431 (Copy Fail).
-            CRYPTO_USER_API_AEAD = no;
+        # Nixpkgs remains the build framework, but the enclave kernel's stable
+        # patch level is pinned directly to kernel.org so security fixes do not
+        # wait for a Nixpkgs refresh.
+        expectedKernelUrl =
+          "https://cdn.kernel.org/pub/linux/kernel/v${pkgs.lib.versions.major kernelUpstream.version}.x/linux-${kernelUpstream.version}.tar.xz";
+        kernelSource = pkgs.fetchurl {
+          inherit (kernelUpstream) url hash;
+        };
+        kernelStructuredExtraConfig = with pkgs.lib.kernel; {
+          VIRTIO = yes;
+          VIRTIO_MMIO = yes;
+          VIRTIO_MENU = yes;
+          VIRTIO_MMIO_CMDLINE_DEVICES = yes;
+          NET = yes;
+          VSOCKETS = yes;
+          VIRTIO_VSOCKETS = yes;
+          HW_RANDOM = yes;
+          NSM = yes; # Enable the in-tree NSM driver for KMS operations.
+          # Keep the unused AF_ALG AEAD socket adapter disabled. This does not
+          # affect OpenSecret's userspace AEAD implementations.
+          CRYPTO_USER_API_AEAD = no;
+        };
+        unverifiedCustomKernel = pkgs.linux_6_12.override {
+          argsOverride = {
+            inherit (kernelUpstream) version;
+            modDirVersion = kernelUpstream.version;
+            src = kernelSource;
           };
-          # Ensure we catch invalid or renamed config flags at build time
+          structuredExtraConfig = kernelStructuredExtraConfig;
+          # Fail if a required option is renamed or becomes unavailable.
           ignoreConfigErrors = false;
         };
+        customKernel =
+          assert pkgs.lib.assertMsg (
+            kernelUpstream.branch == "6.12"
+          ) "The enclave kernel must remain on the reviewed 6.12 LTS branch";
+          assert pkgs.lib.assertMsg (
+            pkgs.lib.versions.majorMinor kernelUpstream.version == kernelUpstream.branch
+          ) "The enclave kernel version must match its declared LTS branch";
+          assert pkgs.lib.assertMsg (
+            kernelUpstream.url == expectedKernelUrl
+          ) "The enclave kernel URL must be the version-matched kernel.org stable tarball";
+          assert pkgs.lib.assertMsg (
+            pkgs.lib.hasPrefix "sha256-" kernelUpstream.hash
+          ) "The enclave kernel source must use an immutable SRI sha256 hash";
+          assert pkgs.lib.assertMsg (
+            unverifiedCustomKernel.version == kernelUpstream.version
+          ) "The realized enclave kernel version differs from the direct upstream pin";
+          assert pkgs.lib.assertMsg (
+            unverifiedCustomKernel.modDirVersion == kernelUpstream.version
+          ) "The realized enclave kernel module version differs from the direct upstream pin";
+          assert pkgs.lib.assertMsg (
+            kernelStructuredExtraConfig.NSM == pkgs.lib.kernel.yes
+            && kernelStructuredExtraConfig.HW_RANDOM == pkgs.lib.kernel.yes
+            && kernelStructuredExtraConfig.VIRTIO == pkgs.lib.kernel.yes
+            && kernelStructuredExtraConfig.VIRTIO_MMIO == pkgs.lib.kernel.yes
+            && kernelStructuredExtraConfig.VIRTIO_MENU == pkgs.lib.kernel.yes
+            && kernelStructuredExtraConfig.VIRTIO_MMIO_CMDLINE_DEVICES == pkgs.lib.kernel.yes
+            && kernelStructuredExtraConfig.NET == pkgs.lib.kernel.yes
+            && kernelStructuredExtraConfig.VSOCKETS == pkgs.lib.kernel.yes
+            && kernelStructuredExtraConfig.VIRTIO_VSOCKETS == pkgs.lib.kernel.yes
+            && kernelStructuredExtraConfig.CRYPTO_USER_API_AEAD == pkgs.lib.kernel.no
+          ) "The enclave kernel's required NSM, hwrng, virtio, vsock, networking, or AEAD configuration changed";
+          unverifiedCustomKernel;
+
+        kernelSourcePin = pkgs.runCommand "opensecret-kernel-source-pin-${kernelUpstream.version}"
+          {
+            nativeBuildInputs = [
+              pkgs.gnugrep
+              pkgs.gnutar
+              pkgs.xz
+            ];
+          }
+          ''
+            set -euo pipefail
+
+            test -s ${kernelSource}
+            tar -xOf ${kernelSource} \
+              linux-${kernelUpstream.version}/drivers/misc/nsm.c > nsm.c
+
+            # 6.12.101 must carry both reviewed NSM fixes: malformed userspace
+            # pointers return before the mutex is touched, and file operations
+            # retain module ownership.
+            ioctl_source="$(sed -n \
+              '/static long nsm_dev_ioctl/,/static int nsm_device_init_vq/p' \
+              nsm.c)"
+            printf '%s\n' "$ioctl_source" > nsm_dev_ioctl.c
+
+            efault_line="$(grep -nF 'r = -EFAULT;' nsm_dev_ioctl.c | head -n1 | cut -d: -f1)"
+            copy_line="$(grep -nF 'if (copy_from_user(&raw, argp, _IOC_SIZE(cmd)))' nsm_dev_ioctl.c | cut -d: -f1)"
+            return_line="$(grep -nF 'return r;' nsm_dev_ioctl.c | head -n1 | cut -d: -f1)"
+            mutex_line="$(grep -nF 'mutex_lock(&nsm->lock);' nsm_dev_ioctl.c | cut -d: -f1)"
+
+            test -n "$efault_line"
+            test -n "$copy_line"
+            test -n "$return_line"
+            test -n "$mutex_line"
+            test "$efault_line" -lt "$copy_line"
+            test "$copy_line" -lt "$return_line"
+            test "$return_line" -lt "$mutex_line"
+
+            fops_source="$(sed -n \
+              '/static const struct file_operations nsm_dev_fops = {/,/};/p' \
+              nsm.c)"
+            printf '%s\n' "$fops_source" | grep -Fq '.owner = THIS_MODULE,'
+            printf '%s\n' "$fops_source" | grep -Fq '.unlocked_ioctl = nsm_dev_ioctl,'
+
+            {
+              echo 'branch=${kernelUpstream.branch}'
+              echo 'version=${kernelUpstream.version}'
+              echo 'source=${kernelUpstream.url}'
+              echo 'hash=${kernelUpstream.hash}'
+              echo 'store_path=${kernelSource}'
+            } > "$out"
+          '';
+
+        kernelSecurityInvariants = pkgs.runCommand
+          "opensecret-kernel-security-invariants-${kernelUpstream.version}"
+          { nativeBuildInputs = [ pkgs.gnugrep ]; }
+          ''
+            set -euo pipefail
+
+            config=${customKernel.configfile}
+            grep -Fqx 'CONFIG_VIRTIO=y' "$config"
+            grep -Fqx 'CONFIG_VIRTIO_MMIO=y' "$config"
+            grep -Fqx 'CONFIG_VIRTIO_MENU=y' "$config"
+            grep -Fqx 'CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y' "$config"
+            grep -Fqx 'CONFIG_NET=y' "$config"
+            grep -Fqx 'CONFIG_VSOCKETS=y' "$config"
+            grep -Fqx 'CONFIG_VIRTIO_VSOCKETS=y' "$config"
+            grep -Fqx 'CONFIG_HW_RANDOM=y' "$config"
+            grep -Fqx 'CONFIG_NSM=y' "$config"
+            grep -Fqx '# CONFIG_CRYPTO_USER_API_AEAD is not set' "$config"
+
+            {
+              echo 'branch=${kernelUpstream.branch}'
+              echo 'version=${kernelUpstream.version}'
+              echo 'source=${kernelUpstream.url}'
+              echo 'hash=${kernelUpstream.hash}'
+              echo 'cmdline=${enclaveKernelCmdline}'
+            } > "$out"
+          '';
+
+        # Preserve the currently deployed Nitro boot behavior explicitly. A
+        # trust-policy experiment belongs in its own held draft PR.
+        enclaveKernelCmdline =
+          "reboot=k panic=30 pci=off nomodules console=ttyS0 random.trust_cpu=on root=/dev/ram0";
 
         # Function to create EIF with specific APP_MODE
         mkEif = { appMode, opensecretPkg ? opensecret, nameSuffix ? "" }: nitro.buildEif {
@@ -246,9 +378,10 @@
           kernel = if arch == "aarch64"
             then "${customKernel}/Image"  # ARM64 uses Image
             else "${customKernel}/bzImage"; # x86_64 uses bzImage
-          # Use the blob config since extracting from custom kernel is complex
-          # The important thing is the kernel itself, not the config file
-          kernelConfig = nitro.blobs.${arch}.kernelConfig;
+          # EIF metadata must describe the exact configuration used to build
+          # this kernel, not the unrelated pre-built Nitro blob configuration.
+          kernelConfig = customKernel.configfile;
+          cmdline = enclaveKernelCmdline;
           # NSM driver is built into kernel 6.8+, so we don't need the old module
           # Setting to null to skip loading the incompatible old module
           nsmKo = null;
@@ -464,6 +597,12 @@
             type = "app";
             program = "${writeNitroBins}/bin/write-nitro-bins";
           };
+        };
+
+        checks = {
+          kernel-source-pin = kernelSourcePin;
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          kernel-security-invariants = kernelSecurityInvariants;
         };
 
         devShell = pkgs.mkShell {

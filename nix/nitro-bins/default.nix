@@ -218,7 +218,10 @@ let
     inherit (upstreams.sdkC) version;
     src = fetchSource upstreams.sdkC;
 
-    patches = [ ./sdk-c-explicit-version.patch ];
+    patches = [
+      ./kmstool-seed-entropy-fail-closed.patch
+      ./sdk-c-explicit-version.patch
+    ];
     strictDeps = true;
 
     nativeBuildInputs = [
@@ -253,7 +256,16 @@ let
 
     postPatch = ''
       source_file="bin/kmstool-enclave-cli/main.c"
-      grep -Fq 'AWS_ASSERT(aws_nitro_enclaves_library_seed_entropy(1024) == AWS_OP_SUCCESS)' "$source_file"
+      if grep -Fq 'AWS_ASSERT(aws_nitro_enclaves_library_seed_entropy' "$source_file"; then
+        echo "entropy seeding is still hidden in AWS_ASSERT" >&2
+        exit 1
+      fi
+      if [[ "$(grep -Fc 'aws_nitro_enclaves_library_seed_entropy(1024)' "$source_file")" -ne 1 ]]; then
+        echo "kmstool must seed system entropy exactly once" >&2
+        exit 1
+      fi
+      grep -Fq 'rc = aws_nitro_enclaves_library_seed_entropy(1024)' "$source_file"
+      grep -Fq 'fail_on(rc != AWS_OP_SUCCESS, "Could not seed system entropy")' "$source_file"
       grep -Fq 'if (NOT DEFINED VERSION)' CMakeLists.txt
     '';
 
@@ -316,6 +328,7 @@ let
       fi
       grep -Fxq 'PLAINTEXT: %s' "$strings_file"
       grep -Fxq 'CIPHERTEXT: %s' "$strings_file"
+      grep -Fxq 'Could not seed system entropy' "$strings_file"
       grep -Fxq 'aws-nitro_enclaves-sdk-c/v${upstreams.sdkC.version}' "$strings_file"
 
       if ! kmstool_dynamic="$(${pkgs.binutils}/bin/readelf -d "$kmstool")"; then

@@ -14,10 +14,13 @@ use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256, Sha512};
 use std::{process::Command, sync::Arc};
 use tokio::sync::Mutex;
-use tracing::error;
 use uuid::Uuid;
 
 use crate::aws_credentials::AwsCredentialManager;
+
+const AES_256_KEY_LENGTH: usize = 32;
+const KMSTOOL_PLAINTEXT_PREFIX: &str = "PLAINTEXT: ";
+const KMSTOOL_CIPHERTEXT_PREFIX: &str = "CIPHERTEXT: ";
 
 #[derive(Debug, thiserror::Error)]
 pub enum EncryptError {
@@ -368,20 +371,113 @@ pub fn decrypt_with_kms(
     let output_str =
         String::from_utf8(output.stdout).map_err(|e| EncryptError::KmsError(e.to_string()))?;
 
-    let plaintext_b64 = output_str
-        .strip_prefix("PLAINTEXT: ")
-        .ok_or_else(|| EncryptError::KmsError("Failed to parse plaintext".to_string()))?
-        .trim();
-
-    STANDARD
-        .decode(plaintext_b64)
-        .map_err(|e| EncryptError::KmsError(format!("Failed to decode base64: {}", e)))
+    parse_kmstool_plaintext(&output_str, "decrypt", None)
 }
 
 #[derive(Debug)]
 pub struct GenKeyResult {
     pub key: Vec<u8>,
     pub encrypted_key: Vec<u8>,
+}
+
+fn strip_single_trailing_newline<'a>(
+    output: &'a str,
+    operation: &str,
+) -> Result<&'a str, EncryptError> {
+    if output.contains('\r') {
+        return Err(EncryptError::KmsError(format!(
+            "Unexpected carriage return in kmstool {operation} output"
+        )));
+    }
+
+    let output = output.strip_suffix('\n').unwrap_or(output);
+    if output.ends_with('\n') {
+        return Err(EncryptError::KmsError(format!(
+            "Unexpected blank line in kmstool {operation} output"
+        )));
+    }
+
+    Ok(output)
+}
+
+fn decode_kmstool_line(
+    line: &str,
+    expected_prefix: &str,
+    field_name: &str,
+) -> Result<Vec<u8>, EncryptError> {
+    let encoded = line
+        .strip_prefix(expected_prefix)
+        .ok_or_else(|| EncryptError::KmsError(format!("Failed to parse kmstool {field_name}")))?;
+
+    if encoded.is_empty() {
+        return Err(EncryptError::KmsError(format!(
+            "Empty kmstool {field_name}"
+        )));
+    }
+
+    STANDARD
+        .decode(encoded)
+        .map_err(|e| EncryptError::KmsError(format!("Failed to decode kmstool {field_name}: {e}")))
+}
+
+fn parse_kmstool_plaintext(
+    output: &str,
+    operation: &str,
+    expected_length: Option<usize>,
+) -> Result<Vec<u8>, EncryptError> {
+    let line = strip_single_trailing_newline(output, operation)?;
+    if line.contains('\n') {
+        return Err(EncryptError::KmsError(format!(
+            "Unexpected additional line in kmstool {operation} output"
+        )));
+    }
+
+    let plaintext = decode_kmstool_line(line, KMSTOOL_PLAINTEXT_PREFIX, "plaintext")?;
+    if let Some(expected_length) = expected_length {
+        if plaintext.len() != expected_length {
+            return Err(EncryptError::KmsError(format!(
+                "Invalid kmstool {operation} plaintext length: expected {expected_length} bytes, got {}",
+                plaintext.len()
+            )));
+        }
+    }
+
+    Ok(plaintext)
+}
+
+fn parse_kmstool_genkey(output: &str) -> Result<GenKeyResult, EncryptError> {
+    let output = strip_single_trailing_newline(output, "genkey")?;
+    let mut lines = output.split('\n');
+    let ciphertext_line = lines
+        .next()
+        .ok_or_else(|| EncryptError::KmsError("Missing kmstool ciphertext".to_string()))?;
+    let plaintext_line = lines
+        .next()
+        .ok_or_else(|| EncryptError::KmsError("Missing kmstool plaintext".to_string()))?;
+
+    if lines.next().is_some() {
+        return Err(EncryptError::KmsError(
+            "Unexpected additional line in kmstool genkey output".to_string(),
+        ));
+    }
+
+    let encrypted_key =
+        decode_kmstool_line(ciphertext_line, KMSTOOL_CIPHERTEXT_PREFIX, "encrypted key")?;
+    let key = decode_kmstool_line(plaintext_line, KMSTOOL_PLAINTEXT_PREFIX, "plaintext key")?;
+    validate_aes_256_key_length(&key)?;
+
+    Ok(GenKeyResult { key, encrypted_key })
+}
+
+pub(crate) fn validate_aes_256_key_length(key: &[u8]) -> Result<(), EncryptError> {
+    if key.len() != AES_256_KEY_LENGTH {
+        return Err(EncryptError::KmsError(format!(
+            "Invalid AES-256 key length: expected {AES_256_KEY_LENGTH} bytes, got {}",
+            key.len()
+        )));
+    }
+
+    Ok(())
 }
 
 pub fn create_new_encryption_key(
@@ -423,29 +519,7 @@ pub fn create_new_encryption_key(
 
     let output_str =
         String::from_utf8(output.stdout).map_err(|e| EncryptError::KmsError(e.to_string()))?;
-    let lines: Vec<&str> = output_str.lines().collect();
-
-    let encrypted_key_b64 = lines[0]
-        .split(": ")
-        .nth(1)
-        .ok_or_else(|| EncryptError::KmsError("Failed to parse encrypted key".to_string()))?;
-    let plaintext_key_b64 = lines[1]
-        .split(": ")
-        .nth(1)
-        .ok_or_else(|| EncryptError::KmsError("Failed to parse plaintext key".to_string()))?;
-
-    let encrypted_key = STANDARD
-        .decode(encrypted_key_b64)
-        .map_err(|e| EncryptError::KmsError(format!("Failed to decode encrypted key: {}", e)))?;
-
-    let plaintext_key = STANDARD
-        .decode(plaintext_key_b64)
-        .map_err(|e| EncryptError::KmsError(e.to_string()))?;
-
-    Ok(GenKeyResult {
-        encrypted_key,
-        key: plaintext_key,
-    })
+    parse_kmstool_genkey(&output_str)
 }
 
 pub fn generate_random<const LENGTH: usize>() -> [u8; LENGTH] {
@@ -524,14 +598,7 @@ pub async fn generate_random_bytes_from_enclave(
     let output_str =
         String::from_utf8(output.stdout).map_err(|e| EncryptError::KmsError(e.to_string()))?;
 
-    let plaintext_b64 = output_str
-        .strip_prefix("PLAINTEXT: ")
-        .ok_or_else(|| EncryptError::KmsError("Failed to parse plaintext".to_string()))?
-        .trim();
-
-    STANDARD
-        .decode(plaintext_b64)
-        .map_err(|e| EncryptError::KmsError(format!("Failed to decode base64: {}", e)))
+    parse_kmstool_plaintext(&output_str, "genrandom", Some(length))
 }
 
 pub struct CustomRng {
@@ -580,6 +647,18 @@ impl CustomRng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kmstool_plaintext_output(bytes: &[u8]) -> String {
+        format!("{KMSTOOL_PLAINTEXT_PREFIX}{}\n", STANDARD.encode(bytes))
+    }
+
+    fn kmstool_genkey_output(encrypted_key: &[u8], plaintext_key: &[u8]) -> String {
+        format!(
+            "{KMSTOOL_CIPHERTEXT_PREFIX}{}\n{KMSTOOL_PLAINTEXT_PREFIX}{}\n",
+            STANDARD.encode(encrypted_key),
+            STANDARD.encode(plaintext_key)
+        )
+    }
 
     #[tokio::test]
     async fn test_encryption_with_key() {
@@ -644,5 +723,104 @@ mod tests {
         let encrypted = encrypt_key_deterministic(&key, content);
         let decrypted = decrypt_key_deterministic(&key, &encrypted).unwrap();
         assert_eq!(content.to_vec(), decrypted);
+    }
+
+    #[test]
+    fn kmstool_decrypt_stdout_contract_is_exact() {
+        let plaintext = b"existing KMS plaintext";
+        let output = kmstool_plaintext_output(plaintext);
+
+        assert_eq!(
+            parse_kmstool_plaintext(&output, "decrypt", None).unwrap(),
+            plaintext
+        );
+
+        let without_final_newline = output.strip_suffix('\n').unwrap();
+        assert_eq!(
+            parse_kmstool_plaintext(without_final_newline, "decrypt", None).unwrap(),
+            plaintext
+        );
+
+        for malformed in [
+            format!("LOG: message\n{output}"),
+            format!("{output}EXTRA: line\n"),
+            format!("{output}\n"),
+            output.replace(KMSTOOL_PLAINTEXT_PREFIX, "PLAINTEXT:"),
+            output.replace(KMSTOOL_PLAINTEXT_PREFIX, "plaintext: "),
+            output.replace('\n', "\r\n"),
+        ] {
+            assert!(
+                parse_kmstool_plaintext(&malformed, "decrypt", None).is_err(),
+                "accepted malformed decrypt output: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kmstool_genrandom_stdout_requires_requested_length() {
+        let requested_length = 32;
+        let output = kmstool_plaintext_output(&[7u8; 32]);
+        assert_eq!(
+            parse_kmstool_plaintext(&output, "genrandom", Some(requested_length)).unwrap(),
+            vec![7u8; requested_length]
+        );
+
+        for wrong_length in [requested_length - 1, requested_length + 1] {
+            let malformed = kmstool_plaintext_output(&vec![7u8; wrong_length]);
+            assert!(
+                parse_kmstool_plaintext(&malformed, "genrandom", Some(requested_length)).is_err(),
+                "accepted {wrong_length} bytes for a {requested_length}-byte request"
+            );
+        }
+    }
+
+    #[test]
+    fn kmstool_genkey_stdout_contract_preserves_aes_256_key() {
+        let encrypted_key = vec![9u8; 48];
+        let plaintext_key = vec![7u8; AES_256_KEY_LENGTH];
+        let output = kmstool_genkey_output(&encrypted_key, &plaintext_key);
+
+        let parsed = parse_kmstool_genkey(&output).unwrap();
+        assert_eq!(parsed.encrypted_key, encrypted_key);
+        assert_eq!(parsed.key, plaintext_key);
+    }
+
+    #[test]
+    fn kmstool_genkey_stdout_rejects_schema_drift_without_panicking() {
+        let encrypted_key_b64 = STANDARD.encode([9u8; 48]);
+        let plaintext_key_b64 = STANDARD.encode([7u8; AES_256_KEY_LENGTH]);
+        let valid = format!(
+            "{KMSTOOL_CIPHERTEXT_PREFIX}{encrypted_key_b64}\n{KMSTOOL_PLAINTEXT_PREFIX}{plaintext_key_b64}\n"
+        );
+
+        for malformed in [
+            String::new(),
+            format!("{KMSTOOL_CIPHERTEXT_PREFIX}{encrypted_key_b64}\n"),
+            format!(
+                "{KMSTOOL_PLAINTEXT_PREFIX}{plaintext_key_b64}\n{KMSTOOL_CIPHERTEXT_PREFIX}{encrypted_key_b64}\n"
+            ),
+            valid.replace(KMSTOOL_CIPHERTEXT_PREFIX, "ENCRYPTED: "),
+            format!("{valid}EXTRA: line\n"),
+            format!("{valid}\n"),
+            valid.replace('\n', "\r\n"),
+        ] {
+            assert!(
+                parse_kmstool_genkey(&malformed).is_err(),
+                "accepted malformed genkey output: {malformed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kmstool_genkey_stdout_rejects_non_aes_256_key_lengths() {
+        let encrypted_key = [9u8; 48];
+
+        for wrong_length in [AES_256_KEY_LENGTH - 1, AES_256_KEY_LENGTH + 1] {
+            let output = kmstool_genkey_output(&encrypted_key, &vec![7u8; wrong_length]);
+            assert!(
+                parse_kmstool_genkey(&output).is_err(),
+                "accepted {wrong_length}-byte plaintext as an AES-256 key"
+            );
+        }
     }
 }

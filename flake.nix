@@ -366,6 +366,21 @@
             } > "$out"
           '';
 
+        entrypointEntropyPreflight = pkgs.runCommand
+          "opensecret-entrypoint-entropy-preflight"
+          {
+            nativeBuildInputs = [
+              pkgs.bash
+              pkgs.coreutils
+              pkgs.gnused
+            ];
+          }
+          ''
+            ENTRYPOINT_UNDER_TEST=${./entrypoint.sh} \
+              bash ${./tests/entrypoint_entropy_preflight.sh}
+            touch "$out"
+          '';
+
         # Preserve the currently deployed Nitro boot behavior explicitly. A
         # trust-policy experiment belongs in its own held draft PR.
         enclaveKernelCmdline =
@@ -600,6 +615,7 @@
         };
 
         checks = {
+          entrypoint-entropy-preflight = entrypointEntropyPreflight;
           kernel-source-pin = kernelSourcePin;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           kernel-security-invariants = kernelSecurityInvariants;

@@ -7,6 +7,81 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
+# BEGIN ENCLAVE_ENTROPY_PREFLIGHT
+# Fail closed before any application or KMS work if the enclave entropy path is
+# not the one we expect. Positional overrides exist only so this function can
+# be exercised against fixtures; production calls it with the defaults.
+verify_enclave_entropy_readiness() {
+    local nsm_device="${1:-/dev/nsm}"
+    local rng_current_path="${2:-/sys/class/misc/hw_random/rng_current}"
+    local python_bin="${3:-python3}"
+    local rng_current
+
+    if [ ! -c "$nsm_device" ]; then
+        log "ERROR: NSM device is missing or is not a character device: $nsm_device"
+        return 1
+    fi
+
+    if [ ! -r "$rng_current_path" ]; then
+        log "ERROR: Hardware RNG selection is not readable: $rng_current_path"
+        return 1
+    fi
+
+    if ! IFS= read -r rng_current < "$rng_current_path"; then
+        log "ERROR: Failed to read hardware RNG selection: $rng_current_path"
+        return 1
+    fi
+
+    if [ "$rng_current" != "nsm-hwrng" ]; then
+        log "ERROR: Unexpected hardware RNG selected: ${rng_current:-<empty>} (expected nsm-hwrng)"
+        return 1
+    fi
+
+    # A flags value of zero selects the urandom source and blocks until the
+    # kernel CRNG is initialized. Bound the admission check to 30 seconds so
+    # a broken entropy path exits instead of hanging before readiness forever.
+    if ! "$python_bin" -c '
+import os
+import signal
+import sys
+
+if not hasattr(os, "getrandom"):
+    sys.exit("os.getrandom is unavailable")
+
+def crng_timeout(_signum, _frame):
+    raise TimeoutError("getrandom readiness check timed out")
+
+signal.signal(signal.SIGALRM, crng_timeout)
+signal.alarm(30)
+try:
+    sample = os.getrandom(1, 0)
+except (OSError, TimeoutError) as error:
+    sys.exit(f"getrandom failed: {error}")
+finally:
+    signal.alarm(0)
+
+if len(sample) != 1:
+    sys.exit(f"getrandom returned {len(sample)} bytes; expected 1")
+'; then
+        log "ERROR: Kernel CRNG readiness check failed"
+        return 1
+    fi
+
+    log "Enclave entropy readiness checks passed (NSM present, nsm-hwrng selected, CRNG initialized)"
+}
+
+verify_enclave_entropy_for_mode() {
+    local app_mode="$1"
+    shift
+
+    if [ "$app_mode" = "local" ]; then
+        return 0
+    fi
+
+    verify_enclave_entropy_readiness "$@"
+}
+# END ENCLAVE_ENTROPY_PREFLIGHT
+
 # Restart-on-exit wrapper for long-running helpers started from this script.
 run_forever() {
     local name="$1"
@@ -72,12 +147,6 @@ log_forwarder() {
 
 log "Starting entrypoint script"
 
-# Start the logging script
-log "Starting log exports"
-
-# Redirect all output to the logging script via VSOCK (with auto-reconnect)
-exec > >(log_forwarder) 2>&1
-
 # Read and set APP_MODE from file
 log "Reading /app/APP_MODE"
 if [ -f /app/APP_MODE ]; then
@@ -93,6 +162,15 @@ fi
 log "Starting entrypoint script"
 log "APP_MODE=$APP_MODE"
 log "Kernel version: $(uname -r)"
+
+# Local development does not run inside a Nitro Enclave and has neither NSM nor
+# nsm-hwrng. All deployable enclave modes must pass before startup continues.
+verify_enclave_entropy_for_mode "$APP_MODE" || exit 1
+
+# Start VSOCK log forwarding only after the enclave entropy path is known good.
+# Until this point, diagnostics remain on the enclave console.
+log "Starting log exports"
+exec > >(log_forwarder) 2>&1
 
 # Increase file descriptor limits to prevent socket exhaustion
 ulimit -n 65536

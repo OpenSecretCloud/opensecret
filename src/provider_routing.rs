@@ -630,6 +630,46 @@ mod tests {
     }
 
     #[test]
+    fn test_new_tinfoil_models_preserve_canonical_ids() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+
+        for model_id in ["kimi-k3", "deepseek-v4-flash"] {
+            let selected = router
+                .select_completion_route(&proxy_router, uuid_for_bucket(50), model_id)
+                .expect("canonical Tinfoil model should route");
+
+            assert_eq!(selected.proxy.provider_name, "tinfoil");
+            assert_eq!(selected.public_model_id, model_id);
+            assert_eq!(selected.provider_model_id, model_id);
+            assert_eq!(selected.response_model_id, model_id);
+            assert_eq!(selected.bucket, None);
+        }
+    }
+
+    #[test]
+    fn test_new_tinfoil_models_reject_near_spellings() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+
+        for model_id in [
+            "kimi-k-3",
+            "kimi-k3-latest",
+            "deepseek-v4-flash-0731",
+            "deepseek-v4flash",
+        ] {
+            let error = router
+                .select_completion_route(&proxy_router, uuid_for_bucket(50), model_id)
+                .expect_err("non-canonical model spelling should be rejected");
+
+            assert_eq!(
+                error,
+                ProviderRoutingError::UnsupportedModel(model_id.to_string())
+            );
+        }
+    }
+
+    #[test]
     fn test_tinfoil_fallback_resolves_known_alias_before_provider_request() {
         let router = ProviderRouter::default();
         let proxy_router = ProxyRouter::new(

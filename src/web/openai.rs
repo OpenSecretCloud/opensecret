@@ -1,4 +1,7 @@
-use crate::model_config::{model_catalog_response, openai_models_response};
+use crate::model_config::{
+    filter_model_list_response_for_access, model_catalog_response, openai_models_response,
+    ModelFeatureAccess,
+};
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
 use crate::provider_client::{
@@ -836,9 +839,14 @@ async fn proxy_openai(
     // Create billing context
     let billing_context = BillingContext::new(auth_method, model_name.clone());
 
+    let model_access = state
+        .model_feature_access_for_request(user.uuid, &model_name)
+        .await;
+
     // Get the completion stream - billing happens automatically inside!
     let completion =
-        get_chat_completion_response(&state, &user, body, &headers, billing_context).await?;
+        get_chat_completion_response(&state, &user, body, &headers, billing_context, model_access)
+            .await?;
 
     debug!(
         "Received completion from provider: {} (streaming: {})",
@@ -916,6 +924,7 @@ pub async fn get_chat_completion_response(
     body: Value,
     headers: &HeaderMap,
     mut billing_context: BillingContext,
+    model_access: ModelFeatureAccess,
 ) -> Result<CompletionStream, ApiError> {
     if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
@@ -944,6 +953,8 @@ pub async fn get_chat_completion_response(
             ApiError::BadRequest
         })?
         .to_string();
+
+    ensure_completion_model_access(&requested_model_name, model_access)?;
 
     let provider_preference = state
         .provider_routing_preference(user.uuid, &requested_model_name)
@@ -1265,6 +1276,18 @@ pub async fn get_chat_completion_response(
     })
 }
 
+pub(crate) fn ensure_completion_model_access(
+    model_name: &str,
+    model_access: ModelFeatureAccess,
+) -> Result<(), ApiError> {
+    if !model_access.allows_model(model_name) {
+        error!("Unsupported completion model requested: {}", model_name);
+        return Err(ApiError::BadRequest);
+    }
+
+    Ok(())
+}
+
 // ============================================================================
 // Centralized Billing Architecture - Internal Functions
 // ============================================================================
@@ -1576,16 +1599,18 @@ async fn proxy_models(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
     axum::Extension(session_id): axum::Extension<Uuid>,
-    axum::Extension(_user): axum::Extension<User>,
+    axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(_body): axum::Extension<()>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+    let model_access = state.model_feature_access(user.uuid).await;
     let proxy_config = state.proxy_router.get_completion_proxy();
-    let models_response = if proxy_config.provider_name == "tinfoil" {
-        openai_models_response()
+    let mut models_response = if proxy_config.provider_name == "tinfoil" {
+        openai_models_response(model_access)
     } else {
         fetch_provider_models(&state.provider_client, &proxy_config).await?
     };
+    filter_model_list_response_for_access(&mut models_response, model_access);
     encrypt_response(&state, &session_id, &models_response).await
 }
 
@@ -1639,11 +1664,12 @@ async fn proxy_model_catalog(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
     axum::Extension(session_id): axum::Extension<Uuid>,
-    axum::Extension(_user): axum::Extension<User>,
+    axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(_body): axum::Extension<()>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
-    let catalog_response = model_catalog_response();
+    let model_access = state.model_feature_access(user.uuid).await;
+    let catalog_response = model_catalog_response(model_access);
     encrypt_response(&state, &session_id, &catalog_response).await
 }
 
@@ -2436,6 +2462,81 @@ async fn try_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_model_access_is_independent_and_default_off() {
+        for model in ["kimi-k3", "deepseek-v4-flash"] {
+            assert!(matches!(
+                ensure_completion_model_access(model, ModelFeatureAccess::default()),
+                Err(ApiError::BadRequest)
+            ));
+        }
+
+        let kimi_only = ModelFeatureAccess::new(true, false);
+        assert!(ensure_completion_model_access("kimi-k3", kimi_only).is_ok());
+        assert!(matches!(
+            ensure_completion_model_access("deepseek-v4-flash", kimi_only),
+            Err(ApiError::BadRequest)
+        ));
+
+        let deepseek_only = ModelFeatureAccess::new(false, true);
+        assert!(ensure_completion_model_access("deepseek-v4-flash", deepseek_only).is_ok());
+        assert!(matches!(
+            ensure_completion_model_access("kimi-k3", deepseek_only),
+            Err(ApiError::BadRequest)
+        ));
+
+        let both = ModelFeatureAccess::new(true, true);
+        assert!(ensure_completion_model_access("kimi-k3", both).is_ok());
+        assert!(ensure_completion_model_access("deepseek-v4-flash", both).is_ok());
+
+        // The feature gate does not replace normal model validation. Ungated and
+        // unknown IDs continue to the existing provider-routing validation path.
+        assert!(
+            ensure_completion_model_access("gpt-oss-120b", ModelFeatureAccess::default()).is_ok()
+        );
+        assert!(
+            ensure_completion_model_access("not-a-real-model", ModelFeatureAccess::default())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn provider_model_response_filter_hides_gated_models_independently() {
+        fn visible_ids(access: ModelFeatureAccess) -> Vec<String> {
+            let mut response = json!({
+                "object": "list",
+                "data": [
+                    {"id": "gpt-oss-120b", "object": "model"},
+                    {"id": "kimi-k3", "object": "model"},
+                    {"id": "deepseek-v4-flash", "object": "model"},
+                    {"object": "model"}
+                ]
+            });
+            filter_model_list_response_for_access(&mut response, access);
+            response["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|model| model.get("id").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        assert_eq!(visible_ids(ModelFeatureAccess::default()), ["gpt-oss-120b"]);
+        assert_eq!(
+            visible_ids(ModelFeatureAccess::new(true, false)),
+            ["gpt-oss-120b", "kimi-k3"]
+        );
+        assert_eq!(
+            visible_ids(ModelFeatureAccess::new(false, true)),
+            ["gpt-oss-120b", "deepseek-v4-flash"]
+        );
+        assert_eq!(
+            visible_ids(ModelFeatureAccess::new(true, true)),
+            ["gpt-oss-120b", "kimi-k3", "deepseek-v4-flash"]
+        );
+    }
 
     fn tts_request(payload: Value) -> TTSRequest {
         serde_json::from_value(payload).unwrap()

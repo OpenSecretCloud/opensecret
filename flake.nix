@@ -44,6 +44,10 @@
         rustToolchain = builtins.fromTOML (builtins.readFile ./rust-toolchain.toml);
         rustChannel = rustToolchain.toolchain.channel;
         rustAnalyzer = pkgs.rust-bin.stable."${rustChannel}".rust-analyzer;
+        appRustPlatform = pkgs.makeRustPlatform {
+          cargo = rust;
+          rustc = rust;
+        };
 
         commonInputs = [
           rust
@@ -440,7 +444,7 @@
           init = "${nitroInit}/bin/init";
         };
 
-        opensecret = pkgs.rustPlatform.buildRustPackage {
+        opensecret = appRustPlatform.buildRustPackage {
           pname = "opensecret";
           version = "0.1.0";
           src = pkgs.lib.cleanSourceWith {
@@ -477,7 +481,6 @@
             pkgs.openssl
             pkgs.zlib
             pkgs.postgresql
-            pkgs.diesel-cli
           ];
           LIBPQ_LIB_DIR = "${pkgs.postgresql.lib}/lib";
         };

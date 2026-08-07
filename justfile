@@ -315,47 +315,34 @@ run-stage-preview: terminate-enclave-preview run-eif-preview restart-socat-previ
 
 ### EIF Building ###
 
-# Build the EIF using Nix
-build-eif:
-    nix build .?submodules=1#eif
-    echo "EIF build completed. PCR:"
-    cat result/pcr.json
-
 # Build EIF for development environment
 build-eif-dev:
-    nix build .?submodules=1#eif-dev
+    nix build '.?submodules=1#eif-dev'
     echo "EIF build completed. PCR:"
     cat result/pcr.json
 
 # Build EIF for production environment
 build-eif-prod:
-    nix build .?submodules=1#eif-prod
+    nix build '.?submodules=1#eif-prod'
     echo "EIF build completed. PCR:"
     cat result/pcr.json
 
 # Build EIF for preview environment
 build-eif-preview:
-    nix build .?submodules=1#eif-preview
-    echo "EIF build completed. PCR:"
-    cat result/pcr.json
-
-# Build EIF with custom environment variables
-build-eif-custom env_vars:
-    #!/usr/bin/env bash
-    eval "{{env_vars}}" nix build .?submodules=1#eif
+    nix build '.?submodules=1#eif-preview'
     echo "EIF build completed. PCR:"
     cat result/pcr.json
 
 # Build EIF for development environment
 copy-pcr-dev:
-    nix build .?submodules=1#eif-dev
+    nix build '.?submodules=1#eif-dev'
     echo "EIF build completed. PCR:"
     cat result/pcr.json
     cp -f result/pcr.json ./pcrDev.json
 
 # Build EIF for production environment
 copy-pcr-prod:
-    nix build .?submodules=1#eif-prod
+    nix build '.?submodules=1#eif-prod'
     echo "EIF build completed. PCR:"
     cat result/pcr.json
     cp -f result/pcr.json ./pcrProd.json
@@ -689,30 +676,6 @@ verify-pcr-prod:
 # Verify PCR values for preview environment
 verify-pcr-preview:
     just _verify-pcr-internal preview pcrPreview.json
-
-# Verify PCR values for custom environment
-verify-pcr-custom:
-    #!/usr/bin/env bash
-    if [ ! -f ./pcrCustom.json ]; then
-        echo "No pcrCustom.json found. Please run build-eif-custom first"
-        exit 1
-    fi
-    
-    if [ ! -f result/pcr.json ]; then
-        echo "No result/pcr.json found. Please rebuild with the same environment variables"
-        exit 1
-    fi
-    
-    if diff -q ./pcrCustom.json result/pcr.json > /dev/null; then
-        echo "✅ Custom PCR values match!"
-    else
-        echo "❌ Custom PCR values do not match!"
-        echo "Expected (./pcrCustom.json):"
-        cat ./pcrCustom.json
-        echo "Got (result/pcr.json):"
-        cat result/pcr.json
-        exit 1
-    fi
 
 # SCP the Nix-built EIF to AWS parent instance (dev)
 scp-eif-to-aws-dev:

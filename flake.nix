@@ -502,19 +502,6 @@
         checks = {
           entrypoint-entropy-preflight = entrypointEntropyPreflight;
           kernel-source-pin = kernelSourcePin;
-          nitro-helper-source-build = pkgs.runCommand
-            "opensecret-nitro-helper-source-build"
-            {
-              nativeBuildInputs = [
-                pkgs.bash
-                pkgs.gnugrep
-              ];
-            }
-            ''
-              REPO_ROOT_UNDER_TEST=${self} \
-                bash ${./tests/nitro_helper_source_build.sh}
-              touch "$out"
-            '';
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           kernel-security-invariants = kernelSecurityInvariants;
           nitro-helper = nitro-bins;

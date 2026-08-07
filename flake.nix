@@ -4,7 +4,9 @@
   inputs = {
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
-      url = "github:oxalica/rust-overlay";
+      # Pin the first upstream revision compatible with Nixpkgs' current
+      # fetchurl naming semantics while preserving the Rust 1.90.0 toolchain.
+      url = "github:oxalica/rust-overlay/37f8f092415b444c3bed6eda6bcbee51cee22e5d";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     # Keep the Nitro helper compiler independent from the application's pinned
@@ -13,7 +15,7 @@
       url = "github:oxalica/rust-overlay/b6916ba032e02122d6ed3064f40cabe937363d43";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    nixpkgs.url = "nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
     # Keep dev security tools current without moving the application or Nitro build pin.
     security-tools-nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-26.05-darwin";
     nitro-util = {
@@ -25,7 +27,23 @@
   outputs = { self, nixpkgs, security-tools-nixpkgs, flake-utils, rust-overlay, nitro-rust-overlay, nitro-util }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        overlays = [ rust-overlay.overlays.default ];
+        # Nixpkgs 26.05 still packages the libtpms v0.10.2 tag, which predates
+        # its one-line GCC 15 const-correctness fix. Keep the Linux dev shell
+        # buildable without changing warnings or moving the package revision.
+        libtpmsGcc15FixOverlay = final: prev: {
+          libtpms = prev.libtpms.overrideAttrs (oldAttrs: {
+            patches = (oldAttrs.patches or [ ]) ++ [
+              (final.fetchpatch2 {
+                url = "https://github.com/stefanberger/libtpms/commit/a20f8b6a22f1ae60d96ae7e554f5e13dd431471b.patch?full_index=1";
+                hash = "sha256-gOm4LCFd7lKJDaLFfcQdtNXtU9QJLn3PMdoQXXm+myI=";
+              })
+            ];
+          });
+        };
+        overlays = [
+          rust-overlay.overlays.default
+          libtpmsGcc15FixOverlay
+        ];
         pkgs = import nixpkgs { inherit system overlays; };
         nitroRustPkgs = import nixpkgs {
           inherit system;
@@ -532,8 +550,8 @@
 
             export LIBCLANG_PATH=${pkgs.libclang.lib}/lib/
             export LD_LIBRARY_PATH=${pkgs.openssl}/lib:$LD_LIBRARY_PATH
-            export CC_wasm32_unknown_unknown=${pkgs.llvmPackages_14.clang-unwrapped}/bin/clang-14
-            export CFLAGS_wasm32_unknown_unknown="-I ${pkgs.llvmPackages_14.libclang.lib}/lib/clang/14.0.6/include/"
+            export CC_wasm32_unknown_unknown=${pkgs.llvmPackages.clang-unwrapped}/bin/clang
+            export CFLAGS_wasm32_unknown_unknown="-I ${pkgs.llvmPackages.libclang.lib}/lib/clang/${pkgs.lib.versions.major pkgs.llvmPackages.libclang.version}/include/"
             export PKG_CONFIG_PATH=${pkgs.openssl.dev}/lib/pkgconfig
 
             ${pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
@@ -546,25 +564,36 @@
               echo "Using 'podman' as an alias for 'docker'"
               echo "You can now use 'docker' commands, which will be executed by podman"
 
-              # Podman configuration
-              export CONTAINERS_CONF=$HOME/.config/containers/containers.conf
-              export CONTAINERS_POLICY=$HOME/.config/containers/policy.json
-              mkdir -p $HOME/.config/containers
-              echo '{"default":[{"type":"insecureAcceptAnything"}]}' > $CONTAINERS_POLICY
+              case "''${OPENSECRET_DEV_CONTAINERS:-1}" in
+                0|false|False|FALSE|no|No|NO|skip|Skip|SKIP)
+                  echo "Skipping development container configuration"
+                  ;;
+                1|true|True|TRUE|yes|Yes|YES)
+                  # Podman configuration
+                  export CONTAINERS_CONF="$HOME/.config/containers/containers.conf"
+                  export CONTAINERS_POLICY="$HOME/.config/containers/policy.json"
+                  mkdir -p "$HOME/.config/containers"
+                  echo '{"default":[{"type":"insecureAcceptAnything"}]}' > "$CONTAINERS_POLICY"
 
-              # Create a basic containers.conf if it doesn't exist
-              if [ ! -f $CONTAINERS_CONF ]; then
-                echo "[engine]
-              cgroup_manager = \"cgroupfs\"
-              events_logger = \"file\"
-              runtime = \"crun\"
+                  # Create a basic containers.conf if it doesn't exist
+                  if [ ! -f "$CONTAINERS_CONF" ]; then
+                    echo "[engine]
+                  cgroup_manager = \"cgroupfs\"
+                  events_logger = \"file\"
+                  runtime = \"crun\"
 
-              [storage]
-              driver = \"vfs\"" > $CONTAINERS_CONF
-              fi
+                  [storage]
+                  driver = \"vfs\"" > "$CONTAINERS_CONF"
+                  fi
 
-              # Ensure correct permissions
-              chmod 600 $CONTAINERS_POLICY $CONTAINERS_CONF
+                  # Ensure correct permissions
+                  chmod 600 "$CONTAINERS_POLICY" "$CONTAINERS_CONF"
+                  ;;
+                *)
+                  echo "ERROR: OPENSECRET_DEV_CONTAINERS must be 0/1, false/true, no/yes, or skip" >&2
+                  exit 1
+                  ;;
+              esac
             ''}
 
             ${setupPostgresScript}

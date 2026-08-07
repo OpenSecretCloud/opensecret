@@ -517,8 +517,8 @@
         };
         continuum-proxy =
           assert pkgs.lib.assertMsg (
-            continuumProxyUpstream.version == "1.47.0"
-          ) "This layer must preserve the deployed Continuum 1.47.0 release";
+            continuumProxyUpstream.version == "1.51.0"
+          ) "This layer must use the reviewed Continuum 1.51.0 release";
           assert pkgs.lib.assertMsg (
             continuumProxyUpstream.tag == "v${continuumProxyUpstream.version}"
           ) "The Continuum tag must match its reviewed version";
@@ -531,7 +531,7 @@
           ) "Continuum source and Go dependencies must use immutable SRI hashes";
           assert pkgs.lib.assertMsg (
             pkgs.lib.versions.majorMinor pkgs.go_1_26.version == "1.26"
-          ) "Continuum 1.47.0 must be built with the reviewed Go 1.26 toolchain";
+          ) "Continuum 1.51.0 must be built with the reviewed Go 1.26 toolchain";
           pkgs.buildGo126Module {
             pname = "continuum-proxy";
             inherit (continuumProxyUpstream) version;
@@ -558,7 +558,7 @@
               source_vendor_hash="$(sed -n 's/.*vendorHash = "\([^"]*\)".*/\1/p' \
                 nix/packages/by-name/continuum-canonical-go-package/package.nix)"
               if [ "$source_vendor_hash" != "${continuumProxyUpstream.vendorHash}" ]; then
-                echo "Continuum vendor hash differs from the reviewed v1.47.0 source" >&2
+                echo "Continuum vendor hash differs from the reviewed v1.51.0 source" >&2
                 exit 1
               fi
             '';

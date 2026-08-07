@@ -19,15 +19,15 @@ if grep -Fq '${./continuum-proxy}' "$repo_root/flake.nix"; then
     exit 1
 fi
 
-grep -Fq 'version = "1.47.0";' "$repo_root/nix/continuum-proxy.nix"
-grep -Fq 'tag = "v1.47.0";' "$repo_root/nix/continuum-proxy.nix"
+grep -Fq 'version = "1.51.0";' "$repo_root/nix/continuum-proxy.nix"
+grep -Fq 'tag = "v1.51.0";' "$repo_root/nix/continuum-proxy.nix"
 grep -Fq 'owner = "edgelesssys";' "$repo_root/nix/continuum-proxy.nix"
 grep -Fq 'repo = "privatemode-public";' "$repo_root/nix/continuum-proxy.nix"
-grep -Fq 'rev = "4b72dcbbd58940835b5ba32502c1e247721b9584";' \
+grep -Fq 'rev = "4e625ecb28aeeabde65fe3b5d78864e02af1932c";' \
     "$repo_root/nix/continuum-proxy.nix"
-grep -Fq 'hash = "sha256-j9WkzJYFCqZ+e48MYGEM7+AIojt8ZwYDXbds2f11Vaw=";' \
+grep -Fq 'hash = "sha256-/nkkiaeKPZ/KswfM1/Nr1SBMslcijEFf2UTWSb/vwYQ=";' \
     "$repo_root/nix/continuum-proxy.nix"
-grep -Fq 'vendorHash = "sha256-PomvHU2qdyTIfu8s8bBOnFZxiRLr/EBuPLivaOBDspU=";' \
+grep -Fq 'vendorHash = "sha256-adHo+dzpeWVnWk3VDVohZJK4C080JJRe/9XqaieMkuI=";' \
     "$repo_root/nix/continuum-proxy.nix"
 
 grep -Fq 'pkgs.buildGo126Module {' "$repo_root/flake.nix"
@@ -46,7 +46,7 @@ grep -Fq 'nix build .#continuum-proxy --no-link --print-out-paths' \
 
 if [ -e "$repo_root/.git" ]; then
     gitlink="$(git -C "$repo_root" ls-files --stage privatemode-public | awk '{ print $2 }')"
-    if [ "$gitlink" != "4b72dcbbd58940835b5ba32502c1e247721b9584" ]; then
+    if [ "$gitlink" != "4e625ecb28aeeabde65fe3b5d78864e02af1932c" ]; then
         echo "the local Continuum gitlink differs from the source-build revision" >&2
         exit 1
     fi

@@ -27,17 +27,11 @@ if [ -z "$gate_line" ] || [ -z "$log_forwarder_line" ] || [ "$gate_line" -ge "$l
 fi
 
 pass_getrandom="$work_dir/pass-getrandom"
-cat > "$pass_getrandom" <<'EOF'
-#!/usr/bin/env bash
-exit 0
-EOF
+printf '#!%s\nexit 0\n' "$BASH" > "$pass_getrandom"
 chmod +x "$pass_getrandom"
 
 fail_getrandom="$work_dir/fail-getrandom"
-cat > "$fail_getrandom" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
+printf '#!%s\nexit 1\n' "$BASH" > "$fail_getrandom"
 chmod +x "$fail_getrandom"
 
 rng_current="$work_dir/rng_current"

@@ -1,7 +1,0 @@
-diff --git a/include/aws/auth/private/credentials_utils.h b/include/aws/auth/private/credentials_utils.h
-index 4abe407..7bba243 100644
---- a/include/aws/auth/private/credentials_utils.h
-+++ b/include/aws/auth/private/credentials_utils.h
-@@ -33 +33 @@ typedef struct aws_http_connection_manager *(aws_http_connection_manager_new_fn)(
--    struct aws_http_connection_manager_options *options);
-+    const struct aws_http_connection_manager_options *options);

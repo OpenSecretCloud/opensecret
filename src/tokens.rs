@@ -52,6 +52,8 @@ mod tests {
         assert_eq!(model_max_ctx("kimi-k2-6"), 256_000);
         assert_eq!(model_max_ctx("gemma4-31b"), 256_000);
         assert_eq!(model_max_ctx("glm-5-2"), 384_000);
+        assert_eq!(model_max_ctx("kimi-k3"), 256_000);
+        assert_eq!(model_max_ctx("deepseek-v4-flash"), 800_000);
         assert_eq!(model_max_ctx("auto:quick"), 128_000);
         assert_eq!(model_max_ctx("auto:powerful"), 256_000);
     }

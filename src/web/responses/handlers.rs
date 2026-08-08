@@ -8,14 +8,14 @@ use crate::{
     jwt::AuthContext,
     model_config::{
         model_config, model_reasoning_history_strategy, resolve_public_model_id,
-        ReasoningHistoryStrategy, ResponsesModelConfig, SamplingConfig,
+        ModelFeatureAccess, ReasoningHistoryStrategy, ResponsesModelConfig, SamplingConfig,
     },
     models::responses::{NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
     os_flags::KAGI_WEB_SEARCH_FLAG_KEY,
     web::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
-        openai::get_chat_completion_response,
+        openai::{ensure_completion_model_access, get_chat_completion_response},
         responses::{
             build_prompt, build_prompt_with_token_reserve, build_usage, constants::*,
             error_mapping, prompt_token_budget, storage_task, tools, ContentPartBuilder,
@@ -127,6 +127,23 @@ fn resolve_responses_sampling(body: &ResponsesCreateRequest) -> SamplingConfig {
         .responses
         .sampling
         .with_overrides(body.temperature, body.top_p)
+}
+
+fn resolve_responses_model(
+    requested_model: &str,
+    completion_provider_name: &str,
+    model_access: ModelFeatureAccess,
+) -> Result<String, ApiError> {
+    ensure_completion_model_access(requested_model, model_access)?;
+
+    match resolve_public_model_id(requested_model) {
+        Some(model) => Ok(model.to_string()),
+        None if completion_provider_name != "tinfoil" => Ok(requested_model.to_string()),
+        None => {
+            error!("Unsupported responses model requested: {}", requested_model);
+            Err(ApiError::BadRequest)
+        }
+    }
 }
 
 const MAPLE_SYSTEM_PROMPT: &str = "You are Maple, a friendly, concise, and helpful assistant. Give direct answers, be honest about uncertainty, and never invent tool use, search results, or sources.";
@@ -411,12 +428,13 @@ mod tests {
         assistant_turn_finished_with_tool_call, build_internal_system_prompt_for_now,
         build_model_turn_request, build_provider_tools, choose_web_search_provider,
         final_assistant_finish_reason, finalize_first_model_tool_call,
-        has_streamed_tool_call_entries, resolve_responses_sampling, wait_for_response_cancellation,
-        ClientResponseState, ConversationParam, InputMessage, ResponsesCreateRequest,
-        StorageMessage, StreamedToolCall, MAPLE_KAGI_WEB_SEARCH_PROMPT, MAPLE_WEB_SEARCH_PROMPT,
-        MAX_WEB_SEARCH_TOOL_TURNS,
+        has_streamed_tool_call_entries, resolve_responses_model, resolve_responses_sampling,
+        wait_for_response_cancellation, ClientResponseState, ConversationParam, InputMessage,
+        ResponsesCreateRequest, StorageMessage, StreamedToolCall, MAPLE_KAGI_WEB_SEARCH_PROMPT,
+        MAPLE_WEB_SEARCH_PROMPT, MAX_WEB_SEARCH_TOOL_TURNS,
     };
     use crate::web::responses::tools::WebSearchProvider;
+    use crate::{model_config::ModelFeatureAccess, ApiError};
     use chrono::{TimeZone, Utc};
     use serde_json::json;
     use tokio::{
@@ -579,6 +597,46 @@ mod tests {
             crate::model_config::DEFAULT_TEMPERATURE
         );
         assert_eq!(sampling.top_p, crate::model_config::DEFAULT_TOP_P);
+    }
+
+    #[test]
+    fn test_resolve_responses_models_enforces_independent_feature_access() {
+        let cases = [
+            (
+                "kimi-k3",
+                ModelFeatureAccess::new(true, false),
+                ModelFeatureAccess::new(false, true),
+            ),
+            (
+                "deepseek-v4-flash",
+                ModelFeatureAccess::new(false, true),
+                ModelFeatureAccess::new(true, false),
+            ),
+        ];
+
+        for (model, enabled_access, wrong_model_access) in cases {
+            assert!(matches!(
+                resolve_responses_model(model, "tinfoil", ModelFeatureAccess::default()),
+                Err(ApiError::BadRequest)
+            ));
+            assert!(matches!(
+                resolve_responses_model(model, "tinfoil", wrong_model_access),
+                Err(ApiError::BadRequest)
+            ));
+            assert_eq!(
+                resolve_responses_model(model, "tinfoil", enabled_access).unwrap(),
+                model
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_responses_model_allows_ungated_model_by_default() {
+        assert_eq!(
+            resolve_responses_model("llama3-3-70b", "tinfoil", ModelFeatureAccess::default())
+                .unwrap(),
+            "llama3-3-70b"
+        );
     }
 
     #[test]
@@ -1832,8 +1890,15 @@ async fn spawn_title_generation_task(
         );
 
         debug!("Title generation: about to call get_chat_completion_response");
-        match get_chat_completion_response(&state, &user, title_request, &headers, billing_context)
-            .await
+        match get_chat_completion_response(
+            &state,
+            &user,
+            title_request,
+            &headers,
+            billing_context,
+            ModelFeatureAccess::default(),
+        )
+        .await
         {
             Ok(mut completion) => {
                 debug!("Title generation: received completion stream from API");
@@ -2540,6 +2605,7 @@ async fn stream_one_assistant_turn(
     state: &Arc<AppState>,
     user: &User,
     body: &ResponsesCreateRequest,
+    model_access: ModelFeatureAccess,
     headers: &HeaderMap,
     prompt_messages: &[Value],
     tools_enabled: bool,
@@ -2584,9 +2650,15 @@ async fn stream_one_assistant_turn(
         body.model.clone(),
     );
 
-    let mut completion =
-        get_chat_completion_response(state, user, chat_request.take(), headers, billing_context)
-            .await?;
+    let mut completion = get_chat_completion_response(
+        state,
+        user,
+        chat_request.take(),
+        headers,
+        billing_context,
+        model_access,
+    )
+    .await?;
 
     debug!(
         "Received completion from provider: {} (model: {})",
@@ -2841,6 +2913,7 @@ async fn setup_completion_processor(
     state: &Arc<AppState>,
     user: &User,
     body: &ResponsesCreateRequest,
+    model_access: ModelFeatureAccess,
     context: &BuiltContext,
     prepared: &PreparedRequest,
     persisted: &PersistedData,
@@ -2864,6 +2937,7 @@ async fn setup_completion_processor(
                 state,
                 user,
                 body,
+                model_access,
                 headers,
                 &prompt_messages,
                 tools_enabled,
@@ -2992,14 +3066,14 @@ async fn create_response_stream(
     trace!("User: {}", user.uuid);
     let requested_model = body.model.clone();
     let completion_provider = state.proxy_router.get_completion_proxy();
-    let resolved_model = match resolve_public_model_id(&requested_model) {
-        Some(model) => model.to_string(),
-        None if completion_provider.provider_name != "tinfoil" => requested_model.clone(),
-        None => {
-            error!("Unsupported responses model requested: {}", requested_model);
-            return Err(ApiError::BadRequest);
-        }
-    };
+    let model_access = state
+        .model_feature_access_for_request(user.uuid, &requested_model)
+        .await;
+    let resolved_model = resolve_responses_model(
+        &requested_model,
+        &completion_provider.provider_name,
+        model_access,
+    )?;
     if requested_model != resolved_model {
         debug!(
             "Resolved responses model {} to {}",
@@ -3213,6 +3287,7 @@ async fn create_response_stream(
                         &orchestrator_state,
                         &orchestrator_user,
                         &orchestrator_body,
+                        model_access,
                         &context_for_completion,
                         &prepared_for_completion,
                         &persisted_for_completion,

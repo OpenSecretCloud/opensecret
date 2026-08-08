@@ -175,6 +175,14 @@
           fi
         '';
 
+        # BEGIN ENCLAVE_ROOTFS
+        # iproute2 installs administrative commands under /sbin. Preserve the
+        # entrypoint's historical /bin/ip path without pulling BusyBox back in.
+        iproute2BinCompat = pkgs.runCommand "iproute2-bin-compat" { } ''
+          mkdir -p "$out/bin"
+          ln -s ${pkgs.iproute2}/sbin/ip "$out/bin/ip"
+        '';
+
         # Function to create rootfs with specific APP_MODE
         mkRootfs = { appMode, opensecretPkg ? opensecret }: pkgs.buildEnv {
           name = "opensecret-rootfs-${appMode}";
@@ -183,17 +191,14 @@
             (pkgs.writeScriptBin "entrypoint" ''
               #!${pkgs.bash}/bin/bash
 
-              # Set up busybox commands and other tools
-              export PATH="/bin:${pkgs.busybox}/bin:${pkgs.python3}/bin:${pkgs.jq}/bin:${pkgs.socat}/bin:${nitro-bins}/bin:$PATH"
+              # Use only the explicitly composed enclave command closure.
+              export PATH="/sbin:/usr/sbin:/bin:/usr/bin:${pkgs.python3}/bin:${pkgs.jq}/bin:${pkgs.socat}/bin:${nitro-bins}/bin:$PATH"
 
-              # Create symlinks for busybox commands
+              # Preserve the historical absolute command locations.
               mkdir -p /bin
-              ln -sf ${pkgs.busybox}/bin/busybox /bin/date
-              ln -sf ${pkgs.busybox}/bin/busybox /bin/ip
               ln -sf ${pkgs.python3}/bin/python3 /bin/python3
               ln -sf ${pkgs.jq}/bin/jq /bin/jq
               ln -sf ${pkgs.socat}/bin/socat /bin/socat
-              ln -sf ${pkgs.curl}/bin/curl /bin/curl
 
               # Set up CA certificates
               mkdir -p /etc/ssl/certs
@@ -245,21 +250,145 @@
               destination = "/app/vsock_helper.py";
             })
             pkgs.bash
-            pkgs.busybox
             pkgs.openssl
-            pkgs.postgresql
             pkgs.socat
             pkgs.python3
             pkgs.jq
             pkgs.iproute2
+            iproute2BinCompat
             pkgs.coreutils
+            pkgs.findutils
+            pkgs.gnused
             pkgs.cacert
-            pkgs.curl
             nitro-bins
             continuum-proxy
           ];
           pathsToLink = [ "/bin" "/lib" "/app" "/usr/bin" "/usr/sbin" "/sbin" ];
         };
+        # END ENCLAVE_ROOTFS
+
+        mkRootfsCommandClosure = { appMode, rootfs }:
+          let
+            rootfsRuntimeClosure = pkgs.closureInfo { rootPaths = [ rootfs ]; };
+          in
+          pkgs.runCommand
+            "opensecret-rootfs-command-closure-${appMode}"
+            {
+              nativeBuildInputs = [
+                pkgs.binutils
+                pkgs.coreutils
+                pkgs.file
+                pkgs.findutils
+                pkgs.gnugrep
+                pkgs.gnused
+              ];
+            }
+            ''
+            set -Eeuo pipefail
+            trap 'status=$?; trap - ERR; echo "rootfs validation failed at line $LINENO: $BASH_COMMAND" >&2; exit "$status"' ERR
+            rootfs=${rootfs}
+            closure_paths=${rootfsRuntimeClosure}/store-paths
+            expected_interpreter=${pkgs.stdenv.cc.bintools.dynamicLinker}
+
+            if grep -Fi busybox "$closure_paths"; then
+              echo "BusyBox unexpectedly entered the rootfs runtime closure" >&2
+              exit 1
+            fi
+
+            for command in \
+              bash sh base64 cat cp date find install jq ln mkdir openssl \
+              python3 sed sleep socat timeout uname continuum-proxy \
+              kmstool_enclave_cli opensecret entrypoint; do
+              test -x "$rootfs/bin/$command"
+            done
+            test -x "$rootfs/bin/ip"
+            test -x "$rootfs/sbin/ip"
+            test "$(readlink -f "$rootfs/bin/bash")" = "$(readlink -f "${pkgs.bash}/bin/bash")"
+            test "$(readlink -f "$rootfs/bin/date")" = "$(readlink -f "${pkgs.coreutils}/bin/date")"
+            test "$(readlink -f "$rootfs/bin/find")" = "$(readlink -f "${pkgs.findutils}/bin/find")"
+            test "$(readlink -f "$rootfs/bin/sed")" = "$(readlink -f "${pkgs.gnused}/bin/sed")"
+            test "$(readlink -f "$rootfs/bin/ip")" = "$(readlink -f "$rootfs/sbin/ip")"
+            test ! -e "$rootfs/bin/busybox"
+            test ! -e "$rootfs/bin/curl"
+            for server_command in postgres psql pg_ctl initdb; do
+              test ! -e "$rootfs/bin/$server_command"
+            done
+
+            test -f "$rootfs/app/APP_MODE"
+            test -f "$rootfs/app/traffic_forwarder.py"
+            test -f "$rootfs/app/vsock_helper.py"
+            test "$(printf rng | "$rootfs/bin/base64")" = "cm5n"
+            test "$(printf rng | "$rootfs/bin/sed" -n 's/^r/R/p')" = "Rng"
+            test "$("$rootfs/bin/find" "$rootfs/app" -maxdepth 1 -name APP_MODE -print -quit)" = "$rootfs/app/APP_MODE"
+            "$rootfs/bin/timeout" 5 "$rootfs/bin/date" +%s >/dev/null
+            "$rootfs/bin/timeout" 5 "$rootfs/bin/sleep" 0
+            "$rootfs/bin/ip" -Version >/dev/null
+
+            executable_list="$(mktemp)"
+            "$rootfs/bin/find" -L "$rootfs" -type f -perm -0100 -print0 > "$executable_list"
+
+            while IFS= read -r -d "" executable; do
+              if ! file -Lb "$executable" | grep -q '^ELF '; then
+                continue
+              fi
+
+              program_headers="$(readelf -lW "$executable")"
+              if grep -q 'INTERP' <<<"$program_headers"; then
+                interpreter="$(sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p' <<<"$program_headers")"
+                if [ "$interpreter" != "$expected_interpreter" ]; then
+                  echo "unexpected ELF interpreter for $executable: $interpreter" >&2
+                  exit 1
+                fi
+                if ! ldd_output="$(${pkgs.glibc.bin}/bin/ldd "$executable" 2>&1)"; then
+                  echo "ldd failed for $executable" >&2
+                  echo "$ldd_output" >&2
+                  exit 1
+                fi
+                if grep -Fq 'not found' <<<"$ldd_output"; then
+                  echo "missing shared library for $executable" >&2
+                  echo "$ldd_output" >&2
+                  exit 1
+                fi
+              fi
+
+              if awk '
+                $1 == "GNU_STACK" {
+                  for (field = 2; field <= NF; field++) {
+                    if ($field ~ /^[RWE]*E[RWE]*$/) {
+                      executable_stack = 1
+                    }
+                  }
+                }
+                END { exit(executable_stack ? 0 : 1) }
+              ' <<<"$program_headers"; then
+                echo "executable stack found in $executable" >&2
+                exit 1
+              fi
+            done < "$executable_list"
+
+            touch "$out"
+            '';
+
+        rootfsCommandClosure = mkRootfsCommandClosure {
+          appMode = "dev";
+          rootfs = mkRootfs { appMode = "dev"; };
+        };
+
+        rootfsCompositionStatic = pkgs.runCommand
+          "opensecret-rootfs-composition-static"
+          {
+            nativeBuildInputs = [
+              pkgs.bash
+              pkgs.coreutils
+              pkgs.gnugrep
+              pkgs.gnused
+            ];
+          }
+          ''
+            REPO_ROOT_UNDER_TEST=${self} \
+              bash ${./tests/rootfs_composition.sh}
+            touch "$out"
+          '';
 
         # Nixpkgs remains the build framework, but the enclave kernel's stable
         # patch level is pinned directly to kernel.org so security fixes do not
@@ -443,24 +572,37 @@
         enclaveKernelCmdline =
           "reboot=k panic=30 pci=off nomodules console=ttyS0 random.trust_cpu=on root=/dev/ram0";
 
-        # Function to create EIF with specific APP_MODE
-        mkEif = { appMode, opensecretPkg ? opensecret, nameSuffix ? "" }: nitro.buildEif {
-          name = "opensecret-eif-${appMode}${nameSuffix}";
-          # The kernel image location varies by architecture
-          kernel = if arch == "aarch64"
-            then "${customKernel}/Image"  # ARM64 uses Image
-            else "${customKernel}/bzImage"; # x86_64 uses bzImage
-          # EIF metadata must describe the exact configuration used to build
-          # this kernel, not the unrelated pre-built Nitro blob configuration.
-          kernelConfig = customKernel.configfile;
-          cmdline = enclaveKernelCmdline;
-          # NSM driver is built into kernel 6.8+, so we don't need the old module
-          # Setting to null to skip loading the incompatible old module
-          nsmKo = null;
-          copyToRoot = mkRootfs { inherit appMode opensecretPkg; };
-          entrypoint = "/bin/entrypoint";
-          init = "${nitroInit}/bin/init";
-        };
+        # Function to create EIF with specific APP_MODE. Every EIF build first
+        # realizes the semantic checks for the exact rootfs it will package.
+        mkEif = { appMode, opensecretPkg ? opensecret, nameSuffix ? "" }:
+          let
+            rootfs = mkRootfs { inherit appMode opensecretPkg; };
+            rootfsValidation = mkRootfsCommandClosure {
+              inherit appMode rootfs;
+            };
+          in
+          (nitro.buildEif {
+            name = "opensecret-eif-${appMode}${nameSuffix}";
+            # The kernel image location varies by architecture
+            kernel = if arch == "aarch64"
+              then "${customKernel}/Image"  # ARM64 uses Image
+              else "${customKernel}/bzImage"; # x86_64 uses bzImage
+            # EIF metadata must describe the exact configuration used to build
+            # this kernel, not the unrelated pre-built Nitro blob configuration.
+            kernelConfig = customKernel.configfile;
+            cmdline = enclaveKernelCmdline;
+            # NSM driver is built into kernel 6.8+, so we don't need the old module
+            # Setting to null to skip loading the incompatible old module
+            nsmKo = null;
+            copyToRoot = rootfs;
+            entrypoint = "/bin/entrypoint";
+            init = "${nitroInit}/bin/init";
+          }).overrideAttrs (oldAttrs: {
+            doCheck = true;
+            checkPhase = (oldAttrs.checkPhase or "") + ''
+              test -e ${rootfsValidation}
+            '';
+          });
 
         opensecret = appRustPlatform.buildRustPackage {
           pname = "opensecret";
@@ -535,9 +677,11 @@
         checks = {
           entrypoint-entropy-preflight = entrypointEntropyPreflight;
           kernel-source-pin = kernelSourcePin;
+          rootfs-composition-static = rootfsCompositionStatic;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           kernel-security-invariants = kernelSecurityInvariants;
           nitro-helper = nitro-bins;
+          rootfs-command-closure = rootfsCommandClosure;
         };
 
         devShell = pkgs.mkShell {

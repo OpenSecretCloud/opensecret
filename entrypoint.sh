@@ -456,9 +456,6 @@ log "Added Kagi Search domain to /etc/hosts"
 echo "127.0.0.24 api.search.brave.com" >> /etc/hosts
 log "Added Brave Search domain to /etc/hosts"
 
-touch /app/libnsm.so
-log "Created /app/libnsm.so"
-
 # Print network information for debugging
 log "Network configuration:"
 ip addr show

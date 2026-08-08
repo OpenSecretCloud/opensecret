@@ -66,6 +66,20 @@ jobs:
   test:
     name: Test Suite
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317
+        env:
+          POSTGRES_USER: opensecret_user
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: opensecret
+        options: >-
+          --health-cmd "pg_isready -U opensecret_user -d opensecret"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -80,10 +94,29 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpq-dev pkg-config libssl-dev
+          sudo apt-get install -y libpq-dev pkg-config libssl-dev postgresql-client
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
 
+      - name: Apply database migrations
+        env:
+          AEAD_TAMPER_TEST_DATABASE_URL: postgres://opensecret_user:password@localhost:5432/opensecret
+        run: |
+          set -euo pipefail
+          for migration in migrations/*/up.sql; do
+            psql "$AEAD_TAMPER_TEST_DATABASE_URL" \
+              --set ON_ERROR_STOP=1 \
+              --single-transaction \
+              --file "$migration"
+          done
+
       - name: Run tests
         run: cargo test --locked --all-features
+
+      - name: Run Postgres-backed security tests
+        env:
+          AEAD_TAMPER_TEST_DATABASE_URL: postgres://opensecret_user:password@localhost:5432/opensecret
+        run: |
+          cargo test --locked --all-features aead_db_tamper_tests:: -- --ignored --test-threads=1
+          cargo test --locked --all-features web::oauth_routes::tests::db_oauth_ -- --ignored --test-threads=1

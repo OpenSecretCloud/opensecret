@@ -175,6 +175,28 @@
           fi
         '';
 
+        # A derived package cannot safely consume a path nested inside the Git
+        # submodule. Fetch the exact reviewed toolkit revision explicitly.
+        nitroToolkitVsockSource = pkgs.fetchFromGitHub {
+          owner = "OpenSecretCloud";
+          repo = "nitro-toolkit";
+          rev = "dcfea5f66c3f0aea232b649da2ce3661be54cc14";
+          hash = "sha256-Q1bcR2J1cGQzSXR/lTjY3k5HERcevQqNvlvicaHAuN0=";
+        };
+
+        vsockHelper = pkgs.runCommand
+          "opensecret-vsock-helper-empty-response"
+          { nativeBuildInputs = [ pkgs.patch ]; }
+          ''
+            install -m 0644 ${nitroToolkitVsockSource}/vsock_helper.py vsock_helper.py
+            patch -p1 --fuzz=0 --batch --forward < ${./nix/vsock-helper-empty-response.patch}
+            ${pkgs.python3}/bin/python3 -m py_compile vsock_helper.py
+            VSOCK_HELPER_UNDER_TEST="$PWD/vsock_helper.py" \
+              ${pkgs.python3}/bin/python3 ${./tests/vsock_helper_empty_response.py}
+            mkdir -p "$out/app"
+            install -m 0444 vsock_helper.py "$out/app/vsock_helper.py"
+          '';
+
         # Function to create rootfs with specific APP_MODE
         mkRootfs = { appMode, opensecretPkg ? opensecret }: pkgs.buildEnv {
           name = "opensecret-rootfs-${appMode}";
@@ -239,11 +261,7 @@
               text = builtins.readFile ./nitro-toolkit/traffic_forwarder.py;
               destination = "/app/traffic_forwarder.py";
             })
-            (pkgs.writeTextFile {
-              name = "vsock_helper";
-              text = builtins.readFile ./nitro-toolkit/vsock_helper.py;
-              destination = "/app/vsock_helper.py";
-            })
+            vsockHelper
             pkgs.bash
             pkgs.busybox
             pkgs.openssl
@@ -535,6 +553,7 @@
         checks = {
           entrypoint-entropy-preflight = entrypointEntropyPreflight;
           kernel-source-pin = kernelSourcePin;
+          vsock-helper-empty-response = vsockHelper;
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           kernel-security-invariants = kernelSecurityInvariants;
           nitro-helper = nitro-bins;

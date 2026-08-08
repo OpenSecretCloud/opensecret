@@ -1,0 +1,14 @@
+--- a/vsock_helper.py
++++ b/vsock_helper.py
+@@ -6,0 +7,4 @@
++
++# Bound the complete encoded parent response before appending each chunk.
++# Exactly 1 MiB is accepted; the first byte over the boundary fails closed.
++MAX_RESPONSE_BYTES = 1024 * 1024
+@@ -35,0 +40,6 @@
++                                if len(response) + len(chunk) > MAX_RESPONSE_BYTES:
++                                    print(
++                                        f"Response exceeded {MAX_RESPONSE_BYTES} byte limit",
++                                        file=sys.stderr,
++                                    )
++                                    return json.dumps({"error": "VSOCK response exceeded size limit"})

@@ -1,6 +1,6 @@
 use crate::model_config::{
-    filter_model_list_response_for_access, model_catalog_response, openai_models_response,
-    ModelFeatureAccess,
+    filter_model_list_response_for_access, model_catalog_response, model_config,
+    openai_models_response, ModelFeatureAccess,
 };
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
@@ -991,6 +991,7 @@ pub async fn get_chat_completion_response(
             selected_route.selection_source
         );
     }
+    apply_chat_completion_model_defaults(&mut modified_body, &selected_route.public_model_id);
     modified_body.insert(
         "model".to_string(),
         json!(selected_route.provider_model_id.clone()),
@@ -1356,6 +1357,38 @@ fn ensure_stream_usage(body: &mut serde_json::Map<String, Value>) {
 fn tinfoil_user_cache_secret(user_uuid: Uuid) -> String {
     // Keep the cache namespace stable without exposing the raw user identifier.
     hex::encode(Sha256::digest(user_uuid.as_bytes()))
+}
+
+fn apply_chat_completion_model_defaults(
+    body: &mut serde_json::Map<String, Value>,
+    public_model_id: &str,
+) {
+    // Resolve against the canonical public model selected by provider routing.
+    // This keeps model-specific controls centralized with the same configuration
+    // used by the Responses adapter instead of duplicating model IDs in clients.
+    let config = model_config(public_model_id).responses;
+
+    if config.include_reasoning {
+        body.entry("include_reasoning".to_string())
+            .or_insert_with(|| json!(true));
+    }
+
+    if !config.enable_thinking {
+        return;
+    }
+
+    match body.entry("chat_template_kwargs".to_string()) {
+        serde_json::map::Entry::Occupied(mut entry) => {
+            if let Some(kwargs) = entry.get_mut().as_object_mut() {
+                kwargs
+                    .entry("enable_thinking".to_string())
+                    .or_insert_with(|| json!(true));
+            }
+        }
+        serde_json::map::Entry::Vacant(entry) => {
+            entry.insert(json!({ "enable_thinking": true }));
+        }
+    }
 }
 
 fn apply_provider_managed_request_fields(
@@ -2462,6 +2495,66 @@ async fn try_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_completions_enable_gemma_thinking_from_canonical_model_config() {
+        let mut body = serde_json::Map::from_iter([
+            ("model".to_string(), json!("provider-specific-gemma-id")),
+            (
+                "chat_template_kwargs".to_string(),
+                json!({ "future_option": "preserved" }),
+            ),
+        ]);
+
+        apply_chat_completion_model_defaults(&mut body, "gemma4-31b");
+
+        assert_eq!(body.get("include_reasoning"), Some(&json!(true)));
+        assert_eq!(
+            body.get("chat_template_kwargs"),
+            Some(&json!({
+                "enable_thinking": true,
+                "future_option": "preserved",
+            }))
+        );
+        assert_eq!(
+            body.get("model"),
+            Some(&json!("provider-specific-gemma-id"))
+        );
+    }
+
+    #[test]
+    fn chat_completion_model_defaults_preserve_explicit_gemma_opt_out() {
+        let mut body = serde_json::Map::from_iter([
+            ("include_reasoning".to_string(), json!(false)),
+            (
+                "chat_template_kwargs".to_string(),
+                json!({ "enable_thinking": false }),
+            ),
+        ]);
+
+        apply_chat_completion_model_defaults(&mut body, "gemma4-31b");
+
+        assert_eq!(body.get("include_reasoning"), Some(&json!(false)));
+        assert_eq!(
+            body.get("chat_template_kwargs"),
+            Some(&json!({ "enable_thinking": false }))
+        );
+    }
+
+    #[test]
+    fn chat_completion_model_defaults_leave_llama_and_unknown_models_unchanged() {
+        for model in ["llama3-3-70b", "unknown-model"] {
+            let mut body = serde_json::Map::from_iter([
+                ("model".to_string(), json!(model)),
+                ("messages".to_string(), json!([])),
+            ]);
+            let original = body.clone();
+
+            apply_chat_completion_model_defaults(&mut body, model);
+
+            assert_eq!(body, original, "unexpected defaults for {model}");
+        }
+    }
 
     #[test]
     fn completion_model_access_is_independent_and_default_off() {

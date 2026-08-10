@@ -542,6 +542,37 @@ impl FromStr for AppMode {
     }
 }
 
+fn normalize_optional_env(value: Result<String, env::VarError>) -> Option<String> {
+    value
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn optional_env(name: &str) -> Option<String> {
+    normalize_optional_env(env::var(name))
+}
+
+#[cfg(test)]
+mod optional_env_tests {
+    use super::*;
+
+    #[test]
+    fn absent_or_blank_values_are_not_configured() {
+        assert_eq!(normalize_optional_env(Err(env::VarError::NotPresent)), None);
+        assert_eq!(normalize_optional_env(Ok(String::new())), None);
+        assert_eq!(normalize_optional_env(Ok(" \t\n ".to_string())), None);
+    }
+
+    #[test]
+    fn configured_values_are_trimmed() {
+        assert_eq!(
+            normalize_optional_env(Ok("  configured value  ".to_string())),
+            Some("configured value".to_string())
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     app_mode: AppMode,
@@ -3521,31 +3552,31 @@ async fn main() -> Result<(), Error> {
     let resend_api_key = if app_mode != AppMode::Local {
         retrieve_resend_api_key(aws_credential_manager.clone(), db.clone()).await?
     } else {
-        std::env::var("RESEND_API_KEY").ok()
+        optional_env("RESEND_API_KEY")
     };
 
     let github_client_secret = if app_mode != AppMode::Local {
         retrieve_github_client_secret(aws_credential_manager.clone(), db.clone()).await?
     } else {
-        std::env::var("GITHUB_CLIENT_SECRET").ok()
+        optional_env("GITHUB_CLIENT_SECRET")
     };
 
     let github_client_id = if app_mode != AppMode::Local {
         retrieve_github_client_id(aws_credential_manager.clone(), db.clone()).await?
     } else {
-        std::env::var("GITHUB_CLIENT_ID").ok()
+        optional_env("GITHUB_CLIENT_ID")
     };
 
     let google_client_secret = if app_mode != AppMode::Local {
         retrieve_google_client_secret(aws_credential_manager.clone(), db.clone()).await?
     } else {
-        std::env::var("GOOGLE_CLIENT_SECRET").ok()
+        optional_env("GOOGLE_CLIENT_SECRET")
     };
 
     let google_client_id = if app_mode != AppMode::Local {
         retrieve_google_client_id(aws_credential_manager.clone(), db.clone()).await?
     } else {
-        std::env::var("GOOGLE_CLIENT_ID").ok()
+        optional_env("GOOGLE_CLIENT_ID")
     };
 
     let sqs_queue_maple_events_url = if app_mode != AppMode::Local {
@@ -3589,37 +3620,33 @@ async fn main() -> Result<(), Error> {
         // Get from database if in enclave mode
         retrieve_billing_api_key(aws_credential_manager.clone(), db.clone()).await?
     } else {
-        std::env::var("BILLING_API_KEY").ok()
+        optional_env("BILLING_API_KEY")
     };
 
     let billing_server_url = if app_mode != AppMode::Local {
         // Get from database if in enclave mode
         retrieve_billing_server_url(aws_credential_manager.clone(), db.clone()).await?
     } else {
-        std::env::var("BILLING_SERVER_URL").ok()
+        optional_env("BILLING_SERVER_URL")
     };
 
     let brave_api_key = if app_mode != AppMode::Local {
         // Get from database if in enclave mode
         retrieve_brave_api_key(aws_credential_manager.clone(), db.clone()).await?
     } else {
-        std::env::var("BRAVE_API_KEY")
-            .ok()
-            .filter(|key| !key.trim().is_empty())
+        optional_env("BRAVE_API_KEY")
     };
 
     let kagi_api_key = if app_mode != AppMode::Local {
         retrieve_kagi_api_key(aws_credential_manager.clone(), db.clone()).await?
     } else {
-        std::env::var("KAGI_API_KEY")
-            .ok()
-            .filter(|key| !key.trim().is_empty())
+        optional_env("KAGI_API_KEY")
     };
 
     let os_flags_api_key = if app_mode != AppMode::Local {
         retrieve_os_flags_api_key(aws_credential_manager.clone(), db.clone()).await?
     } else {
-        std::env::var("OS_FLAGS_API_KEY").ok()
+        optional_env("OS_FLAGS_API_KEY")
     };
 
     let os_flags_base_url = if app_mode != AppMode::Local {
@@ -3635,7 +3662,7 @@ async fn main() -> Result<(), Error> {
             }
         }
     } else {
-        std::env::var("OS_FLAGS_BASE_URL").ok()
+        optional_env("OS_FLAGS_BASE_URL")
     };
 
     let app_state = AppStateBuilder::default()

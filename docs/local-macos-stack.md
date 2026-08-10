@@ -1,131 +1,63 @@
-# Local macOS Stack
+# Local macOS stack
 
-This runbook is for developing OpenSecret locally on macOS with the native
-Continuum proxy and the in-process Tinfoil Rust SDK. It is intentionally
-separate from the Linux/Nitro enclave deployment path.
-
-## Shape
-
-Run these processes from the OpenSecret checkout:
+This runbook covers OpenSecret with the native Continuum proxy and the
+in-process Tinfoil Rust SDK. It is separate from Linux/Nitro deployment.
 
 ```text
 Continuum proxy   http://127.0.0.1:8092
-OpenSecret API    http://127.0.0.1:3000 (includes the Tinfoil SDK)
-Maple frontend    VITE_OPEN_SECRET_API_URL=http://127.0.0.1:3000
+OpenSecret API    http://127.0.0.1:3000
+Maple             VITE_OPEN_SECRET_API_URL=http://127.0.0.1:3000
 ```
 
-In local mode, OpenSecret reads `.env` through `dotenv`.
+Tinfoil discovery, attestation, TLS pinning, and requests happen inside the
+OpenSecret process; there is no local Tinfoil sidecar or port.
 
-The supported local recipe sets `OPENAI_API_BASE` to the loopback Continuum
-proxy and does not require `OPENAI_API_KEY` for that route. Treat any other
-custom provider base as a credential boundary and inspect current URL/header
-handling before supplying credentials. The local Continuum proxy recipe enables
-Privatemode shared prompt caching at the proxy layer, so callers do not need to
-send a per-request `cache_salt`.
-
-OpenSecret initializes one shared Tinfoil SDK client from `TINFOIL_API_KEY`.
-The SDK verifies enclave attestation, pins TLS to the verified enclave, and
-reuses its connection pool for models, chat, audio, and embeddings requests.
-
-## One-Time Setup
-
-Initialize submodules:
+## One-time setup
 
 ```sh
 git submodule update --init --recursive
-```
-
-Build the macOS-native Continuum proxy binary:
-
-```sh
+install -d -m 700 .local/secrets
+touch .local/secrets/tinfoil_api_key .local/secrets/continuum_api_key
+chmod 600 .local/secrets/tinfoil_api_key .local/secrets/continuum_api_key
 nix develop -c just build-local-proxies-macos
 ```
 
-This writes the generated binary under `.local/bin/`, which is gitignored:
+Populate the credential files without printing their contents. The generated
+proxy binary and secret directory are gitignored local state.
 
-```text
-.local/bin/continuum-proxy-darwin
-```
-
-The checked-in Linux Continuum proxy binary is not replaced.
-
-## Secrets
-
-For local development, store provider keys in gitignored files:
-
-```text
-.local/secrets/continuum_api_key
-.local/secrets/tinfoil_api_key
-```
-
-The run recipes also accept environment variables. The Tinfoil key is read by
-OpenSecret itself, not by a local sidecar:
+Enter `nix develop` once to prepare the local PostgreSQL state and create `.env`
+when absent. Review an existing `.env` rather than replacing it, then run:
 
 ```sh
-CONTINUUM_API_KEY=...
-TINFOIL_API_KEY=...
+just diesel-migration-run-local
 ```
 
-Prefer the gitignored files for day-to-day use so keys do not land in shell history.
+## Run
 
-## Environment
+Use separate terminals.
 
-The usual path is to enter the dev shell once and let its shell hook create
-`.env`:
-
-```sh
-nix develop
-```
-
-When `.env` does not already exist, `nix develop` starts from `.env.sample`,
-fills in the local Postgres URL, and generates local-only secret values.
-
-The `run-local-backend-macos` recipe injects the local Continuum proxy URL and
-direct Tinfoil API key when it starts the backend. If creating `.env` by hand
-and running `cargo run` directly, generate local-only secrets with OpenSSL and
-set these provider values yourself:
-
-```dotenv
-APP_MODE=local
-OPENAI_API_BASE=http://127.0.0.1:8092
-TINFOIL_API_KEY=<your key>
-ENCLAVE_SECRET_MOCK=<openssl rand -hex 32>
-JWT_SECRET=<openssl rand -hex 32>
-```
-
-## Running
-
-Use separate terminals:
+Terminal 1:
 
 ```sh
 nix develop -c just run-continuum-proxy-macos
-nix develop -c just diesel-migration-run-local
+```
+
+Terminal 2:
+
+```sh
 nix develop -c just run-local-backend-macos
 ```
 
-Then point Maple at the local backend from the Maple checkout:
+The backend recipe selects the loopback Continuum base and reads the Tinfoil
+credential. Any other custom provider base is a credential boundary; derive
+URL and header behavior from current source before supplying credentials.
+
+In Maple, set its ignored local configuration to:
 
 ```dotenv
 VITE_OPEN_SECRET_API_URL=http://127.0.0.1:3000
 ```
 
-and run:
-
-```sh
-nix develop -c just dev
-```
-
-That command starts Maple's web-only Research client. To exercise native
-Tauri behavior or Agent Mode, use Maple's desktop workflow instead:
-
-```sh
-nix develop -c just desktop-dev
-```
-
-## Notes
-
-- Production Linux/Nitro and local macOS Continuum proxy launches enable Privatemode shared prompt caching without a fixed prompt cache salt. The cache is shared by requests handled by the same proxy instance and is reset when that proxy restarts.
-- The macOS Continuum proxy binary is a generated local artifact only.
-- There is no local Tinfoil proxy process or port. Tinfoil traffic originates
-  from the OpenSecret process through the SDK's attested, origin-bound client.
-- Device builds, TestFlight, notarization, and production app signing still need Apple developer credentials configured separately.
+Follow the selected Maple revision's own `AGENTS.md` and development or
+validation skill when present. Browser Research and native Agent Mode are
+separate consumers; choose the path that exercises the changed contract.

@@ -16,7 +16,12 @@ Maple frontend    VITE_OPEN_SECRET_API_URL=http://127.0.0.1:3000
 
 In local mode, OpenSecret reads `.env` through `dotenv`.
 
-When `OPENAI_API_BASE` is not `api.openai.com`, OpenSecret treats it as the default Continuum-compatible proxy and does not require `OPENAI_API_KEY` for that route. The local Continuum proxy recipe enables Privatemode shared prompt caching at the proxy layer, so callers do not need to send a per-request `cache_salt`.
+The supported local recipe sets `OPENAI_API_BASE` to the loopback Continuum
+proxy and does not require `OPENAI_API_KEY` for that route. Treat any other
+custom provider base as a credential boundary and inspect current URL/header
+handling before supplying credentials. The local Continuum proxy recipe enables
+Privatemode shared prompt caching at the proxy layer, so callers do not need to
+send a per-request `cache_salt`.
 
 OpenSecret initializes one shared Tinfoil SDK client from `TINFOIL_API_KEY`.
 The SDK verifies enclave attestation, pins TLS to the verified enclave, and
@@ -108,6 +113,13 @@ and run:
 
 ```sh
 nix develop -c just dev
+```
+
+That command starts Maple's web-only Research client. To exercise native
+Tauri behavior or Agent Mode, use Maple's desktop workflow instead:
+
+```sh
+nix develop -c just desktop-dev
 ```
 
 ## Notes

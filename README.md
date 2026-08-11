@@ -1,153 +1,102 @@
 # OpenSecret
 
-This is the platform code for running OpenSecret's backend. This is intended to run on AWS Nitro inside an enclave.
+OpenSecret is the open-source Rust backend for confidential AI applications
+such as [Maple](https://github.com/OpenSecretCloud/Maple). It owns
+authentication, encrypted client sessions and persistence, provider routing,
+usage accounting, and OpenAI-shaped/Responses APIs carried inside the
+OpenSecret encrypted transport.
 
-## AWS Nitro Deployment
+Production is designed for AWS Nitro Enclaves. A source checkout or local build
+can validate implementation and build invariants, but does not by itself prove
+the artifact, PCR, IAM/KMS policy, logging, or network configuration of a
+deployed environment.
 
-When deploying to AWS Nitro, you'll need to choose the appropriate environment:
-- `dev` for development environment
-- `preview` for preview/staging environment  
-- `prod` for production environment
+## Local quick start
 
-The current flake exports only those three named EIFs. Supporting another
-environment requires adding and reviewing another named flake output.
+The Nix flake pins the Rust toolchain, PostgreSQL, Diesel, native libraries, and
+provider dependencies.
 
-Each environment has its own configuration, secrets, and infrastructure. Make sure to use the correct environment variables and AWS resources for your target environment.
+Before running migrations, confirm that the PostgreSQL listener and database
+belong to this checkout. The development shell may reuse any listener answering
+on its configured port; use distinct state and ports for concurrent checkouts.
+It may also start `.pgdata` and create `.env` from `.env.sample`. On Linux,
+container setup changes user-level state unless disabled. See
+[`docs/dev-shell.md`](docs/dev-shell.md) for controls.
 
-### New Nix-based Deployment
-
-The new deployment process uses Nix to create reproducible builds:
-
-1. Nix builds the pinned Nitro KMS/NSM helper sources as part of the EIF.
-   To inspect that helper closure independently on Linux ARM:
-```bash
-just build-nitro-bins
+```sh
+git submodule update --init --recursive
+OPENSECRET_DEV_CONTAINERS=0 nix develop
+just diesel-migration-run-local
 ```
 
-2. Build the EIF for your target environment:
-```bash
-# For development
-nix build '.?submodules=1#eif-dev'
+Backend startup does not run Diesel schema migrations;
+`src/migrations.rs` is separate application-data migration logic.
 
-# For production
-nix build '.?submodules=1#eif-prod'
+### Provider credentials and macOS stack
 
-# For preview
-nix build '.?submodules=1#eif-preview'
+Tinfoil runs in-process; there is no local Tinfoil sidecar. For protected
+credential files, the native Continuum proxy, process topology, and Maple
+wiring, follow [`docs/local-macos-stack.md`](docs/local-macos-stack.md).
+
+## Configuration and API boundary
+
+`.env.sample` is the supported local-development starting point; current
+startup source is authoritative. Keep real credentials in ignored files or
+protected environment variables. Billing and feature flags are optional
+external HTTP APIs whose administrative credentials remain in the backend;
+their server implementations are not part of this repository setup.
+
+Protected routes require OpenSecret attestation/key exchange and encrypted
+sessions. “OpenAI-shaped” describes decrypted payloads, not a plaintext
+OpenAI-compatible wire endpoint. Use an OpenSecret SDK or Maple for
+protected-route integration tests; plain `curl` is suitable only for public
+health probes.
+
+Contributor and coding-agent standards live in [`AGENTS.md`](AGENTS.md).
+Task-specific development, API, provider, security, and validation workflows
+live under [`.agents/skills/`](.agents/skills/).
+
+## Validation
+
+The Rust CI gate is formatting, strict all-target/all-feature Clippy, and locked
+all-feature tests. Run it through the pinned shell without starting local
+services:
+
+```sh
+OPENSECRET_DEV_POSTGRES=0 OPENSECRET_DEV_ENV=0 OPENSECRET_DEV_CONTAINERS=0 \
+  nix develop --no-write-lock-file -c cargo fmt --all -- --check
+OPENSECRET_DEV_POSTGRES=0 OPENSECRET_DEV_ENV=0 OPENSECRET_DEV_CONTAINERS=0 \
+  nix develop --no-write-lock-file -c env RUSTFLAGS='-D warnings' \
+  cargo clippy --locked --all-targets --all-features -- -D warnings
+OPENSECRET_DEV_POSTGRES=0 OPENSECRET_DEV_ENV=0 OPENSECRET_DEV_CONTAINERS=0 \
+  nix develop --no-write-lock-file -c env RUSTFLAGS='-D warnings' \
+  cargo test --locked --all-features
 ```
 
-This will create a symlink `result` pointing to the built EIF file.
+Default CI does not run ignored database or live-provider tests. Use the
+[`validate-opensecret`](.agents/skills/validate-opensecret/SKILL.md) workflow
+for disposable PostgreSQL tests, authorized provider checks, encrypted-client
+smoke tests, Nix checks, and release-only EIF/PCR evidence. Report those layers
+separately.
 
-3. Copy the EIF to your AWS parent instance:
-```bash
-# For development
-just scp-eif-to-aws-dev
+## Nitro builds and deployment
 
-# For production
-just scp-eif-to-aws-prod
+The supported EIF outputs are `eif-dev`, `eif-preview`, and `eif-prod`, built
+with the repository's Nix flake on the appropriate Linux/ARM environment. Build,
+PCR comparison, deployment, and live trust verification are distinct evidence.
 
-# For preview
-just scp-eif-to-aws-preview
-```
+Routine pull requests do not require EIF/PCR parity. Before an authorized dev
+or prod publish/deployment, use the supported Linux/ARM64 release builder to
+review and deliberately update/verify the target measurements; never update
+checked-in PCRs solely to clear ordinary pull-request CI.
 
-4. Deploy the EIF:
-```bash
-# For development
-just deploy-dev-nix
+See [`docs/nitro-deploy.md`](docs/nitro-deploy.md) for operator procedures.
+Changing PCR references or KMS policy, copying artifacts, starting or stopping
+enclaves, restarting remote services, staging, and deployment require explicit
+authorization for the named environment.
 
-# For production
-just deploy-prod-nix
+## Contributing
 
-# For preview
-just deploy-preview-nix
-```
-
-The deployment process will:
-1. Build the EIF
-2. Copy it to the AWS parent instance
-3. Prompt you to review the PCR values
-4. After confirmation, terminate any existing enclave
-5. Run the new enclave
-6. Restart the socat proxy
-
-### PCR Value Management
-
-The Nix build process generates PCR (Platform Configuration Register) values that are used by AWS KMS for attestation. You can:
-
-1. Copy PCR values to a reference file:
-```bash
-just copy-pcr-dev    # For development
-just copy-pcr-prod   # For production
-just copy-pcr-preview # For preview
-```
-
-2. Verify PCR values match the reference:
-```bash
-just verify-pcr-dev    # For development
-just verify-pcr-prod   # For production
-just verify-pcr-preview # For preview
-```
-
-This ensures the build is reproducible and matches the expected configuration.
-
-## Nitro Enclaves Setup
-
-The project uses AWS Nitro Enclaves and requires two helper artifacts:
-- `libnsm.so` - NSM (Nitro Security Module) library
-- `kmstool_enclave_cli` - KMS tool for key operations
-
-Nix builds both from fixed commits and hashes declared in
-`nix/nitro-bins/upstreams.nix`. The source repositories are:
-- [aws-nitro-enclaves-nsm-api](https://github.com/aws/aws-nitro-enclaves-nsm-api)
-- [aws-nitro-enclaves-sdk-c](https://github.com/aws/aws-nitro-enclaves-sdk-c)
-
-### Building Nitro Binaries
-
-To build the same helper derivation consumed by the EIF:
-
-```bash
-just build-nitro-bins
-```
-
-The build fetches only the reviewed, immutable sources and produces a Nix
-result; it never writes ELF binaries back into the repository. Normal EIF
-builds consume this derivation automatically.
-
-## Building and Deploying with Nix
-
-### Building the EIF
-
-1. Build an explicit EIF target using Nix; its helper closure is built
-   automatically (development shown):
-```bash
-nix build '.?submodules=1#eif-dev'
-```
-
-This will create a symlink `result` pointing to the built EIF file.
-
-### EIF construction contract
-
-The named Nix outputs are the only supported way to assemble the OpenSecret
-application root filesystem and EIF. The parent-instance credential requester
-and logging containers are operational services, not EIF build inputs.
-
-The Nix-based build:
-- Creates a more reproducible build environment
-- Source-builds Nitro helper artifacts from reviewed commits and hashes
-- Integrates with the Monzo aws-nitro-util for EIF creation
-- Preserves the application-facing helper CLI contract
-
-The resulting EIF is deployed with the environment-specific commands above.
-
-## CI/CD Requirements
-
-### GitHub Actions Runner
-
-This project requires a custom GitHub Actions runner with the following specifications:
-
-- Label: `ubuntu-22.04-arm64-4core`
-- Architecture: ARM64
-- Operating System: Ubuntu 22.04
-- Resources: 4 CPU cores
-
-The workflow uses this custom runner for both development and production builds. For more information about setting up custom GitHub Actions runners, see [GitHub's documentation](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners).
+Keep changes focused, add regression coverage at the owning boundary, and
+follow the relevant repository skill. Before opening a pull request, run every
+validation tier reached by the diff and state what remains unverified.

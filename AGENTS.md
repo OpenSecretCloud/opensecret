@@ -9,9 +9,10 @@ specialized work.
 1. Inspect the checkout, branch, remotes, submodules, and worktree before
    editing. Preserve unrelated changes. For new work, prefer current
    `origin/master` unless the task names another base.
-2. Initialize dependencies with `git submodule update --init --recursive` and
-   use the pinned Nix toolchain. Do not install substitute system toolchains
-   merely to bypass the repository environment.
+2. Inspect submodule status during review. Initialize dependencies with
+   `git submodule update --init --recursive` when building, testing, or working
+   in their contents. Use the pinned Nix toolchain; do not install substitute
+   system toolchains merely to bypass the repository environment.
 3. Remember that `nix develop` has stateful PostgreSQL, `.env`, and Linux
    container hooks. Use `docs/dev-shell.md` for controls and give concurrent
    checkouts distinct state and ports.
@@ -128,16 +129,22 @@ guidance.
 Use `$develop-opensecret` for the local stack and code-placement workflow. Use
 `$validate-opensecret` to choose focused tests, exact Rust CI parity,
 disposable-database validation, authorized provider probes, encrypted client
-smoke tests, and Nix/EIF checks.
+smoke tests, Nix checks, and release-only EIF/PCR evidence.
 
 Match evidence to the changed boundary. Report exact commands, counts, ignored
 or skipped tests, configured external services, and every unverified layer.
 
 ## Operator authority
 
-Local builds and read-only comparison of a built PCR against a reviewed,
-checked-in reference are validation when the task reaches that boundary. They
-are not deployment.
+EIF/PCR parity is a release and deployment gate, not an ordinary development
+or pull-request gate. If CI successfully builds an EIF and then fails only the
+PCR comparison after compiled inputs changed, record deferred release work;
+do not update references merely to make CI green. Treat an EIF build failure
+separately.
+
+Before publishing or deploying an authorized dev or prod EIF, build it on the
+supported Linux/ARM64 release builder, intentionally review its measurements,
+and complete the authorized reference, history, signing, and comparison work.
 
 Require explicit authorization for changing PCR references or histories, KMS
 or IAM policy, shared or remote migrations, copying artifacts to hosts,

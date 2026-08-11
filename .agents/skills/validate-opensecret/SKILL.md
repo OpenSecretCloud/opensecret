@@ -1,6 +1,6 @@
 ---
 name: validate-opensecret
-description: Validate OpenSecret changes with focused Rust tests, exact CI parity, disposable PostgreSQL migration and ignored-test proof, separately authorized provider checks, encrypted SDK or Maple smoke tests, and Nix/EIF/PCR evidence. Use before claiming backend work complete or when reviewing whether test evidence matches a changed API, provider, persistence, security, build, or deployment boundary.
+description: Validate OpenSecret changes with focused Rust tests, exact Rust CI parity, disposable PostgreSQL migration and ignored-test proof, separately authorized provider checks, encrypted SDK or Maple smoke tests, Nix checks, and release-only EIF/PCR evidence. Use before claiming backend work complete or when reviewing whether test evidence matches a changed API, provider, persistence, security, build, or deployment boundary.
 ---
 
 # Validate OpenSecret
@@ -17,7 +17,8 @@ applicable tiers. A higher tier supplements rather than replaces lower tiers.
 | Auth, encryption, persistence, reset, or SQL migration | Tier 1 plus Tier 2 when database state is involved. |
 | HTTP, middleware, SSE, Responses, or client contract | Tier 1 plus Tier 4; include affected SDK/Maple paths. |
 | Provider, model, routing, headers, usage, or attestation | Tier 1 plus focused provider tests; add authorized Tiers 3 and 4 when the claim reaches them. |
-| Nix, entrypoint, kernel, Nitro, EIF, or PCR | Tier 1 when Rust is affected plus Tier 5 on each available platform. |
+| Nix, entrypoint, kernel, or packaging | Tier 1 when Rust is affected plus applicable current-host Tier 5 checks. |
+| Authorized dev or prod publish/deployment | Tier 5 release EIF/PCR evidence on the supported Linux/ARM64 builder. |
 
 Keep credentials and user data out of commands, logs, fixtures, and tracked
 files. Never blanket-run `cargo test -- --ignored`: ignored tests mix
@@ -77,7 +78,7 @@ OPENSECRET_DEV_POSTGRES=0 OPENSECRET_DEV_ENV=0 OPENSECRET_DEV_CONTAINERS=0 \
   ./.agents/skills/validate-opensecret/scripts/disposable_db_tests.sh
 ```
 
-When the diff adds or changes the latest reversible migration, use
+When the diff adds a new, unreleased latest reversible migration, use
 `--redo-latest` instead. It includes the same validation and also exercises the
 latest down/up cycle inside that disposable lifecycle:
 
@@ -149,7 +150,7 @@ Configure billing or feature-flag API URLs/keys only when their public backend
 outcome is in scope. Treat them as external HTTP dependencies and test the
 changed success, denial, timeout, and unavailable behavior.
 
-## Tier 5: validate Nix, EIF, and PCR boundaries
+## Tier 5: validate Nix and release artifacts
 
 For current-host flake or packaging changes:
 
@@ -159,27 +160,30 @@ nix flake check --no-write-lock-file --print-build-logs
 nix build --no-link --no-write-lock-file .#default
 ```
 
-Current-host checks do not prove Linux/ARM EIF construction. On the supported
-Linux/ARM builder, development artifact/PCR validation is:
+EIF construction, PCR comparison, and reference/history updates are
+release-only work. Ordinary development and pull-request completion do not run
+or block on the all-PR PCR comparison. If CI successfully builds an EIF and
+then fails only because compiled inputs changed its measurements, report
+deferred release work and do not copy or sign CI values to make it green. Treat
+an EIF build failure separately.
 
-```sh
-nix build '.?submodules=1#eif-dev'
-cmp -s result/pcr.json pcrDev.json
-```
-
-Use production outputs only when production-image validation is in scope.
-Record the derivation and comparison result. Building and read-only comparison
-are not deployment; PCR mutation, artifact transfer, KMS changes, enclave
-lifecycle, staging, and deployment require explicit authorization.
+Immediately before an authorized dev or prod publish/deployment, use the
+supported Linux/ARM64 release builder and the operator runbook in
+`docs/nitro-deploy.md` to build the exact target, review its measurements, and
+deliberately update and verify the appropriate references and history. PCR
+mutation, signing, artifact transfer, KMS changes, enclave lifecycle, staging,
+and deployment require explicit authorization.
 
 ## Report without overclaiming
 
 Record the commit and dirty state, host, exact commands, test/ignored/skip
 counts, disposable database lifecycle, external authorization category, client
-configuration, artifact/PCR source, and every unrun or unavailable layer.
+configuration, and every unrun or unavailable layer. For release evidence,
+also record the target artifact and PCR source.
 
-Use narrow labels: **static/unit**, **disposable DB**, **live provider**,
-**local encrypted full stack**, **Linux/Nitro/PCR**, or **deployed** validated.
+Use narrow labels: **static/unit**, **disposable DB**, **live provider**, or
+**local encrypted full stack**. Use **Linux/Nitro/PCR** or **deployed** only for
+authorized release/deployment evidence.
 Failed, skipped, ignored, interrupted, timing-dependent, and unavailable checks
 remain exactly that; do not turn partial evidence into “fully tested” or
 “production ready.”

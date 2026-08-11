@@ -100,7 +100,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'status=$?; printf "disposable database validation failed at line %s (status %s)\n" "$LINENO" "$status" >&2; exit "$status"' ERR
 
-initdb -D "$pgdata" --username="$admin_user" \
+initdb -D "$pgdata" --username="$admin_user" --encoding=UTF8 \
   --auth-local=trust --auth-host=scram-sha-256 >/dev/null
 mkdir -p "$pgsockets"
 pg_ctl start -D "$pgdata" \
@@ -153,14 +153,15 @@ test "$(psql "$AEAD_TAMPER_TEST_DATABASE_URL" -Atqc \
   "SELECT count(*) FROM information_schema.tables
     WHERE table_schema = 'public'")" -eq 0
 
-diesel migration run --database-url "$AEAD_TAMPER_TEST_DATABASE_URL"
+diesel migration run --locked-schema \
+  --database-url "$AEAD_TAMPER_TEST_DATABASE_URL"
 expected_migrations="$(find migrations -type f -name up.sql | wc -l | tr -d ' ')"
 test "$expected_migrations" -gt 0
 assert_migration_count
 
 if [ "$redo_latest" -eq 1 ]; then
-  diesel migration redo --database-url "$AEAD_TAMPER_TEST_DATABASE_URL"
-  diesel migration run --database-url "$AEAD_TAMPER_TEST_DATABASE_URL"
+  diesel migration redo --locked-schema \
+    --database-url "$AEAD_TAMPER_TEST_DATABASE_URL"
   assert_migration_count
 fi
 

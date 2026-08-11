@@ -19,7 +19,8 @@ git submodule update --init --recursive
 install -d -m 700 .local/secrets
 touch .local/secrets/tinfoil_api_key .local/secrets/continuum_api_key
 chmod 600 .local/secrets/tinfoil_api_key .local/secrets/continuum_api_key
-nix develop -c just build-local-proxies-macos
+OPENSECRET_DEV_POSTGRES=0 OPENSECRET_DEV_ENV=0 OPENSECRET_DEV_CONTAINERS=0 \
+  nix develop --no-write-lock-file -c just build-local-proxies-macos
 ```
 
 Populate the credential files without printing their contents. The generated
@@ -39,7 +40,8 @@ Use separate terminals.
 Terminal 1:
 
 ```sh
-nix develop -c just run-continuum-proxy-macos
+OPENSECRET_DEV_POSTGRES=0 OPENSECRET_DEV_ENV=0 OPENSECRET_DEV_CONTAINERS=0 \
+  nix develop --no-write-lock-file -c just run-continuum-proxy-macos
 ```
 
 Terminal 2:

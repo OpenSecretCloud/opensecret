@@ -16,60 +16,35 @@ deployed environment.
 The Nix flake pins the Rust toolchain, PostgreSQL, Diesel, native libraries, and
 provider dependencies.
 
+Before running migrations, confirm that the PostgreSQL listener and database
+belong to this checkout. The development shell may reuse any listener answering
+on its configured port; use distinct state and ports for concurrent checkouts.
+It may also start `.pgdata` and create `.env` from `.env.sample`. On Linux,
+container setup changes user-level state unless disabled. See
+[`docs/dev-shell.md`](docs/dev-shell.md) for controls.
+
 ```sh
 git submodule update --init --recursive
 OPENSECRET_DEV_CONTAINERS=0 nix develop
 just diesel-migration-run-local
 ```
 
-The development shell may reuse a PostgreSQL listener, start `.pgdata`, and
-create `.env` from `.env.sample`. On Linux, container setup also changes
-user-level container configuration unless disabled. See
-[`docs/dev-shell.md`](docs/dev-shell.md) before running check-only commands or
-multiple checkouts.
-
 Backend startup does not run Diesel schema migrations;
 `src/migrations.rs` is separate application-data migration logic.
 
 ### Provider credentials and macOS stack
 
-Tinfoil runs in-process and requires a credential. The supported macOS local
-stack can also use a native Continuum proxy. Store credentials in these
-gitignored files:
-
-```text
-.local/secrets/tinfoil_api_key
-.local/secrets/continuum_api_key
-```
-
-Build the local proxy once, then run the long-lived processes in separate
-terminals:
-
-```sh
-nix develop -c just build-local-proxies-macos
-```
-
-Terminal 1:
-
-```sh
-nix develop -c just run-continuum-proxy-macos
-```
-
-Terminal 2:
-
-```sh
-nix develop -c just run-local-backend-macos
-```
-
-See [`docs/local-macos-stack.md`](docs/local-macos-stack.md) for topology and
-Maple wiring. There is no local Tinfoil sidecar.
+Tinfoil runs in-process; there is no local Tinfoil sidecar. For protected
+credential files, the native Continuum proxy, process topology, and Maple
+wiring, follow [`docs/local-macos-stack.md`](docs/local-macos-stack.md).
 
 ## Configuration and API boundary
 
-`.env.sample` is the configuration inventory. Keep all real credentials in
-ignored files or protected environment variables. Billing and feature flags
-are optional external HTTP APIs whose administrative credentials remain in the
-backend; their server implementations are not part of this repository setup.
+`.env.sample` is the supported local-development starting point; current
+startup source is authoritative. Keep real credentials in ignored files or
+protected environment variables. Billing and feature flags are optional
+external HTTP APIs whose administrative credentials remain in the backend;
+their server implementations are not part of this repository setup.
 
 Protected routes require OpenSecret attestation/key exchange and encrypted
 sessions. “OpenAI-shaped” describes decrypted payloads, not a plaintext
@@ -101,13 +76,19 @@ OPENSECRET_DEV_POSTGRES=0 OPENSECRET_DEV_ENV=0 OPENSECRET_DEV_CONTAINERS=0 \
 Default CI does not run ignored database or live-provider tests. Use the
 [`validate-opensecret`](.agents/skills/validate-opensecret/SKILL.md) workflow
 for disposable PostgreSQL tests, authorized provider checks, encrypted-client
-smoke tests, and Nix/EIF/PCR evidence. Report those layers separately.
+smoke tests, Nix checks, and release-only EIF/PCR evidence. Report those layers
+separately.
 
 ## Nitro builds and deployment
 
 The supported EIF outputs are `eif-dev`, `eif-preview`, and `eif-prod`, built
 with the repository's Nix flake on the appropriate Linux/ARM environment. Build,
 PCR comparison, deployment, and live trust verification are distinct evidence.
+
+Routine pull requests do not require EIF/PCR parity. Before an authorized dev
+or prod publish/deployment, use the supported Linux/ARM64 release builder to
+review and deliberately update/verify the target measurements; never update
+checked-in PCRs solely to clear ordinary pull-request CI.
 
 See [`docs/nitro-deploy.md`](docs/nitro-deploy.md) for operator procedures.
 Changing PCR references or KMS policy, copying artifacts, starting or stopping

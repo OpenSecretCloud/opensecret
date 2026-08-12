@@ -11,7 +11,10 @@ use crate::encrypt::{
 };
 use crate::jwt::validate_platform_jwt;
 use crate::login_routes::RegisterCredentials;
-use crate::model_config::{model_requires_feature_flag, ModelFeatureAccess};
+use crate::model_config::{
+    model_requires_feature_flag, ModelAliasTargets, ModelFeatureAccess, ModelPlan,
+    PaidModelAliasOverrides,
+};
 use crate::models::account_deletion::{AccountDeletionError, NewAccountDeletionRequest};
 use crate::models::email_verification::{EmailVerificationError, NewEmailVerification};
 use crate::models::oauth::{NewUserOAuthConnection, OAuthError};
@@ -43,7 +46,10 @@ use crate::{
     models::enclave_secrets::NewEnclaveSecret,
     private_key::{generate_twelve_word_seed, plaintext_user_seed_to_key},
 };
-use crate::{billing::BillingClient, web::platform::common::PROJECT_RESEND_API_KEY};
+use crate::{
+    billing::{BillingClient, ChatBillingAccess},
+    web::platform::common::PROJECT_RESEND_API_KEY,
+};
 use crate::{
     db::{setup_db, DBConnection, DBError},
     models::users::{NewUser, User, UserError},
@@ -122,7 +128,7 @@ mod aead_db_tamper_tests;
 use apple_signin::AppleJwtVerifier;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
 use provider_client::{ProviderClient, ProviderRequestError};
-use provider_routing::{ProviderName, ProviderPreference, ProviderRouter};
+use provider_routing::ProviderRouter;
 use proxy_config::ProxyRouter;
 
 const ENCLAVE_KEY_NAME: &str = "enclave_key";
@@ -143,7 +149,8 @@ const KAGI_API_KEY_NAME: &str = "kagi_api_key";
 const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
 const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
 const MODEL_ACCESS_FLAGS_TIMEOUT_SECS: u64 = 5;
-const PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS: u64 = 5;
+const MODEL_ALIAS_FLAGS_TIMEOUT_SECS: u64 = 5;
+const BILLING_ACCESS_TIMEOUT_SECS: u64 = 5;
 const MAX_ATTESTATION_NONCE_BYTES: usize = 512;
 const MAX_PENDING_ATTESTATIONS: usize = 65_536;
 const PENDING_ATTESTATION_TTL: Duration = Duration::from_secs(5 * 60);
@@ -386,6 +393,9 @@ pub enum ApiError {
     #[error("Free tier token limit exceeded")]
     FreeTokenLimitExceeded,
 
+    #[error("Model not available on current plan")]
+    ModelNotAvailableOnPlan,
+
     #[error("Message exceeds context limit")]
     MessageExceedsContextLimit,
 
@@ -422,6 +432,7 @@ impl IntoResponse for ApiError {
             ApiError::EmailAlreadyExists => StatusCode::CONFLICT,
             ApiError::UsageLimitReached => StatusCode::FORBIDDEN,
             ApiError::FreeTokenLimitExceeded => StatusCode::FORBIDDEN,
+            ApiError::ModelNotAvailableOnPlan => StatusCode::FORBIDDEN,
             ApiError::MessageExceedsContextLimit => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
@@ -990,6 +1001,46 @@ impl AppState {
         }
     }
 
+    /// Load one billing snapshot for quota, guest, and model-plan decisions.
+    /// Missing configuration, failures, and timeouts retain the existing
+    /// fail-open quota behavior while granting free-model access only.
+    pub(crate) async fn chat_billing_access(
+        &self,
+        user_uuid: Uuid,
+        is_api: bool,
+    ) -> Option<ChatBillingAccess> {
+        let Some(client) = &self.billing_client else {
+            trace!(
+                "billing client not configured; using free model access (user_uuid={})",
+                user_uuid
+            );
+            return None;
+        };
+
+        match tokio::time::timeout(
+            Duration::from_secs(BILLING_ACCESS_TIMEOUT_SECS),
+            client.chat_access(user_uuid, is_api),
+        )
+        .await
+        {
+            Ok(Ok(access)) => Some(access),
+            Ok(Err(e)) => {
+                warn!(
+                    "billing access check failed (user_uuid={}): {}; using free model access",
+                    user_uuid, e
+                );
+                None
+            }
+            Err(_) => {
+                warn!(
+                    "billing access check timed out after {}s (user_uuid={}); using free model access",
+                    BILLING_ACCESS_TIMEOUT_SECS, user_uuid
+                );
+                None
+            }
+        }
+    }
+
     /// Load all model-access flags as one snapshot so every model surface uses
     /// the same os-flags cache key. Missing configuration, missing flags, and
     /// control-plane failures all preserve the default-off behavior.
@@ -1027,7 +1078,7 @@ impl AppState {
     }
 
     /// Avoid an os-flags lookup for models that cannot be model-access gated.
-    /// Gated requests use the same two-flag snapshot as both model-list APIs.
+    /// Gated requests use the same model-access snapshot as both model-list APIs.
     pub(crate) async fn model_feature_access_for_request(
         &self,
         user_uuid: Uuid,
@@ -1040,53 +1091,50 @@ impl AppState {
         self.model_feature_access(user_uuid).await
     }
 
-    pub(crate) async fn provider_routing_preference(
+    /// Resolve the automatic model aliases for this user's plan. Paid alias
+    /// overrides are batched and default off on missing configuration, missing
+    /// flags, service failures, or timeouts. Free plans never apply overrides.
+    pub(crate) async fn model_alias_targets(
         &self,
         user_uuid: Uuid,
-        requested_model: &str,
-    ) -> Option<ProviderPreference> {
-        let flag_key = self
-            .provider_router
-            .continuum_flag_key_for_completion_model(requested_model)?;
+        model_plan: ModelPlan,
+    ) -> ModelAliasTargets {
+        if !model_plan.is_paid() {
+            return ModelAliasTargets::for_plan(model_plan);
+        }
 
         let Some(client) = &self.os_flags_client else {
             trace!(
-                "os-flags client not configured; using default provider routing for model {}",
-                requested_model
+                "os-flags client not configured; using default paid model aliases (user_uuid={})",
+                user_uuid
             );
-            return None;
+            return ModelAliasTargets::for_plan(model_plan);
         };
 
-        match tokio::time::timeout(
-            Duration::from_secs(PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS),
-            client.get_bool_flag(user_uuid, flag_key),
+        let overrides = match tokio::time::timeout(
+            Duration::from_secs(MODEL_ALIAS_FLAGS_TIMEOUT_SECS),
+            client.get_user_flags(user_uuid, Some(os_flags::PAID_MODEL_ALIAS_FLAG_KEYS)),
         )
         .await
         {
-            Ok(Ok(Some(true))) => Some(ProviderPreference::feature_flag(ProviderName::Continuum)),
-            Ok(Ok(Some(false))) => Some(ProviderPreference::feature_flag(ProviderName::Tinfoil)),
-            Ok(Ok(None)) => {
-                debug!(
-                    "os-flags provider routing flag missing (user_uuid={}, requested_model={}, flag_key={}); using default provider routing",
-                    user_uuid, requested_model, flag_key
-                );
-                None
-            }
+            Ok(Ok(response)) => PaidModelAliasOverrides::from_flag_values(&response.flags),
             Ok(Err(e)) => {
                 warn!(
-                    "os-flags provider routing check failed (user_uuid={}, requested_model={}, flag_key={}): {}; using default provider routing",
-                    user_uuid, requested_model, flag_key, e
+                    "os-flags paid model alias check failed (user_uuid={}): {}; using default aliases",
+                    user_uuid, e
                 );
-                None
+                PaidModelAliasOverrides::default()
             }
             Err(_) => {
                 warn!(
-                    "os-flags provider routing check timed out after {}s (user_uuid={}, requested_model={}, flag_key={}); using default provider routing",
-                    PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS, user_uuid, requested_model, flag_key
+                    "os-flags paid model alias check timed out after {}s (user_uuid={}); using default aliases",
+                    MODEL_ALIAS_FLAGS_TIMEOUT_SECS, user_uuid
                 );
-                None
+                PaidModelAliasOverrides::default()
             }
-        }
+        };
+
+        ModelAliasTargets::for_plan_with_overrides(model_plan, overrides)
     }
 
     fn password_login_identifier_for_user(user: &User) -> (PasswordLoginIdentifierKind, String) {

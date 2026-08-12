@@ -1,6 +1,6 @@
 use crate::model_config::{
-    filter_model_list_response_for_access, model_catalog_response, openai_models_response,
-    ModelAliasTargets, ModelFeatureAccess, ModelPlan,
+    filter_model_list_response_for_access, is_auto_model_alias, model_catalog_response,
+    openai_models_response, ModelAliasTargets, ModelFeatureAccess, ModelPlan,
 };
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
@@ -801,9 +801,12 @@ async fn proxy_openai(
         })?
         .to_string();
 
-    let model_name = ModelAliasTargets::for_plan(model_plan)
-        .resolve(&requested_model_name)
-        .to_string();
+    let alias_targets = if is_auto_model_alias(&requested_model_name) {
+        state.model_alias_targets(user.uuid, model_plan).await
+    } else {
+        ModelAliasTargets::for_plan(model_plan)
+    };
+    let model_name = alias_targets.resolve(&requested_model_name).to_string();
     if requested_model_name != model_name {
         debug!(
             "Resolved chat model {} to {}",
@@ -1662,8 +1665,8 @@ async fn proxy_model_catalog(
     let model_plan = ModelPlan::from_is_paid(
         billing_access.is_some_and(crate::billing::ChatBillingAccess::is_paid),
     );
-    let catalog_response =
-        model_catalog_response(model_access, ModelAliasTargets::for_plan(model_plan));
+    let alias_targets = state.model_alias_targets(user.uuid, model_plan).await;
+    let catalog_response = model_catalog_response(model_access, alias_targets);
     encrypt_response(&state, &session_id, &catalog_response).await
 }
 

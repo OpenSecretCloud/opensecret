@@ -7,9 +7,9 @@ use crate::{
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
     jwt::AuthContext,
     model_config::{
-        model_config, model_reasoning_history_strategy, resolve_public_model_id, ModelAliasTargets,
-        ModelFeatureAccess, ModelPlan, ReasoningHistoryStrategy, ResponsesModelConfig,
-        SamplingConfig,
+        is_auto_model_alias, model_config, model_reasoning_history_strategy,
+        resolve_public_model_id, ModelAliasTargets, ModelFeatureAccess, ModelPlan,
+        ReasoningHistoryStrategy, ResponsesModelConfig, SamplingConfig,
     },
     models::responses::{NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
@@ -442,6 +442,7 @@ mod tests {
     };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
+    use std::collections::HashMap;
     use tokio::{
         sync::{broadcast, mpsc},
         time::{timeout, Duration},
@@ -757,6 +758,53 @@ mod tests {
             auto_request["chat_template_kwargs"]["preserve_thinking"],
             true
         );
+
+        let overrides =
+            crate::model_config::PaidModelAliasOverrides::from_flag_values(&HashMap::from([
+                (
+                    crate::os_flags::PAID_QUICK_DEEPSEEK_ALIAS_FLAG_KEY.to_string(),
+                    true,
+                ),
+                (
+                    crate::os_flags::PAID_POWERFUL_GLM_ALIAS_FLAG_KEY.to_string(),
+                    true,
+                ),
+            ]));
+        let targets = ModelAliasTargets::for_plan_with_overrides(ModelPlan::Paid, overrides);
+        let paid_quick =
+            responses_request_for_model(targets.resolve(crate::model_config::AUTO_QUICK_MODEL_ID));
+        let paid_quick_request = build_model_turn_request(
+            &paid_quick,
+            &[json!({"role": "user", "content": "hello"})],
+            false,
+            None,
+        );
+        assert_eq!(
+            paid_quick_request["model"],
+            crate::model_config::DEEPSEEK_V4_FLASH_MODEL_ID
+        );
+        assert!(paid_quick_request.get("chat_template_kwargs").is_none());
+
+        let paid_powerful = responses_request_for_model(
+            targets.resolve(crate::model_config::AUTO_POWERFUL_MODEL_ID),
+        );
+        let paid_powerful_request = build_model_turn_request(
+            &paid_powerful,
+            &[json!({"role": "user", "content": "hello"})],
+            false,
+            None,
+        );
+        assert_eq!(
+            paid_powerful_request["model"],
+            crate::model_config::GLM_5_2_MODEL_ID
+        );
+        assert_eq!(
+            paid_powerful_request["chat_template_kwargs"]["clear_thinking"],
+            false
+        );
+        assert!(paid_powerful_request["chat_template_kwargs"]
+            .get("preserve_thinking")
+            .is_none());
     }
 
     #[test]
@@ -3097,9 +3145,12 @@ async fn create_response_stream(
         );
         return Err(ApiError::Unauthorized);
     }
-    let selected_model = ModelAliasTargets::for_plan(model_plan)
-        .resolve(&requested_model)
-        .to_string();
+    let alias_targets = if is_auto_model_alias(&requested_model) {
+        state.model_alias_targets(user.uuid, model_plan).await
+    } else {
+        ModelAliasTargets::for_plan(model_plan)
+    };
+    let selected_model = alias_targets.resolve(&requested_model).to_string();
     let completion_provider = state.proxy_router.get_completion_proxy();
     let model_access = state
         .model_feature_access_for_request(user.uuid, &selected_model)

@@ -18,6 +18,12 @@ pub const AGENT_FEATURE_FLAG_KEY: &str = "agent";
 pub const KAGI_WEB_SEARCH_FLAG_KEY: &str = "web-search.kagi";
 pub const KIMI_K3_MODEL_ACCESS_FLAG_KEY: &str = "model-access.kimi-k3";
 pub const MODEL_ACCESS_FLAG_KEYS: &[&str] = &[KIMI_K3_MODEL_ACCESS_FLAG_KEY];
+pub const PAID_QUICK_DEEPSEEK_ALIAS_FLAG_KEY: &str = "model-alias.paid.quick.deepseek-v4-flash";
+pub const PAID_POWERFUL_GLM_ALIAS_FLAG_KEY: &str = "model-alias.paid.powerful.glm-5-2";
+pub const PAID_MODEL_ALIAS_FLAG_KEYS: &[&str] = &[
+    PAID_QUICK_DEEPSEEK_ALIAS_FLAG_KEY,
+    PAID_POWERFUL_GLM_ALIAS_FLAG_KEY,
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum OsFlagsError {

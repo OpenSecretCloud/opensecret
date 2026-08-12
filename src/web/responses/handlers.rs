@@ -7,7 +7,7 @@ use crate::{
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
     jwt::AuthContext,
     model_config::{
-        model_config, model_reasoning_history_strategy, resolve_public_model_id,
+        model_config, model_reasoning_history_strategy, resolve_public_model_id, ModelAliasTargets,
         ModelFeatureAccess, ModelPlan, ReasoningHistoryStrategy, ResponsesModelConfig,
         SamplingConfig,
     },
@@ -437,7 +437,7 @@ mod tests {
     };
     use crate::web::responses::tools::WebSearchProvider;
     use crate::{
-        model_config::{ModelFeatureAccess, ModelPlan},
+        model_config::{ModelAliasTargets, ModelFeatureAccess, ModelPlan},
         ApiError,
     };
     use chrono::{TimeZone, Utc};
@@ -706,8 +706,10 @@ mod tests {
     }
 
     #[test]
-    fn test_build_model_turn_request_preserves_auto_alias_for_provider_resolution() {
-        let body = responses_request_for_model(crate::model_config::AUTO_QUICK_MODEL_ID);
+    fn test_build_model_turn_request_uses_resolved_alias_target() {
+        let targets = ModelAliasTargets::for_plan(ModelPlan::Free);
+        let body =
+            responses_request_for_model(targets.resolve(crate::model_config::AUTO_QUICK_MODEL_ID));
         let chat_request = build_model_turn_request(
             &body,
             &[json!({"role": "user", "content": "hello"})],
@@ -715,10 +717,7 @@ mod tests {
             None,
         );
 
-        assert_eq!(
-            chat_request["model"],
-            crate::model_config::AUTO_QUICK_MODEL_ID
-        );
+        assert_eq!(chat_request["model"], crate::model_config::QUICK_MODEL_ID);
     }
 
     #[test]
@@ -744,8 +743,10 @@ mod tests {
         );
         assert_eq!(glm_request["chat_template_kwargs"]["clear_thinking"], false);
 
-        let auto_powerful =
-            responses_request_for_model(crate::model_config::AUTO_POWERFUL_MODEL_ID);
+        let targets = ModelAliasTargets::for_plan(ModelPlan::Paid);
+        let auto_powerful = responses_request_for_model(
+            targets.resolve(crate::model_config::AUTO_POWERFUL_MODEL_ID),
+        );
         let auto_request = build_model_turn_request(
             &auto_powerful,
             &[json!({"role": "user", "content": "hello"})],
@@ -3096,12 +3097,15 @@ async fn create_response_stream(
         );
         return Err(ApiError::Unauthorized);
     }
+    let selected_model = ModelAliasTargets::for_plan(model_plan)
+        .resolve(&requested_model)
+        .to_string();
     let completion_provider = state.proxy_router.get_completion_proxy();
     let model_access = state
-        .model_feature_access_for_request(user.uuid, &requested_model)
+        .model_feature_access_for_request(user.uuid, &selected_model)
         .await;
     let resolved_model = resolve_responses_model(
-        &requested_model,
+        &selected_model,
         &completion_provider.provider_name,
         model_access,
         model_plan,
@@ -3111,8 +3115,8 @@ async fn create_response_stream(
             "Resolved responses model {} to {}",
             requested_model, resolved_model
         );
-        body.model = resolved_model;
     }
+    body.model = resolved_model;
 
     trace!("Request body: {:?}", body);
     trace!("Stream requested: {}", body.stream);

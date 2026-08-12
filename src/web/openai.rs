@@ -1,6 +1,6 @@
 use crate::model_config::{
     filter_model_list_response_for_access, model_catalog_response, openai_models_response,
-    ModelFeatureAccess, ModelPlan,
+    ModelAliasTargets, ModelFeatureAccess, ModelPlan,
 };
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
@@ -768,7 +768,7 @@ async fn proxy_openai(
     axum::Extension(session_id): axum::Extension<Uuid>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(auth_method): axum::Extension<AuthMethod>,
-    axum::Extension(body): axum::Extension<Value>,
+    axum::Extension(mut body): axum::Extension<Value>,
 ) -> Result<Response, ApiError> {
     let billing_access = state
         .chat_billing_access(user.uuid, auth_method == AuthMethod::ApiKey)
@@ -792,7 +792,7 @@ async fn proxy_openai(
     }
 
     // Extract the model from the request
-    let model_name = body
+    let requested_model_name = body
         .get("model")
         .and_then(|m| m.as_str())
         .ok_or_else(|| {
@@ -801,8 +801,21 @@ async fn proxy_openai(
         })?
         .to_string();
 
+    let model_name = ModelAliasTargets::for_plan(model_plan)
+        .resolve(&requested_model_name)
+        .to_string();
+    if requested_model_name != model_name {
+        debug!(
+            "Resolved chat model {} to {}",
+            requested_model_name, model_name
+        );
+        body.as_object_mut()
+            .expect("model was read from a JSON object")
+            .insert("model".to_string(), json!(model_name));
+    }
+
     // Create billing context
-    let billing_context = BillingContext::new(auth_method, model_name.clone());
+    let billing_context = BillingContext::new(auth_method, requested_model_name);
 
     let model_access = state
         .model_feature_access_for_request(user.uuid, &model_name)
@@ -1642,8 +1655,15 @@ async fn proxy_model_catalog(
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(_body): axum::Extension<()>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
-    let model_access = state.model_feature_access(user.uuid).await;
-    let catalog_response = model_catalog_response(model_access);
+    let (model_access, billing_access) = tokio::join!(
+        state.model_feature_access(user.uuid),
+        state.chat_billing_access(user.uuid, false)
+    );
+    let model_plan = ModelPlan::from_is_paid(
+        billing_access.is_some_and(crate::billing::ChatBillingAccess::is_paid),
+    );
+    let catalog_response =
+        model_catalog_response(model_access, ModelAliasTargets::for_plan(model_plan));
     encrypt_response(&state, &session_id, &catalog_response).await
 }
 

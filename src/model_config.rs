@@ -101,7 +101,12 @@ struct ModelAliasEntry {
     label: &'static str,
     short_name: &'static str,
     description: &'static str,
-    target_model: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ModelAliasTargets {
+    quick: &'static str,
+    powerful: &'static str,
 }
 
 pub const DEFAULT_CONTEXT_WINDOW: usize = 64_000;
@@ -111,6 +116,16 @@ pub const AUTO_QUICK_MODEL_ID: &str = "auto:quick";
 pub const AUTO_POWERFUL_MODEL_ID: &str = "auto:powerful";
 pub const QUICK_MODEL_ID: &str = "gpt-oss-120b";
 pub const POWERFUL_MODEL_ID: &str = "kimi-k2-6";
+
+const FREE_MODEL_ALIAS_TARGETS: ModelAliasTargets = ModelAliasTargets {
+    quick: QUICK_MODEL_ID,
+    powerful: POWERFUL_MODEL_ID,
+};
+
+const PAID_MODEL_ALIAS_TARGETS: ModelAliasTargets = ModelAliasTargets {
+    quick: QUICK_MODEL_ID,
+    powerful: POWERFUL_MODEL_ID,
+};
 
 const DEFAULT_SAMPLING_CONFIG: SamplingConfig = SamplingConfig {
     temperature: DEFAULT_TEMPERATURE,
@@ -411,6 +426,37 @@ impl ModelPlan {
     }
 }
 
+impl ModelAliasTargets {
+    pub(crate) const fn for_plan(plan: ModelPlan) -> Self {
+        match plan {
+            ModelPlan::Free => FREE_MODEL_ALIAS_TARGETS,
+            ModelPlan::Paid => PAID_MODEL_ALIAS_TARGETS,
+        }
+    }
+
+    pub(crate) fn resolve(self, model: &str) -> &str {
+        match model {
+            AUTO_QUICK_MODEL_ID => self.quick,
+            AUTO_POWERFUL_MODEL_ID => self.powerful,
+            _ => model,
+        }
+    }
+
+    fn target_for(self, alias: &str) -> Option<&'static str> {
+        match alias {
+            AUTO_QUICK_MODEL_ID => Some(self.quick),
+            AUTO_POWERFUL_MODEL_ID => Some(self.powerful),
+            _ => None,
+        }
+    }
+}
+
+impl Default for ModelAliasTargets {
+    fn default() -> Self {
+        Self::for_plan(ModelPlan::Free)
+    }
+}
+
 impl ModelCapabilities {
     const fn chat(reasoning: bool, vision: bool) -> Self {
         Self {
@@ -441,14 +487,17 @@ impl ModelCapabilities {
 }
 
 impl ModelAliasEntry {
-    fn catalog_json(self) -> Value {
-        let target = model_entry(self.target_model);
+    fn catalog_json(self, alias_targets: ModelAliasTargets) -> Value {
+        let target_model = alias_targets
+            .target_for(self.id)
+            .expect("catalog alias must have a configured target");
+        let target = model_entry(target_model);
         json!({
             "id": self.id,
             "label": self.label,
             "short_name": self.short_name,
             "description": self.description,
-            "target_model": self.target_model,
+            "target_model": target_model,
             "access": target.map(|entry| entry.access.as_str()).unwrap_or("free"),
             "capabilities": target.map(|entry| entry.capabilities.json()).unwrap_or_else(|| ModelCapabilities::chat(false, false).json()),
         })
@@ -598,22 +647,17 @@ const MODEL_ALIAS_ENTRIES: &[ModelAliasEntry] = &[
         label: "Quick",
         short_name: "Quick",
         description: "Fast, everyday responses",
-        target_model: QUICK_MODEL_ID,
     },
     ModelAliasEntry {
         id: AUTO_POWERFUL_MODEL_ID,
         label: "Powerful",
         short_name: "Powerful",
         description: "Deeper thinking & analysis",
-        target_model: POWERFUL_MODEL_ID,
     },
 ];
 
 fn alias_target(model: &str) -> Option<&'static str> {
-    MODEL_ALIAS_ENTRIES
-        .iter()
-        .find(|entry| entry.id == model)
-        .map(|entry| entry.target_model)
+    ModelAliasTargets::default().target_for(model)
 }
 
 fn model_entry(model: &str) -> Option<ModelConfigEntry> {
@@ -686,7 +730,10 @@ pub fn model_supports_reasoning_history(model: &str) -> bool {
     model_reasoning_history_strategy(model).is_some()
 }
 
-pub fn model_catalog_response(access: ModelFeatureAccess) -> Value {
+pub(crate) fn model_catalog_response(
+    access: ModelFeatureAccess,
+    alias_targets: ModelAliasTargets,
+) -> Value {
     let data = MODEL_CONFIGS
         .iter()
         .filter(|entry| entry.listed && access.allows_model(entry.id))
@@ -694,8 +741,12 @@ pub fn model_catalog_response(access: ModelFeatureAccess) -> Value {
         .collect::<Vec<_>>();
     let aliases = MODEL_ALIAS_ENTRIES
         .iter()
-        .filter(|entry| access.allows_model(entry.target_model))
-        .map(|entry| entry.catalog_json())
+        .filter(|entry| {
+            alias_targets
+                .target_for(entry.id)
+                .is_some_and(|target| access.allows_model(target))
+        })
+        .map(|entry| entry.catalog_json(alias_targets))
         .collect::<Vec<_>>();
 
     json!({
@@ -968,6 +1019,16 @@ mod tests {
     }
 
     #[test]
+    fn test_model_alias_targets_are_selected_by_plan() {
+        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+            let targets = ModelAliasTargets::for_plan(plan);
+            assert_eq!(targets.resolve(AUTO_QUICK_MODEL_ID), QUICK_MODEL_ID);
+            assert_eq!(targets.resolve(AUTO_POWERFUL_MODEL_ID), POWERFUL_MODEL_ID);
+            assert_eq!(targets.resolve("glm-5-2"), "glm-5-2");
+        }
+    }
+
+    #[test]
     fn test_model_plan_enforces_catalog_access_tiers_and_alias_targets() {
         for model in [
             "gpt-oss-120b",
@@ -998,7 +1059,8 @@ mod tests {
 
     #[test]
     fn test_catalog_hides_api_only_models_and_includes_aliases() {
-        let response = model_catalog_response(ModelFeatureAccess::default());
+        let response =
+            model_catalog_response(ModelFeatureAccess::default(), ModelAliasTargets::default());
         let data = response["data"].as_array().expect("catalog data");
         assert!(data.iter().any(|model| model["id"] == QUICK_MODEL_ID));
         assert!(!data
@@ -1013,6 +1075,27 @@ mod tests {
         assert!(aliases
             .iter()
             .any(|alias| alias["id"] == AUTO_POWERFUL_MODEL_ID));
+
+        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+            let catalog = model_catalog_response(
+                ModelFeatureAccess::default(),
+                ModelAliasTargets::for_plan(plan),
+            );
+            let aliases = catalog["aliases"].as_array().expect("aliases");
+            let quick = aliases
+                .iter()
+                .find(|alias| alias["id"] == AUTO_QUICK_MODEL_ID)
+                .expect("quick alias");
+            let powerful = aliases
+                .iter()
+                .find(|alias| alias["id"] == AUTO_POWERFUL_MODEL_ID)
+                .expect("powerful alias");
+
+            assert_eq!(quick["target_model"], QUICK_MODEL_ID);
+            assert_eq!(quick["access"], "free");
+            assert_eq!(powerful["target_model"], POWERFUL_MODEL_ID);
+            assert_eq!(powerful["access"], "pro");
+        }
     }
 
     #[test]
@@ -1030,7 +1113,8 @@ mod tests {
 
     #[test]
     fn test_catalog_advertises_voxtral_as_default_speech_model() {
-        let response = model_catalog_response(ModelFeatureAccess::default());
+        let response =
+            model_catalog_response(ModelFeatureAccess::default(), ModelAliasTargets::default());
 
         assert_eq!(response["audio"]["speech"]["available"], true);
         assert_eq!(response["audio"]["speech"]["model"], "voxtral-tts");
@@ -1039,7 +1123,8 @@ mod tests {
 
     #[test]
     fn test_catalog_advertises_kimi_through_continuum() {
-        let catalog = model_catalog_response(ModelFeatureAccess::default());
+        let catalog =
+            model_catalog_response(ModelFeatureAccess::default(), ModelAliasTargets::default());
         let kimi = catalog_model(&catalog, POWERFUL_MODEL_ID);
 
         assert_eq!(kimi["provider"], "continuum");
@@ -1056,7 +1141,7 @@ mod tests {
             (ModelFeatureAccess::default(), false),
             (ModelFeatureAccess::new(true), true),
         ] {
-            let catalog = model_catalog_response(access);
+            let catalog = model_catalog_response(access, ModelAliasTargets::default());
             let openai_models = openai_models_response(access);
 
             assert_eq!(has_model(&catalog, "kimi-k3"), kimi_visible);
@@ -1070,7 +1155,8 @@ mod tests {
 
     #[test]
     fn test_enriched_catalog_has_only_verified_gated_model_metadata() {
-        let catalog = model_catalog_response(ModelFeatureAccess::new(true));
+        let catalog =
+            model_catalog_response(ModelFeatureAccess::new(true), ModelAliasTargets::default());
         let kimi = catalog_model(&catalog, "kimi-k3");
         assert_eq!(kimi["provider_id"], "kimi-k3");
         assert_eq!(kimi["context_window"], 256_000);

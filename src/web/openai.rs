@@ -929,17 +929,9 @@ pub async fn get_chat_completion_response(
 
     ensure_completion_model_access(&requested_model_name, model_access, model_plan)?;
 
-    let provider_preference = state
-        .provider_routing_preference(user.uuid, &requested_model_name)
-        .await;
     let selected_route = state
         .provider_router
-        .select_completion_route_with_preference(
-            &state.proxy_router,
-            user.uuid,
-            &requested_model_name,
-            provider_preference,
-        )
+        .select_completion_route(&state.proxy_router, user.uuid, &requested_model_name)
         .map_err(|err| match err {
             ProviderRoutingError::UnsupportedModel(model) => {
                 error!("Unsupported completion model requested: {}", model);

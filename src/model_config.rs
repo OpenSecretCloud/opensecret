@@ -42,6 +42,8 @@ impl SamplingConfig {
 struct ModelConfigEntry {
     id: &'static str,
     provider_id: &'static str,
+    catalog_provider: &'static str,
+    catalog_provider_id: &'static str,
     display_name: &'static str,
     short_name: &'static str,
     description: &'static str,
@@ -157,6 +159,8 @@ impl ModelConfigEntry {
         Self {
             id,
             provider_id: id,
+            catalog_provider: "tinfoil",
+            catalog_provider_id: id,
             display_name,
             short_name,
             description,
@@ -193,6 +197,8 @@ impl ModelConfigEntry {
         Self {
             id,
             provider_id: id,
+            catalog_provider: "tinfoil",
+            catalog_provider_id: id,
             display_name,
             short_name,
             description,
@@ -227,6 +233,8 @@ impl ModelConfigEntry {
         Self {
             id,
             provider_id: id,
+            catalog_provider: "tinfoil",
+            catalog_provider_id: id,
             display_name,
             short_name,
             description,
@@ -249,6 +257,16 @@ impl ModelConfigEntry {
         self
     }
 
+    const fn with_catalog_provider(
+        mut self,
+        provider: &'static str,
+        provider_id: &'static str,
+    ) -> Self {
+        self.catalog_provider = provider;
+        self.catalog_provider_id = provider_id;
+        self
+    }
+
     const fn with_catalog_metadata(mut self, metadata: ModelCatalogMetadata) -> Self {
         self.catalog_metadata = Some(metadata);
         self
@@ -260,8 +278,8 @@ impl ModelConfigEntry {
             "object": "model",
             "created": 0,
             "owned_by": "opensecret",
-            "provider": "tinfoil",
-            "provider_id": self.provider_id,
+            "provider": self.catalog_provider,
+            "provider_id": self.catalog_provider_id,
             "display_name": self.display_name,
             "short_name": self.short_name,
             "description": self.description,
@@ -518,7 +536,8 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         false,
         40,
         256_000,
-    ),
+    )
+    .with_catalog_provider("continuum", "kimi-k2.6"),
     ModelConfigEntry::new(
         "glm-5-2",
         "GLM 5.2",
@@ -1026,6 +1045,19 @@ mod tests {
         assert_eq!(response["audio"]["speech"]["available"], true);
         assert_eq!(response["audio"]["speech"]["model"], "voxtral-tts");
         assert_eq!(response["audio"]["speech"]["display_name"], "Voxtral TTS");
+    }
+
+    #[test]
+    fn test_catalog_advertises_kimi_through_continuum() {
+        let catalog = model_catalog_response(ModelFeatureAccess::default());
+        let kimi = catalog_model(&catalog, POWERFUL_MODEL_ID);
+
+        assert_eq!(kimi["provider"], "continuum");
+        assert_eq!(kimi["provider_id"], "kimi-k2.6");
+        assert_eq!(
+            resolve_completion_model_id(POWERFUL_MODEL_ID),
+            Some(POWERFUL_MODEL_ID)
+        );
     }
 
     #[test]

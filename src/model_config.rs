@@ -1,6 +1,6 @@
 //! Central model-specific configuration and public model catalog.
 
-use crate::os_flags::{DEEPSEEK_V4_FLASH_MODEL_ACCESS_FLAG_KEY, KIMI_K3_MODEL_ACCESS_FLAG_KEY};
+use crate::os_flags::KIMI_K3_MODEL_ACCESS_FLAG_KEY;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -93,7 +93,6 @@ struct ModelCatalogMetadata {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ModelFeatureAccess {
     kimi_k3: bool,
-    deepseek_v4_flash: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -351,11 +350,8 @@ impl ModelCatalogMetadata {
 }
 
 impl ModelFeatureAccess {
-    pub(crate) const fn new(kimi_k3: bool, deepseek_v4_flash: bool) -> Self {
-        Self {
-            kimi_k3,
-            deepseek_v4_flash,
-        }
+    pub(crate) const fn new(kimi_k3: bool) -> Self {
+        Self { kimi_k3 }
     }
 
     pub(crate) fn from_flag_values(flags: &HashMap<String, bool>) -> Self {
@@ -364,17 +360,12 @@ impl ModelFeatureAccess {
                 .get(KIMI_K3_MODEL_ACCESS_FLAG_KEY)
                 .copied()
                 .unwrap_or(false),
-            flags
-                .get(DEEPSEEK_V4_FLASH_MODEL_ACCESS_FLAG_KEY)
-                .copied()
-                .unwrap_or(false),
         )
     }
 
     fn flag_enabled(self, flag_key: &str) -> bool {
         match flag_key {
             KIMI_K3_MODEL_ACCESS_FLAG_KEY => self.kimi_k3,
-            DEEPSEEK_V4_FLASH_MODEL_ACCESS_FLAG_KEY => self.deepseek_v4_flash,
             _ => false,
         }
     }
@@ -566,7 +557,6 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         60,
         800_000,
     )
-    .requiring_feature_flag(DEEPSEEK_V4_FLASH_MODEL_ACCESS_FLAG_KEY)
     .with_catalog_metadata(ModelCatalogMetadata::new(
         &["text"],
         &["text"],
@@ -1061,23 +1051,18 @@ mod tests {
     }
 
     #[test]
-    fn test_gated_model_visibility_is_default_off_and_independent() {
-        for (access, kimi_visible, deepseek_visible) in [
-            (ModelFeatureAccess::default(), false, false),
-            (ModelFeatureAccess::new(true, false), true, false),
-            (ModelFeatureAccess::new(false, true), false, true),
-            (ModelFeatureAccess::new(true, true), true, true),
+    fn test_kimi_visibility_is_default_off_and_deepseek_is_generally_available() {
+        for (access, kimi_visible) in [
+            (ModelFeatureAccess::default(), false),
+            (ModelFeatureAccess::new(true), true),
         ] {
             let catalog = model_catalog_response(access);
             let openai_models = openai_models_response(access);
 
             assert_eq!(has_model(&catalog, "kimi-k3"), kimi_visible);
-            assert_eq!(has_model(&catalog, "deepseek-v4-flash"), deepseek_visible);
+            assert!(has_model(&catalog, "deepseek-v4-flash"));
             assert_eq!(has_model(&openai_models, "kimi-k3"), kimi_visible);
-            assert_eq!(
-                has_model(&openai_models, "deepseek-v4-flash"),
-                deepseek_visible
-            );
+            assert!(has_model(&openai_models, "deepseek-v4-flash"));
             assert!(has_model(&catalog, QUICK_MODEL_ID));
             assert!(has_model(&openai_models, QUICK_MODEL_ID));
         }
@@ -1085,7 +1070,7 @@ mod tests {
 
     #[test]
     fn test_enriched_catalog_has_only_verified_gated_model_metadata() {
-        let catalog = model_catalog_response(ModelFeatureAccess::new(true, true));
+        let catalog = model_catalog_response(ModelFeatureAccess::new(true));
         let kimi = catalog_model(&catalog, "kimi-k3");
         assert_eq!(kimi["provider_id"], "kimi-k3");
         assert_eq!(kimi["context_window"], 256_000);
@@ -1110,7 +1095,7 @@ mod tests {
         assert_eq!(deepseek["capabilities"]["tool_use"], true);
         assert_eq!(deepseek["tasks"], json!(["generate"]));
 
-        let minimal = openai_models_response(ModelFeatureAccess::new(true, true));
+        let minimal = openai_models_response(ModelFeatureAccess::new(true));
         let minimal_kimi = catalog_model(&minimal, "kimi-k3");
         assert!(minimal_kimi.get("input_modalities").is_none());
         assert!(minimal_kimi.get("parameter_size").is_none());
@@ -1121,13 +1106,13 @@ mod tests {
         let mut flags = HashMap::new();
         let access = ModelFeatureAccess::from_flag_values(&flags);
         assert!(!access.allows_model("kimi-k3"));
-        assert!(!access.allows_model("deepseek-v4-flash"));
+        assert!(access.allows_model("deepseek-v4-flash"));
         assert!(access.allows_model("gpt-oss-120b"));
 
         flags.insert(KIMI_K3_MODEL_ACCESS_FLAG_KEY.to_string(), true);
         let access = ModelFeatureAccess::from_flag_values(&flags);
         assert!(access.allows_model("kimi-k3"));
-        assert!(!access.allows_model("deepseek-v4-flash"));
+        assert!(access.allows_model("deepseek-v4-flash"));
     }
 
     #[test]
@@ -1142,10 +1127,10 @@ mod tests {
             ]
         });
 
-        filter_model_list_response_for_access(&mut response, ModelFeatureAccess::new(true, false));
+        filter_model_list_response_for_access(&mut response, ModelFeatureAccess::default());
 
-        assert!(has_model(&response, "kimi-k3"));
-        assert!(!has_model(&response, "deepseek-v4-flash"));
+        assert!(!has_model(&response, "kimi-k3"));
+        assert!(has_model(&response, "deepseek-v4-flash"));
         assert!(has_model(&response, "provider-specific-model"));
         assert_eq!(response["data"].as_array().expect("data").len(), 3);
     }
@@ -1153,7 +1138,7 @@ mod tests {
     #[test]
     fn test_model_feature_flag_requirements_are_exact() {
         assert!(model_requires_feature_flag("kimi-k3"));
-        assert!(model_requires_feature_flag("deepseek-v4-flash"));
+        assert!(!model_requires_feature_flag("deepseek-v4-flash"));
         assert!(!model_requires_feature_flag("kimi-k2-6"));
         assert!(!model_requires_feature_flag("deepseek-v4-flash-0731"));
         assert!(!model_requires_feature_flag("unknown-model"));

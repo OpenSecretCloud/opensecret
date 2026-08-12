@@ -2450,14 +2450,14 @@ mod tests {
         assert!(matches!(
             ensure_completion_model_access(
                 "kimi-k3",
-                ModelFeatureAccess::new(true, false),
+                ModelFeatureAccess::new(true),
                 ModelPlan::Free
             ),
             Err(ApiError::ModelNotAvailableOnPlan)
         ));
         assert!(ensure_completion_model_access(
             "kimi-k3",
-            ModelFeatureAccess::new(true, false),
+            ModelFeatureAccess::new(true),
             ModelPlan::Paid
         )
         .is_ok());
@@ -2465,21 +2465,13 @@ mod tests {
             ensure_completion_model_access(
                 "deepseek-v4-flash",
                 ModelFeatureAccess::default(),
-                ModelPlan::Paid
-            ),
-            Err(ApiError::BadRequest)
-        ));
-        assert!(matches!(
-            ensure_completion_model_access(
-                "deepseek-v4-flash",
-                ModelFeatureAccess::new(false, true),
                 ModelPlan::Free
             ),
             Err(ApiError::ModelNotAvailableOnPlan)
         ));
         assert!(ensure_completion_model_access(
             "deepseek-v4-flash",
-            ModelFeatureAccess::new(false, true),
+            ModelFeatureAccess::default(),
             ModelPlan::Paid
         )
         .is_ok());
@@ -2505,7 +2497,6 @@ mod tests {
             ),
             Err(ApiError::ModelNotAvailableOnPlan)
         ));
-
         // The feature gate does not replace normal model validation. Ungated and
         // unknown IDs continue to the existing provider-routing validation path.
         assert!(ensure_completion_model_access(
@@ -2523,7 +2514,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_model_response_filter_hides_gated_models_independently() {
+    fn provider_model_response_filter_hides_only_gated_models() {
         fn visible_ids(access: ModelFeatureAccess) -> Vec<String> {
             let mut response = json!({
                 "object": "list",
@@ -2544,17 +2535,12 @@ mod tests {
                 .collect()
         }
 
-        assert_eq!(visible_ids(ModelFeatureAccess::default()), ["gpt-oss-120b"]);
         assert_eq!(
-            visible_ids(ModelFeatureAccess::new(true, false)),
-            ["gpt-oss-120b", "kimi-k3"]
-        );
-        assert_eq!(
-            visible_ids(ModelFeatureAccess::new(false, true)),
+            visible_ids(ModelFeatureAccess::default()),
             ["gpt-oss-120b", "deepseek-v4-flash"]
         );
         assert_eq!(
-            visible_ids(ModelFeatureAccess::new(true, true)),
+            visible_ids(ModelFeatureAccess::new(true)),
             ["gpt-oss-120b", "kimi-k3", "deepseek-v4-flash"]
         );
     }

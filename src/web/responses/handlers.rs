@@ -619,7 +619,7 @@ mod tests {
             resolve_responses_model(
                 "kimi-k3",
                 "tinfoil",
-                ModelFeatureAccess::new(true, false),
+                ModelFeatureAccess::new(true),
                 ModelPlan::Paid
             )
             .unwrap(),
@@ -629,7 +629,7 @@ mod tests {
             resolve_responses_model(
                 "kimi-k3",
                 "tinfoil",
-                ModelFeatureAccess::new(true, false),
+                ModelFeatureAccess::new(true),
                 ModelPlan::Free
             ),
             Err(ApiError::ModelNotAvailableOnPlan)
@@ -652,6 +652,25 @@ mod tests {
             )
             .unwrap(),
             "glm-5-2"
+        );
+        assert!(matches!(
+            resolve_responses_model(
+                "deepseek-v4-flash",
+                "tinfoil",
+                ModelFeatureAccess::default(),
+                ModelPlan::Free
+            ),
+            Err(ApiError::ModelNotAvailableOnPlan)
+        ));
+        assert_eq!(
+            resolve_responses_model(
+                "deepseek-v4-flash",
+                "tinfoil",
+                ModelFeatureAccess::default(),
+                ModelPlan::Paid
+            )
+            .unwrap(),
+            "deepseek-v4-flash"
         );
     }
 

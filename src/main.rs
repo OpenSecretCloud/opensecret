@@ -1074,7 +1074,7 @@ impl AppState {
     }
 
     /// Avoid an os-flags lookup for models that cannot be model-access gated.
-    /// Gated requests use the same two-flag snapshot as both model-list APIs.
+    /// Gated requests use the same model-access snapshot as both model-list APIs.
     pub(crate) async fn model_feature_access_for_request(
         &self,
         user_uuid: Uuid,

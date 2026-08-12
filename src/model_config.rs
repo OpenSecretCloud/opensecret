@@ -65,6 +65,13 @@ pub enum ModelAccessTier {
     Pro,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ModelPlan {
+    #[default]
+    Free,
+    Paid,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelCapabilities {
     pub chat: bool,
@@ -369,6 +376,29 @@ impl ModelAccessTier {
             Self::Starter => "starter",
             Self::Pro => "pro",
         }
+    }
+
+    const fn is_available_to(self, plan: ModelPlan) -> bool {
+        matches!(self, Self::Free) || matches!(plan, ModelPlan::Paid)
+    }
+}
+
+impl ModelPlan {
+    pub(crate) const fn from_is_paid(is_paid: bool) -> Self {
+        if is_paid {
+            Self::Paid
+        } else {
+            Self::Free
+        }
+    }
+
+    pub(crate) const fn is_paid(self) -> bool {
+        matches!(self, Self::Paid)
+    }
+
+    pub(crate) fn allows_model(self, model: &str) -> bool {
+        let canonical = alias_target(model).unwrap_or(model);
+        model_entry(canonical).is_none_or(|entry| entry.access.is_available_to(self))
     }
 }
 
@@ -926,6 +956,35 @@ mod tests {
             Some("deepseek-v4-flash")
         );
         assert_eq!(resolve_public_model_id("unknown-model"), None);
+    }
+
+    #[test]
+    fn test_model_plan_enforces_catalog_access_tiers_and_alias_targets() {
+        for model in [
+            "gpt-oss-120b",
+            "gpt-oss-safeguard-120b",
+            "llama3-3-70b",
+            AUTO_QUICK_MODEL_ID,
+            "unknown-model",
+        ] {
+            assert!(ModelPlan::Free.allows_model(model), "free model: {model}");
+            assert!(ModelPlan::Paid.allows_model(model), "paid model: {model}");
+        }
+
+        for model in [
+            "gemma4-31b",
+            "kimi-k3",
+            "kimi-k2-6",
+            "glm-5-2",
+            "deepseek-v4-flash",
+            AUTO_POWERFUL_MODEL_ID,
+        ] {
+            assert!(
+                !ModelPlan::Free.allows_model(model),
+                "free plan should deny: {model}"
+            );
+            assert!(ModelPlan::Paid.allows_model(model), "paid model: {model}");
+        }
     }
 
     #[test]

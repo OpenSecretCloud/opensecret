@@ -1,6 +1,6 @@
 use crate::model_config::{
     filter_model_list_response_for_access, model_catalog_response, openai_models_response,
-    ModelFeatureAccess,
+    ModelFeatureAccess, ModelPlan,
 };
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
@@ -770,60 +770,25 @@ async fn proxy_openai(
     axum::Extension(auth_method): axum::Extension<AuthMethod>,
     axum::Extension(body): axum::Extension<Value>,
 ) -> Result<Response, ApiError> {
+    let billing_access = state
+        .chat_billing_access(user.uuid, auth_method == AuthMethod::ApiKey)
+        .await;
+    let model_plan = ModelPlan::from_is_paid(
+        billing_access.is_some_and(crate::billing::ChatBillingAccess::is_paid),
+    );
+
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
-    if user.is_guest() {
-        if let Some(billing_client) = &state.billing_client {
-            match billing_client.is_user_paid(user.uuid).await {
-                Ok(true) => {
-                    debug!("Paid guest user allowed for chat: {}", user.uuid);
-                }
-                Ok(false) => {
-                    error!(
-                        "Free guest user attempted to use chat feature: {}",
-                        user.uuid
-                    );
-                    return Err(ApiError::Unauthorized);
-                }
-                Err(e) => {
-                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
-                    return Err(ApiError::Unauthorized);
-                }
-            }
-        } else {
-            error!(
-                "Guest user attempted to use chat without billing client: {}",
-                user.uuid
-            );
-            return Err(ApiError::Unauthorized);
-        }
+    if user.is_guest() && !model_plan.is_paid() {
+        error!(
+            "Guest user without a paid plan attempted to use chat: {}",
+            user.uuid
+        );
+        return Err(ApiError::Unauthorized);
     }
 
-    // Check billing if client exists
-    if let Some(billing_client) = &state.billing_client {
-        debug!(
-            "Checking billing server for user {} (auth_method: {:?})",
-            user.uuid, auth_method
-        );
-        let can_chat_result = if auth_method == AuthMethod::ApiKey {
-            billing_client.can_user_chat_api(user.uuid).await
-        } else {
-            billing_client.can_user_chat(user.uuid).await
-        };
-
-        match can_chat_result {
-            Ok(true) => {
-                // User can chat, proceed with existing logic
-                debug!("Billing service passed for user {}", user.uuid);
-            }
-            Ok(false) => {
-                error!("Usage limit reached for user: {}", user.uuid);
-                return Err(ApiError::UsageLimitReached);
-            }
-            Err(e) => {
-                // Log the error but allow the request
-                error!("Billing service error, allowing request: {}", e);
-            }
-        }
+    if billing_access.is_some_and(|access| !access.can_use()) {
+        error!("Usage limit reached for user: {}", user.uuid);
+        return Err(ApiError::UsageLimitReached);
     }
 
     // Extract the model from the request
@@ -844,9 +809,16 @@ async fn proxy_openai(
         .await;
 
     // Get the completion stream - billing happens automatically inside!
-    let completion =
-        get_chat_completion_response(&state, &user, body, &headers, billing_context, model_access)
-            .await?;
+    let completion = get_chat_completion_response(
+        &state,
+        &user,
+        body,
+        &headers,
+        billing_context,
+        model_access,
+        model_plan,
+    )
+    .await?;
 
     debug!(
         "Received completion from provider: {} (streaming: {})",
@@ -925,6 +897,7 @@ pub async fn get_chat_completion_response(
     headers: &HeaderMap,
     mut billing_context: BillingContext,
     model_access: ModelFeatureAccess,
+    model_plan: ModelPlan,
 ) -> Result<CompletionStream, ApiError> {
     if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
@@ -954,7 +927,7 @@ pub async fn get_chat_completion_response(
         })?
         .to_string();
 
-    ensure_completion_model_access(&requested_model_name, model_access)?;
+    ensure_completion_model_access(&requested_model_name, model_access, model_plan)?;
 
     let provider_preference = state
         .provider_routing_preference(user.uuid, &requested_model_name)
@@ -1279,10 +1252,19 @@ pub async fn get_chat_completion_response(
 pub(crate) fn ensure_completion_model_access(
     model_name: &str,
     model_access: ModelFeatureAccess,
+    model_plan: ModelPlan,
 ) -> Result<(), ApiError> {
     if !model_access.allows_model(model_name) {
         error!("Unsupported completion model requested: {}", model_name);
         return Err(ApiError::BadRequest);
+    }
+
+    if !model_plan.allows_model(model_name) {
+        error!(
+            "Paid completion model requested without entitlement: {}",
+            model_name
+        );
+        return Err(ApiError::ModelNotAvailableOnPlan);
     }
 
     Ok(())
@@ -2464,41 +2446,88 @@ mod tests {
     use super::*;
 
     #[test]
-    fn completion_model_access_is_independent_and_default_off() {
-        for model in ["kimi-k3", "deepseek-v4-flash"] {
-            assert!(matches!(
-                ensure_completion_model_access(model, ModelFeatureAccess::default()),
-                Err(ApiError::BadRequest)
-            ));
-        }
-
-        let kimi_only = ModelFeatureAccess::new(true, false);
-        assert!(ensure_completion_model_access("kimi-k3", kimi_only).is_ok());
+    fn completion_model_access_enforces_feature_and_plan_gates() {
         assert!(matches!(
-            ensure_completion_model_access("deepseek-v4-flash", kimi_only),
+            ensure_completion_model_access(
+                "kimi-k3",
+                ModelFeatureAccess::default(),
+                ModelPlan::Paid
+            ),
             Err(ApiError::BadRequest)
         ));
-
-        let deepseek_only = ModelFeatureAccess::new(false, true);
-        assert!(ensure_completion_model_access("deepseek-v4-flash", deepseek_only).is_ok());
         assert!(matches!(
-            ensure_completion_model_access("kimi-k3", deepseek_only),
+            ensure_completion_model_access(
+                "kimi-k3",
+                ModelFeatureAccess::new(true, false),
+                ModelPlan::Free
+            ),
+            Err(ApiError::ModelNotAvailableOnPlan)
+        ));
+        assert!(ensure_completion_model_access(
+            "kimi-k3",
+            ModelFeatureAccess::new(true, false),
+            ModelPlan::Paid
+        )
+        .is_ok());
+        assert!(matches!(
+            ensure_completion_model_access(
+                "deepseek-v4-flash",
+                ModelFeatureAccess::default(),
+                ModelPlan::Paid
+            ),
             Err(ApiError::BadRequest)
         ));
-
-        let both = ModelFeatureAccess::new(true, true);
-        assert!(ensure_completion_model_access("kimi-k3", both).is_ok());
-        assert!(ensure_completion_model_access("deepseek-v4-flash", both).is_ok());
+        assert!(matches!(
+            ensure_completion_model_access(
+                "deepseek-v4-flash",
+                ModelFeatureAccess::new(false, true),
+                ModelPlan::Free
+            ),
+            Err(ApiError::ModelNotAvailableOnPlan)
+        ));
+        assert!(ensure_completion_model_access(
+            "deepseek-v4-flash",
+            ModelFeatureAccess::new(false, true),
+            ModelPlan::Paid
+        )
+        .is_ok());
+        assert!(matches!(
+            ensure_completion_model_access(
+                "glm-5-2",
+                ModelFeatureAccess::default(),
+                ModelPlan::Free
+            ),
+            Err(ApiError::ModelNotAvailableOnPlan)
+        ));
+        assert!(ensure_completion_model_access(
+            "glm-5-2",
+            ModelFeatureAccess::default(),
+            ModelPlan::Paid
+        )
+        .is_ok());
+        assert!(matches!(
+            ensure_completion_model_access(
+                crate::model_config::AUTO_POWERFUL_MODEL_ID,
+                ModelFeatureAccess::default(),
+                ModelPlan::Free
+            ),
+            Err(ApiError::ModelNotAvailableOnPlan)
+        ));
 
         // The feature gate does not replace normal model validation. Ungated and
         // unknown IDs continue to the existing provider-routing validation path.
-        assert!(
-            ensure_completion_model_access("gpt-oss-120b", ModelFeatureAccess::default()).is_ok()
-        );
-        assert!(
-            ensure_completion_model_access("not-a-real-model", ModelFeatureAccess::default())
-                .is_ok()
-        );
+        assert!(ensure_completion_model_access(
+            "gpt-oss-120b",
+            ModelFeatureAccess::default(),
+            ModelPlan::Free
+        )
+        .is_ok());
+        assert!(ensure_completion_model_access(
+            "not-a-real-model",
+            ModelFeatureAccess::default(),
+            ModelPlan::Free
+        )
+        .is_ok());
     }
 
     #[test]

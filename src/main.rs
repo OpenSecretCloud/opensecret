@@ -43,7 +43,10 @@ use crate::{
     models::enclave_secrets::NewEnclaveSecret,
     private_key::{generate_twelve_word_seed, plaintext_user_seed_to_key},
 };
-use crate::{billing::BillingClient, web::platform::common::PROJECT_RESEND_API_KEY};
+use crate::{
+    billing::{BillingClient, ChatBillingAccess},
+    web::platform::common::PROJECT_RESEND_API_KEY,
+};
 use crate::{
     db::{setup_db, DBConnection, DBError},
     models::users::{NewUser, User, UserError},
@@ -144,6 +147,7 @@ const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
 const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
 const MODEL_ACCESS_FLAGS_TIMEOUT_SECS: u64 = 5;
 const PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS: u64 = 5;
+const BILLING_ACCESS_TIMEOUT_SECS: u64 = 5;
 const MAX_ATTESTATION_NONCE_BYTES: usize = 512;
 const MAX_PENDING_ATTESTATIONS: usize = 65_536;
 const PENDING_ATTESTATION_TTL: Duration = Duration::from_secs(5 * 60);
@@ -386,6 +390,9 @@ pub enum ApiError {
     #[error("Free tier token limit exceeded")]
     FreeTokenLimitExceeded,
 
+    #[error("Model not available on current plan")]
+    ModelNotAvailableOnPlan,
+
     #[error("Message exceeds context limit")]
     MessageExceedsContextLimit,
 
@@ -422,6 +429,7 @@ impl IntoResponse for ApiError {
             ApiError::EmailAlreadyExists => StatusCode::CONFLICT,
             ApiError::UsageLimitReached => StatusCode::FORBIDDEN,
             ApiError::FreeTokenLimitExceeded => StatusCode::FORBIDDEN,
+            ApiError::ModelNotAvailableOnPlan => StatusCode::FORBIDDEN,
             ApiError::MessageExceedsContextLimit => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
@@ -986,6 +994,46 @@ impl AppState {
                     user_uuid, flag_key, e
                 );
                 false
+            }
+        }
+    }
+
+    /// Load one billing snapshot for quota, guest, and model-plan decisions.
+    /// Missing configuration, failures, and timeouts retain the existing
+    /// fail-open quota behavior while granting free-model access only.
+    pub(crate) async fn chat_billing_access(
+        &self,
+        user_uuid: Uuid,
+        is_api: bool,
+    ) -> Option<ChatBillingAccess> {
+        let Some(client) = &self.billing_client else {
+            trace!(
+                "billing client not configured; using free model access (user_uuid={})",
+                user_uuid
+            );
+            return None;
+        };
+
+        match tokio::time::timeout(
+            Duration::from_secs(BILLING_ACCESS_TIMEOUT_SECS),
+            client.chat_access(user_uuid, is_api),
+        )
+        .await
+        {
+            Ok(Ok(access)) => Some(access),
+            Ok(Err(e)) => {
+                warn!(
+                    "billing access check failed (user_uuid={}): {}; using free model access",
+                    user_uuid, e
+                );
+                None
+            }
+            Err(_) => {
+                warn!(
+                    "billing access check timed out after {}s (user_uuid={}); using free model access",
+                    BILLING_ACCESS_TIMEOUT_SECS, user_uuid
+                );
+                None
             }
         }
     }

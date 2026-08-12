@@ -2,13 +2,14 @@
 //! Phases 4 & 5: Always streams to client while concurrently storing to database.
 
 use crate::{
-    billing::BillingError,
+    billing::{BillingError, ChatBillingAccess},
     db::DBError,
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
     jwt::AuthContext,
     model_config::{
         model_config, model_reasoning_history_strategy, resolve_public_model_id,
-        ModelFeatureAccess, ReasoningHistoryStrategy, ResponsesModelConfig, SamplingConfig,
+        ModelFeatureAccess, ModelPlan, ReasoningHistoryStrategy, ResponsesModelConfig,
+        SamplingConfig,
     },
     models::responses::{NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
@@ -133,8 +134,9 @@ fn resolve_responses_model(
     requested_model: &str,
     completion_provider_name: &str,
     model_access: ModelFeatureAccess,
+    model_plan: ModelPlan,
 ) -> Result<String, ApiError> {
-    ensure_completion_model_access(requested_model, model_access)?;
+    ensure_completion_model_access(requested_model, model_access, model_plan)?;
 
     match resolve_public_model_id(requested_model) {
         Some(model) => Ok(model.to_string()),
@@ -434,7 +436,10 @@ mod tests {
         MAPLE_WEB_SEARCH_PROMPT, MAX_WEB_SEARCH_TOOL_TURNS,
     };
     use crate::web::responses::tools::WebSearchProvider;
-    use crate::{model_config::ModelFeatureAccess, ApiError};
+    use crate::{
+        model_config::{ModelFeatureAccess, ModelPlan},
+        ApiError,
+    };
     use chrono::{TimeZone, Utc};
     use serde_json::json;
     use tokio::{
@@ -600,41 +605,66 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_responses_models_enforces_independent_feature_access() {
-        let cases = [
-            (
+    fn test_resolve_responses_models_enforces_feature_and_plan_gates() {
+        assert!(matches!(
+            resolve_responses_model(
                 "kimi-k3",
-                ModelFeatureAccess::new(true, false),
-                ModelFeatureAccess::new(false, true),
+                "tinfoil",
+                ModelFeatureAccess::default(),
+                ModelPlan::Paid
             ),
-            (
-                "deepseek-v4-flash",
-                ModelFeatureAccess::new(false, true),
+            Err(ApiError::BadRequest)
+        ));
+        assert_eq!(
+            resolve_responses_model(
+                "kimi-k3",
+                "tinfoil",
                 ModelFeatureAccess::new(true, false),
+                ModelPlan::Paid
+            )
+            .unwrap(),
+            "kimi-k3"
+        );
+        assert!(matches!(
+            resolve_responses_model(
+                "kimi-k3",
+                "tinfoil",
+                ModelFeatureAccess::new(true, false),
+                ModelPlan::Free
             ),
-        ];
-
-        for (model, enabled_access, wrong_model_access) in cases {
-            assert!(matches!(
-                resolve_responses_model(model, "tinfoil", ModelFeatureAccess::default()),
-                Err(ApiError::BadRequest)
-            ));
-            assert!(matches!(
-                resolve_responses_model(model, "tinfoil", wrong_model_access),
-                Err(ApiError::BadRequest)
-            ));
-            assert_eq!(
-                resolve_responses_model(model, "tinfoil", enabled_access).unwrap(),
-                model
-            );
-        }
+            Err(ApiError::ModelNotAvailableOnPlan)
+        ));
+        assert!(matches!(
+            resolve_responses_model(
+                "glm-5-2",
+                "tinfoil",
+                ModelFeatureAccess::default(),
+                ModelPlan::Free
+            ),
+            Err(ApiError::ModelNotAvailableOnPlan)
+        ));
+        assert_eq!(
+            resolve_responses_model(
+                "glm-5-2",
+                "tinfoil",
+                ModelFeatureAccess::default(),
+                ModelPlan::Paid
+            )
+            .unwrap(),
+            "glm-5-2"
+        );
     }
 
     #[test]
     fn test_resolve_responses_model_allows_ungated_model_by_default() {
         assert_eq!(
-            resolve_responses_model("llama3-3-70b", "tinfoil", ModelFeatureAccess::default())
-                .unwrap(),
+            resolve_responses_model(
+                "llama3-3-70b",
+                "tinfoil",
+                ModelFeatureAccess::default(),
+                ModelPlan::Free
+            )
+            .unwrap(),
             "llama3-3-70b"
         );
     }
@@ -1897,6 +1927,7 @@ async fn spawn_title_generation_task(
             &headers,
             billing_context,
             ModelFeatureAccess::default(),
+            ModelPlan::Free,
         )
         .await
         {
@@ -2005,7 +2036,6 @@ async fn spawn_title_generation_task(
 /// Ensures the request is valid before proceeding.
 ///
 /// Operations:
-/// - Validates user is not guest
 /// - Gets user encryption key
 /// - Normalizes message content to Parts format
 /// - Validates no unsupported features (file uploads)
@@ -2017,34 +2047,6 @@ async fn validate_and_normalize_input(
     auth_context: &AuthContext,
     body: &ResponsesCreateRequest,
 ) -> Result<PreparedRequest, ApiError> {
-    // Check if guest user is allowed (paid guests are allowed, free guests are not)
-    if user.is_guest() {
-        if let Some(billing_client) = &state.billing_client {
-            match billing_client.is_user_paid(user.uuid).await {
-                Ok(true) => {
-                    debug!("Paid guest user allowed for Responses API: {}", user.uuid);
-                }
-                Ok(false) => {
-                    error!(
-                        "Free guest user attempted to use Responses API: {}",
-                        user.uuid
-                    );
-                    return Err(ApiError::Unauthorized);
-                }
-                Err(e) => {
-                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
-                    return Err(ApiError::Unauthorized);
-                }
-            }
-        } else {
-            error!(
-                "Guest user attempted to use Responses API without billing client: {}",
-                user.uuid
-            );
-            return Err(ApiError::Unauthorized);
-        }
-    }
-
     // Get user's encryption key
     let user_key = state
         .get_user_key(user, auth_context, None, None)
@@ -2140,6 +2142,7 @@ async fn build_context_and_check_billing(
     body: &ResponsesCreateRequest,
     user_key: &SecretKey,
     prepared: &PreparedRequest,
+    billing_access: Option<ChatBillingAccess>,
 ) -> Result<BuiltContext, ApiError> {
     let web_search_provider = select_web_search_provider(state.as_ref(), user.uuid, body).await;
     let internal_system_prompt = build_internal_system_prompt(web_search_provider);
@@ -2184,19 +2187,14 @@ async fn build_context_and_check_billing(
         prompt_messages.len()
     );
 
-    // Check billing with token validation (BEFORE any persistence)
-    // Only check for free users to save processing
-    if let Some(billing_client) = &state.billing_client {
+    // Check billing with token validation (BEFORE any persistence).
+    if let Some(billing_access) = billing_access {
         debug!(
             "Checking billing for user {} with {} input tokens",
             user.uuid, total_prompt_tokens
         );
 
-        // Responses API always uses JWT auth (not API key), so is_api = false
-        if let Err(e) = billing_client
-            .check_user_chat_with_tokens(user.uuid, false, total_prompt_tokens as i32)
-            .await
-        {
+        if let Err(e) = billing_access.check_with_tokens(total_prompt_tokens as i32) {
             match e {
                 BillingError::UsageLimitExceeded => {
                     error!("Usage limit exceeded for user: {}", user.uuid);
@@ -2606,6 +2604,7 @@ async fn stream_one_assistant_turn(
     user: &User,
     body: &ResponsesCreateRequest,
     model_access: ModelFeatureAccess,
+    model_plan: ModelPlan,
     headers: &HeaderMap,
     prompt_messages: &[Value],
     tools_enabled: bool,
@@ -2657,6 +2656,7 @@ async fn stream_one_assistant_turn(
         headers,
         billing_context,
         model_access,
+        model_plan,
     )
     .await?;
 
@@ -2914,6 +2914,7 @@ async fn setup_completion_processor(
     user: &User,
     body: &ResponsesCreateRequest,
     model_access: ModelFeatureAccess,
+    model_plan: ModelPlan,
     context: &BuiltContext,
     prepared: &PreparedRequest,
     persisted: &PersistedData,
@@ -2938,6 +2939,7 @@ async fn setup_completion_processor(
                 user,
                 body,
                 model_access,
+                model_plan,
                 headers,
                 &prompt_messages,
                 tools_enabled,
@@ -3065,6 +3067,16 @@ async fn create_response_stream(
     trace!("=== ENTERING create_response_stream ===");
     trace!("User: {}", user.uuid);
     let requested_model = body.model.clone();
+    let billing_access = state.chat_billing_access(user.uuid, false).await;
+    let model_plan =
+        ModelPlan::from_is_paid(billing_access.is_some_and(ChatBillingAccess::is_paid));
+    if user.is_guest() && !model_plan.is_paid() {
+        error!(
+            "Guest user without a paid plan attempted to use Responses API: {}",
+            user.uuid
+        );
+        return Err(ApiError::Unauthorized);
+    }
     let completion_provider = state.proxy_router.get_completion_proxy();
     let model_access = state
         .model_feature_access_for_request(user.uuid, &requested_model)
@@ -3073,6 +3085,7 @@ async fn create_response_stream(
         &requested_model,
         &completion_provider.provider_name,
         model_access,
+        model_plan,
     )?;
     if requested_model != resolved_model {
         debug!(
@@ -3115,9 +3128,15 @@ async fn create_response_stream(
     let prepared = validate_and_normalize_input(&state, &user, &auth_context, &body).await?;
 
     // Phase 2: Build context and check billing
-    let context =
-        build_context_and_check_billing(&state, &user, &body, &prepared.user_key, &prepared)
-            .await?;
+    let context = build_context_and_check_billing(
+        &state,
+        &user,
+        &body,
+        &prepared.user_key,
+        &prepared,
+        billing_access,
+    )
+    .await?;
 
     // Phase 3: Persist request data
     let persisted =
@@ -3288,6 +3307,7 @@ async fn create_response_stream(
                         &orchestrator_user,
                         &orchestrator_body,
                         model_access,
+                        model_plan,
                         &context_for_completion,
                         &prepared_for_completion,
                         &persisted_for_completion,

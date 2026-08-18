@@ -28,3 +28,11 @@ For concurrent live checkouts, choose distinct `PGDATA`, `PGSOCKETS`, `PGPORT`,
 `DATABASE_URL`, and backend bind addresses. Verify the database identity before
 running migrations or destructive tests; never assume that a responding port
 belongs to the current checkout.
+
+## Logging
+
+`APP_MODE=local` writes line-buffered tracing to stdout so redirected `cargo run`
+logs appear immediately. When `RUST_LOG` is unset the default is
+`opensecret=debug` plus `axum_login`, `tower_sessions`, `sqlx=warn`, and
+`tower_http`. Override `RUST_LOG` to quiet or expand that set. Do not log
+secrets, tokens, decrypted bodies, or raw provider payloads.

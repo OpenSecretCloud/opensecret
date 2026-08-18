@@ -82,7 +82,7 @@ use tokio::spawn;
 use tokio::sync::RwLock;
 use tokio::task::{self};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use url::Url;
 use uuid::Uuid;
@@ -564,6 +564,32 @@ fn optional_env(name: &str) -> Option<String> {
     normalize_optional_env(env::var(name))
 }
 
+/// Default `RUST_LOG` when unset. The binary crate is `opensecret`; the old
+/// `sg_backend` default matched no events, so local `cargo run` was silent.
+const DEFAULT_RUST_LOG_FILTER: &str =
+    "opensecret=debug,axum_login=debug,tower_sessions=debug,sqlx=warn,tower_http=debug";
+
+fn init_tracing(app_mode: &AppMode) -> Result<(), Error> {
+    let filter = EnvFilter::new(
+        std::env::var("RUST_LOG").unwrap_or_else(|_| DEFAULT_RUST_LOG_FILTER.to_string()),
+    );
+    let fmt = tracing_subscriber::fmt::layer().with_ansi(false);
+    if matches!(app_mode, AppMode::Local) {
+        // File-redirected stdout is block-buffered; local debug needs lines
+        // to appear in workspace / `cargo run` logs immediately.
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt.with_writer(|| std::io::LineWriter::new(std::io::stdout())))
+            .try_init()?;
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(fmt)
+            .try_init()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod optional_env_tests {
     use super::*;
@@ -580,6 +606,25 @@ mod optional_env_tests {
         assert_eq!(
             normalize_optional_env(Ok("  configured value  ".to_string())),
             Some("configured value".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod default_log_filter_tests {
+    use super::*;
+
+    #[test]
+    fn default_filter_targets_the_opensecret_crate() {
+        assert!(
+            DEFAULT_RUST_LOG_FILTER
+                .split(',')
+                .any(|directive| directive == "opensecret=debug"),
+            "local default must enable opensecret=debug: {DEFAULT_RUST_LOG_FILTER}"
+        );
+        assert!(
+            !DEFAULT_RUST_LOG_FILTER.contains("sg_backend"),
+            "stale sg_backend default hides every local application log: {DEFAULT_RUST_LOG_FILTER}"
         );
     }
 }
@@ -3395,10 +3440,6 @@ async fn retrieve_kagi_api_key(
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    // Add debug logs for entrypoints and exit points
-    tracing::debug!("Starting application");
-
-    // Load .env file
     dotenv::dotenv().ok();
 
     let app_mode = std::env::var("APP_MODE")
@@ -3406,15 +3447,9 @@ async fn main() -> Result<(), Error> {
         .parse::<AppMode>()
         .expect("Invalid APP_MODE");
 
-    tracing_subscriber::registry()
-        .with(EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(
-            |_| {
-                "sg_backend=debug,axum_login=debug,tower_sessions=debug,sqlx=warn,tower_http=debug"
-                    .into()
-            },
-        )))
-        .with(tracing_subscriber::fmt::layer().with_ansi(false))
-        .try_init()?;
+    init_tracing(&app_mode)?;
+    info!(app_mode = %app_mode, "OpenSecret logging initialized");
+    debug!("Starting application");
 
     let aws_credential_manager = if app_mode != AppMode::Local {
         Arc::new(RwLock::new(Some(AwsCredentialManager::new())))

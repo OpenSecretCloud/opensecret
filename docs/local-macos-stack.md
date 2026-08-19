@@ -50,6 +50,9 @@ Terminal 2:
 nix develop -c just run-local-backend-macos
 ```
 
+Local backend logs are line-buffered on stdout. Follow that terminal, or the
+capturing process's log file (workspace-managed starts use `logs/opensecret.log`).
+
 The backend recipe selects the loopback Continuum base and reads the Tinfoil
 credential. Any other custom provider base is a credential boundary; derive
 URL and header behavior from current source before supplying credentials.

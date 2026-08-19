@@ -1,5 +1,4 @@
 use crate::model_config::{resolve_completion_model_id, resolve_public_model_id};
-use crate::os_flags::KIMI_K2_6_CONTINUUM_FLAG_KEY;
 use crate::proxy_config::{canonicalize_tinfoil_model, ProxyConfig, ProxyRouter};
 use uuid::Uuid;
 
@@ -21,31 +20,8 @@ impl ProviderName {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProviderSelectionSource {
     StaticSplit,
-    FeatureFlag,
     DefaultProvider,
     Fallback,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProviderPreference {
-    provider: ProviderName,
-    source: ProviderSelectionSource,
-}
-
-impl ProviderPreference {
-    pub(crate) const fn feature_flag(provider: ProviderName) -> Self {
-        Self {
-            provider,
-            source: ProviderSelectionSource::FeatureFlag,
-        }
-    }
-
-    const fn default_provider(provider: ProviderName) -> Self {
-        Self {
-            provider,
-            source: ProviderSelectionSource::DefaultProvider,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,7 +43,6 @@ struct ModelProviderRoute {
 struct ModelRoutingConfig {
     public_model_id: &'static str,
     routes: &'static [ModelProviderRoute],
-    continuum_flag_key: Option<&'static str>,
     default_provider: Option<ProviderName>,
 }
 
@@ -119,26 +94,17 @@ const PROVIDERS: &[ProviderConfig] = &[
     },
 ];
 
-const KIMI_K2_6_ROUTES: &[ModelProviderRoute] = &[
-    ModelProviderRoute {
-        provider: ProviderName::Tinfoil,
-        provider_model_id: "kimi-k2-6",
-        weight: 100,
-        enabled: true,
-    },
-    ModelProviderRoute {
-        provider: ProviderName::Continuum,
-        provider_model_id: "kimi-k2.6",
-        weight: 100,
-        enabled: true,
-    },
-];
+const KIMI_K2_6_ROUTES: &[ModelProviderRoute] = &[ModelProviderRoute {
+    provider: ProviderName::Continuum,
+    provider_model_id: "kimi-k2.6",
+    weight: 100,
+    enabled: true,
+}];
 
 const MODEL_ROUTES: &[ModelRoutingConfig] = &[ModelRoutingConfig {
     public_model_id: "kimi-k2-6",
     routes: KIMI_K2_6_ROUTES,
-    continuum_flag_key: Some(KIMI_K2_6_CONTINUUM_FLAG_KEY),
-    default_provider: Some(ProviderName::Tinfoil),
+    default_provider: Some(ProviderName::Continuum),
 }];
 
 static DEFAULT_PROVIDER_ROUTING_CONFIG: ProviderRoutingConfig = ProviderRoutingConfig {
@@ -155,48 +121,19 @@ impl Default for ProviderRouter {
 }
 
 impl ProviderRouter {
-    #[cfg(test)]
     pub(crate) fn select_completion_route(
         &self,
         proxy_router: &ProxyRouter,
         account_uuid: Uuid,
         requested_model: &str,
     ) -> Result<SelectedProviderRoute, ProviderRoutingError> {
-        self.select_completion_route_with_preference(
-            proxy_router,
-            account_uuid,
-            requested_model,
-            None,
-        )
-    }
-
-    pub(crate) fn select_completion_route_with_preference(
-        &self,
-        proxy_router: &ProxyRouter,
-        account_uuid: Uuid,
-        requested_model: &str,
-        provider_preference: Option<ProviderPreference>,
-    ) -> Result<SelectedProviderRoute, ProviderRoutingError> {
         if let Some(public_model_id) = resolve_public_model_id(requested_model) {
             if let Some(model_config) = self.model_config(public_model_id) {
-                return self.select_configured_route(
-                    proxy_router,
-                    account_uuid,
-                    model_config,
-                    provider_preference,
-                );
+                return self.select_configured_route(proxy_router, account_uuid, model_config);
             }
         }
 
         self.fallback_completion_route(proxy_router, requested_model)
-    }
-
-    pub(crate) fn continuum_flag_key_for_completion_model(
-        &self,
-        requested_model: &str,
-    ) -> Option<&'static str> {
-        let public_model_id = resolve_public_model_id(requested_model)?;
-        self.model_config(public_model_id)?.continuum_flag_key
     }
 
     fn select_configured_route(
@@ -204,7 +141,6 @@ impl ProviderRouter {
         proxy_router: &ProxyRouter,
         account_uuid: Uuid,
         model_config: &ModelRoutingConfig,
-        provider_preference: Option<ProviderPreference>,
     ) -> Result<SelectedProviderRoute, ProviderRoutingError> {
         let mut eligible_routes = Vec::new();
 
@@ -238,34 +174,14 @@ impl ProviderRouter {
             ));
         }
 
-        let default_preference = model_config
-            .default_provider
-            .map(ProviderPreference::default_provider);
-
-        let provider_preference_route = provider_preference.and_then(|preference| {
+        let preferred_route = model_config.default_provider.and_then(|provider| {
             eligible_routes
                 .iter()
-                .find(|route| route.provider == preference.provider)
-                .map(|route| (route, preference.source))
-        });
-        let default_preference_route = default_preference.and_then(|preference| {
-            eligible_routes
-                .iter()
-                .find(|route| route.provider == preference.provider)
-                .map(|route| {
-                    let source = if provider_preference.is_some() {
-                        ProviderSelectionSource::Fallback
-                    } else {
-                        preference.source
-                    };
-                    (route, source)
-                })
+                .find(|route| route.provider == provider)
         });
 
-        let preferred_route = provider_preference_route.or(default_preference_route);
-
-        let (selected, bucket, selection_source) = if let Some((route, source)) = preferred_route {
-            (route, None, source)
+        let (selected, bucket, selection_source) = if let Some(route) = preferred_route {
+            (route, None, ProviderSelectionSource::DefaultProvider)
         } else {
             let selected =
                 select_weighted_route(account_uuid, &eligible_routes).ok_or_else(|| {
@@ -274,7 +190,7 @@ impl ProviderRouter {
             (
                 selected.route,
                 Some(selected.bucket),
-                if provider_preference.is_some() || default_preference.is_some() {
+                if model_config.default_provider.is_some() {
                     ProviderSelectionSource::Fallback
                 } else {
                     ProviderSelectionSource::StaticSplit
@@ -423,43 +339,25 @@ mod tests {
     }
 
     #[test]
-    fn test_kimi_defaults_to_tinfoil_without_feature_flag_preference() {
+    fn test_kimi_always_uses_continuum() {
         let router = ProviderRouter::default();
         let proxy_router = proxy_router_with_both_providers();
 
-        let selected = router
-            .select_completion_route(&proxy_router, uuid_for_bucket(99), "kimi-k2-6")
-            .expect("route");
+        for bucket in [0, 29, 30, 69, 70, 99] {
+            let selected = router
+                .select_completion_route(&proxy_router, uuid_for_bucket(bucket), "kimi-k2-6")
+                .expect("route");
 
-        assert_eq!(selected.proxy.provider_name, "tinfoil");
-        assert_eq!(selected.public_model_id, "kimi-k2-6");
-        assert_eq!(selected.provider_model_id, "kimi-k2-6");
-        assert_eq!(selected.response_model_id, "kimi-k2-6");
-        assert_eq!(selected.bucket, None);
-        assert_eq!(
-            selected.selection_source,
-            ProviderSelectionSource::DefaultProvider
-        );
-    }
-
-    #[test]
-    fn test_kimi_does_not_use_static_30_percent_rollout_without_feature_flag() {
-        let router = ProviderRouter::default();
-        let proxy_router = proxy_router_with_both_providers();
-
-        let selected = router
-            .select_completion_route(&proxy_router, uuid_for_bucket(70), "kimi-k2-6")
-            .expect("route");
-
-        assert_eq!(selected.proxy.provider_name, "tinfoil");
-        assert_eq!(selected.public_model_id, "kimi-k2-6");
-        assert_eq!(selected.provider_model_id, "kimi-k2-6");
-        assert_eq!(selected.response_model_id, "kimi-k2-6");
-        assert_eq!(selected.bucket, None);
-        assert_eq!(
-            selected.selection_source,
-            ProviderSelectionSource::DefaultProvider
-        );
+            assert_eq!(selected.proxy.provider_name, "continuum");
+            assert_eq!(selected.public_model_id, "kimi-k2-6");
+            assert_eq!(selected.provider_model_id, "kimi-k2.6");
+            assert_eq!(selected.response_model_id, "kimi-k2-6");
+            assert_eq!(selected.bucket, None);
+            assert_eq!(
+                selected.selection_source,
+                ProviderSelectionSource::DefaultProvider
+            );
+        }
     }
 
     #[test]
@@ -475,124 +373,14 @@ mod tests {
             )
             .expect("route");
 
-        assert_eq!(selected.proxy.provider_name, "tinfoil");
+        assert_eq!(selected.proxy.provider_name, "continuum");
         assert_eq!(selected.public_model_id, "kimi-k2-6");
-        assert_eq!(selected.provider_model_id, "kimi-k2-6");
+        assert_eq!(selected.provider_model_id, "kimi-k2.6");
         assert_eq!(selected.response_model_id, "kimi-k2-6");
     }
 
     #[test]
-    fn test_kimi_routing_flag_key_resolves_aliases() {
-        let router = ProviderRouter::default();
-
-        assert_eq!(
-            router.continuum_flag_key_for_completion_model("kimi-k2-6"),
-            Some(KIMI_K2_6_CONTINUUM_FLAG_KEY)
-        );
-        assert_eq!(
-            router.continuum_flag_key_for_completion_model(
-                crate::model_config::AUTO_POWERFUL_MODEL_ID
-            ),
-            Some(KIMI_K2_6_CONTINUUM_FLAG_KEY)
-        );
-        assert_eq!(
-            router
-                .continuum_flag_key_for_completion_model(crate::model_config::AUTO_QUICK_MODEL_ID),
-            None
-        );
-    }
-
-    #[test]
-    fn test_feature_flag_preference_can_select_continuum_outside_static_bucket() {
-        let router = ProviderRouter::default();
-        let proxy_router = proxy_router_with_both_providers();
-
-        let selected = router
-            .select_completion_route_with_preference(
-                &proxy_router,
-                uuid_for_bucket(1),
-                "kimi-k2-6",
-                Some(ProviderPreference::feature_flag(ProviderName::Continuum)),
-            )
-            .expect("route");
-
-        assert_eq!(selected.proxy.provider_name, "continuum");
-        assert_eq!(selected.provider_model_id, "kimi-k2.6");
-        assert_eq!(selected.bucket, None);
-        assert_eq!(
-            selected.selection_source,
-            ProviderSelectionSource::FeatureFlag
-        );
-    }
-
-    #[test]
-    fn test_feature_flag_preference_can_select_tinfoil_inside_static_continuum_bucket() {
-        let router = ProviderRouter::default();
-        let proxy_router = proxy_router_with_both_providers();
-
-        let selected = router
-            .select_completion_route_with_preference(
-                &proxy_router,
-                uuid_for_bucket(99),
-                "kimi-k2-6",
-                Some(ProviderPreference::feature_flag(ProviderName::Tinfoil)),
-            )
-            .expect("route");
-
-        assert_eq!(selected.proxy.provider_name, "tinfoil");
-        assert_eq!(selected.provider_model_id, "kimi-k2-6");
-        assert_eq!(selected.bucket, None);
-        assert_eq!(
-            selected.selection_source,
-            ProviderSelectionSource::FeatureFlag
-        );
-    }
-
-    #[test]
-    fn test_preferred_provider_falls_back_to_default_provider_when_unavailable() {
-        let router = ProviderRouter::default();
-        let proxy_router = ProxyRouter::new(
-            "http://continuum.example.com".to_string(),
-            None,
-            "http://tinfoil.example.com".to_string(),
-        );
-
-        let selected = router
-            .select_completion_route_with_preference(
-                &proxy_router,
-                uuid_for_bucket(70),
-                "kimi-k2-6",
-                Some(ProviderPreference::feature_flag(ProviderName::Continuum)),
-            )
-            .expect("route");
-
-        assert_eq!(selected.proxy.provider_name, "continuum");
-        assert_eq!(
-            selected.selection_source,
-            ProviderSelectionSource::FeatureFlag
-        );
-
-        let tinfoil_only = ProxyRouter::new(
-            "https://api.openai.com".to_string(),
-            None,
-            "http://tinfoil.example.com".to_string(),
-        );
-        let selected = router
-            .select_completion_route_with_preference(
-                &tinfoil_only,
-                uuid_for_bucket(70),
-                "kimi-k2-6",
-                Some(ProviderPreference::feature_flag(ProviderName::Continuum)),
-            )
-            .expect("route");
-
-        assert_eq!(selected.proxy.provider_name, "tinfoil");
-        assert_eq!(selected.bucket, None);
-        assert_eq!(selected.selection_source, ProviderSelectionSource::Fallback);
-    }
-
-    #[test]
-    fn test_kimi_uses_tinfoil_when_continuum_proxy_is_missing() {
+    fn test_kimi_has_no_tinfoil_fallback_when_continuum_proxy_is_missing() {
         let router = ProviderRouter::default();
         let proxy_router = ProxyRouter::new(
             "https://api.openai.com".to_string(),
@@ -600,16 +388,13 @@ mod tests {
             "http://tinfoil.example.com".to_string(),
         );
 
-        let selected = router
+        let error = router
             .select_completion_route(&proxy_router, uuid_for_bucket(1), "kimi-k2-6")
-            .expect("route");
+            .expect_err("no eligible Kimi route");
 
-        assert_eq!(selected.proxy.provider_name, "tinfoil");
-        assert_eq!(selected.provider_model_id, "kimi-k2-6");
-        assert_eq!(selected.bucket, None);
         assert_eq!(
-            selected.selection_source,
-            ProviderSelectionSource::DefaultProvider
+            error,
+            ProviderRoutingError::NoEligibleRoute("kimi-k2-6".to_string())
         );
     }
 
@@ -737,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn test_configured_model_uses_tinfoil_when_continuum_is_missing() {
+    fn test_configured_model_errors_when_continuum_is_missing() {
         let router = ProviderRouter::default();
         let proxy_router = ProxyRouter::new(
             "https://api.openai.com".to_string(),
@@ -745,15 +530,13 @@ mod tests {
             "http://tinfoil.example.com".to_string(),
         );
 
-        let selected = router
+        let error = router
             .select_completion_route(&proxy_router, uuid_for_bucket(50), "kimi-k2-6")
-            .expect("route");
+            .expect_err("no eligible Kimi route");
 
-        assert_eq!(selected.proxy.provider_name, "tinfoil");
-        assert_eq!(selected.provider_model_id, "kimi-k2-6");
         assert_eq!(
-            selected.selection_source,
-            ProviderSelectionSource::DefaultProvider
+            error,
+            ProviderRoutingError::NoEligibleRoute("kimi-k2-6".to_string())
         );
     }
 }

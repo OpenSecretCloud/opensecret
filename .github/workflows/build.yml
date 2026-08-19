@@ -42,12 +42,22 @@ jobs:
         with:
           flake-lock-path: flake.lock
 
+      # Realize every native ARM security check exported by the current flake.
+      # New checks join this gate automatically instead of being duplicated in
+      # a hard-coded workflow list.
+      - name: Run native security checks
+        run: |
+          set -euo pipefail
+          nix flake check '.?submodules=1' --no-write-lock-file --print-build-logs
+          git diff --exit-code -- flake.lock
+
       # Build development EIF directly using Nix package
       - name: Build dev EIF
         id: build-dev
         run: |
           set -euo pipefail
-          nix build .?submodules=1#eif-dev
+          nix build '.?submodules=1#eif-dev' --no-write-lock-file --print-build-logs
+          git diff --exit-code -- flake.lock
           echo "Build completed successfully"
 
       # Verify PCR values match the reference
@@ -109,12 +119,21 @@ jobs:
         with:
           flake-lock-path: flake.lock
 
+      # Repeat the dynamic native gate so the independently scheduled
+      # production job cannot publish an EIF after a failed semantic check.
+      - name: Run native security checks
+        run: |
+          set -euo pipefail
+          nix flake check '.?submodules=1' --no-write-lock-file --print-build-logs
+          git diff --exit-code -- flake.lock
+
       # Build production EIF directly using Nix package
       - name: Build prod EIF
         id: build-prod
         run: |
           set -euo pipefail
-          nix build .?submodules=1#eif-prod
+          nix build '.?submodules=1#eif-prod' --no-write-lock-file --print-build-logs
+          git diff --exit-code -- flake.lock
           echo "Build completed successfully"
 
       # Verify PCR values match the reference

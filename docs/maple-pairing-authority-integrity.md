@@ -257,6 +257,17 @@ head, and verified parent deletion consumes that head and updates its
 ancestors, also in the same transaction. Exact-operation replays still verify
 the hierarchy before returning their stored result.
 
+A mutation response is an immutable receipt for the accepted operation, not a
+fresh statement of the pairing's current lifecycle state. Exact `APPROVE`,
+`CONFIRM`, and `REVOKE` retries therefore return the byte-identical historical
+receipt even after a later transition. The embedded state and revision describe
+that operation's accepted outcome only. A client making an admission decision
+must read the pairing status again and reconcile the host's signed revocation
+stream; it must never restore or retain admission solely because a historical
+mutation receipt says `AwaitingHostCommit` or `Active`. The database regression
+suite proves that historical receipt replay is read-only, a revoked pair remains
+`Revoked`, and a fresh stale `CONFIRM` conflicts instead of resurrecting it.
+
 Missing heads, invalid MACs, non-canonical inventories, revision or membership
 mismatches, deleted high-water tails, and count or digest mismatches are
 integrity failures. Reads, mutations, reset, and destructive deletion fail
@@ -573,3 +584,11 @@ an externally witnessed checkpoint, plus an explicit reconciliation protocol.
 Until that exists, this design must be
 described only as protection against partial tampering and deletion, and
 subtree rollback caught by a still-current authenticated ancestor.
+
+The service also cannot prove that an offline host has applied a newly observed
+revocation or removed a locally staged approval. Backend status and the signed
+revocation stream remain the authoritative service-side state, while the host
+must reconcile them before accepting a controller connection. V1 provides no
+offline-host lease, external monotonic rollback witness, or forced local-state
+deletion guarantee; those are explicit follow-up boundaries rather than claims
+made by the pairing authority.

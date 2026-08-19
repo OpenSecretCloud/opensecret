@@ -24,8 +24,8 @@ use crate::{
         maple_pairing_db::{
             MaplePairing, MaplePairingApproval, MaplePairingAuthorityAccountHead,
             MaplePairingAuthorization, MaplePairingConfirmation, MaplePairingCursor,
-            MaplePairingOperationKind, MaplePairingOperationReceipt, MaplePairingRevocation,
-            MaplePairingRevocationAck, MaplePairingRevocationContext,
+            MaplePairingOperation, MaplePairingOperationKind, MaplePairingOperationReceipt,
+            MaplePairingRevocation, MaplePairingRevocationAck, MaplePairingRevocationContext,
             MaplePairingRevocationHighwater, MaplePairingRevocationMaterial, MaplePairingRole,
             MaplePairingState, NewMaplePairingRequest, StoredMaplePairingPayloadV1,
         },
@@ -4211,6 +4211,149 @@ async fn db_maple_pairing_lifecycle_is_ordered_and_destructive_cleanup_is_comple
     )
     .expect("active pairing should revoke atomically");
     assert_eq!(revoked.pairing_revision, 4);
+
+    // Mutation responses are immutable operation receipts, not current
+    // admission state. Preserve exact retry bytes, but prove that replaying an
+    // old approval or confirmation cannot move a later-revoked pair back to an
+    // admitted state. Clients must use the fresh status/read path for current
+    // lifecycle truth.
+    let (revoked_pair, approval_operation, confirmation_operation, revocation_operation) = {
+        let conn = &mut app_state
+            .db
+            .get_pool()
+            .get()
+            .expect("test database connection should be available");
+        let pair = maple_pairings::table
+            .filter(maple_pairings::uuid.eq(first_pair_id))
+            .first::<MaplePairing>(conn)
+            .expect("revoked pairing should load");
+        let operations = maple_pairing_operations::table
+            .filter(maple_pairing_operations::maple_pairing_id.eq(pair.id))
+            .load::<MaplePairingOperation>(conn)
+            .expect("pairing operations should load");
+        let operation = |kind: MaplePairingOperationKind| {
+            operations
+                .iter()
+                .find(|operation| operation.operation_kind == kind.as_db())
+                .cloned()
+                .unwrap_or_else(|| panic!("{kind:?} operation should exist"))
+        };
+        (
+            pair,
+            operation(MaplePairingOperationKind::Approve),
+            operation(MaplePairingOperationKind::Confirm),
+            operation(MaplePairingOperationKind::Revoke),
+        )
+    };
+    assert_eq!(revoked_pair.state, MaplePairingState::Revoked.as_db());
+    assert_eq!(revoked_pair.revision, 4);
+    let post_revoke_snapshot = maple_pairing_mutation_snapshot(
+        &app_state,
+        &authorization,
+        first_pair_id,
+        host.registration_id,
+        host_stream_id,
+        host_stream_generation,
+    );
+
+    let replayed_approval = app_state
+        .db
+        .replay_maple_pairing_operation(
+            authorization.clone(),
+            host.registration_id,
+            approval_operation.operation_id,
+            MaplePairingOperationKind::Approve,
+            approval_operation.request_mac.clone(),
+        )
+        .expect("exact historical approval replay should remain readable")
+        .expect("accepted approval should retain its operation receipt");
+    assert_eq!(replayed_approval.pairing_revision, 2);
+    assert_eq!(
+        replayed_approval.receipt_enc,
+        approval_operation.receipt_enc
+    );
+
+    let replayed_confirmation = app_state
+        .db
+        .replay_maple_pairing_operation(
+            authorization.clone(),
+            host.registration_id,
+            confirmation_operation.operation_id,
+            MaplePairingOperationKind::Confirm,
+            confirmation_operation.request_mac.clone(),
+        )
+        .expect("exact historical confirmation replay should remain readable")
+        .expect("accepted confirmation should retain its operation receipt");
+    assert_eq!(replayed_confirmation.pairing_revision, 3);
+    assert_eq!(
+        replayed_confirmation.receipt_enc,
+        confirmation_operation.receipt_enc
+    );
+
+    let replayed_revocation = app_state
+        .db
+        .replay_maple_pairing_operation(
+            authorization.clone(),
+            controller.registration_id,
+            revocation_operation.operation_id,
+            MaplePairingOperationKind::Revoke,
+            revocation_operation.request_mac.clone(),
+        )
+        .expect("exact current revocation replay should remain readable")
+        .expect("accepted revocation should retain its operation receipt");
+    assert_eq!(replayed_revocation.pairing_revision, 4);
+    assert_eq!(
+        replayed_revocation.receipt_enc,
+        revocation_operation.receipt_enc
+    );
+
+    let stale_fresh_confirmation = app_state
+        .db
+        .confirm_maple_pairing(MaplePairingConfirmation {
+            authorization: authorization.clone(),
+            operation_id: Uuid::new_v4(),
+            request_mac: vec![123; 32],
+            host_registration_id: host.registration_id,
+            pairing_request_id: first_request_id,
+            pair_id: first_pair_id,
+            expected_pairing_revision: 2,
+            pairing_incarnation: first_incarnation,
+            payload_version: revoked_pair.payload_version,
+            payload_enc: revoked_pair.payload_enc.clone(),
+            receipt_version: 1,
+            receipt_enc: vec![124, 125],
+            activated_at: Utc::now(),
+        });
+    assert!(matches!(
+        stale_fresh_confirmation,
+        Err(DBError::MaplePairingConflict)
+    ));
+    let current_after_replays = app_state
+        .db
+        .get_maple_pairing(
+            authorization.clone(),
+            controller.registration_id,
+            first_pair_id,
+        )
+        .expect("fresh pairing status should load")
+        .expect("revoked pairing should remain visible");
+    assert_eq!(
+        current_after_replays.state,
+        MaplePairingState::Revoked.as_db()
+    );
+    assert_eq!(current_after_replays.revision, 4);
+    assert_eq!(
+        maple_pairing_mutation_snapshot(
+            &app_state,
+            &authorization,
+            first_pair_id,
+            host.registration_id,
+            host_stream_id,
+            host_stream_generation,
+        ),
+        post_revoke_snapshot,
+        "historical receipt replay and a stale fresh confirmation must not resurrect or mutate the revoked pair"
+    );
 
     let referenced_key_ids = app_state
         .db

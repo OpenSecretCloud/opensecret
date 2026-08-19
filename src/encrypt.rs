@@ -185,8 +185,24 @@ impl CanonicalBytes {
         self.append_field(b'i', &value.to_be_bytes())
     }
 
+    pub fn append_u16(&mut self, value: u16) -> &mut Self {
+        self.append_field(b'j', &value.to_be_bytes())
+    }
+
+    pub fn append_bool(&mut self, value: bool) -> &mut Self {
+        self.append_field(b'?', &[u8::from(value)])
+    }
+
     pub fn append_i32(&mut self, value: i32) -> &mut Self {
         self.append_field(b'I', &value.to_be_bytes())
+    }
+
+    pub fn append_i64(&mut self, value: i64) -> &mut Self {
+        self.append_field(b'l', &value.to_be_bytes())
+    }
+
+    pub fn append_u64(&mut self, value: u64) -> &mut Self {
+        self.append_field(b'L', &value.to_be_bytes())
     }
 
     pub fn append_uuid(&mut self, value: Uuid) -> &mut Self {

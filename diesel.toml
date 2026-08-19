@@ -3,6 +3,7 @@
 
 [print_schema]
 file = "src/models/schema.rs"
+patch_file = "src/models/schema.patch"
 
 [migrations_directory]
 dir = "migrations"

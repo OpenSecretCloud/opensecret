@@ -3038,6 +3038,7 @@ dependencies = [
  "diesel",
  "diesel-derive-enum",
  "dotenv",
+ "ed25519-dalek",
  "futures",
  "generic-array",
  "getrandom 0.2.15",

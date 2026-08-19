@@ -14,6 +14,7 @@ use crate::login_routes::RegisterCredentials;
 use crate::model_config::{model_requires_feature_flag, ModelFeatureAccess};
 use crate::models::account_deletion::{AccountDeletionError, NewAccountDeletionRequest};
 use crate::models::email_verification::{EmailVerificationError, NewEmailVerification};
+use crate::models::maple_pairings::{MaplePairingIssuer, MaplePairingIssuerKeySetV1};
 use crate::models::oauth::{NewUserOAuthConnection, OAuthError};
 use crate::models::password_reset::NewPasswordResetRequest;
 use crate::models::platform_password_reset::NewPlatformPasswordResetRequest;
@@ -23,8 +24,8 @@ use crate::web::openai_auth::validate_openai_auth;
 use crate::web::platform_login_routes;
 use crate::web::{
     conversation_projects_routes, conversations_routes, health_routes_with_state,
-    instructions_routes, login_routes, oauth_routes, openai_routes, protected_routes,
-    responses_routes, web_routes,
+    instructions_routes, login_routes, maple_devices_routes, maple_pairings_routes, oauth_routes,
+    openai_routes, protected_routes, responses_routes, web_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 use bounded_ttl_cache::BoundedTtlCache;
@@ -45,7 +46,10 @@ use crate::{
 };
 use crate::{billing::BillingClient, web::platform::common::PROJECT_RESEND_API_KEY};
 use crate::{
-    db::{setup_db, DBConnection, DBError},
+    db::{
+        create_user_with_maple_authority_in_tx,
+        finish_nonreplayable_maple_pairing_authority_transaction, setup_db, DBConnection, DBError,
+    },
     models::users::{NewUser, User, UserError},
 };
 use crate::{encrypt::create_new_encryption_key, jwt::validate_jwt};
@@ -298,6 +302,8 @@ pub enum Error {
 enum CreateUserSeedWrapTransactionError {
     #[error("Diesel error: {0}")]
     Diesel(#[from] diesel::result::Error),
+    #[error("Database error: {0}")]
+    Database(#[from] DBError),
     #[error("User error: {0}")]
     User(#[from] UserError),
     #[error("User seed wrapping error: {0}")]
@@ -316,6 +322,7 @@ impl From<CreateUserSeedWrapTransactionError> for Error {
             CreateUserSeedWrapTransactionError::Diesel(e) => {
                 Error::DatabaseError(DBError::QueryError(e))
             }
+            CreateUserSeedWrapTransactionError::Database(e) => Error::DatabaseError(e),
             CreateUserSeedWrapTransactionError::User(e) => {
                 Error::DatabaseError(DBError::UserError(e))
             }
@@ -347,8 +354,36 @@ pub enum ApiError {
     #[error("Upstream provider temporarily unavailable")]
     ServiceUnavailable,
 
+    #[error("Maple remote pairing authority is temporarily busy; retry shortly")]
+    MapleAuthorityBusy,
+
+    #[error(
+        "Maple remote pairing history capacity has been reached; safely clear remote access, then delete and recreate the affected scope"
+    )]
+    MapleAuthorityCapacityExceeded,
+
+    #[error("Revoke Maple remote access and wait for host acknowledgement before deletion")]
+    MapleAuthorityDeletionBlocked,
+
+    #[error("Maple device security epoch is stale; refresh device state and retry.")]
+    MapleSecurityEpochStale,
+
+    #[error(
+        "This Maple installation enrollment is retired; reset Remote access on this device and enroll it again."
+    )]
+    MapleInstallationRetired,
+
+    #[error("Maple remote access must be cleared on the host before this operation can continue.")]
+    MaplePairingResetClearRequired,
+
     #[error("Bad Request")]
     BadRequest,
+
+    /// The client encrypted this request for an unknown or evicted ephemeral
+    /// attested session. This is intentionally distinct from semantic 400/422
+    /// failures so SDKs can safely re-attest and replay only idempotent bytes.
+    #[error("Attested session is stale")]
+    StaleSession,
 
     #[error("Conflict")]
     Conflict,
@@ -402,15 +437,37 @@ pub enum ApiError {
     TooManyRequests,
 }
 
+impl ApiError {
+    fn machine_code(&self) -> Option<&'static str> {
+        match self {
+            Self::MapleAuthorityBusy => Some("MapleAuthorityBusy"),
+            Self::MapleAuthorityCapacityExceeded => Some("MapleAuthorityCapacityExceeded"),
+            Self::MapleAuthorityDeletionBlocked => Some("MapleAuthorityDeletionBlocked"),
+            Self::MapleSecurityEpochStale => Some("MapleSecurityEpochStale"),
+            Self::MapleInstallationRetired => Some("MapleInstallationRetired"),
+            Self::MaplePairingResetClearRequired => Some("MaplePairingResetClearRequired"),
+            _ => None,
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
+        let code = self.machine_code();
         let status = match self {
             ApiError::InvalidUsernameOrPassword => StatusCode::UNAUTHORIZED,
             ApiError::InvalidJwt => StatusCode::UNAUTHORIZED,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::InternalServerError => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::MapleAuthorityBusy => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::MapleAuthorityCapacityExceeded => StatusCode::CONFLICT,
+            ApiError::MapleAuthorityDeletionBlocked => StatusCode::CONFLICT,
+            ApiError::MapleSecurityEpochStale => StatusCode::CONFLICT,
+            ApiError::MapleInstallationRetired => StatusCode::CONFLICT,
+            ApiError::MaplePairingResetClearRequired => StatusCode::CONFLICT,
             ApiError::BadRequest => StatusCode::BAD_REQUEST,
+            ApiError::StaleSession => StatusCode::GONE,
             ApiError::Conflict => StatusCode::CONFLICT,
             ApiError::InvalidInviteCode => StatusCode::UNAUTHORIZED,
             ApiError::RefreshFailed => StatusCode::UNAUTHORIZED,
@@ -433,6 +490,7 @@ impl IntoResponse for ApiError {
             Json(ErrorResponse {
                 status: status.as_u16(),
                 message: self.to_string(),
+                code,
             }),
         )
             .into_response()
@@ -458,6 +516,17 @@ impl From<DBError> for ApiError {
             DBError::PlatformUserError(_) => ApiError::InternalServerError,
             DBError::OrgMembershipNotFound => ApiError::NotFound,
             DBError::OrgMembershipError(_) => ApiError::InternalServerError,
+            DBError::MaplePairingAuthorityBusy => ApiError::MapleAuthorityBusy,
+            DBError::MaplePairingAuthorityCapacityExceeded => {
+                ApiError::MapleAuthorityCapacityExceeded
+            }
+            DBError::MaplePairingAuthorityDeletionBlocked => {
+                ApiError::MapleAuthorityDeletionBlocked
+            }
+            DBError::MaplePairingAuthorityCorrupt => ApiError::InternalServerError,
+            DBError::MapleDeviceSecurityEpochStale => ApiError::MapleSecurityEpochStale,
+            DBError::MapleInstallationRetired => ApiError::MapleInstallationRetired,
+            DBError::MaplePairingResetClearRequired => ApiError::MaplePairingResetClearRequired,
             _ => ApiError::InternalServerError,
         }
     }
@@ -467,6 +536,156 @@ impl From<DBError> for ApiError {
 pub struct ErrorResponse {
     status: u16,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
+}
+
+#[cfg(test)]
+mod api_error_response_tests {
+    use super::*;
+
+    async fn response_json(error: ApiError) -> (StatusCode, serde_json::Value) {
+        let response = error.into_response();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("API error body should be bounded");
+        let json = serde_json::from_slice(&body).expect("API error body should be JSON");
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn maple_authority_errors_have_stable_sanitized_codes() {
+        for (error, expected_status, expected_code, expected_message) in [
+            (
+                ApiError::MapleAuthorityBusy,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "MapleAuthorityBusy",
+                "Maple remote pairing authority is temporarily busy; retry shortly",
+            ),
+            (
+                ApiError::MapleAuthorityCapacityExceeded,
+                StatusCode::CONFLICT,
+                "MapleAuthorityCapacityExceeded",
+                "Maple remote pairing history capacity has been reached; safely clear remote access, then delete and recreate the affected scope",
+            ),
+            (
+                ApiError::MapleAuthorityDeletionBlocked,
+                StatusCode::CONFLICT,
+                "MapleAuthorityDeletionBlocked",
+                "Revoke Maple remote access and wait for host acknowledgement before deletion",
+            ),
+            (
+                ApiError::MapleSecurityEpochStale,
+                StatusCode::CONFLICT,
+                "MapleSecurityEpochStale",
+                "Maple device security epoch is stale; refresh device state and retry.",
+            ),
+            (
+                ApiError::MaplePairingResetClearRequired,
+                StatusCode::CONFLICT,
+                "MaplePairingResetClearRequired",
+                "Maple remote access must be cleared on the host before this operation can continue.",
+            ),
+            (
+                ApiError::MapleInstallationRetired,
+                StatusCode::CONFLICT,
+                "MapleInstallationRetired",
+                "This Maple installation enrollment is retired; reset Remote access on this device and enroll it again.",
+            ),
+        ] {
+            let (status, json) = response_json(error).await;
+            assert_eq!(status, expected_status);
+            assert_eq!(json["status"], expected_status.as_u16());
+            assert_eq!(json["code"], expected_code);
+            assert_eq!(json["message"], expected_message);
+        }
+    }
+
+    #[tokio::test]
+    async fn existing_api_error_json_omits_machine_code() {
+        let (status, json) = response_json(ApiError::BadRequest).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json,
+            serde_json::json!({"status": 400, "message": "Bad Request"})
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_clear_required_error_is_exact_and_contains_no_authority_material() {
+        let (status, json) = response_json(ApiError::MaplePairingResetClearRequired).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "status": 409,
+                "message": "Maple remote access must be cleared on the host before this operation can continue.",
+                "code": "MaplePairingResetClearRequired"
+            })
+        );
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/maple_pairing_v1_vectors.json"
+        ))
+        .unwrap();
+        assert_eq!(json, vectors["maple_pairing_reset_clear_required_error"]);
+        let encoded = serde_json::to_string(&json).unwrap();
+        for forbidden in [
+            "event_id",
+            "reset_id",
+            "revocation_stream",
+            "issuer_key",
+            "signature",
+            "digest",
+            "sync_payload",
+        ] {
+            assert!(!encoded.contains(forbidden));
+        }
+    }
+
+    #[tokio::test]
+    async fn maple_installation_retired_error_is_exact_and_sanitized() {
+        let (status, json) = response_json(ApiError::MapleInstallationRetired).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "status": 409,
+                "message": "This Maple installation enrollment is retired; reset Remote access on this device and enroll it again.",
+                "code": "MapleInstallationRetired"
+            })
+        );
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/maple_pairing_v1_vectors.json"
+        ))
+        .unwrap();
+        assert_eq!(json, vectors["maple_installation_retired_error"]);
+        assert_eq!(json.as_object().map(|fields| fields.len()), Some(3));
+    }
+
+    #[test]
+    fn maple_authority_database_errors_map_to_exact_public_errors() {
+        assert!(matches!(
+            ApiError::from(DBError::MaplePairingAuthorityBusy),
+            ApiError::MapleAuthorityBusy
+        ));
+        assert!(matches!(
+            ApiError::from(DBError::MaplePairingAuthorityCapacityExceeded),
+            ApiError::MapleAuthorityCapacityExceeded
+        ));
+        assert!(matches!(
+            ApiError::from(DBError::MaplePairingAuthorityDeletionBlocked),
+            ApiError::MapleAuthorityDeletionBlocked
+        ));
+        assert!(matches!(
+            ApiError::from(DBError::MaplePairingAuthorityCorrupt),
+            ApiError::InternalServerError
+        ));
+        assert!(matches!(
+            ApiError::from(DBError::MaplePairingResetClearRequired),
+            ApiError::MaplePairingResetClearRequired
+        ));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -594,6 +813,13 @@ pub struct AppState {
     cancellation_broadcast: tokio::sync::broadcast::Sender<Uuid>,
     brave_client: Option<Arc<crate::brave::BraveClient>>,
     kagi_client: Option<Arc<crate::kagi::KagiClient>>,
+    /// Issuer-backed Maple pairing signer. Production keeps pairing routes
+    /// fail-closed until an attested signer is injected explicitly.
+    maple_pairing_issuer: Option<Arc<dyn MaplePairingIssuer>>,
+    /// Trusted verification keys for current and recently rotated Maple
+    /// pairing issuer keys. Signing without an independently injected keyset
+    /// is deliberately insufficient to enable the routes.
+    maple_pairing_issuer_keyset: Option<Arc<MaplePairingIssuerKeySetV1>>,
 }
 
 #[derive(Debug, Clone)]
@@ -629,6 +855,8 @@ pub struct AppStateBuilder {
     os_flags_api_key: Option<String>,
     brave_api_key: Option<String>,
     kagi_api_key: Option<String>,
+    maple_pairing_issuer: Option<Arc<dyn MaplePairingIssuer>>,
+    maple_pairing_issuer_keyset: Option<Arc<MaplePairingIssuerKeySetV1>>,
 }
 
 impl AppStateBuilder {
@@ -759,6 +987,22 @@ impl AppStateBuilder {
         self
     }
 
+    pub fn maple_pairing_issuer(
+        mut self,
+        maple_pairing_issuer: Option<Arc<dyn MaplePairingIssuer>>,
+    ) -> Self {
+        self.maple_pairing_issuer = maple_pairing_issuer;
+        self
+    }
+
+    pub fn maple_pairing_issuer_keyset(
+        mut self,
+        maple_pairing_issuer_keyset: Option<Arc<MaplePairingIssuerKeySetV1>>,
+    ) -> Self {
+        self.maple_pairing_issuer_keyset = maple_pairing_issuer_keyset;
+        self
+    }
+
     pub async fn build(self) -> Result<AppState, Error> {
         let app_mode = self
             .app_mode
@@ -769,6 +1013,74 @@ impl AppStateBuilder {
         let enclave_key = self
             .enclave_key
             .ok_or(Error::BuilderError("enclave_key is required".to_string()))?;
+        if self.maple_pairing_issuer.is_some() && self.maple_pairing_issuer_keyset.is_none() {
+            return Err(Error::BuilderError(
+                "Maple pairing signer requires an independently injected verification keyset"
+                    .to_string(),
+            ));
+        }
+        if let Some(keyset) = self.maple_pairing_issuer_keyset.as_deref() {
+            keyset.validate().map_err(|_| {
+                Error::BuilderError("Maple pairing issuer keyset is invalid".to_string())
+            })?;
+            if let Some(issuer) = self.maple_pairing_issuer.as_deref() {
+                let signer_is_retained = keyset.contains_issuer(issuer).map_err(|_| {
+                    Error::BuilderError("Maple pairing issuer keyset is invalid".to_string())
+                })?;
+                if !signer_is_retained {
+                    return Err(Error::BuilderError(
+                        "Maple pairing signing key is absent from the verification keyset"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        let authority_db = db.clone();
+        let authority_enclave_key = enclave_key.clone();
+        let authority_issuer_keyset = self.maple_pairing_issuer_keyset.clone();
+        let authority_result = task::spawn_blocking(move || {
+            authority_db.bootstrap_or_audit_maple_pairing_authority(
+                &authority_enclave_key,
+                authority_issuer_keyset.as_deref(),
+            )
+        })
+        .await?;
+        match authority_result {
+            Ok(()) => {}
+            Err(DBError::MaplePairingIssuerConfigurationConflict) => {
+                return Err(Error::BuilderError(
+                    "Maple pairing issuer keyset conflicts with the authenticated lifetime registry"
+                        .to_string(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let audit_db = db.clone();
+        let audit_enclave_key = enclave_key.clone();
+        let referenced_key_ids = task::spawn_blocking(move || {
+            audit_db.audit_maple_pairing_issuer_key_references(&audit_enclave_key)
+        })
+        .await??;
+        if !referenced_key_ids.is_empty() && self.maple_pairing_issuer_keyset.is_none() {
+            return Err(Error::BuilderError(
+                "Durable Maple pairings require their historical issuer verification keyset"
+                    .to_string(),
+            ));
+        }
+        if let Some(keyset) = self.maple_pairing_issuer_keyset.as_deref() {
+            for key_id in referenced_key_ids {
+                let retained = keyset.contains_key_id(&key_id).map_err(|_| {
+                    Error::BuilderError(
+                        "Maple pairing issuer reference failed validation".to_string(),
+                    )
+                })?;
+                if !retained {
+                    return Err(Error::BuilderError(
+                        "Maple pairing verification keyset omits a durable issuer key".to_string(),
+                    ));
+                }
+            }
+        }
         let aws_credential_manager = self.aws_credential_manager.ok_or(Error::BuilderError(
             "aws_credential_manager is required".to_string(),
         ))?;
@@ -964,6 +1276,8 @@ impl AppStateBuilder {
             cancellation_broadcast: cancellation_tx,
             brave_client,
             kagi_client,
+            maple_pairing_issuer: self.maple_pairing_issuer,
+            maple_pairing_issuer_keyset: self.maple_pairing_issuer_keyset,
         })
     }
 }
@@ -1306,22 +1620,32 @@ impl AppState {
         decrypted_password_verifier: &str,
         plaintext_seed: &[u8],
     ) -> Result<User, Error> {
+        let expected_issuer_key_inventory_digest = self
+            .db
+            .configured_maple_pairing_issuer_key_inventory_digest()?;
         let conn = &mut self
             .db
             .get_pool()
             .get()
             .map_err(|_| Error::DatabaseError(DBError::ConnectionError))?;
 
-        conn.transaction::<_, CreateUserSeedWrapTransactionError, _>(|conn| {
-            let user = new_user.insert(conn)?;
-            let new_wrapping = self.new_password_seed_wrapping_for_user(
-                &user,
-                decrypted_password_verifier,
-                plaintext_seed,
-            )?;
-            new_wrapping.upsert_by_credential(conn)?;
-            Ok(user)
-        })
+        finish_nonreplayable_maple_pairing_authority_transaction(
+            conn.transaction::<_, CreateUserSeedWrapTransactionError, _>(|conn| {
+                let user = create_user_with_maple_authority_in_tx(
+                    conn,
+                    &new_user,
+                    &self.enclave_key,
+                    &expected_issuer_key_inventory_digest,
+                )?;
+                let new_wrapping = self.new_password_seed_wrapping_for_user(
+                    &user,
+                    decrypted_password_verifier,
+                    plaintext_seed,
+                )?;
+                new_wrapping.upsert_by_credential(conn)?;
+                Ok(user)
+            }),
+        )
         .map_err(Error::from)
     }
 
@@ -1400,38 +1724,48 @@ impl AppState {
         access_token_enc: Vec<u8>,
         plaintext_seed: &[u8],
     ) -> Result<User, Error> {
+        let expected_issuer_key_inventory_digest = self
+            .db
+            .configured_maple_pairing_issuer_key_inventory_digest()?;
         let conn = &mut self
             .db
             .get_pool()
             .get()
             .map_err(|_| Error::DatabaseError(DBError::ConnectionError))?;
 
-        conn.transaction::<_, CreateUserSeedWrapTransactionError, _>(|conn| {
-            let user = new_user.insert(conn)?;
+        finish_nonreplayable_maple_pairing_authority_transaction(
+            conn.transaction::<_, CreateUserSeedWrapTransactionError, _>(|conn| {
+                let user = create_user_with_maple_authority_in_tx(
+                    conn,
+                    &new_user,
+                    &self.enclave_key,
+                    &expected_issuer_key_inventory_digest,
+                )?;
 
-            let new_connection = NewUserOAuthConnection {
-                user_id: user.uuid,
-                provider_id,
-                provider_user_id: provider_user_id.to_string(),
-                access_token_enc,
-                refresh_token_enc: None,
-                expires_at: None,
-            };
-            new_connection.insert(conn)?;
+                let new_connection = NewUserOAuthConnection {
+                    user_id: user.uuid,
+                    provider_id,
+                    provider_user_id: provider_user_id.to_string(),
+                    access_token_enc,
+                    refresh_token_enc: None,
+                    expires_at: None,
+                };
+                new_connection.insert(conn)?;
 
-            let new_wrapping = self.new_oauth_seed_wrapping_for_user(
-                &user,
-                provider_name,
-                provider_user_id,
-                plaintext_seed,
-            )?;
-            new_wrapping.upsert_by_credential(conn)?;
+                let new_wrapping = self.new_oauth_seed_wrapping_for_user(
+                    &user,
+                    provider_name,
+                    provider_user_id,
+                    plaintext_seed,
+                )?;
+                new_wrapping.upsert_by_credential(conn)?;
 
-            let new_verification = NewEmailVerification::new(user.uuid, 24, true);
-            new_verification.insert(conn)?;
+                let new_verification = NewEmailVerification::new(user.uuid, 24, true);
+                new_verification.insert(conn)?;
 
-            Ok(user)
-        })
+                Ok(user)
+            }),
+        )
         .map_err(Error::from)
     }
 
@@ -1778,14 +2112,14 @@ impl AppState {
             .lock()
             .await
             .acquire(session_id)
-            .ok_or(ApiError::BadRequest)
+            .ok_or(ApiError::StaleSession)
     }
 
     pub(crate) async fn touch_session(&self, session_id: &Uuid) -> Result<(), ApiError> {
         if self.session_states.lock().await.touch(session_id) {
             Ok(())
         } else {
-            Err(ApiError::BadRequest)
+            Err(ApiError::StaleSession)
         }
     }
 
@@ -1989,6 +2323,13 @@ impl AppState {
                     &reset_request,
                     encrypted_password,
                     new_wrapping,
+                    &self.enclave_key,
+                    &|context| {
+                        crate::web::maple_devices::build_reset_clear_material(
+                            &self.enclave_key,
+                            context,
+                        )
+                    },
                 )?;
 
                 // Send confirmation email in the background
@@ -2379,7 +2720,8 @@ impl AppState {
             {
                 // Secret verification succeeded, proceed with account deletion
                 // Use the transaction-based method for atomicity
-                self.db.mark_and_delete_user(&user, &deletion_request)?;
+                self.db
+                    .mark_and_delete_user(&user, &deletion_request, &self.enclave_key)?;
 
                 // Send confirmation email in the background if the user has an email
                 if let Some(email) = user.email.clone() {
@@ -3724,6 +4066,14 @@ async fn main() -> Result<(), Error> {
         )
         .merge(
             web_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            maple_devices_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            maple_pairings_routes(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
         )
         .merge(

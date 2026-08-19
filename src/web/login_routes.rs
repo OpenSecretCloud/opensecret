@@ -497,16 +497,53 @@ pub async fn password_reset_confirm(
         project.id,
     )
     .await
-    .map_err(|e| match e {
-        crate::Error::PasswordResetExpired => ApiError::BadRequest,
-        crate::Error::InvalidPasswordResetSecret => ApiError::BadRequest,
-        crate::Error::InvalidPasswordResetRequest => ApiError::BadRequest,
-        _ => ApiError::InternalServerError,
-    })?;
+    .map_err(map_password_reset_confirmation_error)?;
 
     let response = json!({
         "message": "Password reset successful. You can now log in with your new password."
     });
     let result = encrypt_response(&data, &session_id, &response).await;
     result
+}
+
+fn map_password_reset_confirmation_error(error: crate::Error) -> ApiError {
+    match error {
+        crate::Error::PasswordResetExpired
+        | crate::Error::InvalidPasswordResetSecret
+        | crate::Error::InvalidPasswordResetRequest => ApiError::BadRequest,
+        crate::Error::DatabaseError(DBError::MaplePairingAuthorityCapacityExceeded) => {
+            ApiError::MapleAuthorityCapacityExceeded
+        }
+        crate::Error::DatabaseError(DBError::MaplePairingAuthorityBusy) => {
+            ApiError::MapleAuthorityBusy
+        }
+        _ => ApiError::InternalServerError,
+    }
+}
+
+#[cfg(test)]
+mod authority_error_tests {
+    use super::*;
+
+    #[test]
+    fn password_reset_exposes_only_retryable_authority_failures() {
+        assert!(matches!(
+            map_password_reset_confirmation_error(crate::Error::DatabaseError(
+                DBError::MaplePairingAuthorityCapacityExceeded,
+            )),
+            ApiError::MapleAuthorityCapacityExceeded
+        ));
+        assert!(matches!(
+            map_password_reset_confirmation_error(crate::Error::DatabaseError(
+                DBError::MaplePairingAuthorityBusy,
+            )),
+            ApiError::MapleAuthorityBusy
+        ));
+        assert!(matches!(
+            map_password_reset_confirmation_error(crate::Error::DatabaseError(
+                DBError::MaplePairingAuthorityCorrupt,
+            )),
+            ApiError::InternalServerError
+        ));
+    }
 }

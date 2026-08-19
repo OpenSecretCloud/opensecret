@@ -1587,7 +1587,7 @@ mod tests {
             "failed same-email OAuth attempt must not create attacker subject connection"
         );
 
-        let _ = app_state.db.delete_user(&user);
+        let _ = app_state.db.delete_user(&user, &app_state.enclave_key);
     }
 
     #[tokio::test]
@@ -1663,7 +1663,9 @@ mod tests {
             )
             .expect("new OAuth auth context should unwrap the committed seed wrap");
 
-        let _ = app_state.db.delete_user(&authenticated_user.user);
+        let _ = app_state
+            .db
+            .delete_user(&authenticated_user.user, &app_state.enclave_key);
     }
 
     async fn build_local_test_app_state(database_url: String) -> AppState {
@@ -1709,7 +1711,10 @@ mod tests {
 
         let user = app_state
             .db
-            .create_user(NewUser::new(Some(email), None, project_id))
+            .create_user(
+                NewUser::new(Some(email), None, project_id),
+                &app_state.enclave_key,
+            )
             .expect("test OAuth user should insert");
 
         let provider = app_state

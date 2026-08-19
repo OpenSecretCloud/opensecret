@@ -55,10 +55,10 @@ async fn create_org(
     let new_org = NewOrg::new(create_request.name);
     let org = data
         .db
-        .create_org_with_owner(new_org, platform_user.uuid)
+        .create_org_with_owner(new_org, platform_user.uuid, &data.enclave_key)
         .map_err(|e| {
             error!("Failed to create organization with owner: {:?}", e);
-            ApiError::InternalServerError
+            ApiError::from(e)
         })?;
 
     let response = OrgResponse {
@@ -134,9 +134,9 @@ async fn delete_org(
     }
 
     // Delete the org
-    data.db.delete_org(&org).map_err(|e| {
+    data.db.delete_org(&org, &data.enclave_key).map_err(|e| {
         error!("Failed to delete organization: {:?}", e);
-        ApiError::InternalServerError
+        ApiError::from(e)
     })?;
 
     let response = serde_json::json!({

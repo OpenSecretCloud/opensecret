@@ -1,6 +1,6 @@
 --- a/src/models/schema.rs
 +++ b/src/models/schema.rs
-@@ -397,13 +397,13 @@
+@@ -397,12 +397,12 @@
          request_mac -> Bytea,
          outcome_kind -> Int2,
          outcome_digest -> Bytea,

@@ -25,7 +25,7 @@ container setup changes user-level state unless disabled. See
 
 ```sh
 git submodule update --init --recursive
-OPENSECRET_DEV_CONTAINERS=0 nix develop
+OPENSECRET_DEV_CONTAINERS=0 nix develop --no-update-lock-file
 just diesel-migration-run-local
 ```
 

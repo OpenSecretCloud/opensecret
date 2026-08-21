@@ -23,7 +23,7 @@ authorizes the exact action and environment.
 ## Enter the toolchain deliberately
 
 ```sh
-OPENSECRET_DEV_CONTAINERS=0 nix develop
+OPENSECRET_DEV_CONTAINERS=0 nix develop --no-update-lock-file
 ```
 
 The shell may reuse a PostgreSQL listener, start `.pgdata`, and create `.env`
@@ -38,7 +38,7 @@ database.
 Run SQL migrations before starting the backend:
 
 ```sh
-OPENSECRET_DEV_CONTAINERS=0 nix develop -c just diesel-migration-run-local
+OPENSECRET_DEV_CONTAINERS=0 nix develop --no-update-lock-file -c just diesel-migration-run-local
 ```
 
 `src/migrations.rs` is application-data migration logic, not the Diesel runner.
@@ -46,7 +46,7 @@ For a schema change, create a new reversible migration and let Diesel regenerate
 `src/models/schema.rs`:
 
 ```sh
-OPENSECRET_DEV_CONTAINERS=0 nix develop -c \
+OPENSECRET_DEV_CONTAINERS=0 nix develop --no-update-lock-file -c \
   just diesel-migration-generate add_user_preferences
 ```
 

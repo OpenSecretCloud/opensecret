@@ -21,7 +21,7 @@ applicable tiers. A higher tier supplements rather than replaces lower tiers.
 | Authorized dev or prod publish/deployment | Tier 5 release EIF/PCR evidence on the supported Linux/ARM64 builder. |
 
 Keep credentials and user data out of commands, logs, fixtures, and tracked
-files. Never blanket-run `cargo test -- --ignored`: ignored tests mix
+files. Never blanket-run `cargo test --locked -- --ignored`: ignored tests mix
 disposable-database mutation with a credentialed live-provider test.
 
 ## Tier 0: iterate narrowly

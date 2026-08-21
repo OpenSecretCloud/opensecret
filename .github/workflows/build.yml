@@ -47,7 +47,7 @@ jobs:
         id: build-dev
         run: |
           set -euo pipefail
-          nix build .?submodules=1#eif-dev
+          nix build --no-update-lock-file .?submodules=1#eif-dev
           echo "Build completed successfully"
 
       # Verify PCR values match the reference
@@ -114,7 +114,7 @@ jobs:
         id: build-prod
         run: |
           set -euo pipefail
-          nix build .?submodules=1#eif-prod
+          nix build --no-update-lock-file .?submodules=1#eif-prod
           echo "Build completed successfully"
 
       # Verify PCR values match the reference

@@ -51,7 +51,10 @@ PY
 )"
 admin_user="$(id -un)"
 test_database="opensecret_agent_test_$(openssl rand -hex 6)"
+issuer_rotation_test_database="opensecret_issuer_rotation_test_$(openssl rand -hex 6)"
+oauth_test_database="opensecret_oauth_test_$(openssl rand -hex 6)"
 tests_passed=0
+authority_sql_count=0
 
 cleanup() {
   status=$?
@@ -90,8 +93,8 @@ cleanup() {
   rm -rf -- "$workdir"
 
   if [ "$status" -eq 0 ] && [ "$tests_passed" -eq 1 ]; then
-    printf 'Disposable-DB evidence: %s AEAD/database tests and %s OAuth database tests passed; no tests skipped; temporary cluster removed.\n' \
-      "$aead_count" "$oauth_count"
+    printf 'Disposable-DB evidence: %s Maple authority SQL cases, %s AEAD/database tests, and %s OAuth database tests passed; no tests skipped; temporary cluster removed.\n' \
+      "$authority_sql_count" "$aead_count" "$oauth_count"
   fi
   exit "$status"
 }
@@ -160,10 +163,39 @@ test "$expected_migrations" -gt 0
 assert_migration_count
 
 if [ "$redo_latest" -eq 1 ]; then
-  diesel migration redo --locked-schema \
+  if diesel migration revert --locked-schema \
+    --database-url "$AEAD_TAMPER_TEST_DATABASE_URL" \
+    >"$workdir/unguarded-revert.log" 2>&1; then
+    printf 'destructive Maple pairing migration reverted without disposable guard\n' >&2
+    exit 1
+  fi
+  grep -q 'maple pairing rollback is destructive' \
+    "$workdir/unguarded-revert.log"
+  assert_migration_count
+  PGOPTIONS='-c opensecret.allow_destructive_maple_pairing_down=disposable-test-only' \
+    diesel migration redo --locked-schema \
     --database-url "$AEAD_TAMPER_TEST_DATABASE_URL"
   assert_migration_count
 fi
+
+authority_sql_count="$(
+  MAPLE_AUTHORITY_SQL_TEST_LOG_DIR="$workdir" \
+    bash "$script_dir/maple_pairing_authority_hierarchy_sql_tests.sh"
+)"
+test "$authority_sql_count" -eq 21
+
+# Registry expansion is lifetime-persistent by design. Give its cutover
+# regression a dedicated migrated database so [A] -> [A,B] is real without
+# polluting the shared AEAD database used by every other pairing test.
+createdb -h "$pgsockets" -p "$pgport" -U "$admin_user" \
+  --maintenance-db=postgres --owner=opensecret_user "$issuer_rotation_test_database"
+export MAPLE_ISSUER_ROTATION_TEST_DATABASE_URL="postgres://opensecret_user:password@127.0.0.1:${pgport}/${issuer_rotation_test_database}"
+diesel migration run --locked-schema \
+  --database-url "$MAPLE_ISSUER_ROTATION_TEST_DATABASE_URL"
+test "$(psql "$MAPLE_ISSUER_ROTATION_TEST_DATABASE_URL" -Atqc \
+  'SELECT count(*) FROM __diesel_schema_migrations')" -eq "$expected_migrations"
+test "$(psql "$MAPLE_ISSUER_ROTATION_TEST_DATABASE_URL" -Atqc \
+  'SELECT current_database()')" = "$issuer_rotation_test_database"
 
 cargo test --locked --all-features aead_db_tamper_tests \
   -- --ignored --list | tee "$workdir/aead-tests.list"
@@ -185,6 +217,19 @@ if grep -qi 'skipping:' "$workdir/aead-tests.log"; then
 fi
 grep -Eq "test result: ok\\. ${aead_count} passed; 0 failed; 0 ignored;" \
   "$workdir/aead-tests.log"
+
+# The Maple issuer registry is intentionally lifetime-append-only. Run the
+# non-pairing OAuth DB suite against a separately migrated database so its
+# signer-free AppState fixture cannot depend on which pairing test ran first.
+createdb -h "$pgsockets" -p "$pgport" -U "$admin_user" \
+  --maintenance-db=postgres --owner=opensecret_user "$oauth_test_database"
+test_database="$oauth_test_database"
+export DATABASE_URL="postgres://opensecret_user:password@127.0.0.1:${pgport}/${test_database}"
+export AEAD_TAMPER_TEST_DATABASE_URL="$DATABASE_URL"
+diesel migration run --locked-schema \
+  --database-url "$AEAD_TAMPER_TEST_DATABASE_URL"
+assert_database_identity
+assert_migration_count
 
 cargo test --locked --all-features web::oauth_routes::tests::db_ \
   -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$workdir/oauth-tests.log"

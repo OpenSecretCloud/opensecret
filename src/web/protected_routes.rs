@@ -1251,24 +1251,35 @@ pub async fn confirm_account_deletion(
             let result = encrypt_response(&data, &session_id, &response).await;
             result
         }
-        Err(e) => match e {
-            Error::AccountDeletionExpired => {
-                warn!("Account deletion confirmation has expired: {:?}", e);
-                Err(ApiError::BadRequest)
-            }
-            Error::InvalidAccountDeletionSecret => {
-                warn!("Invalid account deletion secret: {:?}", e);
-                Err(ApiError::BadRequest)
-            }
-            Error::InvalidAccountDeletionRequest => {
-                warn!("Invalid account deletion request: {:?}", e);
-                Err(ApiError::BadRequest)
-            }
-            _ => {
-                error!("Error in confirming account deletion: {:?}", e);
-                Err(ApiError::InternalServerError)
-            }
-        },
+        Err(e) => Err(map_account_deletion_confirmation_error(e)),
+    }
+}
+
+fn map_account_deletion_confirmation_error(error: Error) -> ApiError {
+    match error {
+        Error::AccountDeletionExpired => {
+            warn!("Account deletion confirmation has expired");
+            ApiError::BadRequest
+        }
+        Error::InvalidAccountDeletionSecret => {
+            warn!("Invalid account deletion secret");
+            ApiError::BadRequest
+        }
+        Error::InvalidAccountDeletionRequest => {
+            warn!("Invalid account deletion request");
+            ApiError::BadRequest
+        }
+        Error::DatabaseError(DBError::MaplePairingAuthorityDeletionBlocked) => {
+            ApiError::MapleAuthorityDeletionBlocked
+        }
+        Error::DatabaseError(DBError::MaplePairingAuthorityCapacityExceeded) => {
+            ApiError::MapleAuthorityCapacityExceeded
+        }
+        Error::DatabaseError(DBError::MaplePairingAuthorityBusy) => ApiError::MapleAuthorityBusy,
+        other => {
+            error!("Error in confirming account deletion: {:?}", other);
+            ApiError::InternalServerError
+        }
     }
 }
 
@@ -1390,6 +1401,28 @@ mod tests {
     use super::*;
     use crate::encrypt::{decrypt_with_key, encrypt_with_key};
     use secp256k1::SecretKey;
+
+    #[test]
+    fn account_deletion_exposes_only_actionable_authority_failures() {
+        assert!(matches!(
+            map_account_deletion_confirmation_error(Error::DatabaseError(
+                DBError::MaplePairingAuthorityDeletionBlocked,
+            )),
+            ApiError::MapleAuthorityDeletionBlocked
+        ));
+        assert!(matches!(
+            map_account_deletion_confirmation_error(Error::DatabaseError(
+                DBError::MaplePairingAuthorityBusy,
+            )),
+            ApiError::MapleAuthorityBusy
+        ));
+        assert!(matches!(
+            map_account_deletion_confirmation_error(Error::DatabaseError(
+                DBError::MaplePairingAuthorityCorrupt,
+            )),
+            ApiError::InternalServerError
+        ));
+    }
 
     #[test]
     fn test_derivation_path_validation() {

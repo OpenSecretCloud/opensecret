@@ -160,10 +160,13 @@ async fn create_project(
             .unwrap_or_else(|| String::from("")),
     );
 
-    let project = data.db.create_org_project(new_project).map_err(|e| {
-        error!("Failed to create project: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    let project = data
+        .db
+        .create_org_project(new_project, &data.enclave_key)
+        .map_err(|e| {
+            error!("Failed to create project: {:?}", e);
+            ApiError::from(e)
+        })?;
 
     let response = ProjectResponse {
         id: project.uuid,
@@ -381,10 +384,12 @@ async fn delete_project(
     }
 
     // Delete the project
-    data.db.delete_org_project(&project).map_err(|e| {
-        error!("Failed to delete project: {:?}", e);
-        ApiError::InternalServerError
-    })?;
+    data.db
+        .delete_org_project(&project, &data.enclave_key)
+        .map_err(|e| {
+            error!("Failed to delete project: {:?}", e);
+            ApiError::from(e)
+        })?;
 
     let response = serde_json::json!({
         "message": "Project deleted successfully"

@@ -3,6 +3,8 @@ pub mod audio_utils;
 pub mod encryption_middleware;
 mod health_routes;
 pub mod login_routes;
+pub mod maple_devices;
+pub mod maple_pairings;
 mod oauth_routes;
 mod openai;
 pub mod openai_auth;
@@ -14,6 +16,8 @@ pub(crate) mod web_safety;
 
 pub use health_routes::router_with_state as health_routes_with_state;
 pub use login_routes::router as login_routes;
+pub use maple_devices::router as maple_devices_routes;
+pub use maple_pairings::router as maple_pairings_routes;
 pub use oauth_routes::router as oauth_routes;
 pub use openai::router as openai_routes;
 pub use platform::router as platform_routes;

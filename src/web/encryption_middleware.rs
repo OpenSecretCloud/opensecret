@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::{ApiError, AppState};
 
 const MAX_ENCRYPTED_BODY_BYTES: usize = 50 * 1024 * 1024; // 50MB
+const MAX_DECRYPTED_BODY_BYTES: usize = 50 * 1024 * 1024; // 50MB
 
 #[derive(Deserialize)]
 pub struct EncryptedRequest {
@@ -73,6 +74,31 @@ where
 pub async fn decrypt_request<T>(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, ApiError>
+where
+    T: DeserializeOwned + Send + Sync + Clone + 'static,
+{
+    decrypt_request_bounded::<T, MAX_ENCRYPTED_BODY_BYTES, MAX_DECRYPTED_BODY_BYTES>(
+        State(state),
+        headers,
+        request,
+        next,
+    )
+    .await
+}
+
+/// Decrypt a request using route-specific transport and plaintext limits.
+/// Small control-plane DTOs should use this instead of inheriting the generic
+/// attachment-sized envelope.
+pub async fn decrypt_request_bounded<
+    T,
+    const MAX_ENCRYPTED_BYTES: usize,
+    const MAX_DECRYPTED_BYTES: usize,
+>(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError>
@@ -103,7 +129,7 @@ where
     }
 
     let body = std::mem::replace(request.body_mut(), Body::empty());
-    let body_bytes = axum::body::to_bytes(body, MAX_ENCRYPTED_BODY_BYTES)
+    let body_bytes = axum::body::to_bytes(body, MAX_ENCRYPTED_BYTES)
         .await
         .map_err(|_| ApiError::PayloadTooLarge)?;
 
@@ -117,9 +143,14 @@ where
         .decrypt_session_data(&session_id, &session_lease, &encrypted_request.encrypted)
         .await
         .map_err(|_| ApiError::BadRequest)?;
+    if decrypted_data.len() > MAX_DECRYPTED_BYTES {
+        return Err(ApiError::PayloadTooLarge);
+    }
 
-    let decrypted: T = serde_json::from_slice(&decrypted_data).map_err(|e| {
-        tracing::error!("Failed to deserialize decrypted data: {:?}", e);
+    let decrypted: T = serde_json::from_slice(&decrypted_data).map_err(|_| {
+        // Serde data errors may embed literal field values. Decrypted request
+        // contents must never escape into host-visible logs.
+        tracing::error!("Failed to deserialize decrypted request data");
         ApiError::BadRequest
     })?;
 
@@ -212,7 +243,7 @@ mod tests {
         let observed_calls = calls.clone();
 
         let result = forward_bodyless_request::<(), _, _, _, _>(
-            ready(Err::<(), ApiError>(ApiError::BadRequest)),
+            ready(Err::<(), ApiError>(ApiError::StaleSession)),
             Uuid::new_v4(),
             Request::builder()
                 .method(Method::POST)
@@ -231,11 +262,14 @@ mod tests {
             Ok(_) => panic!("unknown session reached next"),
         };
         let response = error.into_response();
-        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), axum::http::StatusCode::GONE);
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();
-        assert_eq!(body.as_ref(), br#"{"status":400,"message":"Bad Request"}"#);
+        assert_eq!(
+            body.as_ref(),
+            br#"{"status":410,"message":"Attested session is stale"}"#
+        );
     }
 
     #[tokio::test]

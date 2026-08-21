@@ -1,0 +1,16 @@
+--- a/src/models/schema.rs
++++ b/src/models/schema.rs
+@@ -397,12 +397,12 @@
+         request_mac -> Bytea,
+         outcome_kind -> Int2,
+         outcome_digest -> Bytea,
+         receipt_version -> Int2,
+         receipt_enc -> Bytea,
+         receipt_digest -> Bytea,
+-        referenced_issuer_key_ids -> Array<Nullable<Text>>,
++        referenced_issuer_key_ids -> Array<Text>,
+         accepted_at -> Timestamptz,
+         record_mac -> Bytea,
+         retired_at -> Timestamptz,
+     }
+ }

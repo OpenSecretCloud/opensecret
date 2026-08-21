@@ -4,7 +4,6 @@
 unmaintained = "none"
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "No patched rsa release; Tinfoil uses RSA public-key verification only, while the advisory affects private-key operations" },
-    { id = "RUSTSEC-2026-0258", reason = "The remaining h2 0.3 dependency comes from the legacy Hyper 0.14 provider transport; h2 has no patched 0.3 release" },
 ]
 
 [bans]

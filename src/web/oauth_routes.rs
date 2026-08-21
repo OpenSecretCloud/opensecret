@@ -2,7 +2,7 @@ use crate::apple_signin::{generate_apple_client_secret, validate_apple_native_to
 #[cfg(test)]
 use crate::models::oauth::NewUserOAuthConnection;
 use crate::models::oauth::UserOAuthConnection;
-use crate::oauth::OAuthState;
+use crate::oauth::{BasicClient, OAuthState};
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
 use crate::web::login_routes::handle_new_user_registration;
 use crate::web::platform::common::{
@@ -28,8 +28,7 @@ use axum::{
 use base64::Engine as _;
 use oauth2::TokenResponse;
 use oauth2::{
-    basic::{BasicClient, BasicTokenType},
-    AuthorizationCode, EmptyExtraTokenFields, StandardTokenResponse,
+    basic::BasicTokenType, AuthorizationCode, EmptyExtraTokenFields, StandardTokenResponse,
 };
 use reqwest::header::AUTHORIZATION;
 use secp256k1::SecretKey;
@@ -549,7 +548,7 @@ pub async fn oauth_callback(
         let token_url = "https://appleid.apple.com/auth/token";
 
         // Let's try a custom approach matching your successful Postman request
-        let client = reqwest::Client::new();
+        let client = crate::http_client::client();
 
         // Get the parameters from the OAuth client
         let client_id = oauth_client.client_id().as_str();
@@ -643,7 +642,7 @@ pub async fn oauth_callback(
         })?;
 
         let redirect_uri = oauth_client
-            .redirect_url()
+            .redirect_uri()
             .ok_or_else(|| {
                 error!("OAuth redirect URL not configured");
                 ApiError::InternalServerError
@@ -737,9 +736,18 @@ pub async fn oauth_callback(
         (token, Some(id_token))
     } else {
         // For other providers, use the standard OAuth client
+        let http_client = oauth2::reqwest::ClientBuilder::new()
+            // OAuth token endpoints must not follow redirects: doing so could
+            // send client credentials to an attacker-controlled destination.
+            .redirect(oauth2::reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| {
+                error!("Failed to build OAuth HTTP client: {:?}", e);
+                ApiError::InternalServerError
+            })?;
         let token = oauth_client
             .exchange_code(AuthorizationCode::new(callback_request.code.clone()))
-            .request_async(oauth2::reqwest::async_http_client)
+            .request_async(&http_client)
             .await
             .map_err(|e| {
                 error!("Failed to exchange code for access token: {:?}", e);
@@ -902,7 +910,7 @@ async fn fetch_github_user(
     access_token: &str,
     github_provider: &GithubProvider,
 ) -> Result<GithubUser, ApiError> {
-    let client = reqwest::Client::new();
+    let client = crate::http_client::client();
     let user_url = &github_provider.user_info_url;
 
     debug!("Sending request to GitHub API: {}", user_url);
@@ -1016,7 +1024,7 @@ async fn fetch_google_user(
     access_token: &str,
     google_provider: &GoogleProvider,
 ) -> Result<GoogleUser, ApiError> {
-    let client = reqwest::Client::new();
+    let client = crate::http_client::client();
     let user_url = &google_provider.user_info_url;
 
     debug!("Sending request to Google API: {}", user_url);

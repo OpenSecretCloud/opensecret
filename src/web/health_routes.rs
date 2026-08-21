@@ -4,7 +4,7 @@ use crate::{
 };
 use axum::{http::StatusCode, Router};
 use axum::{routing::get, Json};
-use reqwest_tinfoil::Method;
+use reqwest::Method;
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;

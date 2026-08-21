@@ -3,7 +3,8 @@ use crate::models::oauth::NewOAuthProvider;
 use crate::Error;
 use async_trait::async_trait;
 use oauth2::{
-    basic::BasicClient, AuthUrl, ClientId, ClientSecret, CsrfToken, RedirectUrl, Scope, TokenUrl,
+    basic::BasicClient as OAuthBasicClient, AuthUrl, ClientId, ClientSecret, CsrfToken,
+    EndpointNotSet, EndpointSet, RedirectUrl, Scope, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,6 +19,9 @@ use uuid::Uuid;
 const OAUTH_STATE_TTL: Duration = Duration::from_secs(10 * 60);
 // This limit applies independently to each configured provider.
 const OAUTH_STATE_CAPACITY: usize = 4_096;
+
+pub type BasicClient =
+    OAuthBasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthState {
@@ -165,16 +169,14 @@ impl GithubProvider {
         let token_url = TokenUrl::new(self.token_url.clone())
             .map_err(|e| Error::OAuthError(format!("Invalid token URL: {}", e)))?;
 
-        Ok(BasicClient::new(
-            ClientId::new(client_id),
-            Some(ClientSecret::new(client_secret)),
-            auth_url,
-            Some(token_url),
-        )
-        .set_redirect_uri(
-            RedirectUrl::new(redirect_url)
-                .map_err(|e| Error::OAuthError(format!("Invalid redirect URL: {}", e)))?,
-        ))
+        Ok(OAuthBasicClient::new(ClientId::new(client_id))
+            .set_client_secret(ClientSecret::new(client_secret))
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url)
+            .set_redirect_uri(
+                RedirectUrl::new(redirect_url)
+                    .map_err(|e| Error::OAuthError(format!("Invalid redirect URL: {}", e)))?,
+            ))
     }
 
     pub async fn generate_authorize_url(&self, client: &BasicClient) -> (String, CsrfToken) {
@@ -271,16 +273,14 @@ impl GoogleProvider {
         let token_url = TokenUrl::new(self.token_url.clone())
             .map_err(|e| Error::OAuthError(format!("Invalid token URL: {}", e)))?;
 
-        Ok(BasicClient::new(
-            ClientId::new(client_id),
-            Some(ClientSecret::new(client_secret)),
-            auth_url,
-            Some(token_url),
-        )
-        .set_redirect_uri(
-            RedirectUrl::new(redirect_url)
-                .map_err(|e| Error::OAuthError(format!("Invalid redirect URL: {}", e)))?,
-        ))
+        Ok(OAuthBasicClient::new(ClientId::new(client_id))
+            .set_client_secret(ClientSecret::new(client_secret))
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url)
+            .set_redirect_uri(
+                RedirectUrl::new(redirect_url)
+                    .map_err(|e| Error::OAuthError(format!("Invalid redirect URL: {}", e)))?,
+            ))
     }
 
     pub async fn generate_authorize_url(&self, client: &BasicClient) -> (String, CsrfToken) {
@@ -379,16 +379,14 @@ impl AppleProvider {
         let token_url = TokenUrl::new(self.token_url.clone())
             .map_err(|e| Error::OAuthError(format!("Invalid token URL: {}", e)))?;
 
-        Ok(BasicClient::new(
-            ClientId::new(client_id),
-            Some(ClientSecret::new(client_secret)),
-            auth_url,
-            Some(token_url),
-        )
-        .set_redirect_uri(
-            RedirectUrl::new(redirect_url)
-                .map_err(|e| Error::OAuthError(format!("Invalid redirect URL: {}", e)))?,
-        ))
+        Ok(OAuthBasicClient::new(ClientId::new(client_id))
+            .set_client_secret(ClientSecret::new(client_secret))
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url)
+            .set_redirect_uri(
+                RedirectUrl::new(redirect_url)
+                    .map_err(|e| Error::OAuthError(format!("Invalid redirect URL: {}", e)))?,
+            ))
     }
 
     pub async fn generate_authorize_url(&self, client: &BasicClient) -> (String, CsrfToken) {

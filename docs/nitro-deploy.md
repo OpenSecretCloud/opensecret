@@ -1089,7 +1089,7 @@ sudo vim /etc/nitro_enclaves/vsock-proxy.yaml
 Add these lines:
 ```
 - {address: github-proxy.tinfoil.sh, port: 443}
-# Retained unchanged by this minimal migration; tinfoil-rs v0.1.3 embeds its trust root.
+# Retained unchanged by this migration; tinfoil-rs v0.2.0 embeds its trust root.
 - {address: tuf-repo-cdn.sigstore.dev, port: 443}
 - {address: kds-proxy.tinfoil.sh, port: 443}
 - {address: atc.tinfoil.sh, port: 443}

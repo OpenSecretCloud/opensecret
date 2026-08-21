@@ -47,7 +47,7 @@ OPENSECRET_DEV_POSTGRES=0 OPENSECRET_DEV_ENV=0 OPENSECRET_DEV_CONTAINERS=0 \
 Terminal 2:
 
 ```sh
-nix develop -c just run-local-backend-macos
+nix develop --no-update-lock-file -c just run-local-backend-macos
 ```
 
 Local backend logs are line-buffered on stdout. Follow that terminal, or the

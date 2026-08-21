@@ -10,7 +10,7 @@ default:
 
 # Build the pinned NSM and KMS helper sources with Nix
 build-nitro-bins:
-    nix build .#nitro-bins
+    nix build --no-update-lock-file .#nitro-bins
 
 ### Credential Requester Commands ###
 
@@ -170,7 +170,7 @@ update-continuum-proxy-version version:
 
 # Build continuum-proxy from source using Nix (produces statically linked binary)
 build-continuum-proxy:
-    nix build ./privatemode-public#privatemode-proxy.bin -o continuum-proxy-build
+    nix build --no-update-lock-file ./privatemode-public#privatemode-proxy.bin -o continuum-proxy-build
     chmod u+w continuum-proxy || true
     cp continuum-proxy-build/bin/privatemode-proxy continuum-proxy
     chmod +x continuum-proxy
@@ -187,7 +187,7 @@ update-continuum-proxy version="v1.39.1":
 ### Local macOS Proxy Commands ###
 
 # Build the macOS-native Continuum proxy binary under .local/bin.
-# Run from a Nix dev shell, for example: nix develop -c just build-local-proxies-macos
+# Run from a Nix dev shell, for example: nix develop --no-update-lock-file -c just build-local-proxies-macos
 build-local-proxies-macos: build-continuum-proxy-macos
 
 # Build a macOS-native Continuum proxy without replacing the checked-in Linux binary.
@@ -218,7 +218,7 @@ run-continuum-proxy-macos:
     port="${CONTINUUM_PROXY_PORT:-8092}"
     workspace="${CONTINUUM_PROXY_WORKSPACE:-.local/continuum}"
     if [ ! -x "$bin" ]; then
-        echo "$bin is missing. Run: nix develop -c just build-continuum-proxy-macos" >&2
+        echo "$bin is missing. Run: nix develop --no-update-lock-file -c just build-continuum-proxy-macos" >&2
         exit 1
     fi
     api_key="${CONTINUUM_API_KEY:-}"
@@ -249,7 +249,7 @@ run-local-backend-macos:
     APP_MODE="${APP_MODE:-local}" \
         OPENAI_API_BASE="${OPENAI_API_BASE:-http://127.0.0.1:8092}" \
         TINFOIL_API_KEY="$tinfoil_api_key" \
-        exec cargo run
+        exec cargo run --locked
 
 ### Enclave Management ###
 
@@ -317,32 +317,32 @@ run-stage-preview: terminate-enclave-preview run-eif-preview restart-socat-previ
 
 # Build EIF for development environment
 build-eif-dev:
-    nix build '.?submodules=1#eif-dev'
+    nix build --no-update-lock-file '.?submodules=1#eif-dev'
     echo "EIF build completed. PCR:"
     cat result/pcr.json
 
 # Build EIF for production environment
 build-eif-prod:
-    nix build '.?submodules=1#eif-prod'
+    nix build --no-update-lock-file '.?submodules=1#eif-prod'
     echo "EIF build completed. PCR:"
     cat result/pcr.json
 
 # Build EIF for preview environment
 build-eif-preview:
-    nix build '.?submodules=1#eif-preview'
+    nix build --no-update-lock-file '.?submodules=1#eif-preview'
     echo "EIF build completed. PCR:"
     cat result/pcr.json
 
 # Build EIF for development environment
 copy-pcr-dev:
-    nix build '.?submodules=1#eif-dev'
+    nix build --no-update-lock-file '.?submodules=1#eif-dev'
     echo "EIF build completed. PCR:"
     cat result/pcr.json
     cp -f result/pcr.json ./pcrDev.json
 
 # Build EIF for production environment
 copy-pcr-prod:
-    nix build '.?submodules=1#eif-prod'
+    nix build --no-update-lock-file '.?submodules=1#eif-prod'
     echo "EIF build completed. PCR:"
     cat result/pcr.json
     cp -f result/pcr.json ./pcrProd.json

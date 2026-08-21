@@ -167,13 +167,13 @@ just build-nitro-bins
 2. Build the EIF for your target environment:
 ```bash
 # For development
-nix build '.?submodules=1#eif-dev'
+nix build --no-update-lock-file '.?submodules=1#eif-dev'
 
 # For production
-nix build '.?submodules=1#eif-prod'
+nix build --no-update-lock-file '.?submodules=1#eif-prod'
 
 # For preview
-nix build '.?submodules=1#eif-preview'
+nix build --no-update-lock-file '.?submodules=1#eif-preview'
 ```
 
 This will create a symlink `result` pointing to the built EIF file.

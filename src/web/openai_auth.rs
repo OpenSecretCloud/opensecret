@@ -116,3 +116,18 @@ pub async fn validate_openai_auth(
     req.extensions_mut().insert(AuthMethod::Jwt);
     next.run(req).await
 }
+
+/// Authenticate the dedicated models route when current OpenAI credentials
+/// are present. The route's attested encryption session is validated
+/// independently by its encryption middleware.
+pub async fn validate_optional_openai_auth(
+    state: State<Arc<crate::AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    if !req.headers().contains_key(header::AUTHORIZATION) {
+        return next.run(req).await;
+    }
+
+    validate_openai_auth(state, req, next).await
+}

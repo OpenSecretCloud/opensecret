@@ -725,13 +725,6 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
             )),
         )
         .route(
-            "/v1/models",
-            get(proxy_models).layer(axum::middleware::from_fn_with_state(
-                app_state.clone(),
-                decrypt_request::<()>,
-            )),
-        )
-        .route(
             "/v1/models/catalog",
             get(proxy_model_catalog).layer(axum::middleware::from_fn_with_state(
                 app_state.clone(),
@@ -757,6 +750,18 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
             post(proxy_embeddings).layer(axum::middleware::from_fn_with_state(
                 app_state.clone(),
                 decrypt_request::<EmbeddingRequest>,
+            )),
+        )
+        .with_state(app_state)
+}
+
+pub fn models_router(app_state: Arc<AppState>) -> Router<()> {
+    Router::new()
+        .route(
+            "/v1/models",
+            get(proxy_models).layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                decrypt_request::<()>,
             )),
         )
         .with_state(app_state)
@@ -1587,13 +1592,13 @@ async fn encrypt_sse_event(
 
 async fn proxy_models(
     State(state): State<Arc<AppState>>,
-    _headers: HeaderMap,
     axum::Extension(session_id): axum::Extension<Uuid>,
-    axum::Extension(user): axum::Extension<User>,
-    axum::Extension(_auth_method): axum::Extension<AuthMethod>,
-    axum::Extension(_body): axum::Extension<()>,
+    user: Option<axum::Extension<User>>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
-    let model_access = state.model_feature_access(user.uuid).await;
+    let model_access = match user {
+        Some(axum::Extension(user)) => state.model_feature_access(user.uuid).await,
+        None => ModelFeatureAccess::default(),
+    };
     let proxy_config = state.proxy_router.get_completion_proxy();
     let mut models_response = if proxy_config.provider_name == "tinfoil" {
         openai_models_response(model_access)

@@ -100,6 +100,7 @@ mod crypto_property_tests;
 mod db;
 mod email;
 mod encrypt;
+mod http_client;
 mod jwt;
 mod kagi;
 mod kv;
@@ -227,6 +228,9 @@ pub enum Error {
 
     #[error(transparent)]
     TryInit(#[from] tracing_subscriber::util::TryInitError),
+
+    #[error("failed to install the required Ring crypto provider")]
+    CryptoProvider,
 
     #[error("Database error: {0}")]
     DatabaseError(#[from] DBError),
@@ -3441,6 +3445,7 @@ async fn retrieve_kagi_api_key(
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     dotenv::dotenv().ok();
+    http_client::install_ring_crypto_provider().map_err(|_| Error::CryptoProvider)?;
 
     let app_mode = std::env::var("APP_MODE")
         .unwrap_or_else(|_| "local".to_string())

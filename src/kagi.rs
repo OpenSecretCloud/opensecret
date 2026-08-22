@@ -178,7 +178,7 @@ impl KagiClient {
         }
 
         let base_url = Url::parse(&format!("{}/", base_url.trim_end_matches('/')))?;
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::client_builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(KAGI_REQUEST_TIMEOUT)
             .pool_max_idle_per_host(100)

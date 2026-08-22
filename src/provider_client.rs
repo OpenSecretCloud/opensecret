@@ -3,21 +3,17 @@ use crate::proxy_config::ProxyConfig;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use hyper::client::HttpConnector;
-use hyper::header::{HeaderName as HyperHeaderName, HeaderValue as HyperHeaderValue};
-use hyper::{Body as HyperBody, Client as HyperClient, Request as HyperRequest};
-use hyper_tls::HttpsConnector;
-use reqwest_tinfoil::{Method, Request as ReqwestRequest};
+use reqwest::{Method, Request as ReqwestRequest};
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-type StandardHttpClient = HyperClient<HttpsConnector<HttpConnector>, HyperBody>;
+type StandardHttpClient = reqwest::Client;
 type TinfoilRefreshTask = JoinHandle<Result<SecureClientSnapshot, ProviderRequestError>>;
 
 const TINFOIL_INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -28,7 +24,7 @@ const TINFOIL_UNINITIALIZED_BASE_URL: &str = "https://in-process.tinfoil.invalid
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderClientError {
     #[error("failed to build provider HTTP client: {0}")]
-    Client(#[from] reqwest_tinfoil::Error),
+    Client(#[from] reqwest::Error),
 
     #[error("failed to install the required Ring crypto provider")]
     CryptoProvider,
@@ -52,8 +48,8 @@ pub enum ProviderRequestError {
 }
 
 pub enum ProviderResponse {
-    Tinfoil(reqwest_tinfoil::Response),
-    Standard(hyper::Response<HyperBody>),
+    Tinfoil(reqwest::Response),
+    Standard(reqwest::Response),
 }
 
 #[derive(Clone)]
@@ -132,9 +128,7 @@ impl ProviderResponse {
     pub async fn bytes(self) -> Result<Bytes, String> {
         match self {
             Self::Tinfoil(response) => response.bytes().await.map_err(|error| error.to_string()),
-            Self::Standard(response) => hyper::body::to_bytes(response.into_body())
-                .await
-                .map_err(|error| error.to_string()),
+            Self::Standard(response) => response.bytes().await.map_err(|error| error.to_string()),
         }
     }
 
@@ -149,7 +143,7 @@ impl ProviderResponse {
             ),
             Self::Standard(response) => Box::pin(
                 response
-                    .into_body()
+                    .bytes_stream()
                     .map(|result| result.map_err(|e| e.to_string())),
             ),
         }
@@ -208,7 +202,7 @@ enum TinfoilAttempt {
     Secure(SecureClientSnapshot),
     #[cfg(test)]
     Plain {
-        client: reqwest_tinfoil::Client,
+        client: reqwest::Client,
         base_url: String,
         api_key: String,
     },
@@ -219,7 +213,7 @@ enum TinfoilTransport {
     Secure(Arc<SecureTinfoilTransport>),
     #[cfg(test)]
     Plain {
-        client: reqwest_tinfoil::Client,
+        client: reqwest::Client,
         base_url: String,
         api_key: String,
     },
@@ -513,7 +507,8 @@ pub struct ProviderClient {
 
 impl ProviderClient {
     pub async fn new(tinfoil_api_key: String) -> Result<Self, ProviderClientError> {
-        install_crypto_provider()?;
+        crate::http_client::install_ring_crypto_provider()
+            .map_err(|_| ProviderClientError::CryptoProvider)?;
 
         let secure_transport = Arc::new(SecureTinfoilTransport {
             api_key: tinfoil_api_key,
@@ -528,13 +523,14 @@ impl ProviderClient {
 
         Ok(Self {
             tinfoil: TinfoilTransport::Secure(secure_transport),
-            standard: standard_http_client(),
+            standard: standard_http_client()?,
         })
     }
 
     #[cfg(test)]
     fn uninitialized_for_test() -> Result<Self, ProviderClientError> {
-        install_crypto_provider()?;
+        crate::http_client::install_ring_crypto_provider()
+            .map_err(|_| ProviderClientError::CryptoProvider)?;
 
         Ok(Self {
             tinfoil: TinfoilTransport::Secure(Arc::new(SecureTinfoilTransport {
@@ -548,13 +544,14 @@ impl ProviderClient {
                 // without creating a real discovery request.
                 initialization_started: AtomicBool::new(true),
             })),
-            standard: standard_http_client(),
+            standard: standard_http_client()?,
         })
     }
 
     #[cfg(test)]
     pub fn for_test(base_url: String) -> Result<Self, ProviderClientError> {
-        install_crypto_provider()?;
+        crate::http_client::install_ring_crypto_provider()
+            .map_err(|_| ProviderClientError::CryptoProvider)?;
         let client = test_http_client()?;
 
         Ok(Self {
@@ -563,7 +560,7 @@ impl ProviderClient {
                 base_url,
                 api_key: "test-tinfoil-key".to_string(),
             },
-            standard: standard_http_client(),
+            standard: standard_http_client()?,
         })
     }
 
@@ -697,7 +694,7 @@ impl ProviderClient {
             base_url.trim_end_matches('/'),
             path.trim_start_matches('/')
         );
-        let url = reqwest_tinfoil::Url::parse(&url)
+        let url = reqwest::Url::parse(&url)
             .map_err(|error| ProviderRequestError::Build(error.to_string()))?;
         let mut request = ReqwestRequest::new(method, url);
 
@@ -744,32 +741,27 @@ impl ProviderClient {
             provider.base_url.trim_end_matches('/'),
             path.trim_start_matches('/')
         );
-        let mut request = HyperRequest::builder().method(method.as_str()).uri(url);
+        let url = reqwest::Url::parse(&url)
+            .map_err(|error| ProviderRequestError::Build(error.to_string()))?;
+        let mut headers = source_headers.map(forwarded_headers).unwrap_or_default();
 
         if let Some(content_type) = content_type {
-            request = request.header("Content-Type", content_type);
+            let content_type = HeaderValue::from_str(content_type)
+                .map_err(|error| ProviderRequestError::Build(error.to_string()))?;
+            headers.insert(header::CONTENT_TYPE, content_type);
         }
         if let Some(api_key) = provider.api_key.as_deref().filter(|key| !key.is_empty()) {
-            request = request.header("Authorization", format!("Bearer {api_key}"));
+            let mut authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
+                .map_err(|error| ProviderRequestError::Build(error.to_string()))?;
+            authorization.set_sensitive(true);
+            headers.insert(header::AUTHORIZATION, authorization);
         }
-        if let Some(headers) = source_headers {
-            let skipped = skipped_forward_headers(headers);
-            for (name, value) in headers {
-                if !skipped.contains(name) {
-                    if let (Ok(name), Ok(value)) = (
-                        HyperHeaderName::from_bytes(name.as_ref()),
-                        HyperHeaderValue::from_bytes(value.as_bytes()),
-                    ) {
-                        request = request.header(name, value);
-                    }
-                }
-            }
+        let mut request = self.standard.request(method, url).headers(headers);
+        if let Some(body) = body {
+            request = request.body(body);
         }
 
-        let request = request
-            .body(body.map(HyperBody::from).unwrap_or_else(HyperBody::empty))
-            .map_err(|error| ProviderRequestError::Build(error.to_string()))?;
-        let response = tokio::time::timeout(response_start_timeout, self.standard.request(request))
+        let response = tokio::time::timeout(response_start_timeout, request.send())
             .await
             .map_err(|_| ProviderRequestError::Timeout(response_start_timeout))?
             .map_err(|error| ProviderRequestError::Send(error.to_string()))?;
@@ -778,39 +770,29 @@ impl ProviderClient {
 }
 
 #[cfg(test)]
-fn test_http_client() -> Result<reqwest_tinfoil::Client, reqwest_tinfoil::Error> {
-    reqwest_tinfoil::Client::builder()
+fn test_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    crate::http_client::client_builder()
         // Plain transport exists only for loopback contract tests. Supplying an
         // empty trust store keeps client construction independent of host CA
         // files while ensuring an accidental HTTPS test request trusts no CA.
-        .tls_certs_only(std::iter::empty::<reqwest_tinfoil::Certificate>())
+        .tls_certs_only(std::iter::empty::<reqwest::Certificate>())
         .pool_idle_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(10)
         .build()
 }
 
-fn standard_http_client() -> StandardHttpClient {
-    HyperClient::builder()
+fn standard_http_client() -> Result<StandardHttpClient, reqwest::Error> {
+    crate::http_client::client_builder()
+        // Provider responses are untrusted. In particular, following a 307 or
+        // 308 could replay a prompt or audio body to an arbitrary Location.
+        .redirect(reqwest::redirect::Policy::none())
+        // Preserve the previous direct-connection behavior. The enclave's
+        // plaintext loopback provider traffic must not be rerouted by inherited
+        // HTTP_PROXY/HTTPS_PROXY/ALL_PROXY environment variables.
+        .no_proxy()
         .pool_idle_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(10)
-        .build::<_, HyperBody>(HttpsConnector::new())
-}
-
-fn install_crypto_provider() -> Result<(), ProviderClientError> {
-    static INSTALLATION: OnceLock<Result<(), ()>> = OnceLock::new();
-
-    if INSTALLATION
-        .get_or_init(|| {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .map_err(|_| ())
-        })
-        .is_err()
-    {
-        Err(ProviderClientError::CryptoProvider)
-    } else {
-        Ok(())
-    }
+        .build()
 }
 
 fn skipped_forward_headers(source: &HeaderMap) -> HashSet<HeaderName> {
@@ -970,10 +952,11 @@ mod tests {
 
     #[test]
     fn provider_response_exposes_the_upstream_content_type() {
-        let response = hyper::Response::builder()
+        let response = axum::http::Response::builder()
             .header("content-type", "audio/flac")
-            .body(HyperBody::empty())
-            .unwrap();
+            .body(reqwest::Body::default())
+            .unwrap()
+            .into();
 
         assert_eq!(
             ProviderResponse::Standard(response).content_type(),
@@ -1236,6 +1219,77 @@ mod tests {
 
         assert!(response.is_success());
         assert_eq!(response.bytes().await.unwrap(), "standard-provider-ok");
+    }
+
+    #[tokio::test]
+    async fn standard_provider_redirect_does_not_replay_request() {
+        let (target_tx, mut target_rx) = mpsc::channel(1);
+        let target_app = Router::new().route(
+            "/redirect-target",
+            any(move |body: Bytes| {
+                let target_tx = target_tx.clone();
+                async move {
+                    target_tx.send(body).await.unwrap();
+                    StatusCode::OK
+                }
+            }),
+        );
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        let target_server =
+            tokio::spawn(async move { axum::serve(target_listener, target_app).await.unwrap() });
+
+        let redirect_location = format!("http://{target_address}/redirect-target");
+        let redirect_app = Router::new().route(
+            "/v1/chat/completions",
+            any(move || {
+                let redirect_location = redirect_location.clone();
+                async move {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(header::LOCATION, redirect_location)],
+                    )
+                }
+            }),
+        );
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_address = redirect_listener.local_addr().unwrap();
+        let redirect_server =
+            tokio::spawn(
+                async move { axum::serve(redirect_listener, redirect_app).await.unwrap() },
+            );
+
+        let client = ProviderClient::uninitialized_for_test().unwrap();
+        let provider = ProxyConfig {
+            base_url: format!("http://{redirect_address}"),
+            api_key: None,
+            provider_name: ProviderName::Continuum.as_str().to_string(),
+        };
+        let body = Bytes::from_static(br#"{"model":"glm-5-2"}"#);
+
+        let response = client
+            .send(
+                &provider,
+                ProviderRequest::new(Method::POST, "/v1/chat/completions", Duration::from_secs(5))
+                    .content_type("application/json")
+                    .body(body),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::TEMPORARY_REDIRECT.as_u16()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target_rx.recv())
+                .await
+                .is_err(),
+            "the redirect target must never receive the provider request body"
+        );
+
+        redirect_server.abort();
+        target_server.abort();
     }
 
     #[tokio::test]
@@ -1618,7 +1672,7 @@ mod tests {
             .unwrap_or("unknown");
         let manifest = json!({
             "captured_at_unix_seconds": captured_at_unix_seconds,
-            "implementation": "tinfoil-rs v0.1.3 (in-process)",
+            "implementation": "tinfoil-rs v0.2.0 (in-process)",
             "revision": revision,
             "working_tree": working_tree_status,
             "credential_label": credential_label,

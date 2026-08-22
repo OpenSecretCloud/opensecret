@@ -84,7 +84,7 @@ pub struct BillingClient {
 impl BillingClient {
     pub fn new(api_key: String, base_url: String) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::http_client::client(),
             api_key,
             base_url,
         }

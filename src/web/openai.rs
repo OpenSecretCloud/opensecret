@@ -26,7 +26,7 @@ use base64::{engine::general_purpose, Engine as _};
 use bigdecimal::BigDecimal;
 use chrono::Utc;
 use futures::StreamExt;
-use reqwest_tinfoil::Method;
+use reqwest::Method;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;

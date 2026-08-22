@@ -29,7 +29,7 @@ pub struct BraveClient {
 impl BraveClient {
     /// Create a new Brave client with the given API key
     pub fn new(api_key: String) -> Result<Self, BraveError> {
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::client_builder()
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
             .pool_max_idle_per_host(100)

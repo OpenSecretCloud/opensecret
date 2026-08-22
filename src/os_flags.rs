@@ -132,7 +132,7 @@ impl OsFlagsClient {
         let base_url = format!("{}/", base_url.trim_end_matches('/'));
         let base_url = Url::parse(&base_url)?;
 
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::client_builder()
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
             .pool_max_idle_per_host(100)

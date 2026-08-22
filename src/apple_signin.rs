@@ -125,7 +125,7 @@ pub struct AppleJwtVerifier {
 impl AppleJwtVerifier {
     pub fn new() -> Self {
         Self {
-            http_client: Client::new(),
+            http_client: crate::http_client::client(),
             jwks_cache: Arc::new(RwLock::new(AppleJwksCache {
                 keys: HashMap::new(),
                 last_updated: chrono::Utc::now() - chrono::Duration::hours(2), // Force initial fetch

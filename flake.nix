@@ -486,7 +486,8 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "tinfoil-0.1.0" = "sha256-ViCg20dzw61r1k740xQpyJjfBthv6yXHzBAhxH7OC8Y=";
+              "tinfoil-0.2.0" = "sha256-+J/9OtgO8kNba9UoWEmGuzpTxPKVV8VuSl05mNe8Kpw=";
+              "tinfoil-ehbp-0.3.1" = "sha256-BSSob5uyIIOw/Zr5aZFTU0GOM5imxk7KoZ5g+I4+s70=";
             };
           };
           nativeBuildInputs = [

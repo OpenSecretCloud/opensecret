@@ -56,7 +56,12 @@ use crate::{
 };
 use crate::{encrypt::create_new_encryption_key, jwt::validate_jwt};
 use aws_credentials::{AwsCredentialManager, AwsCredentials};
-use axum::{http::StatusCode, middleware::from_fn_with_state, response::IntoResponse, Json};
+use axum::{
+    http::{HeaderName, HeaderValue, StatusCode},
+    middleware::{from_fn, from_fn_with_state, Next},
+    response::{IntoResponse, Response},
+    Json,
+};
 use base64::engine::general_purpose;
 use base64::Engine as _;
 use chacha20poly1305::aead::Aead;
@@ -157,6 +162,12 @@ const MAX_PENDING_ATTESTATIONS: usize = 65_536;
 const PENDING_ATTESTATION_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_ENCRYPTION_SESSIONS: usize = 2_097_152;
 const ENCRYPTION_SESSION_IDLE_TTL: Duration = Duration::from_secs(65 * 60);
+
+pub(crate) const ERROR_CONTRACT_HEADER: &str = "x-opensecret-error-contract";
+pub(crate) const ERROR_CODE_HEADER: &str = "x-opensecret-error-code";
+const ERROR_CONTRACT_VERSION: &str = "1";
+const SESSION_NOT_FOUND_ERROR_CODE: &str = "session_not_found";
+const ACCESS_TOKEN_EXPIRED_ERROR_CODE: &str = "access_token_expired";
 
 type PendingAttestationKey = [u8; 32];
 pub(crate) type SessionLease = CacheLease<SessionState>;
@@ -352,6 +363,9 @@ pub enum ApiError {
     #[error("Invalid JWT")]
     InvalidJwt,
 
+    #[error("Invalid JWT")]
+    AccessTokenExpired,
+
     #[error("Internal server error")]
     InternalServerError,
 
@@ -360,6 +374,9 @@ pub enum ApiError {
 
     #[error("Bad Request")]
     BadRequest,
+
+    #[error("Bad Request")]
+    SessionNotFound,
 
     #[error("Conflict")]
     Conflict,
@@ -418,13 +435,15 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let status = match self {
+        let status = match &self {
             ApiError::InvalidUsernameOrPassword => StatusCode::UNAUTHORIZED,
             ApiError::InvalidJwt => StatusCode::UNAUTHORIZED,
+            ApiError::AccessTokenExpired => StatusCode::UNAUTHORIZED,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::InternalServerError => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::BadRequest => StatusCode::BAD_REQUEST,
+            ApiError::SessionNotFound => StatusCode::BAD_REQUEST,
             ApiError::Conflict => StatusCode::CONFLICT,
             ApiError::InvalidInviteCode => StatusCode::UNAUTHORIZED,
             ApiError::RefreshFailed => StatusCode::UNAUTHORIZED,
@@ -443,15 +462,39 @@ impl IntoResponse for ApiError {
             ApiError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
         };
-        (
+        let error_code = match &self {
+            ApiError::SessionNotFound => Some(SESSION_NOT_FOUND_ERROR_CODE),
+            ApiError::AccessTokenExpired => Some(ACCESS_TOKEN_EXPIRED_ERROR_CODE),
+            _ => None,
+        };
+        let mut response = (
             status,
             Json(ErrorResponse {
                 status: status.as_u16(),
                 message: self.to_string(),
             }),
         )
-            .into_response()
+            .into_response();
+        response.headers_mut().insert(
+            ERROR_CONTRACT_HEADER,
+            HeaderValue::from_static(ERROR_CONTRACT_VERSION),
+        );
+        if let Some(error_code) = error_code {
+            response
+                .headers_mut()
+                .insert(ERROR_CODE_HEADER, HeaderValue::from_static(error_code));
+        }
+        response
     }
+}
+
+async fn add_error_contract_header(request: axum::extract::Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        ERROR_CONTRACT_HEADER,
+        HeaderValue::from_static(ERROR_CONTRACT_VERSION),
+    );
+    response
 }
 
 impl From<ProviderRequestError> for ApiError {
@@ -482,6 +525,78 @@ impl From<DBError> for ApiError {
 pub struct ErrorResponse {
     status: u16,
     message: String,
+}
+
+#[cfg(test)]
+mod api_error_contract_tests {
+    use super::*;
+
+    async fn assert_error_response(
+        error: ApiError,
+        expected_status: StatusCode,
+        expected_body: &[u8],
+        expected_code: Option<&str>,
+    ) {
+        let response = error.into_response();
+
+        assert_eq!(response.status(), expected_status);
+        assert_eq!(
+            response.headers().get(ERROR_CONTRACT_HEADER).unwrap(),
+            ERROR_CONTRACT_VERSION
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(ERROR_CODE_HEADER)
+                .map(|value| value.to_str().unwrap()),
+            expected_code
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), expected_body);
+    }
+
+    #[tokio::test]
+    async fn session_not_found_adds_code_without_changing_legacy_response() {
+        assert_error_response(
+            ApiError::SessionNotFound,
+            StatusCode::BAD_REQUEST,
+            br#"{"status":400,"message":"Bad Request"}"#,
+            Some(SESSION_NOT_FOUND_ERROR_CODE),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn access_token_expired_adds_code_without_changing_legacy_response() {
+        assert_error_response(
+            ApiError::AccessTokenExpired,
+            StatusCode::UNAUTHORIZED,
+            br#"{"status":401,"message":"Invalid JWT"}"#,
+            Some(ACCESS_TOKEN_EXPIRED_ERROR_CODE),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn generic_bad_request_and_invalid_jwt_are_not_recoverable() {
+        assert_error_response(
+            ApiError::BadRequest,
+            StatusCode::BAD_REQUEST,
+            br#"{"status":400,"message":"Bad Request"}"#,
+            None,
+        )
+        .await;
+        assert_error_response(
+            ApiError::InvalidJwt,
+            StatusCode::UNAUTHORIZED,
+            br#"{"status":401,"message":"Invalid JWT"}"#,
+            None,
+        )
+        .await;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1867,7 +1982,7 @@ impl AppState {
         }
     }
 
-    pub(crate) async fn acquire_session(
+    pub(crate) async fn acquire_request_session(
         &self,
         session_id: &Uuid,
     ) -> Result<SessionLease, ApiError> {
@@ -1875,7 +1990,7 @@ impl AppState {
             .lock()
             .await
             .acquire(session_id)
-            .ok_or(ApiError::BadRequest)
+            .ok_or(ApiError::SessionNotFound)
     }
 
     pub(crate) async fn touch_session(&self, session_id: &Uuid) -> Result<(), ApiError> {
@@ -3795,6 +3910,11 @@ async fn main() -> Result<(), Error> {
         .allow_methods(Any)
         // allow all headers
         .allow_headers(Any)
+        // expose the machine-readable recovery contract to browser SDKs
+        .expose_headers([
+            HeaderName::from_static(ERROR_CONTRACT_HEADER),
+            HeaderName::from_static(ERROR_CODE_HEADER),
+        ])
         // allow requests from any origin
         .allow_origin(Any);
 
@@ -3839,7 +3959,8 @@ async fn main() -> Result<(), Error> {
             platform_routes(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_platform_jwt)),
         )
-        .layer(cors);
+        .layer(cors)
+        .layer(from_fn(add_error_contract_header));
 
     let bind_addr =
         std::env::var("OPENSECRET_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());

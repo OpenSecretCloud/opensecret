@@ -212,6 +212,40 @@ fn models_route_allows_optional_identity_but_requires_session_e2ee() {
 }
 
 #[test]
+fn openai_auth_remains_outside_session_decryption() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let main_source = fs::read_to_string(manifest_dir.join("src/main.rs"))
+        .expect("main source should be readable");
+    let openai_source = fs::read_to_string(manifest_dir.join("src/web/openai.rs"))
+        .expect("OpenAI route source should be readable");
+
+    // `route_layer` is applied when the completed OpenAI router is composed
+    // into the application, so it wraps the route-local decryption layers.
+    // This order lets a request with both an expired access token and a stale
+    // session receive the access-token refresh signal first.
+    assert!(
+        main_source.contains(
+            "openai_routes(app_state.clone())\n                .route_layer(from_fn_with_state(app_state.clone(), validate_openai_auth))"
+        ),
+        "OpenAI routes must apply authentication outside route-local middleware"
+    );
+
+    let router_body = extract_function_body(&openai_source, "pub fn router");
+    let chat_route_start = router_body
+        .find("\"/v1/chat/completions\"")
+        .expect("chat completions route should exist");
+    let next_route_start = router_body[chat_route_start + 1..]
+        .find(".route(")
+        .map(|index| chat_route_start + 1 + index)
+        .unwrap_or(router_body.len());
+    let chat_route = &router_body[chat_route_start..next_route_start];
+    assert!(
+        chat_route.contains("decrypt_request::<Value>"),
+        "chat completions must retain route-local session decryption"
+    );
+}
+
+#[test]
 fn web_routes_remain_jwt_authenticated_and_e2ee_wrapped() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let main_source = fs::read_to_string(manifest_dir.join("src/main.rs"))
@@ -260,6 +294,7 @@ fn user_jwt_middleware_requires_active_seed_wrap_before_request_extensions() {
             "AuthContext::from_claims(&claims)",
             "if user.project_id != auth_context.project_id",
             "verify_seed_wrap_for_auth_context(&user, &auth_context)",
+            "if access_token_expired",
             "req.extensions_mut().insert(auth_context)",
             "req.extensions_mut().insert(user)",
         ],
@@ -291,6 +326,7 @@ fn openai_jwt_fallback_inserts_signed_auth_context_but_api_keys_do_not() {
             "AuthContext::from_claims(&claims)",
             "if user.project_id != auth_context.project_id",
             "verify_seed_wrap_for_auth_context(&user, &auth_context)",
+            "if access_token_expired",
             "req.extensions_mut().insert(auth_context)",
             "req.extensions_mut().insert(user)",
             "req.extensions_mut().insert(AuthMethod::Jwt)",
@@ -744,6 +780,23 @@ fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
             && !main_contents.contains("convert_guest_to_email_and_seed_wrap")
             && !db_contents.contains("update_user_and_seed_wrap"),
         "guest conversion is intentionally unsupported; do not reintroduce it without revisiting the seed-wrap lifecycle"
+    );
+}
+
+#[test]
+fn platform_access_expiry_is_signaled_only_after_user_validation() {
+    let jwt_source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/jwt.rs");
+    let contents = fs::read_to_string(&jwt_source).expect("JWT source should be readable");
+    let middleware_body = extract_function_body(&contents, "pub async fn validate_platform_jwt");
+
+    assert_patterns_in_order(
+        middleware_body,
+        &[
+            "Uuid::parse_str(&claims.sub)",
+            "get_platform_user_by_uuid(platform_user_id)",
+            "if access_token_expired",
+            "req.extensions_mut().insert(platform_user)",
+        ],
     );
 }
 

@@ -1,4 +1,4 @@
-use crate::jwt::{validate_token, AuthContext, USER_ACCESS};
+use crate::jwt::{validate_access_token_for_auth, AuthContext, USER_ACCESS};
 use crate::ApiError;
 use axum::{
     body::Body,
@@ -72,10 +72,11 @@ pub async fn validate_openai_auth(
         None => return ApiError::InvalidJwt.into_response(),
     };
 
-    let claims = match validate_token(&token, &data, USER_ACCESS) {
-        Ok(claims) => claims,
-        Err(_) => return ApiError::InvalidJwt.into_response(),
-    };
+    let (claims, access_token_expired) =
+        match validate_access_token_for_auth(&token, &data, USER_ACCESS) {
+            Ok(validation) => validation,
+            Err(_) => return ApiError::InvalidJwt.into_response(),
+        };
 
     let auth_context = match AuthContext::from_claims(&claims) {
         Ok(auth_context) => auth_context,
@@ -109,6 +110,10 @@ pub async fn validate_openai_auth(
             e
         );
         return ApiError::InvalidJwt.into_response();
+    }
+
+    if access_token_expired {
+        return ApiError::AccessTokenExpired.into_response();
     }
 
     req.extensions_mut().insert(auth_context);

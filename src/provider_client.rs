@@ -783,6 +783,13 @@ fn test_http_client() -> Result<reqwest::Client, reqwest::Error> {
 
 fn standard_http_client() -> Result<StandardHttpClient, reqwest::Error> {
     crate::http_client::client_builder()
+        // Provider responses are untrusted. In particular, following a 307 or
+        // 308 could replay a prompt or audio body to an arbitrary Location.
+        .redirect(reqwest::redirect::Policy::none())
+        // Preserve the previous direct-connection behavior. The enclave's
+        // plaintext loopback provider traffic must not be rerouted by inherited
+        // HTTP_PROXY/HTTPS_PROXY/ALL_PROXY environment variables.
+        .no_proxy()
         .pool_idle_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(10)
         .build()
@@ -1212,6 +1219,77 @@ mod tests {
 
         assert!(response.is_success());
         assert_eq!(response.bytes().await.unwrap(), "standard-provider-ok");
+    }
+
+    #[tokio::test]
+    async fn standard_provider_redirect_does_not_replay_request() {
+        let (target_tx, mut target_rx) = mpsc::channel(1);
+        let target_app = Router::new().route(
+            "/redirect-target",
+            any(move |body: Bytes| {
+                let target_tx = target_tx.clone();
+                async move {
+                    target_tx.send(body).await.unwrap();
+                    StatusCode::OK
+                }
+            }),
+        );
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        let target_server =
+            tokio::spawn(async move { axum::serve(target_listener, target_app).await.unwrap() });
+
+        let redirect_location = format!("http://{target_address}/redirect-target");
+        let redirect_app = Router::new().route(
+            "/v1/chat/completions",
+            any(move || {
+                let redirect_location = redirect_location.clone();
+                async move {
+                    (
+                        StatusCode::TEMPORARY_REDIRECT,
+                        [(header::LOCATION, redirect_location)],
+                    )
+                }
+            }),
+        );
+        let redirect_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_address = redirect_listener.local_addr().unwrap();
+        let redirect_server =
+            tokio::spawn(
+                async move { axum::serve(redirect_listener, redirect_app).await.unwrap() },
+            );
+
+        let client = ProviderClient::uninitialized_for_test().unwrap();
+        let provider = ProxyConfig {
+            base_url: format!("http://{redirect_address}"),
+            api_key: None,
+            provider_name: ProviderName::Continuum.as_str().to_string(),
+        };
+        let body = Bytes::from_static(br#"{"model":"glm-5-2"}"#);
+
+        let response = client
+            .send(
+                &provider,
+                ProviderRequest::new(Method::POST, "/v1/chat/completions", Duration::from_secs(5))
+                    .content_type("application/json")
+                    .body(body),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::TEMPORARY_REDIRECT.as_u16()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), target_rx.recv())
+                .await
+                .is_err(),
+            "the redirect target must never receive the provider request body"
+        );
+
+        redirect_server.abort();
+        target_server.abort();
     }
 
     #[tokio::test]

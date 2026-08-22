@@ -501,6 +501,7 @@
             pkgs.zlib
             pkgs.postgresql
           ];
+          SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
           LIBPQ_LIB_DIR = "${pkgs.postgresql.lib}/lib";
         };
 

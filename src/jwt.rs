@@ -596,10 +596,11 @@ pub async fn validate_jwt(
 
     tracing::trace!("Validating JWT");
 
-    let claims = match validate_token(&token, &data, USER_ACCESS) {
-        Ok(claims) => claims,
-        Err(_) => return ApiError::InvalidJwt.into_response(),
-    };
+    let (claims, access_token_expired) =
+        match validate_access_token_for_auth(&token, &data, USER_ACCESS) {
+            Ok(validation) => validation,
+            Err(_) => return ApiError::InvalidJwt.into_response(),
+        };
 
     let auth_context = match AuthContext::from_claims(&claims) {
         Ok(auth_context) => auth_context,
@@ -635,6 +636,10 @@ pub async fn validate_jwt(
         return ApiError::InvalidJwt.into_response();
     }
 
+    if access_token_expired {
+        return ApiError::AccessTokenExpired.into_response();
+    }
+
     req.extensions_mut().insert(auth_context);
     req.extensions_mut().insert(user);
     next.run(req).await
@@ -657,10 +662,11 @@ pub async fn validate_platform_jwt(
 
     tracing::trace!("Validating platform JWT");
 
-    let claims = match validate_token(&token, &data, PLATFORM_ACCESS) {
-        Ok(claims) => claims,
-        Err(_) => return ApiError::InvalidJwt.into_response(),
-    };
+    let (claims, access_token_expired) =
+        match validate_access_token_for_auth(&token, &data, PLATFORM_ACCESS) {
+            Ok(validation) => validation,
+            Err(_) => return ApiError::InvalidJwt.into_response(),
+        };
 
     let platform_user_id: Uuid = match Uuid::parse_str(&claims.sub) {
         Ok(uuid) => uuid,
@@ -678,6 +684,10 @@ pub async fn validate_platform_jwt(
         }
     };
 
+    if access_token_expired {
+        return ApiError::AccessTokenExpired.into_response();
+    }
+
     req.extensions_mut().insert(platform_user);
     next.run(req).await
 }
@@ -687,9 +697,46 @@ pub(crate) fn validate_token(
     data: &AppState,
     expected_audience: &str,
 ) -> Result<CustomClaims, ApiError> {
+    validate_token_with_keys(original_token, &data.config.jwt_keys, expected_audience)
+}
+
+pub(crate) fn validate_access_token_for_auth(
+    original_token: &str,
+    data: &AppState,
+    expected_audience: &str,
+) -> Result<(CustomClaims, bool), ApiError> {
+    if !is_access_token_audience(expected_audience) {
+        return Err(ApiError::InvalidJwt);
+    }
+    validate_token_with_keys_for_auth(original_token, &data.config.jwt_keys, expected_audience)
+}
+
+fn validate_token_with_keys(
+    original_token: &str,
+    jwt_keys: &JwtKeys,
+    expected_audience: &str,
+) -> Result<CustomClaims, ApiError> {
+    let (claims, access_token_expired) =
+        validate_token_with_keys_for_auth(original_token, jwt_keys, expected_audience)?;
+    if access_token_expired {
+        Err(ApiError::AccessTokenExpired)
+    } else {
+        Ok(claims)
+    }
+}
+
+fn is_access_token_audience(audience: &str) -> bool {
+    audience == USER_ACCESS || audience == PLATFORM_ACCESS
+}
+
+fn validate_token_with_keys_for_auth(
+    original_token: &str,
+    jwt_keys: &JwtKeys,
+    expected_audience: &str,
+) -> Result<(CustomClaims, bool), ApiError> {
     // Try ES256K first
-    let es256k = Es256k::<Sha256>::new(data.config.jwt_keys.secp.clone());
-    let public_key = data.config.jwt_keys.public_key();
+    let es256k = Es256k::<Sha256>::new(jwt_keys.secp.clone());
+    let public_key = jwt_keys.public_key();
 
     tracing::trace!("Attempting to validate ES256K token");
 
@@ -703,49 +750,187 @@ pub(crate) fn validate_token(
     };
 
     // Deserialize claims first
-    let token: Token<CustomClaims> = match es256k.validator(&public_key).validate(&parsed_token) {
-        Ok(token) => {
-            tracing::trace!("ES256K signature validation successful");
+    let (token, access_token_expired): (Token<CustomClaims>, bool) =
+        match es256k.validator(&public_key).validate(&parsed_token) {
+            Ok(token) => {
+                tracing::trace!("ES256K signature validation successful");
 
-            // Only validate expiration, not maturity
-            let time_options = TimeOptions::default();
-            if let Err(e) = token.claims().validate_expiration(&time_options) {
-                tracing::error!("Token expired: {:?}", e);
-                return Err(ApiError::InvalidJwt);
-            }
-
-            // Validate audience with proper type annotation
-            let claims: &Claims<CustomClaims> = token.claims();
-            if let Some(audience) = &claims.custom.aud {
-                if audience != expected_audience {
-                    tracing::error!(
-                        "Invalid audience: got {}, expected {}",
-                        audience,
-                        expected_audience
-                    );
+                // Validate the audience before classifying expiration. This ensures
+                // an expired token for another audience is never a refresh signal.
+                let claims: &Claims<CustomClaims> = token.claims();
+                if let Some(audience) = &claims.custom.aud {
+                    if audience != expected_audience {
+                        tracing::error!(
+                            "Invalid audience: got {}, expected {}",
+                            audience,
+                            expected_audience
+                        );
+                        return Err(ApiError::InvalidJwt);
+                    }
+                } else {
+                    tracing::error!("Missing audience in token, expected {}", expected_audience);
                     return Err(ApiError::InvalidJwt);
                 }
-            } else {
-                tracing::error!("Missing audience in token, expected {}", expected_audience);
+
+                // Only validate expiration, not maturity. Access-token expiry is
+                // carried to the authentication middleware so identity and auth
+                // binding checks still run before a refresh signal is emitted.
+                let time_options = TimeOptions::default();
+                let access_token_expired = match token.claims().validate_expiration(&time_options) {
+                    Ok(_) => false,
+                    Err(jwt_compact::ValidationError::Expired)
+                        if is_access_token_audience(expected_audience) =>
+                    {
+                        true
+                    }
+                    Err(e) => {
+                        tracing::error!("Token expiration validation failed: {:?}", e);
+                        return Err(ApiError::InvalidJwt);
+                    }
+                };
+
+                (token, access_token_expired)
+            }
+            Err(e) => {
+                tracing::debug!("ES256K validation failed: {:?}", e);
                 return Err(ApiError::InvalidJwt);
             }
+        };
 
-            token
-        }
-        Err(e) => {
-            tracing::debug!("ES256K validation failed: {:?}", e);
-            return Err(ApiError::InvalidJwt);
-        }
-    };
-
-    // Return the claims
-    Ok(token.claims().custom.clone())
+    Ok((token.claims().custom.clone(), access_token_expired))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use jsonwebtoken::{decode as jwt_decode, DecodingKey, Validation};
+
+    fn test_keys(byte: u8) -> JwtKeys {
+        JwtKeys::new(vec![byte; 32]).unwrap()
+    }
+
+    fn signed_test_token(
+        keys: &JwtKeys,
+        audience: &str,
+        expiration: Option<chrono::DateTime<Utc>>,
+    ) -> String {
+        signed_test_token_with_auth_binding(
+            keys,
+            audience,
+            expiration,
+            Some(URL_SAFE_NO_PAD.encode([7u8; 32])),
+        )
+    }
+
+    fn signed_test_token_with_auth_binding(
+        keys: &JwtKeys,
+        audience: &str,
+        expiration: Option<chrono::DateTime<Utc>>,
+        auth_binding: Option<String>,
+    ) -> String {
+        let now = Utc::now();
+        let mut claims = Claims::new(CustomClaims {
+            sub: Uuid::nil().to_string(),
+            aud: Some(audience.to_string()),
+            azp: None,
+            role: None,
+            token_format: Some(USER_TOKEN_FORMAT_V2),
+            auth_method: Some(AuthMethod::Password.as_str().to_string()),
+            project_id: Some(1),
+            auth_binding,
+        });
+        claims.issued_at = Some(now - Duration::minutes(2));
+        claims.not_before = Some(now - Duration::minutes(2));
+        claims.expiration = expiration;
+
+        Es256k::<Sha256>::new(keys.secp.clone())
+            .token(
+                &Header::empty().with_token_type("JWT"),
+                &claims,
+                &keys.signing_key,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn expired_user_access_token_is_recoverable_only_after_signature_and_audience_validation() {
+        let trusted_keys = test_keys(1);
+        let other_keys = test_keys(2);
+        let expired = Utc::now() - Duration::minutes(1);
+
+        let expired_access = signed_test_token(&trusted_keys, USER_ACCESS, Some(expired));
+        assert!(matches!(
+            validate_token_with_keys(&expired_access, &trusted_keys, USER_ACCESS),
+            Err(ApiError::AccessTokenExpired)
+        ));
+
+        let wrong_audience = signed_test_token(&trusted_keys, USER_REFRESH, Some(expired));
+        assert!(matches!(
+            validate_token_with_keys(&wrong_audience, &trusted_keys, USER_ACCESS),
+            Err(ApiError::InvalidJwt)
+        ));
+
+        let wrong_signature = signed_test_token(&other_keys, USER_ACCESS, Some(expired));
+        assert!(matches!(
+            validate_token_with_keys(&wrong_signature, &trusted_keys, USER_ACCESS),
+            Err(ApiError::InvalidJwt)
+        ));
+    }
+
+    #[test]
+    fn expired_access_tokens_are_recoverable_but_refresh_tokens_are_not() {
+        let keys = test_keys(3);
+        let expired = Utc::now() - Duration::minutes(1);
+
+        let refresh = signed_test_token(&keys, USER_REFRESH, Some(expired));
+        assert!(matches!(
+            validate_token_with_keys(&refresh, &keys, USER_REFRESH),
+            Err(ApiError::InvalidJwt)
+        ));
+
+        let platform_access = signed_test_token(&keys, PLATFORM_ACCESS, Some(expired));
+        assert!(matches!(
+            validate_token_with_keys(&platform_access, &keys, PLATFORM_ACCESS),
+            Err(ApiError::AccessTokenExpired)
+        ));
+    }
+
+    #[test]
+    fn expired_access_claims_are_available_for_auth_binding_validation() {
+        let keys = test_keys(5);
+        let malformed_binding = URL_SAFE_NO_PAD.encode([7u8; 31]);
+        let token = signed_test_token_with_auth_binding(
+            &keys,
+            USER_ACCESS,
+            Some(Utc::now() - Duration::minutes(1)),
+            Some(malformed_binding),
+        );
+
+        let (claims, access_token_expired) =
+            validate_token_with_keys_for_auth(&token, &keys, USER_ACCESS).unwrap();
+        assert!(access_token_expired);
+        assert!(matches!(
+            AuthContext::from_claims(&claims),
+            Err(ApiError::InvalidJwt)
+        ));
+    }
+
+    #[test]
+    fn valid_access_and_malformed_tokens_do_not_report_expiration() {
+        let keys = test_keys(4);
+        let valid = signed_test_token(&keys, USER_ACCESS, Some(Utc::now() + Duration::minutes(5)));
+        let missing_expiration = signed_test_token(&keys, USER_ACCESS, None);
+
+        assert!(validate_token_with_keys(&valid, &keys, USER_ACCESS).is_ok());
+        assert!(matches!(
+            validate_token_with_keys(&missing_expiration, &keys, USER_ACCESS),
+            Err(ApiError::InvalidJwt)
+        ));
+        assert!(matches!(
+            validate_token_with_keys("not-a-jwt", &keys, USER_ACCESS),
+            Err(ApiError::InvalidJwt)
+        ));
+    }
 
     #[test]
     fn test_jsonwebtoken_hs256_round_trip() {

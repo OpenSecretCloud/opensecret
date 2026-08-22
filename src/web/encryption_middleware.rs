@@ -47,6 +47,14 @@ fn skips_encrypted_body<T: 'static>(method: &Method) -> bool {
         || std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>()
 }
 
+fn parse_session_id(headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    headers
+        .get("x-session-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(ApiError::BadRequest)
+}
+
 async fn forward_bodyless_request<T, Resource, SessionCheck, RunNext, RunNextFuture>(
     session_check: SessionCheck,
     session_id: Uuid,
@@ -79,11 +87,7 @@ pub async fn decrypt_request<T>(
 where
     T: DeserializeOwned + Send + Sync + Clone + 'static,
 {
-    let session_id = headers
-        .get("x-session-id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| Uuid::parse_str(v).ok())
-        .ok_or(ApiError::BadRequest)?;
+    let session_id = parse_session_id(&headers)?;
 
     // Skip body processing for GET, DELETE, or when T is ().
     if skips_encrypted_body::<T>(request.method()) {
@@ -91,7 +95,7 @@ where
         // Reject an unknown session before a handler can perform side effects.
         return forward_bodyless_request::<T, _, _, _, _>(
             async {
-                let session_lease = state.acquire_session(&session_id).await?;
+                let session_lease = state.acquire_request_session(&session_id).await?;
                 state.touch_session(&session_id).await?;
                 Ok(session_lease)
             },
@@ -112,7 +116,7 @@ where
 
     // Pin only after the request body has arrived. A slow or abandoned
     // upload therefore cannot retain a session indefinitely.
-    let session_lease = state.acquire_session(&session_id).await?;
+    let session_lease = state.acquire_request_session(&session_id).await?;
     let decrypted_data = state
         .decrypt_session_data(&session_id, &session_lease, &encrypted_request.encrypted)
         .await
@@ -206,13 +210,27 @@ mod tests {
         assert!(!skips_encrypted_body::<serde_json::Value>(&Method::POST));
     }
 
+    #[test]
+    fn missing_and_malformed_session_headers_are_generic_bad_requests() {
+        for headers in [HeaderMap::new(), {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-session-id", HeaderValue::from_static("not-a-uuid"));
+            headers
+        }] {
+            let error = parse_session_id(&headers).unwrap_err();
+            let response = error.into_response();
+            assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+            assert!(response.headers().get(crate::ERROR_CODE_HEADER).is_none());
+        }
+    }
+
     #[tokio::test]
     async fn failed_session_check_never_calls_next() {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed_calls = calls.clone();
 
         let result = forward_bodyless_request::<(), _, _, _, _>(
-            ready(Err::<(), ApiError>(ApiError::BadRequest)),
+            ready(Err::<(), ApiError>(ApiError::SessionNotFound)),
             Uuid::new_v4(),
             Request::builder()
                 .method(Method::POST)
@@ -232,6 +250,10 @@ mod tests {
         };
         let response = error.into_response();
         assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(crate::ERROR_CODE_HEADER).unwrap(),
+            "session_not_found"
+        );
         let body = axum::body::to_bytes(response.into_body(), 1024)
             .await
             .unwrap();

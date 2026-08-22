@@ -743,31 +743,25 @@ impl ProviderClient {
         );
         let url = reqwest::Url::parse(&url)
             .map_err(|error| ProviderRequestError::Build(error.to_string()))?;
-        let mut request = ReqwestRequest::new(method, url);
+        let mut headers = source_headers.map(forwarded_headers).unwrap_or_default();
 
-        if let Some(headers) = source_headers {
-            *request.headers_mut() = forwarded_headers(headers);
-        }
         if let Some(content_type) = content_type {
             let content_type = HeaderValue::from_str(content_type)
                 .map_err(|error| ProviderRequestError::Build(error.to_string()))?;
-            request
-                .headers_mut()
-                .insert(header::CONTENT_TYPE, content_type);
+            headers.insert(header::CONTENT_TYPE, content_type);
         }
         if let Some(api_key) = provider.api_key.as_deref().filter(|key| !key.is_empty()) {
             let mut authorization = HeaderValue::from_str(&format!("Bearer {api_key}"))
                 .map_err(|error| ProviderRequestError::Build(error.to_string()))?;
             authorization.set_sensitive(true);
-            request
-                .headers_mut()
-                .insert(header::AUTHORIZATION, authorization);
+            headers.insert(header::AUTHORIZATION, authorization);
         }
+        let mut request = self.standard.request(method, url).headers(headers);
         if let Some(body) = body {
-            *request.body_mut() = Some(body.into());
+            request = request.body(body);
         }
 
-        let response = tokio::time::timeout(response_start_timeout, self.standard.execute(request))
+        let response = tokio::time::timeout(response_start_timeout, request.send())
             .await
             .map_err(|_| ProviderRequestError::Timeout(response_start_timeout))?
             .map_err(|error| ProviderRequestError::Send(error.to_string()))?;

@@ -50,9 +50,10 @@ jobs:
           nix build --no-update-lock-file .?submodules=1#eif-dev
           echo "Build completed successfully"
 
-      # Verify PCR values match the reference
+      # PCR comparison is a master/deployment gate, not a pull-request gate.
       - name: Verify dev PCR
         id: verify-dev
+        if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           if [ ! -f "./pcrDev.json" ]; then
@@ -117,9 +118,10 @@ jobs:
           nix build --no-update-lock-file .?submodules=1#eif-prod
           echo "Build completed successfully"
 
-      # Verify PCR values match the reference
+      # PCR comparison is a master/deployment gate, not a pull-request gate.
       - name: Verify prod PCR
         id: verify-prod
+        if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           if [ ! -f "./pcrProd.json" ]; then

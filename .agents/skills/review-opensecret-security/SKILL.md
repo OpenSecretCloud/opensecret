@@ -123,10 +123,13 @@ Load `$validate-opensecret` and run the tiers reached by the diff. Report local,
 database, provider, client, build/artifact, and live evidence separately.
 
 Local artifact builds and read-only PCR comparison are validation when in
-scope. Require explicit authorization for PCR reference/history mutation,
-signing, KMS/IAM changes, shared or remote migrations, artifact transfer,
-enclave or remote-service lifecycle, secret writes, staging, deployment, or
-release actions. Inspect recipes before deciding whether they are read-only.
+scope. A green pull-request EIF build is not PCR evidence; GitHub Actions
+skips PCR comparison on pull requests and still verifies on master and
+`workflow_dispatch`. Require explicit authorization for PCR
+reference/history mutation, signing, KMS/IAM changes, shared or remote
+migrations, artifact transfer, enclave or remote-service lifecycle, secret
+writes, staging, deployment, or release actions. Inspect recipes before
+deciding whether they are read-only.
 
 ## Report the review
 

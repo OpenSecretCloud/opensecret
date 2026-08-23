@@ -137,10 +137,11 @@ or skipped tests, configured external services, and every unverified layer.
 ## Operator authority
 
 EIF/PCR parity is a release and deployment gate, not an ordinary development
-or pull-request gate. If CI successfully builds an EIF and then fails only the
-PCR comparison after compiled inputs changed, record deferred release work;
-do not update references merely to make CI green. Treat an EIF build failure
-separately.
+or pull-request gate. GitHub Actions still builds the development EIF on
+pull requests, but skips PCR comparison there. Master pushes and
+`workflow_dispatch` still verify PCR values against the checked-in
+references. Do not update PCR references as part of ordinary pull-request
+work. Treat an EIF build failure separately from PCR mismatch.
 
 Before publishing or deploying an authorized dev or prod EIF, build it on the
 supported Linux/ARM64 release builder, intentionally review its measurements,

@@ -85,10 +85,13 @@ The supported EIF outputs are `eif-dev`, `eif-preview`, and `eif-prod`, built
 with the repository's Nix flake on the appropriate Linux/ARM environment. Build,
 PCR comparison, deployment, and live trust verification are distinct evidence.
 
-Routine pull requests do not require EIF/PCR parity. Before an authorized dev
-or prod publish/deployment, use the supported Linux/ARM64 release builder to
-review and deliberately update/verify the target measurements; never update
-checked-in PCRs solely to clear ordinary pull-request CI.
+Routine pull requests do not require EIF/PCR parity. The Nix Reproducible
+Builds workflow still builds the development EIF on pull requests, but skips
+PCR comparison there. Master pushes and manual `workflow_dispatch` still
+verify PCR values against the checked-in references. Before an authorized
+dev or prod publish/deployment, use the supported Linux/ARM64 release
+builder to review and deliberately update/verify the target measurements;
+never update checked-in PCRs solely to clear ordinary pull-request CI.
 
 See [`docs/nitro-deploy.md`](docs/nitro-deploy.md) for operator procedures.
 Changing PCR references or KMS policy, copying artifacts, starting or stopping

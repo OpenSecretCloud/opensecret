@@ -161,11 +161,14 @@ nix build --no-link --no-write-lock-file .#default
 ```
 
 EIF construction, PCR comparison, and reference/history updates are
-release-only work. Ordinary development and pull-request completion do not run
-or block on the all-PR PCR comparison. If CI successfully builds an EIF and
-then fails only because compiled inputs changed its measurements, report
-deferred release work and do not copy or sign CI values to make it green. Treat
-an EIF build failure separately.
+release-only work. The Nix Reproducible Builds workflow builds the
+development EIF on pull requests but skips PCR comparison there. Master
+pushes and `workflow_dispatch` still compare against checked-in
+references. Ordinary pull-request completion does not update PCR
+references. If a master or release build succeeds and then fails only
+PCR comparison, treat that as deferred release work and do not copy or
+sign CI values just to make the job green. Treat an EIF build failure
+separately.
 
 Immediately before an authorized dev or prod publish/deployment, use the
 supported Linux/ARM64 release builder and the operator runbook in

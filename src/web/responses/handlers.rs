@@ -54,6 +54,7 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 const RESPONSES_SSE_KEEPALIVE_INTERVAL_SECS: u64 = 1;
+#[cfg_attr(not(test), allow(dead_code))]
 const MAX_WEB_SEARCH_TOOL_TURNS: usize = 30;
 
 // Default functions for serde
@@ -316,7 +317,6 @@ fn build_tool_choice_value(tool_choice: &Option<String>) -> Value {
 fn build_model_turn_request(
     body: &ResponsesCreateRequest,
     prompt_messages: &[Value],
-    tools_enabled: bool,
     web_search_provider: Option<tools::WebSearchProvider>,
 ) -> Value {
     let config_model = resolve_public_model_id(&body.model).unwrap_or(body.model.as_str());
@@ -332,10 +332,8 @@ fn build_model_turn_request(
         "stream_options": { "include_usage": true }
     });
 
-    if tools_enabled {
-        let provider_tools = web_search_provider
-            .map(|provider| build_provider_tools(&body.tools, provider))
-            .unwrap_or_default();
+    if let Some(provider) = web_search_provider {
+        let provider_tools = build_provider_tools(&body.tools, provider);
         if !provider_tools.is_empty() {
             chat_request["tools"] = Value::Array(provider_tools);
             chat_request["tool_choice"] = build_tool_choice_value(&body.tool_choice);
@@ -695,12 +693,8 @@ mod tests {
         body.temperature = Some(0.5);
         body.top_p = Some(0.75);
 
-        let chat_request = build_model_turn_request(
-            &body,
-            &[json!({"role": "user", "content": "hello"})],
-            false,
-            None,
-        );
+        let chat_request =
+            build_model_turn_request(&body, &[json!({"role": "user", "content": "hello"})], None);
 
         assert_eq!(chat_request["temperature"].as_f64(), Some(0.5));
         assert_eq!(chat_request["top_p"].as_f64(), Some(0.75));
@@ -711,12 +705,8 @@ mod tests {
         let targets = ModelAliasTargets::for_plan(ModelPlan::Free);
         let body =
             responses_request_for_model(targets.resolve(crate::model_config::AUTO_QUICK_MODEL_ID));
-        let chat_request = build_model_turn_request(
-            &body,
-            &[json!({"role": "user", "content": "hello"})],
-            false,
-            None,
-        );
+        let chat_request =
+            build_model_turn_request(&body, &[json!({"role": "user", "content": "hello"})], None);
 
         assert_eq!(chat_request["model"], crate::model_config::QUICK_MODEL_ID);
     }
@@ -724,24 +714,16 @@ mod tests {
     #[test]
     fn test_build_model_turn_request_applies_reasoning_history_template_kwargs() {
         let kimi = responses_request_for_model("kimi-k2-6");
-        let kimi_request = build_model_turn_request(
-            &kimi,
-            &[json!({"role": "user", "content": "hello"})],
-            false,
-            None,
-        );
+        let kimi_request =
+            build_model_turn_request(&kimi, &[json!({"role": "user", "content": "hello"})], None);
         assert_eq!(
             kimi_request["chat_template_kwargs"]["preserve_thinking"],
             true
         );
 
         let glm = responses_request_for_model("glm-5-2");
-        let glm_request = build_model_turn_request(
-            &glm,
-            &[json!({"role": "user", "content": "hello"})],
-            false,
-            None,
-        );
+        let glm_request =
+            build_model_turn_request(&glm, &[json!({"role": "user", "content": "hello"})], None);
         assert_eq!(glm_request["chat_template_kwargs"]["clear_thinking"], false);
 
         let targets = ModelAliasTargets::for_plan(ModelPlan::Paid);
@@ -751,7 +733,6 @@ mod tests {
         let auto_request = build_model_turn_request(
             &auto_powerful,
             &[json!({"role": "user", "content": "hello"})],
-            false,
             None,
         );
         assert_eq!(
@@ -776,7 +757,6 @@ mod tests {
         let paid_quick_request = build_model_turn_request(
             &paid_quick,
             &[json!({"role": "user", "content": "hello"})],
-            false,
             None,
         );
         assert_eq!(
@@ -791,7 +771,6 @@ mod tests {
         let paid_powerful_request = build_model_turn_request(
             &paid_powerful,
             &[json!({"role": "user", "content": "hello"})],
-            false,
             None,
         );
         assert_eq!(
@@ -808,21 +787,25 @@ mod tests {
     }
 
     #[test]
-    fn test_build_model_turn_request_omits_tools_with_provider_retained() {
+    fn test_build_model_turn_request_includes_tools_when_provider_is_present() {
         let mut body = responses_request_for_model("kimi-k2-6");
         body.tool_choice = Some("auto".to_string());
         body.tools = Some(json!([{ "type": "web_search" }]));
 
-        let chat_request = build_model_turn_request(
+        let with_provider = build_model_turn_request(
             &body,
             &[json!({"role": "user", "content": "hello"})],
-            false,
             Some(WebSearchProvider::Kagi),
         );
+        let without_provider =
+            build_model_turn_request(&body, &[json!({"role": "user", "content": "hello"})], None);
 
-        assert!(chat_request.get("tools").is_none());
-        assert!(chat_request.get("tool_choice").is_none());
-        assert!(chat_request.get("parallel_tool_calls").is_none());
+        assert_eq!(with_provider["tools"][0]["function"]["name"], "web_search");
+        assert_eq!(with_provider["tool_choice"], "auto");
+        assert_eq!(with_provider["parallel_tool_calls"], false);
+        assert!(without_provider.get("tools").is_none());
+        assert!(without_provider.get("tool_choice").is_none());
+        assert!(without_provider.get("parallel_tool_calls").is_none());
     }
 
     #[test]
@@ -2685,8 +2668,7 @@ async fn stream_one_assistant_turn(
     tool_turn_count: usize,
     prompt_token_estimate: usize,
 ) -> Result<AssistantTurnOutcome, ApiError> {
-    let mut chat_request =
-        build_model_turn_request(body, prompt_messages, tools_enabled, web_search_provider);
+    let mut chat_request = build_model_turn_request(body, prompt_messages, web_search_provider);
 
     trace!(
         "Chat completion request to model {}: {}",
@@ -2992,8 +2974,7 @@ async fn setup_completion_processor(
     mut rx_tool_ack: mpsc::Receiver<Result<(), String>>,
 ) -> Result<crate::models::responses::Response, ApiError> {
     let web_search_provider = context.web_search_provider;
-    let tools_available = web_search_provider.is_some();
-    let mut tools_enabled = tools_available;
+    let tools_enabled = web_search_provider.is_some();
     let mut prompt_messages = Arc::as_ref(&context.prompt_messages).clone();
     let mut prompt_token_estimate = context.total_prompt_tokens;
     let mut kagi_allowed_urls = tools::collect_kagi_allowed_urls_from_prompt(&prompt_messages);
@@ -3041,17 +3022,7 @@ async fn setup_completion_processor(
                     )
                     .await?;
 
-                    tools_enabled = tools_available && tool_turn_count < MAX_WEB_SEARCH_TOOL_TURNS;
-                    if !tools_enabled && tools_available {
-                        info!(
-                            "Reached max web_search tool turns ({}) for response {}; continuing with web_search disabled",
-                            MAX_WEB_SEARCH_TOOL_TURNS, persisted.response.uuid
-                        );
-                    }
-                    // Tool schemas stop at the turn limit, but provider guidance
-                    // must remain while prior untrusted tool output is in context.
-                    let internal_system_prompt =
-                        build_internal_system_prompt(web_search_provider);
+                    let internal_system_prompt = build_internal_system_prompt(web_search_provider);
                     let (rebuilt_messages, rebuilt_tokens) = build_prompt(
                         state.db.as_ref(),
                         context.conversation.id,

@@ -527,7 +527,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         "Starter-friendly reasoning and vision model.",
         ModelAccessTier::Starter,
         ModelCapabilities::chat(true, true),
-        &["New", "Reasoning"],
+        &["Reasoning"],
         true,
         true,
         false,
@@ -562,7 +562,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         "Powerful model for deeper thinking and analysis.",
         ModelAccessTier::Pro,
         ModelCapabilities::chat(true, true),
-        &["New", "Reasoning"],
+        &["Reasoning"],
         true,
         true,
         false,
@@ -577,7 +577,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         "Long-horizon pro reasoning model.",
         ModelAccessTier::Pro,
         ModelCapabilities::chat(true, false),
-        &["New", "Reasoning"],
+        &["Reasoning"],
         true,
         true,
         false,
@@ -824,6 +824,22 @@ mod tests {
             .iter()
             .find(|model| model["id"] == model_id)
             .expect("model in catalog")
+    }
+
+    fn model_ids_with_badge(response: &Value, badge: &str) -> Vec<String> {
+        let mut model_ids = response["data"]
+            .as_array()
+            .expect("model list data")
+            .iter()
+            .filter(|model| {
+                model["badges"]
+                    .as_array()
+                    .is_some_and(|badges| badges.iter().any(|value| value == badge))
+            })
+            .filter_map(|model| model["id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        model_ids.sort_unstable();
+        model_ids
     }
 
     #[test]
@@ -1197,6 +1213,23 @@ mod tests {
             assert!(has_model(&catalog, model));
             assert!(has_model(&openai_models, model));
         }
+    }
+
+    #[test]
+    fn test_only_kimi_k3_and_deepseek_have_new_badges() {
+        let expected = vec![
+            DEEPSEEK_V4_FLASH_MODEL_ID.to_string(),
+            KIMI_K3_MODEL_ID.to_string(),
+        ];
+
+        assert_eq!(
+            model_ids_with_badge(&model_catalog_response(ModelAliasTargets::default()), "New"),
+            expected
+        );
+        assert_eq!(
+            model_ids_with_badge(&openai_models_response(), "New"),
+            expected
+        );
     }
 
     #[test]

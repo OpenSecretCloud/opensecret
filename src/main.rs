@@ -1201,9 +1201,9 @@ impl AppState {
         }
     }
 
-    /// Resolve the automatic model aliases for this user's plan. Paid alias
-    /// overrides are batched and default off on missing configuration, missing
-    /// flags, service failures, or timeouts. Free plans never apply overrides.
+    /// Resolve the automatic model aliases for this user's plan. The paid alias
+    /// override defaults off on missing configuration, a missing flag, service
+    /// failure, or timeout. Free plans never apply the override.
     pub(crate) async fn model_alias_targets(
         &self,
         user_uuid: Uuid,

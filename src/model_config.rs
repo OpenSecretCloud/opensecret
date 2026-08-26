@@ -1,6 +1,6 @@
 //! Central model-specific configuration and public model catalog.
 
-use crate::os_flags::{PAID_POWERFUL_GLM_ALIAS_FLAG_KEY, PAID_QUICK_DEEPSEEK_ALIAS_FLAG_KEY};
+use crate::os_flags::PAID_POWERFUL_GLM_ALIAS_FLAG_KEY;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -105,7 +105,6 @@ pub(crate) struct ModelAliasTargets {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PaidModelAliasOverrides {
-    quick_deepseek: bool,
     powerful_glm: bool,
 }
 
@@ -125,7 +124,7 @@ const FREE_MODEL_ALIAS_TARGETS: ModelAliasTargets = ModelAliasTargets {
 };
 
 const PAID_MODEL_ALIAS_TARGETS: ModelAliasTargets = ModelAliasTargets {
-    quick: QUICK_MODEL_ID,
+    quick: DEEPSEEK_V4_FLASH_MODEL_ID,
     powerful: POWERFUL_MODEL_ID,
 };
 
@@ -406,11 +405,7 @@ impl ModelAliasTargets {
         match plan {
             ModelPlan::Free => FREE_MODEL_ALIAS_TARGETS,
             ModelPlan::Paid => Self {
-                quick: if overrides.quick_deepseek {
-                    DEEPSEEK_V4_FLASH_MODEL_ID
-                } else {
-                    PAID_MODEL_ALIAS_TARGETS.quick
-                },
+                quick: PAID_MODEL_ALIAS_TARGETS.quick,
                 powerful: if overrides.powerful_glm {
                     GLM_5_2_MODEL_ID
                 } else {
@@ -440,10 +435,6 @@ impl ModelAliasTargets {
 impl PaidModelAliasOverrides {
     pub(crate) fn from_flag_values(flags: &HashMap<String, bool>) -> Self {
         Self {
-            quick_deepseek: flags
-                .get(PAID_QUICK_DEEPSEEK_ALIAS_FLAG_KEY)
-                .copied()
-                .unwrap_or(false),
             powerful_glm: flags
                 .get(PAID_POWERFUL_GLM_ALIAS_FLAG_KEY)
                 .copied()
@@ -660,8 +651,8 @@ fn alias_target(model: &str) -> Option<&'static str> {
     ModelAliasTargets::default().target_for(model)
 }
 
-pub(crate) fn is_auto_model_alias(model: &str) -> bool {
-    matches!(model, AUTO_QUICK_MODEL_ID | AUTO_POWERFUL_MODEL_ID)
+pub(crate) fn model_alias_requires_flag_lookup(model: &str) -> bool {
+    model == AUTO_POWERFUL_MODEL_ID
 }
 
 fn model_entry(model: &str) -> Option<ModelConfigEntry> {
@@ -993,29 +984,26 @@ mod tests {
 
     #[test]
     fn test_model_alias_targets_are_selected_by_plan() {
-        for plan in [ModelPlan::Free, ModelPlan::Paid] {
-            let targets = ModelAliasTargets::for_plan(plan);
-            assert_eq!(targets.resolve(AUTO_QUICK_MODEL_ID), QUICK_MODEL_ID);
-            assert_eq!(targets.resolve(AUTO_POWERFUL_MODEL_ID), POWERFUL_MODEL_ID);
-            assert_eq!(targets.resolve("glm-5-2"), "glm-5-2");
-        }
+        let free = ModelAliasTargets::for_plan(ModelPlan::Free);
+        assert_eq!(free.resolve(AUTO_QUICK_MODEL_ID), QUICK_MODEL_ID);
+        assert_eq!(free.resolve(AUTO_POWERFUL_MODEL_ID), POWERFUL_MODEL_ID);
+
+        let paid = ModelAliasTargets::for_plan(ModelPlan::Paid);
+        assert_eq!(
+            paid.resolve(AUTO_QUICK_MODEL_ID),
+            DEEPSEEK_V4_FLASH_MODEL_ID
+        );
+        assert_eq!(paid.resolve(AUTO_POWERFUL_MODEL_ID), POWERFUL_MODEL_ID);
+        assert_eq!(paid.resolve("glm-5-2"), "glm-5-2");
     }
 
     #[test]
-    fn test_paid_model_alias_overrides_are_plan_gated_and_independent() {
-        for (quick_enabled, powerful_enabled) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
-            let flags = HashMap::from([
-                (
-                    PAID_QUICK_DEEPSEEK_ALIAS_FLAG_KEY.to_string(),
-                    quick_enabled,
-                ),
-                (
-                    PAID_POWERFUL_GLM_ALIAS_FLAG_KEY.to_string(),
-                    powerful_enabled,
-                ),
-            ]);
+    fn test_paid_powerful_alias_override_is_plan_gated() {
+        for powerful_enabled in [false, true] {
+            let flags = HashMap::from([(
+                PAID_POWERFUL_GLM_ALIAS_FLAG_KEY.to_string(),
+                powerful_enabled,
+            )]);
             let overrides = PaidModelAliasOverrides::from_flag_values(&flags);
 
             let free = ModelAliasTargets::for_plan_with_overrides(ModelPlan::Free, overrides);
@@ -1025,11 +1013,7 @@ mod tests {
             let paid = ModelAliasTargets::for_plan_with_overrides(ModelPlan::Paid, overrides);
             assert_eq!(
                 paid.resolve(AUTO_QUICK_MODEL_ID),
-                if quick_enabled {
-                    DEEPSEEK_V4_FLASH_MODEL_ID
-                } else {
-                    QUICK_MODEL_ID
-                }
+                DEEPSEEK_V4_FLASH_MODEL_ID
             );
             assert_eq!(
                 paid.resolve(AUTO_POWERFUL_MODEL_ID),
@@ -1049,10 +1033,7 @@ mod tests {
 
     #[test]
     fn test_catalog_alias_metadata_tracks_paid_override_targets() {
-        let flags = HashMap::from([
-            (PAID_QUICK_DEEPSEEK_ALIAS_FLAG_KEY.to_string(), true),
-            (PAID_POWERFUL_GLM_ALIAS_FLAG_KEY.to_string(), true),
-        ]);
+        let flags = HashMap::from([(PAID_POWERFUL_GLM_ALIAS_FLAG_KEY.to_string(), true)]);
         let targets = ModelAliasTargets::for_plan_with_overrides(
             ModelPlan::Paid,
             PaidModelAliasOverrides::from_flag_values(&flags),
@@ -1123,7 +1104,10 @@ mod tests {
             .iter()
             .any(|alias| alias["id"] == AUTO_POWERFUL_MODEL_ID));
 
-        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+        for (plan, expected_quick, expected_quick_access) in [
+            (ModelPlan::Free, QUICK_MODEL_ID, "free"),
+            (ModelPlan::Paid, DEEPSEEK_V4_FLASH_MODEL_ID, "pro"),
+        ] {
             let catalog = model_catalog_response(ModelAliasTargets::for_plan(plan));
             let aliases = catalog["aliases"].as_array().expect("aliases");
             let quick = aliases
@@ -1135,10 +1119,28 @@ mod tests {
                 .find(|alias| alias["id"] == AUTO_POWERFUL_MODEL_ID)
                 .expect("powerful alias");
 
-            assert_eq!(quick["target_model"], QUICK_MODEL_ID);
-            assert_eq!(quick["access"], "free");
+            assert_eq!(quick["target_model"], expected_quick);
+            assert_eq!(quick["access"], expected_quick_access);
             assert_eq!(powerful["target_model"], POWERFUL_MODEL_ID);
             assert_eq!(powerful["access"], "pro");
+        }
+    }
+
+    #[test]
+    fn test_only_powerful_alias_requires_flag_lookup() {
+        assert!(model_alias_requires_flag_lookup(AUTO_POWERFUL_MODEL_ID));
+        for model in [
+            AUTO_QUICK_MODEL_ID,
+            QUICK_MODEL_ID,
+            POWERFUL_MODEL_ID,
+            "kimi-k3",
+            DEEPSEEK_V4_FLASH_MODEL_ID,
+            GLM_5_2_MODEL_ID,
+        ] {
+            assert!(
+                !model_alias_requires_flag_lookup(model),
+                "direct/static model should not require flags: {model}"
+            );
         }
     }
 

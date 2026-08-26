@@ -1,6 +1,6 @@
 use crate::model_config::{
-    is_auto_model_alias, model_catalog_response, openai_models_response, ModelAliasTargets,
-    ModelPlan,
+    model_alias_requires_flag_lookup, model_catalog_response, openai_models_response,
+    ModelAliasTargets, ModelPlan,
 };
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
@@ -806,7 +806,7 @@ async fn proxy_openai(
         })?
         .to_string();
 
-    let alias_targets = if is_auto_model_alias(&requested_model_name) {
+    let alias_targets = if model_alias_requires_flag_lookup(&requested_model_name) {
         state.model_alias_targets(user.uuid, model_plan).await
     } else {
         ModelAliasTargets::for_plan(model_plan)

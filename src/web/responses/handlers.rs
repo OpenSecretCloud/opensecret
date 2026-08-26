@@ -8,8 +8,8 @@ use crate::{
     jwt::AuthContext,
     model_config::{
         is_auto_model_alias, model_config, model_reasoning_history_strategy,
-        resolve_public_model_id, ModelAliasTargets, ModelFeatureAccess, ModelPlan,
-        ReasoningHistoryStrategy, ResponsesModelConfig, SamplingConfig,
+        resolve_public_model_id, ModelAliasTargets, ModelPlan, ReasoningHistoryStrategy,
+        ResponsesModelConfig, SamplingConfig,
     },
     models::responses::{NewUserMessage, ResponseStatus, ResponsesError},
     models::users::User,
@@ -134,10 +134,9 @@ fn resolve_responses_sampling(body: &ResponsesCreateRequest) -> SamplingConfig {
 fn resolve_responses_model(
     requested_model: &str,
     completion_provider_name: &str,
-    model_access: ModelFeatureAccess,
     model_plan: ModelPlan,
 ) -> Result<String, ApiError> {
-    ensure_completion_model_access(requested_model, model_access, model_plan)?;
+    ensure_completion_model_access(requested_model, model_plan)?;
 
     match resolve_public_model_id(requested_model) {
         Some(model) => Ok(model.to_string()),
@@ -476,7 +475,7 @@ mod tests {
     };
     use crate::web::responses::tools::{self, WebSearchProvider};
     use crate::{
-        model_config::{ModelAliasTargets, ModelFeatureAccess, ModelPlan},
+        model_config::{ModelAliasTargets, ModelPlan},
         ApiError,
     };
     use chrono::{TimeZone, Utc};
@@ -645,85 +644,37 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_responses_models_enforces_feature_and_plan_gates() {
-        assert!(matches!(
-            resolve_responses_model(
-                "kimi-k3",
-                "tinfoil",
-                ModelFeatureAccess::default(),
-                ModelPlan::Paid
-            ),
-            Err(ApiError::BadRequest)
-        ));
+    fn test_resolve_responses_models_enforces_plan_gates() {
         assert_eq!(
-            resolve_responses_model(
-                "kimi-k3",
-                "tinfoil",
-                ModelFeatureAccess::new(true),
-                ModelPlan::Paid
-            )
-            .unwrap(),
+            resolve_responses_model("kimi-k3", "tinfoil", ModelPlan::Paid).unwrap(),
             "kimi-k3"
         );
         assert!(matches!(
-            resolve_responses_model(
-                "kimi-k3",
-                "tinfoil",
-                ModelFeatureAccess::new(true),
-                ModelPlan::Free
-            ),
+            resolve_responses_model("kimi-k3", "tinfoil", ModelPlan::Free),
             Err(ApiError::ModelNotAvailableOnPlan)
         ));
         assert!(matches!(
-            resolve_responses_model(
-                "glm-5-2",
-                "tinfoil",
-                ModelFeatureAccess::default(),
-                ModelPlan::Free
-            ),
+            resolve_responses_model("glm-5-2", "tinfoil", ModelPlan::Free),
             Err(ApiError::ModelNotAvailableOnPlan)
         ));
         assert_eq!(
-            resolve_responses_model(
-                "glm-5-2",
-                "tinfoil",
-                ModelFeatureAccess::default(),
-                ModelPlan::Paid
-            )
-            .unwrap(),
+            resolve_responses_model("glm-5-2", "tinfoil", ModelPlan::Paid).unwrap(),
             "glm-5-2"
         );
         assert!(matches!(
-            resolve_responses_model(
-                "deepseek-v4-flash",
-                "tinfoil",
-                ModelFeatureAccess::default(),
-                ModelPlan::Free
-            ),
+            resolve_responses_model("deepseek-v4-flash", "tinfoil", ModelPlan::Free),
             Err(ApiError::ModelNotAvailableOnPlan)
         ));
         assert_eq!(
-            resolve_responses_model(
-                "deepseek-v4-flash",
-                "tinfoil",
-                ModelFeatureAccess::default(),
-                ModelPlan::Paid
-            )
-            .unwrap(),
+            resolve_responses_model("deepseek-v4-flash", "tinfoil", ModelPlan::Paid).unwrap(),
             "deepseek-v4-flash"
         );
     }
 
     #[test]
-    fn test_resolve_responses_model_allows_ungated_model_by_default() {
+    fn test_resolve_responses_model_allows_free_model() {
         assert_eq!(
-            resolve_responses_model(
-                "llama3-3-70b",
-                "tinfoil",
-                ModelFeatureAccess::default(),
-                ModelPlan::Free
-            )
-            .unwrap(),
+            resolve_responses_model("llama3-3-70b", "tinfoil", ModelPlan::Free).unwrap(),
             "llama3-3-70b"
         );
     }
@@ -2151,7 +2102,6 @@ async fn spawn_title_generation_task(
             title_request,
             &headers,
             billing_context,
-            ModelFeatureAccess::default(),
             ModelPlan::Free,
         )
         .await
@@ -2841,7 +2791,6 @@ async fn stream_one_assistant_turn(
     state: &Arc<AppState>,
     user: &User,
     body: &ResponsesCreateRequest,
-    model_access: ModelFeatureAccess,
     model_plan: ModelPlan,
     headers: &HeaderMap,
     prompt_messages: &[Value],
@@ -2892,7 +2841,6 @@ async fn stream_one_assistant_turn(
         chat_request.take(),
         headers,
         billing_context,
-        model_access,
         model_plan,
     )
     .await?;
@@ -3150,7 +3098,6 @@ async fn setup_completion_processor(
     state: &Arc<AppState>,
     user: &User,
     body: &ResponsesCreateRequest,
-    model_access: ModelFeatureAccess,
     model_plan: ModelPlan,
     context: &BuiltContext,
     prepared: &PreparedRequest,
@@ -3174,7 +3121,6 @@ async fn setup_completion_processor(
                 state,
                 user,
                 body,
-                model_access,
                 model_plan,
                 headers,
                 &prompt_messages,
@@ -3313,13 +3259,9 @@ async fn create_response_stream(
     };
     let selected_model = alias_targets.resolve(&requested_model).to_string();
     let completion_provider = state.proxy_router.get_completion_proxy();
-    let model_access = state
-        .model_feature_access_for_request(user.uuid, &selected_model)
-        .await;
     let resolved_model = resolve_responses_model(
         &selected_model,
         &completion_provider.provider_name,
-        model_access,
         model_plan,
     )?;
     if requested_model != resolved_model {
@@ -3542,7 +3484,6 @@ async fn create_response_stream(
                         &orchestrator_state,
                         &orchestrator_user,
                         &orchestrator_body,
-                        model_access,
                         model_plan,
                         &context_for_completion,
                         &prepared_for_completion,

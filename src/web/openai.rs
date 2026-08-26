@@ -1,6 +1,6 @@
 use crate::model_config::{
-    filter_model_list_response_for_access, is_auto_model_alias, model_catalog_response,
-    openai_models_response, ModelAliasTargets, ModelFeatureAccess, ModelPlan,
+    is_auto_model_alias, model_catalog_response, openai_models_response, ModelAliasTargets,
+    ModelPlan,
 };
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
@@ -825,21 +825,10 @@ async fn proxy_openai(
     // Create billing context
     let billing_context = BillingContext::new(auth_method, requested_model_name);
 
-    let model_access = state
-        .model_feature_access_for_request(user.uuid, &model_name)
-        .await;
-
     // Get the completion stream - billing happens automatically inside!
-    let completion = get_chat_completion_response(
-        &state,
-        &user,
-        body,
-        &headers,
-        billing_context,
-        model_access,
-        model_plan,
-    )
-    .await?;
+    let completion =
+        get_chat_completion_response(&state, &user, body, &headers, billing_context, model_plan)
+            .await?;
 
     debug!(
         "Received completion from provider: {} (streaming: {})",
@@ -917,7 +906,6 @@ pub async fn get_chat_completion_response(
     body: Value,
     headers: &HeaderMap,
     mut billing_context: BillingContext,
-    model_access: ModelFeatureAccess,
     model_plan: ModelPlan,
 ) -> Result<CompletionStream, ApiError> {
     if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
@@ -948,7 +936,7 @@ pub async fn get_chat_completion_response(
         })?
         .to_string();
 
-    ensure_completion_model_access(&requested_model_name, model_access, model_plan)?;
+    ensure_completion_model_access(&requested_model_name, model_plan)?;
 
     let selected_route = state
         .provider_router
@@ -1264,14 +1252,8 @@ pub async fn get_chat_completion_response(
 
 pub(crate) fn ensure_completion_model_access(
     model_name: &str,
-    model_access: ModelFeatureAccess,
     model_plan: ModelPlan,
 ) -> Result<(), ApiError> {
-    if !model_access.allows_model(model_name) {
-        error!("Unsupported completion model requested: {}", model_name);
-        return Err(ApiError::BadRequest);
-    }
-
     if !model_plan.allows_model(model_name) {
         error!(
             "Paid completion model requested without entitlement: {}",
@@ -1595,17 +1577,13 @@ async fn proxy_models(
     axum::Extension(session_id): axum::Extension<Uuid>,
     user: Option<axum::Extension<User>>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
-    let model_access = match user {
-        Some(axum::Extension(user)) => state.model_feature_access(user.uuid).await,
-        None => ModelFeatureAccess::default(),
-    };
+    let _ = user;
     let proxy_config = state.proxy_router.get_completion_proxy();
-    let mut models_response = if proxy_config.provider_name == "tinfoil" {
-        openai_models_response(model_access)
+    let models_response = if proxy_config.provider_name == "tinfoil" {
+        openai_models_response()
     } else {
         fetch_provider_models(&state.provider_client, &proxy_config).await?
     };
-    filter_model_list_response_for_access(&mut models_response, model_access);
     encrypt_response(&state, &session_id, &models_response).await
 }
 
@@ -1663,15 +1641,12 @@ async fn proxy_model_catalog(
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(_body): axum::Extension<()>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
-    let (model_access, billing_access) = tokio::join!(
-        state.model_feature_access(user.uuid),
-        state.chat_billing_access(user.uuid, false)
-    );
+    let billing_access = state.chat_billing_access(user.uuid, false).await;
     let model_plan = ModelPlan::from_is_paid(
         billing_access.is_some_and(crate::billing::ChatBillingAccess::is_paid),
     );
     let alias_targets = state.model_alias_targets(user.uuid, model_plan).await;
-    let catalog_response = model_catalog_response(model_access, alias_targets);
+    let catalog_response = model_catalog_response(alias_targets);
     encrypt_response(&state, &session_id, &catalog_response).await
 }
 
@@ -2466,111 +2441,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn completion_model_access_enforces_feature_and_plan_gates() {
+    fn completion_model_access_enforces_plan_gates() {
         assert!(matches!(
-            ensure_completion_model_access(
-                "kimi-k3",
-                ModelFeatureAccess::default(),
-                ModelPlan::Paid
-            ),
-            Err(ApiError::BadRequest)
-        ));
-        assert!(matches!(
-            ensure_completion_model_access(
-                "kimi-k3",
-                ModelFeatureAccess::new(true),
-                ModelPlan::Free
-            ),
+            ensure_completion_model_access("kimi-k3", ModelPlan::Free),
             Err(ApiError::ModelNotAvailableOnPlan)
         ));
-        assert!(ensure_completion_model_access(
-            "kimi-k3",
-            ModelFeatureAccess::new(true),
-            ModelPlan::Paid
-        )
-        .is_ok());
+        assert!(ensure_completion_model_access("kimi-k3", ModelPlan::Paid).is_ok());
         assert!(matches!(
-            ensure_completion_model_access(
-                "deepseek-v4-flash",
-                ModelFeatureAccess::default(),
-                ModelPlan::Free
-            ),
+            ensure_completion_model_access("deepseek-v4-flash", ModelPlan::Free),
             Err(ApiError::ModelNotAvailableOnPlan)
         ));
-        assert!(ensure_completion_model_access(
-            "deepseek-v4-flash",
-            ModelFeatureAccess::default(),
-            ModelPlan::Paid
-        )
-        .is_ok());
+        assert!(ensure_completion_model_access("deepseek-v4-flash", ModelPlan::Paid).is_ok());
         assert!(matches!(
-            ensure_completion_model_access(
-                "glm-5-2",
-                ModelFeatureAccess::default(),
-                ModelPlan::Free
-            ),
+            ensure_completion_model_access("glm-5-2", ModelPlan::Free),
             Err(ApiError::ModelNotAvailableOnPlan)
         ));
-        assert!(ensure_completion_model_access(
-            "glm-5-2",
-            ModelFeatureAccess::default(),
-            ModelPlan::Paid
-        )
-        .is_ok());
+        assert!(ensure_completion_model_access("glm-5-2", ModelPlan::Paid).is_ok());
         assert!(matches!(
             ensure_completion_model_access(
                 crate::model_config::AUTO_POWERFUL_MODEL_ID,
-                ModelFeatureAccess::default(),
                 ModelPlan::Free
             ),
             Err(ApiError::ModelNotAvailableOnPlan)
         ));
-        // The feature gate does not replace normal model validation. Ungated and
-        // unknown IDs continue to the existing provider-routing validation path.
-        assert!(ensure_completion_model_access(
-            "gpt-oss-120b",
-            ModelFeatureAccess::default(),
-            ModelPlan::Free
-        )
-        .is_ok());
-        assert!(ensure_completion_model_access(
-            "not-a-real-model",
-            ModelFeatureAccess::default(),
-            ModelPlan::Free
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn provider_model_response_filter_hides_only_gated_models() {
-        fn visible_ids(access: ModelFeatureAccess) -> Vec<String> {
-            let mut response = json!({
-                "object": "list",
-                "data": [
-                    {"id": "gpt-oss-120b", "object": "model"},
-                    {"id": "kimi-k3", "object": "model"},
-                    {"id": "deepseek-v4-flash", "object": "model"},
-                    {"object": "model"}
-                ]
-            });
-            filter_model_list_response_for_access(&mut response, access);
-            response["data"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|model| model.get("id").and_then(Value::as_str))
-                .map(str::to_owned)
-                .collect()
-        }
-
-        assert_eq!(
-            visible_ids(ModelFeatureAccess::default()),
-            ["gpt-oss-120b", "deepseek-v4-flash"]
-        );
-        assert_eq!(
-            visible_ids(ModelFeatureAccess::new(true)),
-            ["gpt-oss-120b", "kimi-k3", "deepseek-v4-flash"]
-        );
+        // Plan access does not replace normal model validation. Unknown IDs
+        // continue to the existing provider-routing validation path.
+        assert!(ensure_completion_model_access("gpt-oss-120b", ModelPlan::Free).is_ok());
+        assert!(ensure_completion_model_access("not-a-real-model", ModelPlan::Free).is_ok());
     }
 
     fn tts_request(payload: Value) -> TTSRequest {

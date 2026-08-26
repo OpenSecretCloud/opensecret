@@ -11,10 +11,7 @@ use crate::encrypt::{
 };
 use crate::jwt::validate_platform_jwt;
 use crate::login_routes::RegisterCredentials;
-use crate::model_config::{
-    model_requires_feature_flag, ModelAliasTargets, ModelFeatureAccess, ModelPlan,
-    PaidModelAliasOverrides,
-};
+use crate::model_config::{ModelAliasTargets, ModelPlan, PaidModelAliasOverrides};
 use crate::models::account_deletion::{AccountDeletionError, NewAccountDeletionRequest};
 use crate::models::email_verification::{EmailVerificationError, NewEmailVerification};
 use crate::models::oauth::{NewUserOAuthConnection, OAuthError};
@@ -154,7 +151,6 @@ const BRAVE_API_KEY_NAME: &str = "brave_api_key";
 const KAGI_API_KEY_NAME: &str = "kagi_api_key";
 const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
 const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
-const MODEL_ACCESS_FLAGS_TIMEOUT_SECS: u64 = 5;
 const MODEL_ALIAS_FLAGS_TIMEOUT_SECS: u64 = 5;
 const BILLING_ACCESS_TIMEOUT_SECS: u64 = 5;
 const MAX_ATTESTATION_NONCE_BYTES: usize = 512;
@@ -1203,56 +1199,6 @@ impl AppState {
                 None
             }
         }
-    }
-
-    /// Load all model-access flags as one snapshot so every model surface uses
-    /// the same os-flags cache key. Missing configuration, missing flags, and
-    /// control-plane failures all preserve the default-off behavior.
-    pub(crate) async fn model_feature_access(&self, user_uuid: Uuid) -> ModelFeatureAccess {
-        let Some(client) = &self.os_flags_client else {
-            trace!(
-                "os-flags client not configured; using default-off model access (user_uuid={})",
-                user_uuid
-            );
-            return ModelFeatureAccess::default();
-        };
-
-        match tokio::time::timeout(
-            Duration::from_secs(MODEL_ACCESS_FLAGS_TIMEOUT_SECS),
-            client.get_user_flags(user_uuid, Some(os_flags::MODEL_ACCESS_FLAG_KEYS)),
-        )
-        .await
-        {
-            Ok(Ok(response)) => ModelFeatureAccess::from_flag_values(&response.flags),
-            Ok(Err(e)) => {
-                warn!(
-                    "os-flags model access check failed (user_uuid={}): {}; using default-off model access",
-                    user_uuid, e
-                );
-                ModelFeatureAccess::default()
-            }
-            Err(_) => {
-                warn!(
-                    "os-flags model access check timed out after {}s (user_uuid={}); using default-off model access",
-                    MODEL_ACCESS_FLAGS_TIMEOUT_SECS, user_uuid
-                );
-                ModelFeatureAccess::default()
-            }
-        }
-    }
-
-    /// Avoid an os-flags lookup for models that cannot be model-access gated.
-    /// Gated requests use the same model-access snapshot as both model-list APIs.
-    pub(crate) async fn model_feature_access_for_request(
-        &self,
-        user_uuid: Uuid,
-        requested_model: &str,
-    ) -> ModelFeatureAccess {
-        if !model_requires_feature_flag(requested_model) {
-            return ModelFeatureAccess::default();
-        }
-
-        self.model_feature_access(user_uuid).await
     }
 
     /// Resolve the automatic model aliases for this user's plan. Paid alias

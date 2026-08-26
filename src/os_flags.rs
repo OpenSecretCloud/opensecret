@@ -16,8 +16,8 @@ const USER_FLAGS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 #[allow(dead_code)]
 pub const AGENT_FEATURE_FLAG_KEY: &str = "agent";
 pub const KAGI_WEB_SEARCH_FLAG_KEY: &str = "web-search.kagi";
-pub const PAID_POWERFUL_GLM_ALIAS_FLAG_KEY: &str = "model-alias.paid.powerful.glm-5-2";
-pub const PAID_MODEL_ALIAS_FLAG_KEYS: &[&str] = &[PAID_POWERFUL_GLM_ALIAS_FLAG_KEY];
+pub const PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY: &str = "model-alias.paid.powerful.kimi-k3";
+pub const PAID_MODEL_ALIAS_FLAG_KEYS: &[&str] = &[PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY];
 
 #[derive(Debug, thiserror::Error)]
 pub enum OsFlagsError {

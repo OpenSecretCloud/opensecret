@@ -734,7 +734,7 @@ mod tests {
 
         let overrides =
             crate::model_config::PaidModelAliasOverrides::from_flag_values(&HashMap::from([(
-                crate::os_flags::PAID_POWERFUL_GLM_ALIAS_FLAG_KEY.to_string(),
+                crate::os_flags::PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY.to_string(),
                 true,
             )]));
         let targets = ModelAliasTargets::for_plan_with_overrides(ModelPlan::Paid, overrides);
@@ -761,14 +761,14 @@ mod tests {
         );
         assert_eq!(
             paid_powerful_request["model"],
-            crate::model_config::GLM_5_2_MODEL_ID
+            crate::model_config::KIMI_K3_MODEL_ID
         );
         assert_eq!(
-            paid_powerful_request["chat_template_kwargs"]["clear_thinking"],
-            false
+            paid_powerful_request["chat_template_kwargs"]["preserve_thinking"],
+            true
         );
         assert!(paid_powerful_request["chat_template_kwargs"]
-            .get("preserve_thinking")
+            .get("clear_thinking")
             .is_none());
     }
 

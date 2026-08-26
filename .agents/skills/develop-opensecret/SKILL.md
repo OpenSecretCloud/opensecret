@@ -65,8 +65,9 @@ Billing and feature flags are optional external HTTP API boundaries. Configure
 their URLs and backend-only credentials only when the task exercises their
 public outcomes; do not pull their server implementations into this setup.
 
-Plain `curl` is suitable for health probes, not protected-route proof. Use a
-pinned OpenSecret SDK or Maple for authenticated encrypted smoke tests.
+Plain `curl` is suitable for health probes, not protected-route proof. Use the
+SDK under a selected Maple checkout's `sdk/` directory or the corresponding
+pinned Maple application client for authenticated encrypted smoke tests.
 
 ## Follow ownership
 

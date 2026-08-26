@@ -85,11 +85,13 @@ at those points.
 
 ## Coordinate pinned consumers
 
-Resolve OpenSecret SDK and Maple checkouts independently. Search each available
-repository from its own root, without hiding errors, and follow its checked-in
-`AGENTS.md` and applicable skills when present. If a consumer checkout is
-unavailable, report compatibility as unverified rather than claiming there are
-no consumers.
+Resolve one current Maple checkout: the OpenSecret SDK source is under its
+`sdk/` directory, while the Maple application consumers remain under
+`frontend/`. Search from the Maple root without hiding errors and follow its
+checked-in `AGENTS.md` and applicable skills. If a Maple checkout or an affected
+consumer is unavailable, report compatibility as unverified rather than
+falling back to the retired standalone SDK repository or claiming there are no
+consumers.
 
 Maple's browser Research path uses Responses/Conversations through the
 TypeScript client, while native Agent Mode uses chat completions through the
@@ -97,12 +99,16 @@ Rust client. A semantic change intended for both is two protocol integrations,
 not one shared wire-field edit. Trace request construction, provider handoff,
 persistence, and usage in each affected path.
 
-Use the versions pinned by the selected Maple revision. Update SDK types,
-custom-fetch adaptation, native transport allowlists, call sites, mocks, and
-fixtures only where the contract reaches them. Test old-client/new-server and
-new-client/old-server behavior. Prefer server-first rollout for compatible
-additions; use an explicit capability/version gate when either direction cannot
-interoperate.
+Use the SDK source and application dependency resolutions recorded by the
+selected Maple revision. `frontend/package.json` is authoritative for whether
+the browser client consumes a published TypeScript version or the in-tree
+`file:../sdk` package. The native client continues to consume the published
+Rust crate pinned in `frontend/src-tauri/Cargo.toml` until the proxy and Rust
+consumers switch together. Update SDK types, custom-fetch adaptation, native
+transport allowlists, call sites, mocks, and fixtures only where the contract
+reaches them. Test old-client/new-server and new-client/old-server behavior.
+Prefer server-first rollout for compatible additions; use an explicit
+capability/version gate when either direction cannot interoperate.
 
 ## Validate the changed boundary
 

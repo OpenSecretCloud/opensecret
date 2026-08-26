@@ -130,7 +130,8 @@ The first is process liveness; the second checks Tinfoil model connectivity.
 Neither proves PostgreSQL, auth, encryption, persistence, routing, billing,
 flags, or a user flow.
 
-Exercise protected routes through a pinned OpenSecret SDK or Maple:
+Exercise protected routes through the SDK under a selected Maple checkout's
+`sdk/` directory or through the corresponding pinned Maple application client:
 
 1. Start an isolated migrated backend with the authorized external services.
 2. Exercise the exact changed success and failure paths with route-appropriate
@@ -141,10 +142,14 @@ Exercise protected routes through a pinned OpenSecret SDK or Maple:
 5. Inspect bounded logs for accidental sensitive content.
 
 In the selected Maple revision, follow its checked-in `AGENTS.md` and matching
-validation skill when present. Otherwise derive commands from that revision's
-repository-native docs and build metadata. Test browser Research and native
-Agent paths independently when both consume the change. An unavailable client
-checkout leaves that layer unverified.
+SDK or application validation skill when present. Otherwise derive commands
+from that revision's repository-native docs and build metadata. Read
+`frontend/package.json` to determine whether the browser client consumes a
+published TypeScript version or the in-tree `file:../sdk` package. The native
+path remains on the Rust crate pinned in `frontend/src-tauri/Cargo.toml` until
+the coordinated proxy/Rust switch. Test browser Research and native Agent paths
+independently when both consume the change. An unavailable client checkout
+leaves that layer unverified.
 
 Configure billing or feature-flag API URLs/keys only when their public backend
 outcome is in scope. Treat them as external HTTP dependencies and test the

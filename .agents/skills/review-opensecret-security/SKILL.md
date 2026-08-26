@@ -102,8 +102,12 @@ Apply these OpenSecret-specific invariants:
   Safe metadata is bounded and allowlisted.
 - A changed ciphertext format needs explicit versioning, compatibility,
   rollback, and access to the owning key; ordinary startup lacks user keys.
-- Shared protocol changes require coordinated testing of pinned SDKs and
-  affected Maple paths.
+- Shared protocol changes require coordinated review of the SDK source under a
+  selected Maple checkout's `sdk/` directory and the dependency actually
+  resolved by each affected Maple application path. Treat
+  `frontend/package.json` as authoritative for the TypeScript client; the Rust
+  client remains on its published crate until the coordinated proxy/Rust
+  switch.
 
 Use `$change-opensecret-api` or `$change-opensecret-provider` for the detailed
 contract procedure rather than duplicating it here.

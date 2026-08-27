@@ -15,6 +15,7 @@ const USER_FLAGS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 // externally configured identifiers.
 #[allow(dead_code)]
 pub const AGENT_FEATURE_FLAG_KEY: &str = "agent";
+pub const GLM_5_2_CONTINUUM_FLAG_KEY: &str = "provider-routing.glm-5-2.continuum";
 pub const KAGI_WEB_SEARCH_FLAG_KEY: &str = "web-search.kagi";
 pub const PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY: &str = "model-alias.paid.powerful.kimi-k3";
 pub const PAID_MODEL_ALIAS_FLAG_KEYS: &[&str] = &[PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY];

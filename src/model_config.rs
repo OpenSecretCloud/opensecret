@@ -1,9 +1,6 @@
 //! Central model-specific configuration and public model catalog.
 
-use crate::os_flags::{
-    KIMI_K3_MODEL_ACCESS_FLAG_KEY, PAID_POWERFUL_GLM_ALIAS_FLAG_KEY,
-    PAID_QUICK_DEEPSEEK_ALIAS_FLAG_KEY,
-};
+use crate::os_flags::PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -56,7 +53,6 @@ struct ModelConfigEntry {
     listed: bool,
     api_listed: bool,
     enabled: bool,
-    required_feature_flag: Option<&'static str>,
     deprecated: bool,
     sort_order: u16,
     config: ModelConfig,
@@ -93,11 +89,6 @@ struct ModelCatalogMetadata {
     active_parameter_size: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ModelFeatureAccess {
-    kimi_k3: bool,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct ModelAliasEntry {
     id: &'static str,
@@ -114,8 +105,7 @@ pub(crate) struct ModelAliasTargets {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PaidModelAliasOverrides {
-    quick_deepseek: bool,
-    powerful_glm: bool,
+    powerful_kimi_k3: bool,
 }
 
 pub const DEFAULT_CONTEXT_WINDOW: usize = 64_000;
@@ -125,6 +115,7 @@ pub const AUTO_QUICK_MODEL_ID: &str = "auto:quick";
 pub const AUTO_POWERFUL_MODEL_ID: &str = "auto:powerful";
 pub const QUICK_MODEL_ID: &str = "gpt-oss-120b";
 pub const POWERFUL_MODEL_ID: &str = "kimi-k2-6";
+pub const KIMI_K3_MODEL_ID: &str = "kimi-k3";
 pub const DEEPSEEK_V4_FLASH_MODEL_ID: &str = "deepseek-v4-flash";
 pub const GLM_5_2_MODEL_ID: &str = "glm-5-2";
 
@@ -134,7 +125,7 @@ const FREE_MODEL_ALIAS_TARGETS: ModelAliasTargets = ModelAliasTargets {
 };
 
 const PAID_MODEL_ALIAS_TARGETS: ModelAliasTargets = ModelAliasTargets {
-    quick: QUICK_MODEL_ID,
+    quick: DEEPSEEK_V4_FLASH_MODEL_ID,
     powerful: POWERFUL_MODEL_ID,
 };
 
@@ -195,7 +186,6 @@ impl ModelConfigEntry {
             listed,
             api_listed: listed,
             enabled,
-            required_feature_flag: None,
             deprecated,
             sort_order,
             config: ModelConfig::new(context_window),
@@ -233,7 +223,6 @@ impl ModelConfigEntry {
             listed,
             api_listed: listed,
             enabled,
-            required_feature_flag: None,
             deprecated,
             sort_order,
             config: ModelConfig::with_responses(context_window, responses),
@@ -269,17 +258,11 @@ impl ModelConfigEntry {
             listed: false,
             api_listed: true,
             enabled,
-            required_feature_flag: None,
             deprecated,
             sort_order,
             config: ModelConfig::new(context_window),
             catalog_metadata: None,
         }
-    }
-
-    const fn requiring_feature_flag(mut self, flag_key: &'static str) -> Self {
-        self.required_feature_flag = Some(flag_key);
-        self
     }
 
     const fn with_catalog_provider(
@@ -375,35 +358,6 @@ impl ModelCatalogMetadata {
     }
 }
 
-impl ModelFeatureAccess {
-    pub(crate) const fn new(kimi_k3: bool) -> Self {
-        Self { kimi_k3 }
-    }
-
-    pub(crate) fn from_flag_values(flags: &HashMap<String, bool>) -> Self {
-        Self::new(
-            flags
-                .get(KIMI_K3_MODEL_ACCESS_FLAG_KEY)
-                .copied()
-                .unwrap_or(false),
-        )
-    }
-
-    fn flag_enabled(self, flag_key: &str) -> bool {
-        match flag_key {
-            KIMI_K3_MODEL_ACCESS_FLAG_KEY => self.kimi_k3,
-            _ => false,
-        }
-    }
-
-    pub(crate) fn allows_model(self, model: &str) -> bool {
-        let canonical = alias_target(model).unwrap_or(model);
-        model_entry(canonical)
-            .and_then(|entry| entry.required_feature_flag)
-            .is_none_or(|flag_key| self.flag_enabled(flag_key))
-    }
-}
-
 impl ModelAccessTier {
     const fn as_str(self) -> &'static str {
         match self {
@@ -452,13 +406,9 @@ impl ModelAliasTargets {
         match plan {
             ModelPlan::Free => FREE_MODEL_ALIAS_TARGETS,
             ModelPlan::Paid => Self {
-                quick: if overrides.quick_deepseek {
-                    DEEPSEEK_V4_FLASH_MODEL_ID
-                } else {
-                    PAID_MODEL_ALIAS_TARGETS.quick
-                },
-                powerful: if overrides.powerful_glm {
-                    GLM_5_2_MODEL_ID
+                quick: PAID_MODEL_ALIAS_TARGETS.quick,
+                powerful: if overrides.powerful_kimi_k3 {
+                    KIMI_K3_MODEL_ID
                 } else {
                     PAID_MODEL_ALIAS_TARGETS.powerful
                 },
@@ -486,12 +436,8 @@ impl ModelAliasTargets {
 impl PaidModelAliasOverrides {
     pub(crate) fn from_flag_values(flags: &HashMap<String, bool>) -> Self {
         Self {
-            quick_deepseek: flags
-                .get(PAID_QUICK_DEEPSEEK_ALIAS_FLAG_KEY)
-                .copied()
-                .unwrap_or(false),
-            powerful_glm: flags
-                .get(PAID_POWERFUL_GLM_ALIAS_FLAG_KEY)
+            powerful_kimi_k3: flags
+                .get(PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY)
                 .copied()
                 .unwrap_or(false),
         }
@@ -581,7 +527,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         "Starter-friendly reasoning and vision model.",
         ModelAccessTier::Starter,
         ModelCapabilities::chat(true, true),
-        &["New", "Reasoning"],
+        &["Reasoning"],
         true,
         true,
         false,
@@ -590,7 +536,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         GEMMA4_RESPONSES_MODEL_CONFIG,
     ),
     ModelConfigEntry::new(
-        "kimi-k3",
+        KIMI_K3_MODEL_ID,
         "Kimi K3",
         "Kimi K3",
         "Multimodal reasoning and tool-use model.",
@@ -603,7 +549,6 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         30,
         256_000,
     )
-    .requiring_feature_flag(KIMI_K3_MODEL_ACCESS_FLAG_KEY)
     .with_catalog_metadata(ModelCatalogMetadata::new(
         &["text", "image"],
         &["text"],
@@ -617,7 +562,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         "Powerful model for deeper thinking and analysis.",
         ModelAccessTier::Pro,
         ModelCapabilities::chat(true, true),
-        &["New", "Reasoning"],
+        &["Reasoning"],
         true,
         true,
         false,
@@ -632,7 +577,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         "Long-horizon pro reasoning model.",
         ModelAccessTier::Pro,
         ModelCapabilities::chat(true, false),
-        &["New", "Reasoning"],
+        &["Reasoning"],
         true,
         true,
         false,
@@ -707,8 +652,8 @@ fn alias_target(model: &str) -> Option<&'static str> {
     ModelAliasTargets::default().target_for(model)
 }
 
-pub(crate) fn is_auto_model_alias(model: &str) -> bool {
-    matches!(model, AUTO_QUICK_MODEL_ID | AUTO_POWERFUL_MODEL_ID)
+pub(crate) fn model_alias_requires_flag_lookup(model: &str) -> bool {
+    model == AUTO_POWERFUL_MODEL_ID
 }
 
 fn model_entry(model: &str) -> Option<ModelConfigEntry> {
@@ -732,13 +677,6 @@ pub fn resolve_public_model_id(model: &str) -> Option<&'static str> {
         .iter()
         .find(|entry| entry.id == canonical && entry.api_listed && entry.enabled)
         .map(|entry| entry.id)
-}
-
-pub(crate) fn model_requires_feature_flag(model: &str) -> bool {
-    let canonical = alias_target(model).unwrap_or(model);
-    model_entry(canonical)
-        .and_then(|entry| entry.required_feature_flag)
-        .is_some()
 }
 
 pub fn model_config(model: &str) -> ModelConfig {
@@ -781,22 +719,14 @@ pub fn model_supports_reasoning_history(model: &str) -> bool {
     model_reasoning_history_strategy(model).is_some()
 }
 
-pub(crate) fn model_catalog_response(
-    access: ModelFeatureAccess,
-    alias_targets: ModelAliasTargets,
-) -> Value {
+pub(crate) fn model_catalog_response(alias_targets: ModelAliasTargets) -> Value {
     let data = MODEL_CONFIGS
         .iter()
-        .filter(|entry| entry.listed && access.allows_model(entry.id))
+        .filter(|entry| entry.listed)
         .map(|entry| entry.catalog_json())
         .collect::<Vec<_>>();
     let aliases = MODEL_ALIAS_ENTRIES
         .iter()
-        .filter(|entry| {
-            alias_targets
-                .target_for(entry.id)
-                .is_some_and(|target| access.allows_model(target))
-        })
         .map(|entry| entry.catalog_json(alias_targets))
         .collect::<Vec<_>>();
 
@@ -823,10 +753,10 @@ pub(crate) fn model_catalog_response(
     })
 }
 
-pub fn openai_models_response(access: ModelFeatureAccess) -> Value {
+pub fn openai_models_response() -> Value {
     let mut data = MODEL_CONFIGS
         .iter()
-        .filter(|entry| entry.api_listed && entry.enabled && access.allows_model(entry.id))
+        .filter(|entry| entry.api_listed && entry.enabled)
         .map(|entry| entry.openai_model_json())
         .collect::<Vec<_>>();
 
@@ -875,22 +805,6 @@ pub fn openai_models_response(access: ModelFeatureAccess) -> Value {
     })
 }
 
-pub(crate) fn filter_model_list_response_for_access(
-    response: &mut Value,
-    access: ModelFeatureAccess,
-) {
-    let Some(data) = response.get_mut("data").and_then(Value::as_array_mut) else {
-        return;
-    };
-
-    data.retain(|model| {
-        model
-            .get("id")
-            .and_then(Value::as_str)
-            .is_none_or(|id| access.allows_model(id))
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,6 +824,22 @@ mod tests {
             .iter()
             .find(|model| model["id"] == model_id)
             .expect("model in catalog")
+    }
+
+    fn model_ids_with_badge(response: &Value, badge: &str) -> Vec<String> {
+        let mut model_ids = response["data"]
+            .as_array()
+            .expect("model list data")
+            .iter()
+            .filter(|model| {
+                model["badges"]
+                    .as_array()
+                    .is_some_and(|badges| badges.iter().any(|value| value == badge))
+            })
+            .filter_map(|model| model["id"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        model_ids.sort_unstable();
+        model_ids
     }
 
     #[test]
@@ -1071,29 +1001,26 @@ mod tests {
 
     #[test]
     fn test_model_alias_targets_are_selected_by_plan() {
-        for plan in [ModelPlan::Free, ModelPlan::Paid] {
-            let targets = ModelAliasTargets::for_plan(plan);
-            assert_eq!(targets.resolve(AUTO_QUICK_MODEL_ID), QUICK_MODEL_ID);
-            assert_eq!(targets.resolve(AUTO_POWERFUL_MODEL_ID), POWERFUL_MODEL_ID);
-            assert_eq!(targets.resolve("glm-5-2"), "glm-5-2");
-        }
+        let free = ModelAliasTargets::for_plan(ModelPlan::Free);
+        assert_eq!(free.resolve(AUTO_QUICK_MODEL_ID), QUICK_MODEL_ID);
+        assert_eq!(free.resolve(AUTO_POWERFUL_MODEL_ID), POWERFUL_MODEL_ID);
+
+        let paid = ModelAliasTargets::for_plan(ModelPlan::Paid);
+        assert_eq!(
+            paid.resolve(AUTO_QUICK_MODEL_ID),
+            DEEPSEEK_V4_FLASH_MODEL_ID
+        );
+        assert_eq!(paid.resolve(AUTO_POWERFUL_MODEL_ID), POWERFUL_MODEL_ID);
+        assert_eq!(paid.resolve("glm-5-2"), "glm-5-2");
     }
 
     #[test]
-    fn test_paid_model_alias_overrides_are_plan_gated_and_independent() {
-        for (quick_enabled, powerful_enabled) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
-            let flags = HashMap::from([
-                (
-                    PAID_QUICK_DEEPSEEK_ALIAS_FLAG_KEY.to_string(),
-                    quick_enabled,
-                ),
-                (
-                    PAID_POWERFUL_GLM_ALIAS_FLAG_KEY.to_string(),
-                    powerful_enabled,
-                ),
-            ]);
+    fn test_paid_powerful_kimi_k3_alias_override_is_plan_gated_and_default_off() {
+        for powerful_enabled in [false, true] {
+            let flags = HashMap::from([(
+                PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY.to_string(),
+                powerful_enabled,
+            )]);
             let overrides = PaidModelAliasOverrides::from_flag_values(&flags);
 
             let free = ModelAliasTargets::for_plan_with_overrides(ModelPlan::Free, overrides);
@@ -1103,16 +1030,12 @@ mod tests {
             let paid = ModelAliasTargets::for_plan_with_overrides(ModelPlan::Paid, overrides);
             assert_eq!(
                 paid.resolve(AUTO_QUICK_MODEL_ID),
-                if quick_enabled {
-                    DEEPSEEK_V4_FLASH_MODEL_ID
-                } else {
-                    QUICK_MODEL_ID
-                }
+                DEEPSEEK_V4_FLASH_MODEL_ID
             );
             assert_eq!(
                 paid.resolve(AUTO_POWERFUL_MODEL_ID),
                 if powerful_enabled {
-                    GLM_5_2_MODEL_ID
+                    KIMI_K3_MODEL_ID
                 } else {
                     POWERFUL_MODEL_ID
                 }
@@ -1123,19 +1046,24 @@ mod tests {
             PaidModelAliasOverrides::from_flag_values(&HashMap::new()),
             PaidModelAliasOverrides::default()
         );
+        assert_eq!(
+            PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY,
+            "model-alias.paid.powerful.kimi-k3"
+        );
+        assert_eq!(
+            crate::os_flags::PAID_MODEL_ALIAS_FLAG_KEYS,
+            &[PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY]
+        );
     }
 
     #[test]
     fn test_catalog_alias_metadata_tracks_paid_override_targets() {
-        let flags = HashMap::from([
-            (PAID_QUICK_DEEPSEEK_ALIAS_FLAG_KEY.to_string(), true),
-            (PAID_POWERFUL_GLM_ALIAS_FLAG_KEY.to_string(), true),
-        ]);
+        let flags = HashMap::from([(PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY.to_string(), true)]);
         let targets = ModelAliasTargets::for_plan_with_overrides(
             ModelPlan::Paid,
             PaidModelAliasOverrides::from_flag_values(&flags),
         );
-        let catalog = model_catalog_response(ModelFeatureAccess::default(), targets);
+        let catalog = model_catalog_response(targets);
         let aliases = catalog["aliases"].as_array().expect("aliases");
         let quick = aliases
             .iter()
@@ -1149,9 +1077,9 @@ mod tests {
         assert_eq!(quick["target_model"], DEEPSEEK_V4_FLASH_MODEL_ID);
         assert_eq!(quick["access"], "pro");
         assert_eq!(quick["capabilities"]["vision"], false);
-        assert_eq!(powerful["target_model"], GLM_5_2_MODEL_ID);
+        assert_eq!(powerful["target_model"], KIMI_K3_MODEL_ID);
         assert_eq!(powerful["access"], "pro");
-        assert_eq!(powerful["capabilities"]["vision"], false);
+        assert_eq!(powerful["capabilities"]["vision"], true);
     }
 
     #[test]
@@ -1185,8 +1113,7 @@ mod tests {
 
     #[test]
     fn test_catalog_hides_api_only_models_and_includes_aliases() {
-        let response =
-            model_catalog_response(ModelFeatureAccess::default(), ModelAliasTargets::default());
+        let response = model_catalog_response(ModelAliasTargets::default());
         let data = response["data"].as_array().expect("catalog data");
         assert!(data.iter().any(|model| model["id"] == QUICK_MODEL_ID));
         assert!(!data
@@ -1202,11 +1129,11 @@ mod tests {
             .iter()
             .any(|alias| alias["id"] == AUTO_POWERFUL_MODEL_ID));
 
-        for plan in [ModelPlan::Free, ModelPlan::Paid] {
-            let catalog = model_catalog_response(
-                ModelFeatureAccess::default(),
-                ModelAliasTargets::for_plan(plan),
-            );
+        for (plan, expected_quick, expected_quick_access) in [
+            (ModelPlan::Free, QUICK_MODEL_ID, "free"),
+            (ModelPlan::Paid, DEEPSEEK_V4_FLASH_MODEL_ID, "pro"),
+        ] {
+            let catalog = model_catalog_response(ModelAliasTargets::for_plan(plan));
             let aliases = catalog["aliases"].as_array().expect("aliases");
             let quick = aliases
                 .iter()
@@ -1217,16 +1144,34 @@ mod tests {
                 .find(|alias| alias["id"] == AUTO_POWERFUL_MODEL_ID)
                 .expect("powerful alias");
 
-            assert_eq!(quick["target_model"], QUICK_MODEL_ID);
-            assert_eq!(quick["access"], "free");
+            assert_eq!(quick["target_model"], expected_quick);
+            assert_eq!(quick["access"], expected_quick_access);
             assert_eq!(powerful["target_model"], POWERFUL_MODEL_ID);
             assert_eq!(powerful["access"], "pro");
         }
     }
 
     #[test]
+    fn test_only_powerful_alias_requires_flag_lookup() {
+        assert!(model_alias_requires_flag_lookup(AUTO_POWERFUL_MODEL_ID));
+        for model in [
+            AUTO_QUICK_MODEL_ID,
+            QUICK_MODEL_ID,
+            POWERFUL_MODEL_ID,
+            "kimi-k3",
+            DEEPSEEK_V4_FLASH_MODEL_ID,
+            GLM_5_2_MODEL_ID,
+        ] {
+            assert!(
+                !model_alias_requires_flag_lookup(model),
+                "direct/static model should not require flags: {model}"
+            );
+        }
+    }
+
+    #[test]
     fn test_openai_models_includes_api_only_models() {
-        let response = openai_models_response(ModelFeatureAccess::default());
+        let response = openai_models_response();
         let data = response["data"].as_array().expect("models data");
 
         assert!(data
@@ -1239,8 +1184,7 @@ mod tests {
 
     #[test]
     fn test_catalog_advertises_voxtral_as_default_speech_model() {
-        let response =
-            model_catalog_response(ModelFeatureAccess::default(), ModelAliasTargets::default());
+        let response = model_catalog_response(ModelAliasTargets::default());
 
         assert_eq!(response["audio"]["speech"]["available"], true);
         assert_eq!(response["audio"]["speech"]["model"], "voxtral-tts");
@@ -1249,8 +1193,7 @@ mod tests {
 
     #[test]
     fn test_catalog_advertises_kimi_through_continuum() {
-        let catalog =
-            model_catalog_response(ModelFeatureAccess::default(), ModelAliasTargets::default());
+        let catalog = model_catalog_response(ModelAliasTargets::default());
         let kimi = catalog_model(&catalog, POWERFUL_MODEL_ID);
 
         assert_eq!(kimi["provider"], "continuum");
@@ -1262,28 +1205,38 @@ mod tests {
     }
 
     #[test]
-    fn test_kimi_visibility_is_default_off_and_deepseek_is_generally_available() {
-        for (access, kimi_visible) in [
-            (ModelFeatureAccess::default(), false),
-            (ModelFeatureAccess::new(true), true),
-        ] {
-            let catalog = model_catalog_response(access, ModelAliasTargets::default());
-            let openai_models = openai_models_response(access);
+    fn test_kimi_k3_and_deepseek_are_generally_listed() {
+        let catalog = model_catalog_response(ModelAliasTargets::default());
+        let openai_models = openai_models_response();
 
-            assert_eq!(has_model(&catalog, "kimi-k3"), kimi_visible);
-            assert!(has_model(&catalog, "deepseek-v4-flash"));
-            assert_eq!(has_model(&openai_models, "kimi-k3"), kimi_visible);
-            assert!(has_model(&openai_models, "deepseek-v4-flash"));
-            assert!(has_model(&catalog, QUICK_MODEL_ID));
-            assert!(has_model(&openai_models, QUICK_MODEL_ID));
+        for model in ["kimi-k3", "deepseek-v4-flash", QUICK_MODEL_ID] {
+            assert!(has_model(&catalog, model));
+            assert!(has_model(&openai_models, model));
         }
     }
 
     #[test]
-    fn test_enriched_catalog_has_only_verified_gated_model_metadata() {
-        let catalog =
-            model_catalog_response(ModelFeatureAccess::new(true), ModelAliasTargets::default());
+    fn test_only_kimi_k3_and_deepseek_have_new_badges() {
+        let expected = vec![
+            DEEPSEEK_V4_FLASH_MODEL_ID.to_string(),
+            KIMI_K3_MODEL_ID.to_string(),
+        ];
+
+        assert_eq!(
+            model_ids_with_badge(&model_catalog_response(ModelAliasTargets::default()), "New"),
+            expected
+        );
+        assert_eq!(
+            model_ids_with_badge(&openai_models_response(), "New"),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_enriched_catalog_has_verified_new_model_metadata() {
+        let catalog = model_catalog_response(ModelAliasTargets::default());
         let kimi = catalog_model(&catalog, "kimi-k3");
+        assert_eq!(kimi["access"], "pro");
         assert_eq!(kimi["provider_id"], "kimi-k3");
         assert_eq!(kimi["context_window"], 256_000);
         assert_eq!(kimi["input_modalities"], json!(["text", "image"]));
@@ -1296,6 +1249,7 @@ mod tests {
         assert_eq!(kimi["tasks"], json!(["generate", "vision"]));
 
         let deepseek = catalog_model(&catalog, "deepseek-v4-flash");
+        assert_eq!(deepseek["access"], "pro");
         assert_eq!(deepseek["provider_id"], "deepseek-v4-flash");
         assert_eq!(deepseek["context_window"], 800_000);
         assert_eq!(deepseek["input_modalities"], json!(["text"]));
@@ -1307,52 +1261,9 @@ mod tests {
         assert_eq!(deepseek["capabilities"]["tool_use"], true);
         assert_eq!(deepseek["tasks"], json!(["generate"]));
 
-        let minimal = openai_models_response(ModelFeatureAccess::new(true));
+        let minimal = openai_models_response();
         let minimal_kimi = catalog_model(&minimal, "kimi-k3");
         assert!(minimal_kimi.get("input_modalities").is_none());
         assert!(minimal_kimi.get("parameter_size").is_none());
-    }
-
-    #[test]
-    fn test_model_access_snapshot_defaults_missing_flags_off() {
-        let mut flags = HashMap::new();
-        let access = ModelFeatureAccess::from_flag_values(&flags);
-        assert!(!access.allows_model("kimi-k3"));
-        assert!(access.allows_model("deepseek-v4-flash"));
-        assert!(access.allows_model("gpt-oss-120b"));
-
-        flags.insert(KIMI_K3_MODEL_ACCESS_FLAG_KEY.to_string(), true);
-        let access = ModelFeatureAccess::from_flag_values(&flags);
-        assert!(access.allows_model("kimi-k3"));
-        assert!(access.allows_model("deepseek-v4-flash"));
-    }
-
-    #[test]
-    fn test_raw_model_list_filter_hides_only_denied_gated_models() {
-        let mut response = json!({
-            "object": "list",
-            "data": [
-                {"id": "kimi-k3"},
-                {"id": "deepseek-v4-flash"},
-                {"id": "provider-specific-model"},
-                {"object": "model"}
-            ]
-        });
-
-        filter_model_list_response_for_access(&mut response, ModelFeatureAccess::default());
-
-        assert!(!has_model(&response, "kimi-k3"));
-        assert!(has_model(&response, "deepseek-v4-flash"));
-        assert!(has_model(&response, "provider-specific-model"));
-        assert_eq!(response["data"].as_array().expect("data").len(), 3);
-    }
-
-    #[test]
-    fn test_model_feature_flag_requirements_are_exact() {
-        assert!(model_requires_feature_flag("kimi-k3"));
-        assert!(!model_requires_feature_flag("deepseek-v4-flash"));
-        assert!(!model_requires_feature_flag("kimi-k2-6"));
-        assert!(!model_requires_feature_flag("deepseek-v4-flash-0731"));
-        assert!(!model_requires_feature_flag("unknown-model"));
     }
 }

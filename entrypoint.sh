@@ -863,14 +863,6 @@ else
     log "Kagi Search connection failed"
 fi
 
-# Test the connection to Brave Search
-log "Testing connection to Brave Search:"
-if timeout 5 bash -c '</dev/tcp/127.0.0.24/443'; then
-    log "Brave Search connection successful"
-else
-    log "Brave Search connection failed"
-fi
-
 # Start the continuum-proxy if we're in AWS Nitro mode
 if [ "$APP_MODE" != "local" ]; then
     # Get Continuum Proxy API key from Secrets Manager

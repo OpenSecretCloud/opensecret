@@ -39,8 +39,8 @@ Cargo commands from the repository root.
 - `src/provider_routing.rs`: provider selection and upstream model mapping.
 - `src/proxy_config.rs` and `src/provider_client.rs`: provider endpoints,
   credentials, transport, attestation, streaming, and safe retry decisions.
-- `src/brave.rs`, `src/kagi.rs`, and `src/web/web_routes.rs`: provider-specific
-  web adapters and provider-neutral public web routes.
+- `src/kagi.rs` and `src/web/web_routes.rs`: Kagi web adapter and
+  provider-neutral public web routes.
 
 Keep server-controlled authentication, authorization, encryption, persistence,
 provider credentials and routing, entitlement decisions, and usage accounting

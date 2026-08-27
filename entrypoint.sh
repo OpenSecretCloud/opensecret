@@ -452,10 +452,6 @@ log "Added Tinfoil proxy domains (including legacy router domains) to /etc/hosts
 echo "127.0.0.23 kagi.com" >> /etc/hosts
 log "Added Kagi Search domain to /etc/hosts"
 
-# Add Brave Search hostname to /etc/hosts
-echo "127.0.0.24 api.search.brave.com" >> /etc/hosts
-log "Added Brave Search domain to /etc/hosts"
-
 touch /app/libnsm.so
 log "Created /app/libnsm.so"
 
@@ -596,10 +592,6 @@ run_forever tf_tinfoil_router_inf10 python3 /app/traffic_forwarder.py 127.0.0.32
 # Start the traffic forwarder for Kagi Search in the background
 log "Starting Kagi Search traffic forwarder"
 run_forever tf_kagi_search python3 /app/traffic_forwarder.py 127.0.0.23 443 3 8026 &
-
-# Start the traffic forwarder for Brave Search in the background
-log "Starting Brave Search traffic forwarder"
-run_forever tf_brave_search python3 /app/traffic_forwarder.py 127.0.0.24 443 3 8027 &
 
 # Wait for the forwarders to start
 log "Waiting for forwarders to start"

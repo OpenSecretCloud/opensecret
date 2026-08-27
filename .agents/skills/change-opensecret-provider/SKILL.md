@@ -24,8 +24,8 @@ inventories:
   streaming, and retry decisions.
 - `src/web/openai.rs` and `src/web/responses/`: route-specific request
   rewriting, canonical response projection, tools, and usage.
-- `src/web/web_routes.rs`, `src/brave.rs`, and `src/kagi.rs`: public web
-  contracts and provider adapters.
+- `src/web/web_routes.rs` and `src/kagi.rs`: public web contracts and the
+  Kagi search/extract adapter.
 
 Trace the changed public model or capability through every affected layer and
 its tests. Historical parity notes can explain intent, but current source and

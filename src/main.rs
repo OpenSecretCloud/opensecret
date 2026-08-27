@@ -96,7 +96,6 @@ mod apple_signin;
 mod aws_credentials;
 mod billing;
 mod bounded_ttl_cache;
-mod brave;
 #[cfg(test)]
 mod crypto_property_tests;
 mod db;
@@ -147,7 +146,6 @@ const RESEND_API_KEY_NAME: &str = "resend_api_key";
 
 const BILLING_API_KEY_NAME: &str = "billing_api_key";
 const BILLING_SERVER_URL_NAME: &str = "billing_server_url";
-const BRAVE_API_KEY_NAME: &str = "brave_api_key";
 const KAGI_API_KEY_NAME: &str = "kagi_api_key";
 const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
 const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
@@ -764,7 +762,6 @@ pub struct AppState {
     os_flags_client: Option<os_flags::OsFlagsClient>,
     apple_jwt_verifier: Arc<AppleJwtVerifier>,
     cancellation_broadcast: tokio::sync::broadcast::Sender<Uuid>,
-    brave_client: Option<Arc<crate::brave::BraveClient>>,
     kagi_client: Option<Arc<crate::kagi::KagiClient>>,
 }
 
@@ -799,7 +796,6 @@ pub struct AppStateBuilder {
     billing_server_url: Option<String>,
     os_flags_base_url: Option<String>,
     os_flags_api_key: Option<String>,
-    brave_api_key: Option<String>,
     kagi_api_key: Option<String>,
 }
 
@@ -918,11 +914,6 @@ impl AppStateBuilder {
 
     pub fn os_flags_api_key(mut self, os_flags_api_key: Option<String>) -> Self {
         self.os_flags_api_key = os_flags_api_key;
-        self
-    }
-
-    pub fn brave_api_key(mut self, brave_api_key: Option<String>) -> Self {
-        self.brave_api_key = brave_api_key;
         self
     }
 
@@ -1068,26 +1059,6 @@ impl AppStateBuilder {
 
         let (cancellation_tx, _) = tokio::sync::broadcast::channel(1024);
 
-        let brave_client = if let Some(ref api_key) = self.brave_api_key {
-            tracing::info!("Initializing Brave client with connection pooling (max 100 idle connections, 10s timeout)");
-            match crate::brave::BraveClient::new(api_key.clone()) {
-                Ok(client) => {
-                    tracing::debug!("Brave client initialized successfully");
-                    Some(Arc::new(client))
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to initialize Brave client: {:?}. Web search will be unavailable.",
-                        e
-                    );
-                    None
-                }
-            }
-        } else {
-            tracing::debug!("Brave API key not configured, web search tool will be unavailable");
-            None
-        };
-
         let kagi_client = if let Some(ref api_key) = self.kagi_api_key {
             tracing::info!("Initializing Kagi client");
             match crate::kagi::KagiClient::new(api_key.clone()) {
@@ -1097,14 +1068,14 @@ impl AppStateBuilder {
                 }
                 Err(e) => {
                     tracing::error!(
-                        "Failed to initialize Kagi client: {:?}. Kagi web search will be unavailable.",
+                        "Failed to initialize Kagi client: {:?}. Web search will be unavailable.",
                         e
                     );
                     None
                 }
             }
         } else {
-            tracing::debug!("Kagi API key not configured, Kagi web search will be unavailable");
+            tracing::debug!("Kagi API key not configured, web search will be unavailable");
             None
         };
 
@@ -1134,7 +1105,6 @@ impl AppStateBuilder {
             os_flags_client,
             apple_jwt_verifier,
             cancellation_broadcast: cancellation_tx,
-            brave_client,
             kagi_client,
         })
     }
@@ -3476,48 +3446,6 @@ async fn retrieve_os_flags_base_url(
     }
 }
 
-async fn retrieve_brave_api_key(
-    aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
-    db: Arc<dyn DBConnection + Send + Sync>,
-) -> Result<Option<String>, Error> {
-    let creds = aws_credential_manager
-        .read()
-        .await
-        .clone()
-        .expect("non-local mode should have creds")
-        .get_credentials()
-        .await
-        .expect("non-local mode should have creds");
-
-    // check if the key already exists in the db
-    let existing_key = db.get_enclave_secret_by_key(BRAVE_API_KEY_NAME)?;
-
-    if let Some(ref encrypted_key) = existing_key {
-        // Convert the stored bytes back to base64
-        let base64_encrypted_key = general_purpose::STANDARD.encode(&encrypted_key.value);
-
-        debug!("trying to decrypt base64 encrypted Brave API key");
-
-        // Decrypt the existing key
-        let decrypted_bytes = decrypt_with_kms(
-            &creds.region,
-            &creds.access_key_id,
-            &creds.secret_access_key,
-            &creds.token,
-            &base64_encrypted_key,
-        )
-        .map_err(|e| Error::EncryptionError(e.to_string()))?;
-
-        // Convert the decrypted bytes to a UTF-8 string
-        String::from_utf8(decrypted_bytes)
-            .map_err(|e| Error::EncryptionError(format!("Failed to decode UTF-8: {}", e)))
-            .map(Some)
-    } else {
-        tracing::info!("Brave API key not found in the database");
-        Ok(None)
-    }
-}
-
 async fn retrieve_kagi_api_key(
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
     db: Arc<dyn DBConnection + Send + Sync>,
@@ -3832,13 +3760,6 @@ async fn main() -> Result<(), Error> {
         optional_env("BILLING_SERVER_URL")
     };
 
-    let brave_api_key = if app_mode != AppMode::Local {
-        // Get from database if in enclave mode
-        retrieve_brave_api_key(aws_credential_manager.clone(), db.clone()).await?
-    } else {
-        optional_env("BRAVE_API_KEY")
-    };
-
     let kagi_api_key = if app_mode != AppMode::Local {
         retrieve_kagi_api_key(aws_credential_manager.clone(), db.clone()).await?
     } else {
@@ -3886,7 +3807,6 @@ async fn main() -> Result<(), Error> {
         .billing_server_url(billing_server_url)
         .os_flags_base_url(os_flags_base_url)
         .os_flags_api_key(os_flags_api_key)
-        .brave_api_key(brave_api_key)
         .kagi_api_key(kagi_api_key)
         .build()
         .await?;

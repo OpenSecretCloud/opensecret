@@ -176,39 +176,54 @@ nix build --no-update-lock-file '.?submodules=1#eif-prod'
 nix build --no-update-lock-file '.?submodules=1#eif-preview'
 ```
 
-This will create a symlink `result` pointing to the built EIF file.
+This creates a `result` symlink to an immutable Nix store output directory
+containing `image.eif` and `pcr.json`.
 
-3. Copy the EIF to your AWS parent instance:
+3. For preview or low-level diagnostics only, copy the EIF manually:
 ```bash
-# For development
-just scp-eif-to-aws-dev
-
-# For production
-just scp-eif-to-aws-prod
-
 # For preview
 just scp-eif-to-aws-preview
 ```
 
+The tagged dev/prod deployment command performs its own verified upload; do not
+stage a shared `opensecret.eif` first.
+
 4. Deploy the EIF:
 ```bash
 # For development
-just deploy-dev-nix
+git checkout v1.2.3
+nix develop
+just deploy-dev-nix v1.2.3
 
 # For production
-just deploy-prod-nix
+just deploy-prod-nix v1.2.3
 
 # For preview
 just deploy-preview-nix
 ```
 
-The deployment process will:
-1. Build the EIF
-2. Copy it to the AWS parent instance
-3. Prompt you to review the PCR values
-4. After confirmation, terminate any existing enclave
-5. Run the new enclave
-6. Restart the socat proxy
+The tagged dev/prod deployment process will:
+1. Build the EIF from the exact clean tag.
+2. Show the tag, environment, PCR tuple, and EIF digest for typed confirmation.
+3. Upload the content-addressed
+   `opensecret-${tag}-${environment}-${sha256}.eif` without replacing the
+   running enclave.
+4. Require two exact legacy-history reads at least ten minutes apart; raw
+   GitHub currently advertises a five-minute cache lifetime.
+5. Authenticate the matching immutable Sigstore Release, require GitHub's live
+   tag to resolve to the local commit, and bind the manifest to the exact local
+   EIF digest and complete PCR tuple.
+6. Under one host-wide remote lock, verify its digest, terminate only exact-name
+   `opensecret` enclaves, recheck the digest, launch it, and restart socat.
+
+Direct `scp-eif-*`, split `stage`/`run-stage`, and `run-eif-*` recipes are
+low-level operational primitives, not safe release entrypoints.
+
+A launch or SSH failure after termination does not roll back automatically.
+Retry the same protected tag for a transient failure. For rollback, check out a
+previously approved protected tag and run its normal `deploy-dev-nix` or
+`deploy-prod-nix` recipe so every publication, tag, artifact, and digest gate
+runs again.
 
 ### PCR Value Management
 
@@ -218,7 +233,6 @@ The Nix build process generates PCR (Platform Configuration Register) values tha
 ```bash
 just copy-pcr-dev    # For development
 just copy-pcr-prod   # For production
-just copy-pcr-preview # For preview
 ```
 
 2. Verify PCR values match the reference:
@@ -229,9 +243,19 @@ just verify-pcr-preview # For preview
 ```
 
 This is a local regression check against mutable reference files; it does not
-authenticate a release or prove reproducibility by itself. New dev/prod release
-measurements are published only by the manually approved tagged Sigstore
-workflow described in [PCR_VERIFICATION.md](PCR_VERIFICATION.md).
+authenticate a release or prove reproducibility by itself. During the
+migration, future release candidates are dual-published: the manually approved
+tagged workflow first publishes the full Sigstore provenance used to generate
+new-client snapshots, and only then may the existing local key add PCR0-only
+compatibility entries for already-released clients. New clients never read or
+fall back to the GitHub histories. This repository change performs neither
+publication automatically. Follow the ordering and gated deployment commands in
+[PCR_VERIFICATION.md](PCR_VERIFICATION.md); do not use low-level `run-eif-*`
+recipes as release entrypoints.
+
+Once a signed history suffix is merged and exposed by raw GitHub, it is an
+irreversible legacy approval. If that candidate is later abandoned, leave the
+entry intact and use a new commit and semver tag for the replacement.
 
 ## Setup SSL
 

@@ -304,11 +304,15 @@ restart-socat-prod:
 restart-socat-preview:
     ssh -i $PREVIEW_SSH_KEY $PREVIEW_SERVER "sudo systemctl restart socat-proxy.service"
 
-# Run the staged dev environment
-run-stage-dev: terminate-enclave-dev run-eif-dev restart-socat-dev
+# Split staging cannot bind the later run to one approved artifact.
+run-stage-dev:
+    @echo "❌ Use 'just deploy-dev-nix <vMAJOR.MINOR.PATCH>' for an atomic, verified release deployment." >&2
+    @exit 1
 
-# Run the staged prod environment
-run-stage-prod: terminate-enclave-prod run-eif-prod restart-socat-prod
+# Split staging cannot bind the later run to one approved artifact.
+run-stage-prod:
+    @echo "❌ Use 'just deploy-prod-nix <vMAJOR.MINOR.PATCH>' for an atomic, verified release deployment." >&2
+    @exit 1
 
 # Run the staged preview environment
 run-stage-preview: terminate-enclave-preview run-eif-preview restart-socat-preview
@@ -347,52 +351,510 @@ copy-pcr-prod:
     cat result/pcr.json
     cp -f result/pcr.json ./pcrProd.json
 
-# Legacy PCR histories are frozen. Keep the public recipe names so old
-# automation fails closed with an actionable message instead of mutating them.
-_legacy-pcr-history-frozen:
-    @echo "❌ Legacy PCR history updates are frozen; use the Nitro EIF release workflow." >&2
-    @exit 1
-
-append-pcr-dev: _legacy-pcr-history-frozen
-
-append-pcr-prod: _legacy-pcr-history-frozen
-
-_append-pcr-file pcr_file history_file label: _legacy-pcr-history-frozen
-
-update-pcr-dev: _legacy-pcr-history-frozen
-
-update-pcr-prod: _legacy-pcr-history-frozen
-
-update-pcr-all: _legacy-pcr-history-frozen
-
-
-# Legacy key generation is frozen along with legacy PCR history mutation.
-generate-pcr-keys: _legacy-pcr-history-frozen
-
-# Verify signatures in a PCR history file using the SIGNING_PUBLIC_KEY environment variable
-verify-pcr-history env:
+# Internal transition-only compatibility primitive. Release operators must use
+# append-legacy-pcr-release so both Sigstore publications are authenticated
+# before either old PCR0-only signature is created.
+_append-pcr-file pcr_file history_file environment:
     #!/usr/bin/env bash
-    set -e
-    
-    # Check if the Node.js script exists and is executable
-    if [ ! -x "./pcr_verify.js" ]; then
-        chmod +x ./pcr_verify.js
-    fi
-    
-    # Check for required environment variable
-    if [ -z "${SIGNING_PUBLIC_KEY}" ]; then
-        echo "❌ Error: SIGNING_PUBLIC_KEY environment variable is not set"
-        echo "Retrieve the historical public key used for these frozen records."
-        echo "Generating a new key cannot verify existing history."
+    set -euo pipefail
+
+    pcr_file={{quote(pcr_file)}}
+    history_file={{quote(history_file)}}
+
+    if [[ ! -f "$pcr_file" ]]; then
+        echo "❌ Required PCR file does not exist: $pcr_file" >&2
         exit 1
     fi
-    
-    # Display the first few characters of the public key for debugging
-    PUBLIC_KEY_PREFIX="${SIGNING_PUBLIC_KEY:0:20}..."
-    echo "Verifying signatures using public key: $PUBLIC_KEY_PREFIX"
-    
-    # Run the verification script
+    if [[ ! -f "$history_file" ]]; then
+        echo "❌ Refusing to create missing append-only history: $history_file" >&2
+        exit 1
+    fi
+
+    history_git_path="${history_file#./}"
+    base_history="$(mktemp "${TMPDIR:-/tmp}/opensecret-legacy-head.XXXXXX")"
+    temporary_history=""
+    cleanup() {
+        if [[ -n "$temporary_history" ]]; then
+            rm -f -- "$temporary_history"
+        fi
+        rm -f -- "$base_history"
+    }
+    trap cleanup EXIT
+
+    if ! git show "HEAD:$history_git_path" > "$base_history"; then
+        echo "❌ Could not load $history_git_path from HEAD." >&2
+        exit 1
+    fi
+    if ! git diff --cached --quiet -- "$history_file" &&
+       ! git diff --quiet -- "$history_file"; then
+        echo "❌ Legacy history has different staged and unstaged changes." >&2
+        exit 1
+    fi
+
+    # A retry may see the one valid suffix written by an earlier partial
+    # update-pcr-all run. Validate the working history against HEAD before
+    # inspecting it; truncation, reordering, mutation, bad signatures, and
+    # cross-environment PCR0 reuse all fail here.
+    ./pcr_verify.js \
+        {{environment}} \
+        --history-file "$history_file" \
+        --base-history-file "$base_history"
+
+    pcr0="$(jq -er '.PCR0' "$pcr_file")"
+    pcr1="$(jq -er '.PCR1' "$pcr_file")"
+    pcr2="$(jq -er '.PCR2' "$pcr_file")"
+    exact_matches="$(
+        jq \
+            --arg pcr0 "$pcr0" \
+            --arg pcr1 "$pcr1" \
+            --arg pcr2 "$pcr2" \
+            '[.[] | select(.PCR0 == $pcr0 and .PCR1 == $pcr1 and .PCR2 == $pcr2)] | length' \
+            "$history_file"
+    )"
+    pcr0_matches="$(
+        jq --arg pcr0 "$pcr0" '[.[] | select(.PCR0 == $pcr0)] | length' "$history_file"
+    )"
+
+    history_differs=0
+    if ! git diff --quiet HEAD -- "$history_file"; then
+        history_differs=1
+    fi
+    if [[ "$exact_matches" == "1" && "$pcr0_matches" == "1" ]]; then
+        ./pcr_verify.js \
+            {{environment}} \
+            --history-file "$history_file" \
+            --base-history-file "$base_history" \
+            --require-pcr-file "$pcr_file"
+
+        if [[ "$history_differs" == "1" ]]; then
+            base_pcr0_matches="$(
+                jq --arg pcr0 "$pcr0" \
+                    '[.[] | select(.PCR0 == $pcr0)] | length' \
+                    "$base_history"
+            )"
+            base_entries="$(jq -er 'length' "$base_history")"
+            candidate_entries="$(jq -er 'length' "$history_file")"
+            if [[ "$base_pcr0_matches" != "0" ]] ||
+               (( candidate_entries != base_entries + 1 )); then
+                echo "❌ Dirty history is not exactly the requested one-entry append." >&2
+                exit 1
+            fi
+        fi
+
+        echo "✅ {{environment}} legacy history already contains the exact PCR tuple."
+        exit 0
+    fi
+    if [[ "$pcr0_matches" != "0" ]]; then
+        echo "❌ {{environment}} history already contains PCR0 with a different or duplicate tuple." >&2
+        exit 1
+    fi
+    if [[ "$history_differs" == "1" ]]; then
+        echo "❌ {{environment}} history differs from HEAD but lacks the requested exact tuple." >&2
+        exit 1
+    fi
+    if [[ -z "${SIGNING_PRIVATE_KEY:-}" ]]; then
+        echo "❌ SIGNING_PRIVATE_KEY must contain the existing legacy PKCS#8 DER key encoded as base64." >&2
+        exit 1
+    fi
+
+    signature="$(./pcr_sign.js sign-pcr0 "$pcr0")"
+    timestamp="$(date +%s)"
+    temporary_history="$(mktemp "./.${history_git_path##*/}.XXXXXX")"
+
+    jq \
+        --arg pcr0 "$pcr0" \
+        --arg pcr1 "$pcr1" \
+        --arg pcr2 "$pcr2" \
+        --arg signature "$signature" \
+        --argjson timestamp "$timestamp" \
+        '. + [{
+            PCR0: $pcr0,
+            PCR1: $pcr1,
+            PCR2: $pcr2,
+            timestamp: $timestamp,
+            signature: $signature
+        }]' \
+        "$history_file" > "$temporary_history"
+    ./pcr_verify.js \
+        {{environment}} \
+        --history-file "$temporary_history" \
+        --base-history-file "$base_history" \
+        --require-pcr-file "$pcr_file"
+
+    # Do not overwrite a concurrent operator's edit.
+    if ! cmp -s "$base_history" "$history_file"; then
+        echo "❌ Legacy history changed while the append was being prepared." >&2
+        exit 1
+    fi
+    mv "$temporary_history" "$history_file"
+    temporary_history=""
+
+    ./pcr_verify.js \
+        {{environment}} \
+        --history-file "$history_file" \
+        --base-history-file "$base_history" \
+        --require-pcr-file "$pcr_file"
+    echo "✅ Appended the {{environment}} tuple for legacy clients."
+
+prepare-pcr-references:
+    just copy-pcr-dev
+    just copy-pcr-prod
+
+update-pcr-prod:
+    @echo "❌ Use 'just prepare-pcr-references' before tagging, then 'just update-pcr-all <tag>' after Sigstore publication." >&2
+    @exit 1
+
+update-pcr-dev:
+    @echo "❌ Use 'just prepare-pcr-references' before tagging, then 'just update-pcr-all <tag>' after Sigstore publication." >&2
+    @exit 1
+
+update-pcr-all release_tag:
+    just append-legacy-pcr-release {{quote(release_tag)}}
+
+# Do not rotate this key: released clients pin the existing public key.
+generate-pcr-keys:
+    @echo "❌ Legacy key generation is disabled; recover the existing SIGNING_PRIVATE_KEY." >&2
+    @exit 1
+
+# Verify every history entry using the public key pinned by legacy clients.
+verify-pcr-history env:
     ./pcr_verify.js {{env}}
+
+# Require a local history to contain the exact complete tuple.
+verify-legacy-pcr-compatibility env pcr_file:
+    ./pcr_verify.js {{env}} --require-pcr-file {{quote(pcr_file)}}
+
+# Require GitHub's master history—the URL used by old clients—to expose the
+# exact tuple before terminating a running enclave.
+verify-legacy-pcr-published env pcr_file:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    case "{{env}}" in
+        dev)
+            history_url="https://raw.githubusercontent.com/OpenSecretCloud/opensecret/master/pcrDevHistory.json"
+            other_history_url="https://raw.githubusercontent.com/OpenSecretCloud/opensecret/master/pcrProdHistory.json"
+            base_history="pcrDevHistory.json"
+            other_base_history="pcrProdHistory.json"
+            other_environment="prod"
+            ;;
+        prod)
+            history_url="https://raw.githubusercontent.com/OpenSecretCloud/opensecret/master/pcrProdHistory.json"
+            other_history_url="https://raw.githubusercontent.com/OpenSecretCloud/opensecret/master/pcrDevHistory.json"
+            base_history="pcrProdHistory.json"
+            other_base_history="pcrDevHistory.json"
+            other_environment="dev"
+            ;;
+        *)
+            echo "❌ Legacy publication exists only for dev or prod." >&2
+            exit 1
+            ;;
+    esac
+    test -s "$base_history"
+    test -s "$other_base_history"
+
+    published_history="$(mktemp "${TMPDIR:-/tmp}/opensecret-legacy-history.XXXXXX")"
+    published_other_history="$(mktemp "${TMPDIR:-/tmp}/opensecret-legacy-other.XXXXXX")"
+    trap 'rm -f "$published_history" "$published_other_history"' EXIT
+    fetch_history() {
+        local url="$1"
+        local output="$2"
+        curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --retry 3 \
+            --retry-delay 2 \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            "$url" \
+            --output "$output"
+    }
+    fetch_history "$history_url" "$published_history"
+    fetch_history "$other_history_url" "$published_other_history"
+    ./pcr_verify.js \
+        {{env}} \
+        --history-file "$published_history" \
+        --other-history-file "$published_other_history" \
+        --base-history-file "$base_history" \
+        --require-pcr-file {{quote(pcr_file)}}
+    ./pcr_verify.js \
+        "$other_environment" \
+        --history-file "$published_other_history" \
+        --other-history-file "$published_history" \
+        --base-history-file "$other_base_history"
+    echo "✅ GitHub master exposes the {{env}} tuple as append-only dev/prod histories."
+
+# Require two successful raw-GitHub reads separated by ten minutes. The
+# endpoint currently advertises max-age=300; this conservative soak reduces
+# the chance that an old client reaches a still-stale CDN edge.
+verify-legacy-pcr-propagated env pcr_file:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    environment={{quote(env)}}
+    pcr_file={{quote(pcr_file)}}
+    case "$environment" in
+        dev|prod) ;;
+        *)
+            echo "❌ Legacy publication exists only for dev or prod." >&2
+            exit 1
+            ;;
+    esac
+    test -s "$pcr_file"
+
+    just verify-legacy-pcr-published "$environment" "$pcr_file"
+
+    pcr0="$(jq -er '.PCR0' "$pcr_file")"
+    marker_dir=".local/legacy-pcr-soak"
+    marker="$marker_dir/${environment}-${pcr0}.timestamp"
+    minimum_age=600
+    now="$(date +%s)"
+    mkdir -p "$marker_dir"
+
+    if [[ ! -f "$marker" ]]; then
+        printf '%s\n' "$now" > "$marker"
+        echo "⏳ First verified raw-GitHub observation recorded for $environment." >&2
+        echo "   Wait at least $minimum_age seconds, then rerun this command." >&2
+        exit 1
+    fi
+
+    first_observation="$(tr -d '\r\n' < "$marker")"
+    if [[ ! "$first_observation" =~ ^[0-9]+$ ]] ||
+       (( first_observation > now )); then
+        echo "❌ Invalid propagation marker: $marker" >&2
+        exit 1
+    fi
+    age=$((now - first_observation))
+    if (( age < minimum_age )); then
+        echo "⏳ Raw-GitHub propagation soak has run for ${age}s; ${minimum_age}s required." >&2
+        exit 1
+    fi
+
+    # The first read above is deliberately repeated after the elapsed-time
+    # check so deployment never relies on an old successful observation.
+    just verify-legacy-pcr-published "$environment" "$pcr_file"
+    echo "✅ Two exact raw-GitHub observations are separated by at least ${minimum_age}s."
+
+# Authenticate a published tagged manifest and bind it to the exact local EIF.
+verify-sigstore-release-published release_tag environment pcr_file eif_file allow_legacy_history_changes='false':
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    release_tag={{quote(release_tag)}}
+    environment={{quote(environment)}}
+    pcr_file={{quote(pcr_file)}}
+    eif_file={{quote(eif_file)}}
+    allow_legacy_history_changes={{quote(allow_legacy_history_changes)}}
+    repository="OpenSecretCloud/opensecret"
+    legacy_check_dir=""
+    release_dir=""
+    cleanup() {
+        if [[ -n "$legacy_check_dir" ]]; then
+            rm -rf -- "$legacy_check_dir"
+        fi
+        if [[ -n "$release_dir" ]]; then
+            rm -rf -- "$release_dir"
+        fi
+    }
+    trap cleanup EXIT
+
+    if [[ ! "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+        echo "❌ Release tag must match exactly vMAJOR.MINOR.PATCH." >&2
+        exit 1
+    fi
+    if [[ "$environment" != "dev" && "$environment" != "prod" ]]; then
+        echo "❌ Release environment must be dev or prod." >&2
+        exit 1
+    fi
+    if [[ "$allow_legacy_history_changes" != "false" &&
+          "$allow_legacy_history_changes" != "true" ]]; then
+        echo "❌ Internal legacy-history mode must be true or false." >&2
+        exit 1
+    fi
+    for command in cosign gh git jq python3; do
+        if ! command -v "$command" >/dev/null; then
+            echo "❌ Required release verifier is missing: $command" >&2
+            echo "   Enter the pinned Nix development shell first." >&2
+            exit 1
+        fi
+    done
+    if [[ ! -s "$pcr_file" || ! -s "$eif_file" ]]; then
+        echo "❌ Required local PCR or EIF file is missing." >&2
+        exit 1
+    fi
+
+    cosign_version="$(cosign version 2>&1)"
+    if ! grep -Eq 'GitVersion:[[:space:]]+v?3\.1\.2([[:space:]]|$)' <<<"$cosign_version"; then
+        echo "❌ Deployment verification requires exactly Cosign 3.1.2." >&2
+        printf '%s\n' "$cosign_version" >&2
+        exit 1
+    fi
+
+    tag_commit="$(git rev-parse --verify "${release_tag}^{commit}")"
+    if [[ "$(git rev-parse HEAD)" != "$tag_commit" ]]; then
+        echo "❌ Check out the exact tagged commit before deployment." >&2
+        exit 1
+    fi
+    if [[ "$allow_legacy_history_changes" == "false" ]]; then
+        if ! git diff --quiet || ! git diff --cached --quiet; then
+            echo "❌ Refusing to verify deployment from a tracked worktree that differs from the tag." >&2
+            exit 1
+        fi
+    else
+        changed_files="$(
+            {
+                git diff --name-only
+                git diff --cached --name-only
+            } | LC_ALL=C sort -u
+        )"
+        while IFS= read -r changed_file; do
+            case "$changed_file" in
+                ""|pcrDevHistory.json|pcrProdHistory.json) ;;
+                *)
+                    echo "❌ Only append-only legacy histories may differ while preparing compatibility." >&2
+                    exit 1
+                    ;;
+            esac
+        done <<<"$changed_files"
+
+        legacy_check_dir="$(mktemp -d "${TMPDIR:-/tmp}/opensecret-legacy-tag.XXXXXX")"
+        git show "${tag_commit}:pcrDevHistory.json" > "$legacy_check_dir/pcrDevHistory.json"
+        git show "${tag_commit}:pcrProdHistory.json" > "$legacy_check_dir/pcrProdHistory.json"
+        ./pcr_verify.js dev \
+            --base-history-file "$legacy_check_dir/pcrDevHistory.json"
+        ./pcr_verify.js prod \
+            --base-history-file "$legacy_check_dir/pcrProdHistory.json"
+        rm -rf -- "$legacy_check_dir"
+        legacy_check_dir=""
+    fi
+
+    remote_tag_commit="$(
+        gh api "repos/$repository/commits/$release_tag" --jq .sha
+    )"
+    if [[ "$remote_tag_commit" != "$tag_commit" ]]; then
+        echo "❌ GitHub's current tag does not resolve to the authenticated local commit." >&2
+        exit 1
+    fi
+
+    release_state="$(
+        gh release view "$release_tag" \
+            --repo "$repository" \
+            --json isDraft,isImmutable,isPrerelease,tagName \
+            --jq '[.tagName, .isDraft, .isPrerelease, .isImmutable] | @tsv'
+    )"
+    expected_release_state="${release_tag}"$'\tfalse\tfalse\ttrue'
+    if [[ "$release_state" != "$expected_release_state" ]]; then
+        echo "❌ $release_tag is not a published, stable, immutable GitHub Release." >&2
+        exit 1
+    fi
+
+    release_dir="$(mktemp -d "${TMPDIR:-/tmp}/opensecret-release.XXXXXX")"
+    manifest_name="opensecret-nitro-${release_tag}-${environment}.manifest.json"
+    bundle_name="opensecret-nitro-${release_tag}-${environment}.manifest.sigstore.json"
+    gh release download "$release_tag" \
+        --repo "$repository" \
+        --pattern "$manifest_name" \
+        --pattern "$bundle_name" \
+        --dir "$release_dir"
+
+    manifest="$release_dir/$manifest_name"
+    bundle="$release_dir/$bundle_name"
+    test -s "$manifest"
+    test -s "$bundle"
+    jq -e \
+        '.mediaType == "application/vnd.dev.sigstore.bundle.v0.3+json"' \
+        "$bundle" >/dev/null
+
+    workflow_run="$(jq -er '.build.workflowRun' "$manifest")"
+    python3 scripts/generate_nitro_release_manifest.py verify \
+        --environment "$environment" \
+        --commit "$tag_commit" \
+        --tag "$release_tag" \
+        --workflow-run "$workflow_run" \
+        --pcr "$pcr_file" \
+        --eif "$eif_file" \
+        --flake-lock flake.lock \
+        --manifest "$manifest"
+
+    certificate_identity="https://github.com/${repository}/.github/workflows/release-nitro-eif.yml@refs/tags/${release_tag}"
+    cosign verify-blob \
+        --bundle "$bundle" \
+        --certificate-github-workflow-name "Nitro EIF Release" \
+        --certificate-github-workflow-ref "refs/tags/$release_tag" \
+        --certificate-github-workflow-repository "$repository" \
+        --certificate-github-workflow-sha "$tag_commit" \
+        --certificate-github-workflow-trigger "workflow_dispatch" \
+        --certificate-identity "$certificate_identity" \
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+        "$manifest"
+
+    echo "✅ $release_tag authenticates the exact local $environment EIF and PCR tuple."
+
+# After an immutable tagged release exists, authenticate both release outputs
+# and only then create/reuse the legacy PCR0 entries needed by old clients.
+append-legacy-pcr-release release_tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    release_tag={{quote(release_tag)}}
+    if [[ ! "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+        echo "❌ Release tag must match exactly vMAJOR.MINOR.PATCH." >&2
+        exit 1
+    fi
+
+    tag_commit="$(git rev-parse --verify "${release_tag}^{commit}")"
+    if [[ "$(git rev-parse HEAD)" != "$tag_commit" ]]; then
+        echo "❌ Check out the exact released tag before preparing legacy compatibility." >&2
+        exit 1
+    fi
+
+    build_dir=".local/release-builds/$release_tag"
+    install -d -m 0700 "$build_dir"
+    nix build --no-update-lock-file \
+        --out-link "$build_dir/dev" \
+        '.?submodules=1#eif-dev'
+    nix build --no-update-lock-file \
+        --out-link "$build_dir/prod" \
+        '.?submodules=1#eif-prod'
+
+    dev_result="$(realpath "$build_dir/dev")"
+    prod_result="$(realpath "$build_dir/prod")"
+    for result_dir in "$dev_result" "$prod_result"; do
+        if [[ "$result_dir" != /nix/store/* ]]; then
+            echo "❌ Release build must resolve to an immutable Nix store output." >&2
+            exit 1
+        fi
+        test -s "$result_dir/pcr.json"
+        test -s "$result_dir/image.eif"
+    done
+
+    if ! cmp -s pcrDev.json "$dev_result/pcr.json" ||
+       ! cmp -s pcrProd.json "$prod_result/pcr.json"; then
+        echo "❌ Tagged builds do not match the checked-in PCR references." >&2
+        exit 1
+    fi
+
+    # Both Sigstore releases are authenticated before either legacy history is
+    # changed. The true mode permits only already-validated history suffixes so
+    # an interrupted dev/prod append can be retried safely.
+    just verify-sigstore-release-published \
+        "$release_tag" dev \
+        "$dev_result/pcr.json" "$dev_result/image.eif" true
+    just verify-sigstore-release-published \
+        "$release_tag" prod \
+        "$prod_result/pcr.json" "$prod_result/image.eif" true
+
+    just _append-pcr-file \
+        "$dev_result/pcr.json" pcrDevHistory.json dev
+    just _append-pcr-file \
+        "$prod_result/pcr.json" pcrProdHistory.json prod
+
+    echo "✅ Legacy compatibility now matches the authenticated $release_tag release."
+    echo "   Commit only the suffix-only history changes and merge them to protected master."
 
 # Internal function for PCR verification
 _verify-pcr-internal env pcr_file:
@@ -495,17 +957,182 @@ ssh-prod CMD:
 view-console-logs-preview:
     ssh -i $PREVIEW_SSH_KEY $PREVIEW_SERVER "export ENCLAVE_ID=$(nitro-cli describe-enclaves | jq -r '.[0].EnclaveID') && nitro-cli console --enclave-id $ENCLAVE_ID"
 
-# Deploy to dev environment without debug mode (using Nix-built EIF)
-deploy-dev-nix: build-eif-dev verify-pcr-dev scp-eif-to-aws-dev
-    @echo "EIF copied to server. Please review the PCR values and press Enter to continue with termination and deployment..."
-    @read -p ""
-    just terminate-enclave-dev run-eif-dev restart-socat-dev
+# Deploy one exact tagged dev/prod EIF after both trust paths are published.
+_deploy-tagged-nitro-eif release_tag environment:
+    #!/usr/bin/env bash
+    set -euo pipefail
 
-# Deploy to prod environment without debug mode (using Nix-built EIF)
-deploy-prod-nix: build-eif-prod verify-pcr-prod scp-eif-to-aws-prod
-    @echo "EIF copied to production server. Please review the PCR values and press Enter to continue with termination and deployment..."
-    @read -p ""
-    just terminate-enclave-prod run-eif-prod restart-socat-prod
+    release_tag={{quote(release_tag)}}
+    environment={{quote(environment)}}
+    if [[ ! "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+        echo "❌ Release tag must match exactly vMAJOR.MINOR.PATCH." >&2
+        exit 1
+    fi
+
+    case "$environment" in
+        dev)
+            ssh_key="${DEV_SSH_KEY:?DEV_SSH_KEY is required}"
+            server="${DEV_SERVER:?DEV_SERVER is required}"
+            ;;
+        prod)
+            ssh_key="${PROD_SSH_KEY:?PROD_SSH_KEY is required}"
+            server="${PROD_SERVER:?PROD_SERVER is required}"
+            ;;
+        *)
+            echo "❌ Tagged deployment exists only for dev or prod." >&2
+            exit 1
+            ;;
+    esac
+
+    result_dir="$(realpath result)"
+    if [[ "$result_dir" != /nix/store/* ]]; then
+        echo "❌ EIF result must resolve to an immutable Nix store output." >&2
+        exit 1
+    fi
+    pcr_file="$(realpath "$result_dir/pcr.json")"
+    eif_file="$(realpath "$result_dir/image.eif")"
+    if [[ "$pcr_file" != /nix/store/* || "$eif_file" != /nix/store/* ]]; then
+        echo "❌ PCR and EIF files must remain inside the immutable Nix store." >&2
+        exit 1
+    fi
+    test -s "$pcr_file"
+    test -s "$eif_file"
+
+    local_digest="$(openssl dgst -sha256 "$eif_file" | awk '{print $NF}')"
+    if [[ ! "$local_digest" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "❌ Could not calculate a canonical EIF SHA-256 digest." >&2
+        exit 1
+    fi
+    remote_eif="opensecret-${release_tag}-${environment}-${local_digest}.eif"
+
+    printf 'Release: %s\nEnvironment: %s\nEIF SHA-256: %s\nPCR tuple:\n' \
+        "$release_tag" "$environment" "$local_digest"
+    jq '{PCR0, PCR1, PCR2}' "$pcr_file"
+    confirmation="$environment $release_tag"
+    read -r -p "Type '$confirmation' to run live publication gates and deploy: " answer
+    if [[ "$answer" != "$confirmation" ]]; then
+        echo "❌ Deployment cancelled." >&2
+        exit 1
+    fi
+
+    # Stage first so the time-sensitive gates run immediately before the
+    # remote locked replacement. The content-addressed path is harmless if a
+    # later gate fails.
+    scp -i "$ssh_key" "$eif_file" "${server}:~/${remote_eif}"
+
+    just verify-legacy-pcr-propagated "$environment" "$pcr_file"
+    just verify-sigstore-release-published \
+        "$release_tag" \
+        "$environment" \
+        "$pcr_file" \
+        "$eif_file"
+
+    # One remote critical section binds the final hash check, targeted
+    # termination, launch, and proxy restart. It preserves p11ne and any
+    # unrelated enclave, and terminates every exact-name OpenSecret instance.
+    ssh -i "$ssh_key" "$server" \
+        bash -s -- "$remote_eif" "$local_digest" "$environment" "$release_tag" <<'REMOTE_DEPLOY'
+    set -euo pipefail
+
+    remote_eif="${1:?}"
+    expected_digest="${2:?}"
+    environment="${3:?}"
+    release_tag="${4:?}"
+
+    case "$environment" in
+        dev|prod) ;;
+        *) exit 1 ;;
+    esac
+    [[ "$release_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || exit 1
+    [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]] || exit 1
+    [[ "$remote_eif" == \
+        "opensecret-${release_tag}-${environment}-${expected_digest}.eif" ]] || exit 1
+
+    for command in flock install jq nitro-cli sha256sum sudo systemctl; do
+        if ! command -v "$command" >/dev/null; then
+            echo "Required parent-instance command is missing: $command" >&2
+            exit 1
+        fi
+    done
+
+    lock_dir="$HOME/.local/state/opensecret/deploy-locks"
+    install -d -m 0700 "$lock_dir"
+    exec 9>"$lock_dir/host.lock"
+    if ! flock -n 9; then
+        echo "Another OpenSecret deployment is in progress on this parent instance." >&2
+        exit 1
+    fi
+
+    remote_path="$HOME/$remote_eif"
+    test -f "$remote_path"
+
+    described="$(nitro-cli describe-enclaves)"
+    jq -e 'type == "array"' <<<"$described" >/dev/null
+
+    mapfile -t application_ids < <(
+        jq -r \
+            '.[] | select(.EnclaveName == "opensecret") | .EnclaveID' \
+            <<<"$described"
+    )
+    mapfile -t ambiguous_names < <(
+        jq -r \
+            '.[] |
+             select((.EnclaveName // "") | startswith("opensecret")) |
+             select(.EnclaveName != "opensecret") |
+             .EnclaveName' \
+            <<<"$described"
+    )
+    if ((${#ambiguous_names[@]})); then
+        printf 'Refusing to guess whether these enclaves are application instances: %s\n' \
+            "${ambiguous_names[*]}" >&2
+        exit 1
+    fi
+
+    verify_digest() {
+        local actual
+        actual="$(sha256sum -- "$remote_path")"
+        actual="${actual%% *}"
+        if [[ "$actual" != "$expected_digest" ]]; then
+            echo "Staged EIF digest does not match the authenticated release." >&2
+            exit 1
+        fi
+    }
+
+    # Verify immediately before stopping the currently healthy application.
+    verify_digest
+    for enclave_id in "${application_ids[@]}"; do
+        [[ -n "$enclave_id" && "$enclave_id" != "null" ]] || exit 1
+        nitro-cli terminate-enclave --enclave-id "$enclave_id"
+    done
+
+    remaining="$(
+        nitro-cli describe-enclaves |
+            jq '[.[] | select(.EnclaveName == "opensecret")] | length'
+    )"
+    if [[ "$remaining" != "0" ]]; then
+        echo "An OpenSecret application enclave remains after termination." >&2
+        exit 1
+    fi
+
+    # Re-authenticate after termination and immediately before launch.
+    verify_digest
+    nitro-cli run-enclave \
+        --eif-path "$remote_path" \
+        --enclave-name opensecret \
+        --memory 16384 \
+        --cpu-count 4
+    sudo -n systemctl restart socat-proxy.service
+    REMOTE_DEPLOY
+
+    echo "✅ Deployed $remote_eif with verified SHA-256 $local_digest."
+
+# Deploy to dev using the exact checked-out, published stable tag.
+deploy-dev-nix release_tag: build-eif-dev verify-pcr-dev
+    just _deploy-tagged-nitro-eif {{quote(release_tag)}} dev
+
+# Deploy to prod using the exact checked-out, published stable tag.
+deploy-prod-nix release_tag: build-eif-prod verify-pcr-prod
+    just _deploy-tagged-nitro-eif {{quote(release_tag)}} prod
 
 # Deploy to preview environment without debug mode (using Nix-built EIF)
 deploy-preview-nix: build-eif-preview verify-pcr-preview scp-eif-to-aws-preview

@@ -23,6 +23,7 @@ jobs:
       EXPECTED_OWNER_ID: "185423582"
       REPOSITORY_ID: ${{ github.repository_id }}
       OWNER_ID: ${{ github.repository_owner_id }}
+      REF_PROTECTED: ${{ github.ref_protected }}
     steps:
       - name: Check out the selected tag
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -51,6 +52,10 @@ jobs:
           fi
           if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
             echo "Dispatch this workflow with an existing tag selected as the workflow ref." >&2
+            exit 1
+          fi
+          if [[ "$REF_PROTECTED" != "true" ]]; then
+            echo "Release tags must be covered by an active tag protection or ruleset." >&2
             exit 1
           fi
           if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
@@ -121,6 +126,30 @@ jobs:
           git diff --exit-code -- flake.lock
           test -s result/image.eif
           test -s result/pcr.json
+
+          case "$ENVIRONMENT" in
+            dev)
+              reference_pcr="pcrDev.json"
+              ;;
+            prod)
+              reference_pcr="pcrProd.json"
+              ;;
+            *)
+              echo "Unsupported release environment: $ENVIRONMENT" >&2
+              exit 1
+              ;;
+          esac
+
+          if ! cmp -s "$reference_pcr" result/pcr.json; then
+            echo "$reference_pcr does not describe the tagged EIF." >&2
+            diff -u "$reference_pcr" result/pcr.json || true
+            exit 1
+          fi
+
+          # The legacy histories must remain valid, but the new tuple is added
+          # only after this workflow has published immutable Sigstore evidence.
+          # The legacy private key is never present in Actions.
+          node ./pcr_verify.js "$ENVIRONMENT"
 
           asset_dir="release-assets"
           eif_name="opensecret-$RELEASE_TAG-$ENVIRONMENT.eif"
@@ -425,7 +454,19 @@ jobs:
           require_current_tag
           if gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release already exists for $RELEASE_TAG; refusing to replace it." >&2
+            existing_is_draft="$(
+              gh release view "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json isDraft \
+                --jq .isDraft
+            )"
+            if [[ "$existing_is_draft" == "true" ]]; then
+              echo "An unpublished draft already exists for $RELEASE_TAG." >&2
+              echo "Inspect and explicitly delete that stale draft before rerunning all jobs." >&2
+            else
+              echo "Published release already exists for $RELEASE_TAG." >&2
+            fi
+            echo "Refusing to replace or delete any existing release." >&2
             exit 1
           fi
 

@@ -131,7 +131,7 @@ mod aead_db_tamper_tests;
 use apple_signin::AppleJwtVerifier;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
 use provider_client::{ProviderClient, ProviderRequestError};
-use provider_routing::ProviderRouter;
+use provider_routing::{ProviderName, ProviderPreference, ProviderRouter};
 use proxy_config::ProxyRouter;
 
 const ENCLAVE_KEY_NAME: &str = "enclave_key";
@@ -152,6 +152,7 @@ const KAGI_API_KEY_NAME: &str = "kagi_api_key";
 const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
 const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
 const MODEL_ALIAS_FLAGS_TIMEOUT_SECS: u64 = 5;
+const PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS: u64 = 5;
 const BILLING_ACCESS_TIMEOUT_SECS: u64 = 5;
 const MAX_ATTESTATION_NONCE_BYTES: usize = 512;
 const MAX_PENDING_ATTESTATIONS: usize = 65_536;
@@ -1157,6 +1158,58 @@ impl AppState {
                     user_uuid, flag_key, e
                 );
                 false
+            }
+        }
+    }
+
+    /// Resolve an explicit provider preference only for models configured for
+    /// flag-controlled routing. Missing configuration, flags, failures, and
+    /// timeouts retain the model's default provider.
+    pub(crate) async fn provider_routing_preference(
+        &self,
+        user_uuid: Uuid,
+        requested_model: &str,
+    ) -> Option<ProviderPreference> {
+        let flag_key = self
+            .provider_router
+            .continuum_flag_key_for_completion_model(requested_model)?;
+
+        let Some(client) = &self.os_flags_client else {
+            trace!(
+                "os-flags client not configured; using default provider routing for model {}",
+                requested_model
+            );
+            return None;
+        };
+
+        match tokio::time::timeout(
+            Duration::from_secs(PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS),
+            client.get_bool_flag(user_uuid, flag_key),
+        )
+        .await
+        {
+            Ok(Ok(Some(true))) => Some(ProviderPreference::feature_flag(ProviderName::Continuum)),
+            Ok(Ok(Some(false))) => Some(ProviderPreference::feature_flag(ProviderName::Tinfoil)),
+            Ok(Ok(None)) => {
+                debug!(
+                    "os-flags provider routing flag missing (user_uuid={}, requested_model={}, flag_key={}); using default provider routing",
+                    user_uuid, requested_model, flag_key
+                );
+                None
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "os-flags provider routing check failed (user_uuid={}, requested_model={}, flag_key={}): {}; using default provider routing",
+                    user_uuid, requested_model, flag_key, e
+                );
+                None
+            }
+            Err(_) => {
+                warn!(
+                    "os-flags provider routing check timed out after {}s (user_uuid={}, requested_model={}, flag_key={}); using default provider routing",
+                    PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS, user_uuid, requested_model, flag_key
+                );
+                None
             }
         }
     }

@@ -181,24 +181,29 @@ enum AssistantTurnOutcome {
     Final,
 }
 
-fn select_web_search(state: &AppState, user_uuid: Uuid, body: &ResponsesCreateRequest) -> bool {
-    if !is_tool_choice_allowed(&body.tool_choice) || !is_web_search_enabled(&body.tools) {
-        return false;
-    }
+fn web_search_is_selected(
+    tool_choice: &Option<String>,
+    tools: &Option<Value>,
+    kagi_available: bool,
+) -> bool {
+    is_tool_choice_allowed(tool_choice) && is_web_search_enabled(tools) && kagi_available
+}
 
-    if state.kagi_client.is_none() {
+fn select_web_search(state: &AppState, user_uuid: Uuid, body: &ResponsesCreateRequest) -> bool {
+    let kagi_available = state.kagi_client.is_some();
+    let selected = web_search_is_selected(&body.tool_choice, &body.tools, kagi_available);
+    if selected {
+        info!(
+            user_uuid = %user_uuid,
+            "Selected Kagi as the Responses web-search provider"
+        );
+    } else if is_tool_choice_allowed(&body.tool_choice) && is_web_search_enabled(&body.tools) {
         debug!(
             user_uuid = %user_uuid,
             "Kagi web-search client is unavailable"
         );
-        return false;
     }
-
-    info!(
-        user_uuid = %user_uuid,
-        "Selected Kagi as the Responses web-search provider"
-    );
-    true
+    selected
 }
 
 fn build_internal_system_prompt_for_now(
@@ -375,7 +380,7 @@ mod tests {
         build_model_turn_request, build_provider_tools, final_assistant_finish_reason,
         finalize_first_model_tool_call, has_streamed_tool_call_entries,
         maple_kagi_web_search_prompt, resolve_responses_model, resolve_responses_sampling,
-        wait_for_response_cancellation, web_search_tool_turn_limit,
+        wait_for_response_cancellation, web_search_is_selected, web_search_tool_turn_limit,
         web_search_tool_turn_limit_error, web_search_tool_turn_limit_reached, ClientResponseState,
         ConversationParam, InputMessage, ResponsesCreateRequest, StorageMessage, StreamedToolCall,
         MAX_WEB_SEARCH_TOOL_TURNS_FREE, MAX_WEB_SEARCH_TOOL_TURNS_PAID,
@@ -858,6 +863,24 @@ mod tests {
         append_streamed_tool_calls(&mut tool_calls, &json!([]));
 
         assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn test_web_search_is_selected_requires_kagi_and_requested_search() {
+        let web_search = Some(json!([{ "type": "web_search" }]));
+        let auto = Some("auto".to_string());
+        let none = Some("none".to_string());
+
+        assert!(web_search_is_selected(&auto, &web_search, true));
+        assert!(web_search_is_selected(&None, &web_search, true));
+        assert!(!web_search_is_selected(&auto, &web_search, false));
+        assert!(!web_search_is_selected(&none, &web_search, true));
+        assert!(!web_search_is_selected(&auto, &None, true));
+        assert!(!web_search_is_selected(
+            &auto,
+            &Some(json!([{ "type": "unknown_tool" }])),
+            true
+        ));
     }
 
     #[test]

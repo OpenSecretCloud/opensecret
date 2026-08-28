@@ -60,6 +60,9 @@ pub(crate) struct ModelRouteSpec {
     pub(crate) provider_model_id: &'static str,
     pub(crate) response_model_id: &'static str,
     pub(crate) rate_limit_scope: RateLimitScope,
+    /// Maximum prompt-token reservation for one image on this deployment.
+    /// Zero means the route is not advertised as accepting image input.
+    pub(crate) image_token_reservation: u64,
     pub(crate) weight: u16,
     pub(crate) enabled: bool,
 }
@@ -95,6 +98,19 @@ impl ProviderRegistry {
     pub(crate) fn completion_models(&self) -> &'static [CompletionModelSpec] {
         self.completion_models
     }
+
+    pub(crate) fn completion_route(
+        &self,
+        provider: ProviderId,
+        provider_model_id: &str,
+    ) -> Option<&ModelRouteSpec> {
+        self.completion_models
+            .iter()
+            .flat_map(|model| model.routes)
+            .find(|route| {
+                route.provider == provider && route.provider_model_id == provider_model_id
+            })
+    }
 }
 
 const PROVIDERS: &[ProviderSpec] = &[
@@ -115,6 +131,7 @@ const GPT_OSS_120B_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider_model_id: QUICK_MODEL_ID,
     response_model_id: QUICK_MODEL_ID,
     rate_limit_scope: RateLimitScope::ProviderModel,
+    image_token_reservation: 0,
     weight: 100,
     enabled: true,
 }];
@@ -124,6 +141,7 @@ const GEMMA4_31B_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider_model_id: "gemma4-31b",
     response_model_id: "gemma4-31b",
     rate_limit_scope: RateLimitScope::ProviderModel,
+    image_token_reservation: 16_384,
     weight: 100,
     enabled: true,
 }];
@@ -133,6 +151,7 @@ const KIMI_K3_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider_model_id: KIMI_K3_MODEL_ID,
     response_model_id: KIMI_K3_MODEL_ID,
     rate_limit_scope: RateLimitScope::ProviderModel,
+    image_token_reservation: 16_384,
     weight: 100,
     enabled: true,
 }];
@@ -142,6 +161,7 @@ const KIMI_K2_6_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider_model_id: "kimi-k2.6",
     response_model_id: POWERFUL_MODEL_ID,
     rate_limit_scope: RateLimitScope::ProviderAccount,
+    image_token_reservation: 4_096,
     weight: 100,
     enabled: true,
 }];
@@ -152,6 +172,7 @@ const GLM_5_2_ROUTES: &[ModelRouteSpec] = &[
         provider_model_id: GLM_5_2_MODEL_ID,
         response_model_id: GLM_5_2_MODEL_ID,
         rate_limit_scope: RateLimitScope::ProviderModel,
+        image_token_reservation: 0,
         weight: 100,
         enabled: true,
     },
@@ -160,6 +181,7 @@ const GLM_5_2_ROUTES: &[ModelRouteSpec] = &[
         provider_model_id: "glm-5.2",
         response_model_id: GLM_5_2_MODEL_ID,
         rate_limit_scope: RateLimitScope::ProviderAccount,
+        image_token_reservation: 0,
         weight: 100,
         enabled: true,
     },
@@ -170,6 +192,7 @@ const DEEPSEEK_V4_FLASH_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider_model_id: DEEPSEEK_V4_FLASH_MODEL_ID,
     response_model_id: DEEPSEEK_V4_FLASH_MODEL_ID,
     rate_limit_scope: RateLimitScope::ProviderModel,
+    image_token_reservation: 0,
     weight: 100,
     enabled: true,
 }];
@@ -179,6 +202,7 @@ const LLAMA3_3_70B_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider_model_id: "llama3-3-70b",
     response_model_id: "llama3-3-70b",
     rate_limit_scope: RateLimitScope::ProviderModel,
+    image_token_reservation: 0,
     weight: 100,
     enabled: true,
 }];
@@ -188,6 +212,7 @@ const GPT_OSS_SAFEGUARD_120B_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider_model_id: "gpt-oss-safeguard-120b",
     response_model_id: "gpt-oss-safeguard-120b",
     rate_limit_scope: RateLimitScope::ProviderModel,
+    image_token_reservation: 0,
     weight: 100,
     enabled: true,
 }];
@@ -318,6 +343,24 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(registered, expected);
+    }
+
+    #[test]
+    fn registry_pins_known_image_accounting_bounds_per_deployment() {
+        assert_eq!(
+            PROVIDER_REGISTRY
+                .completion_route(ProviderId::Tinfoil, KIMI_K3_MODEL_ID)
+                .expect("K3 route")
+                .image_token_reservation,
+            16_384
+        );
+        assert_eq!(
+            PROVIDER_REGISTRY
+                .completion_route(ProviderId::Continuum, "kimi-k2.6")
+                .expect("K2.6 route")
+                .image_token_reservation,
+            4_096
+        );
     }
 
     #[test]

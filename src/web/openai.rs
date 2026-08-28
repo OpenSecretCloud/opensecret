@@ -1,10 +1,14 @@
-use crate::inference::health::ShadowObservationMode;
+use crate::inference::admission::{
+    ActualUsage, AdmissionEstimate, AdmissionRejection, LogicalAdmissionTicket, RouteTurnPermit,
+    TerminalDisposition,
+};
+use crate::inference::health::{ProbeClaimResult, ProbeLease, ShadowObservationMode};
 use crate::inference::{
     AttemptFailure, AttemptFailureKind, AttemptOutcome, AttemptStage, AttemptTerminal,
     CompletionEvidence, InferenceAttempt, InferenceExecution, InferenceIntent, InferenceSurface,
     ReplaySafety, WorkloadClass,
 };
-use crate::inference_planning::{RoutePlan, RoutePlanningError};
+use crate::inference_planning::{ProviderPreference, RoutePlan, RoutePlanningError};
 use crate::model_config::{
     model_alias_requires_flag_lookup, model_catalog_response, openai_models_response,
     ModelAliasTargets, ModelPlan,
@@ -15,7 +19,7 @@ use crate::provider_client::{
     ProviderClient, ProviderRequest, ProviderRequestError, ProviderResponse, ProviderSendTrace,
     UpstreamProviderError,
 };
-use crate::provider_registry::{ProviderId, SHADOW_ROUTING_POLICY_VERSION};
+use crate::provider_registry::{ProviderId, PROVIDER_REGISTRY, SHADOW_ROUTING_POLICY_VERSION};
 use crate::provider_routing::{
     compare_shadow_route, ProviderRouter, ProviderRoutingError, SelectedProviderRoute,
     ShadowRouteComparison,
@@ -43,8 +47,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, trace, warn};
@@ -56,6 +60,15 @@ const MAX_AUDIO_SIZE: usize = 100 * 1024 * 1024;
 // Timeout constants for provider requests
 const REQUEST_TIMEOUT_SECS: u64 = 120; // Request timeout (generous for large non-streaming responses)
 const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming reads
+const UNKNOWN_ROUTE_IMAGE_TOKEN_RESERVATION: u64 = 16_384;
+const COMPLETION_PROMPT_BASE_TOKEN_OVERHEAD: u64 = 512;
+const COMPLETION_PROMPT_MESSAGE_TOKEN_OVERHEAD: u64 = 64;
+const COMPLETION_PROMPT_TOOL_TOKEN_OVERHEAD: u64 = 256;
+const COMPLETION_PROMPT_TOOL_CALL_TOKEN_OVERHEAD: u64 = 64;
+const COMPLETION_PROMPT_ARGUMENT_ENTRY_TOKEN_OVERHEAD: u64 = 16;
+const COMPLETION_PROMPT_LINE_PREFIX_TOKEN_OVERHEAD: u64 = 4;
+const MAX_COMPLETION_NAME_BYTES: usize = 64;
+const MAX_COMPLETION_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 const TTS_BILLING_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const TTS_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_TTS_INPUT_CHARS: usize = 100_000;
@@ -63,6 +76,16 @@ const MAX_BOUNDED_PROVIDER_RESPONSE_BYTES: usize = 256 * 1024;
 
 const PROVIDER_MANAGED_CACHE_SALT_FIELD: &str = "cache_salt";
 const PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD: &str = "user_cache_secret";
+const PROVIDER_MANAGED_KV_TRANSFER_PARAMS_FIELD: &str = "kv_transfer_params";
+const TINFOIL_TOOL_AUTO_CONTINUE_FIELD: &str = "x-tinfoil-tool-auto-continue";
+const TINFOIL_ROUTER_EXECUTION_FIELDS: &[&str] = &[
+    "auto_model_options",
+    "code_execution_options",
+    "filters",
+    "pii_check_options",
+    "prompt_injection_check_options",
+    "web_search_options",
+];
 
 #[derive(Clone, Default)]
 struct CompletionRequestLogMetadata {
@@ -539,10 +562,46 @@ impl BillingContext {
     }
 }
 
+/// A single, move-only billing settlement for one logical provider model turn.
+///
+/// `request_id` can span a complete Responses tool loop, while `execution_id`
+/// identifies exactly one model turn. Reusing the execution UUID as the SQS
+/// event id makes an accidentally repeated publish idempotent at the billing
+/// consumer without introducing distributed coordination in OpenSecret.
+#[derive(Debug)]
+struct UsageSettlement {
+    event_id: Uuid,
+    request_id: crate::inference::InferenceRequestId,
+    execution_id: crate::inference::InferenceExecutionId,
+    attempt_id: crate::inference::InferenceAttemptId,
+    requested_model_id: String,
+    public_model_id: String,
+    provider_name: String,
+    auth_method: AuthMethod,
+}
+
+impl UsageSettlement {
+    fn new(billing_context: BillingContext, attempt: &InferenceAttempt) -> Self {
+        Self {
+            event_id: attempt.execution_id.as_uuid(),
+            request_id: attempt.request_id,
+            execution_id: attempt.execution_id,
+            attempt_id: attempt.attempt_id,
+            requested_model_id: billing_context.model_name,
+            public_model_id: attempt.route.public_model_id.clone(),
+            provider_name: attempt.route.provider.as_str().to_string(),
+            auth_method: billing_context.auth_method,
+        }
+    }
+}
+
 /// Usage statistics extracted from a completion
 #[derive(Debug, Clone)]
 pub struct CompletionUsage {
     pub prompt_tokens: i32,
+    /// Whether the provider explicitly reported a prompt-token total.
+    /// A synthesized zero is not sufficient for refunding reserved input capacity.
+    pub prompt_tokens_observed: bool,
     pub completion_tokens: i32,
     /// Whether the provider explicitly reported a completion-token total.
     /// A synthesized zero is not sufficient for enforcing aggregate output budgets.
@@ -642,6 +701,11 @@ impl StreamUsageAccumulator {
             .unwrap_or(0);
         self.latest_usage = Some(CompletionUsage {
             prompt_tokens,
+            prompt_tokens_observed: observed.prompt_tokens.is_some()
+                || self
+                    .latest_usage
+                    .as_ref()
+                    .is_some_and(|usage| usage.prompt_tokens_observed),
             completion_tokens,
             completion_tokens_observed: observed.completion_tokens.is_some()
                 || self
@@ -667,10 +731,15 @@ impl StreamUsageAccumulator {
 
         self.finalized = true;
         let mut usage = self.latest_usage.take()?;
-        usage.cached_prompt_tokens = usage
-            .cached_prompt_tokens
-            .map(|cached| cached.min(usage.prompt_tokens));
-        (usage.prompt_tokens > 0 || usage.completion_tokens > 0).then_some(usage)
+        if usage.prompt_tokens_observed {
+            usage.cached_prompt_tokens = usage
+                .cached_prompt_tokens
+                .map(|cached| cached.min(usage.prompt_tokens));
+        }
+        (usage.prompt_tokens_observed
+            || usage.completion_tokens_observed
+            || usage.cached_prompt_tokens.is_some())
+        .then_some(usage)
     }
 }
 
@@ -707,7 +776,11 @@ pub struct CompletionStream {
 #[derive(Debug, Clone)]
 pub(crate) struct PinnedCompletionRequest {
     intent: InferenceIntent,
+    /// A pure provisional decision used for model-compatible validation and
+    /// context construction before scarce admission is acquired.
     route: SelectedProviderRoute,
+    provider_preference: Option<ProviderPreference>,
+    finalized_route: Arc<OnceLock<SelectedProviderRoute>>,
 }
 
 impl PinnedCompletionRequest {
@@ -716,11 +789,19 @@ impl PinnedCompletionRequest {
     }
 
     pub(crate) fn public_model_id(&self) -> &str {
-        &self.route.public_model_id
+        &self.selected_route().public_model_id
     }
 
     fn begin_execution(&self) -> InferenceExecution {
         self.intent.begin_execution()
+    }
+
+    fn selected_route(&self) -> &SelectedProviderRoute {
+        self.finalized_route.get().unwrap_or(&self.route)
+    }
+
+    fn finalize_route(&self, route: SelectedProviderRoute) -> bool {
+        self.finalized_route.set(route).is_ok()
     }
 }
 
@@ -772,6 +853,7 @@ impl From<ApiError> for CompletionExecutionError {
     }
 }
 
+#[cfg(test)]
 fn failed_completion_execution(
     provider_router: &ProviderRouter,
     attempt: InferenceAttempt,
@@ -923,51 +1005,69 @@ fn record_attempt_outcome(
             );
         }
         AttemptOutcome::Terminal(terminal) => {
-            let attempt = terminal.attempt();
             let shadow_report = provider_router.observe_attempt_terminal(terminal, shadow_mode);
-            debug!(
-                "Inference shadow health observation: request_id={}, execution_id={}, attempt_id={}, policy_version={}, mode={:?}, route_provider={}, route_model={}, signal={:?}, capacity_pool={:?}, snapshot={:?}, mutated={}",
-                attempt.request_id,
-                attempt.execution_id,
-                attempt.attempt_id,
-                shadow_report.policy_version,
-                shadow_report.mode,
-                shadow_report.route.provider.as_str(),
-                shadow_report.route.provider_model_id,
-                shadow_report.signal,
-                shadow_report.capacity_pool,
-                shadow_report.snapshot,
-                shadow_report.mutated
-            );
-            match terminal {
-                AttemptTerminal::Completed { evidence, .. } => debug!(
-                    "Inference attempt completed: request_id={}, execution_id={}, attempt_id={}, provider={}, public_model={}, provider_model={}, evidence={:?}",
-                    attempt.request_id,
-                    attempt.execution_id,
-                    attempt.attempt_id,
-                    attempt.route.provider.as_str(),
-                    attempt.route.public_model_id,
-                    attempt.route.provider_model_id,
-                    evidence
-                ),
-                AttemptTerminal::Failed { failure, .. } => warn!(
-                    "Inference attempt failed: request_id={}, execution_id={}, attempt_id={}, provider={}, public_model={}, provider_model={}, kind={:?}, stage={:?}, replay_safety={:?}, status={:?}, retry_after_ms={:?}, upstream_request_id={:?}, upstream_code={:?}",
-                    attempt.request_id,
-                    attempt.execution_id,
-                    attempt.attempt_id,
-                    attempt.route.provider.as_str(),
-                    attempt.route.public_model_id,
-                    attempt.route.provider_model_id,
-                    failure.kind,
-                    failure.stage,
-                    failure.replay_safety,
-                    failure.status,
-                    failure.retry_after.map(|duration| duration.as_millis()),
-                    failure.upstream_request_id,
-                    failure.upstream_code
-                ),
-            }
+            log_attempt_terminal(terminal, &shadow_report);
         }
+    }
+}
+
+fn record_attempt_terminal_with_probe(
+    provider_router: &ProviderRouter,
+    terminal: &AttemptTerminal,
+    shadow_mode: ShadowObservationMode,
+    probe: Option<ProbeLease>,
+) {
+    let shadow_report =
+        provider_router.observe_attempt_terminal_with_probe(terminal, shadow_mode, probe);
+    log_attempt_terminal(terminal, &shadow_report);
+}
+
+fn log_attempt_terminal(
+    terminal: &AttemptTerminal,
+    shadow_report: &crate::inference::health::ShadowObservationReport,
+) {
+    let attempt = terminal.attempt();
+    debug!(
+        "Inference shadow health observation: request_id={}, execution_id={}, attempt_id={}, policy_version={}, mode={:?}, route_provider={}, route_model={}, signal={:?}, capacity_pool={:?}, snapshot={:?}, mutated={}",
+        attempt.request_id,
+        attempt.execution_id,
+        attempt.attempt_id,
+        shadow_report.policy_version,
+        shadow_report.mode,
+        shadow_report.route.provider.as_str(),
+        shadow_report.route.provider_model_id,
+        shadow_report.signal,
+        shadow_report.capacity_pool,
+        shadow_report.snapshot,
+        shadow_report.mutated
+    );
+    match terminal {
+        AttemptTerminal::Completed { evidence, .. } => debug!(
+            "Inference attempt completed: request_id={}, execution_id={}, attempt_id={}, provider={}, public_model={}, provider_model={}, evidence={:?}",
+            attempt.request_id,
+            attempt.execution_id,
+            attempt.attempt_id,
+            attempt.route.provider.as_str(),
+            attempt.route.public_model_id,
+            attempt.route.provider_model_id,
+            evidence
+        ),
+        AttemptTerminal::Failed { failure, .. } => warn!(
+            "Inference attempt failed: request_id={}, execution_id={}, attempt_id={}, provider={}, public_model={}, provider_model={}, kind={:?}, stage={:?}, replay_safety={:?}, status={:?}, retry_after_ms={:?}, upstream_request_id={:?}, upstream_code={:?}",
+            attempt.request_id,
+            attempt.execution_id,
+            attempt.attempt_id,
+            attempt.route.provider.as_str(),
+            attempt.route.public_model_id,
+            attempt.route.provider_model_id,
+            failure.kind,
+            failure.stage,
+            failure.replay_safety,
+            failure.status,
+            failure.retry_after.map(|duration| duration.as_millis()),
+            failure.upstream_request_id,
+            failure.upstream_code
+        ),
     }
 }
 
@@ -1062,42 +1162,63 @@ async fn read_non_streaming_completion_response(
     response_model_id: &str,
     attempt: &InferenceAttempt,
     body_limit: Option<usize>,
+    body_timeout: Duration,
 ) -> Result<Value, AttemptFailure> {
-    let body_bytes = match body_limit {
-        Some(limit_bytes) => bytes::Bytes::from(
-            collect_bounded_provider_response_body(response.bytes_stream(), limit_bytes)
-                .await
-                .map_err(|error| {
-                    error!(
-                        "Failed to read bounded inference response body: request_id={}, execution_id={}, attempt_id={}, error={}",
-                        attempt.request_id, attempt.execution_id, attempt.attempt_id, error
-                    );
-                    let kind = match error {
-                        BoundedProviderResponseBodyError::Read => {
-                            AttemptFailureKind::ResponseBody
-                        }
-                        BoundedProviderResponseBodyError::TooLarge { .. } => {
-                            AttemptFailureKind::InvalidResponse
-                        }
-                    };
-                    AttemptFailure::new(
-                        kind,
-                        AttemptStage::ResponseBody,
-                        ReplaySafety::NotProvenPreAcceptance,
-                    )
-                })?,
-        ),
-        None => response.bytes().await.map_err(|error| {
-            error!(
-                "Failed to read inference response body: request_id={}, execution_id={}, attempt_id={}, error={}",
-                attempt.request_id, attempt.execution_id, attempt.attempt_id, error
+    let body_bytes = match timeout(body_timeout, async move {
+        match body_limit {
+            Some(limit_bytes) => collect_bounded_provider_response_body(
+                response.bytes_stream(),
+                limit_bytes,
+            )
+            .await
+            .map(bytes::Bytes::from)
+            .map_err(|error| {
+                error!(
+                    "Failed to read bounded inference response body: request_id={}, execution_id={}, attempt_id={}, error={}",
+                    attempt.request_id, attempt.execution_id, attempt.attempt_id, error
+                );
+                let kind = match error {
+                    BoundedProviderResponseBodyError::Read => AttemptFailureKind::ResponseBody,
+                    BoundedProviderResponseBodyError::TooLarge { .. } => {
+                        AttemptFailureKind::InvalidResponse
+                    }
+                };
+                AttemptFailure::new(
+                    kind,
+                    AttemptStage::ResponseBody,
+                    ReplaySafety::NotProvenPreAcceptance,
+                )
+            }),
+            None => response.bytes().await.map_err(|error| {
+                error!(
+                    "Failed to read inference response body: request_id={}, execution_id={}, attempt_id={}, error={}",
+                    attempt.request_id, attempt.execution_id, attempt.attempt_id, error
+                );
+                AttemptFailure::new(
+                    AttemptFailureKind::ResponseBody,
+                    AttemptStage::ResponseBody,
+                    ReplaySafety::NotProvenPreAcceptance,
+                )
+            }),
+        }
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            warn!(
+                "Inference response body timed out: request_id={}, execution_id={}, attempt_id={}, timeout_ms={}",
+                attempt.request_id,
+                attempt.execution_id,
+                attempt.attempt_id,
+                body_timeout.as_millis()
             );
-            AttemptFailure::new(
+            return Err(AttemptFailure::new(
                 AttemptFailureKind::ResponseBody,
                 AttemptStage::ResponseBody,
                 ReplaySafety::NotProvenPreAcceptance,
-            )
-        })?,
+            ));
+        }
     };
 
     let mut response_json: Value = serde_json::from_slice(&body_bytes).map_err(|error| {
@@ -1220,11 +1341,14 @@ async fn process_completion_stream(
                     usage_accumulator.observe(&json);
                     canonicalize_response_model(&mut json, response_model_id);
 
-                    if tx_consumer
-                        .send(CompletionChunk::StreamChunk(json))
-                        .await
-                        .is_err()
-                    {
+                    if !matches!(
+                        timeout(
+                            chunk_timeout,
+                            tx_consumer.send(CompletionChunk::StreamChunk(json))
+                        )
+                        .await,
+                        Ok(Ok(()))
+                    ) {
                         return finish_stream_processing(
                             &mut usage_accumulator,
                             StreamUsageFinalization::ConsumerDropped,
@@ -1301,8 +1425,7 @@ async fn publish_stream_usage(
     finalization: StreamUsageFinalization,
     state: &Arc<AppState>,
     user: &User,
-    billing_context: &BillingContext,
-    provider: &str,
+    settlement: UsageSettlement,
     tx_consumer: &mpsc::Sender<CompletionChunk>,
 ) {
     let Some(usage) = usage else {
@@ -1312,11 +1435,11 @@ async fn publish_stream_usage(
     if !finalization.is_provider_done() {
         warn!(
             "Finalizing streaming usage from terminal fallback: trigger={:?}, provider={}, model={}",
-            finalization, provider, billing_context.model_name
+            finalization, settlement.provider_name, settlement.public_model_id
         );
     }
 
-    publish_usage_event_internal(state, user, billing_context, usage.clone(), provider).await;
+    settle_completion_usage(state, user, settlement, usage.clone()).await;
 
     // Billing is independent from the consumer. If it has gone away after a
     // terminal provider signal, the usage event must still be emitted once.
@@ -1438,6 +1561,12 @@ async fn proxy_openai(
     }
     pin_chat_request_model(&mut body, &pinned_completion);
 
+    let logical_ticket: LogicalAdmissionTicket = state
+        .inference_admission
+        .acquire_logical(user.uuid, WorkloadClass::Interactive)
+        .await
+        .map_err(admission_api_error)?;
+
     // Create billing context
     let billing_context = BillingContext::new(auth_method, requested_model_name);
 
@@ -1473,6 +1602,7 @@ async fn proxy_openai(
             // Billing already happened in get_chat_completion_response!
             // Just encrypt and return
             let encrypted_response = encrypt_response(&state, &session_id, &response_json).await?;
+            drop(logical_ticket);
             return Ok(encrypted_response.into_response());
         } else {
             error!("Expected FullResponse chunk but got something else");
@@ -1485,6 +1615,7 @@ async fn proxy_openai(
     let mut rx = completion.stream;
 
     let stream = async_stream::stream! {
+        let _logical_ticket = logical_ticket;
         while let Some(chunk) = rx.recv().await {
             match chunk {
                 CompletionChunk::StreamChunk(json) => {
@@ -1718,7 +1849,682 @@ pub(crate) async fn prepare_completion_request(
         route.selection_source
     );
 
-    Ok(PinnedCompletionRequest { intent, route })
+    Ok(PinnedCompletionRequest {
+        intent,
+        route,
+        provider_preference,
+        finalized_route: Arc::new(OnceLock::new()),
+    })
+}
+
+#[derive(Debug)]
+struct AdmittedProviderTurn {
+    route: SelectedProviderRoute,
+    permit: RouteTurnPermit,
+    probe: Option<ProbeLease>,
+}
+
+fn admission_api_error(rejection: AdmissionRejection) -> ApiError {
+    let status = if rejection.status_hint() == 429 {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    ApiError::InferenceCapacity {
+        status,
+        retry_after: Some(rejection.retry_after),
+        client_replay_safe: false,
+    }
+}
+
+fn probe_api_error(retry_after: Duration) -> ApiError {
+    ApiError::InferenceCapacity {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        retry_after: Some(retry_after),
+        client_replay_safe: false,
+    }
+}
+
+fn route_image_token_reservation(route: &SelectedProviderRoute) -> u64 {
+    PROVIDER_REGISTRY
+        .completion_route(route.provider, &route.provider_model_id)
+        .map_or(UNKNOWN_ROUTE_IMAGE_TOKEN_RESERVATION, |route| {
+            route.image_token_reservation
+        })
+}
+
+/// Ensures every accepted request has a provider-visible output bound that
+/// matches admission's reservation. This bounds provider extensions such as
+/// `ignore_eos` and token allowlists without trying to enumerate every option
+/// that can suppress ordinary generation termination.
+fn ensure_bounded_completion_generation(
+    body: &mut serde_json::Map<String, Value>,
+    completion_default_reservation: u64,
+) {
+    for field in ["max_completion_tokens", "max_tokens"] {
+        if body.get(field).is_some_and(Value::is_null) {
+            body.remove(field);
+        }
+    }
+
+    let has_explicit_maximum = ["max_completion_tokens", "max_tokens"]
+        .into_iter()
+        .any(|field| body.contains_key(field));
+    if !has_explicit_maximum {
+        let requested_minimum = body.get("min_tokens").and_then(Value::as_u64).unwrap_or(0);
+        body.insert(
+            "max_tokens".to_string(),
+            json!(completion_default_reservation.max(requested_minimum)),
+        );
+    }
+}
+
+fn validate_completion_request_controls(
+    body: &serde_json::Map<String, Value>,
+    max_completion_choices: u64,
+) -> Result<(), ApiError> {
+    for field in ["max_completion_tokens", "max_tokens"] {
+        let Some(value) = body.get(field) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        if value.as_u64().is_none_or(|tokens| tokens == 0) {
+            warn!(field, "Rejected non-canonical completion maximum");
+            return Err(ApiError::BadRequest);
+        }
+    }
+
+    if let Some(value) = body.get("n") {
+        if !value.is_null() {
+            let Some(count) = value.as_u64().filter(|count| *count > 0) else {
+                warn!("Rejected non-canonical completion choice count");
+                return Err(ApiError::BadRequest);
+            };
+            if count > max_completion_choices {
+                warn!(
+                    count,
+                    max_completion_choices, "Rejected excessive completion choice count"
+                );
+                return Err(ApiError::BadRequest);
+            }
+        }
+    }
+    if let Some(value) = body.get("min_tokens") {
+        if value.as_u64().is_none() {
+            warn!("Rejected non-canonical minimum completion tokens");
+            return Err(ApiError::BadRequest);
+        }
+    }
+    if let Some(value) = body.get("stream") {
+        if !value.is_null() && !value.is_boolean() {
+            warn!("Rejected non-canonical completion stream flag");
+            return Err(ApiError::BadRequest);
+        }
+    }
+
+    validate_completion_names(body)?;
+    validate_completion_tool_arguments(body)?;
+
+    Ok(())
+}
+
+fn validate_completion_name(value: &Value, field: &'static str) -> Result<(), ApiError> {
+    let Some(name) = value.as_str() else {
+        warn!(field, "Rejected non-string completion name");
+        return Err(ApiError::BadRequest);
+    };
+    if name.is_empty()
+        || name.len() > MAX_COMPLETION_NAME_BYTES
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        warn!(field, "Rejected non-canonical completion name");
+        return Err(ApiError::BadRequest);
+    }
+    Ok(())
+}
+
+fn validate_nested_completion_name(
+    value: &Value,
+    container: &str,
+    field: &'static str,
+) -> Result<(), ApiError> {
+    if let Some(name) = value.get(container).and_then(|nested| nested.get("name")) {
+        validate_completion_name(name, field)?;
+    }
+    Ok(())
+}
+
+fn validate_completion_names(body: &serde_json::Map<String, Value>) -> Result<(), ApiError> {
+    if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            if let Some(name) = message.get("name") {
+                validate_completion_name(name, "messages[].name")?;
+            }
+            validate_nested_completion_name(
+                message,
+                "function_call",
+                "messages[].function_call.name",
+            )?;
+            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for tool_call in tool_calls {
+                    validate_nested_completion_name(
+                        tool_call,
+                        "function",
+                        "messages[].tool_calls[].function.name",
+                    )?;
+                }
+            }
+        }
+    }
+
+    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            validate_nested_completion_name(tool, "function", "tools[].function.name")?;
+            validate_nested_completion_name(tool, "custom", "tools[].custom.name")?;
+        }
+    }
+    if let Some(tool_choice) = body.get("tool_choice") {
+        validate_nested_completion_name(tool_choice, "function", "tool_choice.function.name")?;
+        validate_nested_completion_name(tool_choice, "custom", "tool_choice.custom.name")?;
+    }
+
+    Ok(())
+}
+
+fn validate_completion_tool_arguments(
+    body: &serde_json::Map<String, Value>,
+) -> Result<(), ApiError> {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for message in messages {
+        let calls = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .chain(message.get("function_call"));
+        for call in calls {
+            let Some(arguments) = call.get("function").unwrap_or(call).get("arguments") else {
+                continue;
+            };
+            let Some(arguments) = arguments.as_str() else {
+                warn!("Rejected non-string historical tool arguments");
+                return Err(ApiError::BadRequest);
+            };
+            if arguments.len() > MAX_COMPLETION_TOOL_ARGUMENT_BYTES
+                || serde_json::from_str::<Value>(arguments).is_err()
+            {
+                warn!("Rejected invalid or oversized historical tool arguments");
+                return Err(ApiError::BadRequest);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_unsupported_completion_media_part(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| {
+            matches!(
+                kind,
+                "video_url" | "input_video" | "image_pil" | "image_embeds" | "prompt_embeds"
+            )
+        })
+        || ["video_url", "image_pil", "image_embeds", "prompt_embeds"]
+            .into_iter()
+            .any(|field| object.contains_key(field))
+}
+
+fn completion_contains_unsupported_media(body: &serde_json::Map<String, Value>) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                let Some(content) = message.get("content") else {
+                    return false;
+                };
+                content.as_array().map_or_else(
+                    || is_unsupported_completion_media_part(content),
+                    |parts| parts.iter().any(is_unsupported_completion_media_part),
+                )
+            })
+        })
+}
+
+fn strip_provider_internal_request_fields(body: &mut serde_json::Map<String, Value>) {
+    if body
+        .remove(PROVIDER_MANAGED_KV_TRANSFER_PARAMS_FIELD)
+        .is_some()
+    {
+        debug!("Stripped provider-internal KV transfer parameters");
+    }
+}
+
+fn estimate_completion_admission(
+    body: &serde_json::Map<String, Value>,
+    route: &SelectedProviderRoute,
+    completion_default_reservation: u64,
+) -> AdmissionEstimate {
+    let image_token_reservation = route_image_token_reservation(route);
+    let prompt_tokens = estimate_json_prompt_tokens(body, image_token_reservation);
+    let completion_count = body
+        .get("n")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0)
+        .unwrap_or(1);
+    let requested_maximum = ["max_completion_tokens", "max_tokens"]
+        .into_iter()
+        .find_map(|field| body.get(field).and_then(Value::as_u64))
+        .filter(|tokens| *tokens > 0)
+        .unwrap_or(completion_default_reservation);
+    let requested_minimum = body.get("min_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let completion_tokens = requested_maximum
+        .max(requested_minimum)
+        .saturating_mul(completion_count);
+    AdmissionEstimate::new(prompt_tokens, Some(completion_tokens))
+}
+
+fn is_completion_image_content_part(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let explicit_image = object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "image_url" | "input_image"));
+    let shorthand_image = object.contains_key("image_url");
+    explicit_image || shorthand_image
+}
+
+fn sanitize_completion_message_content(value: &Value, image_count: &mut u64) -> Value {
+    let sanitize_part = |part: &Value, image_count: &mut u64| {
+        if !is_completion_image_content_part(part) {
+            return part.clone();
+        }
+
+        *image_count = image_count.saturating_add(1);
+        let mut sanitized = part.clone();
+        if let Some(object) = sanitized.as_object_mut() {
+            if object.contains_key("image_url") {
+                object.insert("image_url".to_string(), json!("[image]"));
+            }
+        }
+        sanitized
+    };
+
+    match value {
+        Value::Array(parts) => Value::Array(
+            parts
+                .iter()
+                .map(|part| sanitize_part(part, image_count))
+                .collect(),
+        ),
+        part => sanitize_part(part, image_count),
+    }
+}
+
+/// Returns messages with only actual content-part images replaced by a small
+/// sentinel, plus the number of images removed. Restricting recognition to
+/// `messages[*].content[*]` ensures a tool or response JSON schema containing
+/// keys such as `type: image_url` is still counted in full.
+fn sanitize_completion_messages(value: &Value, image_count: &mut u64) -> Value {
+    let Value::Array(messages) = value else {
+        return value.clone();
+    };
+    Value::Array(
+        messages
+            .iter()
+            .map(|message| {
+                let Some(message) = message.as_object() else {
+                    return message.clone();
+                };
+                let mut sanitized = message.clone();
+                if let Some(content) = sanitized.get_mut("content") {
+                    *content = sanitize_completion_message_content(content, image_count);
+                }
+                Value::Object(sanitized)
+            })
+            .collect(),
+    )
+}
+
+fn count_json_object_entries(value: &Value) -> u64 {
+    match value {
+        Value::Array(values) => values.iter().fold(0_u64, |total, value| {
+            total.saturating_add(count_json_object_entries(value))
+        }),
+        Value::Object(object) => object.values().fold(
+            u64::try_from(object.len()).unwrap_or(u64::MAX),
+            |total, value| total.saturating_add(count_json_object_entries(value)),
+        ),
+        _ => 0,
+    }
+}
+
+fn completion_tool_argument_shape(body: &serde_json::Map<String, Value>) -> (u64, u64, u64) {
+    let mut tool_calls = 0_u64;
+    let mut argument_entries = 0_u64;
+    let mut normalized_argument_bytes = 0_u64;
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return (tool_calls, argument_entries, normalized_argument_bytes);
+    };
+
+    for message in messages {
+        let calls = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .chain(message.get("function_call"));
+        for call in calls {
+            tool_calls = tool_calls.saturating_add(1);
+            let Some(arguments) = call.get("function").unwrap_or(call).get("arguments") else {
+                continue;
+            };
+            if let Some(arguments) = arguments.as_str() {
+                argument_entries = argument_entries.saturating_add(
+                    u64::try_from(arguments.bytes().filter(|byte| *byte == b':').count())
+                        .unwrap_or(u64::MAX),
+                );
+                if let Ok(arguments) = serde_json::from_str::<Value>(arguments) {
+                    normalized_argument_bytes = normalized_argument_bytes.saturating_add(
+                        serde_json::to_string(&arguments)
+                            .map(|arguments| u64::try_from(arguments.len()).unwrap_or(u64::MAX))
+                            .unwrap_or(u64::MAX),
+                    );
+                }
+            } else {
+                argument_entries =
+                    argument_entries.saturating_add(count_json_object_entries(arguments));
+            }
+        }
+    }
+    (tool_calls, argument_entries, normalized_argument_bytes)
+}
+
+fn count_prompt_line_breaks(value: &Value) -> u64 {
+    match value {
+        Value::String(text) => text.chars().fold(0_u64, |total, ch| {
+            total.saturating_add(u64::from(matches!(
+                ch,
+                '\n' | '\r' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+            )))
+        }),
+        Value::Array(values) => values.iter().fold(0_u64, |total, value| {
+            total.saturating_add(count_prompt_line_breaks(value))
+        }),
+        Value::Object(object) => object.values().fold(0_u64, |total, value| {
+            total.saturating_add(count_prompt_line_breaks(value))
+        }),
+        _ => 0,
+    }
+}
+
+fn estimate_json_prompt_tokens(
+    body: &serde_json::Map<String, Value>,
+    image_token_reservation: u64,
+) -> u64 {
+    let mut image_count = 0_u64;
+    let mut sanitized_body = body.clone();
+    if let Some(messages) = sanitized_body.get_mut("messages") {
+        *messages = sanitize_completion_messages(messages, &mut image_count);
+    }
+    let sanitized_body = Value::Object(sanitized_body);
+    let prompt_line_break_count = count_prompt_line_breaks(&sanitized_body);
+    let serialized = serde_json::to_string(&sanitized_body)
+        .expect("serde_json::Value serialization is infallible");
+    let message_count = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let tool_count = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let attribute_escape_expansion = serialized.bytes().fold(0_u64, |total, byte| {
+        total.saturating_add(match byte {
+            b'&' => 4, // `&` -> `&amp;`
+            b'"' => 5, // `"` -> `&quot;` after JSON decoding
+            _ => 0,
+        })
+    });
+    let normalized_json_separator_expansion = u64::try_from(
+        serialized
+            .bytes()
+            .filter(|byte| matches!(byte, b',' | b':'))
+            .count(),
+    )
+    .unwrap_or(u64::MAX);
+    let normalized_json_unicode_expansion = serialized.chars().fold(0_u64, |total, ch| {
+        if ch.is_ascii() {
+            return total;
+        }
+        let escaped_bytes = if ch.len_utf8() == 4 { 12 } else { 6 };
+        total.saturating_add(u64::try_from(escaped_bytes - ch.len_utf8()).unwrap_or(u64::MAX))
+    });
+    let (tool_call_count, argument_entry_count, normalized_argument_bytes) =
+        completion_tool_argument_shape(body);
+
+    // Provider tokenizers are not interchangeable: K3 can split ordinary
+    // ASCII nearly eleven times more finely than cl100k. UTF-8 bytes are a
+    // tokenizer-independent upper bound for the byte-level provider
+    // tokenizers on these routes; explicit structural allowances cover prompt
+    // markers and template text that are not present verbatim in the JSON.
+    u64::try_from(serialized.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(attribute_escape_expansion)
+        .saturating_add(normalized_json_separator_expansion)
+        .saturating_add(normalized_json_unicode_expansion)
+        .saturating_add(normalized_argument_bytes)
+        .saturating_add(COMPLETION_PROMPT_BASE_TOKEN_OVERHEAD)
+        .saturating_add(
+            u64::try_from(message_count)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(COMPLETION_PROMPT_MESSAGE_TOKEN_OVERHEAD),
+        )
+        .saturating_add(
+            u64::try_from(tool_count)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(COMPLETION_PROMPT_TOOL_TOKEN_OVERHEAD),
+        )
+        .saturating_add(tool_call_count.saturating_mul(COMPLETION_PROMPT_TOOL_CALL_TOKEN_OVERHEAD))
+        .saturating_add(
+            argument_entry_count.saturating_mul(COMPLETION_PROMPT_ARGUMENT_ENTRY_TOKEN_OVERHEAD),
+        )
+        .saturating_add(
+            prompt_line_break_count.saturating_mul(COMPLETION_PROMPT_LINE_PREFIX_TOKEN_OVERHEAD),
+        )
+        .saturating_add(image_count.saturating_mul(image_token_reservation))
+}
+
+fn replan_completion_route_excluding(
+    state: &AppState,
+    pinned: &PinnedCompletionRequest,
+    excluded_routes: &mut HashSet<crate::inference::RouteKey>,
+) -> Result<SelectedProviderRoute, ApiError> {
+    loop {
+        let route = state
+            .provider_router
+            .select_active_completion_route_excluding(
+                &state.proxy_router,
+                &pinned.intent,
+                pinned.provider_preference,
+                excluded_routes,
+            )
+            .map_err(provider_routing_api_error)?;
+
+        // Model substitution is finalized during request preparation, before
+        // Responses builds model-specific context and defaults. Admission may
+        // still move a request to another provider for that public model, but
+        // it must never change the public model behind an already-built body.
+        if route.public_model_id == pinned.route.public_model_id {
+            return Ok(route);
+        }
+        excluded_routes.insert(route.identity().route_key());
+    }
+}
+
+/// Acquires one fair provider-turn reservation, then atomically claims any
+/// expired health/capacity gates. A first turn may replan to another provider
+/// for the prepared public model only before its first upstream send. Once
+/// finalized, Responses tool turns reacquire admission on the identical route
+/// and never consult health or switch provider/model.
+async fn admit_completion_turn(
+    state: &Arc<AppState>,
+    pinned: &PinnedCompletionRequest,
+    body: &serde_json::Map<String, Value>,
+    allow_replan: bool,
+) -> Result<AdmittedProviderTurn, ApiError> {
+    let completion_default_reservation = state
+        .inference_admission
+        .policy()
+        .completion_default_reservation();
+    if let Some(route) = pinned.finalized_route.get() {
+        let estimate = estimate_completion_admission(body, route, completion_default_reservation);
+        let permit = state
+            .inference_admission
+            .acquire_turn(
+                &route.identity().route_key(),
+                pinned.intent.account_uuid,
+                pinned.intent.workload_class,
+                estimate,
+                None,
+            )
+            .await
+            .map_err(admission_api_error)?;
+        return Ok(AdmittedProviderTurn {
+            route: route.clone(),
+            permit,
+            probe: None,
+        });
+    }
+
+    let admission_deadline = Instant::now()
+        .checked_add(match pinned.intent.workload_class {
+            WorkloadClass::Interactive => state.inference_admission.policy().interactive_wait(),
+            WorkloadClass::Background => state.inference_admission.policy().background_wait(),
+        })
+        .unwrap_or_else(Instant::now);
+    let mut excluded_routes = HashSet::new();
+    let mut route = pinned.route.clone();
+
+    loop {
+        let route_key = route.identity().route_key();
+        let estimate = estimate_completion_admission(body, &route, completion_default_reservation);
+        let permit = match state
+            .inference_admission
+            .acquire_turn(
+                &route_key,
+                pinned.intent.account_uuid,
+                pinned.intent.workload_class,
+                estimate,
+                Some(admission_deadline),
+            )
+            .await
+        {
+            Ok(permit) => permit,
+            Err(rejection) => {
+                debug!(
+                    "Inference route lost local admission before send: request_id={}, provider={}, provider_model={}, kind={:?}",
+                    pinned.intent.request_id,
+                    route.provider.as_str(),
+                    route.provider_model_id,
+                    rejection.kind
+                );
+                let local_error = admission_api_error(rejection);
+                if !allow_replan {
+                    return Err(local_error);
+                }
+                excluded_routes.insert(route_key);
+                match replan_completion_route_excluding(state, pinned, &mut excluded_routes) {
+                    Ok(replanned) => {
+                        route = replanned;
+                        continue;
+                    }
+                    Err(_) => return Err(local_error),
+                }
+            }
+        };
+
+        let probe = match state.provider_router.try_claim_probe(&route_key) {
+            ProbeClaimResult::Ready(probe) => probe,
+            ProbeClaimResult::Rejected {
+                reason,
+                retry_after,
+            } => {
+                debug!(
+                    "Inference route lost half-open claim before send: request_id={}, provider={}, provider_model={}, reason={:?}",
+                    pinned.intent.request_id,
+                    route.provider.as_str(),
+                    route.provider_model_id,
+                    reason
+                );
+                permit.settle(None, TerminalDisposition::ProvenPreAcceptance);
+                let local_error = probe_api_error(retry_after);
+                if !allow_replan {
+                    return Err(local_error);
+                }
+                excluded_routes.insert(route_key);
+                match replan_completion_route_excluding(state, pinned, &mut excluded_routes) {
+                    Ok(replanned) => {
+                        route = replanned;
+                        continue;
+                    }
+                    Err(_) => return Err(local_error),
+                }
+            }
+        };
+
+        match pinned.finalize_route(route.clone()) {
+            true => {
+                return Ok(AdmittedProviderTurn {
+                    route,
+                    permit,
+                    probe,
+                });
+            }
+            false => {
+                // Pinned requests are not started concurrently today, but fail
+                // safely if that invariant changes: refund before sending and
+                // reacquire the already-finalized route on the next iteration.
+                drop(probe);
+                permit.settle(None, TerminalDisposition::ProvenPreAcceptance);
+                let finalized = pinned
+                    .finalized_route
+                    .get()
+                    .expect("failed OnceLock set means another route was finalized")
+                    .clone();
+                let estimate =
+                    estimate_completion_admission(body, &finalized, completion_default_reservation);
+                let permit = state
+                    .inference_admission
+                    .acquire_turn(
+                        &finalized.identity().route_key(),
+                        pinned.intent.account_uuid,
+                        pinned.intent.workload_class,
+                        estimate,
+                        Some(admission_deadline),
+                    )
+                    .await
+                    .map_err(admission_api_error)?;
+                return Ok(AdmittedProviderTurn {
+                    route: finalized,
+                    permit,
+                    probe: None,
+                });
+            }
+        }
+    }
 }
 
 /// Ensures cancellation or panic cannot make an in-flight attempt disappear
@@ -1728,10 +2534,13 @@ struct AttemptObservationGuard {
     attempt: InferenceAttempt,
     provider_router: Arc<ProviderRouter>,
     stage: AttemptStage,
+    turn_permit: Option<RouteTurnPermit>,
+    probe: Option<ProbeLease>,
     armed: bool,
 }
 
 impl AttemptObservationGuard {
+    #[cfg(test)]
     fn new(
         attempt: InferenceAttempt,
         provider_router: Arc<ProviderRouter>,
@@ -1741,6 +2550,25 @@ impl AttemptObservationGuard {
             attempt,
             provider_router,
             stage,
+            turn_permit: None,
+            probe: None,
+            armed: true,
+        }
+    }
+
+    fn new_admitted(
+        attempt: InferenceAttempt,
+        provider_router: Arc<ProviderRouter>,
+        stage: AttemptStage,
+        turn_permit: RouteTurnPermit,
+        probe: Option<ProbeLease>,
+    ) -> Self {
+        Self {
+            attempt,
+            provider_router,
+            stage,
+            turn_permit: Some(turn_permit),
+            probe,
             armed: true,
         }
     }
@@ -1758,12 +2586,37 @@ impl AttemptObservationGuard {
     }
 
     fn record_terminal(&mut self, terminal: &AttemptTerminal) {
+        self.record_terminal_with_usage(terminal, None);
+    }
+
+    fn record_terminal_with_usage(
+        &mut self,
+        terminal: &AttemptTerminal,
+        usage: Option<&CompletionUsage>,
+    ) {
         debug_assert_eq!(terminal.attempt(), &self.attempt);
-        record_attempt_outcome(
+        let (actual, disposition) = match terminal {
+            AttemptTerminal::Completed { .. } => (
+                usage.map(completion_actual_usage),
+                TerminalDisposition::Completed,
+            ),
+            AttemptTerminal::Failed { failure, .. }
+                if failure.replay_safety == ReplaySafety::ProvenPreAcceptance =>
+            {
+                (None, TerminalDisposition::ProvenPreAcceptance)
+            }
+            AttemptTerminal::Failed { .. } => (None, TerminalDisposition::Ambiguous),
+        };
+        record_attempt_terminal_with_probe(
             &self.provider_router,
-            &AttemptOutcome::Terminal(terminal.clone()),
+            terminal,
             ShadowObservationMode::Update,
+            self.probe.take(),
         );
+        // Commit health/probe state before admission can wake another waiter.
+        if let Some(permit) = self.turn_permit.take() {
+            permit.settle(actual, disposition);
+        }
         self.disarm();
     }
 
@@ -1779,6 +2632,22 @@ impl AttemptObservationGuard {
     }
 }
 
+fn completion_actual_usage(usage: &CompletionUsage) -> ActualUsage {
+    ActualUsage {
+        prompt_tokens: usage
+            .prompt_tokens_observed
+            .then(|| u64::try_from(usage.prompt_tokens).ok())
+            .flatten(),
+        completion_tokens: usage
+            .completion_tokens_observed
+            .then(|| u64::try_from(usage.completion_tokens).ok())
+            .flatten(),
+        cached_prompt_tokens: usage
+            .cached_prompt_tokens
+            .and_then(|tokens| u64::try_from(tokens).ok()),
+    }
+}
+
 impl Drop for AttemptObservationGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -1786,11 +2655,16 @@ impl Drop for AttemptObservationGuard {
         }
 
         let terminal = self.cancellation_terminal();
-        record_attempt_outcome(
+        record_attempt_terminal_with_probe(
             &self.provider_router,
-            &AttemptOutcome::Terminal(terminal),
+            &terminal,
             ShadowObservationMode::Update,
+            self.probe.take(),
         );
+        // Commit the neutral terminal before admission can wake a waiter.
+        if let Some(permit) = self.turn_permit.take() {
+            permit.settle(None, TerminalDisposition::Ambiguous);
+        }
         warn!(
             "Inference attempt abandoned before terminal processing: request_id={}, execution_id={}, attempt_id={}, stage={:?}",
             self.attempt.request_id,
@@ -1819,9 +2693,10 @@ pub(crate) struct StartedCompletion {
     attempt: InferenceAttempt,
     terminal_guard: Option<AttemptObservationGuard>,
     response_model_id: String,
+    public_model_id: String,
     is_streaming: bool,
-    billing_context: BillingContext,
     non_streaming_body_limit: Option<usize>,
+    usage_settlement: Option<UsageSettlement>,
 }
 
 /// Starts one model turn against a route pinned for the logical inference
@@ -1937,7 +2812,7 @@ async fn get_chat_completion_response_with_options(
     user: &User,
     body: Value,
     headers: &HeaderMap,
-    mut billing_context: BillingContext,
+    billing_context: BillingContext,
     pinned: &PinnedCompletionRequest,
     options: CompletionExecutionOptions,
 ) -> Result<StartedCompletion, CompletionExecutionError> {
@@ -1954,6 +2829,17 @@ async fn get_chat_completion_response_with_options(
         })?
         .clone();
 
+    validate_completion_request_controls(
+        &modified_body,
+        state.inference_admission.policy().max_completion_choices(),
+    )
+    .map_err(CompletionExecutionError::from)?;
+    if completion_contains_unsupported_media(&modified_body) {
+        warn!("Rejected unsupported media content in completion request");
+        return Err(ApiError::BadRequest.into());
+    }
+    strip_provider_internal_request_fields(&mut modified_body);
+
     // Check if streaming is requested (default to false if not specified)
     let is_streaming = modified_body
         .get("stream")
@@ -1969,23 +2855,74 @@ async fn get_chat_completion_response_with_options(
         })?
         .to_string();
 
-    if body_model_name != pinned.route.public_model_id {
+    if body_model_name != pinned.public_model_id() {
         error!(
             "Prepared inference model did not match execution body: request_id={}, preferred_model={}, prepared_model={}, body_model={}",
             pinned.intent.request_id,
             pinned.intent.public_model_id,
-            pinned.route.public_model_id,
+            pinned.public_model_id(),
             body_model_name
         );
         return Err(ApiError::InternalServerError.into());
     }
 
     ensure_completion_model_access(&pinned.route.public_model_id, pinned.intent.model_plan)?;
-    let selected_route = pinned.route.clone();
+    if let Some(expected_route) = &options.exact_route {
+        if !completion_route_matches_exact_constraint(&pinned.route, expected_route) {
+            error!(
+                "Completion route did not match the server-selected constraint: request_id={}, public_model={}, expected_provider={}, expected_provider_model={}, selected_provider={}, selected_proxy_provider={}, selected_provider_model={}",
+                pinned.intent.request_id,
+                pinned.route.public_model_id,
+                expected_route.provider_name,
+                expected_route.provider_model_id,
+                pinned.route.provider.as_str(),
+                pinned.route.proxy.provider_name,
+                pinned.route.provider_model_id
+            );
+            return Err(CompletionExecutionError::Request(
+                ApiError::ServiceUnavailable,
+            ));
+        }
+    }
+    ensure_bounded_completion_generation(
+        &mut modified_body,
+        state
+            .inference_admission
+            .policy()
+            .completion_default_reservation(),
+    );
+
+    let AdmittedProviderTurn {
+        route: selected_route,
+        permit,
+        probe,
+    } = admit_completion_turn(state, pinned, &modified_body, options.exact_route.is_none())
+        .await
+        .map_err(CompletionExecutionError::from)?;
+    if selected_route.public_model_id != body_model_name {
+        error!(
+            "Admission changed the prepared public model: request_id={}, prepared_model={}, admitted_model={}",
+            pinned.intent.request_id,
+            body_model_name,
+            selected_route.public_model_id
+        );
+        drop(probe);
+        permit.settle(None, TerminalDisposition::ProvenPreAcceptance);
+        return Err(CompletionExecutionError::Request(
+            ApiError::InternalServerError,
+        ));
+    }
+    if let Err(error) =
+        ensure_completion_model_access(&selected_route.public_model_id, pinned.intent.model_plan)
+    {
+        drop(probe);
+        permit.settle(None, TerminalDisposition::ProvenPreAcceptance);
+        return Err(CompletionExecutionError::Request(error));
+    }
     if let Some(expected_route) = &options.exact_route {
         if !completion_route_matches_exact_constraint(&selected_route, expected_route) {
             error!(
-                "Completion route did not match the server-selected constraint: request_id={}, public_model={}, expected_provider={}, expected_provider_model={}, selected_provider={}, selected_proxy_provider={}, selected_provider_model={}",
+                "Admitted completion route did not match the server-selected constraint: request_id={}, public_model={}, expected_provider={}, expected_provider_model={}, selected_provider={}, selected_proxy_provider={}, selected_provider_model={}",
                 pinned.intent.request_id,
                 selected_route.public_model_id,
                 expected_route.provider_name,
@@ -1994,6 +2931,8 @@ async fn get_chat_completion_response_with_options(
                 selected_route.proxy.provider_name,
                 selected_route.provider_model_id
             );
+            drop(probe);
+            permit.settle(None, TerminalDisposition::ProvenPreAcceptance);
             return Err(CompletionExecutionError::Request(
                 ApiError::ServiceUnavailable,
             ));
@@ -2011,14 +2950,16 @@ async fn get_chat_completion_response_with_options(
         user.uuid,
     );
     if options.exact_route.is_some() {
-        apply_server_selected_cache_isolation(
+        if let Err(error) = apply_server_selected_cache_isolation(
             &mut modified_body,
             &selected_route.proxy.provider_name,
             options.continuum_cache_salt.as_deref(),
-        )?;
+        ) {
+            drop(probe);
+            permit.settle(None, TerminalDisposition::ProvenPreAcceptance);
+            return Err(CompletionExecutionError::Request(error));
+        }
     }
-    billing_context.model_name = selected_route.public_model_id.clone();
-
     // Prepare one logical model-turn execution. The provider transport may
     // report more than one attempt when Tinfoil safely refreshes a stale
     // attested route after a proven pre-connect failure.
@@ -2039,10 +2980,17 @@ async fn get_chat_completion_response_with_options(
         ensure_stream_usage(&mut request_body);
 
         let request_body_value = Value::Object(request_body);
+        let attempt = execution.begin_attempt(route_identity.clone());
+        let mut terminal_guard = AttemptObservationGuard::new_admitted(
+            attempt.clone(),
+            Arc::clone(&state.provider_router),
+            AttemptStage::BeforeSend,
+            permit,
+            probe,
+        );
         let request_body_json = match serde_json::to_string(&request_body_value) {
             Ok(json) => json,
             Err(error) => {
-                let attempt = execution.begin_attempt(route_identity.clone());
                 let failure = AttemptFailure::new(
                     AttemptFailureKind::RequestBuild,
                     AttemptStage::BeforeSend,
@@ -2052,12 +3000,12 @@ async fn get_chat_completion_response_with_options(
                     "Failed to serialize inference request: request_id={}, execution_id={}, attempt_id={}, error={:?}",
                     attempt.request_id, attempt.execution_id, attempt.attempt_id, error
                 );
-                return Err(failed_completion_execution(
-                    &state.provider_router,
-                    attempt,
-                    failure,
-                    ApiError::InternalServerError,
-                ));
+                let terminal = AttemptTerminal::Failed { attempt, failure };
+                terminal_guard.record_terminal(&terminal);
+                return Err(CompletionExecutionError::Attempt {
+                    terminal,
+                    public_error: ApiError::InternalServerError,
+                });
             }
         };
         let request_log_metadata =
@@ -2072,11 +3020,7 @@ async fn get_chat_completion_response_with_options(
             request_log_metadata
         );
 
-        let terminal_guard = AttemptObservationGuard::new(
-            execution.begin_attempt(route_identity.clone()),
-            Arc::clone(&state.provider_router),
-            AttemptStage::AwaitingResponse,
-        );
+        terminal_guard.set_stage(AttemptStage::AwaitingResponse);
         let (
             ProviderSendTrace {
                 prior_failures,
@@ -2135,14 +3079,13 @@ async fn get_chat_completion_response_with_options(
                     failure.stage,
                     request_log_metadata
                 );
-                let execution_error = failed_completion_execution(
-                    &state.provider_router,
-                    attempt,
-                    failure.clone(),
-                    public_completion_error(&err, &failure),
-                );
-                terminal_guard.disarm();
-                return Err(execution_error);
+                let public_error = public_completion_error(&err, &failure);
+                let terminal = AttemptTerminal::Failed { attempt, failure };
+                terminal_guard.record_terminal(&terminal);
+                return Err(CompletionExecutionError::Attempt {
+                    terminal,
+                    public_error,
+                });
             }
         }
     };
@@ -2155,11 +3098,12 @@ async fn get_chat_completion_response_with_options(
     Ok(StartedCompletion {
         response: Some(response),
         successful_provider,
+        usage_settlement: Some(UsageSettlement::new(billing_context, &attempt)),
         attempt,
         terminal_guard: Some(terminal_guard),
         response_model_id: selected_route.response_model_id,
+        public_model_id: selected_route.public_model_id,
         is_streaming,
-        billing_context,
         non_streaming_body_limit: options.non_streaming_body_limit,
     })
 }
@@ -2182,9 +3126,13 @@ pub(crate) async fn finish_started_completion(
     let successful_provider = started.successful_provider.clone();
     let attempt = started.attempt.clone();
     let response_model_id = started.response_model_id.clone();
+    let public_model_id = started.public_model_id.clone();
     let is_streaming = started.is_streaming;
-    let billing_context = started.billing_context.clone();
     let non_streaming_body_limit = started.non_streaming_body_limit;
+    let usage_settlement = started
+        .usage_settlement
+        .take()
+        .expect("started completion usage settlement can only be consumed once");
 
     // NOW: Process the response internally and handle billing
     if !is_streaming {
@@ -2197,38 +3145,34 @@ pub(crate) async fn finish_started_completion(
             &response_model_id,
             &attempt,
             non_streaming_body_limit,
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
         )
         .await
         {
             Ok(response_json) => response_json,
             Err(failure) => {
-                let execution_error = failed_completion_execution(
-                    &state.provider_router,
-                    attempt.clone(),
+                let terminal = AttemptTerminal::Failed {
+                    attempt: attempt.clone(),
                     failure,
-                    ApiError::InternalServerError,
-                );
-                terminal_guard.disarm();
-                return Err(execution_error);
+                };
+                terminal_guard.record_terminal(&terminal);
+                return Err(CompletionExecutionError::Attempt {
+                    terminal,
+                    public_error: ApiError::InternalServerError,
+                });
             }
         };
 
+        let usage = extract_usage(&response_json);
         let terminal = AttemptTerminal::Completed {
             attempt: attempt.clone(),
             evidence: CompletionEvidence::NonStreamingResponse,
         };
-        terminal_guard.record_terminal(&terminal);
+        terminal_guard.record_terminal_with_usage(&terminal, usage.as_ref());
 
         // ✅ Handle billing HERE, inside completions API
-        if let Some(usage) = extract_usage(&response_json) {
-            publish_usage_event_internal(
-                state,
-                user,
-                &billing_context,
-                usage,
-                &successful_provider,
-            )
-            .await;
+        if let Some(usage) = usage {
+            settle_completion_usage(state, user, usage_settlement, usage).await;
         }
 
         // Return the full response as a single chunk
@@ -2240,7 +3184,7 @@ pub(crate) async fn finish_started_completion(
             stream: rx,
             metadata: CompletionMetadata {
                 provider_name: successful_provider,
-                model_name: billing_context.model_name.clone(),
+                model_name: public_model_id,
                 is_streaming: false,
                 attempt,
             },
@@ -2254,8 +3198,6 @@ pub(crate) async fn finish_started_completion(
     // Spawn INTERNAL task that handles billing
     let state_clone = state.clone();
     let user_clone = user.clone();
-    let billing_ctx = billing_context.clone();
-    let provider = successful_provider.clone();
     let stream_attempt = attempt.clone();
     terminal_guard.set_stage(AttemptStage::Stream);
 
@@ -2269,14 +3211,13 @@ pub(crate) async fn finish_started_completion(
         )
         .await;
         let terminal = result.terminal.clone();
-        terminal_guard.record_terminal(&terminal);
+        terminal_guard.record_terminal_with_usage(&terminal, result.usage.as_ref());
         publish_stream_usage(
             result.usage,
             result.finalization,
             &state_clone,
             &user_clone,
-            &billing_ctx,
-            &provider,
+            usage_settlement,
             &tx_consumer,
         )
         .await;
@@ -2287,7 +3228,7 @@ pub(crate) async fn finish_started_completion(
         stream: rx_consumer,
         metadata: CompletionMetadata {
             provider_name: successful_provider,
-            model_name: billing_context.model_name.clone(),
+            model_name: public_model_id,
             is_streaming: true,
             attempt,
         },
@@ -2335,11 +3276,14 @@ fn extract_usage(json: &Value) -> Option<CompletionUsage> {
 
     Some(CompletionUsage {
         prompt_tokens,
+        prompt_tokens_observed: observed.prompt_tokens.is_some(),
         completion_tokens: observed.completion_tokens.unwrap_or(0),
         completion_tokens_observed: observed.completion_tokens.is_some(),
-        cached_prompt_tokens: observed
-            .cached_prompt_tokens
-            .map(|tokens| tokens.min(prompt_tokens)),
+        cached_prompt_tokens: observed.cached_prompt_tokens.map(|cached| {
+            observed
+                .prompt_tokens
+                .map_or(cached, |prompt| cached.min(prompt))
+        }),
     })
 }
 
@@ -2398,11 +3342,37 @@ fn tinfoil_user_cache_secret(user_uuid: Uuid) -> String {
     hex::encode(Sha256::digest(user_uuid.as_bytes()))
 }
 
+fn strip_tinfoil_router_execution_controls(body: &mut serde_json::Map<String, Value>) {
+    for field in TINFOIL_ROUTER_EXECUTION_FIELDS {
+        if body.remove(*field).is_some() {
+            debug!(field, "Stripped Tinfoil router-owned execution field");
+        }
+    }
+
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for tool in tools {
+        let Some(tool) = tool.as_object_mut() else {
+            continue;
+        };
+        let mut stripped = tool.remove(TINFOIL_TOOL_AUTO_CONTINUE_FIELD).is_some();
+        stripped |= tool
+            .get_mut("function")
+            .and_then(Value::as_object_mut)
+            .is_some_and(|function| function.remove(TINFOIL_TOOL_AUTO_CONTINUE_FIELD).is_some());
+        if stripped {
+            debug!("Stripped Tinfoil router-owned tool auto-continue flag");
+        }
+    }
+}
+
 fn apply_provider_managed_request_fields(
     body: &mut serde_json::Map<String, Value>,
     provider_name: &str,
     user_uuid: Uuid,
 ) {
+    strip_provider_internal_request_fields(body);
     if body.remove(PROVIDER_MANAGED_CACHE_SALT_FIELD).is_some() {
         debug!("Stripped provider-managed completion request field: cache_salt");
     }
@@ -2412,6 +3382,10 @@ fn apply_provider_managed_request_fields(
         .is_some();
 
     if provider_name == ProviderId::Tinfoil.as_str() {
+        // OpenSecret owns tool loops, admission, and model routing. Tinfoil's
+        // router-only controls can otherwise fan one admitted request into
+        // several hidden upstream generations.
+        strip_tinfoil_router_execution_controls(body);
         body.insert(
             PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD.to_string(),
             json!(tinfoil_user_cache_secret(user_uuid)),
@@ -2528,7 +3502,36 @@ fn find_sse_frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
 }
 
 /// Internal billing function - NEVER exposed outside this module
-/// This function publishes usage events to both the database and SQS
+/// Settles one completion execution with a stable idempotency key.
+async fn settle_completion_usage(
+    state: &Arc<AppState>,
+    user: &User,
+    settlement: UsageSettlement,
+    usage: CompletionUsage,
+) {
+    debug!(
+        "Settling inference usage exactly once: request_id={}, execution_id={}, attempt_id={}, requested_model={}, public_model={}, provider={}",
+        settlement.request_id,
+        settlement.execution_id,
+        settlement.attempt_id,
+        settlement.requested_model_id,
+        settlement.public_model_id,
+        settlement.provider_name
+    );
+    publish_usage_record(
+        state,
+        user,
+        settlement.event_id,
+        settlement.auth_method == AuthMethod::ApiKey,
+        settlement.provider_name,
+        settlement.public_model_id,
+        usage,
+    )
+    .await;
+}
+
+/// Legacy settlement seam for modalities that have not migrated to routing-v2.
+/// Stack 9 owns moving those callers onto execution-scoped identifiers.
 async fn publish_usage_event_internal(
     state: &Arc<AppState>,
     user: &User,
@@ -2536,9 +3539,45 @@ async fn publish_usage_event_internal(
     usage: CompletionUsage,
     provider_name: &str,
 ) {
+    publish_usage_record(
+        state,
+        user,
+        Uuid::new_v4(),
+        billing_context.auth_method == AuthMethod::ApiKey,
+        provider_name.to_string(),
+        billing_context.model_name.clone(),
+        usage,
+    )
+    .await;
+}
+
+/// Publishes one already-identified usage record to the legacy local table and
+/// the authoritative billing queue. Callers own idempotency before this seam.
+#[allow(clippy::too_many_arguments)]
+async fn publish_usage_record(
+    state: &Arc<AppState>,
+    user: &User,
+    event_id: Uuid,
+    is_api_request: bool,
+    provider_name: String,
+    model_name: String,
+    mut usage: CompletionUsage,
+) {
     if usage.prompt_tokens == 0 && usage.completion_tokens == 0 {
         return;
     }
+
+    // Partial provider usage can still carry a raw cached-token observation for
+    // conservative admission settlement. Billing requires cached input to be a
+    // subset of an observed prompt total, so omit it when that total is absent.
+    usage.cached_prompt_tokens = usage
+        .prompt_tokens_observed
+        .then(|| {
+            usage
+                .cached_prompt_tokens
+                .map(|cached| cached.min(usage.prompt_tokens))
+        })
+        .flatten();
 
     // Local token_usage keeps the legacy rough estimate for observability.
     // The billing server recomputes authoritative provider cost from SQS tokens.
@@ -2551,7 +3590,7 @@ async fn publish_usage_event_internal(
     info!(
         "Chat completion usage for user {}: model={}, provider={}, prompt_tokens={}, cached_prompt_tokens={}, completion_tokens={}, total_tokens={}, estimated_cost={}",
         user.uuid,
-        billing_context.model_name,
+        model_name,
         provider_name,
         usage.prompt_tokens,
         usage.cached_prompt_tokens.unwrap_or(0),
@@ -2563,9 +3602,6 @@ async fn publish_usage_event_internal(
     // Spawn background task for DB + SQS
     let state_clone = state.clone();
     let user_id = user.uuid;
-    let is_api_request = billing_context.auth_method == AuthMethod::ApiKey;
-    let provider_name = provider_name.to_string();
-    let model_name = billing_context.model_name.clone();
 
     tokio::spawn(async move {
         // Create and store token usage record
@@ -2585,6 +3621,7 @@ async fn publish_usage_event_internal(
         // Post event to SQS if configured
         if let Some(publisher) = &state_clone.sqs_publisher {
             let event = build_usage_event(
+                event_id,
                 user_id,
                 usage,
                 total_cost,
@@ -2617,6 +3654,7 @@ async fn publish_usage_event_internal(
 }
 
 fn build_usage_event(
+    event_id: Uuid,
     user_id: Uuid,
     usage: CompletionUsage,
     estimated_cost: BigDecimal,
@@ -2625,7 +3663,7 @@ fn build_usage_event(
     model_name: String,
 ) -> UsageEvent {
     UsageEvent {
-        event_id: Uuid::new_v4(),
+        event_id,
         user_id,
         input_tokens: usage.prompt_tokens,
         output_tokens: usage.completion_tokens,
@@ -3451,6 +4489,7 @@ async fn proxy_embeddings(
                 BillingContext::new(_auth_method, embedding_request.model.clone());
             let embedding_usage = CompletionUsage {
                 prompt_tokens,
+                prompt_tokens_observed: true,
                 completion_tokens: 0, // Embeddings don't have completion tokens
                 completion_tokens_observed: false,
                 cached_prompt_tokens: None,
@@ -3714,6 +4753,8 @@ mod tests {
                 selection_source: crate::provider_registry::RouteSelectionSource::StaticSplit,
                 model_selection_source: crate::provider_routing::ModelSelectionSource::AutoPrimary,
             },
+            provider_preference: None,
+            finalized_route: Arc::new(OnceLock::new()),
         }
     }
 
@@ -3772,7 +4813,673 @@ mod tests {
                 selection_source: crate::provider_registry::RouteSelectionSource::DefaultProvider,
                 model_selection_source: crate::provider_routing::ModelSelectionSource::AutoFallback,
             },
+            provider_preference: None,
+            finalized_route: Arc::new(OnceLock::new()),
         }
+    }
+
+    #[test]
+    fn admission_estimate_sanitizes_images_and_uses_selected_deployment_bounds() {
+        let body = json!({
+            "model": "kimi-k3",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello admission"},
+                    {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", "A".repeat(100_000))}},
+                    {"type": "input_image", "image_url": "data:image/png;base64,BBBB"},
+                    {"image_url": "https://example.com/shorthand.png"},
+                    {"type": null, "image_url": "https://example.com/null-shorthand.png"},
+                    {"type": "garbage", "image_url": "https://example.com/coerced-shorthand.png"}
+                ]
+            }],
+            "max_completion_tokens": 321,
+            "n": 4
+        });
+
+        let k3 = pinned_test_completion();
+        let k2 = pinned_auto_fallback_completion();
+        let k3_estimate =
+            estimate_completion_admission(body.as_object().expect("object"), &k3.route, 4_096);
+        let k2_estimate =
+            estimate_completion_admission(body.as_object().expect("object"), &k2.route, 4_096);
+
+        assert_eq!(k3_estimate.completion_tokens, Some(1_284));
+        assert_eq!(k2_estimate.completion_tokens, Some(1_284));
+        assert_eq!(
+            k3_estimate.prompt_tokens - k2_estimate.prompt_tokens,
+            5 * (16_384 - 4_096)
+        );
+        assert!(k3_estimate.prompt_tokens >= 5 * 16_384);
+        assert!(k3_estimate.prompt_tokens < 90_000);
+
+        let compact_body = json!({
+            "model": "kimi-k3",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hello admission"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,A"}},
+                    {"type": "input_image", "image_url": "data:image/png;base64,B"},
+                    {"image_url": "https://example.com/short.png"},
+                    {"type": null, "image_url": "https://example.com/null-short.png"},
+                    {"type": false, "image_url": "https://example.com/coerced-short.png"}
+                ]
+            }],
+            "max_completion_tokens": 321,
+            "n": 4
+        });
+        let compact_estimate = estimate_completion_admission(
+            compact_body.as_object().expect("object"),
+            &k3.route,
+            4_096,
+        );
+        assert!(
+            k3_estimate
+                .prompt_tokens
+                .abs_diff(compact_estimate.prompt_tokens)
+                < 16
+        );
+    }
+
+    #[test]
+    fn missing_completion_max_is_bounded_and_reserved_per_choice() {
+        let mut body = json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "ignore_eos": true,
+            "allowed_token_ids": [1, 2],
+            "n": 3
+        })
+        .as_object()
+        .expect("object")
+        .clone();
+        let pinned = pinned_test_completion();
+
+        ensure_bounded_completion_generation(&mut body, 4_096);
+        let estimate = estimate_completion_admission(&body, &pinned.route, 4_096);
+
+        assert_eq!(body["max_tokens"], 4_096);
+        assert_eq!(body["ignore_eos"], true);
+        assert_eq!(body["allowed_token_ids"], json!([1, 2]));
+        assert_eq!(estimate.completion_tokens, Some(12_288));
+    }
+
+    #[test]
+    fn null_completion_maxima_are_replaced_by_the_bounded_minimum() {
+        let mut body = json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": null,
+            "max_tokens": null,
+            "min_tokens": 8_192
+        })
+        .as_object()
+        .expect("object")
+        .clone();
+
+        validate_completion_request_controls(&body, 8).expect("canonical controls");
+        ensure_bounded_completion_generation(&mut body, 4_096);
+
+        assert!(!body.contains_key("max_completion_tokens"));
+        assert_eq!(body["max_tokens"], 8_192);
+    }
+
+    #[test]
+    fn completion_controls_reject_provider_coercible_json_types() {
+        for (field, value) in [
+            ("max_completion_tokens", json!("20000")),
+            ("max_tokens", json!(20_000.0)),
+            ("n", json!("4")),
+            ("min_tokens", json!("20000")),
+            ("stream", json!("true")),
+            ("stream", json!(1)),
+        ] {
+            let body = serde_json::Map::from_iter([(field.to_string(), value)]);
+            assert!(matches!(
+                validate_completion_request_controls(&body, 8),
+                Err(ApiError::BadRequest)
+            ));
+        }
+
+        let canonical = json!({
+            "max_completion_tokens": 20_000,
+            "max_tokens": null,
+            "n": 4,
+            "min_tokens": 0,
+            "stream": true
+        });
+        assert!(
+            validate_completion_request_controls(canonical.as_object().expect("object"), 8).is_ok()
+        );
+
+        let excessive = json!({"n": 9});
+        assert!(matches!(
+            validate_completion_request_controls(excessive.as_object().expect("object"), 8),
+            Err(ApiError::BadRequest)
+        ));
+    }
+
+    #[test]
+    fn completion_names_bound_derived_tool_attribute_expansion() {
+        let mut messages = vec![json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "shared-call",
+                "type": "function",
+                "function": {"name": "&".repeat(65), "arguments": "{}"}
+            }]
+        })];
+        messages.extend(
+            (0..128)
+                .map(|_| json!({"role": "tool", "tool_call_id": "shared-call", "content": "ok"})),
+        );
+        let repeated = json!({"messages": messages, "max_tokens": 64});
+        assert!(matches!(
+            validate_completion_request_controls(repeated.as_object().expect("object"), 8),
+            Err(ApiError::BadRequest)
+        ));
+
+        for body in [
+            json!({"messages": [{"role": "user", "name": "bad&name", "content": "x"}]}),
+            json!({"tools": [{"type": "function", "function": {"name": "bad name"}}]}),
+            json!({"tool_choice": {"type": "function", "function": {"name": "bad\"name"}}}),
+        ] {
+            assert!(matches!(
+                validate_completion_request_controls(body.as_object().expect("object"), 8),
+                Err(ApiError::BadRequest)
+            ));
+        }
+
+        let canonical = json!({
+            "messages": [{
+                "role": "assistant",
+                "tool_calls": [{"function": {"name": "open_urls-2"}}]
+            }],
+            "tools": [{"type": "function", "function": {"name": "open_urls-2"}}],
+            "tool_choice": {"type": "function", "function": {"name": "open_urls-2"}}
+        });
+        assert!(
+            validate_completion_request_controls(canonical.as_object().expect("object"), 8).is_ok()
+        );
+    }
+
+    #[test]
+    fn historical_tool_arguments_must_be_bounded_valid_json_strings() {
+        for arguments in [
+            Value::String("{invalid".to_string()),
+            Value::String(format!(
+                "\"{}\"",
+                "x".repeat(MAX_COMPLETION_TOOL_ARGUMENT_BYTES)
+            )),
+            json!({"not": "a string"}),
+        ] {
+            let body = json!({
+                "messages": [{
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "type": "function",
+                        "function": {"name": "bounded_tool", "arguments": arguments}
+                    }]
+                }]
+            });
+            assert!(matches!(
+                validate_completion_request_controls(body.as_object().expect("object"), 8),
+                Err(ApiError::BadRequest)
+            ));
+        }
+    }
+
+    #[test]
+    fn admission_estimate_reserves_forwarded_min_tokens_per_choice() {
+        let mut body = json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "min_tokens": 20_000,
+            "n": 2
+        })
+        .as_object()
+        .expect("object")
+        .clone();
+        let pinned = pinned_test_completion();
+
+        ensure_bounded_completion_generation(&mut body, 4_096);
+        let estimate = estimate_completion_admission(&body, &pinned.route, 4_096);
+
+        assert_eq!(body["max_tokens"], 20_000);
+        assert_eq!(estimate.completion_tokens, Some(40_000));
+    }
+
+    #[test]
+    fn admission_estimate_counts_schema_keys_numbers_and_structure() {
+        let mut properties = serde_json::Map::new();
+        for index in 0..256 {
+            properties.insert(
+                format!("property_{index:04}_{}", "x".repeat(48)),
+                json!({"type": "integer", "enum": [index, index + 1, index + 2]}),
+            );
+        }
+        let body = json!({
+            "messages": [{"role": "user", "content": "return structured data"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "large_schema",
+                    "parameters": {"type": "object", "properties": properties}
+                }
+            }],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "numeric_schema",
+                    "schema": {"type": "integer", "enum": (0..512).collect::<Vec<_>>()}
+                }
+            },
+            "max_tokens": 64
+        });
+        let baseline = json!({
+            "messages": [{"role": "user", "content": "return structured data"}],
+            "max_tokens": 64
+        });
+        let pinned = pinned_test_completion();
+
+        let estimate =
+            estimate_completion_admission(body.as_object().expect("object"), &pinned.route, 4_096);
+        let baseline_estimate = estimate_completion_admission(
+            baseline.as_object().expect("object"),
+            &pinned.route,
+            4_096,
+        );
+
+        assert!(estimate.prompt_tokens > baseline_estimate.prompt_tokens + 1_000);
+    }
+
+    #[test]
+    fn prompt_bound_is_tokenizer_independent_and_preserves_text_with_image_key() {
+        let adversarial_text = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".repeat(4_000);
+        let body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": adversarial_text,
+                    "image_url": null
+                }]
+            }],
+            "max_tokens": 64
+        });
+        let pinned = pinned_test_completion();
+
+        let estimate =
+            estimate_completion_admission(body.as_object().expect("object"), &pinned.route, 4_096);
+
+        assert!(estimate.prompt_tokens >= u64::try_from(adversarial_text.len()).unwrap() + 16_384);
+    }
+
+    #[test]
+    fn prompt_bound_accounts_for_provider_attribute_entity_expansion() {
+        let attribute = "&\"".repeat(5_000);
+        let body = json!({
+            "messages": [{"role": "user", "name": attribute, "content": "hello"}],
+            "max_tokens": 64
+        });
+        let pinned = pinned_test_completion();
+
+        let estimate =
+            estimate_completion_admission(body.as_object().expect("object"), &pinned.route, 4_096);
+
+        // Each pair expands from two decoded bytes to eleven entity bytes.
+        assert!(estimate.prompt_tokens >= 55_000);
+    }
+
+    #[test]
+    fn prompt_bound_accounts_for_tool_argument_normalization_and_tags() {
+        let array_arguments = json!({"a": vec![0; 10_000]}).to_string();
+        let array_body = json!({
+            "messages": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-array",
+                    "type": "function",
+                    "function": {"name": "array_tool", "arguments": array_arguments}
+                }]
+            }],
+            "max_tokens": 64
+        });
+        let mut object_arguments = serde_json::Map::new();
+        for index in 0..1_000 {
+            object_arguments.insert(format!("a{index}"), Value::Null);
+        }
+        let object_body = json!({
+            "messages": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-object",
+                    "type": "function",
+                    "function": {
+                        "name": "object_tool",
+                        "arguments": Value::Object(object_arguments).to_string()
+                    }
+                }]
+            }],
+            "max_tokens": 64
+        });
+        let pinned = pinned_test_completion();
+
+        let array_estimate = estimate_completion_admission(
+            array_body.as_object().expect("object"),
+            &pinned.route,
+            4_096,
+        );
+        let object_estimate = estimate_completion_admission(
+            object_body.as_object().expect("object"),
+            &pinned.route,
+            4_096,
+        );
+
+        assert!(array_estimate.prompt_tokens >= 30_000);
+        assert!(object_estimate.prompt_tokens >= 17_000);
+
+        let exponent_arguments = format!(
+            r#"{{"x":[{}]}}"#,
+            std::iter::repeat_n("1e15", 10_000)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let exponent_body = json!({
+            "messages": [{
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-exponent",
+                    "type": "function",
+                    "function": {"name": "exponent_tool", "arguments": exponent_arguments}
+                }]
+            }],
+            "max_tokens": 64
+        });
+        validate_completion_request_controls(exponent_body.as_object().expect("object"), 8)
+            .expect("bounded valid arguments");
+        let exponent_estimate = estimate_completion_admission(
+            exponent_body.as_object().expect("object"),
+            &pinned.route,
+            4_096,
+        );
+        assert!(exponent_estimate.prompt_tokens >= 100_134);
+    }
+
+    #[test]
+    fn prompt_bound_accounts_for_multiline_tool_schema_formatting() {
+        let description = format!("{}x", "x\n".repeat(10_000));
+        let body = json!({
+            "messages": [{"role": "user", "content": "use the tool"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "multiline_tool",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "string", "description": description}
+                        }
+                    }
+                }
+            }],
+            "max_tokens": 64
+        });
+        let pinned = pinned_auto_fallback_completion();
+
+        let estimate =
+            estimate_completion_admission(body.as_object().expect("object"), &pinned.route, 4_096);
+
+        assert!(estimate.prompt_tokens >= 40_044);
+    }
+
+    #[test]
+    fn message_tool_schema_named_image_url_is_counted_not_sanitized() {
+        let large_description = "schema detail ".repeat(2_000);
+        let body = json!({
+            "messages": [{
+                "role": "developer",
+                "content": "use the provided schema",
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "schema_tool",
+                        "parameters": {
+                            "type": "image_url",
+                            "description": large_description
+                        }
+                    }
+                }]
+            }],
+            "max_tokens": 64
+        });
+        let baseline = json!({
+            "messages": [{"role": "developer", "content": "use the provided schema"}],
+            "max_tokens": 64
+        });
+        let pinned = pinned_test_completion();
+
+        let estimate =
+            estimate_completion_admission(body.as_object().expect("object"), &pinned.route, 4_096);
+        let baseline_estimate = estimate_completion_admission(
+            baseline.as_object().expect("object"),
+            &pinned.route,
+            4_096,
+        );
+
+        assert!(estimate.prompt_tokens > baseline_estimate.prompt_tokens + 2_000);
+    }
+
+    #[test]
+    fn unsupported_media_is_rejected_in_explicit_shorthand_and_cached_shapes() {
+        for part in [
+            json!({"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}),
+            json!({"video_url": "https://example.com/a.mp4"}),
+            json!({"type": null, "video_url": "https://example.com/a.mp4"}),
+            json!({"type": "garbage", "video_url": "https://example.com/a.mp4"}),
+            json!({"type": "input_video", "video_url": "data:video/mp4;base64,AAAA"}),
+            json!({"type": "image_pil", "image_pil": null, "uuid": "cached-image"}),
+            json!({"image_embeds": null, "uuid": "cached-image"}),
+            json!({"type": "prompt_embeds", "prompt_embeds": null}),
+        ] {
+            let body = json!({
+                "messages": [{"role": "user", "content": [part]}],
+                "max_tokens": 64
+            });
+            assert!(completion_contains_unsupported_media(
+                body.as_object().expect("object")
+            ));
+        }
+
+        let image = json!({
+            "messages": [{
+                "role": "user",
+                "content": [{"image_url": "https://example.com/a.png"}]
+            }]
+        });
+        assert!(!completion_contains_unsupported_media(
+            image.as_object().expect("object")
+        ));
+    }
+
+    #[test]
+    fn usage_settlement_uses_one_stable_id_per_execution() {
+        let pinned = pinned_test_completion();
+        let route = pinned.route.identity();
+        let first_execution = pinned.begin_execution();
+        let first_attempt = first_execution.begin_attempt(route.clone());
+        let recovered_attempt = first_execution.begin_attempt(route.clone());
+        let next_attempt = pinned.begin_execution().begin_attempt(route);
+        let billing = || BillingContext::new(AuthMethod::Jwt, "auto-powerful".to_string());
+
+        let first = UsageSettlement::new(billing(), &first_attempt);
+        let recovered = UsageSettlement::new(billing(), &recovered_attempt);
+        let next = UsageSettlement::new(billing(), &next_attempt);
+
+        assert_eq!(first.event_id, recovered.event_id);
+        assert_eq!(first.event_id, first_execution.execution_id.as_uuid());
+        assert_ne!(first.attempt_id, recovered.attempt_id);
+        assert_ne!(first.event_id, next.event_id);
+    }
+
+    #[tokio::test]
+    async fn attempt_guard_holds_admission_until_authoritative_terminal() {
+        let policy =
+            crate::inference::admission::AdmissionPolicy::with_deployment_in_flight_for_test(
+                &crate::provider_registry::PROVIDER_REGISTRY,
+                1,
+            )
+            .expect("one-slot policy");
+        let controller = crate::inference::admission::AdmissionController::new(
+            &crate::provider_registry::PROVIDER_REGISTRY,
+            policy,
+        )
+        .expect("controller");
+        let pinned = pinned_test_completion();
+        let route_key = pinned.route.identity().route_key();
+        let permit = controller
+            .acquire_turn(
+                &route_key,
+                Uuid::nil(),
+                WorkloadClass::Interactive,
+                AdmissionEstimate::new(10, Some(5)),
+                None,
+            )
+            .await
+            .expect("first permit");
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let mut guard = AttemptObservationGuard::new_admitted(
+            attempt.clone(),
+            Arc::new(ProviderRouter::default()),
+            AttemptStage::ResponseBody,
+            permit,
+            None,
+        );
+
+        let rejection = controller
+            .acquire_turn(
+                &route_key,
+                Uuid::from_u128(1),
+                WorkloadClass::Background,
+                AdmissionEstimate::new(1, Some(1)),
+                None,
+            )
+            .await
+            .expect_err("response headers must not release the permit");
+        assert_eq!(
+            rejection.kind,
+            crate::inference::admission::AdmissionRejectionKind::DeploymentBusy
+        );
+
+        let terminal = AttemptTerminal::Completed {
+            attempt,
+            evidence: CompletionEvidence::NonStreamingResponse,
+        };
+        let usage = CompletionUsage {
+            prompt_tokens: 8,
+            prompt_tokens_observed: true,
+            completion_tokens: 4,
+            completion_tokens_observed: true,
+            cached_prompt_tokens: Some(2),
+        };
+        guard.record_terminal_with_usage(&terminal, Some(&usage));
+
+        let next = controller
+            .acquire_turn(
+                &route_key,
+                Uuid::from_u128(1),
+                WorkloadClass::Background,
+                AdmissionEstimate::new(1, Some(1)),
+                None,
+            )
+            .await
+            .expect("terminal releases the deployment slot");
+        next.settle(None, TerminalDisposition::ProvenPreAcceptance);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_health_is_visible_before_a_queued_waiter_is_released() {
+        let policy =
+            crate::inference::admission::AdmissionPolicy::with_deployment_in_flight_for_test(
+                &PROVIDER_REGISTRY,
+                1,
+            )
+            .expect("one-slot policy");
+        let controller =
+            crate::inference::admission::AdmissionController::new(&PROVIDER_REGISTRY, policy)
+                .expect("controller");
+        let provider_router = Arc::new(ProviderRouter::default());
+        let pinned = pinned_test_completion();
+        let route_key = pinned.route.identity().route_key();
+        let permit = controller
+            .acquire_turn(
+                &route_key,
+                Uuid::nil(),
+                WorkloadClass::Interactive,
+                AdmissionEstimate::new(1, Some(1)),
+                None,
+            )
+            .await
+            .expect("first permit");
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let mut guard = AttemptObservationGuard::new_admitted(
+            attempt.clone(),
+            provider_router.clone(),
+            AttemptStage::ResponseBody,
+            permit,
+            None,
+        );
+
+        let waiter_controller = controller.clone();
+        let waiter_router = provider_router.clone();
+        let waiter_route = route_key.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let permit = waiter_controller
+                .acquire_turn(
+                    &waiter_route,
+                    Uuid::from_u128(1),
+                    WorkloadClass::Interactive,
+                    AdmissionEstimate::new(1, Some(1)),
+                    None,
+                )
+                .await
+                .expect("queued waiter should acquire after release");
+            let circuit_is_open = matches!(
+                waiter_router.try_claim_probe(&waiter_route),
+                ProbeClaimResult::Rejected {
+                    reason: crate::inference::health::ProbeRejectionReason::CircuitOpen,
+                    ..
+                }
+            );
+            permit.settle(None, TerminalDisposition::ProvenPreAcceptance);
+            circuit_is_open
+        });
+        started_rx.await.expect("waiter started");
+        tokio::task::yield_now().await;
+
+        let terminal = AttemptTerminal::Failed {
+            attempt,
+            failure: AttemptFailure::new(
+                AttemptFailureKind::CapacityRejected,
+                AttemptStage::ResponseBody,
+                ReplaySafety::NotProvenPreAcceptance,
+            )
+            .with_upstream_response(503, Some(Duration::from_secs(30)), None),
+        };
+        guard.record_terminal(&terminal);
+
+        assert!(
+            timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("waiter should wake")
+                .expect("waiter task"),
+            "the circuit-opening terminal must be visible before admission wakes the waiter"
+        );
     }
 
     #[test]
@@ -3864,15 +5571,20 @@ mod tests {
             Arc::clone(&provider_router),
             AttemptStage::ResponseBody,
         );
+        let usage_settlement = UsageSettlement::new(
+            BillingContext::new(AuthMethod::Jwt, "kimi-k3".to_string()),
+            &attempt,
+        );
         let mut started = StartedCompletion {
             response: Some(response),
             successful_provider: ProviderId::Tinfoil.as_str().to_string(),
             attempt,
             terminal_guard: Some(terminal_guard),
             response_model_id: "kimi-k3".to_string(),
+            public_model_id: "kimi-k3".to_string(),
             is_streaming: false,
-            billing_context: BillingContext::new(AuthMethod::Jwt, "kimi-k3".to_string()),
             non_streaming_body_limit: None,
+            usage_settlement: Some(usage_settlement),
         };
 
         drop(started.response.take());
@@ -4216,6 +5928,7 @@ mod tests {
             &second_route.response_model_id,
             &second_attempt,
             None,
+            Duration::from_secs(1),
         )
         .await
         .expect("canonical Continuum response");
@@ -4405,6 +6118,7 @@ mod tests {
             &second_route.response_model_id,
             &second_attempt,
             None,
+            Duration::from_secs(1),
         )
         .await
         .expect("canonical K2.6 response");
@@ -4499,7 +6213,12 @@ mod tests {
             baseline,
         )
         .expect("initial GLM route");
-        let pinned = PinnedCompletionRequest { intent, route };
+        let pinned = PinnedCompletionRequest {
+            intent,
+            route,
+            provider_preference: None,
+            finalized_route: Arc::new(OnceLock::new()),
+        };
 
         let send_pinned_turn = |content: &'static str| {
             let provider_client = &provider_client;
@@ -4526,6 +6245,7 @@ mod tests {
                     &pinned.route.response_model_id,
                     &attempt,
                     None,
+                    Duration::from_secs(1),
                 )
                 .await
                 .expect("canonical pinned response");
@@ -4657,7 +6377,12 @@ mod tests {
             route.model_selection_source,
             crate::provider_routing::ModelSelectionSource::AutoPrimary
         );
-        let pinned = PinnedCompletionRequest { intent, route };
+        let pinned = PinnedCompletionRequest {
+            intent,
+            route,
+            provider_preference: None,
+            finalized_route: Arc::new(OnceLock::new()),
+        };
 
         let send_pinned_turn = |content: &'static str| {
             let provider_client = &provider_client;
@@ -4684,6 +6409,7 @@ mod tests {
                     &pinned.route.response_model_id,
                     &attempt,
                     None,
+                    Duration::from_secs(1),
                 )
                 .await
                 .expect("canonical pinned K3 response");
@@ -5163,9 +6889,15 @@ mod tests {
         let attempt = pinned
             .begin_execution()
             .begin_attempt(pinned.route.identity());
-        let failure = read_non_streaming_completion_response(response, "kimi-k3", &attempt, None)
-            .await
-            .expect_err("top-level provider error payload must fail the attempt");
+        let failure = read_non_streaming_completion_response(
+            response,
+            "kimi-k3",
+            &attempt,
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("top-level provider error payload must fail the attempt");
         server.abort();
 
         assert_eq!(failure.kind, AttemptFailureKind::UpstreamResponseError);
@@ -5208,10 +6940,15 @@ mod tests {
         let attempt = pinned
             .begin_execution()
             .begin_attempt(pinned.route.identity());
-        let failure =
-            read_non_streaming_completion_response(response, "kimi-k3", &attempt, Some(8))
-                .await
-                .expect_err("response over the descriptor cap must fail");
+        let failure = read_non_streaming_completion_response(
+            response,
+            "kimi-k3",
+            &attempt,
+            Some(8),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("response over the descriptor cap must fail");
         server.abort();
 
         assert_eq!(failure.kind, AttemptFailureKind::InvalidResponse);
@@ -5257,6 +6994,42 @@ mod tests {
             .decrypt(ciphertext, &nonce)
             .expect("Maple SDK AEAD contract");
         assert_eq!(decrypted, plaintext.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn mock_provider_pending_non_streaming_body_times_out() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let pending = futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+                axum::http::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from_stream(pending))
+                    .expect("mock pending response")
+            }),
+        );
+        let (trace, server) = call_mock_provider(app).await;
+        let response = trace.result.expect("mock provider response start");
+        let pinned = pinned_test_completion();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+
+        let failure = read_non_streaming_completion_response(
+            response,
+            "kimi-k3",
+            &attempt,
+            None,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("pending non-streaming body must time out");
+        server.abort();
+
+        assert_eq!(failure.kind, AttemptFailureKind::ResponseBody);
+        assert_eq!(failure.stage, AttemptStage::ResponseBody);
+        assert_eq!(failure.replay_safety, ReplaySafety::NotProvenPreAcceptance);
     }
 
     #[tokio::test]
@@ -5307,6 +7080,51 @@ mod tests {
                 consecutive_failures: 1
             }
         );
+    }
+
+    #[tokio::test]
+    async fn slow_stream_consumer_cannot_hold_the_processor_forever() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                axum::http::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from(concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"one\"},\"finish_reason\":null}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"two\"},\"finish_reason\":null}]}\n\n",
+                        "data: [DONE]\n\n"
+                    )))
+                    .expect("mock streaming response")
+            }),
+        );
+        let (trace, server) = call_mock_provider(app).await;
+        let response = trace.result.expect("mock provider response start");
+        let pinned = pinned_test_completion();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let (tx, _rx) = mpsc::channel(1);
+
+        let result = timeout(
+            Duration::from_millis(200),
+            process_completion_stream(response, "kimi-k3", attempt, &tx, Duration::from_millis(20)),
+        )
+        .await
+        .expect("slow consumer must be bounded");
+        server.abort();
+
+        assert!(matches!(
+            result.terminal,
+            AttemptTerminal::Failed {
+                failure: AttemptFailure {
+                    kind: AttemptFailureKind::ConsumerDropped,
+                    stage: AttemptStage::Stream,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -6113,10 +7931,70 @@ mod tests {
     }
 
     #[test]
+    fn strips_tinfoil_router_execution_controls_but_preserves_tool_schema() {
+        let mut body = serde_json::Map::from_iter([
+            ("web_search_options".to_string(), json!({"enabled": true})),
+            (
+                "code_execution_options".to_string(),
+                json!({"accessToken": "client-controlled"}),
+            ),
+            ("pii_check_options".to_string(), json!({})),
+            (
+                "auto_model_options".to_string(),
+                json!([{"model": "different-model"}]),
+            ),
+            (
+                "tools".to_string(),
+                json!([{
+                    "type": "function",
+                    "function": {
+                        "name": "render_preview",
+                        "description": "Render a preview",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "x-tinfoil-tool-auto-continue": true
+                    }
+                }]),
+            ),
+            (
+                "tool_choice".to_string(),
+                json!({"type": "function", "function": {"name": "render_preview"}}),
+            ),
+        ]);
+
+        apply_provider_managed_request_fields(
+            &mut body,
+            ProviderId::Tinfoil.as_str(),
+            Uuid::from_u128(42),
+        );
+
+        for field in TINFOIL_ROUTER_EXECUTION_FIELDS {
+            assert!(!body.contains_key(*field));
+        }
+        let function = body["tools"][0]["function"]
+            .as_object()
+            .expect("ordinary function schema remains");
+        assert!(!function.contains_key(TINFOIL_TOOL_AUTO_CONTINUE_FIELD));
+        assert_eq!(function["name"], "render_preview");
+        assert_eq!(function["description"], "Render a preview");
+        assert_eq!(
+            function["parameters"]["properties"]["title"]["type"],
+            "string"
+        );
+        assert_eq!(body["tool_choice"]["function"]["name"], "render_preview");
+    }
+
+    #[test]
     fn strips_tinfoil_cache_fields_from_non_tinfoil_requests() {
         let mut body = serde_json::Map::from_iter([
             ("cache_salt".to_string(), json!("user-supplied")),
             ("user_cache_secret".to_string(), json!("client-controlled")),
+            (
+                "kv_transfer_params".to_string(),
+                json!({"prompt_token_ids": [1, 2, 3]}),
+            ),
         ]);
 
         apply_provider_managed_request_fields(
@@ -6127,6 +8005,7 @@ mod tests {
 
         assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
         assert!(!body.contains_key(PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD));
+        assert!(!body.contains_key(PROVIDER_MANAGED_KV_TRANSFER_PARAMS_FIELD));
     }
 
     #[test]
@@ -6174,6 +8053,7 @@ mod tests {
         let usage = extract_usage(&response).expect("usage should parse");
 
         assert_eq!(usage.prompt_tokens, 100);
+        assert!(usage.prompt_tokens_observed);
         assert_eq!(usage.completion_tokens, 20);
         assert!(usage.completion_tokens_observed);
         assert_eq!(usage.cached_prompt_tokens, Some(42));
@@ -6190,8 +8070,33 @@ mod tests {
         let usage = extract_usage(&response).expect("usage should parse");
 
         assert_eq!(usage.prompt_tokens, 100);
+        assert!(usage.prompt_tokens_observed);
         assert_eq!(usage.completion_tokens, 0);
         assert!(!usage.completion_tokens_observed);
+    }
+
+    #[test]
+    fn completion_only_usage_preserves_missing_prompt_token_signal() {
+        let response = json!({
+            "usage": {
+                "completion_tokens": 7,
+                "prompt_tokens_details": {
+                    "cached_tokens": 5
+                }
+            }
+        });
+
+        let usage = extract_usage(&response).expect("usage should parse");
+        let actual = completion_actual_usage(&usage);
+
+        assert_eq!(usage.prompt_tokens, 0);
+        assert!(!usage.prompt_tokens_observed);
+        assert_eq!(usage.completion_tokens, 7);
+        assert!(usage.completion_tokens_observed);
+        assert_eq!(usage.cached_prompt_tokens, Some(5));
+        assert_eq!(actual.prompt_tokens, None);
+        assert_eq!(actual.completion_tokens, Some(7));
+        assert_eq!(actual.cached_prompt_tokens, Some(5));
     }
 
     #[test]
@@ -6262,12 +8167,14 @@ mod tests {
     fn cached_prompt_tokens_are_mapped_to_sqs_cached_input_tokens() {
         let usage = CompletionUsage {
             prompt_tokens: 100,
+            prompt_tokens_observed: true,
             completion_tokens: 20,
             completion_tokens_observed: true,
             cached_prompt_tokens: Some(42),
         };
 
         let event = build_usage_event(
+            Uuid::parse_str("dca25195-ae0a-4c49-aa7a-bd2ba21a7d2b").unwrap(),
             Uuid::parse_str("6142db59-fc0c-413d-8792-579fc1457fe2").unwrap(),
             usage,
             BigDecimal::from_str("0.001").unwrap(),
@@ -6288,6 +8195,7 @@ mod tests {
     fn route_identity_is_preserved_in_usage_events() {
         let usage = CompletionUsage {
             prompt_tokens: 100,
+            prompt_tokens_observed: true,
             completion_tokens: 20,
             completion_tokens_observed: true,
             cached_prompt_tokens: Some(42),
@@ -6302,6 +8210,7 @@ mod tests {
             ("continuum", "glm-5-2"),
         ] {
             let event = build_usage_event(
+                Uuid::parse_str("dca25195-ae0a-4c49-aa7a-bd2ba21a7d2b").unwrap(),
                 Uuid::parse_str("6142db59-fc0c-413d-8792-579fc1457fe2").unwrap(),
                 usage.clone(),
                 BigDecimal::from_str("0.001").unwrap(),
@@ -6384,6 +8293,7 @@ mod tests {
         cached_prompt_tokens: Option<i32>,
     ) {
         assert_eq!(usage.prompt_tokens, prompt_tokens);
+        assert!(usage.prompt_tokens_observed);
         assert_eq!(usage.completion_tokens, completion_tokens);
         assert!(usage.completion_tokens_observed);
         assert_eq!(usage.cached_prompt_tokens, cached_prompt_tokens);
@@ -6579,6 +8489,17 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_zero_usage_is_not_dropped() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(0, 0, None, None, true));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("explicit zero totals are authoritative usage");
+        assert_usage(usage, 0, 0, None);
+    }
+
+    #[test]
     fn stream_prompt_only_usage_keeps_completion_tokens_unobserved() {
         let mut accumulator = StreamUsageAccumulator::default();
         accumulator.observe(&json!({
@@ -6590,8 +8511,32 @@ mod tests {
             .take_final_usage(StreamUsageFinalization::ProviderDone)
             .expect("non-zero prompt usage should be retained");
         assert_eq!(usage.prompt_tokens, 33);
+        assert!(usage.prompt_tokens_observed);
         assert_eq!(usage.completion_tokens, 0);
         assert!(!usage.completion_tokens_observed);
+    }
+
+    #[test]
+    fn stream_cached_usage_without_prompt_total_keeps_cached_tokens_unobserved() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&json!({
+            "choices": [{ "finish_reason": "stop" }],
+            "usage": {
+                "completion_tokens": 7,
+                "prompt_tokens_details": { "cached_tokens": 5 }
+            }
+        }));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("observed completion usage should be retained");
+        let actual = completion_actual_usage(&usage);
+        assert!(!usage.prompt_tokens_observed);
+        assert!(usage.completion_tokens_observed);
+        assert_eq!(usage.cached_prompt_tokens, Some(5));
+        assert_eq!(actual.prompt_tokens, None);
+        assert_eq!(actual.completion_tokens, Some(7));
+        assert_eq!(actual.cached_prompt_tokens, Some(5));
     }
 
     #[test]

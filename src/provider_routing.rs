@@ -1,6 +1,6 @@
 use crate::inference::health::{
-    ShadowDisposition, ShadowHealthState, ShadowObservationMode, ShadowObservationReport,
-    ShadowRouteSnapshot, MIN_CAPACITY_COOLDOWN,
+    ProbeClaimResult, ProbeLease, ShadowDisposition, ShadowHealthState, ShadowObservationMode,
+    ShadowObservationReport, ShadowRouteSnapshot, MIN_CAPACITY_COOLDOWN,
 };
 use crate::inference::{AttemptTerminal, InferenceIntent, RouteIdentity, RouteKey};
 use crate::inference_planning::{
@@ -17,6 +17,7 @@ use crate::provider_registry::{
 #[cfg(test)]
 use crate::proxy_config::canonicalize_tinfoil_model;
 use crate::proxy_config::{ProxyConfig, ProxyRouter};
+use std::collections::HashSet;
 use std::time::Duration;
 #[cfg(test)]
 use uuid::Uuid;
@@ -212,6 +213,20 @@ impl ProviderRouter {
         self.shadow_health.observe_terminal(terminal, mode)
     }
 
+    pub(crate) fn observe_attempt_terminal_with_probe(
+        &self,
+        terminal: &AttemptTerminal,
+        mode: ShadowObservationMode,
+        probe: Option<ProbeLease>,
+    ) -> ShadowObservationReport {
+        self.shadow_health
+            .observe_terminal_with_probe(terminal, mode, probe)
+    }
+
+    pub(crate) fn try_claim_probe(&self, route: &RouteKey) -> ProbeClaimResult {
+        self.shadow_health.try_claim_probe(route)
+    }
+
     pub(crate) fn shadow_health_snapshot(&self, route: &RouteKey) -> Option<ShadowRouteSnapshot> {
         self.shadow_health.snapshot(route)
     }
@@ -281,6 +296,32 @@ impl ProviderRouter {
             intent,
             &candidates,
             provider_preference,
+            &HashSet::new(),
+        )
+    }
+
+    /// Replans a not-yet-sent logical request while excluding route resources
+    /// that lost admission or half-open ownership races. This never retries an
+    /// upstream attempt; callers may use it only before the first send.
+    pub(crate) fn select_active_completion_route_excluding(
+        &self,
+        proxy_router: &ProxyRouter,
+        intent: &InferenceIntent,
+        provider_preference: Option<ProviderPreference>,
+        excluded_routes: &HashSet<RouteKey>,
+    ) -> Result<SelectedProviderRoute, ProviderRoutingError> {
+        let model_plan = plan_completion_model_candidates(intent);
+        let candidates = model_plan
+            .public_model_ids
+            .iter()
+            .map(|public_model_id| intent.for_candidate_public_model(public_model_id.clone()))
+            .collect::<Vec<_>>();
+        self.select_health_aware_model_candidates(
+            proxy_router,
+            intent,
+            &candidates,
+            provider_preference,
+            excluded_routes,
         )
     }
 
@@ -317,6 +358,7 @@ impl ProviderRouter {
         preferred_intent: &InferenceIntent,
         candidates: &[InferenceIntent],
         provider_preference: Option<ProviderPreference>,
+        excluded_routes: &HashSet<RouteKey>,
     ) -> Result<SelectedProviderRoute, ProviderRoutingError> {
         if candidates.is_empty() {
             return Err(ProviderRoutingError::NoEligibleRoute(
@@ -344,14 +386,14 @@ impl ProviderRouter {
                 {
                     continue;
                 }
-                configured_routes.push((
-                    candidate_index,
-                    route.provider,
-                    RouteKey {
-                        provider: route.provider,
-                        provider_model_id: route.provider_model_id.to_string(),
-                    },
-                ));
+                let route_key = RouteKey {
+                    provider: route.provider,
+                    provider_model_id: route.provider_model_id.to_string(),
+                };
+                if excluded_routes.contains(&route_key) {
+                    continue;
+                }
+                configured_routes.push((candidate_index, route.provider, route_key));
             }
         }
 
@@ -382,6 +424,13 @@ impl ProviderRouter {
                     earliest_recovery[*candidate_index] = Some(
                         earliest_recovery[*candidate_index]
                             .map_or(remaining, |current: Duration| current.min(remaining)),
+                    );
+                }
+                ShadowDisposition::ProbeInFlight { retry_after } => {
+                    let retry_after = ceil_retry_after(retry_after);
+                    earliest_recovery[*candidate_index] = Some(
+                        earliest_recovery[*candidate_index]
+                            .map_or(retry_after, |current: Duration| current.min(retry_after)),
                     );
                 }
                 disposition if route_is_available_for_new_request(disposition) => {
@@ -720,7 +769,10 @@ fn ceil_retry_after(duration: Duration) -> Duration {
 }
 
 fn route_is_available_for_new_request(disposition: ShadowDisposition) -> bool {
-    !matches!(disposition, ShadowDisposition::WouldOpen { .. })
+    !matches!(
+        disposition,
+        ShadowDisposition::WouldOpen { .. } | ShadowDisposition::ProbeInFlight { .. }
+    )
 }
 
 fn proxy_for_provider(proxy_router: &ProxyRouter, provider: ProviderId) -> Option<ProxyConfig> {

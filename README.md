@@ -46,6 +46,13 @@ protected environment variables. Billing and feature flags are optional
 external HTTP APIs whose administrative credentials remain in the backend;
 their server implementations are not part of this repository setup.
 
+Inference concurrency and bounded queues use a reviewed policy compiled into
+the OpenSecret binary; there is no environment-variable or enclave-secret
+override in the first release. The controller is local to one process or
+enclave and does not guess provider RPM/TPM limits. See
+[`docs/inference-admission.md`](docs/inference-admission.md) for the baseline,
+accounting model, replica boundary, and future control-plane seam.
+
 Protected routes require OpenSecret attestation/key exchange and encrypted
 sessions. “OpenAI-shaped” describes decrypted payloads, not a plaintext
 OpenAI-compatible wire endpoint. Use an OpenSecret SDK or Maple for

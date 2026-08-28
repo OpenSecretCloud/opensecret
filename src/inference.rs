@@ -4,6 +4,7 @@ use std::fmt;
 use std::time::Duration;
 use uuid::Uuid;
 
+pub(crate) mod admission;
 pub(crate) mod health;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,12 @@ macro_rules! inference_id {
 inference_id!(InferenceRequestId);
 inference_id!(InferenceExecutionId);
 inference_id!(InferenceAttemptId);
+
+impl InferenceExecutionId {
+    pub(crate) const fn as_uuid(self) -> Uuid {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InferenceIntent {

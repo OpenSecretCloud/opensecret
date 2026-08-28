@@ -131,10 +131,11 @@ mod web;
 mod aead_db_tamper_tests;
 
 use apple_signin::AppleJwtVerifier;
+use inference::admission::{AdmissionController, AdmissionPolicy};
 use inference_planning::ProviderPreference;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
 use provider_client::{ProviderClient, ProviderRequestError};
-use provider_registry::ProviderId;
+use provider_registry::{ProviderId, PROVIDER_REGISTRY};
 use provider_routing::ProviderRouter;
 use proxy_config::ProxyRouter;
 
@@ -865,6 +866,7 @@ pub struct AppState {
     provider_client: Arc<ProviderClient>,
     proxy_router: Arc<ProxyRouter>,
     provider_router: Arc<ProviderRouter>,
+    inference_admission: Arc<AdmissionController>,
     resend_api_key: Option<String>,
     ephemeral_keys: Arc<RwLock<BoundedTtlCache<PendingAttestationKey, EphemeralSecret>>>,
     session_states: Arc<tokio::sync::Mutex<LeaseAwareTtlCache<Uuid, SessionState>>>,
@@ -909,6 +911,7 @@ pub struct AppStateBuilder {
     os_flags_base_url: Option<String>,
     os_flags_api_key: Option<String>,
     kagi_api_key: Option<String>,
+    inference_admission_policy: Option<AdmissionPolicy>,
 }
 
 impl AppStateBuilder {
@@ -1031,6 +1034,14 @@ impl AppStateBuilder {
 
     pub fn kagi_api_key(mut self, kagi_api_key: Option<String>) -> Self {
         self.kagi_api_key = kagi_api_key;
+        self
+    }
+
+    pub(crate) fn inference_admission_policy(
+        mut self,
+        inference_admission_policy: AdmissionPolicy,
+    ) -> Self {
+        self.inference_admission_policy = Some(inference_admission_policy);
         self
     }
 
@@ -1168,6 +1179,18 @@ impl AppStateBuilder {
             provider_client.tinfoil_base_url(),
         ));
         let provider_router = Arc::new(ProviderRouter::default());
+        let inference_admission = Arc::new(
+            AdmissionController::new(
+                &PROVIDER_REGISTRY,
+                self.inference_admission_policy.unwrap_or_else(|| {
+                    AdmissionPolicy::baseline_for(&PROVIDER_REGISTRY)
+                        .expect("static provider registry has a valid admission policy")
+                }),
+            )
+            .map_err(|error| {
+                Error::BuilderError(format!("Invalid inference admission policy: {error}"))
+            })?,
+        );
 
         let (cancellation_tx, _) = tokio::sync::broadcast::channel(1024);
 
@@ -1200,6 +1223,7 @@ impl AppStateBuilder {
             provider_client,
             proxy_router,
             provider_router,
+            inference_admission,
             resend_api_key: self.resend_api_key,
             ephemeral_keys: Arc::new(RwLock::new(BoundedTtlCache::new(
                 NonZeroUsize::new(MAX_PENDING_ATTESTATIONS)
@@ -3900,6 +3924,11 @@ async fn main() -> Result<(), Error> {
         optional_env("OS_FLAGS_BASE_URL")
     };
 
+    let inference_admission_policy =
+        AdmissionPolicy::baseline_for(&PROVIDER_REGISTRY).map_err(|error| {
+            Error::BuilderError(format!("Invalid inference admission policy: {error}"))
+        })?;
+
     let app_state = AppStateBuilder::default()
         .app_mode(app_mode.clone())
         .db(db)
@@ -3920,6 +3949,7 @@ async fn main() -> Result<(), Error> {
         .os_flags_base_url(os_flags_base_url)
         .os_flags_api_key(os_flags_api_key)
         .kagi_api_key(kagi_api_key)
+        .inference_admission_policy(inference_admission_policy)
         .build()
         .await?;
     tracing::info!("App state created, app_mode: {:?}", app_mode);

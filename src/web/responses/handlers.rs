@@ -5,6 +5,7 @@ use crate::{
     billing::{BillingError, ChatBillingAccess},
     db::DBError,
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
+    inference::admission::{AdmissionRejection, LogicalAdmissionTicket},
     inference::{
         AttemptFailure, AttemptFailureKind, AttemptTerminal, InferenceIntent, InferenceSurface,
         ReplaySafety, WorkloadClass,
@@ -50,7 +51,7 @@ use crate::{
 };
 use axum::{
     extract::{Path, State},
-    http::{header, HeaderMap, HeaderName, HeaderValue},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::from_fn_with_state,
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -61,7 +62,7 @@ use axum::{
 };
 use base64::Engine;
 use chrono::Utc;
-use futures::{FutureExt, Stream};
+use futures::{FutureExt, Stream, StreamExt};
 use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -259,6 +260,15 @@ pub enum PublicResponseFailure {
 
 impl PublicResponseFailure {
     fn from_completion_error(error: &CompletionExecutionError) -> Self {
+        if let CompletionExecutionError::Request(ApiError::InferenceCapacity { status, .. }) = error
+        {
+            return if *status == StatusCode::TOO_MANY_REQUESTS {
+                Self::CapacityRateLimited
+            } else {
+                Self::CapacityOverloaded
+            };
+        }
+
         match error.terminal() {
             Some(AttemptTerminal::Failed { failure, .. })
                 if failure.kind == crate::inference::AttemptFailureKind::CapacityRejected =>
@@ -297,6 +307,19 @@ impl PublicResponseFailure {
                 error_code: INFERENCE_CAPACITY_ERROR_CODE,
             },
         )
+    }
+}
+
+fn logical_admission_api_error(rejection: AdmissionRejection) -> ApiError {
+    let status = if rejection.status_hint() == StatusCode::TOO_MANY_REQUESTS.as_u16() {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    ApiError::InferenceCapacity {
+        status,
+        retry_after: Some(rejection.retry_after),
+        client_replay_safe: false,
     }
 }
 
@@ -557,7 +580,7 @@ mod tests {
         web::openai::CompletionExecutionError,
         ApiError,
     };
-    use axum::{routing::get, Json, Router};
+    use axum::{http::StatusCode, routing::get, Json, Router};
     use chrono::{TimeZone, Utc};
     use serde_json::json;
     use std::collections::HashMap;
@@ -859,6 +882,15 @@ mod tests {
         }
         assert_eq!(
             image_description_api_error(ApiError::ServiceUnavailable).class,
+            ImageDescriptionFailureClass::PreAcceptance
+        );
+        assert_eq!(
+            image_description_api_error(ApiError::InferenceCapacity {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                retry_after: Some(Duration::from_secs(1)),
+                client_replay_safe: false,
+            })
+            .class,
             ImageDescriptionFailureClass::PreAcceptance
         );
         assert_eq!(
@@ -1194,6 +1226,29 @@ mod tests {
         assert!(PublicResponseFailure::DeadlineExceeded
             .contract_metadata()
             .is_none());
+    }
+
+    #[test]
+    fn local_admission_failures_preserve_capacity_class_after_persistence() {
+        let rate_limited = CompletionExecutionError::Request(ApiError::InferenceCapacity {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Some(Duration::from_secs(1)),
+            client_replay_safe: false,
+        });
+        assert_eq!(
+            PublicResponseFailure::from_completion_error(&rate_limited),
+            PublicResponseFailure::CapacityRateLimited
+        );
+
+        let overloaded = CompletionExecutionError::Request(ApiError::InferenceCapacity {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: Some(Duration::from_secs(1)),
+            client_replay_safe: false,
+        });
+        assert_eq!(
+            PublicResponseFailure::from_completion_error(&overloaded),
+            PublicResponseFailure::CapacityOverloaded
+        );
     }
 
     #[test]
@@ -2868,7 +2923,9 @@ fn image_description_api_error(error: ApiError) -> ImageDescriptionAttemptError 
         ApiError::BadRequest | ApiError::Unauthorized | ApiError::ModelNotAvailableOnPlan => {
             ImageDescriptionFailureClass::Terminal
         }
-        ApiError::ServiceUnavailable => ImageDescriptionFailureClass::PreAcceptance,
+        ApiError::ServiceUnavailable | ApiError::InferenceCapacity { .. } => {
+            ImageDescriptionFailureClass::PreAcceptance
+        }
         ApiError::TooManyRequests => ImageDescriptionFailureClass::RetryableResponse,
         _ => ImageDescriptionFailureClass::AmbiguousAfterSend,
     };
@@ -2941,6 +2998,17 @@ impl ImageDescriptionAttemptExecutor for ResponsesImageDescriptionExecutor<'_> {
             ));
         }
 
+        // Each descriptor candidate is its own logical inference request. The
+        // outer image scheduler limits concurrent candidates so a multi-image
+        // Responses request cannot bypass or self-overflow the account bound.
+        let _logical_ticket = self
+            .state
+            .inference_admission
+            .acquire_logical(self.user.uuid, WorkloadClass::Interactive)
+            .await
+            .map_err(logical_admission_api_error)
+            .map_err(image_description_api_error)?;
+
         let headers = HeaderMap::new();
         let billing_context =
             BillingContext::new(AuthMethod::Jwt, candidate.public_model_id.to_string());
@@ -3010,8 +3078,11 @@ async fn describe_images(
     };
     let fallback_policy = RetryNonTerminalImageDescriptionFallbackPolicy;
 
-    let outcomes =
-        futures::future::join_all(images.iter().enumerate().map(|(image_index, image)| {
+    let descriptor_concurrency = state.inference_admission.policy().per_account_in_flight();
+    let pending = images
+        .iter()
+        .enumerate()
+        .map(|(image_index, image)| {
             let executor = &executor;
             let fallback_policy = &fallback_policy;
             async move {
@@ -3026,7 +3097,11 @@ async fn describe_images(
                 .await;
                 (image_index, image.content_index, result)
             }
-        }))
+        })
+        .collect::<Vec<_>>();
+    let outcomes = futures::stream::iter(pending)
+        .buffered(descriptor_concurrency)
+        .collect::<Vec<_>>()
         .await;
 
     let mut pairs = Vec::with_capacity(outcomes.len());
@@ -3124,6 +3199,24 @@ async fn spawn_title_generation_task(
     user_content: String,
 ) {
     tokio::spawn(async move {
+        let _logical_ticket = match state
+            .inference_admission
+            .acquire_logical(user.uuid, WorkloadClass::Background)
+            .await
+        {
+            Ok(ticket) => ticket,
+            Err(rejection) => {
+                debug!(
+                    user_uuid = %user.uuid,
+                    conversation_uuid = %conversation_uuid,
+                    kind = ?rejection.kind,
+                    retry_after_seconds = rejection.retry_after.as_secs(),
+                    "Title generation shed by local admission control"
+                );
+                return;
+            }
+        };
+
         debug!(
             "Starting background title generation for conversation {}",
             conversation_uuid
@@ -4442,6 +4535,7 @@ async fn supervise_response_execution(
     rx_tool_ack: mpsc::Receiver<Result<(), String>>,
     terminal_ack: oneshot::Receiver<Result<Option<ResponseTerminal>, String>>,
     cancel_rx: broadcast::Receiver<Uuid>,
+    logical_ticket: LogicalAdmissionTicket,
     first_started: StartedCompletion,
     execution_policy: ResponseExecutionPolicy,
 ) {
@@ -4526,6 +4620,11 @@ async fn supervise_response_execution(
             return;
         }
     };
+
+    // The logical admission ticket covers the complete Responses job, including
+    // every model/tool turn and the authoritative terminal write. Client
+    // backpressure after persistence must not consume scarce logical capacity.
+    drop(logical_ticket);
 
     // This is the sole client-terminal writer. Awaiting the send preserves all
     // preceding data under backpressure while the stream remains connected.
@@ -4677,6 +4776,21 @@ async fn create_response_stream(
     body.max_output_tokens = Some(execution_policy.output_token_budget);
     let response_uuid = Uuid::new_v4();
     let model_turn_body = model_turn_request_without_user_payload(&body);
+
+    // Descriptor requests have settled. The main Responses request now owns
+    // one logical ticket through its full model/tool loop and authoritative
+    // terminal persistence. If descriptors already completed, a rejection at
+    // this seam must not advertise the whole HTTP request as side-effect-free.
+    let logical_ticket = state
+        .inference_admission
+        .acquire_logical(user.uuid, WorkloadClass::Interactive)
+        .await
+        .map_err(logical_admission_api_error)
+        .map_err(CompletionExecutionError::Request)
+        .map_err(|error| {
+            responses_pre_persistence_api_error(error, !image_descriptions.is_empty())
+        })?;
+
     let first_started = start_responses_assistant_turn(
         &state,
         &user,
@@ -4798,6 +4912,7 @@ async fn create_response_stream(
         rx_tool_ack,
         rx_terminal_ack,
         cancel_rx,
+        logical_ticket,
         first_started,
         execution_policy,
     ));

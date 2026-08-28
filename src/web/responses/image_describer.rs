@@ -132,12 +132,26 @@ pub fn build_image_description_request(
         ],
     });
 
-    // Gemma's ordinary Responses configuration enables thinking. Image
-    // description is a bounded preprocessing operation, so disable both
-    // supported reasoning controls for this fixed helper request.
-    if candidate.provider_model_id == "gemma4-31b" {
-        request["include_reasoning"] = json!(false);
-        request["chat_template_kwargs"] = json!({ "enable_thinking": false });
+    // Image description is a bounded preprocessing operation. These models use
+    // different native chat-template switches, so keep each provider/model
+    // control explicit rather than assuming one generic reasoning knob.
+    request["include_reasoning"] = json!(false);
+    match candidate.provider_model_id {
+        // Kimi K2.6's vLLM template uses `thinking`; `enable_thinking` is not
+        // the native switch and is ignored by some deployed template versions.
+        "kimi-k2.6" => {
+            request["chat_template_kwargs"] = json!({ "thinking": false });
+        }
+        // Gemma 4 uses vLLM's `enable_thinking` template switch.
+        "gemma4-31b" => {
+            request["chat_template_kwargs"] = json!({ "enable_thinking": false });
+        }
+        // Kimi K3's vLLM renderer accepts `enable_thinking` as an alias, but
+        // `thinking` is its canonical native control.
+        "kimi-k3" => {
+            request["chat_template_kwargs"] = json!({ "thinking": false });
+        }
+        _ => {}
     }
 
     Ok(request)
@@ -517,12 +531,18 @@ mod tests {
     }
 
     #[test]
-    fn continuum_request_uses_public_model_and_provider_managed_cache_fields() {
+    fn continuum_kimi_request_disables_thinking_and_uses_provider_managed_cache_fields() {
         let request = build_image_description_request(IMAGE_DESCRIPTION_CANDIDATES[0], input())
             .expect("request");
 
         assert_eq!(request["model"], "kimi-k2-6");
         assert_eq!(request["stream"], false);
+        assert_eq!(request["include_reasoning"], false);
+        assert_eq!(request["chat_template_kwargs"]["thinking"], false);
+        assert!(request["chat_template_kwargs"]
+            .get("enable_thinking")
+            .is_none());
+        assert!(request.get("reasoning_effort").is_none());
         assert!(request.get("cache_salt").is_none());
         assert_eq!(
             request["messages"][1]["content"][1]["image_url"]["url"],
@@ -542,6 +562,23 @@ mod tests {
         assert_eq!(request["model"], "gemma4-31b");
         assert_eq!(request["include_reasoning"], false);
         assert_eq!(request["chat_template_kwargs"]["enable_thinking"], false);
+        assert!(request["chat_template_kwargs"].get("thinking").is_none());
+        assert!(request.get("reasoning_effort").is_none());
+        assert!(request.get("cache_salt").is_none());
+    }
+
+    #[test]
+    fn tinfoil_kimi_k3_request_uses_native_thinking_control() {
+        let request = build_image_description_request(IMAGE_DESCRIPTION_CANDIDATES[2], input())
+            .expect("request");
+
+        assert_eq!(request["model"], "kimi-k3");
+        assert_eq!(request["include_reasoning"], false);
+        assert_eq!(request["chat_template_kwargs"]["thinking"], false);
+        assert!(request["chat_template_kwargs"]
+            .get("enable_thinking")
+            .is_none());
+        assert!(request.get("reasoning_effort").is_none());
         assert!(request.get("cache_salt").is_none());
     }
 

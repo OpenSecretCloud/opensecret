@@ -2506,7 +2506,7 @@ async fn describe_images(
                         failure.error.summary
                     );
                 }
-                return Err(ApiError::ServiceUnavailable);
+                return Err(ApiError::ImageDescriptionUnavailable);
             }
         };
 

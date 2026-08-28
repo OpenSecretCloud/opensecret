@@ -7,6 +7,7 @@ use crate::{
     web::responses::{constants::*, error_mapping, types::*},
     ApiError,
 };
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use secp256k1::SecretKey;
 use serde_json::{json, Value};
 use tracing::error;
@@ -22,13 +23,36 @@ use uuid::Uuid;
 /// - Token counting text extraction
 pub struct MessageContentConverter;
 
-const INPUT_IMAGE_TOKEN_ESTIMATE: usize = 1024;
+/// Safe stand-in for legacy image-only messages after raw images are removed
+/// from model context. It deliberately contains no URL, file ID, MIME type, or
+/// other attachment metadata.
+pub(crate) const MODEL_IMAGE_OMITTED_PLACEHOLDER: &str =
+    "[Image 1 attachment omitted from model input.]";
+
+pub(crate) fn model_image_omitted_placeholder(image_number: usize) -> String {
+    format!("[Image {image_number} attachment omitted from model input.]")
+}
+
+pub(crate) const MAX_INPUT_IMAGES: usize = 10;
+const MAX_INPUT_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 impl MessageContentConverter {
+    pub(crate) fn image_count(content: &MessageContent) -> usize {
+        match content {
+            MessageContent::Text(_) => 0,
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter(|part| matches!(part, MessageContentPart::InputImage { .. }))
+                .count(),
+        }
+    }
+
     /// Validate MessageContent parts to ensure unsupported features are rejected
     ///
     /// Currently validates:
     /// - file_id is not supported in InputImage (only image_url)
+    /// - at most 10 images are present
+    /// - image_url is a supported base64 data URL that decodes to at most 20 MiB
     ///
     /// # Arguments
     /// * `content` - The content to validate
@@ -37,6 +61,11 @@ impl MessageContentConverter {
     /// Ok(()) if valid, Err(ApiError) if validation fails
     pub fn validate_content(content: &MessageContent) -> Result<(), ApiError> {
         if let MessageContent::Parts(parts) = content {
+            let image_count = Self::image_count(content);
+            if image_count > MAX_INPUT_IMAGES {
+                return Err(ApiError::PayloadTooLarge);
+            }
+
             for part in parts {
                 if let MessageContentPart::InputImage {
                     file_id, image_url, ..
@@ -45,12 +74,56 @@ impl MessageContentConverter {
                     if file_id.is_some() {
                         return Err(ApiError::BadRequest);
                     }
-                    if image_url.is_none() {
-                        return Err(ApiError::BadRequest);
-                    }
+
+                    Self::validate_image_data_url(
+                        image_url.as_deref().ok_or(ApiError::BadRequest)?,
+                    )?;
                 }
             }
         }
+        Ok(())
+    }
+
+    fn validate_image_data_url(image_url: &str) -> Result<(), ApiError> {
+        let Some(data_url) = image_url
+            .get(..5)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("data:"))
+        else {
+            return Err(ApiError::BadRequest);
+        };
+
+        debug_assert_eq!(data_url.len(), 5);
+        Self::validate_base64_data_url(&image_url[5..], MAX_INPUT_IMAGE_BYTES)
+    }
+
+    fn validate_base64_data_url(data_url: &str, max_decoded_bytes: usize) -> Result<(), ApiError> {
+        let (metadata, payload) = data_url.split_once(',').ok_or(ApiError::BadRequest)?;
+        let mut metadata_parts = metadata.split(';');
+        let media_type = metadata_parts.next().unwrap_or_default();
+        let is_supported_image = [
+            "image/png",
+            "image/jpeg",
+            "image/jpg",
+            "image/webp",
+            "image/gif",
+            "image/avif",
+        ]
+        .iter()
+        .any(|supported| media_type.eq_ignore_ascii_case(supported));
+        let is_exact_base64_form = metadata_parts
+            .next()
+            .is_some_and(|component| component.eq_ignore_ascii_case("base64"))
+            && metadata_parts.next().is_none();
+
+        if !is_supported_image || !is_exact_base64_form || payload.is_empty() {
+            return Err(ApiError::BadRequest);
+        }
+
+        let decoded = STANDARD.decode(payload).map_err(|_| ApiError::BadRequest)?;
+        if decoded.len() > max_decoded_bytes {
+            return Err(ApiError::PayloadTooLarge);
+        }
+
         Ok(())
     }
 
@@ -73,23 +146,32 @@ impl MessageContentConverter {
         }
     }
 
-    /// Convert MessageContent to OpenAI API format for chat completions
+    /// Convert MessageContent to the format sent to the main conversation model.
     ///
-    /// Transforms our internal MessageContent representation into the format
-    /// expected by OpenAI's Chat Completions API.
-    ///
-    /// # Arguments
-    /// * `content` - The content to convert
-    ///
-    /// # Returns
-    /// JSON Value in OpenAI format
-    pub fn to_openai_format(content: &MessageContent) -> Value {
+    /// Raw image parts are replaced by numbered, non-sensitive text markers while
+    /// all remaining parts keep their original order. The markers correlate later
+    /// `read_image` results without exposing URLs or bytes, and keep legacy
+    /// image-only messages valid even when no description exists.
+    pub fn to_model_format(content: &MessageContent) -> Value {
         match content {
             MessageContent::Text(text) => json!(text),
             MessageContent::Parts(parts) => {
-                let openai_parts: Vec<Value> =
-                    parts.iter().map(Self::content_part_to_openai).collect();
-                json!(openai_parts)
+                let mut model_parts = Vec::with_capacity(parts.len());
+                let mut image_number = 0usize;
+
+                for part in parts {
+                    if matches!(part, MessageContentPart::InputImage { .. }) {
+                        image_number += 1;
+                        model_parts.push(json!({
+                            "type": "text",
+                            "text": model_image_omitted_placeholder(image_number)
+                        }));
+                    } else {
+                        model_parts.push(Self::content_part_to_openai(part));
+                    }
+                }
+
+                json!(model_parts)
             }
         }
     }
@@ -173,17 +255,26 @@ impl MessageContentConverter {
         }
     }
 
-    /// Estimate prompt tokens for a user message, including multimodal parts.
+    /// Estimate the prompt tokens sent to the main conversation model.
     ///
-    /// Provider tokenizers count image parts even though their data URLs should
-    /// not be counted as plain text. Use a conservative fixed image estimate so
-    /// context truncation leaves enough room for vision-token expansion.
+    /// Raw image bytes are excluded. Numbered marker text is counted because
+    /// [`Self::to_model_format`] sends those safe markers to preserve placement.
     pub fn estimate_prompt_tokens(content: &MessageContent) -> usize {
         match content {
             MessageContent::Text(text) => count_tokens(text),
-            MessageContent::Parts(parts) => parts.iter().fold(0usize, |total, part| {
-                total.saturating_add(Self::estimate_content_part_tokens(part))
-            }),
+            MessageContent::Parts(parts) => {
+                let mut image_number = 0usize;
+                parts.iter().fold(0usize, |total, part| {
+                    if matches!(part, MessageContentPart::InputImage { .. }) {
+                        image_number += 1;
+                        total.saturating_add(count_tokens(&model_image_omitted_placeholder(
+                            image_number,
+                        )))
+                    } else {
+                        total.saturating_add(Self::estimate_content_part_tokens(part))
+                    }
+                })
+            }
         }
     }
 
@@ -192,7 +283,7 @@ impl MessageContentConverter {
             MessageContentPart::Text { text } | MessageContentPart::InputText { text } => {
                 count_tokens(text)
             }
-            MessageContentPart::InputImage { .. } => INPUT_IMAGE_TOKEN_ESTIMATE,
+            MessageContentPart::InputImage { .. } => 0,
             MessageContentPart::InputFile { filename, .. } => count_tokens(filename),
         }
     }
@@ -438,6 +529,132 @@ impl ConversationItemConverter {
 mod tests {
     use super::*;
 
+    fn input_image(image_url: Option<&str>) -> MessageContentPart {
+        MessageContentPart::InputImage {
+            image_url: image_url.map(str::to_string),
+            file_id: None,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_content_accepts_ten_inline_images() {
+        let content = MessageContent::Parts(
+            (0..MAX_INPUT_IMAGES)
+                .map(|_| input_image(Some("data:image/png;base64,aGVsbG8=")))
+                .collect(),
+        );
+
+        assert!(MessageContentConverter::validate_content(&content).is_ok());
+    }
+
+    #[test]
+    fn test_validate_content_rejects_more_than_ten_images() {
+        let content = MessageContent::Parts(
+            (0..=MAX_INPUT_IMAGES)
+                .map(|_| input_image(Some("data:image/png;base64,aGVsbG8=")))
+                .collect(),
+        );
+
+        assert!(matches!(
+            MessageContentConverter::validate_content(&content),
+            Err(ApiError::PayloadTooLarge)
+        ));
+    }
+
+    #[test]
+    fn test_validate_content_rejects_remote_and_non_data_image_urls() {
+        for image_url in [
+            "custom-image-source",
+            "http://example.com/image.png",
+            "https://example.com/image.png",
+            "https://localhost/image.png",
+            "https://127.0.0.1/image.png",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://user:password@example.com/image.png",
+        ] {
+            let content = MessageContent::Parts(vec![input_image(Some(image_url))]);
+
+            assert!(matches!(
+                MessageContentConverter::validate_content(&content),
+                Err(ApiError::BadRequest)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_validate_content_rejects_missing_or_empty_image_url() {
+        for image_url in [None, Some("")] {
+            let content = MessageContent::Parts(vec![input_image(image_url)]);
+
+            assert!(matches!(
+                MessageContentConverter::validate_content(&content),
+                Err(ApiError::BadRequest)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_validate_content_accepts_supported_base64_image_data_urls() {
+        for media_type in [
+            "image/png",
+            "image/jpeg",
+            "image/jpg",
+            "image/webp",
+            "image/gif",
+            "image/avif",
+        ] {
+            let content = MessageContent::Parts(vec![input_image(Some(&format!(
+                "data:{media_type};base64,aGVsbG8="
+            )))]);
+
+            assert!(MessageContentConverter::validate_content(&content).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_validate_content_rejects_malformed_base64_data_urls() {
+        for image_url in [
+            "data:image/png;base64",
+            "data:image/png,not-base64",
+            "data:image/png;base64,",
+            "data:image/png;base64,%%%%",
+            "data:text/plain;base64,aGVsbG8=",
+            "data:image/svg+xml;base64,aGVsbG8=",
+            "data:image/png;charset=utf-8;base64,aGVsbG8=",
+            "data:image/png;#%zz;base64,aGVsbG8=",
+            "data:image/png;\n;base64,aGVsbG8=",
+        ] {
+            let content = MessageContent::Parts(vec![input_image(Some(image_url))]);
+
+            assert!(matches!(
+                MessageContentConverter::validate_content(&content),
+                Err(ApiError::BadRequest)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_validate_base64_data_url_enforces_decoded_byte_limit() {
+        assert_eq!(MAX_INPUT_IMAGE_BYTES, 20 * 1024 * 1024);
+
+        let at_limit = STANDARD.encode([0_u8; 8]);
+        assert!(MessageContentConverter::validate_base64_data_url(
+            &format!("image/png;base64,{at_limit}"),
+            8
+        )
+        .is_ok());
+
+        let over_limit = STANDARD.encode([0_u8; 9]);
+        assert!(matches!(
+            MessageContentConverter::validate_base64_data_url(
+                &format!("image/png;base64,{over_limit}"),
+                8
+            ),
+            Err(ApiError::PayloadTooLarge)
+        ));
+    }
+
     #[test]
     fn test_normalize_text_to_parts() {
         let content = MessageContent::Text("hello".to_string());
@@ -508,7 +725,7 @@ mod tests {
     }
 
     #[test]
-    fn test_estimate_prompt_tokens_counts_images() {
+    fn test_estimate_prompt_tokens_counts_safe_markers_not_image_bytes() {
         let content = MessageContent::Parts(vec![
             MessageContentPart::InputText {
                 text: "hello world".to_string(),
@@ -528,27 +745,61 @@ mod tests {
         let tokens = MessageContentConverter::estimate_prompt_tokens(&content);
         assert_eq!(
             tokens,
-            count_tokens("hello world") + (2 * INPUT_IMAGE_TOKEN_ESTIMATE)
+            count_tokens("hello world")
+                + count_tokens(&model_image_omitted_placeholder(1))
+                + count_tokens(&model_image_omitted_placeholder(2))
         );
     }
 
     #[test]
-    fn test_to_openai_format_text() {
-        let content = MessageContent::Text("hello".to_string());
-        let openai = MessageContentConverter::to_openai_format(&content);
-        assert_eq!(openai, json!("hello"));
+    fn test_to_model_format_omits_images_and_preserves_text_order() {
+        let content = MessageContent::Parts(vec![
+            MessageContentPart::InputText {
+                text: "before".to_string(),
+            },
+            MessageContentPart::InputImage {
+                image_url: Some("data:image/png;base64,sensitive-image-bytes".to_string()),
+                file_id: None,
+                detail: Some("high".to_string()),
+            },
+            MessageContentPart::Text {
+                text: "after".to_string(),
+            },
+        ]);
+
+        let model_content = MessageContentConverter::to_model_format(&content);
+        let parts = model_content.as_array().expect("model content array");
+
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], json!({ "type": "text", "text": "before" }));
+        assert_eq!(
+            parts[1],
+            json!({ "type": "text", "text": MODEL_IMAGE_OMITTED_PLACEHOLDER })
+        );
+        assert_eq!(parts[2], json!({ "type": "text", "text": "after" }));
+        assert!(!model_content.to_string().contains("sensitive-image-bytes"));
+        assert!(!model_content.to_string().contains("image_url"));
     }
 
     #[test]
-    fn test_to_openai_format_parts() {
-        let content = MessageContent::Parts(vec![MessageContentPart::InputText {
-            text: "hello".to_string(),
+    fn test_to_model_format_keeps_legacy_image_only_message_valid() {
+        let content = MessageContent::Parts(vec![MessageContentPart::InputImage {
+            image_url: Some("data:image/png;base64,sensitive-image-bytes".to_string()),
+            file_id: None,
+            detail: None,
         }]);
-        let openai = MessageContentConverter::to_openai_format(&content);
 
-        assert!(openai.is_array());
-        assert_eq!(openai[0]["type"], "text");
-        assert_eq!(openai[0]["text"], "hello");
+        let model_content = MessageContentConverter::to_model_format(&content);
+
+        assert_eq!(
+            model_content,
+            json!([{ "type": "text", "text": MODEL_IMAGE_OMITTED_PLACEHOLDER }])
+        );
+        assert_eq!(
+            MessageContentConverter::estimate_prompt_tokens(&content),
+            count_tokens(MODEL_IMAGE_OMITTED_PLACEHOLDER)
+        );
+        assert!(!model_content.to_string().contains("sensitive-image-bytes"));
     }
 
     #[test]

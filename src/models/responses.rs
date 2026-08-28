@@ -122,6 +122,23 @@ pub struct NewResponse {
     pub metadata_enc: Option<Vec<u8>>,
 }
 
+/// A tool call and its directly linked output inserted as part of a response request.
+#[derive(Debug, Clone)]
+pub struct PersistedToolCallOutputPair {
+    pub tool_call: ToolCall,
+    pub tool_output: ToolOutput,
+}
+
+/// Records inserted atomically before a Responses API stream starts.
+#[derive(Debug, Clone)]
+pub struct PersistedResponseWithToolItems {
+    pub response: Response,
+    pub user_message: UserMessage,
+    pub tool_items: Vec<PersistedToolCallOutputPair>,
+    /// Latest durable item timestamp, used to continue monotonic response item ordering.
+    pub last_item_created_at: DateTime<Utc>,
+}
+
 impl Response {
     pub fn get_by_uuid_and_user(
         conn: &mut PgConnection,
@@ -234,6 +251,68 @@ impl NewResponse {
             .values(self)
             .get_result(conn)
             .map_err(ResponsesError::DatabaseError)
+    }
+
+    /// Inserts a response, its user message, and precomputed tool call/output pairs atomically.
+    ///
+    /// `self.user_id` and `self.conversation_id` are the authoritative ownership values. The
+    /// existing conversation is scoped to that user before any insert, and all child ownership
+    /// and response-link fields are overwritten from the inserted response. Tool item timestamps
+    /// are reassigned monotonically after the database-generated user message timestamp, and each
+    /// output's `tool_call_fk` is overwritten with the directly inserted call's database ID.
+    pub fn create_with_message_and_tool_items(
+        self,
+        conn: &mut PgConnection,
+        mut user_message: NewUserMessage,
+        tool_items: Vec<(NewToolCall, NewToolOutput)>,
+    ) -> Result<PersistedResponseWithToolItems, ResponsesError> {
+        conn.transaction(|tx| {
+            // This method is only for existing conversations. Scope the parent row to the
+            // authenticated user before creating any child records.
+            Conversation::get_by_id_and_user(tx, self.conversation_id, self.user_id)?;
+
+            let response = self.insert(tx)?;
+
+            user_message.conversation_id = response.conversation_id;
+            user_message.response_id = Some(response.id);
+            user_message.user_id = response.user_id;
+            let user_message = user_message.insert(tx)?;
+            let mut last_item_created_at = user_message.created_at;
+
+            let mut persisted_tool_items = Vec::with_capacity(tool_items.len());
+            for (mut new_tool_call, mut new_tool_output) in tool_items {
+                new_tool_call.created_at = last_item_created_at
+                    .checked_add_signed(chrono::Duration::microseconds(1))
+                    .ok_or(ResponsesError::ValidationError)?;
+                new_tool_call.conversation_id = response.conversation_id;
+                new_tool_call.response_id = Some(response.id);
+                new_tool_call.user_id = response.user_id;
+                let tool_call = new_tool_call.insert(tx)?;
+
+                new_tool_output.created_at = tool_call
+                    .created_at
+                    .checked_add_signed(chrono::Duration::microseconds(1))
+                    .ok_or(ResponsesError::ValidationError)?;
+                new_tool_output.conversation_id = response.conversation_id;
+                new_tool_output.response_id = Some(response.id);
+                new_tool_output.user_id = response.user_id;
+                new_tool_output.tool_call_fk = tool_call.id;
+                let tool_output = new_tool_output.insert(tx)?;
+
+                last_item_created_at = tool_output.created_at;
+                persisted_tool_items.push(PersistedToolCallOutputPair {
+                    tool_call,
+                    tool_output,
+                });
+            }
+
+            Ok(PersistedResponseWithToolItems {
+                response,
+                user_message,
+                tool_items: persisted_tool_items,
+                last_item_created_at,
+            })
+        })
     }
 }
 

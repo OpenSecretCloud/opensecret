@@ -10,6 +10,7 @@ use crate::{
         responses::{
             NewAssistantMessage, NewConversation, NewConversationProject, NewReasoningItem,
             NewResponse, NewToolCall, NewToolOutput, NewUserMessage, ResponseStatus,
+            ResponsesError,
         },
         schema::{
             assistant_messages, conversation_projects, conversation_summaries, conversations,
@@ -1122,6 +1123,410 @@ async fn db_destructive_password_reset_wipes_response_storage_cascade() {
     assert_response_storage_counts(&app_state, user.uuid, 0);
 
     let _ = app_state.db.delete_user(&user);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_atomic_response_tool_items_overwrite_child_linkage_and_order_timestamps() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let owner = create_response_transaction_test_user(&app_state, project.id, marker, "owner");
+    let hostile = create_response_transaction_test_user(&app_state, project.id, marker, "hostile");
+    let owner_conversation = insert_response_transaction_test_conversation(&app_state, owner.uuid);
+    let hostile_conversation =
+        insert_response_transaction_test_conversation(&app_state, hostile.uuid);
+
+    let response_uuid = Uuid::new_v4();
+    let message_uuid = Uuid::new_v4();
+    let first_call_uuid = Uuid::new_v4();
+    let first_output_uuid = Uuid::new_v4();
+    let second_call_uuid = Uuid::new_v4();
+    let second_output_uuid = Uuid::new_v4();
+
+    let persisted = app_state
+        .db
+        .create_response_with_message_and_tool_items(
+            response_transaction_test_response(response_uuid, owner.uuid, owner_conversation),
+            NewUserMessage {
+                uuid: message_uuid,
+                conversation_id: hostile_conversation,
+                response_id: Some(i64::MAX),
+                user_id: hostile.uuid,
+                content_enc: vec![1, 2, 3],
+                prompt_tokens: 3,
+            },
+            vec![
+                response_transaction_test_tool_pair(
+                    first_call_uuid,
+                    first_output_uuid,
+                    hostile.uuid,
+                    hostile_conversation,
+                ),
+                response_transaction_test_tool_pair(
+                    second_call_uuid,
+                    second_output_uuid,
+                    hostile.uuid,
+                    hostile_conversation,
+                ),
+            ],
+        )
+        .expect("atomic response transaction should succeed");
+
+    assert_eq!(persisted.response.uuid, response_uuid);
+    assert_eq!(persisted.response.user_id, owner.uuid);
+    assert_eq!(persisted.response.conversation_id, owner_conversation);
+    assert_eq!(persisted.user_message.uuid, message_uuid);
+    assert_eq!(persisted.user_message.user_id, owner.uuid);
+    assert_eq!(persisted.user_message.conversation_id, owner_conversation);
+    assert_eq!(
+        persisted.user_message.response_id,
+        Some(persisted.response.id)
+    );
+    assert_eq!(persisted.tool_items.len(), 2);
+
+    let mut previous_created_at = persisted.user_message.created_at;
+    for pair in &persisted.tool_items {
+        assert_eq!(pair.tool_call.user_id, owner.uuid);
+        assert_eq!(pair.tool_call.conversation_id, owner_conversation);
+        assert_eq!(pair.tool_call.response_id, Some(persisted.response.id));
+        assert_eq!(
+            pair.tool_call
+                .created_at
+                .signed_duration_since(previous_created_at),
+            chrono::Duration::microseconds(1),
+            "each tool call must immediately follow the preceding durable item"
+        );
+
+        assert_eq!(pair.tool_output.user_id, owner.uuid);
+        assert_eq!(pair.tool_output.conversation_id, owner_conversation);
+        assert_eq!(pair.tool_output.response_id, Some(persisted.response.id));
+        assert_eq!(pair.tool_output.tool_call_fk, pair.tool_call.id);
+        assert_eq!(
+            pair.tool_output
+                .created_at
+                .signed_duration_since(pair.tool_call.created_at),
+            chrono::Duration::microseconds(1),
+            "each tool output must immediately follow its directly linked call"
+        );
+
+        previous_created_at = pair.tool_output.created_at;
+    }
+    assert_eq!(persisted.last_item_created_at, previous_created_at);
+
+    assert_response_transaction_row_counts(
+        &app_state,
+        response_uuid,
+        message_uuid,
+        &[first_call_uuid, second_call_uuid],
+        &[first_output_uuid, second_output_uuid],
+        (1, 1, 2, 2),
+    );
+
+    // Text-only Responses requests use the same atomic insert path with no
+    // precomputed tool items; keep that compatibility path covered explicitly.
+    let text_response_uuid = Uuid::new_v4();
+    let text_message_uuid = Uuid::new_v4();
+    let text_only = app_state
+        .db
+        .create_response_with_message_and_tool_items(
+            response_transaction_test_response(text_response_uuid, owner.uuid, owner_conversation),
+            NewUserMessage {
+                uuid: text_message_uuid,
+                conversation_id: owner_conversation,
+                response_id: None,
+                user_id: owner.uuid,
+                content_enc: vec![10, 11, 12],
+                prompt_tokens: 3,
+            },
+            Vec::new(),
+        )
+        .expect("text-only atomic response transaction should succeed");
+
+    assert!(text_only.tool_items.is_empty());
+    assert_eq!(
+        text_only.last_item_created_at,
+        text_only.user_message.created_at
+    );
+    assert_response_transaction_row_counts(
+        &app_state,
+        text_response_uuid,
+        text_message_uuid,
+        &[],
+        &[],
+        (1, 1, 0, 0),
+    );
+
+    let _ = app_state.db.delete_user(&owner);
+    let _ = app_state.db.delete_user(&hostile);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_atomic_response_tool_items_reject_wrong_owner_without_partial_rows() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let conversation_owner =
+        create_response_transaction_test_user(&app_state, project.id, marker, "conversation-owner");
+    let requester =
+        create_response_transaction_test_user(&app_state, project.id, marker, "requester");
+    let conversation_id =
+        insert_response_transaction_test_conversation(&app_state, conversation_owner.uuid);
+
+    let response_uuid = Uuid::new_v4();
+    let message_uuid = Uuid::new_v4();
+    let call_uuid = Uuid::new_v4();
+    let output_uuid = Uuid::new_v4();
+    let result = app_state.db.create_response_with_message_and_tool_items(
+        response_transaction_test_response(response_uuid, requester.uuid, conversation_id),
+        NewUserMessage {
+            uuid: message_uuid,
+            conversation_id,
+            response_id: None,
+            user_id: requester.uuid,
+            content_enc: vec![4, 5, 6],
+            prompt_tokens: 3,
+        },
+        vec![response_transaction_test_tool_pair(
+            call_uuid,
+            output_uuid,
+            requester.uuid,
+            conversation_id,
+        )],
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(DBError::ResponsesError(
+                ResponsesError::ConversationNotFound
+            ))
+        ),
+        "a response must not be created in another user's conversation"
+    );
+    assert_response_transaction_row_counts(
+        &app_state,
+        response_uuid,
+        message_uuid,
+        &[call_uuid],
+        &[output_uuid],
+        (0, 0, 0, 0),
+    );
+
+    let _ = app_state.db.delete_user(&conversation_owner);
+    let _ = app_state.db.delete_user(&requester);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_atomic_response_tool_items_roll_back_on_mid_batch_constraint_failure() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let owner = create_response_transaction_test_user(&app_state, project.id, marker, "rollback");
+    let conversation_id = insert_response_transaction_test_conversation(&app_state, owner.uuid);
+
+    let response_uuid = Uuid::new_v4();
+    let message_uuid = Uuid::new_v4();
+    let first_call_uuid = Uuid::new_v4();
+    let second_call_uuid = Uuid::new_v4();
+    let duplicate_output_uuid = Uuid::new_v4();
+    let result = app_state.db.create_response_with_message_and_tool_items(
+        response_transaction_test_response(response_uuid, owner.uuid, conversation_id),
+        NewUserMessage {
+            uuid: message_uuid,
+            conversation_id,
+            response_id: None,
+            user_id: owner.uuid,
+            content_enc: vec![7, 8, 9],
+            prompt_tokens: 3,
+        },
+        vec![
+            response_transaction_test_tool_pair(
+                first_call_uuid,
+                duplicate_output_uuid,
+                owner.uuid,
+                conversation_id,
+            ),
+            response_transaction_test_tool_pair(
+                second_call_uuid,
+                duplicate_output_uuid,
+                owner.uuid,
+                conversation_id,
+            ),
+        ],
+    );
+
+    assert!(
+        matches!(
+            result,
+            Err(DBError::ResponsesError(ResponsesError::DatabaseError(
+                diesel::result::Error::DatabaseError(
+                    diesel::result::DatabaseErrorKind::UniqueViolation,
+                    _
+                )
+            )))
+        ),
+        "the second output must fail specifically on its duplicate UUID"
+    );
+    assert_response_transaction_row_counts(
+        &app_state,
+        response_uuid,
+        message_uuid,
+        &[first_call_uuid, second_call_uuid],
+        &[duplicate_output_uuid],
+        (0, 0, 0, 0),
+    );
+
+    let _ = app_state.db.delete_user(&owner);
+}
+
+fn create_response_transaction_test_user(
+    app_state: &AppState,
+    project_id: i32,
+    marker: Uuid,
+    label: &str,
+) -> User {
+    app_state
+        .db
+        .create_user(NewUser::new(
+            Some(format!("atomic-response-{label}-{marker}@example.com")),
+            None,
+            project_id,
+        ))
+        .expect("response transaction test user should insert")
+}
+
+fn insert_response_transaction_test_conversation(app_state: &AppState, user_id: Uuid) -> i64 {
+    let conn = &mut app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("test database connection should be available");
+
+    NewConversation {
+        uuid: Uuid::new_v4(),
+        user_id,
+        project_id: None,
+        is_pinned: false,
+        metadata_enc: None,
+    }
+    .insert(conn)
+    .expect("response transaction test conversation should insert")
+    .id
+}
+
+fn response_transaction_test_response(
+    uuid: Uuid,
+    user_id: Uuid,
+    conversation_id: i64,
+) -> NewResponse {
+    NewResponse {
+        uuid,
+        user_id,
+        conversation_id,
+        status: ResponseStatus::InProgress,
+        model: "atomic-response-transaction-test".to_string(),
+        temperature: None,
+        top_p: None,
+        max_output_tokens: None,
+        tool_choice: None,
+        parallel_tool_calls: false,
+        store: true,
+        metadata_enc: None,
+    }
+}
+
+fn response_transaction_test_tool_pair(
+    call_uuid: Uuid,
+    output_uuid: Uuid,
+    hostile_user_id: Uuid,
+    hostile_conversation_id: i64,
+) -> (NewToolCall, NewToolOutput) {
+    (
+        NewToolCall {
+            uuid: call_uuid,
+            conversation_id: hostile_conversation_id,
+            response_id: Some(i64::MAX),
+            user_id: hostile_user_id,
+            name: "read_image".to_string(),
+            arguments_enc: Some(vec![10, 11, 12]),
+            argument_tokens: 3,
+            status: "completed".to_string(),
+            created_at: Utc::now(),
+        },
+        NewToolOutput {
+            uuid: output_uuid,
+            conversation_id: hostile_conversation_id,
+            response_id: Some(i64::MAX),
+            user_id: hostile_user_id,
+            tool_call_fk: i64::MAX,
+            output_enc: vec![13, 14, 15],
+            output_tokens: 3,
+            status: "completed".to_string(),
+            error: None,
+            created_at: Utc::now(),
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assert_response_transaction_row_counts(
+    app_state: &AppState,
+    response_uuid: Uuid,
+    message_uuid: Uuid,
+    call_uuids: &[Uuid],
+    output_uuids: &[Uuid],
+    expected: (i64, i64, i64, i64),
+) {
+    let conn = &mut app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("test database connection should be available");
+
+    let response_count = responses::table
+        .filter(responses::uuid.eq(response_uuid))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("response count should query");
+    let message_count = user_messages::table
+        .filter(user_messages::uuid.eq(message_uuid))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("user message count should query");
+    let call_count = tool_calls::table
+        .filter(tool_calls::uuid.eq_any(call_uuids))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("tool call count should query");
+    let output_count = tool_outputs::table
+        .filter(tool_outputs::uuid.eq_any(output_uuids))
+        .count()
+        .get_result::<i64>(conn)
+        .expect("tool output count should query");
+
+    assert_eq!(
+        (response_count, message_count, call_count, output_count),
+        expected,
+        "response transaction row counts"
+    );
 }
 
 async fn build_local_test_app_state(database_url: String) -> AppState {

@@ -35,8 +35,9 @@ use crate::models::responses::{
     validate_conversation_project_limit, AssistantMessage, Conversation, ConversationProject,
     ConversationProjectFilter, NewAssistantMessage, NewConversation, NewConversationProject,
     NewReasoningItem, NewResponse, NewToolCall, NewToolOutput, NewUserInstruction, NewUserMessage,
-    ProjectInstructionUpdate, RawThreadMessage, RawThreadMessageMetadata, ReasoningItem, Response,
-    ResponseStatus, ResponsesError, ToolCall, ToolOutput, UserInstruction, UserMessage,
+    PersistedResponseWithToolItems, ProjectInstructionUpdate, RawThreadMessage,
+    RawThreadMessageMetadata, ReasoningItem, Response, ResponseStatus, ResponsesError, ToolCall,
+    ToolOutput, UserInstruction, UserMessage,
 };
 use crate::models::schema::users;
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
@@ -591,6 +592,12 @@ pub trait DBConnection {
 
     // Responses (job tracker)
     fn create_response(&self, new_response: NewResponse) -> Result<Response, DBError>;
+    fn create_response_with_message_and_tool_items(
+        &self,
+        new_response: NewResponse,
+        user_message: NewUserMessage,
+        tool_items: Vec<(NewToolCall, NewToolOutput)>,
+    ) -> Result<PersistedResponseWithToolItems, DBError>;
     fn get_response_by_uuid_and_user(&self, uuid: Uuid, user_id: Uuid)
         -> Result<Response, DBError>;
     fn update_response_status(
@@ -2422,6 +2429,18 @@ impl DBConnection for PostgresConnection {
     fn create_response(&self, new_response: NewResponse) -> Result<Response, DBError> {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_response.insert(conn).map_err(DBError::from)
+    }
+
+    fn create_response_with_message_and_tool_items(
+        &self,
+        new_response: NewResponse,
+        user_message: NewUserMessage,
+        tool_items: Vec<(NewToolCall, NewToolOutput)>,
+    ) -> Result<PersistedResponseWithToolItems, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        new_response
+            .create_with_message_and_tool_items(conn, user_message, tool_items)
+            .map_err(DBError::from)
     }
 
     fn get_response_by_uuid_and_user(

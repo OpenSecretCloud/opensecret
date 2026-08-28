@@ -1070,6 +1070,23 @@ pub struct NewToolOutput {
     pub created_at: DateTime<Utc>,
 }
 
+impl ToolOutput {
+    pub fn get_by_uuid(
+        conn: &mut PgConnection,
+        uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<ToolOutput, ResponsesError> {
+        tool_outputs::table
+            .filter(tool_outputs::uuid.eq(uuid))
+            .filter(tool_outputs::user_id.eq(user_id))
+            .first::<ToolOutput>(conn)
+            .map_err(|e| match e {
+                diesel::result::Error::NotFound => ResponsesError::ToolOutputNotFound,
+                _ => ResponsesError::DatabaseError(e),
+            })
+    }
+}
+
 impl NewToolOutput {
     pub fn insert(&self, conn: &mut PgConnection) -> Result<ToolOutput, ResponsesError> {
         diesel::insert_into(tool_outputs::table)
@@ -1184,6 +1201,17 @@ pub struct NewReasoningItem {
 }
 
 impl ReasoningItem {
+    pub fn get_by_uuid(
+        conn: &mut PgConnection,
+        item_uuid: Uuid,
+    ) -> Result<Option<ReasoningItem>, ResponsesError> {
+        reasoning_items::table
+            .filter(reasoning_items::uuid.eq(item_uuid))
+            .first::<ReasoningItem>(conn)
+            .optional()
+            .map_err(ResponsesError::DatabaseError)
+    }
+
     pub fn update(
         conn: &mut PgConnection,
         item_uuid: Uuid,

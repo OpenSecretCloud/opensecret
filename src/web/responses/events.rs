@@ -9,7 +9,7 @@ use uuid::Uuid;
 use super::constants::{
     ERROR_DATA_ENCRYPTION_FAILED, ERROR_DATA_SERIALIZATION_FAILED, EVENT_RESPONSE_CANCELLED,
     EVENT_RESPONSE_COMPLETED, EVENT_RESPONSE_CONTENT_PART_ADDED, EVENT_RESPONSE_CONTENT_PART_DONE,
-    EVENT_RESPONSE_CREATED, EVENT_RESPONSE_ERROR, EVENT_RESPONSE_IN_PROGRESS,
+    EVENT_RESPONSE_CREATED, EVENT_RESPONSE_FAILED, EVENT_RESPONSE_IN_PROGRESS,
     EVENT_RESPONSE_OUTPUT_ITEM_ADDED, EVENT_RESPONSE_OUTPUT_ITEM_DONE,
     EVENT_RESPONSE_OUTPUT_TEXT_DELTA, EVENT_RESPONSE_OUTPUT_TEXT_DONE,
     EVENT_RESPONSE_REASONING_TEXT_DELTA, EVENT_RESPONSE_REASONING_TEXT_DONE,
@@ -17,7 +17,7 @@ use super::constants::{
 };
 use super::handlers::{
     encrypt_event, ResponseCancelledEvent, ResponseCompletedEvent, ResponseContentPartAddedEvent,
-    ResponseContentPartDoneEvent, ResponseCreatedEvent, ResponseErrorEvent,
+    ResponseContentPartDoneEvent, ResponseCreatedEvent, ResponseFailedEvent,
     ResponseInProgressEvent, ResponseOutputItemAddedEvent, ResponseOutputItemDoneEvent,
     ResponseOutputTextDeltaEvent, ResponseOutputTextDoneEvent, ResponseReasoningTextDeltaEvent,
     ResponseReasoningTextDoneEvent, ToolCallCreatedEvent, ToolOutputCreatedEvent,
@@ -141,7 +141,7 @@ pub enum ResponseEvent {
     OutputItemDone(ResponseOutputItemDoneEvent),
     Completed(ResponseCompletedEvent),
     Cancelled(ResponseCancelledEvent),
-    Error(ResponseErrorEvent),
+    Failed(ResponseFailedEvent),
     ToolCallCreated(ToolCallCreatedEvent),
     ToolOutputCreated(ToolOutputCreatedEvent),
 }
@@ -162,7 +162,7 @@ impl ResponseEvent {
             ResponseEvent::OutputItemDone(_) => EVENT_RESPONSE_OUTPUT_ITEM_DONE,
             ResponseEvent::Completed(_) => EVENT_RESPONSE_COMPLETED,
             ResponseEvent::Cancelled(_) => EVENT_RESPONSE_CANCELLED,
-            ResponseEvent::Error(_) => EVENT_RESPONSE_ERROR,
+            ResponseEvent::Failed(_) => EVENT_RESPONSE_FAILED,
             ResponseEvent::ToolCallCreated(_) => EVENT_TOOL_CALL_CREATED,
             ResponseEvent::ToolOutputCreated(_) => EVENT_TOOL_OUTPUT_CREATED,
         }
@@ -187,7 +187,7 @@ impl ResponseEvent {
             ResponseEvent::Cancelled(e) => {
                 emitter.emit_without_sequence(self.event_type(), e).await
             }
-            ResponseEvent::Error(e) => emitter.emit_without_sequence(self.event_type(), e).await,
+            ResponseEvent::Failed(e) => emitter.emit(self.event_type(), e).await,
             ResponseEvent::ToolCallCreated(e) => emitter.emit(self.event_type(), e).await,
             ResponseEvent::ToolOutputCreated(e) => emitter.emit(self.event_type(), e).await,
         }
@@ -198,8 +198,8 @@ impl ResponseEvent {
 mod tests {
     use super::*;
     use crate::web::responses::constants::{
-        OBJECT_TYPE_RESPONSE, STATUS_IN_PROGRESS, TEXT_FORMAT_TYPE, TOOL_CHOICE_AUTO,
-        TRUNCATION_DISABLED,
+        OBJECT_TYPE_RESPONSE, STATUS_FAILED, STATUS_IN_PROGRESS, TEXT_FORMAT_TYPE,
+        TOOL_CHOICE_AUTO, TRUNCATION_DISABLED,
     };
 
     #[derive(Serialize)]
@@ -236,48 +236,79 @@ mod tests {
         use uuid::Uuid;
 
         // Test that event types map correctly
+        let response = ResponsesCreateResponse {
+            id: Uuid::new_v4(),
+            object: OBJECT_TYPE_RESPONSE,
+            created_at: 0,
+            status: STATUS_IN_PROGRESS.to_string(),
+            background: false,
+            error: None,
+            incomplete_details: None,
+            instructions: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            model: "test".to_string(),
+            output: vec![],
+            parallel_tool_calls: false,
+            previous_response_id: None,
+            prompt_cache_key: None,
+            reasoning: ReasoningInfo {
+                effort: None,
+                summary: None,
+            },
+            safety_identifier: None,
+            store: true,
+            temperature: 1.0,
+            text: TextFormat {
+                format: TextFormatSpec {
+                    format_type: TEXT_FORMAT_TYPE.to_string(),
+                },
+            },
+            tool_choice: TOOL_CHOICE_AUTO.to_string(),
+            tools: vec![],
+            top_logprobs: 0,
+            top_p: 1.0,
+            truncation: TRUNCATION_DISABLED,
+            usage: None,
+            user: None,
+            metadata: None,
+        };
         let created = ResponseEvent::Created(ResponseCreatedEvent {
             event_type: EVENT_RESPONSE_CREATED,
-            response: ResponsesCreateResponse {
-                id: Uuid::new_v4(),
-                object: OBJECT_TYPE_RESPONSE,
-                created_at: 0,
-                status: STATUS_IN_PROGRESS.to_string(),
-                background: false,
-                error: None,
-                incomplete_details: None,
-                instructions: None,
-                max_output_tokens: None,
-                max_tool_calls: None,
-                model: "test".to_string(),
-                output: vec![],
-                parallel_tool_calls: false,
-                previous_response_id: None,
-                prompt_cache_key: None,
-                reasoning: ReasoningInfo {
-                    effort: None,
-                    summary: None,
-                },
-                safety_identifier: None,
-                store: true,
-                temperature: 1.0,
-                text: TextFormat {
-                    format: TextFormatSpec {
-                        format_type: TEXT_FORMAT_TYPE.to_string(),
-                    },
-                },
-                tool_choice: TOOL_CHOICE_AUTO.to_string(),
-                tools: vec![],
-                top_logprobs: 0,
-                top_p: 1.0,
-                truncation: TRUNCATION_DISABLED,
-                usage: None,
-                user: None,
-                metadata: None,
-            },
+            response: response.clone(),
             sequence_number: 0,
         });
 
         assert_eq!(created.event_type(), EVENT_RESPONSE_CREATED);
+
+        let failed_payload = ResponseFailedEvent {
+            event_type: EVENT_RESPONSE_FAILED,
+            response: ResponsesCreateResponse {
+                status: STATUS_FAILED.to_string(),
+                error: Some(ResponseError {
+                    code: "rate_limit_exceeded".to_string(),
+                    message: "Inference capacity is temporarily unavailable.".to_string(),
+                }),
+                ..response
+            },
+            sequence_number: 1,
+            opensecret: Some(OpenSecretResponseError {
+                error_contract: "1",
+                error_code: "inference_capacity",
+            }),
+        };
+        let serialized = serde_json::to_value(&failed_payload).unwrap();
+        assert_eq!(serialized["type"], EVENT_RESPONSE_FAILED);
+        assert_eq!(serialized["response"]["status"], STATUS_FAILED);
+        assert_eq!(
+            serialized["response"]["error"]["code"],
+            "rate_limit_exceeded"
+        );
+        assert!(serialized.get("error").is_none());
+        assert_eq!(serialized["opensecret"]["error_code"], "inference_capacity");
+        assert_eq!(
+            ResponseEvent::Failed(failed_payload).event_type(),
+            EVENT_RESPONSE_FAILED
+        );
     }
 }

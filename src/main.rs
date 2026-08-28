@@ -54,7 +54,7 @@ use crate::{
 use crate::{encrypt::create_new_encryption_key, jwt::validate_jwt};
 use aws_credentials::{AwsCredentialManager, AwsCredentials};
 use axum::{
-    http::{HeaderName, HeaderValue, StatusCode},
+    http::{header, HeaderName, HeaderValue, StatusCode},
     middleware::{from_fn, from_fn_with_state, Next},
     response::{IntoResponse, Response},
     Json,
@@ -165,10 +165,13 @@ const ENCRYPTION_SESSION_IDLE_TTL: Duration = Duration::from_secs(65 * 60);
 
 pub(crate) const ERROR_CONTRACT_HEADER: &str = "x-opensecret-error-contract";
 pub(crate) const ERROR_CODE_HEADER: &str = "x-opensecret-error-code";
-const ERROR_CONTRACT_VERSION: &str = "1";
+pub(crate) const CLIENT_REPLAY_HEADER: &str = "x-opensecret-client-replay";
+pub(crate) const ERROR_CONTRACT_VERSION: &str = "1";
 const SESSION_NOT_FOUND_ERROR_CODE: &str = "session_not_found";
 const ACCESS_TOKEN_EXPIRED_ERROR_CODE: &str = "access_token_expired";
 const IMAGE_DESCRIPTION_UNAVAILABLE_ERROR_CODE: &str = "image_description_unavailable";
+pub(crate) const INFERENCE_CAPACITY_ERROR_CODE: &str = "inference_capacity";
+const CLIENT_REPLAY_SAFE: &str = "safe";
 
 type PendingAttestationKey = [u8; 32];
 pub(crate) type SessionLease = CacheLease<SessionState>;
@@ -375,6 +378,12 @@ pub enum ApiError {
 
     #[error("Upstream provider temporarily unavailable")]
     ImageDescriptionUnavailable,
+    #[error("Inference capacity is temporarily unavailable")]
+    InferenceCapacity {
+        status: StatusCode,
+        retry_after: Option<Duration>,
+        client_replay_safe: bool,
+    },
 
     #[error("Bad Request")]
     BadRequest,
@@ -437,6 +446,18 @@ pub enum ApiError {
     TooManyRequests,
 }
 
+impl ApiError {
+    pub(crate) fn with_client_replay_safe(mut self) -> Self {
+        if let Self::InferenceCapacity {
+            client_replay_safe, ..
+        } = &mut self
+        {
+            *client_replay_safe = true;
+        }
+        self
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let status = match &self {
@@ -447,6 +468,7 @@ impl IntoResponse for ApiError {
             ApiError::InternalServerError => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::ImageDescriptionUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::InferenceCapacity { status, .. } => *status,
             ApiError::BadRequest => StatusCode::BAD_REQUEST,
             ApiError::SessionNotFound => StatusCode::BAD_REQUEST,
             ApiError::Conflict => StatusCode::CONFLICT,
@@ -471,6 +493,7 @@ impl IntoResponse for ApiError {
             ApiError::SessionNotFound => Some(SESSION_NOT_FOUND_ERROR_CODE),
             ApiError::AccessTokenExpired => Some(ACCESS_TOKEN_EXPIRED_ERROR_CODE),
             ApiError::ImageDescriptionUnavailable => Some(IMAGE_DESCRIPTION_UNAVAILABLE_ERROR_CODE),
+            ApiError::InferenceCapacity { .. } => Some(INFERENCE_CAPACITY_ERROR_CODE),
             _ => None,
         };
         let mut response = (
@@ -489,6 +512,24 @@ impl IntoResponse for ApiError {
             response
                 .headers_mut()
                 .insert(ERROR_CODE_HEADER, HeaderValue::from_static(error_code));
+        }
+        if let ApiError::InferenceCapacity {
+            retry_after,
+            client_replay_safe,
+            ..
+        } = self
+        {
+            if client_replay_safe {
+                response.headers_mut().insert(
+                    CLIENT_REPLAY_HEADER,
+                    HeaderValue::from_static(CLIENT_REPLAY_SAFE),
+                );
+            }
+            if let Some(retry_after) = retry_after {
+                if let Ok(value) = HeaderValue::from_str(&retry_after.as_secs().to_string()) {
+                    response.headers_mut().insert(header::RETRY_AFTER, value);
+                }
+            }
         }
         response
     }
@@ -626,6 +667,42 @@ mod api_error_contract_tests {
             None,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn inference_capacity_contract_is_sanitized_and_replay_is_explicit() {
+        let response = ApiError::InferenceCapacity {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Some(Duration::from_secs(9)),
+            client_replay_safe: true,
+        }
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[ERROR_CONTRACT_HEADER], "1");
+        assert_eq!(
+            response.headers()[ERROR_CODE_HEADER],
+            INFERENCE_CAPACITY_ERROR_CODE
+        );
+        assert_eq!(response.headers()[CLIENT_REPLAY_HEADER], "safe");
+        assert_eq!(response.headers()[header::RETRY_AFTER], "9");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.as_ref(),
+            br#"{"status":429,"message":"Inference capacity is temporarily unavailable"}"#
+        );
+
+        let response = ApiError::InferenceCapacity {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: None,
+            client_replay_safe: false,
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(CLIENT_REPLAY_HEADER).is_none());
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
     }
 }
 
@@ -3868,6 +3945,8 @@ async fn main() -> Result<(), Error> {
         .expose_headers([
             HeaderName::from_static(ERROR_CONTRACT_HEADER),
             HeaderName::from_static(ERROR_CODE_HEADER),
+            HeaderName::from_static(CLIENT_REPLAY_HEADER),
+            header::RETRY_AFTER,
         ])
         // allow requests from any origin
         .allow_origin(Any);

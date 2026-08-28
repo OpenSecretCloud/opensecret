@@ -23,10 +23,11 @@ use crate::{
     web::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::{
-            ensure_completion_model_access, get_chat_completion_response,
-            get_chat_completion_response_for_expected_route, prepare_completion_request,
-            BillingContext, CompletionChunk, CompletionExecutionError, PinnedCompletionRequest,
-            ServerSelectedCompletionRoute,
+            ensure_completion_model_access, finish_started_completion,
+            get_chat_completion_response, get_chat_completion_response_for_expected_route,
+            prepare_completion_request, start_chat_completion_response, BillingContext,
+            CompletionChunk, CompletionExecutionError, PinnedCompletionRequest,
+            ServerSelectedCompletionRoute, StartedCompletion,
         },
         openai_auth::AuthMethod,
         responses::{
@@ -45,7 +46,7 @@ use crate::{
             ResponseBuilder, ResponseEvent, SseEventEmitter,
         },
     },
-    ApiError, AppState,
+    ApiError, AppState, ERROR_CONTRACT_VERSION, INFERENCE_CAPACITY_ERROR_CODE,
 };
 use axum::{
     extract::{Path, State},
@@ -60,7 +61,7 @@ use axum::{
 };
 use base64::Engine;
 use chrono::Utc;
-use futures::Stream;
+use futures::{FutureExt, Stream};
 use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -70,13 +71,17 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::time::Instant as TokioInstant;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 const RESPONSES_SSE_KEEPALIVE_INTERVAL_SECS: u64 = 1;
 const MAX_WEB_SEARCH_TOOL_TURNS_FREE: usize = 5;
 const MAX_WEB_SEARCH_TOOL_TURNS_PAID: usize = 30;
+const DEFAULT_RESPONSE_OUTPUT_TOKEN_BUDGET: i32 = 4096;
+const MAX_RESPONSE_OUTPUT_TOKEN_BUDGET: i32 = 4096;
+const RESPONSE_EXECUTION_DEADLINE: Duration = Duration::from_secs(10 * 60);
 
 // Default functions for serde
 fn default_store() -> bool {
@@ -202,7 +207,128 @@ struct StreamedToolCall {
 #[derive(Debug, Clone)]
 enum AssistantTurnOutcome {
     ToolCall(ModelToolCall),
-    Final,
+    Final { finish_reason: String },
+}
+
+struct AssistantTurnResult {
+    outcome: AssistantTurnOutcome,
+    completion_tokens: i32,
+    completion_tokens_seen: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResponseExecutionPolicy {
+    deadline: TokioInstant,
+    max_model_turns: usize,
+    max_tool_executions: usize,
+    output_token_budget: i32,
+}
+
+impl ResponseExecutionPolicy {
+    fn new(body: &ResponsesCreateRequest, model_plan: ModelPlan, tools_enabled: bool) -> Self {
+        let output_token_budget = body
+            .max_output_tokens
+            .unwrap_or(DEFAULT_RESPONSE_OUTPUT_TOKEN_BUDGET)
+            .clamp(1, MAX_RESPONSE_OUTPUT_TOKEN_BUDGET);
+        let max_tool_executions = if tools_enabled {
+            web_search_tool_turn_limit(model_plan)
+        } else {
+            0
+        };
+        let max_model_turns = if tools_enabled {
+            max_tool_executions + 2
+        } else {
+            1
+        };
+        Self {
+            deadline: TokioInstant::now() + RESPONSE_EXECUTION_DEADLINE,
+            max_model_turns,
+            max_tool_executions,
+            output_token_budget,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicResponseFailure {
+    CapacityRateLimited,
+    CapacityOverloaded,
+    DeadlineExceeded,
+    Internal,
+}
+
+impl PublicResponseFailure {
+    fn from_completion_error(error: &CompletionExecutionError) -> Self {
+        match error.terminal() {
+            Some(AttemptTerminal::Failed { failure, .. })
+                if failure.kind == crate::inference::AttemptFailureKind::CapacityRejected =>
+            {
+                if failure.status == Some(429) {
+                    Self::CapacityRateLimited
+                } else {
+                    Self::CapacityOverloaded
+                }
+            }
+            _ => Self::Internal,
+        }
+    }
+
+    fn openai_code(self) -> &'static str {
+        match self {
+            Self::CapacityRateLimited => "rate_limit_exceeded",
+            Self::CapacityOverloaded | Self::DeadlineExceeded | Self::Internal => "server_error",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::CapacityRateLimited | Self::CapacityOverloaded => {
+                "Inference capacity is temporarily unavailable."
+            }
+            Self::DeadlineExceeded => "The response exceeded its execution deadline.",
+            Self::Internal => "The response could not be completed.",
+        }
+    }
+
+    fn contract_metadata(self) -> Option<OpenSecretResponseError> {
+        matches!(self, Self::CapacityRateLimited | Self::CapacityOverloaded).then_some(
+            OpenSecretResponseError {
+                error_contract: ERROR_CONTRACT_VERSION,
+                error_code: INFERENCE_CAPACITY_ERROR_CODE,
+            },
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponseTerminal {
+    Completed { finish_reason: String },
+    Failed(PublicResponseFailure),
+    Cancelled,
+}
+
+impl ResponseTerminal {
+    pub(crate) fn status(&self) -> ResponseStatus {
+        match self {
+            Self::Completed { .. } => ResponseStatus::Completed,
+            Self::Failed(_) => ResponseStatus::Failed,
+            Self::Cancelled => ResponseStatus::Cancelled,
+        }
+    }
+}
+
+fn responses_pre_persistence_api_error(
+    error: CompletionExecutionError,
+    completed_image_descriptions: bool,
+) -> ApiError {
+    if completed_image_descriptions {
+        // Descriptor completions have already consumed provider capacity and
+        // published usage. The conversation is still cleanly replayable, but
+        // the whole HTTP request is not side-effect-free.
+        error.into_api_error()
+    } else {
+        error.into_pre_persistence_api_error()
+    }
 }
 
 fn web_search_is_selected(
@@ -406,19 +532,21 @@ mod tests {
         image_description_access, image_description_api_error,
         image_description_attempt_failure_class, maple_kagi_web_search_prompt,
         model_turn_request_without_user_payload, resolve_responses_model,
-        resolve_responses_sampling, wait_for_response_cancellation, web_search_is_selected,
-        web_search_tool_turn_limit, web_search_tool_turn_limit_error,
-        web_search_tool_turn_limit_reached, ClientResponseState, ConversationParam,
-        ImageAttachment, ImageDescriptionFailureClass, ImageDescriptionInput,
+        resolve_responses_sampling, responses_pre_persistence_api_error, send_storage_message,
+        wait_for_response_cancellation, web_search_is_selected, web_search_tool_turn_limit,
+        web_search_tool_turn_limit_error, web_search_tool_turn_limit_reached, ClientResponseState,
+        ConversationParam, ImageAttachment, ImageDescriptionFailureClass, ImageDescriptionInput,
         ImageDescriptionToolPair, InputMessage, MessageContent, MessageContentPart, MessageInput,
-        ResponsesCreateRequest, StorageMessage, StreamedToolCall, MAX_WEB_SEARCH_TOOL_TURNS_FREE,
-        MAX_WEB_SEARCH_TOOL_TURNS_PAID, READ_IMAGE_TOOL_NAME,
+        PublicResponseFailure, ResponseExecutionPolicy, ResponsesCreateRequest, StorageMessage,
+        StreamedToolCall, DEFAULT_RESPONSE_OUTPUT_TOKEN_BUDGET, MAX_RESPONSE_OUTPUT_TOKEN_BUDGET,
+        MAX_WEB_SEARCH_TOOL_TURNS_FREE, MAX_WEB_SEARCH_TOOL_TURNS_PAID, READ_IMAGE_TOOL_NAME,
     };
-    use crate::web::responses::tools;
+    use crate::web::responses::{constants::*, tools};
     use crate::{
         billing::{BillingClient, ChatBillingAccess},
         inference::{AttemptFailure, AttemptFailureKind, AttemptStage, ReplaySafety},
         model_config::{ModelAliasTargets, ModelPlan},
+        web::openai::CompletionExecutionError,
         ApiError,
     };
     use axum::{routing::get, Json, Router};
@@ -427,7 +555,7 @@ mod tests {
     use std::collections::HashMap;
     use tokio::{
         net::TcpListener,
-        sync::{broadcast, mpsc},
+        sync::broadcast,
         time::{timeout, Duration},
     };
     use uuid::Uuid;
@@ -454,6 +582,25 @@ mod tests {
             .expect("load billing access");
         server.abort();
         access
+    }
+
+    #[test]
+    fn completed_image_descriptions_suppress_request_replay_safety() {
+        for (completed_image_descriptions, expected_replay_safe) in [(false, true), (true, false)] {
+            let error = CompletionExecutionError::from(ApiError::InferenceCapacity {
+                status: axum::http::StatusCode::TOO_MANY_REQUESTS,
+                retry_after: Some(Duration::from_secs(7)),
+                client_replay_safe: false,
+            });
+
+            assert!(matches!(
+                responses_pre_persistence_api_error(error, completed_image_descriptions),
+                ApiError::InferenceCapacity {
+                    client_replay_safe,
+                    ..
+                } if client_replay_safe == expected_replay_safe
+            ));
+        }
     }
 
     fn test_image_attachment() -> ImageAttachment {
@@ -576,10 +723,12 @@ mod tests {
         match &client_messages[0] {
             StorageMessage::ToolCall {
                 tool_call_id: actual_id,
+                tool_output_id: actual_output_id,
                 name,
                 arguments: actual_arguments,
             } => {
                 assert_eq!(*actual_id, tool_call_id);
+                assert_eq!(*actual_output_id, tool_output_id);
                 assert_eq!(name, READ_IMAGE_TOOL_NAME);
                 assert_eq!(actual_arguments, &arguments);
             }
@@ -885,44 +1034,107 @@ mod tests {
         let response_uuid = Uuid::new_v4();
         let unrelated_uuid = Uuid::new_v4();
         let (cancel_tx, cancel_rx) = broadcast::channel(8);
-        let (storage_tx, mut storage_rx) = mpsc::channel(2);
-        let (client_tx, mut client_rx) = mpsc::channel(2);
-
-        let listener = tokio::spawn(wait_for_response_cancellation(
-            response_uuid,
-            cancel_rx,
-            storage_tx,
-            client_tx,
-        ));
+        let mut listener = tokio::spawn(wait_for_response_cancellation(response_uuid, cancel_rx));
 
         cancel_tx.send(unrelated_uuid).unwrap();
         assert!(
-            timeout(Duration::from_millis(25), storage_rx.recv())
+            timeout(Duration::from_millis(25), &mut listener)
                 .await
                 .is_err(),
-            "unrelated cancellation should not emit a storage cancellation"
-        );
-        assert!(
-            timeout(Duration::from_millis(25), client_rx.recv())
-                .await
-                .is_err(),
-            "unrelated cancellation should not emit a client cancellation"
-        );
-        assert!(
-            !listener.is_finished(),
             "listener should continue after unrelated cancellation"
         );
 
         cancel_tx.send(response_uuid).unwrap();
+        timeout(Duration::from_secs(1), &mut listener)
+            .await
+            .expect("matching cancellation should finish listener")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_fanout_does_not_commit_to_only_one_channel() {
+        let (tx_storage, mut rx_storage) = tokio::sync::mpsc::channel(1);
+        let (tx_client, mut rx_client) = tokio::sync::mpsc::channel(1);
+        tx_client
+            .send(StorageMessage::Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+            })
+            .await
+            .unwrap();
+
+        let mut fanout = tokio::spawn(async move {
+            send_storage_message(
+                &tx_storage,
+                &tx_client,
+                StorageMessage::Usage {
+                    prompt_tokens: 2,
+                    completion_tokens: 2,
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(timeout(Duration::from_millis(25), &mut fanout)
+            .await
+            .is_err());
+        fanout.abort();
+        let _ = fanout.await;
+
+        assert!(rx_storage.try_recv().is_err());
         assert!(matches!(
-            storage_rx.recv().await,
-            Some(StorageMessage::Cancelled)
+            rx_client.recv().await,
+            Some(StorageMessage::Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1
+            })
         ));
-        assert!(matches!(
-            client_rx.recv().await,
-            Some(StorageMessage::Cancelled)
-        ));
-        listener.await.unwrap();
+        assert!(rx_client.try_recv().is_err());
+    }
+
+    #[test]
+    fn response_execution_policy_hard_bounds_turns_tools_and_output() {
+        let mut body = responses_request_for_model("llama3-3-70b");
+        body.max_output_tokens = None;
+        let free = ResponseExecutionPolicy::new(&body, ModelPlan::Free, true);
+        assert_eq!(free.max_tool_executions, MAX_WEB_SEARCH_TOOL_TURNS_FREE);
+        assert_eq!(free.max_model_turns, MAX_WEB_SEARCH_TOOL_TURNS_FREE + 2);
+        assert_eq!(
+            free.output_token_budget,
+            DEFAULT_RESPONSE_OUTPUT_TOKEN_BUDGET
+        );
+
+        body.max_output_tokens = Some(i32::MAX);
+        let paid = ResponseExecutionPolicy::new(&body, ModelPlan::Paid, true);
+        assert_eq!(paid.max_tool_executions, MAX_WEB_SEARCH_TOOL_TURNS_PAID);
+        assert_eq!(paid.max_model_turns, MAX_WEB_SEARCH_TOOL_TURNS_PAID + 2);
+        assert_eq!(paid.output_token_budget, MAX_RESPONSE_OUTPUT_TOKEN_BUDGET);
+
+        body.max_output_tokens = Some(-5);
+        let no_tools = ResponseExecutionPolicy::new(&body, ModelPlan::Paid, false);
+        assert_eq!(no_tools.max_tool_executions, 0);
+        assert_eq!(no_tools.max_model_turns, 1);
+        assert_eq!(no_tools.output_token_budget, 1);
+    }
+
+    #[test]
+    fn only_capacity_failures_expose_opensecret_terminal_metadata() {
+        let rate_limit = PublicResponseFailure::CapacityRateLimited;
+        assert_eq!(rate_limit.openai_code(), "rate_limit_exceeded");
+        let metadata = rate_limit.contract_metadata().unwrap();
+        assert_eq!(metadata.error_contract, "1");
+        assert_eq!(metadata.error_code, "inference_capacity");
+
+        assert_eq!(
+            PublicResponseFailure::CapacityOverloaded.openai_code(),
+            "server_error"
+        );
+        assert!(PublicResponseFailure::Internal
+            .contract_metadata()
+            .is_none());
+        assert!(PublicResponseFailure::DeadlineExceeded
+            .contract_metadata()
+            .is_none());
     }
 
     #[test]
@@ -1483,6 +1695,27 @@ mod tests {
             Some(tool_call_id_str.as_str())
         );
     }
+
+    #[test]
+    fn client_response_state_marks_only_done_items_completed() {
+        let mut state = ClientResponseState::default();
+        let message_id = Uuid::new_v4();
+        let reasoning_id = Uuid::new_v4();
+
+        state.push_message(message_id);
+        state.push_reasoning(reasoning_id);
+
+        let output_items = state.build_output_items();
+        assert_eq!(output_items[0].status, STATUS_INCOMPLETE);
+        assert_eq!(output_items[1].status, STATUS_INCOMPLETE);
+
+        assert!(state.mark_message_completed(message_id));
+        assert!(state.mark_reasoning_completed(reasoning_id));
+
+        let output_items = state.build_output_items();
+        assert_eq!(output_items[0].status, STATUS_COMPLETED);
+        assert_eq!(output_items[1].status, STATUS_COMPLETED);
+    }
 }
 
 /// Conversation parameter - can be a string UUID or an object with id field
@@ -1768,9 +2001,8 @@ pub struct OutputItem {
 /// Response error structure
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseError {
-    /// Error type
-    #[serde(rename = "type")]
-    pub error_type: String,
+    /// OpenAI-compatible stable error code
+    pub code: String,
 
     /// Error message
     pub message: String,
@@ -1830,15 +2062,21 @@ pub struct ResponseCompletedEvent {
     pub sequence_number: i32,
 }
 
-/// SSE Event wrapper for response.error
+/// SSE Event wrapper for the standard response.failed terminal.
 #[derive(Debug, Clone, Serialize)]
-pub struct ResponseErrorEvent {
-    /// Event type (always "response.error")
+pub struct ResponseFailedEvent {
     #[serde(rename = "type")]
     pub event_type: &'static str,
+    pub response: ResponsesCreateResponse,
+    pub sequence_number: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opensecret: Option<OpenSecretResponseError>,
+}
 
-    /// The error information
-    pub error: ResponseError,
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenSecretResponseError {
+    pub error_contract: &'static str,
+    pub error_code: &'static str,
 }
 
 /// SSE Event wrapper for response.cancelled
@@ -2190,14 +2428,11 @@ pub enum StorageMessage {
         prompt_tokens: i32,
         completion_tokens: i32,
     },
-    ResponseDone {
-        finish_reason: String,
-    },
-    Error(String),
-    Cancelled,
+    Terminal(ResponseTerminal),
     /// Tool-related messages
     ToolCall {
         tool_call_id: Uuid,
+        tool_output_id: Uuid,
         name: String,
         arguments: Value,
     },
@@ -2213,10 +2448,12 @@ enum StreamOutputItemRecord {
     Message {
         id: Uuid,
         text: String,
+        completed: bool,
     },
     Reasoning {
         id: Uuid,
         text: String,
+        completed: bool,
     },
     ToolCall {
         id: Uuid,
@@ -2243,6 +2480,7 @@ impl ClientResponseState {
         self.items.push(StreamOutputItemRecord::Message {
             id: item_id,
             text: String::new(),
+            completed: false,
         });
         self.indices.insert(item_id, output_index);
         output_index as i32
@@ -2253,6 +2491,7 @@ impl ClientResponseState {
         self.items.push(StreamOutputItemRecord::Reasoning {
             id: item_id,
             text: String::new(),
+            completed: false,
         });
         self.indices.insert(item_id, output_index);
         output_index as i32
@@ -2326,14 +2565,49 @@ impl ClientResponseState {
         }
     }
 
+    fn mark_message_completed(&mut self, item_id: Uuid) -> bool {
+        let Some(index) = self.indices.get(&item_id).copied() else {
+            return false;
+        };
+        match self.items.get_mut(index) {
+            Some(StreamOutputItemRecord::Message { completed, .. }) => {
+                *completed = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn mark_reasoning_completed(&mut self, item_id: Uuid) -> bool {
+        let Some(index) = self.indices.get(&item_id).copied() else {
+            return false;
+        };
+        match self.items.get_mut(index) {
+            Some(StreamOutputItemRecord::Reasoning { completed, .. }) => {
+                *completed = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn build_output_items(&self) -> Vec<OutputItem> {
         self.items
             .iter()
             .map(|item| match item {
-                StreamOutputItemRecord::Message { id, text } => OutputItem {
+                StreamOutputItemRecord::Message {
+                    id,
+                    text,
+                    completed,
+                } => OutputItem {
                     id: id.to_string(),
                     output_type: OUTPUT_TYPE_MESSAGE.to_string(),
-                    status: STATUS_COMPLETED.to_string(),
+                    status: if *completed {
+                        STATUS_COMPLETED
+                    } else {
+                        STATUS_INCOMPLETE
+                    }
+                    .to_string(),
                     role: Some(ROLE_ASSISTANT.to_string()),
                     content: Some(vec![
                         ContentPartBuilder::new_output_text(text.clone()).build()
@@ -2343,10 +2617,15 @@ impl ClientResponseState {
                     arguments: None,
                     output: None,
                 },
-                StreamOutputItemRecord::Reasoning { id, .. } => OutputItem {
+                StreamOutputItemRecord::Reasoning { id, completed, .. } => OutputItem {
                     id: id.to_string(),
                     output_type: "reasoning".to_string(),
-                    status: STATUS_COMPLETED.to_string(),
+                    status: if *completed {
+                        STATUS_COMPLETED
+                    } else {
+                        STATUS_INCOMPLETE
+                    }
+                    .to_string(),
                     role: None,
                     content: Some(vec![]),
                     call_id: None,
@@ -2448,6 +2727,7 @@ impl ImageDescriptionToolPair {
         [
             StorageMessage::ToolCall {
                 tool_call_id: self.tool_call_id,
+                tool_output_id: self.tool_output_id,
                 name: READ_IMAGE_TOOL_NAME.to_string(),
                 arguments: self.arguments.clone(),
             },
@@ -3167,6 +3447,7 @@ async fn persist_request_data(
     body: &ResponsesCreateRequest,
     prepared: &PreparedRequest,
     conversation: &crate::models::responses::Conversation,
+    response_uuid: Uuid,
     image_descriptions: &[ImageDescriptionToolPair],
 ) -> Result<PersistedData, ApiError> {
     use crate::models::responses::{NewResponse, ResponseStatus};
@@ -3204,7 +3485,7 @@ async fn persist_request_data(
 
     // Create the Response (job tracker)
     let new_response = NewResponse {
-        uuid: Uuid::new_v4(),
+        uuid: response_uuid,
         user_id: user.uuid,
         conversation_id: conversation.id,
         status: ResponseStatus::InProgress,
@@ -3217,7 +3498,8 @@ async fn persist_request_data(
         store: body.store,
         metadata_enc: metadata_enc.clone(),
     };
-    // Create the simplified user message with extracted UUID.
+    // Create the simplified user message with extracted UUID. The database
+    // fills its response_id from the response inserted in the same transaction.
     let new_msg = NewUserMessage {
         uuid: message_uuid,
         conversation_id: conversation.id,
@@ -3226,7 +3508,6 @@ async fn persist_request_data(
         content_enc: prepared.content_enc.clone(),
         prompt_tokens: prepared.user_message_tokens,
     };
-
     let mut new_tool_items = Vec::with_capacity(image_descriptions.len());
     for pair in image_descriptions {
         let arguments_json = serde_json::to_string(&pair.arguments).map_err(|e| {
@@ -3338,28 +3619,19 @@ async fn execute_tool_call_and_wait(
 
     let tool_call_msg = StorageMessage::ToolCall {
         tool_call_id,
+        tool_output_id,
         name: tool_call.name.clone(),
         arguments: tool_call.arguments.clone(),
     };
 
-    if let Err(e) = tx_storage.send(tool_call_msg.clone()).await {
-        error!(
-            "Critical: Storage channel closed during tool_call for response {} - {:?}",
-            persisted.response.uuid, e
-        );
-        let _ = tx_client
-            .send(StorageMessage::Error(
-                "Internal storage failure - request aborted".to_string(),
-            ))
-            .await;
-        return Err(ApiError::InternalServerError);
-    }
-    if tx_client.try_send(tool_call_msg).is_err() {
-        warn!(
-            "Client channel full or closed, skipping tool_call {} for response {}",
-            tool_call_id, persisted.response.uuid
-        );
-    }
+    send_storage_message(tx_storage, tx_client, tool_call_msg)
+        .await
+        .inspect_err(|_| {
+            error!(
+                "Failed to fan out tool_call for response {}",
+                persisted.response.uuid
+            );
+        })?;
     debug!(
         "Tool loop: enqueued tool_call {} ({}) for response {} in {} ms",
         tool_call_id,
@@ -3418,24 +3690,14 @@ async fn execute_tool_call_and_wait(
         output: tool_output,
     };
 
-    if let Err(e) = tx_storage.send(tool_output_msg.clone()).await {
-        error!(
-            "Critical: Storage channel closed during tool_output for response {} - {:?}",
-            persisted.response.uuid, e
-        );
-        let _ = tx_client
-            .send(StorageMessage::Error(
-                "Internal storage failure - request aborted".to_string(),
-            ))
-            .await;
-        return Err(ApiError::InternalServerError);
-    }
-    if tx_client.try_send(tool_output_msg).is_err() {
-        warn!(
-            "Client channel full or closed, skipping tool_output {} for tool_call {} on response {}",
-            tool_output_id, tool_call_id, persisted.response.uuid
-        );
-    }
+    send_storage_message(tx_storage, tx_client, tool_output_msg)
+        .await
+        .inspect_err(|_| {
+            error!(
+                "Failed to fan out tool_output for response {}",
+                persisted.response.uuid
+            );
+        })?;
     debug!(
         "Tool loop: enqueued tool_output {} for tool_call {} on response {} in {} ms",
         tool_output_id,
@@ -3481,13 +3743,19 @@ async fn send_storage_message(
     tx_client: &mpsc::Sender<StorageMessage>,
     msg: StorageMessage,
 ) -> Result<(), ApiError> {
-    if tx_storage.send(msg.clone()).await.is_err() {
+    // Reserve both bounded queues before committing either copy. If this
+    // future is cancelled while backpressured, the acquired permit is dropped
+    // and neither observer crosses a partial event boundary.
+    let storage_permit = tx_storage.reserve().await.map_err(|_| {
         error!("Storage channel closed unexpectedly");
-        return Err(ApiError::InternalServerError);
-    }
-    if tx_client.try_send(msg).is_err() {
-        warn!("Client channel full or closed");
-    }
+        ApiError::InternalServerError
+    })?;
+    let client_permit = tx_client.reserve().await.map_err(|_| {
+        debug!("Client channel closed while streaming response data");
+        ApiError::InternalServerError
+    })?;
+    storage_permit.send(msg.clone());
+    client_permit.send(msg);
     Ok(())
 }
 
@@ -3561,7 +3829,7 @@ async fn ensure_message_started(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn stream_one_assistant_turn(
+async fn start_responses_assistant_turn(
     state: &Arc<AppState>,
     user: &User,
     body: &ResponsesCreateRequest,
@@ -3569,15 +3837,15 @@ async fn stream_one_assistant_turn(
     headers: &HeaderMap,
     prompt_messages: &[Value],
     tools_enabled: bool,
-    tx_client: &mpsc::Sender<StorageMessage>,
-    tx_storage: &mpsc::Sender<StorageMessage>,
-    next_message_id: &mut Option<Uuid>,
     response_uuid: Uuid,
     conversation_uuid: Uuid,
     tool_turn_count: usize,
     prompt_token_estimate: usize,
-) -> Result<AssistantTurnOutcome, ApiError> {
-    let mut chat_request = build_model_turn_request(body, prompt_messages, tools_enabled);
+    max_output_tokens: i32,
+) -> Result<StartedCompletion, CompletionExecutionError> {
+    let mut turn_body = body.clone();
+    turn_body.max_output_tokens = Some(max_output_tokens);
+    let mut chat_request = build_model_turn_request(&turn_body, prompt_messages, tools_enabled);
 
     let chat_request_bytes = serde_json::to_vec(&chat_request)
         .map(|bytes| bytes.len())
@@ -3601,7 +3869,7 @@ async fn stream_one_assistant_turn(
         pinned_completion.intent().requested_model_id.clone(),
     );
 
-    let mut completion = get_chat_completion_response(
+    start_chat_completion_response(
         state,
         user,
         chat_request.take(),
@@ -3610,7 +3878,22 @@ async fn stream_one_assistant_turn(
         pinned_completion,
     )
     .await
-    .map_err(CompletionExecutionError::into_api_error)?;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_one_assistant_turn(
+    state: &Arc<AppState>,
+    user: &User,
+    started: StartedCompletion,
+    tools_enabled: bool,
+    tx_client: &mpsc::Sender<StorageMessage>,
+    tx_storage: &mpsc::Sender<StorageMessage>,
+    next_message_id: &mut Option<Uuid>,
+    response_uuid: Uuid,
+) -> Result<AssistantTurnResult, ApiError> {
+    let mut completion = finish_started_completion(state, user, started)
+        .await
+        .map_err(CompletionExecutionError::into_api_error)?;
 
     debug!(
         "Received Responses completion stream: request_id={}, execution_id={}, attempt_id={}, provider={}, model={}",
@@ -3627,6 +3910,8 @@ async fn stream_one_assistant_turn(
     let mut reasoning = ReasoningState::NotStarted;
     let mut saw_tool_calls = false;
     let mut ignored_disabled_tool_calls = false;
+    let mut completion_tokens = 0i32;
+    let mut completion_tokens_seen = false;
 
     while let Some(chunk) = completion.stream.recv().await {
         match chunk {
@@ -3768,6 +4053,8 @@ async fn stream_one_assistant_turn(
                 }
             }
             crate::web::openai::CompletionChunk::Usage(usage) => {
+                completion_tokens_seen |= usage.completion_tokens_observed;
+                completion_tokens = completion_tokens.saturating_add(usage.completion_tokens);
                 send_storage_message(
                     tx_storage,
                     tx_client,
@@ -3794,7 +4081,11 @@ async fn stream_one_assistant_turn(
                     );
                     let tool_call = finalize_first_model_tool_call(&streamed_tool_calls)
                         .ok_or(ApiError::InternalServerError)?;
-                    return Ok(AssistantTurnOutcome::ToolCall(tool_call));
+                    return Ok(AssistantTurnResult {
+                        outcome: AssistantTurnOutcome::ToolCall(tool_call),
+                        completion_tokens,
+                        completion_tokens_seen,
+                    });
                 }
 
                 // Ensure a final message item exists even if the model emitted no content.
@@ -3832,15 +4123,13 @@ async fn stream_one_assistant_turn(
                 )
                 .await?;
 
-                send_storage_message(
-                    tx_storage,
-                    tx_client,
-                    StorageMessage::ResponseDone {
+                return Ok(AssistantTurnResult {
+                    outcome: AssistantTurnOutcome::Final {
                         finish_reason: final_finish_reason,
                     },
-                )
-                .await?;
-                return Ok(AssistantTurnOutcome::Final);
+                    completion_tokens,
+                    completion_tokens_seen,
+                });
             }
             crate::web::openai::CompletionChunk::Terminal(AttemptTerminal::Failed {
                 failure,
@@ -3883,17 +4172,37 @@ async fn setup_completion_processor(
     tx_client: mpsc::Sender<StorageMessage>,
     tx_storage: mpsc::Sender<StorageMessage>,
     mut rx_tool_ack: mpsc::Receiver<Result<(), String>>,
-) -> Result<crate::models::responses::Response, ApiError> {
-    let tools_enabled = context.web_search_enabled;
+    first_started: StartedCompletion,
+    execution_policy: ResponseExecutionPolicy,
+) -> ResponseTerminal {
+    let tools_requested = context.web_search_enabled;
     let mut prompt_messages = Arc::as_ref(&context.prompt_messages).clone();
     let mut prompt_token_estimate = context.total_prompt_tokens;
     let mut kagi_allowed_urls = tools::collect_kagi_allowed_urls_from_prompt(&prompt_messages);
+    let mut next_message_id = Some(assistant_message_id);
+    let mut tool_turn_count = 0usize;
+    let mut model_turn_count = 0usize;
+    let mut remaining_output_tokens = execution_policy.output_token_budget;
+    let mut force_final_without_tools = false;
+    let mut first_started = Some(first_started);
 
-    let loop_result: Result<(), ApiError> = async {
-        let mut next_message_id = Some(assistant_message_id);
-        let mut tool_turn_count = 0usize;
-        loop {
-            match stream_one_assistant_turn(
+    loop {
+        if model_turn_count >= execution_policy.max_model_turns || remaining_output_tokens <= 0 {
+            warn!(
+                "Responses execution budget exhausted: response_uuid={}, model_turns={}, max_model_turns={}, remaining_output_tokens={}",
+                persisted.response.uuid,
+                model_turn_count,
+                execution_policy.max_model_turns,
+                remaining_output_tokens
+            );
+            return ResponseTerminal::Failed(PublicResponseFailure::Internal);
+        }
+        model_turn_count += 1;
+        let tools_enabled = tools_requested && !force_final_without_tools;
+
+        let started = match first_started.take() {
+            Some(started) => started,
+            None => match start_responses_assistant_turn(
                 state,
                 user,
                 body,
@@ -3901,71 +4210,114 @@ async fn setup_completion_processor(
                 headers,
                 &prompt_messages,
                 tools_enabled,
-                &tx_client,
-                &tx_storage,
-                &mut next_message_id,
                 persisted.response.uuid,
                 context.conversation.uuid,
                 tool_turn_count,
                 prompt_token_estimate,
+                remaining_output_tokens,
             )
-            .await?
+            .await
             {
-                AssistantTurnOutcome::ToolCall(tool_call) => {
-                    debug!(
-                        "Tool loop: assistant turn requested tool {} for response {}",
-                        tool_call.name, persisted.response.uuid
+                Ok(started) => started,
+                Err(error) => {
+                    let failure = PublicResponseFailure::from_completion_error(&error);
+                    error!(
+                        "Responses provider start failed after persistence: response_uuid={}, failure={:?}",
+                        persisted.response.uuid, failure
                     );
-
-                    tool_turn_count += 1;
-                    execute_tool_call_and_wait(
-                        state,
-                        persisted,
-                        tool_call,
-                        &tx_client,
-                        &tx_storage,
-                        &mut rx_tool_ack,
-                        &mut kagi_allowed_urls,
-                        tool_turn_count,
-                        model_plan,
-                    )
-                    .await?;
-
-                    let internal_system_prompt =
-                        build_internal_system_prompt(tools_enabled, model_plan);
-                    let (rebuilt_messages, rebuilt_tokens) = build_prompt(
-                        state.db.as_ref(),
-                        context.conversation.id,
-                        user.uuid,
-                        user_key,
-                        &body.model,
-                        body.instructions.as_deref(),
-                        Some(&internal_system_prompt),
-                    )?;
-                    prompt_messages = rebuilt_messages;
-                    prompt_token_estimate = rebuilt_tokens;
+                    return ResponseTerminal::Failed(failure);
                 }
-                AssistantTurnOutcome::Final => return Ok(()),
+            },
+        };
+
+        let turn = match stream_one_assistant_turn(
+            state,
+            user,
+            started,
+            tools_enabled,
+            &tx_client,
+            &tx_storage,
+            &mut next_message_id,
+            persisted.response.uuid,
+        )
+        .await
+        {
+            Ok(turn) => turn,
+            Err(_) => return ResponseTerminal::Failed(PublicResponseFailure::Internal),
+        };
+
+        let turn_completion_tokens = turn.completion_tokens.max(0);
+        if turn_completion_tokens > remaining_output_tokens {
+            warn!(
+                "Provider exceeded Responses output budget: response_uuid={}, observed={}, remaining={}",
+                persisted.response.uuid, turn_completion_tokens, remaining_output_tokens
+            );
+            return ResponseTerminal::Failed(PublicResponseFailure::Internal);
+        }
+        remaining_output_tokens -= turn_completion_tokens;
+
+        match turn.outcome {
+            AssistantTurnOutcome::ToolCall(tool_call) => {
+                if !turn.completion_tokens_seen {
+                    warn!(
+                        "Responses tool turn omitted completion-token usage; failing closed: response_uuid={}",
+                        persisted.response.uuid
+                    );
+                    return ResponseTerminal::Failed(PublicResponseFailure::Internal);
+                }
+
+                debug!(
+                    "Tool loop: assistant turn requested tool {} for response {}",
+                    tool_call.name, persisted.response.uuid
+                );
+                tool_turn_count += 1;
+                if execute_tool_call_and_wait(
+                    state,
+                    persisted,
+                    tool_call,
+                    &tx_client,
+                    &tx_storage,
+                    &mut rx_tool_ack,
+                    &mut kagi_allowed_urls,
+                    tool_turn_count,
+                    model_plan,
+                )
+                .await
+                .is_err()
+                {
+                    return ResponseTerminal::Failed(PublicResponseFailure::Internal);
+                }
+                if tool_turn_count > execution_policy.max_tool_executions {
+                    force_final_without_tools = true;
+                }
+
+                let internal_system_prompt =
+                    build_internal_system_prompt(tools_requested, model_plan);
+                let (rebuilt_messages, rebuilt_tokens) = match build_prompt(
+                    state.db.as_ref(),
+                    context.conversation.id,
+                    user.uuid,
+                    user_key,
+                    &body.model,
+                    body.instructions.as_deref(),
+                    Some(&internal_system_prompt),
+                ) {
+                    Ok(prompt) => prompt,
+                    Err(_) => return ResponseTerminal::Failed(PublicResponseFailure::Internal),
+                };
+                prompt_messages = rebuilt_messages;
+                prompt_token_estimate = rebuilt_tokens;
+            }
+            AssistantTurnOutcome::Final { finish_reason } => {
+                return ResponseTerminal::Completed { finish_reason };
             }
         }
     }
-    .await;
-
-    if let Err(e) = loop_result {
-        let msg = StorageMessage::Error(format!("Streaming failed: {:?}", e));
-        let _ = tx_storage.send(msg.clone()).await;
-        let _ = tx_client.try_send(msg);
-        return Err(e);
-    }
-
-    Ok(persisted.response.clone())
 }
 
 async fn wait_for_response_cancellation(
     response_uuid: Uuid,
     mut cancel_rx: broadcast::Receiver<Uuid>,
-    tx_storage: mpsc::Sender<StorageMessage>,
-    tx_client: mpsc::Sender<StorageMessage>,
 ) {
     loop {
         match cancel_rx.recv().await {
@@ -3975,10 +4327,7 @@ async fn wait_for_response_cancellation(
                     response_uuid
                 );
 
-                let _ = tx_storage.send(StorageMessage::Cancelled).await;
-                let _ = tx_client.send(StorageMessage::Cancelled).await;
-
-                trace!("Orchestrator: Cancellation handled, exiting");
+                trace!("Orchestrator: Cancellation selected by supervisor");
                 return;
             }
             Ok(cancelled_id) => {
@@ -4003,6 +4352,115 @@ async fn wait_for_response_cancellation(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise_response_execution(
+    state: Arc<AppState>,
+    user: User,
+    body: ResponsesCreateRequest,
+    pinned_completion: PinnedCompletionRequest,
+    model_plan: ModelPlan,
+    context: BuiltContext,
+    user_key: SecretKey,
+    assistant_message_id: Uuid,
+    persisted: PersistedData,
+    headers: HeaderMap,
+    tx_client: mpsc::Sender<StorageMessage>,
+    tx_storage: mpsc::Sender<StorageMessage>,
+    rx_tool_ack: mpsc::Receiver<Result<(), String>>,
+    terminal_ack: oneshot::Receiver<Result<Option<ResponseTerminal>, String>>,
+    cancel_rx: broadcast::Receiver<Uuid>,
+    first_started: StartedCompletion,
+    execution_policy: ResponseExecutionPolicy,
+) {
+    let response_uuid = persisted.response.uuid;
+    let requested_terminal = {
+        let worker = std::panic::AssertUnwindSafe(setup_completion_processor(
+            &state,
+            &user,
+            &body,
+            &pinned_completion,
+            model_plan,
+            &context,
+            &user_key,
+            assistant_message_id,
+            &persisted,
+            &headers,
+            tx_client.clone(),
+            tx_storage.clone(),
+            rx_tool_ack,
+            first_started,
+            execution_policy,
+        ))
+        .catch_unwind();
+        tokio::pin!(worker);
+
+        tokio::select! {
+            biased;
+            _ = wait_for_response_cancellation(response_uuid, cancel_rx) => {
+                ResponseTerminal::Cancelled
+            }
+            _ = tx_client.closed() => {
+                warn!("Responses client disconnected: response_uuid={}", response_uuid);
+                ResponseTerminal::Failed(PublicResponseFailure::Internal)
+            }
+            _ = tokio::time::sleep_until(execution_policy.deadline) => {
+                warn!("Responses execution deadline reached: response_uuid={}", response_uuid);
+                ResponseTerminal::Failed(PublicResponseFailure::DeadlineExceeded)
+            }
+            result = &mut worker => match result {
+                Ok(terminal) => terminal,
+                Err(_) => {
+                    error!("Responses execution worker panicked: response_uuid={}", response_uuid);
+                    ResponseTerminal::Failed(PublicResponseFailure::Internal)
+                }
+            },
+        }
+    };
+
+    if tx_storage
+        .send(StorageMessage::Terminal(requested_terminal))
+        .await
+        .is_err()
+    {
+        error!(
+            "Storage task closed before terminal persistence: response_uuid={}",
+            response_uuid
+        );
+        return;
+    }
+
+    let authoritative = match terminal_ack.await {
+        Ok(Ok(Some(terminal))) => terminal,
+        Ok(Ok(None)) => {
+            debug!(
+                "Response was deleted before terminal persistence completed: response_uuid={}",
+                response_uuid
+            );
+            return;
+        }
+        Ok(Err(e)) => {
+            error!(
+                "Storage task could not verify terminal persistence: response_uuid={}, error={}",
+                response_uuid, e
+            );
+            return;
+        }
+        Err(_) => {
+            error!(
+                "Storage task dropped terminal acknowledgement: response_uuid={}",
+                response_uuid
+            );
+            return;
+        }
+    };
+
+    // This is the sole client-terminal writer. Awaiting the send preserves all
+    // preceding data under backpressure while the stream remains connected.
+    let _ = tx_client
+        .send(StorageMessage::Terminal(authoritative))
+        .await;
 }
 
 async fn create_response_stream(
@@ -4127,6 +4585,32 @@ async fn create_response_stream(
     );
     let pinned_completion = prepare_completion_request(&state, &user, inference_intent).await?;
 
+    // Start only the first provider request before persistence. A recognized
+    // capacity rejection at this seam proves that no response or user-message
+    // row exists yet, so the caller may safely replay the identical request.
+    // A successful response body remains untouched until Phase 3 commits.
+    let execution_policy =
+        ResponseExecutionPolicy::new(&body, model_plan, context.web_search_enabled);
+    body.max_output_tokens = Some(execution_policy.output_token_budget);
+    let response_uuid = Uuid::new_v4();
+    let model_turn_body = model_turn_request_without_user_payload(&body);
+    let first_started = start_responses_assistant_turn(
+        &state,
+        &user,
+        &model_turn_body,
+        &pinned_completion,
+        &headers,
+        context.prompt_messages.as_ref(),
+        context.web_search_enabled,
+        response_uuid,
+        context.conversation.uuid,
+        0,
+        context.total_prompt_tokens,
+        execution_policy.output_token_budget,
+    )
+    .await
+    .map_err(|error| responses_pre_persistence_api_error(error, !image_descriptions.is_empty()))?;
+
     // Phase 3: Persist request data
     let persisted = persist_request_data(
         &state,
@@ -4134,11 +4618,13 @@ async fn create_response_stream(
         &body,
         &prepared,
         &context.conversation,
+        response_uuid,
         &image_descriptions,
     )
     .await?;
 
-    // Check if first message and spawn title generation task
+    // Capture stream and title data before moving execution state into the
+    // supervisor task.
     let (user_count, assistant_count) =
         context
             .prompt_messages
@@ -4153,29 +4639,23 @@ async fn create_response_stream(
                 }
             });
 
-    if user_count == 1 && assistant_count == 0 {
-        let user_content =
-            MessageContentConverter::extract_text_for_token_counting(&prepared.message_content);
-        spawn_title_generation_task(
-            state.clone(),
+    let title_request = (user_count == 1 && assistant_count == 0).then(|| {
+        (
             context.conversation.id,
             context.conversation.uuid,
-            user.clone(),
             prepared.user_key,
-            user_content,
+            MessageContentConverter::extract_text_for_token_counting(&prepared.message_content),
         )
-        .await;
-    }
-
-    // Capture variables needed inside the stream
+    });
+    let assistant_message_id = prepared.assistant_message_id;
     let response_for_stream = persisted.response.clone();
     let decrypted_metadata = persisted.decrypted_metadata.clone();
-    let assistant_message_id = prepared.assistant_message_id;
     let total_prompt_tokens = context.total_prompt_tokens;
     let response_id = persisted.response.id;
     let response_uuid = persisted.response.uuid;
     // Persist all generated response items on a single monotonic timestamp sequence that
-    // begins immediately after the user message so retrieval order matches stream order.
+    // begins immediately after the last durable request item so retrieval order matches stream
+    // order even when read_image call/output pairs were persisted with the user message.
     let first_response_item_created_at = persisted
         .last_item_created_at
         .checked_add_signed(chrono::Duration::microseconds(1))
@@ -4183,160 +4663,97 @@ async fn create_response_stream(
     let conversation_id = context.conversation.id;
     let user_id = user.uuid;
     let user_key = prepared.user_key;
-    let conversation_for_stream = context.conversation.clone();
-    let prompt_messages = context.prompt_messages.clone();
-    let web_search_enabled = context.web_search_enabled;
-    let image_descriptions_for_stream = Arc::new(image_descriptions);
-    let model_turn_body = model_turn_request_without_user_payload(&body);
-    let pinned_completion_for_stream = pinned_completion.clone();
+    drop(prepared);
+    let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
+    let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
+    let (tx_tool_ack, rx_tool_ack) = mpsc::channel::<Result<(), String>>(8);
+    let (tx_terminal_ack, rx_terminal_ack) =
+        oneshot::channel::<Result<Option<ResponseTerminal>, String>>();
+    let cancel_rx = state.cancellation_broadcast.subscribe();
 
-    // Phases 4-6 now happen INSIDE the stream to start sending events ASAP
+    // The image pairs are already durable. Emit them before the supervisor can
+    // enqueue any assistant output, and never send them back through storage.
+    for pair in &image_descriptions {
+        for message in pair.client_messages() {
+            tx_client
+                .send(message)
+                .await
+                .map_err(|_| ApiError::InternalServerError)?;
+        }
+    }
+
+    let storage_db = state.db.clone();
+    tokio::spawn(async move {
+        storage_task(
+            rx_storage,
+            Some(tx_tool_ack),
+            Some(tx_terminal_ack),
+            storage_db,
+            response_id,
+            response_uuid,
+            first_response_item_created_at,
+            conversation_id,
+            user_id,
+            user_key,
+        )
+        .await;
+    });
+
+    tokio::spawn(supervise_response_execution(
+        state.clone(),
+        user.clone(),
+        model_turn_body,
+        pinned_completion,
+        model_plan,
+        context,
+        user_key,
+        assistant_message_id,
+        persisted,
+        headers,
+        tx_client,
+        tx_storage,
+        rx_tool_ack,
+        rx_terminal_ack,
+        cancel_rx,
+        first_started,
+        execution_policy,
+    ));
+
+    if let Some((conversation_id, conversation_uuid, user_key, user_content)) = title_request {
+        spawn_title_generation_task(
+            state.clone(),
+            conversation_id,
+            conversation_uuid,
+            user.clone(),
+            user_key,
+            user_content,
+        )
+        .await;
+    }
+
+    // Storage and execution are already running; the body only translates the
+    // ordered client channel into encrypted SSE events.
     trace!("Creating SSE event stream for client");
     let event_stream = async_stream::stream! {
         trace!("=== STARTING SSE STREAM ===");
-
-        // Initialize the SSE event emitter
         let mut emitter = SseEventEmitter::new(&state, session_id, 0);
-
-        // Send initial response.created event IMMEDIATELY (before any processing)
-        trace!("Building response.created event");
         let created_response = ResponseBuilder::from_response(&response_for_stream)
             .status(STATUS_IN_PROGRESS)
             .metadata(decrypted_metadata.clone())
             .build();
-
         let created_event = ResponseCreatedEvent {
             event_type: EVENT_RESPONSE_CREATED,
             response: created_response.clone(),
             sequence_number: emitter.sequence_number(),
         };
-
         yield Ok(ResponseEvent::Created(created_event).to_sse_event(&mut emitter).await);
-
-        // Event 2: response.in_progress
         let in_progress_event = ResponseInProgressEvent {
             event_type: EVENT_RESPONSE_IN_PROGRESS,
             response: created_response,
             sequence_number: emitter.sequence_number(),
         };
-
         yield Ok(ResponseEvent::InProgress(in_progress_event).to_sse_event(&mut emitter).await);
 
-        // Phase 4: Create dual streams and spawn storage task
-        trace!("Phase 4: Creating dual streams and spawning storage task");
-        let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
-        let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
-
-        // These pairs are already durable. Queue them only for client emission,
-        // before the orchestrator can enqueue any assistant output.
-        for pair in image_descriptions_for_stream.iter() {
-            for message in pair.client_messages() {
-                let _ = tx_client.send(message).await;
-            }
-        }
-
-        // Create channel for tool persistence acknowledgments (supports multiple tool loops)
-        let (tx_tool_ack, rx_tool_ack) = mpsc::channel::<Result<(), String>>(8);
-
-        let _storage_handle = {
-            let db = state.db.clone();
-
-            tokio::spawn(async move {
-                storage_task(
-                    rx_storage,
-                    Some(tx_tool_ack),
-                    db,
-                    response_id,
-                    response_uuid,
-                    first_response_item_created_at,
-                    conversation_id,
-                    user_id,
-                    user_key,
-                )
-                .await;
-            })
-        };
-
-        // Spawn orchestrator task for phases 5-6 (runs in background, sends events to tx_client)
-        trace!("Spawning background orchestrator for phases 5-6");
-        let orchestrator_tx_client = tx_client.clone();
-        let orchestrator_tx_storage = tx_storage.clone();
-        let orchestrator_state = state.clone();
-        let orchestrator_user = user.clone();
-        let orchestrator_body = model_turn_body.clone();
-        let orchestrator_headers = headers.clone();
-        let orchestrator_response = response_for_stream.clone();
-        let orchestrator_metadata = decrypted_metadata.clone();
-        let orchestrator_last_item_created_at = persisted.last_item_created_at;
-        let orchestrator_conversation = conversation_for_stream.clone();
-        let orchestrator_prompt_messages = prompt_messages.clone();
-        let orchestrator_pinned_completion = pinned_completion_for_stream.clone();
-
-        tokio::spawn(async move {
-            trace!("Orchestrator: Starting phases 5-6 in background");
-
-            // Subscribe to cancellation broadcast. The endpoint lives on a separate
-            // request task, so each stream listens for its own response UUID.
-            let cancel_rx = orchestrator_state.cancellation_broadcast.subscribe();
-            let cancellation_listener = wait_for_response_cancellation(
-                response_uuid,
-                cancel_rx,
-                orchestrator_tx_storage.clone(),
-                orchestrator_tx_client.clone(),
-            );
-
-            // Run phases 5-6 with cancellation support
-            tokio::select! {
-                _ = async {
-                    // Phase 5-6: Run the normal assistant/tool loop
-                    trace!("Orchestrator: Setting up assistant/tool loop");
-
-                    let context_for_completion = BuiltContext {
-                        conversation: orchestrator_conversation,
-                        prompt_messages: orchestrator_prompt_messages,
-                        total_prompt_tokens,
-                        web_search_enabled,
-                    };
-
-                    let persisted_for_completion = PersistedData {
-                        response: orchestrator_response.clone(),
-                        decrypted_metadata: orchestrator_metadata.clone(),
-                        last_item_created_at: orchestrator_last_item_created_at,
-                    };
-
-                    match setup_completion_processor(
-                        &orchestrator_state,
-                        &orchestrator_user,
-                        &orchestrator_body,
-                        &orchestrator_pinned_completion,
-                        model_plan,
-                        &context_for_completion,
-                        &user_key,
-                        assistant_message_id,
-                        &persisted_for_completion,
-                        &orchestrator_headers,
-                        orchestrator_tx_client.clone(),
-                        orchestrator_tx_storage.clone(),
-                        rx_tool_ack,
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            trace!("Orchestrator: Assistant/tool loop completed");
-                        }
-                        Err(e) => {
-                            error!("Orchestrator: Assistant/tool loop failed: {:?}", e);
-                        }
-                    }
-                } => {
-                    trace!("Orchestrator: Phases 5-6 completed normally");
-                }
-
-                _ = cancellation_listener => {}
-            }
-        });
-
-        // NOW immediately start the event loop - it will receive events from orchestrator as they happen
         trace!("Starting event loop to receive messages from background tasks");
         let mut client_state = ClientResponseState::default();
         let mut total_prompt_tokens_used = 0i32;
@@ -4426,6 +4843,7 @@ async fn create_response_stream(
                             .build(),
                     };
                     yield Ok(ResponseEvent::OutputItemDone(output_item_done_event).to_sse_event(&mut emitter).await);
+                    client_state.mark_message_completed(item_id);
                 }
                 StorageMessage::ReasoningStarted { item_id } => {
                     let output_index = client_state.push_reasoning(item_id);
@@ -4503,8 +4921,14 @@ async fn create_response_stream(
                         },
                     };
                     yield Ok(ResponseEvent::OutputItemDone(reasoning_item_done).to_sse_event(&mut emitter).await);
+                    client_state.mark_reasoning_completed(item_id);
                 }
-                StorageMessage::ResponseDone { finish_reason: _finish_reason } => {
+                StorageMessage::Usage { prompt_tokens, completion_tokens } => {
+                    trace!("Client stream received usage data");
+                    total_prompt_tokens_used += prompt_tokens;
+                    total_completion_tokens += completion_tokens;
+                }
+                StorageMessage::Terminal(terminal) => {
                     let usage = build_usage(
                         if total_prompt_tokens_used > 0 {
                             total_prompt_tokens_used
@@ -4513,58 +4937,58 @@ async fn create_response_stream(
                         },
                         total_completion_tokens,
                     );
-
-                    let done_response = ResponseBuilder::from_response(&response_for_stream)
-                        .status(STATUS_COMPLETED)
-                        .output(client_state.build_output_items())
-                        .usage(usage)
-                        .metadata(decrypted_metadata.clone())
-                        .build();
-
-                    let completed_event = ResponseCompletedEvent {
-                        event_type: EVENT_RESPONSE_COMPLETED,
-                        response: done_response,
-                        sequence_number: emitter.sequence_number(),
-                    };
-
-                    yield Ok(ResponseEvent::Completed(completed_event).to_sse_event(&mut emitter).await);
+                    match terminal {
+                        ResponseTerminal::Completed { .. } => {
+                            let done_response = ResponseBuilder::from_response(&response_for_stream)
+                                .status(STATUS_COMPLETED)
+                                .output(client_state.build_output_items())
+                                .usage(usage)
+                                .metadata(decrypted_metadata.clone())
+                                .build();
+                            let completed_event = ResponseCompletedEvent {
+                                event_type: EVENT_RESPONSE_COMPLETED,
+                                response: done_response,
+                                sequence_number: emitter.sequence_number(),
+                            };
+                            yield Ok(ResponseEvent::Completed(completed_event).to_sse_event(&mut emitter).await);
+                        }
+                        ResponseTerminal::Cancelled => {
+                            let cancelled_event = ResponseCancelledEvent {
+                                id: Uuid::new_v4().to_string(),
+                                event_type: EVENT_RESPONSE_CANCELLED,
+                                created_at: Utc::now().timestamp(),
+                                data: ResponseCancelledData { id: response_uuid },
+                            };
+                            yield Ok(ResponseEvent::Cancelled(cancelled_event).to_sse_event(&mut emitter).await);
+                        }
+                        ResponseTerminal::Failed(failure) => {
+                            let failed_response = ResponseBuilder::from_response(&response_for_stream)
+                                .status(STATUS_FAILED)
+                                .output(client_state.build_output_items())
+                                .usage(usage)
+                                .metadata(decrypted_metadata.clone())
+                                .error(ResponseError {
+                                    code: failure.openai_code().to_string(),
+                                    message: failure.message().to_string(),
+                                })
+                                .build();
+                            let failed_event = ResponseFailedEvent {
+                                event_type: EVENT_RESPONSE_FAILED,
+                                response: failed_response,
+                                sequence_number: emitter.sequence_number(),
+                                opensecret: failure.contract_metadata(),
+                            };
+                            yield Ok(ResponseEvent::Failed(failed_event).to_sse_event(&mut emitter).await);
+                        }
+                    }
                     break;
                 }
-                StorageMessage::Usage { prompt_tokens, completion_tokens } => {
-                    trace!("Client stream received usage data");
-                    total_prompt_tokens_used += prompt_tokens;
-                    total_completion_tokens += completion_tokens;
-                }
-                StorageMessage::Cancelled => {
-                    debug!("Client stream received cancellation signal");
-                    // Send response.cancelled event
-                    let cancelled_event = ResponseCancelledEvent {
-                        id: Uuid::new_v4().to_string(),
-                        event_type: EVENT_RESPONSE_CANCELLED,
-                        created_at: Utc::now().timestamp(),
-                        data: ResponseCancelledData {
-                            id: response_uuid,
-                        },
-                    };
-
-                    yield Ok(ResponseEvent::Cancelled(cancelled_event).to_sse_event(&mut emitter).await);
-                    break;
-                }
-                StorageMessage::Error(error_msg) => {
-                    error!("Client stream received error: {}", error_msg);
-                    // Send error event to client
-                    let error_event = ResponseErrorEvent {
-                        event_type: EVENT_RESPONSE_ERROR,
-                        error: ResponseError {
-                            error_type: "stream_error".to_string(),
-                            message: error_msg,
-                        },
-                    };
-
-                    yield Ok(ResponseEvent::Error(error_event).to_sse_event(&mut emitter).await);
-                    break;
-                }
-                StorageMessage::ToolCall { tool_call_id, name, arguments } => {
+                StorageMessage::ToolCall {
+                    tool_call_id,
+                    tool_output_id: _,
+                    name,
+                    arguments,
+                } => {
                     debug!(
                         "Client stream received tool_call {} ({}) for response {}",
                         tool_call_id, name, response_uuid
@@ -4992,6 +5416,10 @@ async fn delete_response(
             _ => ApiError::InternalServerError,
         }
     })?;
+
+    // Stop any in-flight provider/tool work for the deleted response. Storage
+    // treats the now-absent row as an authoritative nonterminal transport stop.
+    let _ = state.cancellation_broadcast.send(id);
 
     let response = DeletedObjectResponse::response(id);
 

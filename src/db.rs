@@ -703,6 +703,8 @@ pub trait DBConnection {
 
     // Reasoning items
     fn create_reasoning_item(&self, new_item: NewReasoningItem) -> Result<ReasoningItem, DBError>;
+    fn get_reasoning_item_by_uuid(&self, item_uuid: Uuid)
+        -> Result<Option<ReasoningItem>, DBError>;
     fn update_reasoning_item(
         &self,
         item_uuid: Uuid,
@@ -715,6 +717,7 @@ pub trait DBConnection {
     fn create_tool_call(&self, new_call: NewToolCall) -> Result<ToolCall, DBError>;
     fn get_tool_call_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<ToolCall, DBError>;
     fn create_tool_output(&self, new_output: NewToolOutput) -> Result<ToolOutput, DBError>;
+    fn get_tool_output_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<ToolOutput, DBError>;
 
     // Context reconstruction
     fn get_conversation_context_messages(
@@ -2885,6 +2888,14 @@ impl DBConnection for PostgresConnection {
         new_item.insert(conn).map_err(DBError::from)
     }
 
+    fn get_reasoning_item_by_uuid(
+        &self,
+        item_uuid: Uuid,
+    ) -> Result<Option<ReasoningItem>, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        ReasoningItem::get_by_uuid(conn, item_uuid).map_err(DBError::from)
+    }
+
     fn update_reasoning_item(
         &self,
         item_uuid: Uuid,
@@ -2911,6 +2922,11 @@ impl DBConnection for PostgresConnection {
     fn create_tool_output(&self, new_output: NewToolOutput) -> Result<ToolOutput, DBError> {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         new_output.insert(conn).map_err(DBError::from)
+    }
+
+    fn get_tool_output_by_uuid(&self, uuid: Uuid, user_id: Uuid) -> Result<ToolOutput, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        ToolOutput::get_by_uuid(conn, uuid, user_id).map_err(DBError::from)
     }
 
     // Context reconstruction

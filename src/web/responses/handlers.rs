@@ -70,7 +70,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    convert::Infallible,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -5790,14 +5789,10 @@ async fn create_response_stream(
 
         if require_explicit_terminal && !saw_terminal {
             error!("Responses client stream closed without a terminal event");
-            let error_event = ResponseErrorEvent {
-                event_type: EVENT_RESPONSE_ERROR,
-                error: ResponseError {
-                    error_type: "stream_error".to_string(),
-                    message: "Response stream ended unexpectedly".to_string(),
-                },
-            };
-            yield Ok(ResponseEvent::Error(error_event).to_sse_event(&mut emitter).await);
+            // No storage-authoritative terminal arrived. Fail the body so the
+            // V2 gateway emits an authenticated transport error, without claiming
+            // that the response reached a durable failed state.
+            yield Err(ApiError::InternalServerError);
         }
 
         // Client stream is done, but storage and upstream tasks continue independently
@@ -5810,7 +5805,7 @@ async fn create_response_stream(
 
 fn responses_sse_response<S>(event_stream: S) -> Response
 where
-    S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
+    S: Stream<Item = Result<Event, ApiError>> + Send + 'static,
 {
     let sse = Sse::new(event_stream).keep_alive(
         KeepAlive::new()

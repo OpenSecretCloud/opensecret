@@ -867,7 +867,20 @@ impl CompletionExecutionError {
     }
 
     pub(crate) fn into_pre_persistence_api_error(self) -> ApiError {
-        self.into_api_error().with_client_replay_safe()
+        let replay_safe = match &self {
+            Self::Request(_) => true,
+            Self::Attempt {
+                terminal: AttemptTerminal::Failed { failure, .. },
+                ..
+            } => failure.replay_safety == ReplaySafety::ProvenPreAcceptance,
+            Self::Attempt { .. } => false,
+        };
+        let error = self.into_api_error();
+        if replay_safe {
+            error.with_client_replay_safe()
+        } else {
+            error
+        }
     }
 }
 
@@ -988,11 +1001,7 @@ fn attempt_failure_from_provider_error(error: &ProviderRequestError) -> AttemptF
                     AttemptFailureKind::HttpStatus
                 },
                 AttemptStage::AwaitingResponse,
-                if is_capacity_rejection {
-                    ReplaySafety::ProvenPreAcceptance
-                } else {
-                    ReplaySafety::NotProvenPreAcceptance
-                },
+                ReplaySafety::NotProvenPreAcceptance,
             )
             .with_upstream_response(
                 upstream.status,
@@ -1604,7 +1613,7 @@ async fn proxy_openai(
         &pinned_completion,
     )
     .await
-    .map_err(CompletionExecutionError::into_api_error)?;
+    .map_err(CompletionExecutionError::into_pre_persistence_api_error)?;
 
     debug!(
         "Received completion stream: request_id={}, execution_id={}, attempt_id={}, provider={}, streaming={}",
@@ -3933,7 +3942,7 @@ mod tests {
         let failure = attempt_failure_from_provider_error(&error);
         assert_eq!(failure.kind, AttemptFailureKind::CapacityRejected);
         assert_eq!(failure.stage, AttemptStage::AwaitingResponse);
-        assert_eq!(failure.replay_safety, ReplaySafety::ProvenPreAcceptance);
+        assert_eq!(failure.replay_safety, ReplaySafety::NotProvenPreAcceptance);
         assert_eq!(failure.status, Some(429));
         assert_eq!(failure.retry_after, Some(Duration::from_secs(17)));
         assert_eq!(
@@ -4008,7 +4017,7 @@ mod tests {
             assert!(!error.to_string().contains("private capacity detail"));
             let failure = attempt_failure_from_provider_error(&error);
             assert_eq!(failure.kind, AttemptFailureKind::CapacityRejected);
-            assert_eq!(failure.replay_safety, ReplaySafety::ProvenPreAcceptance);
+            assert_eq!(failure.replay_safety, ReplaySafety::NotProvenPreAcceptance);
             assert_eq!(failure.status, Some(status));
             assert_eq!(failure.retry_after, Some(Duration::from_secs(11)));
             assert!(matches!(
@@ -4020,6 +4029,54 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn upstream_capacity_failure_does_not_claim_client_replay_safety() {
+        let provider_error = ProviderRequestError::Upstream(UpstreamProviderError {
+            status: 429,
+            retry_after: Some(Duration::from_secs(7)),
+            upstream_request_id: None,
+        });
+        let failure = attempt_failure_from_provider_error(&provider_error);
+        let pinned = pinned_test_completion();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let response = failed_completion_execution(
+            attempt,
+            failure.clone(),
+            public_completion_error(&provider_error, &failure),
+        )
+        .into_pre_persistence_api_error()
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response
+            .headers()
+            .get(crate::CLIENT_REPLAY_HEADER)
+            .is_none());
+        assert_eq!(response.headers()[crate::ERROR_CONTRACT_HEADER], "1");
+        assert_eq!(
+            response.headers()[crate::ERROR_CODE_HEADER],
+            crate::INFERENCE_CAPACITY_ERROR_CODE
+        );
+        assert_eq!(response.headers()[header::RETRY_AFTER], "7");
+    }
+
+    #[test]
+    fn local_pre_send_capacity_failure_marks_client_replay_safe() {
+        let response = CompletionExecutionError::from(ApiError::InferenceCapacity {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: Some(Duration::from_secs(3)),
+            client_replay_safe: false,
+        })
+        .into_pre_persistence_api_error()
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[crate::CLIENT_REPLAY_HEADER], "safe");
+        assert_eq!(response.headers()[header::RETRY_AFTER], "3");
     }
 
     #[tokio::test]
@@ -4211,6 +4268,7 @@ mod tests {
                 &tx,
                 Duration::from_secs(30),
                 None,
+                false,
             ),
         )
         .await
@@ -4258,6 +4316,7 @@ mod tests {
                 &tx,
                 Duration::from_secs(30),
                 Some(&execution),
+                false,
             ),
         )
         .await
@@ -4494,7 +4553,7 @@ mod tests {
         });
         let failure = attempt_failure_from_provider_error(&upstream);
         assert_eq!(failure.kind, AttemptFailureKind::CapacityRejected);
-        assert_eq!(failure.replay_safety, ReplaySafety::ProvenPreAcceptance);
+        assert_eq!(failure.replay_safety, ReplaySafety::NotProvenPreAcceptance);
         assert_eq!(failure.status, Some(429));
         assert_eq!(failure.retry_after, Some(Duration::from_secs(60)));
         assert_eq!(failure.upstream_request_id.as_deref(), Some("request-123"));
@@ -4629,7 +4688,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_statuses_are_explicit_rejections_and_529_is_normalized() {
+    fn capacity_statuses_are_normalized_without_claiming_replay_safety() {
         for (upstream_status, public_status) in [
             (429, StatusCode::TOO_MANY_REQUESTS),
             (503, StatusCode::SERVICE_UNAVAILABLE),
@@ -4642,7 +4701,7 @@ mod tests {
             });
             let failure = attempt_failure_from_provider_error(&provider_error);
             assert_eq!(failure.kind, AttemptFailureKind::CapacityRejected);
-            assert_eq!(failure.replay_safety, ReplaySafety::ProvenPreAcceptance);
+            assert_eq!(failure.replay_safety, ReplaySafety::NotProvenPreAcceptance);
             assert_eq!(failure.status, Some(upstream_status));
             assert!(matches!(
                 public_completion_error(&provider_error, &failure),

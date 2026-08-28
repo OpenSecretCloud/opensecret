@@ -4,6 +4,8 @@ use std::fmt;
 use std::time::Duration;
 use uuid::Uuid;
 
+pub(crate) mod health;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelSelectionMode {
     AutoQuick,

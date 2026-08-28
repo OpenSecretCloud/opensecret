@@ -41,11 +41,24 @@ pub(crate) struct ProviderSpec {
     pub(crate) enabled: bool,
 }
 
+/// Scope of an upstream 429 for a configured completion route.
+///
+/// Tinfoil meters the shared OpenSecret credential per model, while
+/// Continuum/Edgeless documents organization-level limits. Keeping this in the
+/// credential-free registry prevents runtime error text or arbitrary model
+/// strings from defining health-state keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RateLimitScope {
+    ProviderModel,
+    ProviderAccount,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ModelRouteSpec {
     pub(crate) provider: ProviderId,
     pub(crate) provider_model_id: &'static str,
     pub(crate) response_model_id: &'static str,
+    pub(crate) rate_limit_scope: RateLimitScope,
     pub(crate) weight: u16,
     pub(crate) enabled: bool,
 }
@@ -78,7 +91,6 @@ impl ProviderRegistry {
             .find(|model| model.public_model_id == public_model_id)
     }
 
-    #[cfg(test)]
     pub(crate) fn completion_models(&self) -> &'static [CompletionModelSpec] {
         self.completion_models
     }
@@ -101,6 +113,7 @@ const GPT_OSS_120B_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider: ProviderId::Tinfoil,
     provider_model_id: QUICK_MODEL_ID,
     response_model_id: QUICK_MODEL_ID,
+    rate_limit_scope: RateLimitScope::ProviderModel,
     weight: 100,
     enabled: true,
 }];
@@ -109,6 +122,7 @@ const GEMMA4_31B_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider: ProviderId::Tinfoil,
     provider_model_id: "gemma4-31b",
     response_model_id: "gemma4-31b",
+    rate_limit_scope: RateLimitScope::ProviderModel,
     weight: 100,
     enabled: true,
 }];
@@ -117,6 +131,7 @@ const KIMI_K3_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider: ProviderId::Tinfoil,
     provider_model_id: KIMI_K3_MODEL_ID,
     response_model_id: KIMI_K3_MODEL_ID,
+    rate_limit_scope: RateLimitScope::ProviderModel,
     weight: 100,
     enabled: true,
 }];
@@ -125,6 +140,7 @@ const KIMI_K2_6_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider: ProviderId::Continuum,
     provider_model_id: "kimi-k2.6",
     response_model_id: KIMI_K2_6_MODEL_ID,
+    rate_limit_scope: RateLimitScope::ProviderAccount,
     weight: 100,
     enabled: true,
 }];
@@ -133,6 +149,7 @@ const GLM_5_2_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider: ProviderId::Tinfoil,
     provider_model_id: GLM_5_2_MODEL_ID,
     response_model_id: GLM_5_2_MODEL_ID,
+    rate_limit_scope: RateLimitScope::ProviderModel,
     weight: 100,
     enabled: true,
 }];
@@ -142,6 +159,7 @@ const GLM_5_3_ROUTES: &[ModelRouteSpec] = &[
         provider: ProviderId::Continuum,
         provider_model_id: "glm-5.3",
         response_model_id: GLM_5_3_MODEL_ID,
+        rate_limit_scope: RateLimitScope::ProviderAccount,
         weight: 100,
         enabled: true,
     },
@@ -149,6 +167,7 @@ const GLM_5_3_ROUTES: &[ModelRouteSpec] = &[
         provider: ProviderId::Tinfoil,
         provider_model_id: GLM_5_3_MODEL_ID,
         response_model_id: GLM_5_3_MODEL_ID,
+        rate_limit_scope: RateLimitScope::ProviderModel,
         weight: 100,
         enabled: true,
     },
@@ -158,6 +177,7 @@ const GLM_5_3_FLASH_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider: ProviderId::Tinfoil,
     provider_model_id: GLM_5_3_FLASH_MODEL_ID,
     response_model_id: GLM_5_3_FLASH_MODEL_ID,
+    rate_limit_scope: RateLimitScope::ProviderModel,
     weight: 100,
     enabled: true,
 }];
@@ -166,6 +186,7 @@ const DEEPSEEK_V4_FLASH_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider: ProviderId::Tinfoil,
     provider_model_id: DEEPSEEK_V4_FLASH_MODEL_ID,
     response_model_id: DEEPSEEK_V4_FLASH_MODEL_ID,
+    rate_limit_scope: RateLimitScope::ProviderModel,
     weight: 100,
     enabled: true,
 }];
@@ -174,6 +195,7 @@ const LLAMA3_3_70B_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider: ProviderId::Tinfoil,
     provider_model_id: "llama3-3-70b",
     response_model_id: "llama3-3-70b",
+    rate_limit_scope: RateLimitScope::ProviderModel,
     weight: 100,
     enabled: true,
 }];
@@ -182,6 +204,7 @@ const GPT_OSS_SAFEGUARD_120B_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
     provider: ProviderId::Tinfoil,
     provider_model_id: "gpt-oss-safeguard-120b",
     response_model_id: "gpt-oss-safeguard-120b",
+    rate_limit_scope: RateLimitScope::ProviderModel,
     weight: 100,
     enabled: true,
 }];
@@ -414,5 +437,50 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn registry_pins_provider_specific_rate_limit_scopes() {
+        let scopes = PROVIDER_REGISTRY
+            .completion_models()
+            .iter()
+            .flat_map(|model| {
+                model.routes.iter().map(move |route| {
+                    (
+                        route.provider,
+                        route.provider_model_id,
+                        route.rate_limit_scope,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert!(scopes.iter().all(|(provider, _, scope)| match provider {
+            ProviderId::Tinfoil => *scope == RateLimitScope::ProviderModel,
+            ProviderId::Continuum => *scope == RateLimitScope::ProviderAccount,
+        }));
+        assert!(scopes
+            .iter()
+            .any(|(provider, model, scope)| *provider == ProviderId::Tinfoil
+                && *model == KIMI_K3_MODEL_ID
+                && *scope == RateLimitScope::ProviderModel));
+        assert!(scopes.iter().any(|(provider, model, scope)| {
+            *provider == ProviderId::Continuum
+                && *model == "glm-5.3"
+                && *scope == RateLimitScope::ProviderAccount
+        }));
+        assert!(scopes.iter().any(|(provider, model, scope)| {
+            *provider == ProviderId::Tinfoil
+                && *model == GLM_5_3_MODEL_ID
+                && *scope == RateLimitScope::ProviderModel
+        }));
+        assert!(scopes.iter().any(|(provider, model, scope)| {
+            *provider == ProviderId::Tinfoil
+                && *model == GLM_5_3_FLASH_MODEL_ID
+                && *scope == RateLimitScope::ProviderModel
+        }));
+        assert!(!scopes.iter().any(|(provider, model, _)| {
+            *provider == ProviderId::Continuum && *model == "glm-5.2"
+        }));
     }
 }

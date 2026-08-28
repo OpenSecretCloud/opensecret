@@ -1,4 +1,7 @@
-use crate::inference::{InferenceIntent, RouteIdentity};
+use crate::inference::health::{
+    ShadowHealthState, ShadowObservationMode, ShadowObservationReport, ShadowRouteSnapshot,
+};
+use crate::inference::{AttemptTerminal, InferenceIntent, RouteIdentity, RouteKey};
 use crate::inference_planning::{
     plan_completion_route, ConfiguredProviders, ProviderPreference, RoutePlan, RoutePlanningError,
     RoutePlanningInput,
@@ -139,6 +142,7 @@ pub(crate) enum ShadowRouteComparison {
 pub(crate) struct ProviderRouter {
     config: &'static ProviderRoutingConfig,
     registry: &'static ProviderRegistry,
+    shadow_health: ShadowHealthState,
 }
 
 #[derive(Debug, Clone)]
@@ -233,11 +237,29 @@ impl Default for ProviderRouter {
         Self {
             config: &DEFAULT_PROVIDER_ROUTING_CONFIG,
             registry: &PROVIDER_REGISTRY,
+            shadow_health: ShadowHealthState::new(&PROVIDER_REGISTRY),
         }
     }
 }
 
 impl ProviderRouter {
+    pub(crate) fn observe_attempt_terminal(
+        &self,
+        terminal: &AttemptTerminal,
+        mode: ShadowObservationMode,
+    ) -> ShadowObservationReport {
+        self.shadow_health.observe_terminal(terminal, mode)
+    }
+
+    pub(crate) fn shadow_health_snapshot(&self, route: &RouteKey) -> Option<ShadowRouteSnapshot> {
+        self.shadow_health.snapshot(route)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shadow_observation_count(&self) -> usize {
+        self.shadow_health.observation_count()
+    }
+
     #[cfg(test)]
     pub(crate) fn select_completion_route(
         &self,
@@ -605,7 +627,11 @@ fn proxy_for_provider(proxy_router: &ProxyRouter, provider: ProviderId) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::{InferenceSurface, WorkloadClass};
+    use crate::inference::health::{ShadowDisposition, ShadowObservationMode};
+    use crate::inference::{
+        AttemptFailure, AttemptFailureKind, AttemptStage, AttemptTerminal, InferenceSurface,
+        ReplaySafety, WorkloadClass,
+    };
     use crate::model_config::{
         ModelAliasTargets, ModelPlan, PaidModelAliasOverrides, AUTO_POWERFUL_MODEL_ID,
         AUTO_QUICK_MODEL_ID, DEEPSEEK_V4_FLASH_MODEL_ID, GLM_5_2_MODEL_ID, GLM_5_3_FLASH_MODEL_ID,
@@ -613,6 +639,7 @@ mod tests {
     };
     use crate::os_flags::PAID_POWERFUL_GLM_5_3_ALIAS_FLAG_KEY;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     fn proxy_router_with_both_providers() -> ProxyRouter {
         ProxyRouter::new(
@@ -1005,6 +1032,72 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[test]
+    fn hypothetical_open_capacity_never_changes_active_or_shadow_route_selection() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+        let account_uuid = uuid_for_bucket(73);
+        let provider_preference = Some(ProviderPreference::feature_flag(ProviderId::Tinfoil));
+        let intent = InferenceIntent::new(
+            account_uuid,
+            GLM_5_3_MODEL_ID,
+            GLM_5_3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+
+        let active_before = router
+            .select_completion_route_with_preference(
+                &proxy_router,
+                account_uuid,
+                GLM_5_3_MODEL_ID,
+                provider_preference,
+            )
+            .expect("active route before shadow health");
+        let shadow_before = router
+            .shadow_completion_plan(&proxy_router, &intent, provider_preference)
+            .expect("shadow route before shadow health");
+
+        let mut failure = AttemptFailure::new(
+            AttemptFailureKind::CapacityRejected,
+            AttemptStage::AwaitingResponse,
+            ReplaySafety::ProvenPreAcceptance,
+        );
+        failure.status = Some(429);
+        failure.retry_after = Some(Duration::from_secs(60));
+        let terminal = AttemptTerminal::Failed {
+            attempt: intent
+                .begin_execution()
+                .begin_attempt(active_before.identity()),
+            failure,
+        };
+        let report = router.observe_attempt_terminal(&terminal, ShadowObservationMode::Update);
+        assert!(matches!(
+            report.snapshot.expect("known route").effective,
+            ShadowDisposition::WouldOpen { .. }
+        ));
+
+        let active_after = router
+            .select_completion_route_with_preference(
+                &proxy_router,
+                account_uuid,
+                GLM_5_3_MODEL_ID,
+                provider_preference,
+            )
+            .expect("active route after shadow health");
+        let shadow_after = router
+            .shadow_completion_plan(&proxy_router, &intent, provider_preference)
+            .expect("shadow route after shadow health");
+
+        assert_eq!(active_after.identity(), active_before.identity());
+        assert_eq!(shadow_after, shadow_before);
+        assert!(matches!(
+            compare_shadow_route(&Ok(active_after), &Ok(shadow_after)),
+            ShadowRouteComparison::Match { .. }
+        ));
     }
 
     #[test]

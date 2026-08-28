@@ -1,3 +1,4 @@
+use crate::inference::health::ShadowObservationMode;
 use crate::inference::{
     AttemptFailure, AttemptFailureKind, AttemptOutcome, AttemptStage, AttemptTerminal,
     CompletionEvidence, InferenceAttempt, InferenceExecution, InferenceIntent, InferenceSurface,
@@ -19,8 +20,8 @@ use crate::provider_client::{
 };
 use crate::provider_registry::{ProviderId, SHADOW_ROUTING_POLICY_VERSION};
 use crate::provider_routing::{
-    compare_shadow_route, InferenceRoutingMode, ProviderRoutingError, SelectedProviderRoute,
-    ShadowRouteComparison,
+    compare_shadow_route, InferenceRoutingMode, ProviderRouter, ProviderRoutingError,
+    SelectedProviderRoute, ShadowRouteComparison,
 };
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
@@ -891,77 +892,20 @@ impl From<ApiError> for CompletionExecutionError {
 }
 
 fn failed_completion_execution(
+    provider_router: &ProviderRouter,
     attempt: InferenceAttempt,
     failure: AttemptFailure,
     public_error: ApiError,
 ) -> CompletionExecutionError {
     let terminal = AttemptTerminal::Failed { attempt, failure };
-    record_attempt_outcome(&AttemptOutcome::Terminal(terminal.clone()));
+    record_attempt_outcome(
+        provider_router,
+        &AttemptOutcome::Terminal(terminal.clone()),
+        ShadowObservationMode::Update,
+    );
     CompletionExecutionError::Attempt {
         terminal,
         public_error,
-    }
-}
-
-/// Ensures cancellation or panic cannot make an in-flight attempt disappear
-/// from the typed terminal stream. Later routing layers may attach health
-/// observation to the same lifecycle without changing its exactly-once shape.
-struct AttemptTerminalGuard {
-    attempt: InferenceAttempt,
-    stage: AttemptStage,
-    armed: bool,
-}
-
-impl AttemptTerminalGuard {
-    fn new(attempt: InferenceAttempt, stage: AttemptStage) -> Self {
-        Self {
-            attempt,
-            stage,
-            armed: true,
-        }
-    }
-
-    fn set_stage(&mut self, stage: AttemptStage) {
-        self.stage = stage;
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-
-    fn record_terminal(&mut self, terminal: &AttemptTerminal) {
-        debug_assert_eq!(terminal.attempt(), &self.attempt);
-        record_attempt_outcome(&AttemptOutcome::Terminal(terminal.clone()));
-        self.disarm();
-    }
-
-    fn cancellation_terminal(&self) -> AttemptTerminal {
-        AttemptTerminal::Failed {
-            attempt: self.attempt.clone(),
-            failure: AttemptFailure::new(
-                AttemptFailureKind::ConsumerDropped,
-                self.stage,
-                ReplaySafety::NotProvenPreAcceptance,
-            ),
-        }
-    }
-}
-
-impl Drop for AttemptTerminalGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-
-        let terminal = self.cancellation_terminal();
-        record_attempt_outcome(&AttemptOutcome::Terminal(terminal));
-        warn!(
-            "Inference attempt abandoned before terminal processing: request_id={}, execution_id={}, attempt_id={}, stage={:?}",
-            self.attempt.request_id,
-            self.attempt.execution_id,
-            self.attempt.attempt_id,
-            self.stage
-        );
     }
 }
 
@@ -1037,6 +981,7 @@ fn public_completion_error(error: &ProviderRequestError, failure: &AttemptFailur
 }
 
 fn terminalize_recovered_provider_failures(
+    provider_router: &ProviderRouter,
     execution: InferenceExecution,
     route: &crate::inference::RouteIdentity,
     prior_failures: Vec<ProviderRequestError>,
@@ -1050,7 +995,11 @@ fn terminalize_recovered_provider_failures(
                 attempt: attempt.clone(),
                 failure: failure.clone(),
             };
-            record_attempt_outcome(&AttemptOutcome::Terminal(terminal.clone()));
+            record_attempt_outcome(
+                provider_router,
+                &AttemptOutcome::Terminal(terminal.clone()),
+                ShadowObservationMode::TelemetryOnly,
+            );
             warn!(
                 "Inference transport recovered a failed attempt: request_id={}, execution_id={}, attempt_id={}, kind={:?}, replay_safety={:?}",
                 attempt.request_id,
@@ -1064,7 +1013,11 @@ fn terminalize_recovered_provider_failures(
         .collect()
 }
 
-fn record_attempt_outcome(outcome: &AttemptOutcome) {
+fn record_attempt_outcome(
+    provider_router: &ProviderRouter,
+    outcome: &AttemptOutcome,
+    shadow_mode: ShadowObservationMode,
+) {
     match outcome {
         AttemptOutcome::ResponseStarted { attempt, status } => {
             let route_key = attempt.route.route_key();
@@ -1086,6 +1039,21 @@ fn record_attempt_outcome(outcome: &AttemptOutcome) {
         }
         AttemptOutcome::Terminal(terminal) => {
             let attempt = terminal.attempt();
+            let shadow_report = provider_router.observe_attempt_terminal(terminal, shadow_mode);
+            debug!(
+                "Inference shadow health observation: request_id={}, execution_id={}, attempt_id={}, policy_version={}, mode={:?}, route_provider={}, route_model={}, signal={:?}, capacity_pool={:?}, snapshot={:?}, mutated={}",
+                attempt.request_id,
+                attempt.execution_id,
+                attempt.attempt_id,
+                shadow_report.policy_version,
+                shadow_report.mode,
+                shadow_report.route.provider.as_str(),
+                shadow_report.route.provider_model_id,
+                shadow_report.signal,
+                shadow_report.capacity_pool,
+                shadow_report.snapshot,
+                shadow_report.mutated
+            );
             match terminal {
                 AttemptTerminal::Completed { evidence, .. } => debug!(
                     "Inference attempt completed: request_id={}, execution_id={}, attempt_id={}, provider={}, public_model={}, provider_model={}, evidence={:?}",
@@ -1116,6 +1084,20 @@ fn record_attempt_outcome(outcome: &AttemptOutcome) {
             }
         }
     }
+}
+
+#[cfg(test)]
+async fn send_attempt_terminal(
+    provider_router: &ProviderRouter,
+    sender: &mpsc::Sender<CompletionChunk>,
+    terminal: AttemptTerminal,
+) {
+    record_attempt_outcome(
+        provider_router,
+        &AttemptOutcome::Terminal(terminal.clone()),
+        ShadowObservationMode::Update,
+    );
+    let _ = sender.send(CompletionChunk::Terminal(terminal)).await;
 }
 
 fn stream_end_terminal(
@@ -1790,6 +1772,30 @@ pub(crate) async fn prepare_completion_request(
                 &intent,
                 provider_preference,
             );
+            if let Ok(plan) = &shadow {
+                let candidate_health = plan
+                    .eligible_routes
+                    .iter()
+                    .map(|candidate| {
+                        let route_key = crate::inference::RouteKey {
+                            provider: candidate.provider,
+                            provider_model_id: candidate.provider_model_id.clone(),
+                        };
+                        (
+                            candidate.provider.as_str(),
+                            candidate.provider_model_id.as_str(),
+                            state.provider_router.shadow_health_snapshot(&route_key),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                debug!(
+                    "Shadow route health remained observational: request_id={}, public_model={}, routing_policy_version={}, candidate_health={:?}",
+                    intent.request_id,
+                    intent.public_model_id,
+                    plan.policy_version,
+                    candidate_health
+                );
+            }
             retain_active_route_after_shadow_observation(&intent, active, shadow)
         }
     };
@@ -1827,6 +1833,94 @@ pub(crate) async fn prepare_completion_request(
     })
 }
 
+/// Ensures cancellation or panic cannot make an in-flight attempt disappear
+/// from the terminal observation stream. Consumer cancellation is deliberately
+/// neutral for route health, but it must still be represented exactly once.
+struct AttemptObservationGuard {
+    attempt: InferenceAttempt,
+    provider_router: Arc<ProviderRouter>,
+    stage: AttemptStage,
+    armed: bool,
+}
+
+impl AttemptObservationGuard {
+    fn new(
+        attempt: InferenceAttempt,
+        provider_router: Arc<ProviderRouter>,
+        stage: AttemptStage,
+    ) -> Self {
+        Self {
+            attempt,
+            provider_router,
+            stage,
+            armed: true,
+        }
+    }
+
+    fn attempt(&self) -> &InferenceAttempt {
+        &self.attempt
+    }
+
+    fn set_stage(&mut self, stage: AttemptStage) {
+        self.stage = stage;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn record_terminal(&mut self, terminal: &AttemptTerminal) {
+        debug_assert_eq!(terminal.attempt(), &self.attempt);
+        record_attempt_outcome(
+            &self.provider_router,
+            &AttemptOutcome::Terminal(terminal.clone()),
+            ShadowObservationMode::Update,
+        );
+        self.disarm();
+    }
+
+    fn cancellation_terminal(&self) -> AttemptTerminal {
+        AttemptTerminal::Failed {
+            attempt: self.attempt.clone(),
+            failure: AttemptFailure::new(
+                AttemptFailureKind::ConsumerDropped,
+                self.stage,
+                ReplaySafety::NotProvenPreAcceptance,
+            ),
+        }
+    }
+}
+
+impl Drop for AttemptObservationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let terminal = self.cancellation_terminal();
+        record_attempt_outcome(
+            &self.provider_router,
+            &AttemptOutcome::Terminal(terminal),
+            ShadowObservationMode::Update,
+        );
+        warn!(
+            "Inference attempt abandoned before terminal processing: request_id={}, execution_id={}, attempt_id={}, stage={:?}",
+            self.attempt.request_id,
+            self.attempt.execution_id,
+            self.attempt.attempt_id,
+            self.stage
+        );
+    }
+}
+
+async fn await_attempt_result<T>(
+    terminal_guard: AttemptObservationGuard,
+    future: impl std::future::Future<Output = T>,
+) -> (T, AttemptObservationGuard) {
+    let result = future.await;
+    (result, terminal_guard)
+}
+
 /// A provider response whose HTTP success status has been observed, but whose
 /// body has not yet been consumed. Responses holds this value only across its
 /// persistence boundary so a capacity rejection can still be returned as an
@@ -1835,12 +1929,12 @@ pub(crate) struct StartedCompletion {
     response: Option<ProviderResponse>,
     successful_provider: String,
     attempt: InferenceAttempt,
+    terminal_guard: Option<AttemptObservationGuard>,
     response_model_id: String,
     is_streaming: bool,
     billing_context: BillingContext,
     non_streaming_body_limit: Option<usize>,
     require_provider_done: bool,
-    terminal_guard: Option<AttemptTerminalGuard>,
     response_execution: Option<ResponseExecution>,
     response_execution_guard: Option<ResponseExecutionTaskGuard>,
 }
@@ -2110,6 +2204,7 @@ async fn get_chat_completion_response_with_options(
                     attempt.request_id, attempt.execution_id, attempt.attempt_id, error
                 );
                 return Err(failed_completion_execution(
+                    &state.provider_router,
                     attempt,
                     failure,
                     ApiError::InternalServerError,
@@ -2128,29 +2223,46 @@ async fn get_chat_completion_response_with_options(
             request_log_metadata
         );
 
-        let attempt = execution.begin_attempt(route_identity.clone());
-        let mut terminal_guard =
-            AttemptTerminalGuard::new(attempt.clone(), AttemptStage::AwaitingResponse);
-        let ProviderSendTrace {
-            prior_failures,
-            result,
-        } = try_provider(
-            &state.provider_client,
-            &proxy_config,
-            request_body_json,
-            headers,
+        let terminal_guard = AttemptObservationGuard::new(
+            execution.begin_attempt(route_identity.clone()),
+            Arc::clone(&state.provider_router),
+            AttemptStage::AwaitingResponse,
+        );
+        let (
+            ProviderSendTrace {
+                prior_failures,
+                result,
+            },
+            mut terminal_guard,
+        ) = await_attempt_result(
+            terminal_guard,
+            try_provider(
+                &state.provider_client,
+                &proxy_config,
+                request_body_json,
+                headers,
+            ),
         )
         .await;
 
-        let _recovered_terminals =
-            terminalize_recovered_provider_failures(execution, &route_identity, prior_failures);
+        let _recovered_terminals = terminalize_recovered_provider_failures(
+            &state.provider_router,
+            execution,
+            &route_identity,
+            prior_failures,
+        );
 
+        let attempt = terminal_guard.attempt().clone();
         match result {
             Ok(response) => {
-                record_attempt_outcome(&AttemptOutcome::ResponseStarted {
-                    attempt: attempt.clone(),
-                    status: response.status_code(),
-                });
+                record_attempt_outcome(
+                    &state.provider_router,
+                    &AttemptOutcome::ResponseStarted {
+                        attempt: attempt.clone(),
+                        status: response.status_code(),
+                    },
+                    ShadowObservationMode::Update,
+                );
                 info!(
                     "Inference response started: request_id={}, execution_id={}, attempt_id={}",
                     attempt.request_id, attempt.execution_id, attempt.attempt_id
@@ -2175,6 +2287,7 @@ async fn get_chat_completion_response_with_options(
                     request_log_metadata
                 );
                 let execution_error = failed_completion_execution(
+                    &state.provider_router,
                     attempt,
                     failure.clone(),
                     public_completion_error(&err, &failure),
@@ -2194,12 +2307,12 @@ async fn get_chat_completion_response_with_options(
         response: Some(response),
         successful_provider,
         attempt,
+        terminal_guard: Some(terminal_guard),
         response_model_id: selected_route.response_model_id,
         is_streaming,
         billing_context: billing,
         non_streaming_body_limit: options.non_streaming_body_limit,
         require_provider_done,
-        terminal_guard: Some(terminal_guard),
         response_execution,
         response_execution_guard,
     })
@@ -2216,6 +2329,10 @@ pub(crate) async fn finish_started_completion(
         .response
         .take()
         .expect("started completion response can only be consumed once");
+    let mut terminal_guard = started
+        .terminal_guard
+        .take()
+        .expect("started completion terminal guard can only be consumed once");
     let successful_provider = started.successful_provider.clone();
     let attempt = started.attempt.clone();
     let response_model_id = started.response_model_id.clone();
@@ -2225,10 +2342,6 @@ pub(crate) async fn finish_started_completion(
     let require_provider_done = started.require_provider_done;
     let response_execution = started.response_execution.take();
     let response_execution_guard = started.response_execution_guard.take();
-    let mut terminal_guard = started
-        .terminal_guard
-        .take()
-        .expect("started completion terminal guard can only be consumed once");
 
     // NOW: Process the response internally and handle billing
     if !is_streaming {
@@ -2247,6 +2360,7 @@ pub(crate) async fn finish_started_completion(
             Ok(response_json) => response_json,
             Err(failure) => {
                 let execution_error = failed_completion_execution(
+                    &state.provider_router,
                     attempt.clone(),
                     failure,
                     ApiError::InternalServerError,
@@ -2255,6 +2369,12 @@ pub(crate) async fn finish_started_completion(
                 return Err(execution_error);
             }
         };
+
+        let terminal = AttemptTerminal::Completed {
+            attempt: attempt.clone(),
+            evidence: CompletionEvidence::NonStreamingResponse,
+        };
+        terminal_guard.record_terminal(&terminal);
 
         // ✅ Handle billing HERE, inside completions API
         if let Some(usage) = extract_usage(&response_json) {
@@ -2269,11 +2389,6 @@ pub(crate) async fn finish_started_completion(
         }
 
         // Return the full response as a single chunk
-        let terminal = AttemptTerminal::Completed {
-            attempt: attempt.clone(),
-            evidence: CompletionEvidence::NonStreamingResponse,
-        };
-        terminal_guard.record_terminal(&terminal);
         let (tx, rx) = mpsc::channel(2); // Need space for FullResponse + terminal
         let _ = tx.send(CompletionChunk::FullResponse(response_json)).await;
         let _ = tx.send(CompletionChunk::Terminal(terminal)).await;
@@ -2313,6 +2428,8 @@ pub(crate) async fn finish_started_completion(
             require_provider_done,
         )
         .await;
+        let terminal = result.terminal.clone();
+        terminal_guard.record_terminal(&terminal);
         publish_stream_usage(
             result.usage,
             result.finalization,
@@ -2323,10 +2440,7 @@ pub(crate) async fn finish_started_completion(
             &tx_consumer,
         )
         .await;
-        terminal_guard.record_terminal(&result.terminal);
-        let _ = tx_consumer
-            .send(CompletionChunk::Terminal(result.terminal))
-            .await;
+        let _ = tx_consumer.send(CompletionChunk::Terminal(terminal)).await;
     });
 
     Ok(CompletionStream {
@@ -3823,6 +3937,98 @@ mod tests {
         ));
     }
 
+    async fn record_terminal_once(
+        provider_router: &ProviderRouter,
+        terminal: &AttemptTerminal,
+    ) -> crate::inference::health::ShadowRouteSnapshot {
+        let route_key = terminal.attempt().route.route_key();
+        let (terminal_tx, mut terminal_rx) = mpsc::channel(1);
+        send_attempt_terminal(provider_router, &terminal_tx, terminal.clone()).await;
+        drop(terminal_tx);
+        assert!(matches!(
+            terminal_rx.recv().await,
+            Some(CompletionChunk::Terminal(_))
+        ));
+        assert!(terminal_rx.recv().await.is_none());
+        provider_router
+            .shadow_health_snapshot(&route_key)
+            .expect("registered terminal route")
+    }
+
+    #[tokio::test]
+    async fn cancelling_while_awaiting_provider_result_records_one_neutral_terminal() {
+        let provider_router = Arc::new(ProviderRouter::default());
+        let pinned = pinned_test_completion();
+        let route_key = pinned.route.identity().route_key();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let terminal_guard = AttemptObservationGuard::new(
+            attempt,
+            Arc::clone(&provider_router),
+            AttemptStage::AwaitingResponse,
+        );
+
+        let result = timeout(
+            Duration::from_millis(5),
+            await_attempt_result(terminal_guard, futures::future::pending::<()>()),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(provider_router.shadow_observation_count(), 1);
+        assert_eq!(
+            provider_router
+                .shadow_health_snapshot(&route_key)
+                .expect("registered K3 route")
+                .effective,
+            crate::inference::health::ShadowDisposition::Healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn taking_started_response_does_not_disarm_drop_observation() {
+        let (trace, server) = call_mock_provider(static_sse_app("data: [DONE]\n\n")).await;
+        let response = trace.result.expect("mock provider response start");
+        let provider_router = Arc::new(ProviderRouter::default());
+        let pinned = pinned_test_completion();
+        let route_key = pinned.route.identity().route_key();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let terminal_guard = AttemptObservationGuard::new(
+            attempt.clone(),
+            Arc::clone(&provider_router),
+            AttemptStage::ResponseBody,
+        );
+        let mut started = StartedCompletion {
+            response: Some(response),
+            successful_provider: ProviderId::Tinfoil.as_str().to_string(),
+            attempt,
+            terminal_guard: Some(terminal_guard),
+            response_model_id: "kimi-k3".to_string(),
+            is_streaming: false,
+            billing_context: BillingContext::new(AuthMethod::Jwt, "kimi-k3".to_string()),
+            non_streaming_body_limit: None,
+            require_provider_done: false,
+            response_execution: None,
+            response_execution_guard: None,
+        };
+
+        drop(started.response.take());
+        drop(started);
+        server.abort();
+
+        assert_eq!(provider_router.shadow_observation_count(), 1);
+        assert_eq!(
+            provider_router
+                .shadow_health_snapshot(&route_key)
+                .expect("registered K3 route")
+                .effective,
+            crate::inference::health::ShadowDisposition::Healthy
+        );
+    }
+
     #[tokio::test]
     async fn mock_provider_streams_produce_one_sanitized_terminal_result() {
         enum ExpectedTerminal {
@@ -3891,6 +4097,23 @@ mod tests {
                 "{name}"
             );
 
+            let provider_router = ProviderRouter::default();
+            let health = record_terminal_once(&provider_router, &result.terminal).await;
+            match &result.terminal {
+                AttemptTerminal::Completed { .. } => assert_eq!(
+                    health.effective,
+                    crate::inference::health::ShadowDisposition::Healthy,
+                    "{name}"
+                ),
+                AttemptTerminal::Failed { .. } => assert_eq!(
+                    health.route_health,
+                    crate::inference::health::ShadowDisposition::Watch {
+                        consecutive_failures: 1
+                    },
+                    "{name}"
+                ),
+            }
+
             match (expected, result.terminal) {
                 (
                     ExpectedTerminal::Completed(expected_evidence),
@@ -3949,6 +4172,26 @@ mod tests {
             failure.upstream_request_id.as_deref(),
             Some("req-429_a.b:c")
         );
+
+        let provider_router = ProviderRouter::default();
+        let pinned = pinned_test_completion();
+        let route_key = pinned.route.identity().route_key();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let _ = failed_completion_execution(
+            &provider_router,
+            attempt,
+            failure,
+            ApiError::InternalServerError,
+        );
+        assert!(matches!(
+            provider_router
+                .shadow_health_snapshot(&route_key)
+                .expect("registered K3 route")
+                .effective,
+            crate::inference::health::ShadowDisposition::WouldOpen { .. }
+        ));
     }
 
     #[tokio::test]
@@ -4028,6 +4271,26 @@ mod tests {
                     ..
                 }
             ));
+
+            let provider_router = ProviderRouter::default();
+            let pinned = pinned_test_completion();
+            let route_key = pinned.route.identity().route_key();
+            let attempt = pinned
+                .begin_execution()
+                .begin_attempt(pinned.route.identity());
+            let _ = failed_completion_execution(
+                &provider_router,
+                attempt,
+                failure,
+                ApiError::InternalServerError,
+            );
+            assert!(matches!(
+                provider_router
+                    .shadow_health_snapshot(&route_key)
+                    .expect("registered K3 route")
+                    .deployment_capacity,
+                crate::inference::health::ShadowDisposition::WouldOpen { .. }
+            ));
         }
     }
 
@@ -4043,7 +4306,9 @@ mod tests {
         let attempt = pinned
             .begin_execution()
             .begin_attempt(pinned.route.identity());
+        let provider_router = ProviderRouter::default();
         let response = failed_completion_execution(
+            &provider_router,
             attempt,
             failure.clone(),
             public_completion_error(&provider_error, &failure),
@@ -4112,6 +4377,16 @@ mod tests {
         assert_eq!(failure.replay_safety, ReplaySafety::NotProvenPreAcceptance);
         assert_eq!(failure.upstream_code.as_deref(), Some("capacity_error-17"));
         assert!(!format!("{failure:?}").contains("private upstream detail"));
+
+        let provider_router = ProviderRouter::default();
+        let terminal = AttemptTerminal::Failed { attempt, failure };
+        let health = record_terminal_once(&provider_router, &terminal).await;
+        assert_eq!(
+            health.route_health,
+            crate::inference::health::ShadowDisposition::Watch {
+                consecutive_failures: 1
+            }
+        );
     }
 
     #[tokio::test]
@@ -4235,6 +4510,14 @@ mod tests {
                 ..
             }
         ));
+        let provider_router = ProviderRouter::default();
+        let health = record_terminal_once(&provider_router, &result.terminal).await;
+        assert_eq!(
+            health.route_health,
+            crate::inference::health::ShadowDisposition::Watch {
+                consecutive_failures: 1
+            }
+        );
     }
 
     #[tokio::test]
@@ -4286,6 +4569,12 @@ mod tests {
                 ..
             }
         ));
+        let provider_router = ProviderRouter::default();
+        let health = record_terminal_once(&provider_router, &result.terminal).await;
+        assert_eq!(
+            health.effective,
+            crate::inference::health::ShadowDisposition::Healthy
+        );
     }
 
     #[tokio::test]
@@ -4425,6 +4714,54 @@ mod tests {
                 ..
             }
         ));
+        let provider_router = ProviderRouter::default();
+        let health = record_terminal_once(&provider_router, &result.terminal).await;
+        assert_eq!(
+            health.route_health,
+            crate::inference::health::ShadowDisposition::Watch {
+                consecutive_failures: 1
+            }
+        );
+    }
+
+    #[test]
+    fn response_started_is_not_a_health_success_and_cannot_clear_capacity() {
+        let provider_router = ProviderRouter::default();
+        let pinned = pinned_test_completion();
+        let route = pinned.route.identity();
+        let route_key = route.route_key();
+        let execution = pinned.begin_execution();
+        let mut capacity_failure = AttemptFailure::new(
+            AttemptFailureKind::CapacityRejected,
+            AttemptStage::AwaitingResponse,
+            ReplaySafety::ProvenPreAcceptance,
+        );
+        capacity_failure.status = Some(429);
+        capacity_failure.retry_after = Some(Duration::from_secs(60));
+        record_attempt_outcome(
+            &provider_router,
+            &AttemptOutcome::Terminal(AttemptTerminal::Failed {
+                attempt: execution.begin_attempt(route.clone()),
+                failure: capacity_failure,
+            }),
+            ShadowObservationMode::Update,
+        );
+        record_attempt_outcome(
+            &provider_router,
+            &AttemptOutcome::ResponseStarted {
+                attempt: execution.begin_attempt(route),
+                status: 200,
+            },
+            ShadowObservationMode::Update,
+        );
+
+        assert!(matches!(
+            provider_router
+                .shadow_health_snapshot(&route_key)
+                .expect("registered K3 route")
+                .effective,
+            crate::inference::health::ShadowDisposition::WouldOpen { .. }
+        ));
     }
 
     #[test]
@@ -4561,11 +4898,16 @@ mod tests {
 
     #[test]
     fn cancelled_in_flight_attempt_has_one_conservative_terminal_shape() {
+        let provider_router = Arc::new(ProviderRouter::default());
         let pinned = pinned_test_completion();
         let attempt = pinned
             .begin_execution()
             .begin_attempt(pinned.route.identity());
-        let mut guard = AttemptTerminalGuard::new(attempt.clone(), AttemptStage::AwaitingResponse);
+        let mut guard = AttemptObservationGuard::new(
+            attempt.clone(),
+            provider_router,
+            AttemptStage::AwaitingResponse,
+        );
 
         assert!(matches!(
             guard.cancellation_terminal(),
@@ -4585,9 +4927,11 @@ mod tests {
     #[test]
     fn recovered_transport_retry_gets_a_distinct_attempt_in_the_same_execution() {
         let pinned = pinned_test_completion();
+        let provider_router = ProviderRouter::default();
         let execution = pinned.begin_execution();
         let route = pinned.route.identity();
         let recovered = terminalize_recovered_provider_failures(
+            &provider_router,
             execution,
             &route,
             vec![ProviderRequestError::Connect(
@@ -4617,6 +4961,25 @@ mod tests {
         )
         .await;
         assert_eq!(chunks.len(), 1);
+        let provider_router = ProviderRouter::default();
+        let failed_observation = provider_router
+            .observe_attempt_terminal(&without_done.terminal, ShadowObservationMode::Update);
+        assert!(matches!(
+            failed_observation.signal,
+            crate::inference::health::ShadowSignal::RouteFailure {
+                kind: AttemptFailureKind::UnexpectedEof,
+                ..
+            }
+        ));
+        assert_eq!(
+            failed_observation
+                .snapshot
+                .expect("registered route")
+                .route_health,
+            crate::inference::health::ShadowDisposition::Watch {
+                consecutive_failures: 1,
+            }
+        );
         assert!(matches!(
             without_done.terminal,
             AttemptTerminal::Failed {
@@ -4637,6 +5000,15 @@ mod tests {
             true,
         )
         .await;
+        let completed_observation = provider_router
+            .observe_attempt_terminal(&with_done.terminal, ShadowObservationMode::Update);
+        assert_eq!(
+            completed_observation
+                .snapshot
+                .expect("registered route")
+                .route_health,
+            crate::inference::health::ShadowDisposition::Healthy
+        );
         assert!(matches!(
             with_done.terminal,
             AttemptTerminal::Completed {

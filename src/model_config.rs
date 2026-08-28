@@ -521,7 +521,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         true,
         false,
         10,
-        128_000,
+        131_072,
     ),
     ModelConfigEntry::with_responses(
         "gemma4-31b",
@@ -535,7 +535,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         true,
         false,
         20,
-        256_000,
+        262_144,
         GEMMA4_RESPONSES_MODEL_CONFIG,
     ),
     ModelConfigEntry::new(
@@ -570,7 +570,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         true,
         false,
         30,
-        256_000,
+        262_144,
     )
     .with_catalog_metadata(ModelCatalogMetadata::new(
         &["text", "image"],
@@ -590,7 +590,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         true,
         false,
         40,
-        256_000,
+        262_144,
     )
     .with_catalog_provider("continuum", "kimi-k2.6"),
     ModelConfigEntry::new(
@@ -605,7 +605,8 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         true,
         false,
         50,
-        256_000,
+        // Shared window: Continuum supports 262,144; Tinfoil supports 1,048,576.
+        262_144,
     )
     .with_catalog_provider("continuum", "glm-5.3")
     .with_catalog_metadata(ModelCatalogMetadata::new(&["text"], &["text"], None, None)),
@@ -621,7 +622,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         true,
         false,
         60,
-        256_000,
+        393_216,
     ),
     ModelConfigEntry::new(
         DEEPSEEK_V4_FLASH_MODEL_ID,
@@ -635,7 +636,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         true,
         false,
         70,
-        800_000,
+        1_048_576,
     )
     .with_catalog_metadata(ModelCatalogMetadata::new(
         &["text"],
@@ -655,7 +656,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         true,
         false,
         80,
-        128_000,
+        131_072,
     ),
     ModelConfigEntry::api_only(
         "gpt-oss-safeguard-120b",
@@ -668,7 +669,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         true,
         false,
         900,
-        131_000,
+        131_072,
     ),
 ];
 
@@ -893,18 +894,18 @@ mod tests {
 
     #[test]
     fn test_model_context_window_known_models() {
-        assert_eq!(model_context_window("llama3-3-70b"), 128_000);
-        assert_eq!(model_context_window("gpt-oss-120b"), 128_000);
-        assert_eq!(model_context_window("gpt-oss-safeguard-120b"), 131_000);
-        assert_eq!(model_context_window("kimi-k2-6"), 256_000);
-        assert_eq!(model_context_window("gemma4-31b"), 256_000);
-        assert_eq!(model_context_window("glm-5-2"), 256_000);
-        assert_eq!(model_context_window("glm-5-3"), 256_000);
+        assert_eq!(model_context_window("llama3-3-70b"), 131_072);
+        assert_eq!(model_context_window("gpt-oss-120b"), 131_072);
+        assert_eq!(model_context_window("gpt-oss-safeguard-120b"), 131_072);
+        assert_eq!(model_context_window("kimi-k2-6"), 262_144);
+        assert_eq!(model_context_window("gemma4-31b"), 262_144);
+        assert_eq!(model_context_window("glm-5-2"), 393_216);
+        assert_eq!(model_context_window("glm-5-3"), 262_144);
         assert_eq!(model_context_window("glm-5-3-flash"), 1_048_576);
-        assert_eq!(model_context_window("kimi-k3"), 256_000);
-        assert_eq!(model_context_window("deepseek-v4-flash"), 800_000);
-        assert_eq!(model_context_window(AUTO_QUICK_MODEL_ID), 128_000);
-        assert_eq!(model_context_window(AUTO_POWERFUL_MODEL_ID), 256_000);
+        assert_eq!(model_context_window("kimi-k3"), 262_144);
+        assert_eq!(model_context_window("deepseek-v4-flash"), 1_048_576);
+        assert_eq!(model_context_window(AUTO_QUICK_MODEL_ID), 131_072);
+        assert_eq!(model_context_window(AUTO_POWERFUL_MODEL_ID), 393_216);
     }
 
     #[test]
@@ -1013,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_model_config_prefix_matching() {
-        assert_eq!(model_context_window("llama3-3-70b-instruct"), 128_000);
+        assert_eq!(model_context_window("llama3-3-70b-instruct"), 131_072);
         assert_eq!(
             model_context_window("unknown-r1-70b-instruct"),
             DEFAULT_CONTEXT_WINDOW
@@ -1333,7 +1334,7 @@ mod tests {
         assert_eq!(glm["provider"], "continuum");
         assert_eq!(glm["provider_id"], "glm-5.3");
         assert_eq!(glm["access"], "pro");
-        assert_eq!(glm["context_window"], 256_000);
+        assert_eq!(glm["context_window"], 262_144);
         assert_eq!(glm["input_modalities"], json!(["text"]));
         assert_eq!(glm["output_modalities"], json!(["text"]));
         assert_eq!(glm["capabilities"]["vision"], false);
@@ -1416,7 +1417,7 @@ mod tests {
         let kimi = catalog_model(&catalog, "kimi-k3");
         assert_eq!(kimi["access"], "pro");
         assert_eq!(kimi["provider_id"], "kimi-k3");
-        assert_eq!(kimi["context_window"], 256_000);
+        assert_eq!(kimi["context_window"], 262_144);
         assert_eq!(kimi["input_modalities"], json!(["text", "image"]));
         assert_eq!(kimi["output_modalities"], json!(["text"]));
         assert_eq!(kimi["parameter_size"], "2.8T");
@@ -1429,7 +1430,7 @@ mod tests {
         let deepseek = catalog_model(&catalog, "deepseek-v4-flash");
         assert_eq!(deepseek["access"], "pro");
         assert_eq!(deepseek["provider_id"], "deepseek-v4-flash");
-        assert_eq!(deepseek["context_window"], 800_000);
+        assert_eq!(deepseek["context_window"], 1_048_576);
         assert_eq!(deepseek["input_modalities"], json!(["text"]));
         assert_eq!(deepseek["output_modalities"], json!(["text"]));
         assert_eq!(deepseek["parameter_size"], "284B");

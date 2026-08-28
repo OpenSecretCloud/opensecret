@@ -31,7 +31,7 @@ use crate::web::encryption_middleware::{
 use crate::web::openai_auth::AuthMethod;
 use crate::web::responses::{ResponseExecution, ResponseExecutionTaskGuard};
 use crate::{ApiError, AppState};
-use axum::http::{header, HeaderMap, HeaderName};
+use axum::http::{header, HeaderMap, HeaderName, StatusCode};
 use axum::{
     body::Body,
     extract::State,
@@ -724,7 +724,7 @@ impl StreamUsageAccumulator {
                     .is_some_and(|tokens| tokens < previous.completion_tokens)
             {
                 warn!(
-                    "Streaming usage totals regressed: previous_prompt_tokens={}, previous_completion_tokens={}, observed_prompt_tokens={:?}, observed_completion_tokens={:?}; using the latest explicit provider values",
+                    "Streaming usage totals regressed: previous_prompt_tokens={}, previous_completion_tokens={}, observed_prompt_tokens={:?}, observed_completion_tokens={:?}; preserving the highest cumulative totals",
                     previous.prompt_tokens,
                     previous.completion_tokens,
                     observed.prompt_tokens,
@@ -733,19 +733,31 @@ impl StreamUsageAccumulator {
             }
         }
 
+        let prompt_tokens = observed
+            .prompt_tokens
+            .map(|tokens| {
+                self.latest_usage
+                    .as_ref()
+                    .map_or(tokens, |usage| tokens.max(usage.prompt_tokens))
+            })
+            .or_else(|| self.latest_usage.as_ref().map(|usage| usage.prompt_tokens))
+            .unwrap_or(0);
+        let completion_tokens = observed
+            .completion_tokens
+            .map(|tokens| {
+                self.latest_usage
+                    .as_ref()
+                    .map_or(tokens, |usage| tokens.max(usage.completion_tokens))
+            })
+            .or_else(|| {
+                self.latest_usage
+                    .as_ref()
+                    .map(|usage| usage.completion_tokens)
+            })
+            .unwrap_or(0);
         self.latest_usage = Some(CompletionUsage {
-            prompt_tokens: observed
-                .prompt_tokens
-                .or_else(|| self.latest_usage.as_ref().map(|usage| usage.prompt_tokens))
-                .unwrap_or(0),
-            completion_tokens: observed
-                .completion_tokens
-                .or_else(|| {
-                    self.latest_usage
-                        .as_ref()
-                        .map(|usage| usage.completion_tokens)
-                })
-                .unwrap_or(0),
+            prompt_tokens,
+            completion_tokens,
             cached_prompt_tokens: observed.cached_prompt_tokens.or_else(|| {
                 self.latest_usage
                     .as_ref()
@@ -852,6 +864,10 @@ impl CompletionExecutionError {
                 public_error
             }
         }
+    }
+
+    pub(crate) fn into_pre_persistence_api_error(self) -> ApiError {
+        self.into_api_error().with_client_replay_safe()
     }
 }
 
@@ -963,17 +979,52 @@ fn attempt_failure_from_provider_error(error: &ProviderRequestError) -> AttemptF
             AttemptStage::AwaitingResponse,
             ReplaySafety::NotProvenPreAcceptance,
         ),
-        ProviderRequestError::Upstream(upstream) => AttemptFailure::new(
-            AttemptFailureKind::HttpStatus,
-            AttemptStage::AwaitingResponse,
-            ReplaySafety::NotProvenPreAcceptance,
-        )
-        .with_upstream_response(
-            upstream.status,
-            upstream.retry_after,
-            upstream.upstream_request_id.clone(),
-        ),
+        ProviderRequestError::Upstream(upstream) => {
+            let is_capacity_rejection = public_capacity_status(upstream.status).is_some();
+            AttemptFailure::new(
+                if is_capacity_rejection {
+                    AttemptFailureKind::CapacityRejected
+                } else {
+                    AttemptFailureKind::HttpStatus
+                },
+                AttemptStage::AwaitingResponse,
+                if is_capacity_rejection {
+                    ReplaySafety::ProvenPreAcceptance
+                } else {
+                    ReplaySafety::NotProvenPreAcceptance
+                },
+            )
+            .with_upstream_response(
+                upstream.status,
+                upstream.retry_after,
+                upstream.upstream_request_id.clone(),
+            )
+        }
     }
+}
+
+fn public_capacity_status(upstream_status: u16) -> Option<StatusCode> {
+    match upstream_status {
+        429 => Some(StatusCode::TOO_MANY_REQUESTS),
+        503 | 529 => Some(StatusCode::SERVICE_UNAVAILABLE),
+        _ => None,
+    }
+}
+
+fn public_completion_error(error: &ProviderRequestError, failure: &AttemptFailure) -> ApiError {
+    if failure.kind == AttemptFailureKind::CapacityRejected {
+        let status = failure
+            .status
+            .and_then(public_capacity_status)
+            .expect("capacity failure must carry a supported upstream status");
+        return ApiError::InferenceCapacity {
+            status,
+            retry_after: failure.retry_after,
+            client_replay_safe: false,
+        };
+    }
+
+    ApiError::from(error.clone())
 }
 
 fn terminalize_recovered_provider_failures(
@@ -1205,6 +1256,21 @@ async fn read_non_streaming_completion_response(
     Ok(response_json)
 }
 
+async fn completion_consumer_cancelled(
+    tx_consumer: &mpsc::Sender<CompletionChunk>,
+    response_execution: Option<&ResponseExecution>,
+) {
+    if let Some(execution) = response_execution {
+        tokio::select! {
+            biased;
+            _ = execution.cancelled() => {}
+            _ = tx_consumer.closed() => {}
+        }
+    } else {
+        tx_consumer.closed().await;
+    }
+}
+
 async fn process_completion_stream(
     response: ProviderResponse,
     response_model_id: &str,
@@ -1219,31 +1285,24 @@ async fn process_completion_stream(
     let mut usage_accumulator = StreamUsageAccumulator::default();
 
     loop {
-        let next_chunk = timeout(chunk_timeout, body_stream.next());
-        tokio::pin!(next_chunk);
-        let next_chunk = if let Some(execution) = response_execution {
-            tokio::select! {
-                biased;
-                _ = execution.cancelled() => {
-                    return finish_stream_processing(
-                        &mut usage_accumulator,
-                        StreamUsageFinalization::ConsumerDropped,
-                        AttemptTerminal::Failed {
-                            attempt,
-                            failure: AttemptFailure::new(
-                                AttemptFailureKind::ConsumerDropped,
-                                AttemptStage::Stream,
-                                ReplaySafety::NotProvenPreAcceptance,
-                            ),
-                        },
-                    );
-                }
-                result = &mut next_chunk => result,
+        let next_chunk = tokio::select! {
+            biased;
+            _ = completion_consumer_cancelled(tx_consumer, response_execution) => {
+                return finish_stream_processing(
+                    &mut usage_accumulator,
+                    StreamUsageFinalization::ConsumerDropped,
+                    AttemptTerminal::Failed {
+                        attempt,
+                        failure: AttemptFailure::new(
+                            AttemptFailureKind::ConsumerDropped,
+                            AttemptStage::Stream,
+                            ReplaySafety::NotProvenPreAcceptance,
+                        ),
+                    },
+                );
             }
-        } else {
-            next_chunk.await
+            result = timeout(chunk_timeout, body_stream.next()) => result,
         };
-
         match next_chunk {
             Ok(Some(Ok(bytes))) => {
                 buffer.extend_from_slice(bytes.as_ref());
@@ -1303,11 +1362,12 @@ async fn process_completion_stream(
                     usage_accumulator.observe(&json);
                     canonicalize_response_model(&mut json, response_model_id);
 
-                    if tx_consumer
-                        .send(CompletionChunk::StreamChunk(json))
-                        .await
-                        .is_err()
-                    {
+                    let sent = tokio::select! {
+                        biased;
+                        _ = completion_consumer_cancelled(tx_consumer, response_execution) => false,
+                        result = tx_consumer.send(CompletionChunk::StreamChunk(json)) => result.is_ok(),
+                    };
+                    if !sent {
                         return finish_stream_processing(
                             &mut usage_accumulator,
                             StreamUsageFinalization::ConsumerDropped,
@@ -1758,16 +1818,34 @@ pub(crate) async fn prepare_completion_request(
     })
 }
 
-/// Executes one model turn against a route pinned for the logical inference request.
-/// Billing remains internal until the usage-settlement stack separates the recorder.
-pub(crate) async fn get_chat_completion_response(
+/// A provider response whose HTTP success status has been observed, but whose
+/// body has not yet been consumed. Responses holds this value only across its
+/// persistence boundary so a capacity rejection can still be returned as an
+/// ordinary HTTP error without committing conversation state.
+pub(crate) struct StartedCompletion {
+    response: Option<ProviderResponse>,
+    successful_provider: String,
+    attempt: InferenceAttempt,
+    response_model_id: String,
+    is_streaming: bool,
+    billing_context: BillingContext,
+    non_streaming_body_limit: Option<usize>,
+    require_provider_done: bool,
+    terminal_guard: Option<AttemptTerminalGuard>,
+    response_execution: Option<ResponseExecution>,
+    response_execution_guard: Option<ResponseExecutionTaskGuard>,
+}
+
+/// Starts one model turn against a route pinned for the logical inference
+/// request and returns immediately after a successful provider response start.
+pub(crate) async fn start_chat_completion_response(
     state: &Arc<AppState>,
     user: &User,
     body: Value,
     headers: &HeaderMap,
     execution: CompletionExecutionContext<'_>,
     pinned: &PinnedCompletionRequest,
-) -> Result<CompletionStream, CompletionExecutionError> {
+) -> Result<StartedCompletion, CompletionExecutionError> {
     get_chat_completion_response_with_options(
         state,
         user,
@@ -1780,9 +1858,9 @@ pub(crate) async fn get_chat_completion_response(
     .await
 }
 
-/// Responses-only completion entry point with process-local task ownership.
-/// Ordinary Chat Completions retain their existing independent lifecycle.
-pub(crate) async fn get_chat_completion_response_for_execution(
+/// Starts a Responses provider turn with process-local task ownership that
+/// remains held across the persistence boundary and subsequent processing.
+pub(crate) async fn start_chat_completion_response_for_execution(
     state: &Arc<AppState>,
     user: &User,
     body: Value,
@@ -1790,7 +1868,7 @@ pub(crate) async fn get_chat_completion_response_for_execution(
     execution: CompletionExecutionContext<'_>,
     pinned: &PinnedCompletionRequest,
     response_execution: ResponseExecution,
-) -> Result<CompletionStream, CompletionExecutionError> {
+) -> Result<StartedCompletion, CompletionExecutionError> {
     let execution = execution.with_response_execution(response_execution)?;
     get_chat_completion_response_with_options(
         state,
@@ -1842,7 +1920,7 @@ pub(crate) async fn get_chat_completion_response_for_expected_route(
 
     let continuum_cache_salt = (route.provider_name == ProviderId::Continuum.as_str())
         .then(|| format!("server-selected-{}", Uuid::new_v4().simple()));
-    get_chat_completion_response_with_options(
+    let started = get_chat_completion_response_with_options(
         state,
         user,
         body,
@@ -1858,7 +1936,8 @@ pub(crate) async fn get_chat_completion_response_for_expected_route(
             non_streaming_body_limit: Some(MAX_BOUNDED_PROVIDER_RESPONSE_BYTES),
         },
     )
-    .await
+    .await?;
+    finish_started_completion(state, user, started).await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1896,7 +1975,7 @@ async fn get_chat_completion_response_with_options(
     execution: CompletionExecutionContext<'_>,
     pinned: &PinnedCompletionRequest,
     options: CompletionExecutionOptions,
-) -> Result<CompletionStream, CompletionExecutionError> {
+) -> Result<StartedCompletion, CompletionExecutionError> {
     let CompletionExecutionContext {
         mut billing,
         routing,
@@ -2000,7 +2079,7 @@ async fn get_chat_completion_response_with_options(
         selected_route.provider.as_str()
     );
 
-    let (res, successful_provider, attempt, mut terminal_guard) = {
+    let (response, successful_provider, attempt, terminal_guard) = {
         let mut request_body = modified_body.clone();
         let proxy_config = selected_route.proxy.clone();
         let provider_model_name = selected_route.provider_model_id.clone();
@@ -2086,8 +2165,11 @@ async fn get_chat_completion_response_with_options(
                     failure.stage,
                     request_log_metadata
                 );
-                let execution_error =
-                    failed_completion_execution(attempt, failure, ApiError::from(err));
+                let execution_error = failed_completion_execution(
+                    attempt,
+                    failure.clone(),
+                    public_completion_error(&err, &failure),
+                );
                 terminal_guard.disarm();
                 return Err(execution_error);
             }
@@ -2099,6 +2181,46 @@ async fn get_chat_completion_response_with_options(
         successful_provider
     );
 
+    Ok(StartedCompletion {
+        response: Some(response),
+        successful_provider,
+        attempt,
+        response_model_id: selected_route.response_model_id,
+        is_streaming,
+        billing_context: billing,
+        non_streaming_body_limit: options.non_streaming_body_limit,
+        require_provider_done,
+        terminal_guard: Some(terminal_guard),
+        response_execution,
+        response_execution_guard,
+    })
+}
+
+/// Consumes a successfully started provider response. Billing remains internal
+/// until the usage-settlement stack separates the recorder.
+pub(crate) async fn finish_started_completion(
+    state: &Arc<AppState>,
+    user: &User,
+    mut started: StartedCompletion,
+) -> Result<CompletionStream, CompletionExecutionError> {
+    let response = started
+        .response
+        .take()
+        .expect("started completion response can only be consumed once");
+    let successful_provider = started.successful_provider.clone();
+    let attempt = started.attempt.clone();
+    let response_model_id = started.response_model_id.clone();
+    let is_streaming = started.is_streaming;
+    let billing_context = started.billing_context.clone();
+    let non_streaming_body_limit = started.non_streaming_body_limit;
+    let require_provider_done = started.require_provider_done;
+    let response_execution = started.response_execution.take();
+    let response_execution_guard = started.response_execution_guard.take();
+    let mut terminal_guard = started
+        .terminal_guard
+        .take()
+        .expect("started completion terminal guard can only be consumed once");
+
     // NOW: Process the response internally and handle billing
     if !is_streaming {
         // NON-STREAMING: Simple case
@@ -2106,10 +2228,10 @@ async fn get_chat_completion_response_with_options(
         // The request's streaming fields are forwarded unchanged, but this
         // encrypted endpoint currently buffers one byte-exact response carrier.
         let response_json = match read_non_streaming_completion_response(
-            res,
-            &selected_route.response_model_id,
+            response,
+            &response_model_id,
             &attempt,
-            options.non_streaming_body_limit,
+            non_streaming_body_limit,
         )
         .await
         {
@@ -2127,8 +2249,14 @@ async fn get_chat_completion_response_with_options(
 
         // ✅ Handle billing HERE, inside completions API
         if let Some(usage) = extract_usage(&response_json) {
-            publish_usage_event_internal(state, user, billing_context, usage, &successful_provider)
-                .await;
+            publish_usage_event_internal(
+                state,
+                user,
+                &billing_context,
+                usage,
+                &successful_provider,
+            )
+            .await;
         }
 
         // Return the full response as a single chunk
@@ -2161,14 +2289,13 @@ async fn get_chat_completion_response_with_options(
     let user_clone = user.clone();
     let billing_ctx = billing_context.clone();
     let provider = successful_provider.clone();
-    let response_model_id = selected_route.response_model_id.clone();
     let stream_attempt = attempt.clone();
     terminal_guard.set_stage(AttemptStage::Stream);
 
     tokio::spawn(async move {
         let _response_execution_guard = response_execution_guard;
         let result = process_completion_stream(
-            res,
+            response,
             &response_model_id,
             stream_attempt,
             &tx_consumer,
@@ -2202,6 +2329,21 @@ async fn get_chat_completion_response_with_options(
             attempt,
         },
     })
+}
+
+/// Executes one complete model turn. Responses uses the split start/finish
+/// functions so only the first response headers cross its persistence seam.
+pub(crate) async fn get_chat_completion_response(
+    state: &Arc<AppState>,
+    user: &User,
+    body: Value,
+    headers: &HeaderMap,
+    execution: CompletionExecutionContext<'_>,
+    pinned: &PinnedCompletionRequest,
+) -> Result<CompletionStream, CompletionExecutionError> {
+    let started =
+        start_chat_completion_response(state, user, body, headers, execution, pinned).await?;
+    finish_started_completion(state, user, started).await
 }
 
 pub(crate) fn ensure_completion_model_access(
@@ -2242,20 +2384,23 @@ fn extract_usage_observation(json: &Value) -> Option<CompletionUsageObservation>
     let prompt_tokens = usage_json
         .get("prompt_tokens")
         .and_then(|v| v.as_i64())
-        .map(|tokens| tokens.clamp(0, i32::MAX as i64) as i32);
+        .filter(|tokens| *tokens >= 0)
+        .map(|tokens| tokens.min(i32::MAX as i64) as i32);
 
     let cached_prompt_tokens = usage_json
         .get("prompt_tokens_details")
         .and_then(|details| details.get("cached_tokens"))
         .and_then(|v| v.as_i64())
-        .map(|tokens| tokens.clamp(0, i32::MAX as i64) as i32);
+        .filter(|tokens| *tokens >= 0)
+        .map(|tokens| tokens.min(i32::MAX as i64) as i32);
 
     Some(CompletionUsageObservation {
         prompt_tokens,
         completion_tokens: usage_json
             .get("completion_tokens")
             .and_then(|v| v.as_i64())
-            .map(|tokens| tokens.clamp(0, i32::MAX as i64) as i32),
+            .filter(|tokens| *tokens >= 0)
+            .map(|tokens| tokens.min(i32::MAX as i64) as i32),
         cached_prompt_tokens,
     })
 }
@@ -3786,9 +3931,9 @@ mod tests {
             .contains("private upstream capacity detail"));
 
         let failure = attempt_failure_from_provider_error(&error);
-        assert_eq!(failure.kind, AttemptFailureKind::HttpStatus);
+        assert_eq!(failure.kind, AttemptFailureKind::CapacityRejected);
         assert_eq!(failure.stage, AttemptStage::AwaitingResponse);
-        assert_eq!(failure.replay_safety, ReplaySafety::NotProvenPreAcceptance);
+        assert_eq!(failure.replay_safety, ReplaySafety::ProvenPreAcceptance);
         assert_eq!(failure.status, Some(429));
         assert_eq!(failure.retry_after, Some(Duration::from_secs(17)));
         assert_eq!(
@@ -3834,9 +3979,47 @@ mod tests {
             Ok(_) => panic!("mock 429 unexpectedly succeeded"),
         };
         let failure = attempt_failure_from_provider_error(&error);
-        assert_eq!(failure.kind, AttemptFailureKind::HttpStatus);
+        assert_eq!(failure.kind, AttemptFailureKind::CapacityRejected);
         assert_eq!(failure.status, Some(429));
         assert_eq!(failure.retry_after, Some(Duration::from_secs(23)));
+    }
+
+    #[tokio::test]
+    async fn mock_provider_capacity_matrix_normalizes_503_and_synthetic_529() {
+        for status in [503u16, 529u16] {
+            let app = Router::new().route(
+                "/v1/chat/completions",
+                post(move || async move {
+                    axum::http::Response::builder()
+                        .status(status)
+                        .header(header::RETRY_AFTER, "11")
+                        .body(axum::body::Body::from(
+                            r#"{"error":{"message":"private capacity detail"}}"#,
+                        ))
+                        .expect("mock capacity response")
+                }),
+            );
+            let (trace, server) = call_mock_provider(app).await;
+            server.abort();
+            let error = match trace.result {
+                Err(error) => error,
+                Ok(_) => panic!("capacity response unexpectedly succeeded"),
+            };
+            assert!(!error.to_string().contains("private capacity detail"));
+            let failure = attempt_failure_from_provider_error(&error);
+            assert_eq!(failure.kind, AttemptFailureKind::CapacityRejected);
+            assert_eq!(failure.replay_safety, ReplaySafety::ProvenPreAcceptance);
+            assert_eq!(failure.status, Some(status));
+            assert_eq!(failure.retry_after, Some(Duration::from_secs(11)));
+            assert!(matches!(
+                public_completion_error(&error, &failure),
+                ApiError::InferenceCapacity {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    client_replay_safe: false,
+                    ..
+                }
+            ));
+        }
     }
 
     #[tokio::test]
@@ -3990,6 +4173,106 @@ mod tests {
             AttemptTerminal::Failed {
                 failure: AttemptFailure {
                     kind: AttemptFailureKind::StreamTimeout,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_completion_consumer_cancels_a_pending_provider_body() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let pending = futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+                axum::http::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from_stream(pending))
+                    .expect("mock pending response")
+            }),
+        );
+        let (trace, server) = call_mock_provider(app).await;
+        let response = trace.result.expect("mock provider response start");
+        let pinned = pinned_test_completion();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+
+        let result = timeout(
+            Duration::from_millis(100),
+            process_completion_stream(
+                response,
+                "kimi-k3",
+                attempt,
+                &tx,
+                Duration::from_secs(30),
+                None,
+            ),
+        )
+        .await
+        .expect("consumer drop should cancel without waiting for chunk timeout");
+        server.abort();
+
+        assert!(matches!(
+            result.terminal,
+            AttemptTerminal::Failed {
+                failure: AttemptFailure {
+                    kind: AttemptFailureKind::ConsumerDropped,
+                    stage: AttemptStage::Stream,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_response_cancellation_precedes_ready_provider_data() {
+        let (trace, server) = call_mock_provider(static_sse_app(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ignored\"}}]}\n\ndata: [DONE]\n\n",
+        ))
+        .await;
+        let response = trace.result.expect("mock provider response start");
+        let pinned = pinned_test_completion();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let registry = crate::web::responses::ResponseExecutionRegistry::default();
+        let registration = registry
+            .register(Uuid::new_v4(), pinned.intent.account_uuid)
+            .expect("register response execution");
+        let execution = registration.execution();
+        let (tx, mut rx) = mpsc::channel(1);
+        execution.cancel();
+
+        let result = timeout(
+            Duration::from_millis(100),
+            process_completion_stream(
+                response,
+                "kimi-k3",
+                attempt,
+                &tx,
+                Duration::from_secs(30),
+                Some(&execution),
+            ),
+        )
+        .await
+        .expect("sticky cancellation should stop processing before provider data");
+        drop(tx);
+        server.abort();
+
+        assert!(rx.recv().await.is_none());
+        assert!(result.usage.is_none());
+        assert!(matches!(
+            result.terminal,
+            AttemptTerminal::Failed {
+                failure: AttemptFailure {
+                    kind: AttemptFailureKind::ConsumerDropped,
+                    stage: AttemptStage::Stream,
                     ..
                 },
                 ..
@@ -4210,8 +4493,8 @@ mod tests {
             upstream_request_id: Some("request-123".to_string()),
         });
         let failure = attempt_failure_from_provider_error(&upstream);
-        assert_eq!(failure.kind, AttemptFailureKind::HttpStatus);
-        assert_eq!(failure.replay_safety, ReplaySafety::NotProvenPreAcceptance);
+        assert_eq!(failure.kind, AttemptFailureKind::CapacityRejected);
+        assert_eq!(failure.replay_safety, ReplaySafety::ProvenPreAcceptance);
         assert_eq!(failure.status, Some(429));
         assert_eq!(failure.retry_after, Some(Duration::from_secs(60)));
         assert_eq!(failure.upstream_request_id.as_deref(), Some("request-123"));
@@ -4343,6 +4626,46 @@ mod tests {
         );
         assert_eq!(parse_retry_after_hint(Some("not-seconds")), None);
         assert_eq!(parse_retry_after_hint(None), None);
+    }
+
+    #[test]
+    fn capacity_statuses_are_explicit_rejections_and_529_is_normalized() {
+        for (upstream_status, public_status) in [
+            (429, StatusCode::TOO_MANY_REQUESTS),
+            (503, StatusCode::SERVICE_UNAVAILABLE),
+            (529, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let provider_error = ProviderRequestError::Upstream(UpstreamProviderError {
+                status: upstream_status,
+                retry_after: Some(Duration::from_secs(7)),
+                upstream_request_id: None,
+            });
+            let failure = attempt_failure_from_provider_error(&provider_error);
+            assert_eq!(failure.kind, AttemptFailureKind::CapacityRejected);
+            assert_eq!(failure.replay_safety, ReplaySafety::ProvenPreAcceptance);
+            assert_eq!(failure.status, Some(upstream_status));
+            assert!(matches!(
+                public_completion_error(&provider_error, &failure),
+                ApiError::InferenceCapacity {
+                    status,
+                    retry_after: Some(delay),
+                    client_replay_safe: false,
+                } if status == public_status && delay == Duration::from_secs(7)
+            ));
+        }
+
+        let generic = ProviderRequestError::Upstream(UpstreamProviderError {
+            status: 500,
+            retry_after: None,
+            upstream_request_id: None,
+        });
+        let failure = attempt_failure_from_provider_error(&generic);
+        assert_eq!(failure.kind, AttemptFailureKind::HttpStatus);
+        assert_eq!(failure.replay_safety, ReplaySafety::NotProvenPreAcceptance);
+        assert!(matches!(
+            public_completion_error(&generic, &failure),
+            ApiError::InternalServerError
+        ));
     }
 
     #[test]
@@ -4818,6 +5141,34 @@ mod tests {
     }
 
     #[test]
+    fn prompt_only_usage_defaults_completion_tokens_to_zero() {
+        let response = json!({
+            "usage": {
+                "prompt_tokens": 100
+            }
+        });
+
+        let usage = extract_usage(&response).expect("usage should parse");
+
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 0);
+    }
+
+    #[test]
+    fn negative_completion_usage_defaults_to_zero() {
+        let response = json!({
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": -1
+            }
+        });
+
+        let usage = extract_usage(&response).expect("prompt usage should parse");
+
+        assert_eq!(usage.completion_tokens, 0);
+    }
+
+    #[test]
     fn cached_prompt_tokens_are_optional_in_usage_details() {
         let response = json!({
             "usage": {
@@ -5057,6 +5408,18 @@ mod tests {
     }
 
     #[test]
+    fn regressing_cumulative_usage_preserves_highest_totals() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&stream_usage_chunk(500, 100, None, None, false));
+        accumulator.observe(&stream_usage_chunk(400, 0, None, Some("stop"), true));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("provider [DONE] should finalize usage");
+        assert_usage(usage, 500, 100, None);
+    }
+
+    #[test]
     fn provider_done_uses_finish_usage_when_usage_only_frame_is_missing() {
         let mut accumulator = StreamUsageAccumulator::default();
         accumulator.observe(&stream_usage_chunk(400, 20, None, Some("stop"), false));
@@ -5172,6 +5535,21 @@ mod tests {
             .take_final_usage(StreamUsageFinalization::ProviderDone)
             .expect("non-zero prompt usage should be retained");
         assert_usage(usage, 33, 0, None);
+    }
+
+    #[test]
+    fn stream_prompt_only_usage_preserves_prompt_tokens() {
+        let mut accumulator = StreamUsageAccumulator::default();
+        accumulator.observe(&json!({
+            "choices": [{ "finish_reason": "tool_calls" }],
+            "usage": { "prompt_tokens": 33 }
+        }));
+
+        let usage = accumulator
+            .take_final_usage(StreamUsageFinalization::ProviderDone)
+            .expect("non-zero prompt usage should be retained");
+        assert_eq!(usage.prompt_tokens, 33);
+        assert_eq!(usage.completion_tokens, 0);
     }
 
     #[test]

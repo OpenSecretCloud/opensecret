@@ -29,7 +29,7 @@ pub const EVENT_RESPONSE_CONTENT_PART_DONE: &str = "response.content_part.done";
 pub const EVENT_RESPONSE_OUTPUT_ITEM_DONE: &str = "response.output_item.done";
 pub const EVENT_RESPONSE_COMPLETED: &str = "response.completed";
 pub const EVENT_RESPONSE_CANCELLED: &str = "response.cancelled";
-pub const EVENT_RESPONSE_ERROR: &str = "response.error";
+pub const EVENT_RESPONSE_FAILED: &str = "response.failed";
 
 /// Error event data
 pub const ERROR_DATA_ENCRYPTION_FAILED: &str = "encryption_failed";
@@ -38,6 +38,7 @@ pub const ERROR_DATA_SERIALIZATION_FAILED: &str = "serialization_failed";
 /// Message statuses
 pub const STATUS_IN_PROGRESS: &str = "in_progress";
 pub const STATUS_COMPLETED: &str = "completed";
+pub const STATUS_FAILED: &str = "failed";
 pub const STATUS_INCOMPLETE: &str = "incomplete";
 pub const STATUS_CANCELLED: &str = "cancelled";
 

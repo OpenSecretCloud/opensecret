@@ -194,6 +194,7 @@ pub(crate) enum AttemptFailureKind {
     Transport,
     ResponseStartTimeout,
     HttpStatus,
+    CapacityRejected,
     ResponseBody,
     InvalidResponse,
     UpstreamResponseError,

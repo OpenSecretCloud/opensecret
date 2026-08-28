@@ -13,7 +13,6 @@ use tokio::time::timeout;
 pub const IMAGE_DESCRIPTION_ATTEMPT_TIMEOUT_SECS: u64 = 15;
 pub const IMAGE_DESCRIPTION_ATTEMPT_TIMEOUT: Duration =
     Duration::from_secs(IMAGE_DESCRIPTION_ATTEMPT_TIMEOUT_SECS);
-pub const IMAGE_DESCRIPTION_MAX_OUTPUT_TOKENS: u64 = 2_048;
 pub const MAX_IMAGE_DESCRIPTION_RESPONSE_BYTES: usize = 256 * 1024;
 pub const MAX_IMAGE_DESCRIPTION_CHARS: usize = 16 * 1024;
 
@@ -110,7 +109,6 @@ pub fn build_image_description_request(
         "model": candidate.public_model_id,
         "stream": false,
         "temperature": 0.0,
-        "max_tokens": IMAGE_DESCRIPTION_MAX_OUTPUT_TOKENS,
         "messages": [
             {
                 "role": "system",
@@ -528,6 +526,16 @@ mod tests {
         );
         assert_eq!(IMAGE_DESCRIPTION_CANDIDATES[2].provider.as_str(), "tinfoil");
         assert_eq!(IMAGE_DESCRIPTION_CANDIDATES[2].provider_model_id, "kimi-k3");
+    }
+
+    #[test]
+    fn image_description_requests_do_not_impose_output_token_limits() {
+        for candidate in IMAGE_DESCRIPTION_CANDIDATES {
+            let request = build_image_description_request(candidate, input()).expect("request");
+            assert!(request.get("max_tokens").is_none());
+            assert!(request.get("max_completion_tokens").is_none());
+            assert!(request.get("max_output_tokens").is_none());
+        }
     }
 
     #[test]

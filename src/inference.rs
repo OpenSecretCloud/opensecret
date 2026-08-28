@@ -1,5 +1,5 @@
 use crate::model_config::{ModelPlan, AUTO_POWERFUL_MODEL_ID, AUTO_QUICK_MODEL_ID};
-use crate::provider_routing::{ProviderName, ProviderSelectionSource};
+use crate::provider_registry::{ProviderId, RouteSelectionSource};
 use std::fmt;
 use std::time::Duration;
 use uuid::Uuid;
@@ -105,22 +105,22 @@ impl InferenceIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RouteIdentity {
-    pub(crate) provider: ProviderName,
+    pub(crate) provider: ProviderId,
     pub(crate) public_model_id: String,
     pub(crate) provider_model_id: String,
     pub(crate) response_model_id: String,
-    pub(crate) selection_source: ProviderSelectionSource,
+    pub(crate) selection_source: RouteSelectionSource,
     pub(crate) bucket: Option<u8>,
 }
 
 impl RouteIdentity {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        provider: ProviderName,
+        provider: ProviderId,
         public_model_id: impl Into<String>,
         provider_model_id: impl Into<String>,
         response_model_id: impl Into<String>,
-        selection_source: ProviderSelectionSource,
+        selection_source: RouteSelectionSource,
         bucket: Option<u8>,
     ) -> Self {
         Self {
@@ -143,7 +143,7 @@ impl RouteIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RouteKey {
-    pub(crate) provider: ProviderName,
+    pub(crate) provider: ProviderId,
     pub(crate) provider_model_id: String,
 }
 
@@ -300,11 +300,11 @@ mod tests {
 
     fn route() -> RouteIdentity {
         RouteIdentity::new(
-            ProviderName::Tinfoil,
+            ProviderId::Tinfoil,
             "kimi-k3",
             "kimi-k3",
             "kimi-k3",
-            ProviderSelectionSource::StaticSplit,
+            RouteSelectionSource::StaticSplit,
             None,
         )
     }
@@ -371,18 +371,18 @@ mod tests {
     #[test]
     fn route_key_uses_typed_provider_and_upstream_model() {
         let route = RouteIdentity::new(
-            ProviderName::Continuum,
+            ProviderId::Continuum,
             "glm-5-3",
             "glm-5.3",
             "glm-5-3",
-            ProviderSelectionSource::FeatureFlag,
+            RouteSelectionSource::FeatureFlag,
             None,
         );
 
         assert_eq!(
             route.route_key(),
             RouteKey {
-                provider: ProviderName::Continuum,
+                provider: ProviderId::Continuum,
                 provider_model_id: "glm-5.3".to_string(),
             }
         );

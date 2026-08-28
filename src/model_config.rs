@@ -119,6 +119,7 @@ pub const GLM_5_3_MODEL_ID: &str = "glm-5-3";
 pub const GLM_5_3_FLASH_MODEL_ID: &str = "glm-5-3-flash";
 pub const POWERFUL_MODEL_ID: &str = GLM_5_2_MODEL_ID;
 pub const KIMI_K3_MODEL_ID: &str = "kimi-k3";
+pub const KIMI_K2_6_MODEL_ID: &str = "kimi-k2-6";
 pub const DEEPSEEK_V4_FLASH_MODEL_ID: &str = "deepseek-v4-flash";
 
 const FREE_MODEL_ALIAS_TARGETS: ModelAliasTargets = ModelAliasTargets {
@@ -699,6 +700,14 @@ fn model_entry(model: &str) -> Option<ModelConfigEntry> {
         .iter()
         .find(|entry| entry.id == model)
         .copied()
+}
+
+#[cfg(test)]
+pub(crate) fn enabled_api_completion_model_ids() -> impl Iterator<Item = &'static str> {
+    MODEL_CONFIGS
+        .iter()
+        .filter(|entry| entry.api_listed && entry.enabled && entry.capabilities.chat)
+        .map(|entry| entry.id)
 }
 
 pub fn resolve_completion_model_id(model: &str) -> Option<&'static str> {

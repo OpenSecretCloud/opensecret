@@ -3,6 +3,7 @@ use crate::inference::{
     CompletionEvidence, InferenceAttempt, InferenceExecution, InferenceIntent, InferenceSurface,
     ReplaySafety, WorkloadClass,
 };
+use crate::inference_planning::{RoutePlan, RoutePlanningError};
 use crate::model_config::{
     model_alias_requires_flag_lookup, model_catalog_response, openai_models_response,
     ModelAliasTargets, ModelPlan,
@@ -16,8 +17,10 @@ use crate::provider_client::{
     ProviderClient, ProviderRequest, ProviderRequestError, ProviderResponse, ProviderSendTrace,
     UpstreamProviderError,
 };
+use crate::provider_registry::{ProviderId, SHADOW_ROUTING_POLICY_VERSION};
 use crate::provider_routing::{
-    InferenceRoutingMode, ProviderName, ProviderRoutingError, SelectedProviderRoute,
+    compare_shadow_route, InferenceRoutingMode, ProviderRoutingError, SelectedProviderRoute,
+    ShadowRouteComparison,
 };
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
@@ -1650,6 +1653,40 @@ async fn proxy_openai(
     Ok(Sse::new(stream).into_response())
 }
 
+fn retain_active_route_after_shadow_observation(
+    intent: &InferenceIntent,
+    active: Result<SelectedProviderRoute, ProviderRoutingError>,
+    shadow: Result<RoutePlan, RoutePlanningError>,
+) -> Result<SelectedProviderRoute, ProviderRoutingError> {
+    let comparison = compare_shadow_route(&active, &shadow);
+    let policy_version = shadow
+        .as_ref()
+        .map(|plan| plan.policy_version)
+        .unwrap_or(SHADOW_ROUTING_POLICY_VERSION);
+    let candidate_scope = shadow.as_ref().ok().map(|plan| plan.candidate_scope);
+
+    match &comparison {
+        ShadowRouteComparison::Match { .. } => debug!(
+            "Shadow route matched active route: request_id={}, public_model={}, policy_version={}, candidate_scope={:?}, comparison={:?}",
+            intent.request_id,
+            intent.public_model_id,
+            policy_version,
+            candidate_scope,
+            comparison
+        ),
+        ShadowRouteComparison::Mismatch { .. } => warn!(
+            "Shadow route differed from active route; retaining active route: request_id={}, public_model={}, policy_version={}, candidate_scope={:?}, comparison={:?}",
+            intent.request_id,
+            intent.public_model_id,
+            policy_version,
+            candidate_scope,
+            comparison
+        ),
+    }
+
+    active
+}
+
 pub(crate) async fn prepare_completion_request(
     state: &Arc<AppState>,
     user: &User,
@@ -1669,25 +1706,34 @@ pub(crate) async fn prepare_completion_request(
     let provider_preference = state
         .provider_routing_preference(user.uuid, &intent.public_model_id)
         .await;
-    let route = state
-        .provider_router
-        .select_completion_route_for_mode(
-            &state.proxy_router,
-            user.uuid,
-            &intent.public_model_id,
-            provider_preference,
-            routing.mode(),
-        )
-        .map_err(|err| match err {
-            ProviderRoutingError::UnsupportedModel(model) => {
-                error!("Unsupported completion model requested: {}", model);
-                ApiError::BadRequest
-            }
-            ProviderRoutingError::NoEligibleRoute(model) => {
-                error!("No eligible provider route for completion model: {}", model);
-                ApiError::InternalServerError
-            }
-        })?;
+    let active = state.provider_router.select_completion_route_for_mode(
+        &state.proxy_router,
+        user.uuid,
+        &intent.public_model_id,
+        provider_preference,
+        routing.mode(),
+    );
+    let selected = match routing.mode() {
+        InferenceRoutingMode::Legacy => active,
+        InferenceRoutingMode::V2 => {
+            let shadow = state.provider_router.shadow_completion_plan(
+                &state.proxy_router,
+                &intent,
+                provider_preference,
+            );
+            retain_active_route_after_shadow_observation(&intent, active, shadow)
+        }
+    };
+    let route = selected.map_err(|err| match err {
+        ProviderRoutingError::UnsupportedModel(model) => {
+            error!("Unsupported completion model requested: {}", model);
+            ApiError::BadRequest
+        }
+        ProviderRoutingError::NoEligibleRoute(model) => {
+            error!("No eligible provider route for completion model: {}", model);
+            ApiError::InternalServerError
+        }
+    })?;
 
     debug!(
         "Pinned inference route: request_id={}, routing_mode={:?}, selection_mode={:?}, auto={}, surface={:?}, workload={:?}, requested_model={}, public_model={}, provider={}, provider_model={}, bucket={:?}, source={:?}",
@@ -1794,7 +1840,7 @@ pub(crate) async fn get_chat_completion_response_for_expected_route(
             CompletionExecutionError::Request(ApiError::ServiceUnavailable)
         })?;
 
-    let continuum_cache_salt = (route.provider_name == ProviderName::Continuum.as_str())
+    let continuum_cache_salt = (route.provider_name == ProviderId::Continuum.as_str())
         .then(|| format!("server-selected-{}", Uuid::new_v4().simple()));
     get_chat_completion_response_with_options(
         state,
@@ -2257,7 +2303,7 @@ fn apply_provider_managed_request_fields(
         .remove(PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD)
         .is_some();
 
-    if provider_name == ProviderName::Tinfoil.as_str() {
+    if provider_name == ProviderId::Tinfoil.as_str() {
         let user_cache_secret = match cache_policy {
             CompletionCachePolicy::LegacyV1 => tinfoil_user_cache_secret(user_uuid),
             CompletionCachePolicy::BoundV2(namespace) => namespace.tinfoil_user_cache_secret(),
@@ -2279,7 +2325,7 @@ fn apply_server_selected_cache_isolation(
     provider_name: &str,
     continuum_cache_salt: Option<&str>,
 ) -> Result<(), ApiError> {
-    if provider_name != ProviderName::Continuum.as_str() {
+    if provider_name != ProviderId::Continuum.as_str() {
         return Ok(());
     }
 
@@ -3498,7 +3544,7 @@ mod tests {
         let proxy = ProxyConfig {
             base_url,
             api_key: None,
-            provider_name: ProviderName::Tinfoil.as_str().to_string(),
+            provider_name: ProviderId::Tinfoil.as_str().to_string(),
         };
         let trace = try_provider(
             &client,
@@ -3576,7 +3622,7 @@ mod tests {
                 WorkloadClass::Interactive,
             ),
             route: SelectedProviderRoute {
-                provider: ProviderName::Tinfoil,
+                provider: ProviderId::Tinfoil,
                 proxy: ProxyConfig {
                     base_url: "http://tinfoil.example.com".to_string(),
                     api_key: None,
@@ -3586,7 +3632,7 @@ mod tests {
                 provider_model_id: "glm-5-2".to_string(),
                 response_model_id: "glm-5-2".to_string(),
                 bucket: None,
-                selection_source: crate::provider_routing::ProviderSelectionSource::DefaultProvider,
+                selection_source: crate::provider_registry::RouteSelectionSource::DefaultProvider,
             },
             routing_mode: InferenceRoutingMode::V2,
         }
@@ -3993,7 +4039,7 @@ mod tests {
         let proxy = ProxyConfig {
             base_url,
             api_key: None,
-            provider_name: ProviderName::Tinfoil.as_str().to_string(),
+            provider_name: ProviderId::Tinfoil.as_str().to_string(),
         };
         let trace = try_provider(
             &client,
@@ -4061,6 +4107,64 @@ mod tests {
         );
         assert!(pinned.intent().selection_mode.is_auto());
         assert_eq!(pinned.routing_mode(), InferenceRoutingMode::V2);
+    }
+
+    #[test]
+    fn shadow_mismatch_or_error_never_changes_the_active_route() {
+        use crate::inference_planning::{CandidateScope, PlanDecision};
+
+        let mut pinned = pinned_test_completion();
+        pinned.route.proxy.base_url = "https://active-route.example".to_string();
+        pinned.route.proxy.api_key = Some("sentinel-active-api-key".to_string());
+        let active = pinned.route.clone();
+        let shadow = RoutePlan {
+            selected: crate::inference::RouteIdentity::new(
+                ProviderId::Continuum,
+                "glm-5-2",
+                "shadow-provider-model",
+                "glm-5-2",
+                crate::provider_registry::RouteSelectionSource::Fallback,
+                Some(73),
+            ),
+            eligible_routes: Vec::new(),
+            decision: PlanDecision::PreferredProviderUnavailable,
+            candidate_scope: CandidateScope::SamePublicModelOnly,
+            policy_version: SHADOW_ROUTING_POLICY_VERSION,
+        };
+
+        let comparison = compare_shadow_route(&Ok(active.clone()), &Ok(shadow.clone()));
+        let comparison_debug = format!("{comparison:?}");
+        assert!(!comparison_debug.contains("active-route.example"));
+        assert!(!comparison_debug.contains("sentinel-active-api-key"));
+
+        let retained = retain_active_route_after_shadow_observation(
+            pinned.intent(),
+            Ok(active.clone()),
+            Ok(shadow.clone()),
+        )
+        .expect("shadow mismatch must retain active route");
+        assert_eq!(retained.identity(), active.identity());
+        assert_eq!(retained.proxy, active.proxy);
+
+        let retained = retain_active_route_after_shadow_observation(
+            pinned.intent(),
+            Ok(active.clone()),
+            Err(RoutePlanningError::NoEligibleRoute("glm-5-2".to_string())),
+        )
+        .expect("shadow error must retain active route");
+        assert_eq!(retained.identity(), active.identity());
+        assert_eq!(retained.proxy, active.proxy);
+
+        let active_error = ProviderRoutingError::NoEligibleRoute("glm-5-2".to_string());
+        let result = retain_active_route_after_shadow_observation(
+            pinned.intent(),
+            Err(active_error.clone()),
+            Ok(shadow),
+        );
+        assert_eq!(
+            result.expect_err("shadow success cannot rescue active failure"),
+            active_error
+        );
     }
 
     #[test]
@@ -4598,7 +4702,7 @@ mod tests {
 
         apply_provider_managed_request_fields(
             &mut body,
-            ProviderName::Tinfoil.as_str(),
+            ProviderId::Tinfoil.as_str(),
             user_uuid,
             &CompletionCachePolicy::LegacyV1,
         );
@@ -4625,7 +4729,7 @@ mod tests {
 
         apply_provider_managed_request_fields(
             &mut body,
-            ProviderName::Tinfoil.as_str(),
+            ProviderId::Tinfoil.as_str(),
             user_uuid,
             &CompletionCachePolicy::BoundV2(namespace),
         );
@@ -4650,7 +4754,7 @@ mod tests {
 
         apply_provider_managed_request_fields(
             &mut body,
-            ProviderName::Continuum.as_str(),
+            ProviderId::Continuum.as_str(),
             Uuid::from_u128(42),
             &CompletionCachePolicy::LegacyV1,
         );
@@ -4669,7 +4773,7 @@ mod tests {
 
         apply_provider_managed_request_fields(
             &mut body,
-            ProviderName::Continuum.as_str(),
+            ProviderId::Continuum.as_str(),
             user_uuid,
             &CompletionCachePolicy::LegacyV1,
         );
@@ -4678,7 +4782,7 @@ mod tests {
         let server_salt = format!("server-selected-{}", Uuid::new_v4().simple());
         apply_server_selected_cache_isolation(
             &mut body,
-            ProviderName::Continuum.as_str(),
+            ProviderId::Continuum.as_str(),
             Some(&server_salt),
         )
         .expect("server-selected Continuum salt should be accepted");

@@ -103,6 +103,7 @@ mod email;
 mod encrypt;
 mod http_client;
 mod inference;
+mod inference_planning;
 mod jwt;
 mod kagi;
 mod kv;
@@ -117,6 +118,7 @@ mod private_key;
 #[allow(dead_code)] // Used by the dormant Transport V2 core in this stack layer.
 mod provider_cache;
 mod provider_client;
+mod provider_registry;
 mod provider_routing;
 mod proxy_config;
 mod secret_cache_maintenance;
@@ -133,9 +135,10 @@ mod web;
 mod aead_db_tamper_tests;
 
 use apple_signin::AppleJwtVerifier;
+use inference_planning::ProviderPreference;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
 use provider_client::{ProviderClient, ProviderRequestError};
-use provider_routing::{InferenceRoutingMode, ProviderPreference, ProviderRouter};
+use provider_routing::{InferenceRoutingMode, ProviderRouter};
 use proxy_config::ProxyRouter;
 
 const ENCLAVE_KEY_NAME: &str = "enclave_key";

@@ -934,6 +934,80 @@ mod tests {
     }
 
     #[test]
+    fn test_golden_responses_alias_resolution_matrix() {
+        struct Case {
+            name: &'static str,
+            plan: ModelPlan,
+            powerful_kimi_k3: bool,
+            selector: &'static str,
+            expected_model: &'static str,
+            expected_access: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "free auto quick",
+                plan: ModelPlan::Free,
+                powerful_kimi_k3: false,
+                selector: crate::model_config::AUTO_QUICK_MODEL_ID,
+                expected_model: crate::model_config::QUICK_MODEL_ID,
+                expected_access: true,
+            },
+            Case {
+                name: "free auto powerful, flag on",
+                plan: ModelPlan::Free,
+                powerful_kimi_k3: true,
+                selector: crate::model_config::AUTO_POWERFUL_MODEL_ID,
+                expected_model: crate::model_config::POWERFUL_MODEL_ID,
+                expected_access: false,
+            },
+            Case {
+                name: "paid auto quick",
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: false,
+                selector: crate::model_config::AUTO_QUICK_MODEL_ID,
+                expected_model: crate::model_config::DEEPSEEK_V4_FLASH_MODEL_ID,
+                expected_access: true,
+            },
+            Case {
+                name: "paid auto powerful, flag off",
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: false,
+                selector: crate::model_config::AUTO_POWERFUL_MODEL_ID,
+                expected_model: crate::model_config::POWERFUL_MODEL_ID,
+                expected_access: true,
+            },
+            Case {
+                name: "paid auto powerful, flag on",
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: true,
+                selector: crate::model_config::AUTO_POWERFUL_MODEL_ID,
+                expected_model: crate::model_config::KIMI_K3_MODEL_ID,
+                expected_access: true,
+            },
+        ];
+
+        for case in cases {
+            let flags = HashMap::from([(
+                crate::os_flags::PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY.to_string(),
+                case.powerful_kimi_k3,
+            )]);
+            let targets = ModelAliasTargets::for_plan_with_overrides(
+                case.plan,
+                crate::model_config::PaidModelAliasOverrides::from_flag_values(&flags),
+            );
+            let selected_model = targets.resolve(case.selector);
+
+            assert_eq!(selected_model, case.expected_model, "{}", case.name);
+            let result = resolve_responses_model(selected_model, "tinfoil", case.plan);
+            assert_eq!(result.is_ok(), case.expected_access, "{}", case.name);
+            if case.expected_access {
+                assert_eq!(result.unwrap(), case.expected_model, "{}", case.name);
+            }
+        }
+    }
+
+    #[test]
     fn test_build_model_turn_request_applies_reasoning_history_template_kwargs() {
         let kimi = responses_request_for_model("kimi-k2-6");
         let kimi_request =

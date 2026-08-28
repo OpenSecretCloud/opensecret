@@ -3139,6 +3139,64 @@ mod tests {
         assert_eq!(event.model_name, "kimi-k2-6");
     }
 
+    #[test]
+    fn route_identity_is_preserved_in_usage_events() {
+        let usage = CompletionUsage {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            cached_prompt_tokens: Some(42),
+        };
+
+        for (provider, public_model) in [
+            ("tinfoil", "gpt-oss-120b"),
+            ("tinfoil", "deepseek-v4-flash"),
+            ("tinfoil", "kimi-k3"),
+            ("tinfoil", "glm-5-2"),
+            ("continuum", "kimi-k2-6"),
+            ("continuum", "glm-5-2"),
+        ] {
+            let event = build_usage_event(
+                Uuid::parse_str("6142db59-fc0c-413d-8792-579fc1457fe2").unwrap(),
+                usage.clone(),
+                BigDecimal::from_str("0.001").unwrap(),
+                false,
+                provider.to_string(),
+                public_model.to_string(),
+            );
+
+            assert_eq!(event.provider_name, provider);
+            assert_eq!(event.model_name, public_model);
+            assert_eq!(event.input_tokens, 100);
+            assert_eq!(event.output_tokens, 20);
+            assert_eq!(event.cached_input_tokens, Some(42));
+        }
+    }
+
+    #[test]
+    fn provider_model_ids_are_canonicalized_in_client_responses() {
+        for (provider_model, public_model) in [
+            ("kimi-k2.6", "kimi-k2-6"),
+            ("glm-5.2", "glm-5-2"),
+            ("kimi-k3", "kimi-k3"),
+        ] {
+            let mut response = json!({
+                "id": "completion-id",
+                "model": provider_model,
+                "choices": [],
+            });
+
+            canonicalize_response_model(&mut response, public_model);
+
+            assert_eq!(response["model"], public_model);
+            assert_eq!(response["id"], "completion-id");
+            assert_eq!(response["choices"], json!([]));
+        }
+
+        let mut response_without_model = json!({"choices": []});
+        canonicalize_response_model(&mut response_without_model, "glm-5-2");
+        assert!(response_without_model.get("model").is_none());
+    }
+
     fn stream_usage_chunk(
         prompt_tokens: i32,
         completion_tokens: i32,

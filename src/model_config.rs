@@ -1057,6 +1057,124 @@ mod tests {
     }
 
     #[test]
+    fn test_golden_auto_alias_resolution_matrix_by_plan_and_paid_k3_flag() {
+        struct Case {
+            name: &'static str,
+            plan: ModelPlan,
+            powerful_kimi_k3: bool,
+            selector: &'static str,
+            expected_target: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "free quick, flag off",
+                plan: ModelPlan::Free,
+                powerful_kimi_k3: false,
+                selector: AUTO_QUICK_MODEL_ID,
+                expected_target: QUICK_MODEL_ID,
+            },
+            Case {
+                name: "free quick, flag on",
+                plan: ModelPlan::Free,
+                powerful_kimi_k3: true,
+                selector: AUTO_QUICK_MODEL_ID,
+                expected_target: QUICK_MODEL_ID,
+            },
+            Case {
+                name: "free powerful, flag off",
+                plan: ModelPlan::Free,
+                powerful_kimi_k3: false,
+                selector: AUTO_POWERFUL_MODEL_ID,
+                expected_target: POWERFUL_MODEL_ID,
+            },
+            Case {
+                name: "free powerful, flag on",
+                plan: ModelPlan::Free,
+                powerful_kimi_k3: true,
+                selector: AUTO_POWERFUL_MODEL_ID,
+                expected_target: POWERFUL_MODEL_ID,
+            },
+            Case {
+                name: "paid quick, flag off",
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: false,
+                selector: AUTO_QUICK_MODEL_ID,
+                expected_target: DEEPSEEK_V4_FLASH_MODEL_ID,
+            },
+            Case {
+                name: "paid quick, flag on",
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: true,
+                selector: AUTO_QUICK_MODEL_ID,
+                expected_target: DEEPSEEK_V4_FLASH_MODEL_ID,
+            },
+            Case {
+                name: "paid powerful, flag off",
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: false,
+                selector: AUTO_POWERFUL_MODEL_ID,
+                expected_target: POWERFUL_MODEL_ID,
+            },
+            Case {
+                name: "paid powerful, flag on",
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: true,
+                selector: AUTO_POWERFUL_MODEL_ID,
+                expected_target: KIMI_K3_MODEL_ID,
+            },
+        ];
+
+        for case in cases {
+            let flags = HashMap::from([(
+                PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY.to_string(),
+                case.powerful_kimi_k3,
+            )]);
+            let targets = ModelAliasTargets::for_plan_with_overrides(
+                case.plan,
+                PaidModelAliasOverrides::from_flag_values(&flags),
+            );
+
+            assert_eq!(
+                targets.resolve(case.selector),
+                case.expected_target,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_golden_explicit_model_resolution_is_plan_and_flag_invariant() {
+        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+            for powerful_kimi_k3 in [false, true] {
+                let flags = HashMap::from([(
+                    PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY.to_string(),
+                    powerful_kimi_k3,
+                )]);
+                let targets = ModelAliasTargets::for_plan_with_overrides(
+                    plan,
+                    PaidModelAliasOverrides::from_flag_values(&flags),
+                );
+
+                for model in [
+                    QUICK_MODEL_ID,
+                    POWERFUL_MODEL_ID,
+                    KIMI_K3_MODEL_ID,
+                    GLM_5_2_MODEL_ID,
+                    DEEPSEEK_V4_FLASH_MODEL_ID,
+                ] {
+                    assert_eq!(
+                        targets.resolve(model),
+                        model,
+                        "explicit model changed for plan={plan:?}, powerful_kimi_k3={powerful_kimi_k3}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_catalog_alias_metadata_tracks_paid_override_targets() {
         let flags = HashMap::from([(PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY.to_string(), true)]);
         let targets = ModelAliasTargets::for_plan_with_overrides(

@@ -416,6 +416,13 @@ fn proxy_for_provider(proxy_router: &ProxyRouter, provider: ProviderName) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_config::{
+        ModelAliasTargets, ModelPlan, PaidModelAliasOverrides, AUTO_POWERFUL_MODEL_ID,
+        AUTO_QUICK_MODEL_ID, DEEPSEEK_V4_FLASH_MODEL_ID, KIMI_K3_MODEL_ID, POWERFUL_MODEL_ID,
+        QUICK_MODEL_ID,
+    };
+    use crate::os_flags::PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY;
+    use std::collections::HashMap;
 
     fn proxy_router_with_both_providers() -> ProxyRouter {
         ProxyRouter::new(
@@ -435,6 +442,225 @@ mod tests {
         assert_eq!(stable_account_bucket(uuid_for_bucket(49)), 49);
         assert_eq!(stable_account_bucket(uuid_for_bucket(50)), 50);
         assert_eq!(stable_account_bucket(uuid_for_bucket(99)), 99);
+    }
+
+    #[test]
+    fn test_golden_completion_route_matrix_by_selector_plan_and_provider_preference() {
+        #[derive(Clone, Copy)]
+        struct Case {
+            name: &'static str,
+            selector: &'static str,
+            plan: ModelPlan,
+            powerful_kimi_k3: bool,
+            provider_preference: Option<ProviderPreference>,
+            continuum_available: bool,
+            expected_access: bool,
+            expected_public_model: &'static str,
+            expected_provider: &'static str,
+            expected_provider_model: &'static str,
+            expected_source: ProviderSelectionSource,
+        }
+
+        let cases = [
+            Case {
+                name: "free auto quick",
+                selector: AUTO_QUICK_MODEL_ID,
+                plan: ModelPlan::Free,
+                powerful_kimi_k3: false,
+                provider_preference: None,
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: QUICK_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: QUICK_MODEL_ID,
+                expected_source: ProviderSelectionSource::StaticSplit,
+            },
+            Case {
+                name: "free auto powerful remains unavailable when the paid flag is on",
+                selector: AUTO_POWERFUL_MODEL_ID,
+                plan: ModelPlan::Free,
+                powerful_kimi_k3: true,
+                provider_preference: None,
+                continuum_available: true,
+                expected_access: false,
+                expected_public_model: POWERFUL_MODEL_ID,
+                expected_provider: "continuum",
+                expected_provider_model: "kimi-k2.6",
+                expected_source: ProviderSelectionSource::DefaultProvider,
+            },
+            Case {
+                name: "paid auto quick",
+                selector: AUTO_QUICK_MODEL_ID,
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: false,
+                provider_preference: None,
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: DEEPSEEK_V4_FLASH_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: DEEPSEEK_V4_FLASH_MODEL_ID,
+                expected_source: ProviderSelectionSource::StaticSplit,
+            },
+            Case {
+                name: "paid auto powerful, flag off",
+                selector: AUTO_POWERFUL_MODEL_ID,
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: false,
+                provider_preference: None,
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: POWERFUL_MODEL_ID,
+                expected_provider: "continuum",
+                expected_provider_model: "kimi-k2.6",
+                expected_source: ProviderSelectionSource::DefaultProvider,
+            },
+            Case {
+                name: "paid auto powerful, flag on",
+                selector: AUTO_POWERFUL_MODEL_ID,
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: true,
+                provider_preference: None,
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: KIMI_K3_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: KIMI_K3_MODEL_ID,
+                expected_source: ProviderSelectionSource::StaticSplit,
+            },
+            Case {
+                name: "explicit K3 ignores the paid auto flag",
+                selector: KIMI_K3_MODEL_ID,
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: false,
+                provider_preference: None,
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: KIMI_K3_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: KIMI_K3_MODEL_ID,
+                expected_source: ProviderSelectionSource::StaticSplit,
+            },
+            Case {
+                name: "explicit GLM default",
+                selector: GLM_5_2_MODEL_ID,
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: false,
+                provider_preference: None,
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: GLM_5_2_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: GLM_5_2_MODEL_ID,
+                expected_source: ProviderSelectionSource::DefaultProvider,
+            },
+            Case {
+                name: "explicit GLM Tinfoil preference",
+                selector: GLM_5_2_MODEL_ID,
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: false,
+                provider_preference: Some(ProviderPreference::feature_flag(ProviderName::Tinfoil)),
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: GLM_5_2_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: GLM_5_2_MODEL_ID,
+                expected_source: ProviderSelectionSource::FeatureFlag,
+            },
+            Case {
+                name: "explicit GLM Continuum preference",
+                selector: GLM_5_2_MODEL_ID,
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: false,
+                provider_preference: Some(ProviderPreference::feature_flag(
+                    ProviderName::Continuum,
+                )),
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: GLM_5_2_MODEL_ID,
+                expected_provider: "continuum",
+                expected_provider_model: "glm-5.2",
+                expected_source: ProviderSelectionSource::FeatureFlag,
+            },
+            Case {
+                name: "explicit GLM Continuum preference without a Continuum proxy",
+                selector: GLM_5_2_MODEL_ID,
+                plan: ModelPlan::Paid,
+                powerful_kimi_k3: false,
+                provider_preference: Some(ProviderPreference::feature_flag(
+                    ProviderName::Continuum,
+                )),
+                continuum_available: false,
+                expected_access: true,
+                expected_public_model: GLM_5_2_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: GLM_5_2_MODEL_ID,
+                expected_source: ProviderSelectionSource::Fallback,
+            },
+        ];
+
+        let router = ProviderRouter::default();
+        for case in cases {
+            let flags = HashMap::from([(
+                PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY.to_string(),
+                case.powerful_kimi_k3,
+            )]);
+            let alias_targets = ModelAliasTargets::for_plan_with_overrides(
+                case.plan,
+                PaidModelAliasOverrides::from_flag_values(&flags),
+            );
+            let resolved_model = alias_targets.resolve(case.selector);
+            let access = case.plan.allows_model(resolved_model);
+
+            assert_eq!(access, case.expected_access, "{}", case.name);
+            if !case.expected_access {
+                continue;
+            }
+
+            let proxy_router = if case.continuum_available {
+                proxy_router_with_both_providers()
+            } else {
+                ProxyRouter::new(
+                    "https://api.openai.com".to_string(),
+                    None,
+                    "http://tinfoil.example.com".to_string(),
+                )
+            };
+            let selected = router
+                .select_completion_route_with_preference(
+                    &proxy_router,
+                    uuid_for_bucket(73),
+                    resolved_model,
+                    case.provider_preference,
+                )
+                .unwrap_or_else(|error| panic!("{}: {error:?}", case.name));
+
+            assert_eq!(
+                selected.public_model_id, case.expected_public_model,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                selected.provider_model_id, case.expected_provider_model,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                selected.response_model_id, case.expected_public_model,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                selected.proxy.provider_name, case.expected_provider,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                selected.selection_source, case.expected_source,
+                "{}",
+                case.name
+            );
+            assert_eq!(selected.bucket, None, "{}", case.name);
+        }
     }
 
     #[test]

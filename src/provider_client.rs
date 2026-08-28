@@ -1,4 +1,4 @@
-use crate::provider_routing::ProviderName;
+use crate::provider_registry::ProviderId;
 use crate::proxy_config::ProxyConfig;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
@@ -624,7 +624,7 @@ impl ProviderClient {
         provider: &ProxyConfig,
         request: ProviderRequest<'_>,
     ) -> ProviderSendTrace {
-        if provider.provider_name != ProviderName::Tinfoil.as_str() {
+        if provider.provider_name != ProviderId::Tinfoil.as_str() {
             return ProviderSendTrace::terminal(self.send_standard(provider, request).await);
         }
 
@@ -745,7 +745,7 @@ impl ProviderClient {
         request: ProviderRequest<'_>,
         attempt: &TinfoilAttempt,
     ) -> Result<ReqwestRequest, ProviderRequestError> {
-        debug_assert_eq!(provider.provider_name, ProviderName::Tinfoil.as_str());
+        debug_assert_eq!(provider.provider_name, ProviderId::Tinfoil.as_str());
         let ProviderRequest {
             method,
             path,
@@ -940,7 +940,7 @@ mod tests {
         ProxyConfig {
             base_url: "http://ignored.invalid".to_string(),
             api_key: None,
-            provider_name: ProviderName::Tinfoil.as_str().to_string(),
+            provider_name: ProviderId::Tinfoil.as_str().to_string(),
         }
     }
 
@@ -1281,7 +1281,7 @@ mod tests {
         let provider = ProxyConfig {
             base_url: format!("http://{address}"),
             api_key: None,
-            provider_name: ProviderName::Continuum.as_str().to_string(),
+            provider_name: ProviderId::Continuum.as_str().to_string(),
         };
 
         let response = client
@@ -1339,7 +1339,7 @@ mod tests {
         let provider = ProxyConfig {
             base_url: format!("http://{redirect_address}"),
             api_key: None,
-            provider_name: ProviderName::Continuum.as_str().to_string(),
+            provider_name: ProviderId::Continuum.as_str().to_string(),
         };
         let body = Bytes::from_static(br#"{"model":"glm-5-2"}"#);
 
@@ -1388,7 +1388,7 @@ mod tests {
         let provider = ProxyConfig {
             base_url: format!("http://{address}"),
             api_key: Some("provider-key".to_string()),
-            provider_name: ProviderName::Continuum.as_str().to_string(),
+            provider_name: ProviderId::Continuum.as_str().to_string(),
         };
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1592,7 +1592,7 @@ mod tests {
             // the enclave selected and attested by the SDK.
             base_url: client.tinfoil_base_url(),
             api_key: None,
-            provider_name: ProviderName::Tinfoil.as_str().to_string(),
+            provider_name: ProviderId::Tinfoil.as_str().to_string(),
         };
 
         let initialization_deadline = tokio::time::Instant::now() + Duration::from_secs(30);

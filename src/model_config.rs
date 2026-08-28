@@ -663,6 +663,14 @@ fn model_entry(model: &str) -> Option<ModelConfigEntry> {
         .copied()
 }
 
+#[cfg(test)]
+pub(crate) fn enabled_api_completion_model_ids() -> impl Iterator<Item = &'static str> {
+    MODEL_CONFIGS
+        .iter()
+        .filter(|entry| entry.api_listed && entry.enabled && entry.capabilities.chat)
+        .map(|entry| entry.id)
+}
+
 pub fn resolve_completion_model_id(model: &str) -> Option<&'static str> {
     let canonical = alias_target(model).unwrap_or(model);
     MODEL_CONFIGS

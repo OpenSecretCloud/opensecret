@@ -1,0 +1,378 @@
+//! Credential-free provider topology for completion routing.
+//!
+//! This registry is intentionally independent from the legacy execution
+//! router. Stack 3 exercises it in shadow mode so the topology and planner can
+//! be validated before either is allowed to select an executable proxy.
+
+use crate::model_config::{
+    DEEPSEEK_V4_FLASH_MODEL_ID, GLM_5_2_MODEL_ID, KIMI_K3_MODEL_ID, POWERFUL_MODEL_ID,
+    QUICK_MODEL_ID,
+};
+
+pub(crate) const SHADOW_ROUTING_POLICY_VERSION: &str = "routing-v2-shadow-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum ProviderId {
+    Tinfoil,
+    Continuum,
+}
+
+impl ProviderId {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tinfoil => "tinfoil",
+            Self::Continuum => "continuum",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteSelectionSource {
+    StaticSplit,
+    FeatureFlag,
+    DefaultProvider,
+    Fallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderSpec {
+    pub(crate) id: ProviderId,
+    pub(crate) weight: u16,
+    pub(crate) enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ModelRouteSpec {
+    pub(crate) provider: ProviderId,
+    pub(crate) provider_model_id: &'static str,
+    pub(crate) response_model_id: &'static str,
+    pub(crate) weight: u16,
+    pub(crate) enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompletionModelSpec {
+    pub(crate) public_model_id: &'static str,
+    pub(crate) routes: &'static [ModelRouteSpec],
+    pub(crate) default_provider: Option<ProviderId>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProviderRegistry {
+    providers: &'static [ProviderSpec],
+    completion_models: &'static [CompletionModelSpec],
+}
+
+impl ProviderRegistry {
+    pub(crate) fn provider(&self, id: ProviderId) -> Option<&ProviderSpec> {
+        self.providers.iter().find(|provider| provider.id == id)
+    }
+
+    pub(crate) fn providers(&self) -> &'static [ProviderSpec] {
+        self.providers
+    }
+
+    pub(crate) fn completion_model(&self, public_model_id: &str) -> Option<&CompletionModelSpec> {
+        self.completion_models
+            .iter()
+            .find(|model| model.public_model_id == public_model_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completion_models(&self) -> &'static [CompletionModelSpec] {
+        self.completion_models
+    }
+}
+
+const PROVIDERS: &[ProviderSpec] = &[
+    ProviderSpec {
+        id: ProviderId::Tinfoil,
+        weight: 70,
+        enabled: true,
+    },
+    ProviderSpec {
+        id: ProviderId::Continuum,
+        weight: 30,
+        enabled: true,
+    },
+];
+
+const GPT_OSS_120B_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
+    provider: ProviderId::Tinfoil,
+    provider_model_id: QUICK_MODEL_ID,
+    response_model_id: QUICK_MODEL_ID,
+    weight: 100,
+    enabled: true,
+}];
+
+const GEMMA4_31B_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
+    provider: ProviderId::Tinfoil,
+    provider_model_id: "gemma4-31b",
+    response_model_id: "gemma4-31b",
+    weight: 100,
+    enabled: true,
+}];
+
+const KIMI_K3_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
+    provider: ProviderId::Tinfoil,
+    provider_model_id: KIMI_K3_MODEL_ID,
+    response_model_id: KIMI_K3_MODEL_ID,
+    weight: 100,
+    enabled: true,
+}];
+
+const KIMI_K2_6_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
+    provider: ProviderId::Continuum,
+    provider_model_id: "kimi-k2.6",
+    response_model_id: POWERFUL_MODEL_ID,
+    weight: 100,
+    enabled: true,
+}];
+
+const GLM_5_2_ROUTES: &[ModelRouteSpec] = &[
+    ModelRouteSpec {
+        provider: ProviderId::Tinfoil,
+        provider_model_id: GLM_5_2_MODEL_ID,
+        response_model_id: GLM_5_2_MODEL_ID,
+        weight: 100,
+        enabled: true,
+    },
+    ModelRouteSpec {
+        provider: ProviderId::Continuum,
+        provider_model_id: "glm-5.2",
+        response_model_id: GLM_5_2_MODEL_ID,
+        weight: 100,
+        enabled: true,
+    },
+];
+
+const DEEPSEEK_V4_FLASH_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
+    provider: ProviderId::Tinfoil,
+    provider_model_id: DEEPSEEK_V4_FLASH_MODEL_ID,
+    response_model_id: DEEPSEEK_V4_FLASH_MODEL_ID,
+    weight: 100,
+    enabled: true,
+}];
+
+const LLAMA3_3_70B_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
+    provider: ProviderId::Tinfoil,
+    provider_model_id: "llama3-3-70b",
+    response_model_id: "llama3-3-70b",
+    weight: 100,
+    enabled: true,
+}];
+
+const GPT_OSS_SAFEGUARD_120B_ROUTES: &[ModelRouteSpec] = &[ModelRouteSpec {
+    provider: ProviderId::Tinfoil,
+    provider_model_id: "gpt-oss-safeguard-120b",
+    response_model_id: "gpt-oss-safeguard-120b",
+    weight: 100,
+    enabled: true,
+}];
+
+const COMPLETION_MODELS: &[CompletionModelSpec] = &[
+    CompletionModelSpec {
+        public_model_id: QUICK_MODEL_ID,
+        routes: GPT_OSS_120B_ROUTES,
+        default_provider: None,
+    },
+    CompletionModelSpec {
+        public_model_id: "gemma4-31b",
+        routes: GEMMA4_31B_ROUTES,
+        default_provider: None,
+    },
+    CompletionModelSpec {
+        public_model_id: KIMI_K3_MODEL_ID,
+        routes: KIMI_K3_ROUTES,
+        default_provider: None,
+    },
+    CompletionModelSpec {
+        public_model_id: POWERFUL_MODEL_ID,
+        routes: KIMI_K2_6_ROUTES,
+        default_provider: Some(ProviderId::Continuum),
+    },
+    CompletionModelSpec {
+        public_model_id: GLM_5_2_MODEL_ID,
+        routes: GLM_5_2_ROUTES,
+        default_provider: Some(ProviderId::Tinfoil),
+    },
+    CompletionModelSpec {
+        public_model_id: DEEPSEEK_V4_FLASH_MODEL_ID,
+        routes: DEEPSEEK_V4_FLASH_ROUTES,
+        default_provider: None,
+    },
+    CompletionModelSpec {
+        public_model_id: "llama3-3-70b",
+        routes: LLAMA3_3_70B_ROUTES,
+        default_provider: None,
+    },
+    CompletionModelSpec {
+        public_model_id: "gpt-oss-safeguard-120b",
+        routes: GPT_OSS_SAFEGUARD_120B_ROUTES,
+        default_provider: None,
+    },
+];
+
+pub(crate) static PROVIDER_REGISTRY: ProviderRegistry = ProviderRegistry {
+    providers: PROVIDERS,
+    completion_models: COMPLETION_MODELS,
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model_config::{
+        enabled_api_completion_model_ids, AUTO_POWERFUL_MODEL_ID, AUTO_QUICK_MODEL_ID,
+    };
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn registry_is_structurally_valid_and_deterministic() {
+        let registry = &PROVIDER_REGISTRY;
+        let provider_ids = registry
+            .providers()
+            .iter()
+            .map(|provider| provider.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(provider_ids.len(), registry.providers().len());
+
+        let model_ids = registry
+            .completion_models()
+            .iter()
+            .map(|model| model.public_model_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(model_ids.len(), registry.completion_models().len());
+
+        for model in registry.completion_models() {
+            assert!(!model.public_model_id.trim().is_empty());
+            assert!(!model.routes.is_empty(), "{}", model.public_model_id);
+            assert_ne!(model.public_model_id, AUTO_QUICK_MODEL_ID);
+            assert_ne!(model.public_model_id, AUTO_POWERFUL_MODEL_ID);
+
+            let mut route_providers = BTreeSet::new();
+            for route in model.routes {
+                assert!(registry.provider(route.provider).is_some());
+                assert!(route_providers.insert(route.provider));
+                assert!(!route.provider_model_id.trim().is_empty());
+                assert!(!route.response_model_id.trim().is_empty());
+                assert_eq!(route.response_model_id, model.public_model_id);
+            }
+
+            if let Some(default_provider) = model.default_provider {
+                assert!(model
+                    .routes
+                    .iter()
+                    .any(|route| route.provider == default_provider));
+            }
+        }
+
+        let ordered_model_ids = registry
+            .completion_models()
+            .iter()
+            .map(|model| model.public_model_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_model_ids,
+            vec![
+                QUICK_MODEL_ID,
+                "gemma4-31b",
+                KIMI_K3_MODEL_ID,
+                POWERFUL_MODEL_ID,
+                GLM_5_2_MODEL_ID,
+                DEEPSEEK_V4_FLASH_MODEL_ID,
+                "llama3-3-70b",
+                "gpt-oss-safeguard-120b",
+            ]
+        );
+    }
+
+    #[test]
+    fn registry_covers_exactly_enabled_api_completion_models() {
+        let expected = enabled_api_completion_model_ids().collect::<BTreeSet<_>>();
+        let registered = PROVIDER_REGISTRY
+            .completion_models()
+            .iter()
+            .map(|model| model.public_model_id)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(registered, expected);
+    }
+
+    #[test]
+    fn registry_pins_every_provider_model_translation() {
+        let routes = PROVIDER_REGISTRY
+            .completion_models()
+            .iter()
+            .flat_map(|model| {
+                model.routes.iter().map(move |route| {
+                    (
+                        model.public_model_id,
+                        route.provider,
+                        route.provider_model_id,
+                        route.response_model_id,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            routes,
+            vec![
+                (
+                    QUICK_MODEL_ID,
+                    ProviderId::Tinfoil,
+                    QUICK_MODEL_ID,
+                    QUICK_MODEL_ID
+                ),
+                (
+                    "gemma4-31b",
+                    ProviderId::Tinfoil,
+                    "gemma4-31b",
+                    "gemma4-31b"
+                ),
+                (
+                    KIMI_K3_MODEL_ID,
+                    ProviderId::Tinfoil,
+                    KIMI_K3_MODEL_ID,
+                    KIMI_K3_MODEL_ID
+                ),
+                (
+                    POWERFUL_MODEL_ID,
+                    ProviderId::Continuum,
+                    "kimi-k2.6",
+                    POWERFUL_MODEL_ID
+                ),
+                (
+                    GLM_5_2_MODEL_ID,
+                    ProviderId::Tinfoil,
+                    GLM_5_2_MODEL_ID,
+                    GLM_5_2_MODEL_ID
+                ),
+                (
+                    GLM_5_2_MODEL_ID,
+                    ProviderId::Continuum,
+                    "glm-5.2",
+                    GLM_5_2_MODEL_ID
+                ),
+                (
+                    DEEPSEEK_V4_FLASH_MODEL_ID,
+                    ProviderId::Tinfoil,
+                    DEEPSEEK_V4_FLASH_MODEL_ID,
+                    DEEPSEEK_V4_FLASH_MODEL_ID
+                ),
+                (
+                    "llama3-3-70b",
+                    ProviderId::Tinfoil,
+                    "llama3-3-70b",
+                    "llama3-3-70b"
+                ),
+                (
+                    "gpt-oss-safeguard-120b",
+                    ProviderId::Tinfoil,
+                    "gpt-oss-safeguard-120b",
+                    "gpt-oss-safeguard-120b"
+                ),
+            ]
+        );
+    }
+}

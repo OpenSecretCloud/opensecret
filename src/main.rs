@@ -103,6 +103,7 @@ mod email;
 mod encrypt;
 mod http_client;
 mod inference;
+mod inference_planning;
 mod jwt;
 mod kagi;
 mod kv;
@@ -115,6 +116,7 @@ mod oauth;
 mod os_flags;
 mod private_key;
 mod provider_client;
+mod provider_registry;
 mod provider_routing;
 mod proxy_config;
 mod secret_cache_maintenance;
@@ -129,9 +131,11 @@ mod web;
 mod aead_db_tamper_tests;
 
 use apple_signin::AppleJwtVerifier;
+use inference_planning::ProviderPreference;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
 use provider_client::{ProviderClient, ProviderRequestError};
-use provider_routing::{ProviderName, ProviderPreference, ProviderRouter};
+use provider_registry::ProviderId;
+use provider_routing::ProviderRouter;
 use proxy_config::ProxyRouter;
 
 const ENCLAVE_KEY_NAME: &str = "enclave_key";
@@ -1189,8 +1193,8 @@ impl AppState {
         )
         .await
         {
-            Ok(Ok(Some(true))) => Some(ProviderPreference::feature_flag(ProviderName::Continuum)),
-            Ok(Ok(Some(false))) => Some(ProviderPreference::feature_flag(ProviderName::Tinfoil)),
+            Ok(Ok(Some(true))) => Some(ProviderPreference::feature_flag(ProviderId::Continuum)),
+            Ok(Ok(Some(false))) => Some(ProviderPreference::feature_flag(ProviderId::Tinfoil)),
             Ok(Ok(None)) => {
                 debug!(
                     "os-flags provider routing flag missing (user_uuid={}, requested_model={}, flag_key={}); using default provider routing",

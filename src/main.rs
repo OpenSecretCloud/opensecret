@@ -163,6 +163,7 @@ pub(crate) const ERROR_CODE_HEADER: &str = "x-opensecret-error-code";
 const ERROR_CONTRACT_VERSION: &str = "1";
 const SESSION_NOT_FOUND_ERROR_CODE: &str = "session_not_found";
 const ACCESS_TOKEN_EXPIRED_ERROR_CODE: &str = "access_token_expired";
+const IMAGE_DESCRIPTION_UNAVAILABLE_ERROR_CODE: &str = "image_description_unavailable";
 
 type PendingAttestationKey = [u8; 32];
 pub(crate) type SessionLease = CacheLease<SessionState>;
@@ -367,6 +368,9 @@ pub enum ApiError {
     #[error("Upstream provider temporarily unavailable")]
     ServiceUnavailable,
 
+    #[error("Upstream provider temporarily unavailable")]
+    ImageDescriptionUnavailable,
+
     #[error("Bad Request")]
     BadRequest,
 
@@ -437,6 +441,7 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::InternalServerError => StatusCode::INTERNAL_SERVER_ERROR,
             ApiError::ServiceUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            ApiError::ImageDescriptionUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::BadRequest => StatusCode::BAD_REQUEST,
             ApiError::SessionNotFound => StatusCode::BAD_REQUEST,
             ApiError::Conflict => StatusCode::CONFLICT,
@@ -460,6 +465,7 @@ impl IntoResponse for ApiError {
         let error_code = match &self {
             ApiError::SessionNotFound => Some(SESSION_NOT_FOUND_ERROR_CODE),
             ApiError::AccessTokenExpired => Some(ACCESS_TOKEN_EXPIRED_ERROR_CODE),
+            ApiError::ImageDescriptionUnavailable => Some(IMAGE_DESCRIPTION_UNAVAILABLE_ERROR_CODE),
             _ => None,
         };
         let mut response = (
@@ -571,6 +577,28 @@ mod api_error_contract_tests {
             StatusCode::UNAUTHORIZED,
             br#"{"status":401,"message":"Invalid JWT"}"#,
             Some(ACCESS_TOKEN_EXPIRED_ERROR_CODE),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn image_description_unavailable_adds_code_without_changing_legacy_response() {
+        assert_error_response(
+            ApiError::ImageDescriptionUnavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+            br#"{"status":503,"message":"Upstream provider temporarily unavailable"}"#,
+            Some(IMAGE_DESCRIPTION_UNAVAILABLE_ERROR_CODE),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn generic_service_unavailable_remains_uncoded() {
+        assert_error_response(
+            ApiError::ServiceUnavailable,
+            StatusCode::SERVICE_UNAVAILABLE,
+            br#"{"status":503,"message":"Upstream provider temporarily unavailable"}"#,
+            None,
         )
         .await;
     }

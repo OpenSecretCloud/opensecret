@@ -30,7 +30,7 @@ pub enum ProviderClientError {
     CryptoProvider,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProviderRequestError {
     #[error(
         "Tinfoil is temporarily unavailable while router discovery and attestation retry in the background"
@@ -43,8 +43,35 @@ pub enum ProviderRequestError {
     #[error("failed to build provider request: {0}")]
     Build(String),
 
+    #[error("failed to connect to provider: {0}")]
+    Connect(String),
+
     #[error("provider request failed: {0}")]
     Send(String),
+
+    #[error("provider returned HTTP {}", .0.status)]
+    Upstream(UpstreamProviderError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamProviderError {
+    pub status: u16,
+    pub retry_after: Option<Duration>,
+    pub upstream_request_id: Option<String>,
+}
+
+pub(crate) struct ProviderSendTrace {
+    pub(crate) prior_failures: Vec<ProviderRequestError>,
+    pub(crate) result: Result<ProviderResponse, ProviderRequestError>,
+}
+
+impl ProviderSendTrace {
+    fn terminal(result: Result<ProviderResponse, ProviderRequestError>) -> Self {
+        Self {
+            prior_failures: Vec::new(),
+            result,
+        }
+    }
 }
 
 pub enum ProviderResponse {
@@ -118,6 +145,14 @@ impl ProviderResponse {
         }
     }
 
+    pub fn header_str(&self, name: &HeaderName) -> Option<&str> {
+        match self {
+            Self::Tinfoil(response) => response.headers().get(name),
+            Self::Standard(response) => response.headers().get(name),
+        }
+        .and_then(|value| value.to_str().ok())
+    }
+
     pub async fn bytes(self) -> Result<Bytes, String> {
         match self {
             Self::Tinfoil(response) => response.bytes().await.map_err(|error| error.to_string()),
@@ -140,6 +175,14 @@ impl ProviderResponse {
                     .map(|result| result.map_err(|e| e.to_string())),
             ),
         }
+    }
+}
+
+fn map_reqwest_send_error(error: reqwest::Error) -> ProviderRequestError {
+    if error.is_connect() {
+        ProviderRequestError::Connect(error.to_string())
+    } else {
+        ProviderRequestError::Send(error.to_string())
     }
 }
 
@@ -573,8 +616,16 @@ impl ProviderClient {
         provider: &ProxyConfig,
         request: ProviderRequest<'_>,
     ) -> Result<ProviderResponse, ProviderRequestError> {
+        self.send_traced(provider, request).await.result
+    }
+
+    pub(crate) async fn send_traced(
+        &self,
+        provider: &ProxyConfig,
+        request: ProviderRequest<'_>,
+    ) -> ProviderSendTrace {
         if provider.provider_name != ProviderName::Tinfoil.as_str() {
-            return self.send_standard(provider, request).await;
+            return ProviderSendTrace::terminal(self.send_standard(provider, request).await);
         }
 
         let response_start_timeout = request.response_start_timeout;
@@ -582,9 +633,18 @@ impl ProviderClient {
         // request path self-healing if construction behavior changes later;
         // the atomic claim prevents discovery herds.
         self.tinfoil.start_background_initialization();
-        let attempt = self.tinfoil.snapshot()?;
+        let attempt = match self.tinfoil.snapshot() {
+            Ok(attempt) => attempt,
+            Err(error) => return ProviderSendTrace::terminal(Err(error)),
+        };
         let first_request =
-            self.build_tinfoil_request_for_attempt(provider, request.clone(), &attempt)?;
+            match self.build_tinfoil_request_for_attempt(provider, request.clone(), &attempt) {
+                Ok(request) => request,
+                Err(error) => return ProviderSendTrace::terminal(Err(error)),
+            };
+
+        let prior_failures = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let prior_failures_for_send = Arc::clone(&prior_failures);
 
         let send = async {
             match attempt {
@@ -601,6 +661,10 @@ impl ProviderClient {
                         // Request/body/timeout failures are deliberately not replayed by this
                         // certificate-rotation layer.
                         Err(error) if error.is_connect() => {
+                            prior_failures_for_send
+                                .lock()
+                                .expect("provider attempt trace mutex poisoned")
+                                .push(ProviderRequestError::Connect(error.to_string()));
                             let refreshed = spawn_tinfoil_refresh_after_connect_failure(
                                 Arc::clone(self.tinfoil.secure()),
                                 failed_snapshot.clone(),
@@ -621,23 +685,42 @@ impl ProviderClient {
                                 .map_err(|error| ProviderRequestError::Send(error.to_string()))?
                                 .execute(retry_request)
                                 .await
-                                .map_err(|error| ProviderRequestError::Send(error.to_string()))
+                                .map_err(|error| {
+                                    if error.is_connect() {
+                                        ProviderRequestError::Connect(error.to_string())
+                                    } else {
+                                        ProviderRequestError::Send(error.to_string())
+                                    }
+                                })
                         }
-                        Err(error) => Err(ProviderRequestError::Send(error.to_string())),
+                        Err(error) => Err(if error.is_connect() {
+                            ProviderRequestError::Connect(error.to_string())
+                        } else {
+                            ProviderRequestError::Send(error.to_string())
+                        }),
                     }
                 }
                 #[cfg(test)]
                 TinfoilAttempt::Plain { client, .. } => client
                     .execute(first_request)
                     .await
-                    .map_err(|error| ProviderRequestError::Send(error.to_string())),
+                    .map_err(map_reqwest_send_error),
             }
         };
 
-        let response = tokio::time::timeout(response_start_timeout, send)
-            .await
-            .map_err(|_| ProviderRequestError::Timeout(response_start_timeout))??;
-        Ok(ProviderResponse::Tinfoil(response))
+        let result = match tokio::time::timeout(response_start_timeout, send).await {
+            Ok(result) => result.map(ProviderResponse::Tinfoil),
+            Err(_) => Err(ProviderRequestError::Timeout(response_start_timeout)),
+        };
+        let prior_failures = prior_failures
+            .lock()
+            .expect("provider attempt trace mutex poisoned")
+            .clone();
+
+        ProviderSendTrace {
+            prior_failures,
+            result,
+        }
     }
 
     #[cfg(test)]
@@ -757,7 +840,7 @@ impl ProviderClient {
         let response = tokio::time::timeout(response_start_timeout, request.send())
             .await
             .map_err(|_| ProviderRequestError::Timeout(response_start_timeout))?
-            .map_err(|error| ProviderRequestError::Send(error.to_string()))?;
+            .map_err(map_reqwest_send_error)?;
         Ok(ProviderResponse::Standard(response))
     }
 }

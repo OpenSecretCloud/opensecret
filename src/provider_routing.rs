@@ -1,9 +1,10 @@
+use crate::inference::RouteIdentity;
 use crate::model_config::{resolve_completion_model_id, resolve_public_model_id, GLM_5_2_MODEL_ID};
 use crate::os_flags::GLM_5_2_CONTINUUM_FLAG_KEY;
 use crate::proxy_config::{canonicalize_tinfoil_model, ProxyConfig, ProxyRouter};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ProviderName {
     Tinfoil,
     Continuum,
@@ -79,12 +80,26 @@ struct ProviderRoutingConfig {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SelectedProviderRoute {
+    pub(crate) provider: ProviderName,
     pub(crate) proxy: ProxyConfig,
     pub(crate) public_model_id: String,
     pub(crate) provider_model_id: String,
     pub(crate) response_model_id: String,
     pub(crate) bucket: Option<u8>,
     pub(crate) selection_source: ProviderSelectionSource,
+}
+
+impl SelectedProviderRoute {
+    pub(crate) fn identity(&self) -> RouteIdentity {
+        RouteIdentity::new(
+            self.provider,
+            self.public_model_id.clone(),
+            self.provider_model_id.clone(),
+            self.response_model_id.clone(),
+            self.selection_source,
+            self.bucket,
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +313,7 @@ impl ProviderRouter {
         };
 
         Ok(SelectedProviderRoute {
+            provider: selected.provider,
             proxy: selected.proxy.clone(),
             public_model_id: model_config.public_model_id.to_string(),
             provider_model_id: selected.provider_model_id.to_string(),
@@ -334,6 +350,7 @@ impl ProviderRouter {
         };
 
         Ok(SelectedProviderRoute {
+            provider: ProviderName::Tinfoil,
             proxy,
             public_model_id,
             provider_model_id,

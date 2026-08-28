@@ -102,6 +102,7 @@ mod db;
 mod email;
 mod encrypt;
 mod http_client;
+mod inference;
 mod jwt;
 mod kagi;
 mod kv;
@@ -504,7 +505,9 @@ impl From<ProviderRequestError> for ApiError {
             ProviderRequestError::TinfoilUnavailable => Self::ServiceUnavailable,
             ProviderRequestError::Timeout(_)
             | ProviderRequestError::Build(_)
-            | ProviderRequestError::Send(_) => Self::InternalServerError,
+            | ProviderRequestError::Connect(_)
+            | ProviderRequestError::Send(_)
+            | ProviderRequestError::Upstream(_) => Self::InternalServerError,
         }
     }
 }

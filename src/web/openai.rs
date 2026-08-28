@@ -23,7 +23,7 @@ use crate::provider_routing::{
     compare_shadow_route, InferenceRoutingMode, ProviderRouter, ProviderRoutingError,
     SelectedProviderRoute, ShadowRouteComparison,
 };
-use crate::proxy_config::ProxyConfig;
+use crate::proxy_config::{ProxyConfig, ProxyRouter};
 use crate::sqs::UsageEvent;
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
 use crate::web::encryption_middleware::{
@@ -1725,6 +1725,33 @@ fn retain_active_route_after_shadow_observation(
             candidate_scope,
             comparison
         ),
+        ShadowRouteComparison::Mismatch { .. }
+            if matches!(
+                active,
+                Err(ProviderRoutingError::CapacityUnavailable { .. })
+            ) =>
+        {
+            debug!(
+                "GLM canary found every configured same-model route open: request_id={}, public_model={}, policy_version={}, candidate_scope={:?}",
+                intent.request_id,
+                intent.public_model_id,
+                policy_version,
+                candidate_scope
+            )
+        }
+        ShadowRouteComparison::Mismatch { .. }
+            if !intent.selection_mode.is_auto()
+                && intent.public_model_id == crate::model_config::GLM_5_3_MODEL_ID =>
+        {
+            debug!(
+            "Health-aware route differed from the baseline plan; retaining the active route: request_id={}, public_model={}, policy_version={}, candidate_scope={:?}, comparison={:?}",
+            intent.request_id,
+            intent.public_model_id,
+            policy_version,
+            candidate_scope,
+            comparison
+            )
+        }
         ShadowRouteComparison::Mismatch { .. } => warn!(
             "Shadow route differed from active route; retaining active route: request_id={}, public_model={}, policy_version={}, candidate_scope={:?}, comparison={:?}",
             intent.request_id,
@@ -1736,6 +1763,44 @@ fn retain_active_route_after_shadow_observation(
     }
 
     active
+}
+
+fn provider_routing_api_error(error: ProviderRoutingError) -> ApiError {
+    match error {
+        ProviderRoutingError::UnsupportedModel(model) => {
+            error!("Unsupported completion model requested: {}", model);
+            ApiError::BadRequest
+        }
+        ProviderRoutingError::NoEligibleRoute(model) => {
+            error!("No eligible provider route for completion model: {}", model);
+            ApiError::InternalServerError
+        }
+        ProviderRoutingError::CapacityUnavailable { model, retry_after } => {
+            debug!(
+                "All configured same-model routes are temporarily unavailable: public_model={}, retry_after_seconds={}",
+                model,
+                retry_after.as_secs()
+            );
+            ApiError::InferenceCapacity {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                retry_after: Some(retry_after),
+                client_replay_safe: true,
+            }
+        }
+    }
+}
+
+fn select_prepared_completion_route(
+    provider_router: &ProviderRouter,
+    proxy_router: &ProxyRouter,
+    intent: &InferenceIntent,
+    provider_preference: Option<crate::inference_planning::ProviderPreference>,
+    baseline_plan: Result<RoutePlan, RoutePlanningError>,
+) -> Result<SelectedProviderRoute, ApiError> {
+    let active =
+        provider_router.select_active_completion_route(proxy_router, intent, provider_preference);
+    retain_active_route_after_shadow_observation(intent, active, baseline_plan)
+        .map_err(provider_routing_api_error)
 }
 
 pub(crate) async fn prepare_completion_request(
@@ -1757,15 +1822,16 @@ pub(crate) async fn prepare_completion_request(
     let provider_preference = state
         .provider_routing_preference(user.uuid, &intent.public_model_id)
         .await;
-    let active = state.provider_router.select_completion_route_for_mode(
-        &state.proxy_router,
-        user.uuid,
-        &intent.public_model_id,
-        provider_preference,
-        routing.mode(),
-    );
-    let selected = match routing.mode() {
-        InferenceRoutingMode::Legacy => active,
+    let route = match routing.mode() {
+        InferenceRoutingMode::Legacy => state
+            .provider_router
+            .select_completion_route_for_mode(
+                &state.proxy_router,
+                &intent,
+                provider_preference,
+                InferenceRoutingMode::Legacy,
+            )
+            .map_err(provider_routing_api_error)?,
         InferenceRoutingMode::V2 => {
             let shadow = state.provider_router.shadow_completion_plan(
                 &state.proxy_router,
@@ -1796,19 +1862,15 @@ pub(crate) async fn prepare_completion_request(
                     candidate_health
                 );
             }
-            retain_active_route_after_shadow_observation(&intent, active, shadow)
+            select_prepared_completion_route(
+                &state.provider_router,
+                &state.proxy_router,
+                &intent,
+                provider_preference,
+                shadow,
+            )?
         }
     };
-    let route = selected.map_err(|err| match err {
-        ProviderRoutingError::UnsupportedModel(model) => {
-            error!("Unsupported completion model requested: {}", model);
-            ApiError::BadRequest
-        }
-        ProviderRoutingError::NoEligibleRoute(model) => {
-            error!("No eligible provider route for completion model: {}", model);
-            ApiError::InternalServerError
-        }
-    })?;
 
     debug!(
         "Pinned inference route: request_id={}, routing_mode={:?}, selection_mode={:?}, auto={}, surface={:?}, workload={:?}, requested_model={}, public_model={}, provider={}, provider_model={}, bucket={:?}, source={:?}",
@@ -3754,6 +3816,8 @@ fn is_safe_identifier_char(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn completion_error_payload_is_openai_shaped_json() {
@@ -3797,7 +3861,7 @@ mod tests {
         );
     }
 
-    async fn call_mock_provider(app: Router) -> (ProviderSendTrace, tokio::task::JoinHandle<()>) {
+    async fn start_mock_provider(app: Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock provider");
@@ -3807,7 +3871,11 @@ mod tests {
                 .await
                 .expect("serve mock provider");
         });
-        let base_url = format!("http://{address}");
+        (format!("http://{address}"), server)
+    }
+
+    async fn call_mock_provider(app: Router) -> (ProviderSendTrace, tokio::task::JoinHandle<()>) {
+        let (base_url, server) = start_mock_provider(app).await;
         let client = ProviderClient::for_test(base_url.clone()).expect("mock provider client");
         let proxy = ProxyConfig {
             base_url,
@@ -4208,6 +4276,337 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn glm_capacity_failure_switches_only_the_next_request_to_the_mock_alternate() {
+        let tinfoil_count = Arc::new(AtomicUsize::new(0));
+        let tinfoil_bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let tinfoil_app = {
+            let count = Arc::clone(&tinfoil_count);
+            let bodies = Arc::clone(&tinfoil_bodies);
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<Value>| {
+                    let count = Arc::clone(&count);
+                    let bodies = Arc::clone(&bodies);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        bodies.lock().expect("Tinfoil body lock").push(body);
+                        axum::http::Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(axum::body::Body::from(
+                                r#"{"model":"glm-5-3","choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+                            ))
+                            .expect("mock Tinfoil success")
+                    }
+                }),
+            )
+        };
+        let continuum_count = Arc::new(AtomicUsize::new(0));
+        let continuum_bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let continuum_app = {
+            let count = Arc::clone(&continuum_count);
+            let bodies = Arc::clone(&continuum_bodies);
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<Value>| {
+                    let count = Arc::clone(&count);
+                    let bodies = Arc::clone(&bodies);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        bodies.lock().expect("Continuum body lock").push(body);
+                        axum::http::Response::builder()
+                            .status(StatusCode::TOO_MANY_REQUESTS)
+                            .header(header::RETRY_AFTER, "60")
+                            .body(axum::body::Body::empty())
+                            .expect("mock Continuum 429")
+                    }
+                }),
+            )
+        };
+
+        let (tinfoil_url, tinfoil_server) = start_mock_provider(tinfoil_app).await;
+        let (continuum_url, continuum_server) = start_mock_provider(continuum_app).await;
+        let provider_client =
+            ProviderClient::for_test(tinfoil_url.clone()).expect("test provider client");
+        let proxy_router = crate::proxy_config::ProxyRouter::new(continuum_url, None, tinfoil_url);
+        let provider_router = ProviderRouter::default();
+        let intent = InferenceIntent::new(
+            Uuid::nil(),
+            crate::model_config::GLM_5_3_MODEL_ID,
+            crate::model_config::GLM_5_3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+
+        let first_baseline = provider_router.shadow_completion_plan(&proxy_router, &intent, None);
+        let first_route = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &intent,
+            None,
+            first_baseline,
+        )
+        .expect("initial GLM route");
+        assert_eq!(first_route.provider, ProviderId::Continuum);
+        let first_trace = try_provider(
+            &provider_client,
+            &first_route.proxy,
+            json!({
+                "model": first_route.provider_model_id,
+                "messages": [{"role": "user", "content": "one"}]
+            })
+            .to_string(),
+            &HeaderMap::new(),
+        )
+        .await;
+        assert!(first_trace.prior_failures.is_empty());
+        let first_error = match first_trace.result {
+            Err(error) => error,
+            Ok(_) => panic!("mock Continuum unexpectedly succeeded"),
+        };
+        let first_failure = attempt_failure_from_provider_error(&first_error);
+        let first_attempt = intent
+            .begin_execution()
+            .begin_attempt(first_route.identity());
+        let surfaced = public_completion_error(&first_error, &first_failure);
+        let _ =
+            failed_completion_execution(&provider_router, first_attempt, first_failure, surfaced);
+
+        // The triggering logical request made exactly one provider call and did
+        // not replay or fail over to Tinfoil.
+        assert_eq!(continuum_count.load(Ordering::SeqCst), 1);
+        assert_eq!(tinfoil_count.load(Ordering::SeqCst), 0);
+
+        let second_intent = InferenceIntent::new(
+            Uuid::nil(),
+            crate::model_config::GLM_5_3_MODEL_ID,
+            crate::model_config::GLM_5_3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+        assert_ne!(second_intent.request_id, intent.request_id);
+        let second_baseline =
+            provider_router.shadow_completion_plan(&proxy_router, &second_intent, None);
+        let second_route = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &second_intent,
+            None,
+            second_baseline,
+        )
+        .expect("next request uses Tinfoil GLM");
+        assert_eq!(second_route.provider, ProviderId::Tinfoil);
+        assert_eq!(second_route.provider_model_id, "glm-5-3");
+        assert_eq!(
+            second_route.response_model_id,
+            crate::model_config::GLM_5_3_MODEL_ID
+        );
+        let second_trace = try_provider(
+            &provider_client,
+            &second_route.proxy,
+            json!({
+                "model": second_route.provider_model_id,
+                "messages": [{"role": "user", "content": "two"}]
+            })
+            .to_string(),
+            &HeaderMap::new(),
+        )
+        .await;
+        assert!(second_trace.prior_failures.is_empty());
+        let response = second_trace.result.expect("mock Tinfoil succeeds");
+        let second_attempt = second_intent
+            .begin_execution()
+            .begin_attempt(second_route.identity());
+        let canonical_response = read_non_streaming_completion_response(
+            response,
+            &second_route.response_model_id,
+            &second_attempt,
+            None,
+        )
+        .await
+        .expect("canonical Tinfoil response");
+        assert_eq!(
+            canonical_response["model"],
+            crate::model_config::GLM_5_3_MODEL_ID
+        );
+        assert_eq!(
+            second_attempt.route.public_model_id,
+            crate::model_config::GLM_5_3_MODEL_ID
+        );
+        assert_eq!(second_attempt.route.provider, ProviderId::Tinfoil);
+
+        assert_eq!(tinfoil_count.load(Ordering::SeqCst), 1);
+        assert_eq!(continuum_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tinfoil_bodies.lock().expect("Tinfoil bodies")[0]["model"],
+            crate::model_config::GLM_5_3_MODEL_ID
+        );
+        assert_eq!(
+            continuum_bodies.lock().expect("Continuum bodies")[0]["model"],
+            "glm-5.3"
+        );
+
+        tinfoil_server.abort();
+        continuum_server.abort();
+    }
+
+    #[tokio::test]
+    async fn glm_tool_turns_keep_the_original_mock_provider_after_health_opens() {
+        let tinfoil_count = Arc::new(AtomicUsize::new(0));
+        let tinfoil_app = {
+            let count = Arc::clone(&tinfoil_count);
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |Json(_body): Json<Value>| {
+                    let count = Arc::clone(&count);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "model": "glm-5-3",
+                            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                        }))
+                    }
+                }),
+            )
+        };
+        let continuum_count = Arc::new(AtomicUsize::new(0));
+        let continuum_app = {
+            let count = Arc::clone(&continuum_count);
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |Json(_body): Json<Value>| {
+                    let count = Arc::clone(&count);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "model": "glm-5.3",
+                            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                        }))
+                    }
+                }),
+            )
+        };
+        let (tinfoil_url, tinfoil_server) = start_mock_provider(tinfoil_app).await;
+        let (continuum_url, continuum_server) = start_mock_provider(continuum_app).await;
+        let provider_client =
+            ProviderClient::for_test(tinfoil_url.clone()).expect("test provider client");
+        let proxy_router = ProxyRouter::new(continuum_url, None, tinfoil_url);
+        let provider_router = ProviderRouter::default();
+        let intent = InferenceIntent::new(
+            Uuid::nil(),
+            crate::model_config::GLM_5_3_MODEL_ID,
+            crate::model_config::GLM_5_3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+        let baseline = provider_router.shadow_completion_plan(&proxy_router, &intent, None);
+        let route = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &intent,
+            None,
+            baseline,
+        )
+        .expect("initial GLM route");
+        let pinned = PinnedCompletionRequest {
+            intent,
+            route,
+            routing_mode: InferenceRoutingMode::V2,
+        };
+
+        let send_pinned_turn = |content: &'static str| {
+            let provider_client = &provider_client;
+            let pinned = &pinned;
+            async move {
+                let trace = try_provider(
+                    provider_client,
+                    &pinned.route.proxy,
+                    json!({
+                        "model": pinned.route.provider_model_id,
+                        "messages": [{"role": "user", "content": content}]
+                    })
+                    .to_string(),
+                    &HeaderMap::new(),
+                )
+                .await;
+                assert!(trace.prior_failures.is_empty());
+                let response = trace.result.expect("pinned mock turn succeeds");
+                let attempt = pinned
+                    .begin_execution()
+                    .begin_attempt(pinned.route.identity());
+                let response = read_non_streaming_completion_response(
+                    response,
+                    &pinned.route.response_model_id,
+                    &attempt,
+                    None,
+                )
+                .await
+                .expect("canonical pinned response");
+                assert_eq!(response["model"], crate::model_config::GLM_5_3_MODEL_ID);
+                attempt
+            }
+        };
+
+        let first_attempt = send_pinned_turn("first tool turn").await;
+        let external_error = ProviderRequestError::Upstream(UpstreamProviderError {
+            status: 429,
+            retry_after: Some(Duration::from_secs(60)),
+            upstream_request_id: None,
+        });
+        let external_failure = attempt_failure_from_provider_error(&external_error);
+        let external_intent = InferenceIntent::new(
+            Uuid::from_u128(1),
+            crate::model_config::GLM_5_3_MODEL_ID,
+            crate::model_config::GLM_5_3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+        let _ = failed_completion_execution(
+            &provider_router,
+            external_intent
+                .begin_execution()
+                .begin_attempt(pinned.route.identity()),
+            external_failure.clone(),
+            public_completion_error(&external_error, &external_failure),
+        );
+
+        let second_attempt = send_pinned_turn("second tool turn").await;
+        assert_eq!(first_attempt.request_id, second_attempt.request_id);
+        assert_ne!(first_attempt.execution_id, second_attempt.execution_id);
+        assert_eq!(first_attempt.route, second_attempt.route);
+        assert_eq!(continuum_count.load(Ordering::SeqCst), 2);
+        assert_eq!(tinfoil_count.load(Ordering::SeqCst), 0);
+
+        let next_intent = InferenceIntent::new(
+            Uuid::nil(),
+            crate::model_config::GLM_5_3_MODEL_ID,
+            crate::model_config::GLM_5_3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+        let next_baseline =
+            provider_router.shadow_completion_plan(&proxy_router, &next_intent, None);
+        let next_route = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &next_intent,
+            None,
+            next_baseline,
+        )
+        .expect("next logical request switches providers");
+        assert_eq!(next_route.provider, ProviderId::Tinfoil);
+        assert_eq!(next_route.provider_model_id, "glm-5-3");
+
+        tinfoil_server.abort();
+        continuum_server.abort();
+    }
+
+    #[tokio::test]
     async fn mock_provider_429_does_not_wait_for_pending_error_body() {
         let app = Router::new().route(
             "/v1/chat/completions",
@@ -4342,6 +4741,133 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[crate::CLIENT_REPLAY_HEADER], "safe");
         assert_eq!(response.headers()[header::RETRY_AFTER], "3");
+    }
+
+    #[tokio::test]
+    async fn prepared_all_open_glm_route_sends_zero_requests_and_returns_capacity_contract() {
+        let tinfoil_count = Arc::new(AtomicUsize::new(0));
+        let tinfoil_app = {
+            let count = Arc::clone(&tinfoil_count);
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move || {
+                    let count = Arc::clone(&count);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            )
+        };
+        let continuum_count = Arc::new(AtomicUsize::new(0));
+        let continuum_app = {
+            let count = Arc::clone(&continuum_count);
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move || {
+                    let count = Arc::clone(&count);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            )
+        };
+        let (tinfoil_url, tinfoil_server) = start_mock_provider(tinfoil_app).await;
+        let (continuum_url, continuum_server) = start_mock_provider(continuum_app).await;
+        let proxy_router = ProxyRouter::new(continuum_url, None, tinfoil_url);
+        let provider_router = ProviderRouter::default();
+
+        let new_intent = || {
+            InferenceIntent::new(
+                Uuid::nil(),
+                crate::model_config::GLM_5_3_MODEL_ID,
+                crate::model_config::GLM_5_3_MODEL_ID,
+                ModelPlan::Paid,
+                InferenceSurface::Responses,
+                WorkloadClass::Interactive,
+            )
+        };
+        let first_intent = new_intent();
+        let first_baseline =
+            provider_router.shadow_completion_plan(&proxy_router, &first_intent, None);
+        let first_route = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &first_intent,
+            None,
+            first_baseline,
+        )
+        .expect("initial Continuum GLM route");
+        assert_eq!(first_route.provider, ProviderId::Continuum);
+        let first_error = ProviderRequestError::Upstream(UpstreamProviderError {
+            status: 429,
+            retry_after: Some(Duration::from_secs(40)),
+            upstream_request_id: None,
+        });
+        let first_failure = attempt_failure_from_provider_error(&first_error);
+        let _ = failed_completion_execution(
+            &provider_router,
+            first_intent
+                .begin_execution()
+                .begin_attempt(first_route.identity()),
+            first_failure.clone(),
+            public_completion_error(&first_error, &first_failure),
+        );
+
+        let second_intent = new_intent();
+        let second_baseline =
+            provider_router.shadow_completion_plan(&proxy_router, &second_intent, None);
+        let second_route = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &second_intent,
+            None,
+            second_baseline,
+        )
+        .expect("Tinfoil GLM route while Continuum is open");
+        assert_eq!(second_route.provider, ProviderId::Tinfoil);
+        let second_error = ProviderRequestError::Upstream(UpstreamProviderError {
+            status: 503,
+            retry_after: Some(Duration::from_secs(10)),
+            upstream_request_id: None,
+        });
+        let second_failure = attempt_failure_from_provider_error(&second_error);
+        let _ = failed_completion_execution(
+            &provider_router,
+            second_intent
+                .begin_execution()
+                .begin_attempt(second_route.identity()),
+            second_failure.clone(),
+            public_completion_error(&second_error, &second_failure),
+        );
+
+        let third_intent = new_intent();
+        let third_baseline =
+            provider_router.shadow_completion_plan(&proxy_router, &third_intent, None);
+        let error = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &third_intent,
+            None,
+            third_baseline,
+        )
+        .expect_err("both GLM routes are open");
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[crate::CLIENT_REPLAY_HEADER], "safe");
+        assert_eq!(response.headers()[crate::ERROR_CONTRACT_HEADER], "1");
+        assert_eq!(
+            response.headers()[crate::ERROR_CODE_HEADER],
+            crate::INFERENCE_CAPACITY_ERROR_CODE
+        );
+        assert_eq!(response.headers()[header::RETRY_AFTER], "30");
+        assert_eq!(tinfoil_count.load(Ordering::SeqCst), 0);
+        assert_eq!(continuum_count.load(Ordering::SeqCst), 0);
+
+        tinfoil_server.abort();
+        continuum_server.abort();
     }
 
     #[tokio::test]

@@ -1,8 +1,8 @@
-//! Enclave-local shadow health classification for inference routes.
+//! Enclave-local health classification for inference routes.
 //!
-//! This module deliberately has no route-selection API. Stack 5 records what a
-//! versioned policy would do, while the legacy router and shadow planner remain
-//! the only sources of route decisions.
+//! Stack 5 introduced this state observationally. Stack 6 consumes one coherent
+//! snapshot only for the explicit GLM 5.3 canary; every other route remains
+//! observational until its own rollout boundary.
 
 use super::{AttemptFailureKind, AttemptTerminal, RouteKey};
 use crate::provider_registry::{ProviderId, ProviderRegistry, RateLimitScope, PROVIDER_REGISTRY};
@@ -20,7 +20,10 @@ pub(crate) const SHADOW_HEALTH_POLICY_VERSION: &str = "routing-v2-health-shadow-
 const ROUTE_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const ROUTE_FAILURES_TO_OPEN: u8 = 3;
 const ROUTE_OPEN_COOLDOWN: Duration = Duration::from_secs(30);
-const DEFAULT_CAPACITY_COOLDOWN: Duration = Duration::from_secs(1);
+// A missing or zero upstream hint must not turn an active circuit into a hot
+// retry loop. Thirty seconds matches the route-health cooldown while remaining
+// bounded well below the one-hour maximum accepted from providers.
+pub(crate) const MIN_CAPACITY_COOLDOWN: Duration = Duration::from_secs(30);
 const MAX_CAPACITY_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,7 +87,7 @@ struct ShadowHealthPolicy {
     route_failure_window: Duration,
     route_failures_to_open: u8,
     route_open_cooldown: Duration,
-    default_capacity_cooldown: Duration,
+    minimum_capacity_cooldown: Duration,
     max_capacity_cooldown: Duration,
 }
 
@@ -94,7 +97,7 @@ impl Default for ShadowHealthPolicy {
             route_failure_window: ROUTE_FAILURE_WINDOW,
             route_failures_to_open: ROUTE_FAILURES_TO_OPEN,
             route_open_cooldown: ROUTE_OPEN_COOLDOWN,
-            default_capacity_cooldown: DEFAULT_CAPACITY_COOLDOWN,
+            minimum_capacity_cooldown: MIN_CAPACITY_COOLDOWN,
             max_capacity_cooldown: MAX_CAPACITY_COOLDOWN,
         }
     }
@@ -192,6 +195,18 @@ impl ShadowHealthState {
     pub(crate) fn snapshot(&self, route: &RouteKey) -> Option<ShadowRouteSnapshot> {
         let inner = self.lock();
         self.snapshot_locked(&inner, route, Instant::now())
+    }
+
+    /// Returns a point-in-time snapshot for every requested route while holding
+    /// the state lock once. Active selection must not combine observations from
+    /// different instants when deciding whether all canary routes are open.
+    pub(crate) fn snapshot_routes(&self, routes: &[RouteKey]) -> Option<Vec<ShadowRouteSnapshot>> {
+        let inner = self.lock();
+        let now = Instant::now();
+        routes
+            .iter()
+            .map(|route| self.snapshot_locked(&inner, route, now))
+            .collect()
     }
 
     fn observe_terminal_locked(
@@ -322,7 +337,8 @@ impl ShadowHealthState {
             Mutation::Capacity { pool, retry_after } => {
                 if let Some(state) = inner.capacity.get_mut(&pool) {
                     let cooldown = retry_after
-                        .unwrap_or(self.policy.default_capacity_cooldown)
+                        .unwrap_or(self.policy.minimum_capacity_cooldown)
+                        .max(self.policy.minimum_capacity_cooldown)
                         .min(self.policy.max_capacity_cooldown);
                     extend_open_until(&mut state.open_until, now, cooldown);
                 }
@@ -622,7 +638,7 @@ mod tests {
             route_failure_window: Duration::from_secs(10),
             route_failures_to_open: 3,
             route_open_cooldown: Duration::from_secs(5),
-            default_capacity_cooldown: Duration::from_secs(4),
+            minimum_capacity_cooldown: Duration::from_secs(4),
             max_capacity_cooldown: Duration::from_secs(10),
         }
     }
@@ -926,6 +942,33 @@ mod tests {
 
         state.observe_terminal_at(
             &failed(
+                k3.clone(),
+                AttemptFailureKind::CapacityRejected,
+                Some(429),
+                Some(Duration::ZERO),
+            ),
+            ShadowObservationMode::Update,
+            start + Duration::from_secs(10),
+        );
+        assert_eq!(
+            state
+                .snapshot_at(&key, start + Duration::from_secs(10))
+                .unwrap()
+                .effective,
+            ShadowDisposition::WouldOpen {
+                remaining: Duration::from_secs(4)
+            }
+        );
+        assert_eq!(
+            state
+                .snapshot_at(&key, start + Duration::from_secs(14))
+                .unwrap()
+                .effective,
+            ShadowDisposition::WouldProbe
+        );
+
+        state.observe_terminal_at(
+            &failed(
                 k3,
                 AttemptFailureKind::CapacityRejected,
                 Some(429),
@@ -943,6 +986,29 @@ mod tests {
                 remaining: Duration::from_secs(10)
             }
         );
+    }
+
+    #[test]
+    fn route_snapshots_share_one_point_in_time_and_fail_closed_for_unknown_routes() {
+        let state = ShadowHealthState::with_policy(test_policy());
+        let glm_tinfoil = route(ProviderId::Tinfoil, "glm-5-3", "glm-5-3").route_key();
+        let glm_continuum = route(ProviderId::Continuum, "glm-5-3", "glm-5.3").route_key();
+
+        let snapshots = state
+            .snapshot_routes(&[glm_tinfoil.clone(), glm_continuum.clone()])
+            .expect("registered GLM routes");
+        assert_eq!(snapshots.len(), 2);
+        assert!(snapshots
+            .iter()
+            .all(|snapshot| snapshot.effective == ShadowDisposition::Healthy));
+
+        let unknown = RouteKey {
+            provider: ProviderId::Tinfoil,
+            provider_model_id: "not-registered".to_string(),
+        };
+        assert!(state
+            .snapshot_routes(&[glm_tinfoil, unknown, glm_continuum])
+            .is_none());
     }
 
     #[test]

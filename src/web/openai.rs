@@ -47,11 +47,10 @@ const STREAM_CHUNK_TIMEOUT_SECS: u64 = 120; // Per-chunk timeout for streaming r
 const TTS_BILLING_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const TTS_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_TTS_INPUT_CHARS: usize = 100_000;
+const MAX_BOUNDED_PROVIDER_RESPONSE_BYTES: usize = 256 * 1024;
 
 const PROVIDER_MANAGED_CACHE_SALT_FIELD: &str = "cache_salt";
 const PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD: &str = "user_cache_secret";
-
-const LOG_PREVIEW_CHARS: usize = 150;
 
 #[derive(Clone, Default)]
 struct CompletionRequestLogMetadata {
@@ -352,21 +351,6 @@ fn image_part_url(part: &Value) -> Option<&str> {
                 .or_else(|| image.as_str())
         })
         .or_else(|| part.get("image").and_then(Value::as_str))
-}
-
-fn safe_log_preview(value: &str) -> String {
-    let mut chars = value.chars();
-    let preview = chars
-        .by_ref()
-        .take(LOG_PREVIEW_CHARS)
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect::<String>();
-
-    if chars.next().is_some() {
-        format!("{preview}...")
-    } else {
-        preview
-    }
 }
 
 /// Parameters for transcription requests
@@ -905,8 +889,73 @@ pub async fn get_chat_completion_response(
     user: &User,
     body: Value,
     headers: &HeaderMap,
+    billing_context: BillingContext,
+    model_plan: ModelPlan,
+) -> Result<CompletionStream, ApiError> {
+    get_chat_completion_response_with_expected_route(
+        state,
+        user,
+        body,
+        headers,
+        billing_context,
+        model_plan,
+        None,
+    )
+    .await
+}
+
+/// Run an entitled completion only if routing resolves to the server-selected
+/// provider and provider model. The constraint is checked before any request is
+/// serialized or sent; all ordinary plan, cache-field, and billing behavior is
+/// otherwise shared with [`get_chat_completion_response`].
+pub(crate) async fn get_chat_completion_response_for_expected_route(
+    state: &Arc<AppState>,
+    user: &User,
+    body: Value,
+    headers: &HeaderMap,
+    billing_context: BillingContext,
+    model_plan: ModelPlan,
+    route: ServerSelectedCompletionRoute<'_>,
+) -> Result<CompletionStream, ApiError> {
+    let continuum_cache_salt = (route.provider_name == ProviderName::Continuum.as_str())
+        .then(|| format!("server-selected-{}", Uuid::new_v4().simple()));
+    get_chat_completion_response_with_expected_route(
+        state,
+        user,
+        body,
+        headers,
+        billing_context,
+        model_plan,
+        Some(ExpectedCompletionRoute {
+            provider_name: route.provider_name,
+            provider_model_id: route.provider_model_id,
+            continuum_cache_salt,
+        }),
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ServerSelectedCompletionRoute<'a> {
+    pub provider_name: &'a str,
+    pub provider_model_id: &'a str,
+}
+
+struct ExpectedCompletionRoute<'a> {
+    provider_name: &'a str,
+    provider_model_id: &'a str,
+    continuum_cache_salt: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn get_chat_completion_response_with_expected_route(
+    state: &Arc<AppState>,
+    user: &User,
+    body: Value,
+    headers: &HeaderMap,
     mut billing_context: BillingContext,
     model_plan: ModelPlan,
+    expected_route: Option<ExpectedCompletionRoute<'_>>,
 ) -> Result<CompletionStream, ApiError> {
     if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
@@ -936,7 +985,17 @@ pub async fn get_chat_completion_response(
         })?
         .to_string();
 
-    ensure_completion_model_access(&requested_model_name, model_plan)?;
+    let is_server_selected_route = expected_route.is_some();
+    if let Err(error) = ensure_completion_model_access(&requested_model_name, model_plan) {
+        if is_server_selected_route {
+            error!(
+                "Server-selected completion model is not available to the internal paid route: {}",
+                requested_model_name
+            );
+            return Err(ApiError::ServiceUnavailable);
+        }
+        return Err(error);
+    }
 
     let provider_preference = state
         .provider_routing_preference(user.uuid, &requested_model_name)
@@ -952,13 +1011,37 @@ pub async fn get_chat_completion_response(
         .map_err(|err| match err {
             ProviderRoutingError::UnsupportedModel(model) => {
                 error!("Unsupported completion model requested: {}", model);
-                ApiError::BadRequest
+                if is_server_selected_route {
+                    ApiError::ServiceUnavailable
+                } else {
+                    ApiError::BadRequest
+                }
             }
             ProviderRoutingError::NoEligibleRoute(model) => {
                 error!("No eligible provider route for completion model: {}", model);
-                ApiError::InternalServerError
+                if is_server_selected_route {
+                    ApiError::ServiceUnavailable
+                } else {
+                    ApiError::InternalServerError
+                }
             }
         })?;
+
+    if let Some(expected_route) = &expected_route {
+        if selected_route.proxy.provider_name != expected_route.provider_name
+            || selected_route.provider_model_id != expected_route.provider_model_id
+        {
+            error!(
+                "Completion route did not match the server-selected constraint: public_model={}, expected_provider={}, expected_provider_model={}, selected_provider={}, selected_provider_model={}",
+                selected_route.public_model_id,
+                expected_route.provider_name,
+                expected_route.provider_model_id,
+                selected_route.proxy.provider_name,
+                selected_route.provider_model_id
+            );
+            return Err(ApiError::ServiceUnavailable);
+        }
+    }
 
     if requested_model_name != selected_route.public_model_id
         || selected_route.public_model_id != selected_route.provider_model_id
@@ -982,6 +1065,13 @@ pub async fn get_chat_completion_response(
         &selected_route.proxy.provider_name,
         user.uuid,
     );
+    if let Some(expected_route) = &expected_route {
+        apply_server_selected_cache_isolation(
+            &mut modified_body,
+            &selected_route.proxy.provider_name,
+            expected_route.continuum_cache_salt.as_deref(),
+        )?;
+    }
     billing_context.model_name = selected_route.public_model_id.clone();
 
     // Prepare the request to proxies
@@ -1056,10 +1146,27 @@ pub async fn get_chat_completion_response(
         debug!("Processing non-streaming response with internal billing");
         // The request's streaming fields are forwarded unchanged, but this
         // encrypted endpoint currently buffers one byte-exact response carrier.
-        let body_bytes = res.bytes().await.map_err(|e| {
-            error!("Failed to read response body: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        let body_bytes = if expected_route.is_some() {
+            bytes::Bytes::from(
+                collect_bounded_provider_response_body(
+                    res.bytes_stream(),
+                    MAX_BOUNDED_PROVIDER_RESPONSE_BYTES,
+                )
+                .await
+                .map_err(|error| {
+                    error!("Failed to read bounded server-selected response body: {error}");
+                    ApiError::InternalServerError
+                })?,
+            )
+        } else {
+            // Preserve the ordinary Chat Completions path's existing unbounded
+            // response-body behavior. Only server-selected image descriptor
+            // calls opt into the defensive cap above.
+            res.bytes().await.map_err(|e| {
+                error!("Failed to read response body: {:?}", e);
+                ApiError::InternalServerError
+            })?
+        };
 
         let mut response_json: Value = serde_json::from_str(&String::from_utf8_lossy(&body_bytes))
             .map_err(|e| {
@@ -1367,6 +1474,28 @@ fn apply_provider_managed_request_fields(
     } else if replaced_user_cache_secret {
         debug!("Stripped provider-managed completion request field: user_cache_secret");
     }
+}
+
+fn apply_server_selected_cache_isolation(
+    body: &mut serde_json::Map<String, Value>,
+    provider_name: &str,
+    continuum_cache_salt: Option<&str>,
+) -> Result<(), ApiError> {
+    if provider_name != ProviderName::Continuum.as_str() {
+        return Ok(());
+    }
+
+    let cache_salt = continuum_cache_salt
+        .filter(|salt| salt.len() >= 32)
+        .ok_or_else(|| {
+            error!("Missing or invalid server-owned Continuum cache salt");
+            ApiError::InternalServerError
+        })?;
+    body.insert(
+        PROVIDER_MANAGED_CACHE_SALT_FIELD.to_string(),
+        json!(cache_salt),
+    );
+    Ok(())
 }
 
 /// A finish reason marks model completion, but providers may send a richer
@@ -2381,6 +2510,34 @@ async fn proxy_embeddings(
     encrypt_response(&state, &session_id, &response_json).await
 }
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+enum BoundedProviderResponseBodyError {
+    #[error("provider response body read failed")]
+    Read,
+    #[error("provider response body exceeded the {limit_bytes}-byte limit")]
+    TooLarge { limit_bytes: usize },
+}
+
+async fn collect_bounded_provider_response_body<S>(
+    mut body_stream: S,
+    limit_bytes: usize,
+) -> Result<Vec<u8>, BoundedProviderResponseBodyError>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, String>> + Unpin,
+{
+    let mut body = Vec::new();
+
+    while let Some(chunk) = body_stream.next().await {
+        let chunk = chunk.map_err(|_| BoundedProviderResponseBodyError::Read)?;
+        if chunk.len() > limit_bytes.saturating_sub(body.len()) {
+            return Err(BoundedProviderResponseBodyError::TooLarge { limit_bytes });
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
 /// Helper function to try a provider once
 async fn try_provider(
     client: &ProviderClient,
@@ -2415,23 +2572,17 @@ async fn try_provider(
                     "Provider {} returned non-success status: {}",
                     proxy_config.provider_name, status
                 );
-                debug!("Response headers: {}", response.headers_debug());
-
-                // Try to get error body for logging
-                if let Ok(body_bytes) = response.bytes().await {
-                    let body_str = String::from_utf8_lossy(&body_bytes);
-                    let body_preview = safe_log_preview(&body_str);
-                    error!("Response body preview: {}", body_preview);
-                    Err(ProviderRequestError::Send(format!(
-                        "Provider {} returned status {}; body_preview={}",
-                        proxy_config.provider_name, status, body_preview
-                    )))
-                } else {
-                    Err(ProviderRequestError::Send(format!(
-                        "Provider {} returned status {}",
-                        proxy_config.provider_name, status
-                    )))
-                }
+                // Drain only a bounded amount and never log provider response
+                // bodies because they may echo user content.
+                let _ = collect_bounded_provider_response_body(
+                    response.bytes_stream(),
+                    MAX_BOUNDED_PROVIDER_RESPONSE_BYTES,
+                )
+                .await;
+                Err(ProviderRequestError::Send(format!(
+                    "Provider {} returned status {}",
+                    proxy_config.provider_name, status
+                )))
             }
         }
         Err(e) => {
@@ -2447,6 +2598,46 @@ async fn try_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn bounded_provider_response_body_accepts_exact_limit_across_chunks() {
+        let body_stream = futures::stream::iter([
+            Ok::<_, String>(bytes::Bytes::from_static(b"abcd")),
+            Ok(bytes::Bytes::from_static(b"ef")),
+        ]);
+
+        let body = collect_bounded_provider_response_body(body_stream, 6)
+            .await
+            .expect("body at the limit should be accepted");
+
+        assert_eq!(body, b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn bounded_provider_response_body_rejects_before_appending_over_limit_chunk() {
+        let body_stream = futures::stream::iter([
+            Ok::<_, String>(bytes::Bytes::from_static(b"abcd")),
+            Ok(bytes::Bytes::from_static(b"efg")),
+        ]);
+
+        assert_eq!(
+            collect_bounded_provider_response_body(body_stream, 6).await,
+            Err(BoundedProviderResponseBodyError::TooLarge { limit_bytes: 6 })
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_provider_response_body_maps_stream_errors_without_content() {
+        let body_stream = futures::stream::iter([
+            Ok::<_, String>(bytes::Bytes::from_static(b"abcd")),
+            Err("sensitive transport detail".to_string()),
+        ]);
+
+        assert_eq!(
+            collect_bounded_provider_response_body(body_stream, 6).await,
+            Err(BoundedProviderResponseBodyError::Read)
+        );
+    }
 
     #[test]
     fn completion_model_access_enforces_plan_gates() {
@@ -2819,6 +3010,39 @@ mod tests {
 
         assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
         assert!(!body.contains_key(PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD));
+    }
+
+    #[test]
+    fn server_selected_continuum_route_replaces_caller_salt_with_isolated_salt() {
+        let user_uuid = Uuid::from_u128(42);
+        let mut body = serde_json::Map::from_iter([
+            ("cache_salt".to_string(), json!("caller-controlled")),
+            ("messages".to_string(), json!([])),
+        ]);
+
+        apply_provider_managed_request_fields(
+            &mut body,
+            ProviderName::Continuum.as_str(),
+            user_uuid,
+        );
+        assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
+
+        let server_salt = format!("server-selected-{}", Uuid::new_v4().simple());
+        apply_server_selected_cache_isolation(
+            &mut body,
+            ProviderName::Continuum.as_str(),
+            Some(&server_salt),
+        )
+        .expect("server-selected Continuum salt should be accepted");
+
+        assert_eq!(
+            body.get(PROVIDER_MANAGED_CACHE_SALT_FIELD),
+            Some(&json!(server_salt))
+        );
+        assert_ne!(
+            body.get(PROVIDER_MANAGED_CACHE_SALT_FIELD),
+            Some(&json!("caller-controlled"))
+        );
     }
 
     #[test]

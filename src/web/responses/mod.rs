@@ -12,6 +12,7 @@ pub mod conversions;
 pub mod errors;
 pub mod events;
 pub mod handlers;
+pub(crate) mod image_describer;
 pub mod instructions;
 pub mod pagination;
 pub mod storage;

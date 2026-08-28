@@ -105,13 +105,6 @@ impl ProviderResponse {
         }
     }
 
-    pub fn headers_debug(&self) -> String {
-        match self {
-            Self::Tinfoil(response) => format!("{:?}", response.headers()),
-            Self::Standard(response) => format!("{:?}", response.headers()),
-        }
-    }
-
     pub fn content_type(&self) -> Option<&str> {
         match self {
             Self::Tinfoil(response) => response

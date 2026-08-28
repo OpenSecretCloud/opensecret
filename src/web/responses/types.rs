@@ -13,7 +13,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 ///
 /// Supports multiple content types following OpenAI's Conversations API:
 /// - Text (legacy and standard input_text)
-/// - Images (input_image with URL or file_id)
+/// - Images (input_image with an inline base64 data URL)
 /// - Files (input_file for PDFs and documents)
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type")]
@@ -26,7 +26,8 @@ pub enum MessageContentPart {
     #[serde(rename = "input_text")]
     InputText { text: String },
 
-    /// OpenAI Conversations API standard: "input_image"
+    /// OpenAI Conversations API "input_image", restricted to inline data URLs.
+    /// Remote URLs and file IDs are intentionally unsupported.
     #[serde(rename = "input_image")]
     InputImage {
         #[serde(skip_serializing_if = "Option::is_none")]

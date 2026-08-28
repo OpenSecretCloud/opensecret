@@ -2,22 +2,26 @@ use crate::inference::health::{
     ShadowDisposition, ShadowHealthState, ShadowObservationMode, ShadowObservationReport,
     ShadowRouteSnapshot, MIN_CAPACITY_COOLDOWN,
 };
-use crate::inference::{
-    AttemptTerminal, InferenceIntent, ModelSelectionMode, RouteIdentity, RouteKey,
-};
+use crate::inference::{AttemptTerminal, InferenceIntent, RouteIdentity, RouteKey};
 use crate::inference_planning::{
-    plan_completion_route, ConfiguredProviders, ProviderPreference, RoutePlan, RoutePlanningError,
-    RoutePlanningInput,
+    plan_completion_model_candidates, plan_completion_route, ConfiguredProviders,
+    ProviderPreference, RoutePlan, RoutePlanningError, RoutePlanningInput,
 };
-use crate::model_config::{resolve_completion_model_id, resolve_public_model_id, GLM_5_2_MODEL_ID};
+#[cfg(test)]
+use crate::model_config::resolve_completion_model_id;
+use crate::model_config::{resolve_public_model_id, GLM_5_2_MODEL_ID};
 use crate::os_flags::GLM_5_2_CONTINUUM_FLAG_KEY;
 use crate::provider_registry::{
     ProviderId, ProviderRegistry, RouteSelectionSource, PROVIDER_REGISTRY,
 };
-use crate::proxy_config::{canonicalize_tinfoil_model, ProxyConfig, ProxyRouter};
+#[cfg(test)]
+use crate::proxy_config::canonicalize_tinfoil_model;
+use crate::proxy_config::{ProxyConfig, ProxyRouter};
 use std::time::Duration;
+#[cfg(test)]
 use uuid::Uuid;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct ProviderConfig {
     provider: ProviderId,
@@ -25,6 +29,7 @@ struct ProviderConfig {
     enabled: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct ModelProviderRoute {
     provider: ProviderId,
@@ -33,14 +38,15 @@ struct ModelProviderRoute {
     enabled: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct ModelRoutingConfig {
     public_model_id: &'static str,
     routes: &'static [ModelProviderRoute],
-    continuum_flag_key: Option<&'static str>,
     default_provider: Option<ProviderId>,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ProviderRoutingConfig {
     providers: &'static [ProviderConfig],
@@ -56,6 +62,14 @@ pub(crate) struct SelectedProviderRoute {
     pub(crate) response_model_id: String,
     pub(crate) bucket: Option<u8>,
     pub(crate) selection_source: RouteSelectionSource,
+    pub(crate) model_selection_source: ModelSelectionSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelSelectionSource {
+    Explicit,
+    AutoPrimary,
+    AutoFallback,
 }
 
 impl SelectedProviderRoute {
@@ -105,11 +119,13 @@ pub(crate) enum ShadowRouteComparison {
 
 #[derive(Debug)]
 pub(crate) struct ProviderRouter {
+    #[cfg(test)]
     config: &'static ProviderRoutingConfig,
     registry: &'static ProviderRegistry,
     shadow_health: ShadowHealthState,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct EligibleRoute {
     provider: ProviderId,
@@ -118,6 +134,7 @@ struct EligibleRoute {
     effective_weight: u32,
 }
 
+#[cfg(test)]
 const PROVIDERS: &[ProviderConfig] = &[
     ProviderConfig {
         provider: ProviderId::Tinfoil,
@@ -131,6 +148,7 @@ const PROVIDERS: &[ProviderConfig] = &[
     },
 ];
 
+#[cfg(test)]
 const KIMI_K2_6_ROUTES: &[ModelProviderRoute] = &[ModelProviderRoute {
     provider: ProviderId::Continuum,
     provider_model_id: "kimi-k2.6",
@@ -138,6 +156,7 @@ const KIMI_K2_6_ROUTES: &[ModelProviderRoute] = &[ModelProviderRoute {
     enabled: true,
 }];
 
+#[cfg(test)]
 const GLM_5_2_ROUTES: &[ModelProviderRoute] = &[
     ModelProviderRoute {
         provider: ProviderId::Tinfoil,
@@ -153,21 +172,21 @@ const GLM_5_2_ROUTES: &[ModelProviderRoute] = &[
     },
 ];
 
+#[cfg(test)]
 const MODEL_ROUTES: &[ModelRoutingConfig] = &[
     ModelRoutingConfig {
         public_model_id: "kimi-k2-6",
         routes: KIMI_K2_6_ROUTES,
-        continuum_flag_key: None,
         default_provider: Some(ProviderId::Continuum),
     },
     ModelRoutingConfig {
         public_model_id: GLM_5_2_MODEL_ID,
         routes: GLM_5_2_ROUTES,
-        continuum_flag_key: Some(GLM_5_2_CONTINUUM_FLAG_KEY),
         default_provider: Some(ProviderId::Tinfoil),
     },
 ];
 
+#[cfg(test)]
 static DEFAULT_PROVIDER_ROUTING_CONFIG: ProviderRoutingConfig = ProviderRoutingConfig {
     providers: PROVIDERS,
     models: MODEL_ROUTES,
@@ -176,6 +195,7 @@ static DEFAULT_PROVIDER_ROUTING_CONFIG: ProviderRoutingConfig = ProviderRoutingC
 impl Default for ProviderRouter {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
             config: &DEFAULT_PROVIDER_ROUTING_CONFIG,
             registry: &PROVIDER_REGISTRY,
             shadow_health: ShadowHealthState::new(&PROVIDER_REGISTRY),
@@ -216,6 +236,7 @@ impl ProviderRouter {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn select_completion_route_with_preference(
         &self,
         proxy_router: &ProxyRouter,
@@ -239,25 +260,26 @@ impl ProviderRouter {
 
     /// Selects the route used by a newly prepared logical request.
     ///
-    /// Stack 6 activates health filtering only for explicit GLM 5.2 requests.
-    /// Auto aliases and every other public model deliberately retain the legacy
-    /// route decision until their own rollout stack.
+    /// Stack 6 activated the first explicit GLM canary. Stack 7 applies the
+    /// same future-request-only circuit filtering to every completion model and
+    /// composes it with the narrow Auto Powerful K3/K2.6 candidate policy.
+    /// Explicit requests and Auto Quick still contain exactly one public model.
     pub(crate) fn select_active_completion_route(
         &self,
         proxy_router: &ProxyRouter,
         intent: &InferenceIntent,
         provider_preference: Option<ProviderPreference>,
     ) -> Result<SelectedProviderRoute, ProviderRoutingError> {
-        if intent.selection_mode == ModelSelectionMode::Explicit
-            && intent.public_model_id == GLM_5_2_MODEL_ID
-        {
-            return self.select_glm_canary_route(proxy_router, intent, provider_preference);
-        }
-
-        self.select_completion_route_with_preference(
+        let model_plan = plan_completion_model_candidates(intent);
+        let candidates = model_plan
+            .public_model_ids
+            .iter()
+            .map(|public_model_id| intent.for_candidate_public_model(public_model_id.clone()))
+            .collect::<Vec<_>>();
+        self.select_health_aware_model_candidates(
             proxy_router,
-            intent.account_uuid,
-            &intent.public_model_id,
+            intent,
+            &candidates,
             provider_preference,
         )
     }
@@ -289,107 +311,140 @@ impl ProviderRouter {
         )
     }
 
-    fn select_glm_canary_route(
+    fn select_health_aware_model_candidates(
         &self,
         proxy_router: &ProxyRouter,
-        intent: &InferenceIntent,
+        preferred_intent: &InferenceIntent,
+        candidates: &[InferenceIntent],
         provider_preference: Option<ProviderPreference>,
     ) -> Result<SelectedProviderRoute, ProviderRoutingError> {
-        let model = self
-            .registry
-            .completion_model(&intent.public_model_id)
-            .ok_or_else(|| {
-                ProviderRoutingError::UnsupportedModel(intent.public_model_id.clone())
-            })?;
+        if candidates.is_empty() {
+            return Err(ProviderRoutingError::NoEligibleRoute(
+                preferred_intent.public_model_id.clone(),
+            ));
+        }
 
-        let configured_routes = model
-            .routes
-            .iter()
-            .filter_map(|route| {
-                let provider = self.registry.provider(route.provider)?;
+        let mut configured_routes = Vec::new();
+        for (candidate_index, candidate) in candidates.iter().enumerate() {
+            let model = self
+                .registry
+                .completion_model(&candidate.public_model_id)
+                .ok_or_else(|| {
+                    ProviderRoutingError::UnsupportedModel(candidate.public_model_id.clone())
+                })?;
+            for route in model.routes {
+                let Some(provider) = self.registry.provider(route.provider) else {
+                    continue;
+                };
                 if !route.enabled
                     || route.weight == 0
                     || !provider.enabled
                     || provider.weight == 0
                     || proxy_for_provider(proxy_router, route.provider).is_none()
                 {
-                    return None;
+                    continue;
                 }
-
-                Some((
+                configured_routes.push((
+                    candidate_index,
                     route.provider,
                     RouteKey {
                         provider: route.provider,
                         provider_model_id: route.provider_model_id.to_string(),
                     },
-                ))
-            })
-            .collect::<Vec<_>>();
+                ));
+            }
+        }
 
         if configured_routes.is_empty() {
             return Err(ProviderRoutingError::NoEligibleRoute(
-                intent.public_model_id.clone(),
+                preferred_intent.public_model_id.clone(),
             ));
         }
 
         let route_keys = configured_routes
             .iter()
-            .map(|(_, route)| route.clone())
+            .map(|(_, _, route)| route.clone())
             .collect::<Vec<_>>();
         let snapshots = self
             .shadow_health
             .snapshot_routes(&route_keys)
             .ok_or_else(|| ProviderRoutingError::CapacityUnavailable {
-                model: intent.public_model_id.clone(),
+                model: preferred_intent.public_model_id.clone(),
                 retry_after: MIN_CAPACITY_COOLDOWN,
             })?;
 
-        let mut available_providers = ConfiguredProviders::none();
-        let mut earliest_recovery = None;
-        for ((provider, _), snapshot) in configured_routes.iter().zip(snapshots) {
+        let mut available_providers = vec![ConfiguredProviders::none(); candidates.len()];
+        let mut earliest_recovery = vec![None; candidates.len()];
+        for ((candidate_index, provider, _), snapshot) in configured_routes.iter().zip(snapshots) {
             match snapshot.effective {
                 ShadowDisposition::WouldOpen { remaining } => {
                     let remaining = ceil_retry_after(remaining);
-                    earliest_recovery = Some(
-                        earliest_recovery
+                    earliest_recovery[*candidate_index] = Some(
+                        earliest_recovery[*candidate_index]
                             .map_or(remaining, |current: Duration| current.min(remaining)),
                     );
                 }
                 disposition if route_is_available_for_new_request(disposition) => {
-                    available_providers = available_providers.with_provider(*provider);
+                    available_providers[*candidate_index] =
+                        available_providers[*candidate_index].with_provider(*provider);
                 }
                 _ => unreachable!("WouldOpen is handled above"),
             }
         }
 
-        if available_providers == ConfiguredProviders::none() {
-            return Err(ProviderRoutingError::CapacityUnavailable {
-                model: intent.public_model_id.clone(),
-                retry_after: earliest_recovery.unwrap_or(MIN_CAPACITY_COOLDOWN),
+        for (candidate_index, candidate) in candidates.iter().enumerate() {
+            let configured = available_providers[candidate_index];
+            if configured == ConfiguredProviders::none() {
+                continue;
+            }
+
+            let candidate_preference = (candidate_index == 0)
+                .then_some(provider_preference)
+                .flatten();
+            let plan = plan_completion_route(
+                self.registry,
+                RoutePlanningInput {
+                    intent: candidate,
+                    configured_providers: configured,
+                    provider_preference: candidate_preference,
+                },
+            )
+            .map_err(provider_routing_error_from_plan)?;
+
+            let selected = plan.selected;
+            let proxy = proxy_for_provider(proxy_router, selected.provider).ok_or_else(|| {
+                ProviderRoutingError::NoEligibleRoute(candidate.public_model_id.clone())
+            })?;
+            return Ok(SelectedProviderRoute {
+                provider: selected.provider,
+                proxy,
+                public_model_id: selected.public_model_id,
+                provider_model_id: selected.provider_model_id,
+                response_model_id: selected.response_model_id,
+                bucket: selected.bucket,
+                // Provider-route provenance remains independent from model
+                // substitution provenance. AutoFallback below is the only
+                // signal that a different public model was selected.
+                selection_source: selected.selection_source,
+                model_selection_source: match (
+                    preferred_intent.selection_mode.is_auto(),
+                    candidate_index,
+                ) {
+                    (false, _) => ModelSelectionSource::Explicit,
+                    (true, 0) => ModelSelectionSource::AutoPrimary,
+                    (true, _) => ModelSelectionSource::AutoFallback,
+                },
             });
         }
 
-        let plan = plan_completion_route(
-            self.registry,
-            RoutePlanningInput {
-                intent,
-                configured_providers: available_providers,
-                provider_preference,
-            },
-        )
-        .map_err(provider_routing_error_from_plan)?;
-
-        let selected = plan.selected;
-        let proxy = proxy_for_provider(proxy_router, selected.provider)
-            .ok_or_else(|| ProviderRoutingError::NoEligibleRoute(intent.public_model_id.clone()))?;
-        Ok(SelectedProviderRoute {
-            provider: selected.provider,
-            proxy,
-            public_model_id: selected.public_model_id,
-            provider_model_id: selected.provider_model_id,
-            response_model_id: selected.response_model_id,
-            bucket: selected.bucket,
-            selection_source: selected.selection_source,
+        let retry_after = earliest_recovery
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(MIN_CAPACITY_COOLDOWN);
+        Err(ProviderRoutingError::CapacityUnavailable {
+            model: preferred_intent.public_model_id.clone(),
+            retry_after,
         })
     }
 
@@ -398,9 +453,10 @@ impl ProviderRouter {
         requested_model: &str,
     ) -> Option<&'static str> {
         let public_model_id = resolve_public_model_id(requested_model)?;
-        self.model_config(public_model_id)?.continuum_flag_key
+        (public_model_id == GLM_5_2_MODEL_ID).then_some(GLM_5_2_CONTINUUM_FLAG_KEY)
     }
 
+    #[cfg(test)]
     fn select_configured_route(
         &self,
         proxy_router: &ProxyRouter,
@@ -492,9 +548,11 @@ impl ProviderRouter {
             response_model_id: model_config.public_model_id.to_string(),
             bucket,
             selection_source,
+            model_selection_source: ModelSelectionSource::Explicit,
         })
     }
 
+    #[cfg(test)]
     fn fallback_completion_route(
         &self,
         proxy_router: &ProxyRouter,
@@ -529,9 +587,11 @@ impl ProviderRouter {
             response_model_id,
             bucket: None,
             selection_source: RouteSelectionSource::StaticSplit,
+            model_selection_source: ModelSelectionSource::Explicit,
         })
     }
 
+    #[cfg(test)]
     fn provider_config(&self, provider: ProviderId) -> Option<&ProviderConfig> {
         self.config
             .providers
@@ -539,6 +599,7 @@ impl ProviderRouter {
             .find(|config| config.provider == provider)
     }
 
+    #[cfg(test)]
     fn model_config(&self, public_model_id: &str) -> Option<&ModelRoutingConfig> {
         self.config
             .models
@@ -593,12 +654,14 @@ pub(crate) fn compare_shadow_route(
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct WeightedSelection<'a> {
     route: &'a EligibleRoute,
     bucket: u8,
 }
 
+#[cfg(test)]
 fn select_weighted_route<'a>(
     account_uuid: Uuid,
     routes: &'a [EligibleRoute],
@@ -634,6 +697,7 @@ fn select_weighted_route<'a>(
     None
 }
 
+#[cfg(test)]
 fn stable_account_bucket(account_uuid: Uuid) -> u8 {
     (u128::from_be_bytes(*account_uuid.as_bytes()) % 100) as u8
 }
@@ -1321,7 +1385,7 @@ mod tests {
     }
 
     #[test]
-    fn active_glm_canary_consumes_continuum_account_429_without_changing_kimi_routing() {
+    fn continuum_account_429_blocks_explicit_kimi_and_auto_falls_back_to_k3() {
         let router = ProviderRouter::default();
         let proxy_router = proxy_router_with_both_providers();
         router.observe_attempt_terminal(
@@ -1344,47 +1408,200 @@ mod tests {
             .expect("Tinfoil GLM after Continuum account limit");
         assert_eq!(glm.provider, ProviderId::Tinfoil);
 
-        let kimi = router
+        let explicit_kimi_error = router
             .select_active_completion_route(
                 &proxy_router,
                 &intent(POWERFUL_MODEL_ID, POWERFUL_MODEL_ID),
                 None,
             )
-            .expect("Kimi remains on its legacy route in Stack 6");
-        assert_eq!(kimi.provider, ProviderId::Continuum);
-        assert_eq!(kimi.provider_model_id, "kimi-k2.6");
+            .expect_err("explicit Kimi never changes public model");
+        assert!(matches!(
+            explicit_kimi_error,
+            ProviderRoutingError::CapacityUnavailable { model, .. }
+                if model == POWERFUL_MODEL_ID
+        ));
+
+        let auto_kimi = router
+            .select_active_completion_route(
+                &proxy_router,
+                &intent(AUTO_POWERFUL_MODEL_ID, POWERFUL_MODEL_ID),
+                None,
+            )
+            .expect("Auto Powerful may use the compatible K3 model");
+        assert_eq!(auto_kimi.provider, ProviderId::Tinfoil);
+        assert_eq!(auto_kimi.public_model_id, KIMI_K3_MODEL_ID);
+        assert_eq!(auto_kimi.provider_model_id, KIMI_K3_MODEL_ID);
+        assert_eq!(
+            auto_kimi.model_selection_source,
+            ModelSelectionSource::AutoFallback
+        );
     }
 
     #[test]
-    fn active_glm_health_filter_is_inert_for_auto_and_other_models() {
+    fn singleton_model_plans_circuit_break_without_crossing_public_identity() {
         let router = ProviderRouter::default();
         let proxy_router = proxy_router_with_both_providers();
         router.observe_attempt_terminal(
             &capacity_terminal(
                 ProviderId::Tinfoil,
-                GLM_5_2_MODEL_ID,
-                GLM_5_2_MODEL_ID,
+                KIMI_K3_MODEL_ID,
+                KIMI_K3_MODEL_ID,
                 429,
                 Duration::from_secs(60),
             ),
             ShadowObservationMode::Update,
         );
 
-        let synthetic_auto_glm = intent(AUTO_POWERFUL_MODEL_ID, GLM_5_2_MODEL_ID);
-        let auto_route = router
-            .select_active_completion_route(&proxy_router, &synthetic_auto_glm, None)
-            .expect("Auto stays on legacy selection until Stack 7");
-        assert_eq!(auto_route.provider, ProviderId::Tinfoil);
+        let explicit_error = router
+            .select_active_completion_route(
+                &proxy_router,
+                &intent(KIMI_K3_MODEL_ID, KIMI_K3_MODEL_ID),
+                None,
+            )
+            .expect_err("explicit K3 circuit is open");
+        assert!(matches!(
+            explicit_error,
+            ProviderRoutingError::CapacityUnavailable { model, .. }
+                if model == KIMI_K3_MODEL_ID
+        ));
 
-        for (requested, public, expected_provider) in [
-            (KIMI_K3_MODEL_ID, KIMI_K3_MODEL_ID, ProviderId::Tinfoil),
-            (POWERFUL_MODEL_ID, POWERFUL_MODEL_ID, ProviderId::Continuum),
-            (QUICK_MODEL_ID, QUICK_MODEL_ID, ProviderId::Tinfoil),
+        // A healthy compatible model cannot broaden an explicit request.
+        let explicit_k2 = router
+            .select_active_completion_route(
+                &proxy_router,
+                &intent(POWERFUL_MODEL_ID, POWERFUL_MODEL_ID),
+                None,
+            )
+            .expect("explicit K2.6 remains K2.6");
+        assert_eq!(explicit_k2.public_model_id, POWERFUL_MODEL_ID);
+        assert_eq!(
+            explicit_k2.model_selection_source,
+            ModelSelectionSource::Explicit
+        );
+
+        // Auto Quick is also a singleton model plan in Stack 7.
+        router.observe_attempt_terminal(
+            &capacity_terminal(
+                ProviderId::Tinfoil,
+                QUICK_MODEL_ID,
+                QUICK_MODEL_ID,
+                429,
+                Duration::from_secs(60),
+            ),
+            ShadowObservationMode::Update,
+        );
+        let auto_quick_error = router
+            .select_active_completion_route(
+                &proxy_router,
+                &intent(AUTO_QUICK_MODEL_ID, QUICK_MODEL_ID),
+                None,
+            )
+            .expect_err("Auto Quick has no alternate public model");
+        assert!(matches!(
+            auto_quick_error,
+            ProviderRoutingError::CapacityUnavailable { model, .. }
+                if model == QUICK_MODEL_ID
+        ));
+    }
+
+    #[test]
+    fn auto_powerful_falls_back_in_both_flag_selected_directions() {
+        let proxy_router = proxy_router_with_both_providers();
+
+        let k3_preferred = ProviderRouter::default();
+        k3_preferred.observe_attempt_terminal(
+            &capacity_terminal(
+                ProviderId::Tinfoil,
+                KIMI_K3_MODEL_ID,
+                KIMI_K3_MODEL_ID,
+                429,
+                Duration::from_secs(60),
+            ),
+            ShadowObservationMode::Update,
+        );
+        let selected = k3_preferred
+            .select_active_completion_route(
+                &proxy_router,
+                &intent(AUTO_POWERFUL_MODEL_ID, KIMI_K3_MODEL_ID),
+                None,
+            )
+            .expect("flag-on Auto Powerful falls back to K2.6");
+        assert_eq!(selected.public_model_id, POWERFUL_MODEL_ID);
+        assert_eq!(selected.provider, ProviderId::Continuum);
+        assert_eq!(selected.provider_model_id, "kimi-k2.6");
+        assert_eq!(
+            selected.selection_source,
+            RouteSelectionSource::DefaultProvider
+        );
+        assert_eq!(
+            selected.model_selection_source,
+            ModelSelectionSource::AutoFallback
+        );
+
+        let k2_preferred = ProviderRouter::default();
+        k2_preferred.observe_attempt_terminal(
+            &capacity_terminal(
+                ProviderId::Continuum,
+                POWERFUL_MODEL_ID,
+                "kimi-k2.6",
+                429,
+                Duration::from_secs(60),
+            ),
+            ShadowObservationMode::Update,
+        );
+        let selected = k2_preferred
+            .select_active_completion_route(
+                &proxy_router,
+                &intent(AUTO_POWERFUL_MODEL_ID, POWERFUL_MODEL_ID),
+                None,
+            )
+            .expect("flag-off Auto Powerful falls back to K3");
+        assert_eq!(selected.public_model_id, KIMI_K3_MODEL_ID);
+        assert_eq!(selected.provider, ProviderId::Tinfoil);
+        assert_eq!(selected.provider_model_id, KIMI_K3_MODEL_ID);
+        assert_eq!(selected.selection_source, RouteSelectionSource::StaticSplit);
+        assert_eq!(
+            selected.model_selection_source,
+            ModelSelectionSource::AutoFallback
+        );
+    }
+
+    #[test]
+    fn auto_powerful_returns_earliest_capacity_when_both_kimi_candidates_are_open() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+        for terminal in [
+            capacity_terminal(
+                ProviderId::Tinfoil,
+                KIMI_K3_MODEL_ID,
+                KIMI_K3_MODEL_ID,
+                429,
+                Duration::from_secs(50),
+            ),
+            capacity_terminal(
+                ProviderId::Continuum,
+                POWERFUL_MODEL_ID,
+                "kimi-k2.6",
+                429,
+                Duration::from_secs(10),
+            ),
         ] {
-            let selected = router
-                .select_active_completion_route(&proxy_router, &intent(requested, public), None)
-                .expect("non-canary route");
-            assert_eq!(selected.provider, expected_provider, "{requested}");
+            router.observe_attempt_terminal(&terminal, ShadowObservationMode::Update);
+        }
+
+        let error = router
+            .select_active_completion_route(
+                &proxy_router,
+                &intent(AUTO_POWERFUL_MODEL_ID, KIMI_K3_MODEL_ID),
+                None,
+            )
+            .expect_err("both compatible Auto Powerful models are open");
+        match error {
+            ProviderRoutingError::CapacityUnavailable { model, retry_after } => {
+                assert_eq!(model, KIMI_K3_MODEL_ID);
+                assert_eq!(retry_after, Duration::from_secs(30));
+            }
+            other => panic!("unexpected route error: {other:?}"),
         }
     }
 

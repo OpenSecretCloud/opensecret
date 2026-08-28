@@ -715,9 +715,19 @@ impl PinnedCompletionRequest {
         &self.intent
     }
 
+    pub(crate) fn public_model_id(&self) -> &str {
+        &self.route.public_model_id
+    }
+
     fn begin_execution(&self) -> InferenceExecution {
         self.intent.begin_execution()
     }
+}
+
+fn pin_chat_request_model(body: &mut Value, pinned: &PinnedCompletionRequest) {
+    body.as_object_mut()
+        .expect("model was read from a JSON object")
+        .insert("model".to_string(), json!(pinned.public_model_id()));
 }
 
 #[derive(Debug)]
@@ -1419,15 +1429,14 @@ async fn proxy_openai(
         WorkloadClass::Interactive,
     );
     let pinned_completion = prepare_completion_request(&state, &user, intent).await?;
-    if requested_model_name != model_name {
+    let served_model_name = pinned_completion.public_model_id().to_string();
+    if requested_model_name != served_model_name {
         debug!(
-            "Resolved chat model {} to {}",
-            requested_model_name, model_name
+            "Resolved chat model {} to preferred {} and pinned {}",
+            requested_model_name, model_name, served_model_name
         );
-        body.as_object_mut()
-            .expect("model was read from a JSON object")
-            .insert("model".to_string(), json!(model_name));
     }
+    pin_chat_request_model(&mut body, &pinned_completion);
 
     // Create billing context
     let billing_context = BillingContext::new(auth_method, requested_model_name);
@@ -1559,7 +1568,7 @@ fn retain_active_route_after_shadow_observation(
             ) =>
         {
             debug!(
-                "GLM canary found every configured same-model route open: request_id={}, public_model={}, policy_version={}, candidate_scope={:?}",
+                "Health-aware routing found every configured policy candidate open: request_id={}, preferred_public_model={}, policy_version={}, candidate_scope={:?}",
                 intent.request_id,
                 intent.public_model_id,
                 policy_version,
@@ -1567,18 +1576,28 @@ fn retain_active_route_after_shadow_observation(
             )
         }
         ShadowRouteComparison::Mismatch { .. }
-            if !intent.selection_mode.is_auto()
-                && intent.public_model_id == crate::model_config::GLM_5_2_MODEL_ID =>
+            if active.as_ref().is_ok_and(|route| {
+                route.model_selection_source
+                    == crate::provider_routing::ModelSelectionSource::AutoFallback
+            }) =>
         {
             debug!(
-            "Health-aware route differed from the baseline plan; retaining the active route: request_id={}, public_model={}, policy_version={}, candidate_scope={:?}, comparison={:?}",
+                "Auto policy selected a compatible fallback model: request_id={}, preferred_public_model={}, selected_public_model={}, policy_version={}, comparison={:?}",
+                intent.request_id,
+                intent.public_model_id,
+                active.as_ref().map(|route| route.public_model_id.as_str()).unwrap_or("unavailable"),
+                crate::inference_planning::AUTO_MODEL_ROUTING_POLICY_VERSION,
+                comparison
+            )
+        }
+        ShadowRouteComparison::Mismatch { .. } if active.is_ok() => debug!(
+            "Health-aware route differed from the baseline plan; retaining the active route: request_id={}, preferred_public_model={}, policy_version={}, candidate_scope={:?}, comparison={:?}",
             intent.request_id,
             intent.public_model_id,
             policy_version,
             candidate_scope,
             comparison
-            )
-        }
+        ),
         ShadowRouteComparison::Mismatch { .. } => warn!(
             "Shadow route differed from active route; retaining active route: request_id={}, public_model={}, policy_version={}, candidate_scope={:?}, comparison={:?}",
             intent.request_id,
@@ -1604,7 +1623,7 @@ fn provider_routing_api_error(error: ProviderRoutingError) -> ApiError {
         }
         ProviderRoutingError::CapacityUnavailable { model, retry_after } => {
             debug!(
-                "All configured same-model routes are temporarily unavailable: public_model={}, retry_after_seconds={}",
+                "All configured policy-permitted routes are temporarily unavailable: preferred_public_model={}, retry_after_seconds={}",
                 model,
                 retry_after.as_secs()
             );
@@ -1666,7 +1685,7 @@ pub(crate) async fn prepare_completion_request(
             })
             .collect::<Vec<_>>();
         debug!(
-            "Shadow route health remained observational: request_id={}, public_model={}, routing_policy_version={}, candidate_health={:?}",
+            "Baseline route candidate health before active selection: request_id={}, public_model={}, routing_policy_version={}, candidate_health={:?}",
             intent.request_id,
             intent.public_model_id,
             plan.policy_version,
@@ -1680,15 +1699,18 @@ pub(crate) async fn prepare_completion_request(
         provider_preference,
         shadow,
     )?;
+    ensure_completion_model_access(&route.public_model_id, intent.model_plan)?;
 
     debug!(
-        "Pinned inference route: request_id={}, selection_mode={:?}, auto={}, surface={:?}, workload={:?}, requested_model={}, public_model={}, provider={}, provider_model={}, bucket={:?}, source={:?}",
+        "Pinned inference route: request_id={}, selection_mode={:?}, model_selection={:?}, auto={}, surface={:?}, workload={:?}, requested_model={}, preferred_public_model={}, public_model={}, provider={}, provider_model={}, bucket={:?}, source={:?}",
         intent.request_id,
         intent.selection_mode,
+        route.model_selection_source,
         intent.selection_mode.is_auto(),
         intent.surface,
         intent.workload_class,
         intent.requested_model_id,
+        intent.public_model_id,
         route.public_model_id,
         route.provider.as_str(),
         route.provider_model_id,
@@ -1947,15 +1969,18 @@ async fn get_chat_completion_response_with_options(
         })?
         .to_string();
 
-    if body_model_name != pinned.intent.public_model_id {
+    if body_model_name != pinned.route.public_model_id {
         error!(
-            "Prepared inference model did not match execution body: request_id={}, prepared_model={}, body_model={}",
-            pinned.intent.request_id, pinned.intent.public_model_id, body_model_name
+            "Prepared inference model did not match execution body: request_id={}, preferred_model={}, prepared_model={}, body_model={}",
+            pinned.intent.request_id,
+            pinned.intent.public_model_id,
+            pinned.route.public_model_id,
+            body_model_name
         );
         return Err(ApiError::InternalServerError.into());
     }
 
-    ensure_completion_model_access(&pinned.intent.public_model_id, pinned.intent.model_plan)?;
+    ensure_completion_model_access(&pinned.route.public_model_id, pinned.intent.model_plan)?;
     let selected_route = pinned.route.clone();
     if let Some(expected_route) = &options.exact_route {
         if !completion_route_matches_exact_constraint(&selected_route, expected_route) {
@@ -3687,6 +3712,7 @@ mod tests {
                 response_model_id: "kimi-k3".to_string(),
                 bucket: None,
                 selection_source: crate::provider_registry::RouteSelectionSource::StaticSplit,
+                model_selection_source: crate::provider_routing::ModelSelectionSource::AutoPrimary,
             },
         }
     }
@@ -3720,6 +3746,58 @@ mod tests {
             &pinned.route,
             &wrong_model
         ));
+    }
+
+    fn pinned_auto_fallback_completion() -> PinnedCompletionRequest {
+        PinnedCompletionRequest {
+            intent: InferenceIntent::new(
+                Uuid::nil(),
+                crate::model_config::AUTO_POWERFUL_MODEL_ID,
+                crate::model_config::KIMI_K3_MODEL_ID,
+                ModelPlan::Paid,
+                InferenceSurface::ChatCompletions,
+                WorkloadClass::Interactive,
+            ),
+            route: SelectedProviderRoute {
+                provider: ProviderId::Continuum,
+                proxy: ProxyConfig {
+                    base_url: "http://continuum.example.com".to_string(),
+                    api_key: None,
+                    provider_name: "continuum".to_string(),
+                },
+                public_model_id: crate::model_config::POWERFUL_MODEL_ID.to_string(),
+                provider_model_id: "kimi-k2.6".to_string(),
+                response_model_id: crate::model_config::POWERFUL_MODEL_ID.to_string(),
+                bucket: None,
+                selection_source: crate::provider_registry::RouteSelectionSource::DefaultProvider,
+                model_selection_source: crate::provider_routing::ModelSelectionSource::AutoFallback,
+            },
+        }
+    }
+
+    #[test]
+    fn chat_body_uses_the_pinned_auto_fallback_public_model() {
+        let pinned = pinned_auto_fallback_completion();
+        let mut body = json!({
+            "model": crate::model_config::AUTO_POWERFUL_MODEL_ID,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+
+        pin_chat_request_model(&mut body, &pinned);
+
+        assert_eq!(body["model"], crate::model_config::POWERFUL_MODEL_ID);
+        assert_eq!(
+            pinned.intent().public_model_id,
+            crate::model_config::KIMI_K3_MODEL_ID
+        );
+        assert_eq!(
+            pinned.public_model_id(),
+            crate::model_config::POWERFUL_MODEL_ID
+        );
+        assert_eq!(
+            pinned.intent().requested_model_id,
+            crate::model_config::AUTO_POWERFUL_MODEL_ID
+        );
     }
 
     async fn record_terminal_once(
@@ -4167,6 +4245,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_powerful_capacity_failure_switches_only_a_distinct_request_to_k2_6() {
+        let tinfoil_count = Arc::new(AtomicUsize::new(0));
+        let tinfoil_bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let tinfoil_app = {
+            let count = Arc::clone(&tinfoil_count);
+            let bodies = Arc::clone(&tinfoil_bodies);
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<Value>| {
+                    let count = Arc::clone(&count);
+                    let bodies = Arc::clone(&bodies);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        bodies.lock().expect("Tinfoil body lock").push(body);
+                        axum::http::Response::builder()
+                            .status(StatusCode::TOO_MANY_REQUESTS)
+                            .header(header::RETRY_AFTER, "60")
+                            .body(axum::body::Body::empty())
+                            .expect("mock K3 429")
+                    }
+                }),
+            )
+        };
+        let continuum_count = Arc::new(AtomicUsize::new(0));
+        let continuum_bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let continuum_app = {
+            let count = Arc::clone(&continuum_count);
+            let bodies = Arc::clone(&continuum_bodies);
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<Value>| {
+                    let count = Arc::clone(&count);
+                    let bodies = Arc::clone(&bodies);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        bodies.lock().expect("Continuum body lock").push(body);
+                        axum::http::Response::builder()
+                            .status(StatusCode::OK)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(axum::body::Body::from(
+                                r#"{"model":"kimi-k2.6","choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+                            ))
+                            .expect("mock K2.6 success")
+                    }
+                }),
+            )
+        };
+
+        let (tinfoil_url, tinfoil_server) = start_mock_provider(tinfoil_app).await;
+        let (continuum_url, continuum_server) = start_mock_provider(continuum_app).await;
+        let provider_client =
+            ProviderClient::for_test(tinfoil_url.clone()).expect("test provider client");
+        let proxy_router = ProxyRouter::new(continuum_url, None, tinfoil_url);
+        let provider_router = ProviderRouter::default();
+        let first_intent = InferenceIntent::new(
+            Uuid::nil(),
+            crate::model_config::AUTO_POWERFUL_MODEL_ID,
+            crate::model_config::KIMI_K3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+        let first_baseline =
+            provider_router.shadow_completion_plan(&proxy_router, &first_intent, None);
+        let first_route = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &first_intent,
+            None,
+            first_baseline,
+        )
+        .expect("healthy Auto Powerful prefers K3");
+        assert_eq!(first_route.provider, ProviderId::Tinfoil);
+        assert_eq!(
+            first_route.public_model_id,
+            crate::model_config::KIMI_K3_MODEL_ID
+        );
+        assert_eq!(
+            first_route.model_selection_source,
+            crate::provider_routing::ModelSelectionSource::AutoPrimary
+        );
+
+        let user_content = json!("hello");
+        let first_trace = try_provider(
+            &provider_client,
+            &first_route.proxy,
+            json!({
+                "model": first_route.provider_model_id,
+                "messages": [{"role": "user", "content": user_content.clone()}]
+            })
+            .to_string(),
+            &HeaderMap::new(),
+        )
+        .await;
+        assert!(first_trace.prior_failures.is_empty());
+        let first_error = match first_trace.result {
+            Err(error) => error,
+            Ok(_) => panic!("mock K3 unexpectedly succeeded"),
+        };
+        let first_failure = attempt_failure_from_provider_error(&first_error);
+        let first_attempt = first_intent
+            .begin_execution()
+            .begin_attempt(first_route.identity());
+        let surfaced = public_completion_error(&first_error, &first_failure);
+        let _ =
+            failed_completion_execution(&provider_router, first_attempt, first_failure, surfaced);
+
+        assert_eq!(tinfoil_count.load(Ordering::SeqCst), 1);
+        assert_eq!(continuum_count.load(Ordering::SeqCst), 0);
+
+        let second_intent = InferenceIntent::new(
+            Uuid::nil(),
+            crate::model_config::AUTO_POWERFUL_MODEL_ID,
+            crate::model_config::KIMI_K3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+        assert_ne!(second_intent.request_id, first_intent.request_id);
+        let second_baseline =
+            provider_router.shadow_completion_plan(&proxy_router, &second_intent, None);
+        let second_route = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &second_intent,
+            None,
+            second_baseline,
+        )
+        .expect("later Auto Powerful request uses compatible K2.6");
+        assert_eq!(second_route.provider, ProviderId::Continuum);
+        assert_eq!(
+            second_route.public_model_id,
+            crate::model_config::POWERFUL_MODEL_ID
+        );
+        assert_eq!(second_route.provider_model_id, "kimi-k2.6");
+        assert_eq!(
+            second_route.model_selection_source,
+            crate::provider_routing::ModelSelectionSource::AutoFallback
+        );
+        let second_trace = try_provider(
+            &provider_client,
+            &second_route.proxy,
+            json!({
+                "model": second_route.provider_model_id,
+                "messages": [{"role": "user", "content": user_content.clone()}]
+            })
+            .to_string(),
+            &HeaderMap::new(),
+        )
+        .await;
+        assert!(second_trace.prior_failures.is_empty());
+        let response = second_trace.result.expect("mock K2.6 succeeds");
+        let second_attempt = second_intent
+            .begin_execution()
+            .begin_attempt(second_route.identity());
+        let canonical_response = read_non_streaming_completion_response(
+            response,
+            &second_route.response_model_id,
+            &second_attempt,
+            None,
+        )
+        .await
+        .expect("canonical K2.6 response");
+
+        assert_eq!(
+            canonical_response["model"],
+            crate::model_config::POWERFUL_MODEL_ID
+        );
+        assert_eq!(
+            second_intent.requested_model_id,
+            crate::model_config::AUTO_POWERFUL_MODEL_ID
+        );
+        assert_eq!(
+            second_attempt.route.public_model_id,
+            crate::model_config::POWERFUL_MODEL_ID
+        );
+        assert_eq!(tinfoil_count.load(Ordering::SeqCst), 1);
+        assert_eq!(continuum_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tinfoil_bodies.lock().expect("Tinfoil bodies")[0]["model"],
+            crate::model_config::KIMI_K3_MODEL_ID
+        );
+        assert_eq!(
+            continuum_bodies.lock().expect("Continuum bodies")[0]["model"],
+            "kimi-k2.6"
+        );
+        assert_eq!(
+            continuum_bodies.lock().expect("Continuum bodies")[0]["messages"][0]["content"],
+            user_content
+        );
+
+        tinfoil_server.abort();
+        continuum_server.abort();
+    }
+
+    #[tokio::test]
     async fn glm_tool_turns_keep_the_original_mock_provider_after_health_opens() {
         let tinfoil_count = Arc::new(AtomicUsize::new(0));
         let tinfoil_app = {
@@ -4311,6 +4585,181 @@ mod tests {
         .expect("next logical request switches providers");
         assert_eq!(next_route.provider, ProviderId::Continuum);
         assert_eq!(next_route.provider_model_id, "glm-5.2");
+
+        tinfoil_server.abort();
+        continuum_server.abort();
+    }
+
+    #[tokio::test]
+    async fn auto_powerful_tool_turns_keep_the_pinned_k3_after_health_opens() {
+        let tinfoil_count = Arc::new(AtomicUsize::new(0));
+        let tinfoil_bodies = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let tinfoil_app = {
+            let count = Arc::clone(&tinfoil_count);
+            let bodies = Arc::clone(&tinfoil_bodies);
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<Value>| {
+                    let count = Arc::clone(&count);
+                    let bodies = Arc::clone(&bodies);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        bodies.lock().expect("Tinfoil body lock").push(body);
+                        Json(json!({
+                            "model": "kimi-k3",
+                            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                        }))
+                    }
+                }),
+            )
+        };
+        let continuum_count = Arc::new(AtomicUsize::new(0));
+        let continuum_app = {
+            let count = Arc::clone(&continuum_count);
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move |Json(_body): Json<Value>| {
+                    let count = Arc::clone(&count);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({
+                            "model": "kimi-k2.6",
+                            "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+                        }))
+                    }
+                }),
+            )
+        };
+        let (tinfoil_url, tinfoil_server) = start_mock_provider(tinfoil_app).await;
+        let (continuum_url, continuum_server) = start_mock_provider(continuum_app).await;
+        let provider_client =
+            ProviderClient::for_test(tinfoil_url.clone()).expect("test provider client");
+        let proxy_router = ProxyRouter::new(continuum_url, None, tinfoil_url);
+        let provider_router = ProviderRouter::default();
+        let intent = InferenceIntent::new(
+            Uuid::nil(),
+            crate::model_config::AUTO_POWERFUL_MODEL_ID,
+            crate::model_config::KIMI_K3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+        let baseline = provider_router.shadow_completion_plan(&proxy_router, &intent, None);
+        let route = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &intent,
+            None,
+            baseline,
+        )
+        .expect("initial Auto Powerful K3 route");
+        assert_eq!(
+            route.model_selection_source,
+            crate::provider_routing::ModelSelectionSource::AutoPrimary
+        );
+        let pinned = PinnedCompletionRequest { intent, route };
+
+        let send_pinned_turn = |content: &'static str| {
+            let provider_client = &provider_client;
+            let pinned = &pinned;
+            async move {
+                let trace = try_provider(
+                    provider_client,
+                    &pinned.route.proxy,
+                    json!({
+                        "model": pinned.route.provider_model_id,
+                        "messages": [{"role": "user", "content": content}]
+                    })
+                    .to_string(),
+                    &HeaderMap::new(),
+                )
+                .await;
+                assert!(trace.prior_failures.is_empty());
+                let response = trace.result.expect("pinned K3 turn succeeds");
+                let attempt = pinned
+                    .begin_execution()
+                    .begin_attempt(pinned.route.identity());
+                let response = read_non_streaming_completion_response(
+                    response,
+                    &pinned.route.response_model_id,
+                    &attempt,
+                    None,
+                )
+                .await
+                .expect("canonical pinned K3 response");
+                assert_eq!(response["model"], crate::model_config::KIMI_K3_MODEL_ID);
+                attempt
+            }
+        };
+
+        let first_attempt = send_pinned_turn("first tool turn").await;
+        let external_error = ProviderRequestError::Upstream(UpstreamProviderError {
+            status: 429,
+            retry_after: Some(Duration::from_secs(60)),
+            upstream_request_id: None,
+        });
+        let external_failure = attempt_failure_from_provider_error(&external_error);
+        let external_intent = InferenceIntent::new(
+            Uuid::from_u128(7),
+            crate::model_config::KIMI_K3_MODEL_ID,
+            crate::model_config::KIMI_K3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+        let _ = failed_completion_execution(
+            &provider_router,
+            external_intent
+                .begin_execution()
+                .begin_attempt(pinned.route.identity()),
+            external_failure.clone(),
+            public_completion_error(&external_error, &external_failure),
+        );
+
+        let second_attempt = send_pinned_turn("second tool turn").await;
+        assert_eq!(first_attempt.request_id, second_attempt.request_id);
+        assert_ne!(first_attempt.execution_id, second_attempt.execution_id);
+        assert_eq!(first_attempt.route, second_attempt.route);
+        assert_eq!(
+            second_attempt.route.public_model_id,
+            crate::model_config::KIMI_K3_MODEL_ID
+        );
+        assert_eq!(tinfoil_count.load(Ordering::SeqCst), 2);
+        assert_eq!(continuum_count.load(Ordering::SeqCst), 0);
+        assert!(tinfoil_bodies
+            .lock()
+            .expect("Tinfoil bodies")
+            .iter()
+            .all(|body| body["model"] == crate::model_config::KIMI_K3_MODEL_ID));
+
+        let next_intent = InferenceIntent::new(
+            Uuid::nil(),
+            crate::model_config::AUTO_POWERFUL_MODEL_ID,
+            crate::model_config::KIMI_K3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+        let next_baseline =
+            provider_router.shadow_completion_plan(&proxy_router, &next_intent, None);
+        let next_route = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &next_intent,
+            None,
+            next_baseline,
+        )
+        .expect("new Auto request switches to K2.6");
+        assert_eq!(next_route.provider, ProviderId::Continuum);
+        assert_eq!(next_route.provider_model_id, "kimi-k2.6");
+        assert_eq!(
+            next_route.public_model_id,
+            crate::model_config::POWERFUL_MODEL_ID
+        );
+        assert_eq!(
+            next_route.model_selection_source,
+            crate::provider_routing::ModelSelectionSource::AutoFallback
+        );
 
         tinfoil_server.abort();
         continuum_server.abort();
@@ -4544,6 +4993,136 @@ mod tests {
             third_baseline,
         )
         .expect_err("both GLM routes are open");
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[crate::CLIENT_REPLAY_HEADER], "safe");
+        assert_eq!(response.headers()[crate::ERROR_CONTRACT_HEADER], "1");
+        assert_eq!(
+            response.headers()[crate::ERROR_CODE_HEADER],
+            crate::INFERENCE_CAPACITY_ERROR_CODE
+        );
+        assert_eq!(response.headers()[header::RETRY_AFTER], "30");
+        assert_eq!(tinfoil_count.load(Ordering::SeqCst), 0);
+        assert_eq!(continuum_count.load(Ordering::SeqCst), 0);
+
+        tinfoil_server.abort();
+        continuum_server.abort();
+    }
+
+    #[tokio::test]
+    async fn prepared_all_open_auto_powerful_models_send_zero_requests_and_return_capacity() {
+        let tinfoil_count = Arc::new(AtomicUsize::new(0));
+        let tinfoil_app = {
+            let count = Arc::clone(&tinfoil_count);
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move || {
+                    let count = Arc::clone(&count);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            )
+        };
+        let continuum_count = Arc::new(AtomicUsize::new(0));
+        let continuum_app = {
+            let count = Arc::clone(&continuum_count);
+            Router::new().route(
+                "/v1/chat/completions",
+                post(move || {
+                    let count = Arc::clone(&count);
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            )
+        };
+        let (tinfoil_url, tinfoil_server) = start_mock_provider(tinfoil_app).await;
+        let (continuum_url, continuum_server) = start_mock_provider(continuum_app).await;
+        let proxy_router = ProxyRouter::new(continuum_url, None, tinfoil_url);
+        let provider_router = ProviderRouter::default();
+
+        let new_intent = || {
+            InferenceIntent::new(
+                Uuid::nil(),
+                crate::model_config::AUTO_POWERFUL_MODEL_ID,
+                crate::model_config::KIMI_K3_MODEL_ID,
+                ModelPlan::Paid,
+                InferenceSurface::Responses,
+                WorkloadClass::Interactive,
+            )
+        };
+        let first_intent = new_intent();
+        let first_baseline =
+            provider_router.shadow_completion_plan(&proxy_router, &first_intent, None);
+        let first_route = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &first_intent,
+            None,
+            first_baseline,
+        )
+        .expect("initial K3 route");
+        let first_error = ProviderRequestError::Upstream(UpstreamProviderError {
+            status: 429,
+            retry_after: Some(Duration::from_secs(40)),
+            upstream_request_id: None,
+        });
+        let first_failure = attempt_failure_from_provider_error(&first_error);
+        let _ = failed_completion_execution(
+            &provider_router,
+            first_intent
+                .begin_execution()
+                .begin_attempt(first_route.identity()),
+            first_failure.clone(),
+            public_completion_error(&first_error, &first_failure),
+        );
+
+        let second_intent = new_intent();
+        let second_baseline =
+            provider_router.shadow_completion_plan(&proxy_router, &second_intent, None);
+        let second_route = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &second_intent,
+            None,
+            second_baseline,
+        )
+        .expect("K2.6 route while K3 is open");
+        assert_eq!(second_route.provider, ProviderId::Continuum);
+        assert_eq!(
+            second_route.public_model_id,
+            crate::model_config::POWERFUL_MODEL_ID
+        );
+        let second_error = ProviderRequestError::Upstream(UpstreamProviderError {
+            status: 503,
+            retry_after: Some(Duration::from_secs(10)),
+            upstream_request_id: None,
+        });
+        let second_failure = attempt_failure_from_provider_error(&second_error);
+        let _ = failed_completion_execution(
+            &provider_router,
+            second_intent
+                .begin_execution()
+                .begin_attempt(second_route.identity()),
+            second_failure.clone(),
+            public_completion_error(&second_error, &second_failure),
+        );
+
+        let third_intent = new_intent();
+        let third_baseline =
+            provider_router.shadow_completion_plan(&proxy_router, &third_intent, None);
+        let error = select_prepared_completion_route(
+            &provider_router,
+            &proxy_router,
+            &third_intent,
+            None,
+            third_baseline,
+        )
+        .expect_err("K3 and K2.6 circuits are open");
         let response = error.into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);

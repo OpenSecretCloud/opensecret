@@ -103,6 +103,14 @@ impl InferenceIntent {
             execution_id: InferenceExecutionId::new(),
         }
     }
+
+    /// Clones the logical request for planning one policy-approved public-model
+    /// candidate while preserving the original selector and request identity.
+    pub(crate) fn for_candidate_public_model(&self, public_model_id: impl Into<String>) -> Self {
+        let mut candidate = self.clone();
+        candidate.public_model_id = public_model_id.into();
+        candidate
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,6 +350,25 @@ mod tests {
 
         assert_eq!(intent.selection_mode, ModelSelectionMode::Explicit);
         assert!(!intent.selection_mode.is_auto());
+    }
+
+    #[test]
+    fn candidate_intent_preserves_original_auto_authority_and_request_identity() {
+        let preferred = InferenceIntent::new(
+            Uuid::nil(),
+            AUTO_POWERFUL_MODEL_ID,
+            "kimi-k3",
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+        let candidate = preferred.for_candidate_public_model("kimi-k2-6");
+
+        assert_eq!(candidate.request_id, preferred.request_id);
+        assert_eq!(candidate.requested_model_id, AUTO_POWERFUL_MODEL_ID);
+        assert_eq!(candidate.selection_mode, ModelSelectionMode::AutoPowerful);
+        assert_eq!(preferred.public_model_id, "kimi-k3");
+        assert_eq!(candidate.public_model_id, "kimi-k2-6");
     }
 
     #[test]

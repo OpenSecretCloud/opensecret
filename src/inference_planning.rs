@@ -1,11 +1,14 @@
 //! Deterministic, credential-free completion route planning.
 //!
-//! The plan describes route identity and ordered same-model candidates without
-//! naming or invoking an executable endpoint. It remains the baseline shadow
-//! planner for every model and is also reused by Stack 6 after GLM's active
-//! canary has filtered its configured providers through one health snapshot.
+//! The plan describes route identity and ordered candidates without naming or
+//! invoking an executable endpoint. The same-public-model planner remains the
+//! deterministic inner decision; Stack 7 composes it with the narrow ordered
+//! Auto Powerful K3/K2.6 model policy after one health snapshot.
 
-use crate::inference::{InferenceIntent, RouteIdentity};
+use crate::inference::{InferenceIntent, ModelSelectionMode, RouteIdentity};
+use crate::model_config::{
+    models_are_auto_substitution_compatible, KIMI_K3_MODEL_ID, POWERFUL_MODEL_ID,
+};
 use crate::provider_registry::{
     ProviderId, ProviderRegistry, RouteSelectionSource, SHADOW_ROUTING_POLICY_VERSION,
 };
@@ -24,6 +27,7 @@ impl ProviderPreference {
         }
     }
 
+    #[cfg(test)]
     pub(crate) const fn default_provider(provider: ProviderId) -> Self {
         Self {
             provider,
@@ -109,6 +113,21 @@ pub(crate) enum CandidateScope {
     SamePublicModelOnly,
 }
 
+pub(crate) const AUTO_MODEL_ROUTING_POLICY_VERSION: &str = "routing-v2-auto-model-v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelCandidateScope {
+    PreferredPublicModelOnly,
+    CompatibleAutoModels,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelCandidatePlan {
+    pub(crate) public_model_ids: Vec<String>,
+    pub(crate) candidate_scope: ModelCandidateScope,
+    pub(crate) policy_version: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutePlan {
     pub(crate) selected: RouteIdentity,
@@ -127,6 +146,41 @@ pub(crate) enum RoutePlanningError {
 #[derive(Debug, Clone)]
 struct EligibleRoute {
     candidate: RouteCandidate,
+}
+
+/// Plans the ordered public-model candidates for one logical completion.
+///
+/// Only the original Auto selector can authorize a different public model.
+/// Stack 7 intentionally contains one compatible pair: paid Auto Powerful may
+/// move between Kimi K3 and Kimi K2.6. Auto Quick and every explicit request
+/// remain single-model plans.
+pub(crate) fn plan_completion_model_candidates(intent: &InferenceIntent) -> ModelCandidatePlan {
+    let mut public_model_ids = vec![intent.public_model_id.clone()];
+
+    if intent.selection_mode == ModelSelectionMode::AutoPowerful {
+        let alternate = match intent.public_model_id.as_str() {
+            KIMI_K3_MODEL_ID => Some(POWERFUL_MODEL_ID),
+            POWERFUL_MODEL_ID => Some(KIMI_K3_MODEL_ID),
+            _ => None,
+        };
+        if let Some(alternate) = alternate {
+            if intent.model_plan.allows_model(alternate)
+                && models_are_auto_substitution_compatible(&intent.public_model_id, alternate)
+            {
+                public_model_ids.push(alternate.to_string());
+            }
+        }
+    }
+
+    ModelCandidatePlan {
+        candidate_scope: if public_model_ids.len() > 1 {
+            ModelCandidateScope::CompatibleAutoModels
+        } else {
+            ModelCandidateScope::PreferredPublicModelOnly
+        },
+        public_model_ids,
+        policy_version: AUTO_MODEL_ROUTING_POLICY_VERSION,
+    }
 }
 
 pub(crate) fn plan_completion_route(
@@ -301,7 +355,10 @@ fn stable_account_bucket(account_uuid: uuid::Uuid) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_config::{ModelPlan, AUTO_POWERFUL_MODEL_ID, GLM_5_2_MODEL_ID};
+    use crate::model_config::{
+        ModelPlan, AUTO_POWERFUL_MODEL_ID, AUTO_QUICK_MODEL_ID, DEEPSEEK_V4_FLASH_MODEL_ID,
+        GLM_5_2_MODEL_ID, KIMI_K3_MODEL_ID, POWERFUL_MODEL_ID, QUICK_MODEL_ID,
+    };
     use crate::provider_registry::{ProviderId, PROVIDER_REGISTRY};
     use uuid::Uuid;
 
@@ -314,6 +371,71 @@ mod tests {
             crate::inference::InferenceSurface::Responses,
             crate::inference::WorkloadClass::Interactive,
         )
+    }
+
+    fn intent_for_plan(
+        requested_model: &str,
+        public_model: &str,
+        model_plan: ModelPlan,
+    ) -> InferenceIntent {
+        InferenceIntent::new(
+            Uuid::from_u128(73),
+            requested_model,
+            public_model,
+            model_plan,
+            crate::inference::InferenceSurface::Responses,
+            crate::inference::WorkloadClass::Interactive,
+        )
+    }
+
+    #[test]
+    fn auto_model_policy_changes_only_paid_powerful_between_the_agreed_kimi_pair() {
+        let cases = [
+            (
+                intent(AUTO_POWERFUL_MODEL_ID, KIMI_K3_MODEL_ID),
+                vec![KIMI_K3_MODEL_ID, POWERFUL_MODEL_ID],
+                ModelCandidateScope::CompatibleAutoModels,
+            ),
+            (
+                intent(AUTO_POWERFUL_MODEL_ID, POWERFUL_MODEL_ID),
+                vec![POWERFUL_MODEL_ID, KIMI_K3_MODEL_ID],
+                ModelCandidateScope::CompatibleAutoModels,
+            ),
+            (
+                intent(AUTO_QUICK_MODEL_ID, DEEPSEEK_V4_FLASH_MODEL_ID),
+                vec![DEEPSEEK_V4_FLASH_MODEL_ID],
+                ModelCandidateScope::PreferredPublicModelOnly,
+            ),
+            (
+                intent_for_plan(AUTO_QUICK_MODEL_ID, QUICK_MODEL_ID, ModelPlan::Free),
+                vec![QUICK_MODEL_ID],
+                ModelCandidateScope::PreferredPublicModelOnly,
+            ),
+            (
+                intent(KIMI_K3_MODEL_ID, KIMI_K3_MODEL_ID),
+                vec![KIMI_K3_MODEL_ID],
+                ModelCandidateScope::PreferredPublicModelOnly,
+            ),
+        ];
+
+        for (intent, expected, scope) in cases {
+            let plan = plan_completion_model_candidates(&intent);
+            assert_eq!(plan.public_model_ids, expected);
+            assert_eq!(plan.candidate_scope, scope);
+            assert_eq!(plan.policy_version, AUTO_MODEL_ROUTING_POLICY_VERSION);
+        }
+    }
+
+    #[test]
+    fn free_powerful_policy_never_adds_a_paid_alternate() {
+        let intent = intent_for_plan(AUTO_POWERFUL_MODEL_ID, POWERFUL_MODEL_ID, ModelPlan::Free);
+        let plan = plan_completion_model_candidates(&intent);
+
+        assert_eq!(plan.public_model_ids, vec![POWERFUL_MODEL_ID]);
+        assert_eq!(
+            plan.candidate_scope,
+            ModelCandidateScope::PreferredPublicModelOnly
+        );
     }
 
     #[test]

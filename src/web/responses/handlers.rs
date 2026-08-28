@@ -538,11 +538,12 @@ mod tests {
         finalize_first_model_tool_call, has_streamed_tool_call_entries, image_attachments,
         image_description_access, image_description_api_error,
         image_description_attempt_failure_class, maple_kagi_web_search_prompt,
-        model_turn_request_without_user_payload, resolve_responses_model,
-        resolve_responses_sampling, responses_pre_persistence_api_error, send_storage_message,
-        wait_for_response_cancellation, web_search_is_selected, web_search_tool_turn_limit,
-        web_search_tool_turn_limit_error, web_search_tool_turn_limit_reached, ClientResponseState,
-        ConversationParam, ImageAttachment, ImageDescriptionFailureClass, ImageDescriptionInput,
+        model_turn_request_without_user_payload, pin_responses_request_model,
+        resolve_responses_model, resolve_responses_sampling, responses_context_requires_rebuild,
+        responses_pre_persistence_api_error, send_storage_message, wait_for_response_cancellation,
+        web_search_is_selected, web_search_tool_turn_limit, web_search_tool_turn_limit_error,
+        web_search_tool_turn_limit_reached, ClientResponseState, ConversationParam,
+        ImageAttachment, ImageDescriptionFailureClass, ImageDescriptionInput,
         ImageDescriptionToolPair, InputMessage, MessageContent, MessageContentPart, MessageInput,
         PublicResponseFailure, ResponseExecutionPolicy, ResponsesCreateRequest, StorageMessage,
         StreamedToolCall, DEFAULT_RESPONSE_OUTPUT_TOKEN_BUDGET, MAX_RESPONSE_OUTPUT_TOKEN_BUDGET,
@@ -1051,6 +1052,40 @@ mod tests {
         );
         assert!(!serialized.contains("sensitive-image-bytes"));
         assert!(!serialized.contains("request metadata"));
+    }
+
+    #[test]
+    fn pinned_responses_model_drives_the_provider_body_and_model_defaults() {
+        let mut body = responses_request_for_model(crate::model_config::AUTO_POWERFUL_MODEL_ID);
+
+        pin_responses_request_model(&mut body, crate::model_config::POWERFUL_MODEL_ID);
+        let provider_body =
+            build_model_turn_request(&body, &[json!({"role": "user", "content": "hello"})], false);
+
+        assert_eq!(body.model, crate::model_config::POWERFUL_MODEL_ID);
+        assert_eq!(
+            provider_body["model"],
+            crate::model_config::POWERFUL_MODEL_ID
+        );
+        assert_eq!(
+            provider_body["chat_template_kwargs"]["preserve_thinking"],
+            true
+        );
+    }
+
+    #[test]
+    fn responses_context_rebuilds_for_images_or_auto_model_substitution() {
+        assert!(!responses_context_requires_rebuild(
+            "kimi-k3", "kimi-k3", false
+        ));
+        assert!(responses_context_requires_rebuild(
+            "kimi-k3", "kimi-k3", true
+        ));
+        assert!(responses_context_requires_rebuild(
+            "kimi-k3",
+            "kimi-k2-6",
+            false
+        ));
     }
 
     #[tokio::test]
@@ -1869,6 +1904,18 @@ fn model_turn_request_without_user_payload(
         metadata: None,
         stream: body.stream,
     }
+}
+
+fn pin_responses_request_model(body: &mut ResponsesCreateRequest, public_model_id: &str) {
+    body.model = public_model_id.to_string();
+}
+
+fn responses_context_requires_rebuild(
+    initially_resolved_model: &str,
+    pinned_model: &str,
+    completed_image_descriptions: bool,
+) -> bool {
+    completed_image_descriptions || pinned_model != initially_resolved_model
 }
 
 /// Immediate response returned when creating a new response
@@ -4525,7 +4572,8 @@ async fn create_response_stream(
             requested_model, resolved_model
         );
     }
-    body.model = resolved_model;
+    let initially_resolved_model = resolved_model;
+    body.model = initially_resolved_model.clone();
 
     trace!("Stream requested: {}", body.stream);
     let (input_kind, input_message_count) = match &body.input {
@@ -4579,9 +4627,33 @@ async fn create_response_stream(
         None => Vec::new(),
     };
 
-    // Rebuild with enough reserved room for the persisted descriptions so
-    // historical context can be truncated instead of rejecting a valid turn.
-    let context = if image_descriptions.is_empty() {
+    // Descriptor attempts are independent internal requests. Pin the user's
+    // main Responses route only after preprocessing so it observes the latest
+    // local routing state. Auto may select a different public model here; an
+    // explicit selection may only move between providers for the same model.
+    let inference_intent = InferenceIntent::new(
+        user.uuid,
+        requested_model,
+        initially_resolved_model.clone(),
+        model_plan,
+        InferenceSurface::Responses,
+        WorkloadClass::Interactive,
+    );
+    let pinned_completion = prepare_completion_request(&state, &user, inference_intent)
+        .await
+        .map_err(|error| {
+            responses_pre_persistence_api_error(error.into(), !image_descriptions.is_empty())
+        })?;
+    pin_responses_request_model(&mut body, pinned_completion.public_model_id());
+
+    // Rebuild for persisted descriptions and for Auto substitution so context
+    // truncation, tool-call normalization, billing, and model defaults all use
+    // the exact public model pinned for this logical request.
+    let context = if !responses_context_requires_rebuild(
+        &initially_resolved_model,
+        &body.model,
+        !image_descriptions.is_empty(),
+    ) {
         base_context
     } else {
         build_context_and_check_billing(
@@ -4595,23 +4667,6 @@ async fn create_response_stream(
         )
         .await?
     };
-
-    // Descriptor attempts are independent internal requests. Pin the user's
-    // main Responses route only after preprocessing so it observes the latest
-    // local routing state, then fail before persistence if no route is usable.
-    let inference_intent = InferenceIntent::new(
-        user.uuid,
-        requested_model,
-        body.model.clone(),
-        model_plan,
-        InferenceSurface::Responses,
-        WorkloadClass::Interactive,
-    );
-    let pinned_completion = prepare_completion_request(&state, &user, inference_intent)
-        .await
-        .map_err(|error| {
-            responses_pre_persistence_api_error(error.into(), !image_descriptions.is_empty())
-        })?;
 
     // Start only the first provider request before persistence. A recognized
     // capacity rejection at this seam proves that no response or user-message

@@ -41,6 +41,7 @@ impl SamplingConfig {
 #[derive(Debug, Clone, Copy)]
 struct ModelConfigEntry {
     id: &'static str,
+    #[cfg(test)]
     provider_id: &'static str,
     catalog_provider: &'static str,
     catalog_provider_id: &'static str,
@@ -174,6 +175,7 @@ impl ModelConfigEntry {
     ) -> Self {
         Self {
             id,
+            #[cfg(test)]
             provider_id: id,
             catalog_provider: "tinfoil",
             catalog_provider_id: id,
@@ -211,6 +213,7 @@ impl ModelConfigEntry {
     ) -> Self {
         Self {
             id,
+            #[cfg(test)]
             provider_id: id,
             catalog_provider: "tinfoil",
             catalog_provider_id: id,
@@ -246,6 +249,7 @@ impl ModelConfigEntry {
     ) -> Self {
         Self {
             id,
+            #[cfg(test)]
             provider_id: id,
             catalog_provider: "tinfoil",
             catalog_provider_id: id,
@@ -671,6 +675,7 @@ pub(crate) fn enabled_api_completion_model_ids() -> impl Iterator<Item = &'stati
         .map(|entry| entry.id)
 }
 
+#[cfg(test)]
 pub fn resolve_completion_model_id(model: &str) -> Option<&'static str> {
     let canonical = alias_target(model).unwrap_or(model);
     MODEL_CONFIGS
@@ -704,6 +709,36 @@ pub fn model_config(model: &str) -> ModelConfig {
 
 pub fn model_context_window(model: &str) -> usize {
     model_config(model).context_window
+}
+
+/// Returns whether `candidate` can safely replace `preferred` for an Auto
+/// request without narrowing the public capability contract.
+///
+/// Stack 7 deliberately keeps this strict: the substitute must be an enabled
+/// API completion model with the same access tier, capabilities, Responses
+/// behavior, and reasoning-history strategy, and it must not reduce the
+/// context window. A new model pair cannot enter the Auto policy merely by
+/// being added to the provider registry.
+pub(crate) fn models_are_auto_substitution_compatible(preferred: &str, candidate: &str) -> bool {
+    let Some(preferred) = model_entry(preferred) else {
+        return false;
+    };
+    let Some(candidate) = model_entry(candidate) else {
+        return false;
+    };
+
+    preferred.api_listed
+        && preferred.enabled
+        && preferred.capabilities.chat
+        && candidate.api_listed
+        && candidate.enabled
+        && candidate.capabilities.chat
+        && candidate.access == preferred.access
+        && candidate.capabilities == preferred.capabilities
+        && candidate.config.context_window >= preferred.config.context_window
+        && candidate.config.responses == preferred.config.responses
+        && model_reasoning_history_strategy(candidate.id)
+            == model_reasoning_history_strategy(preferred.id)
 }
 
 pub fn model_reasoning_history_strategy(model: &str) -> Option<ReasoningHistoryStrategy> {
@@ -929,6 +964,35 @@ mod tests {
             Some(ReasoningHistoryStrategy::GlmClearThinking)
         );
         assert_eq!(model_reasoning_history_strategy("gemma4-31b"), None);
+    }
+
+    #[test]
+    fn only_the_agreed_kimi_pair_is_auto_substitution_compatible() {
+        assert!(models_are_auto_substitution_compatible(
+            KIMI_K3_MODEL_ID,
+            POWERFUL_MODEL_ID
+        ));
+        assert!(models_are_auto_substitution_compatible(
+            POWERFUL_MODEL_ID,
+            KIMI_K3_MODEL_ID
+        ));
+
+        for candidate in [
+            GLM_5_2_MODEL_ID,
+            DEEPSEEK_V4_FLASH_MODEL_ID,
+            QUICK_MODEL_ID,
+            "gemma4-31b",
+            "llama3-3-70b",
+        ] {
+            assert!(
+                !models_are_auto_substitution_compatible(KIMI_K3_MODEL_ID, candidate),
+                "unexpected compatible Auto substitute: {candidate}"
+            );
+        }
+        assert!(!models_are_auto_substitution_compatible(
+            KIMI_K3_MODEL_ID,
+            "unknown-model"
+        ));
     }
 
     #[test]

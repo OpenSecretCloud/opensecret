@@ -1,8 +1,9 @@
 //! Credential-free provider topology for completion routing.
 //!
 //! This registry is intentionally independent from executable credentials.
-//! Stack 3 introduced it in shadow mode; Stack 6 consumes it for the explicit
-//! GLM same-model provider canary while other active routes remain unchanged.
+//! Stack 3 introduced it in shadow mode. Stack 6 activated same-public-model
+//! provider selection for GLM, and Stack 7 uses the same topology for
+//! health-aware singleton routing plus the narrow Auto Powerful K3/K2.6 pool.
 
 use crate::model_config::{
     DEEPSEEK_V4_FLASH_MODEL_ID, GLM_5_2_MODEL_ID, KIMI_K3_MODEL_ID, POWERFUL_MODEL_ID,

@@ -11,6 +11,7 @@ pub struct ProxyRouter {
     tinfoil_proxy: ProxyConfig,
 }
 
+#[cfg(test)]
 pub fn canonicalize_tinfoil_model(model: &str) -> String {
     match model {
         "whisper-large-v3-turbo" => "whisper-large-v3".to_string(),

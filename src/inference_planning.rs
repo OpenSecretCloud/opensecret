@@ -1,8 +1,9 @@
 //! Deterministic, credential-free completion route planning.
 //!
-//! The plan produced here is shadow-only. It describes route identity and
-//! ordered same-model candidates, but it cannot name or invoke an executable
-//! provider endpoint.
+//! The plan describes route identity and ordered same-model candidates without
+//! naming or invoking an executable endpoint. It remains the baseline shadow
+//! planner for every model and is also reused by Stack 6 after GLM's active
+//! canary has filtered its configured providers through one health snapshot.
 
 use crate::inference::{InferenceIntent, RouteIdentity};
 use crate::provider_registry::{

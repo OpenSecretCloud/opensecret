@@ -325,7 +325,14 @@ fn responses_pre_persistence_api_error(
         // Descriptor completions have already consumed provider capacity and
         // published usage. The conversation is still cleanly replayable, but
         // the whole HTTP request is not side-effect-free.
-        error.into_api_error()
+        let mut error = error.into_api_error();
+        if let ApiError::InferenceCapacity {
+            client_replay_safe, ..
+        } = &mut error
+        {
+            *client_replay_safe = false;
+        }
+        error
     } else {
         error.into_pre_persistence_api_error()
     }
@@ -601,6 +608,23 @@ mod tests {
                 } if client_replay_safe == expected_replay_safe
             ));
         }
+    }
+
+    #[test]
+    fn route_preparation_capacity_after_image_descriptions_is_not_replay_safe() {
+        let route_error = ApiError::InferenceCapacity {
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            retry_after: Some(Duration::from_secs(30)),
+            client_replay_safe: true,
+        };
+
+        assert!(matches!(
+            responses_pre_persistence_api_error(route_error.into(), true),
+            ApiError::InferenceCapacity {
+                client_replay_safe: false,
+                ..
+            }
+        ));
     }
 
     fn test_image_attachment() -> ImageAttachment {
@@ -4583,7 +4607,11 @@ async fn create_response_stream(
         InferenceSurface::Responses,
         WorkloadClass::Interactive,
     );
-    let pinned_completion = prepare_completion_request(&state, &user, inference_intent).await?;
+    let pinned_completion = prepare_completion_request(&state, &user, inference_intent)
+        .await
+        .map_err(|error| {
+            responses_pre_persistence_api_error(error.into(), !image_descriptions.is_empty())
+        })?;
 
     // Start only the first provider request before persistence. A recognized
     // capacity rejection at this seam proves that no response or user-message

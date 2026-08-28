@@ -1,7 +1,10 @@
 use crate::inference::health::{
-    ShadowHealthState, ShadowObservationMode, ShadowObservationReport, ShadowRouteSnapshot,
+    ShadowDisposition, ShadowHealthState, ShadowObservationMode, ShadowObservationReport,
+    ShadowRouteSnapshot, MIN_CAPACITY_COOLDOWN,
 };
-use crate::inference::{AttemptTerminal, InferenceIntent, RouteIdentity, RouteKey};
+use crate::inference::{
+    AttemptTerminal, InferenceIntent, ModelSelectionMode, RouteIdentity, RouteKey,
+};
 use crate::inference_planning::{
     plan_completion_route, ConfiguredProviders, ProviderPreference, RoutePlan, RoutePlanningError,
     RoutePlanningInput,
@@ -12,6 +15,7 @@ use crate::provider_registry::{
     ProviderId, ProviderRegistry, RouteSelectionSource, PROVIDER_REGISTRY,
 };
 use crate::proxy_config::{canonicalize_tinfoil_model, ProxyConfig, ProxyRouter};
+use std::time::Duration;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy)]
@@ -71,6 +75,10 @@ impl SelectedProviderRoute {
 pub(crate) enum ProviderRoutingError {
     UnsupportedModel(String),
     NoEligibleRoute(String),
+    CapacityUnavailable {
+        model: String,
+        retry_after: Duration,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +237,31 @@ impl ProviderRouter {
         self.fallback_completion_route(proxy_router, requested_model)
     }
 
+    /// Selects the route used by a newly prepared logical request.
+    ///
+    /// Stack 6 activates health filtering only for explicit GLM 5.2 requests.
+    /// Auto aliases and every other public model deliberately retain the legacy
+    /// route decision until their own rollout stack.
+    pub(crate) fn select_active_completion_route(
+        &self,
+        proxy_router: &ProxyRouter,
+        intent: &InferenceIntent,
+        provider_preference: Option<ProviderPreference>,
+    ) -> Result<SelectedProviderRoute, ProviderRoutingError> {
+        if intent.selection_mode == ModelSelectionMode::Explicit
+            && intent.public_model_id == GLM_5_2_MODEL_ID
+        {
+            return self.select_glm_canary_route(proxy_router, intent, provider_preference);
+        }
+
+        self.select_completion_route_with_preference(
+            proxy_router,
+            intent.account_uuid,
+            &intent.public_model_id,
+            provider_preference,
+        )
+    }
+
     pub(crate) fn shadow_completion_plan(
         &self,
         proxy_router: &ProxyRouter,
@@ -254,6 +287,110 @@ impl ProviderRouter {
                 provider_preference,
             },
         )
+    }
+
+    fn select_glm_canary_route(
+        &self,
+        proxy_router: &ProxyRouter,
+        intent: &InferenceIntent,
+        provider_preference: Option<ProviderPreference>,
+    ) -> Result<SelectedProviderRoute, ProviderRoutingError> {
+        let model = self
+            .registry
+            .completion_model(&intent.public_model_id)
+            .ok_or_else(|| {
+                ProviderRoutingError::UnsupportedModel(intent.public_model_id.clone())
+            })?;
+
+        let configured_routes = model
+            .routes
+            .iter()
+            .filter_map(|route| {
+                let provider = self.registry.provider(route.provider)?;
+                if !route.enabled
+                    || route.weight == 0
+                    || !provider.enabled
+                    || provider.weight == 0
+                    || proxy_for_provider(proxy_router, route.provider).is_none()
+                {
+                    return None;
+                }
+
+                Some((
+                    route.provider,
+                    RouteKey {
+                        provider: route.provider,
+                        provider_model_id: route.provider_model_id.to_string(),
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        if configured_routes.is_empty() {
+            return Err(ProviderRoutingError::NoEligibleRoute(
+                intent.public_model_id.clone(),
+            ));
+        }
+
+        let route_keys = configured_routes
+            .iter()
+            .map(|(_, route)| route.clone())
+            .collect::<Vec<_>>();
+        let snapshots = self
+            .shadow_health
+            .snapshot_routes(&route_keys)
+            .ok_or_else(|| ProviderRoutingError::CapacityUnavailable {
+                model: intent.public_model_id.clone(),
+                retry_after: MIN_CAPACITY_COOLDOWN,
+            })?;
+
+        let mut available_providers = ConfiguredProviders::none();
+        let mut earliest_recovery = None;
+        for ((provider, _), snapshot) in configured_routes.iter().zip(snapshots) {
+            match snapshot.effective {
+                ShadowDisposition::WouldOpen { remaining } => {
+                    let remaining = ceil_retry_after(remaining);
+                    earliest_recovery = Some(
+                        earliest_recovery
+                            .map_or(remaining, |current: Duration| current.min(remaining)),
+                    );
+                }
+                disposition if route_is_available_for_new_request(disposition) => {
+                    available_providers = available_providers.with_provider(*provider);
+                }
+                _ => unreachable!("WouldOpen is handled above"),
+            }
+        }
+
+        if available_providers == ConfiguredProviders::none() {
+            return Err(ProviderRoutingError::CapacityUnavailable {
+                model: intent.public_model_id.clone(),
+                retry_after: earliest_recovery.unwrap_or(MIN_CAPACITY_COOLDOWN),
+            });
+        }
+
+        let plan = plan_completion_route(
+            self.registry,
+            RoutePlanningInput {
+                intent,
+                configured_providers: available_providers,
+                provider_preference,
+            },
+        )
+        .map_err(provider_routing_error_from_plan)?;
+
+        let selected = plan.selected;
+        let proxy = proxy_for_provider(proxy_router, selected.provider)
+            .ok_or_else(|| ProviderRoutingError::NoEligibleRoute(intent.public_model_id.clone()))?;
+        Ok(SelectedProviderRoute {
+            provider: selected.provider,
+            proxy,
+            public_model_id: selected.public_model_id,
+            provider_model_id: selected.provider_model_id,
+            response_model_id: selected.response_model_id,
+            bucket: selected.bucket,
+            selection_source: selected.selection_source,
+        })
     }
 
     pub(crate) fn continuum_flag_key_for_completion_model(
@@ -422,6 +559,9 @@ pub(crate) fn compare_shadow_route(
         Err(ProviderRoutingError::NoEligibleRoute(_)) => {
             CredentialFreeRouteOutcome::NoEligibleRoute
         }
+        Err(ProviderRoutingError::CapacityUnavailable { .. }) => {
+            CredentialFreeRouteOutcome::NoEligibleRoute
+        }
     };
     let (shadow_outcome, decision, candidate_count) = match shadow {
         Ok(plan) => (
@@ -498,6 +638,27 @@ fn stable_account_bucket(account_uuid: Uuid) -> u8 {
     (u128::from_be_bytes(*account_uuid.as_bytes()) % 100) as u8
 }
 
+fn provider_routing_error_from_plan(error: RoutePlanningError) -> ProviderRoutingError {
+    match error {
+        RoutePlanningError::UnsupportedModel(model) => {
+            ProviderRoutingError::UnsupportedModel(model)
+        }
+        RoutePlanningError::NoEligibleRoute(model) => ProviderRoutingError::NoEligibleRoute(model),
+    }
+}
+
+fn ceil_retry_after(duration: Duration) -> Duration {
+    let seconds = duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0))
+        .max(1);
+    Duration::from_secs(seconds)
+}
+
+fn route_is_available_for_new_request(disposition: ShadowDisposition) -> bool {
+    !matches!(disposition, ShadowDisposition::WouldOpen { .. })
+}
+
 fn proxy_for_provider(proxy_router: &ProxyRouter, provider: ProviderId) -> Option<ProxyConfig> {
     match provider {
         ProviderId::Tinfoil => Some(proxy_router.get_tinfoil_proxy()),
@@ -535,6 +696,73 @@ mod tests {
 
     fn uuid_for_bucket(bucket: u8) -> Uuid {
         Uuid::from_u128(u128::from(bucket))
+    }
+
+    fn intent(requested_model: &str, public_model: &str) -> InferenceIntent {
+        InferenceIntent::new(
+            uuid_for_bucket(73),
+            requested_model,
+            public_model,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        )
+    }
+
+    fn capacity_terminal(
+        provider: ProviderId,
+        public_model: &str,
+        provider_model: &str,
+        status: u16,
+        retry_after: Duration,
+    ) -> AttemptTerminal {
+        let mut failure = AttemptFailure::new(
+            AttemptFailureKind::CapacityRejected,
+            AttemptStage::AwaitingResponse,
+            ReplaySafety::ProvenPreAcceptance,
+        );
+        failure.status = Some(status);
+        failure.retry_after = Some(retry_after);
+        let route = RouteIdentity::new(
+            provider,
+            public_model,
+            provider_model,
+            public_model,
+            RouteSelectionSource::DefaultProvider,
+            None,
+        );
+        AttemptTerminal::Failed {
+            attempt: intent(public_model, public_model)
+                .begin_execution()
+                .begin_attempt(route),
+            failure,
+        }
+    }
+
+    fn route_failure_terminal(
+        provider: ProviderId,
+        public_model: &str,
+        provider_model: &str,
+    ) -> AttemptTerminal {
+        let failure = AttemptFailure::new(
+            AttemptFailureKind::StreamTimeout,
+            AttemptStage::Stream,
+            ReplaySafety::NotProvenPreAcceptance,
+        );
+        let route = RouteIdentity::new(
+            provider,
+            public_model,
+            provider_model,
+            public_model,
+            RouteSelectionSource::DefaultProvider,
+            None,
+        );
+        AttemptTerminal::Failed {
+            attempt: intent(public_model, public_model)
+                .begin_execution()
+                .begin_attempt(route),
+            failure,
+        }
     }
 
     #[test]
@@ -861,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn hypothetical_open_capacity_never_changes_active_or_shadow_route_selection() {
+    fn legacy_selector_and_baseline_planner_remain_health_independent() {
         let router = ProviderRouter::default();
         let proxy_router = proxy_router_with_both_providers();
         let account_uuid = uuid_for_bucket(73);
@@ -924,6 +1152,273 @@ mod tests {
             compare_shadow_route(&Ok(active_after), &Ok(shadow_after)),
             ShadowRouteComparison::Match { .. }
         ));
+    }
+
+    #[test]
+    fn active_glm_canary_preserves_healthy_preferences_and_canonical_identity() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+        let intent = intent(GLM_5_2_MODEL_ID, GLM_5_2_MODEL_ID);
+
+        let cases = [
+            (
+                None,
+                ProviderId::Tinfoil,
+                GLM_5_2_MODEL_ID,
+                RouteSelectionSource::DefaultProvider,
+            ),
+            (
+                Some(ProviderPreference::feature_flag(ProviderId::Tinfoil)),
+                ProviderId::Tinfoil,
+                GLM_5_2_MODEL_ID,
+                RouteSelectionSource::FeatureFlag,
+            ),
+            (
+                Some(ProviderPreference::feature_flag(ProviderId::Continuum)),
+                ProviderId::Continuum,
+                "glm-5.2",
+                RouteSelectionSource::FeatureFlag,
+            ),
+        ];
+
+        for (preference, provider, provider_model, source) in cases {
+            let selected = router
+                .select_active_completion_route(&proxy_router, &intent, preference)
+                .expect("healthy GLM route");
+            assert_eq!(selected.provider, provider);
+            assert_eq!(selected.provider_model_id, provider_model);
+            assert_eq!(selected.public_model_id, GLM_5_2_MODEL_ID);
+            assert_eq!(selected.response_model_id, GLM_5_2_MODEL_ID);
+            assert_eq!(selected.selection_source, source);
+        }
+    }
+
+    #[test]
+    fn active_glm_canary_switches_only_new_requests_to_same_model_alternate() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+        let intent = intent(GLM_5_2_MODEL_ID, GLM_5_2_MODEL_ID);
+
+        let pinned_before_failure = router
+            .select_active_completion_route(&proxy_router, &intent, None)
+            .expect("initial Tinfoil route");
+        assert_eq!(pinned_before_failure.provider, ProviderId::Tinfoil);
+
+        router.observe_attempt_terminal(
+            &capacity_terminal(
+                ProviderId::Tinfoil,
+                GLM_5_2_MODEL_ID,
+                GLM_5_2_MODEL_ID,
+                429,
+                Duration::from_secs(60),
+            ),
+            ShadowObservationMode::Update,
+        );
+
+        // The previously returned pin is immutable; only a fresh preparation
+        // observes the newly opened circuit.
+        assert_eq!(pinned_before_failure.provider, ProviderId::Tinfoil);
+        assert_eq!(pinned_before_failure.provider_model_id, GLM_5_2_MODEL_ID);
+
+        let selected_after_failure = router
+            .select_active_completion_route(&proxy_router, &intent, None)
+            .expect("Continuum GLM fallback");
+        assert_eq!(selected_after_failure.provider, ProviderId::Continuum);
+        assert_eq!(selected_after_failure.provider_model_id, "glm-5.2");
+        assert_eq!(selected_after_failure.public_model_id, GLM_5_2_MODEL_ID);
+        assert_eq!(
+            selected_after_failure.selection_source,
+            RouteSelectionSource::Fallback
+        );
+    }
+
+    #[test]
+    fn active_glm_canary_bypasses_an_open_feature_flag_preference() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+        let intent = intent(GLM_5_2_MODEL_ID, GLM_5_2_MODEL_ID);
+
+        router.observe_attempt_terminal(
+            &capacity_terminal(
+                ProviderId::Continuum,
+                GLM_5_2_MODEL_ID,
+                "glm-5.2",
+                503,
+                Duration::from_secs(60),
+            ),
+            ShadowObservationMode::Update,
+        );
+
+        let selected = router
+            .select_active_completion_route(
+                &proxy_router,
+                &intent,
+                Some(ProviderPreference::feature_flag(ProviderId::Continuum)),
+            )
+            .expect("Tinfoil GLM fallback");
+        assert_eq!(selected.provider, ProviderId::Tinfoil);
+        assert_eq!(selected.provider_model_id, GLM_5_2_MODEL_ID);
+        assert_eq!(selected.selection_source, RouteSelectionSource::Fallback);
+    }
+
+    #[test]
+    fn active_glm_canary_returns_typed_capacity_when_every_configured_route_is_open() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+        let intent = intent(GLM_5_2_MODEL_ID, GLM_5_2_MODEL_ID);
+
+        for terminal in [
+            capacity_terminal(
+                ProviderId::Tinfoil,
+                GLM_5_2_MODEL_ID,
+                GLM_5_2_MODEL_ID,
+                429,
+                Duration::from_secs(40),
+            ),
+            capacity_terminal(
+                ProviderId::Continuum,
+                GLM_5_2_MODEL_ID,
+                "glm-5.2",
+                529,
+                Duration::from_secs(10),
+            ),
+        ] {
+            router.observe_attempt_terminal(&terminal, ShadowObservationMode::Update);
+        }
+
+        let error = router
+            .select_active_completion_route(&proxy_router, &intent, None)
+            .expect_err("both GLM routes are open");
+        match error {
+            ProviderRoutingError::CapacityUnavailable { model, retry_after } => {
+                assert_eq!(model, GLM_5_2_MODEL_ID);
+                assert_eq!(retry_after, Duration::from_secs(30));
+            }
+            other => panic!("unexpected route error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn active_glm_canary_uses_route_failure_threshold_but_not_watch_state() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+        let intent = intent(GLM_5_2_MODEL_ID, GLM_5_2_MODEL_ID);
+        let failure =
+            || route_failure_terminal(ProviderId::Tinfoil, GLM_5_2_MODEL_ID, GLM_5_2_MODEL_ID);
+
+        for observed_failures in 1..=3 {
+            router.observe_attempt_terminal(&failure(), ShadowObservationMode::Update);
+            let selected = router
+                .select_active_completion_route(&proxy_router, &intent, None)
+                .expect("GLM route");
+            let expected = if observed_failures < 3 {
+                ProviderId::Tinfoil
+            } else {
+                ProviderId::Continuum
+            };
+            assert_eq!(selected.provider, expected, "failure {observed_failures}");
+        }
+    }
+
+    #[test]
+    fn active_glm_canary_consumes_continuum_account_429_without_changing_kimi_routing() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+        router.observe_attempt_terminal(
+            &capacity_terminal(
+                ProviderId::Continuum,
+                POWERFUL_MODEL_ID,
+                "kimi-k2.6",
+                429,
+                Duration::from_secs(60),
+            ),
+            ShadowObservationMode::Update,
+        );
+
+        let glm = router
+            .select_active_completion_route(
+                &proxy_router,
+                &intent(GLM_5_2_MODEL_ID, GLM_5_2_MODEL_ID),
+                Some(ProviderPreference::feature_flag(ProviderId::Continuum)),
+            )
+            .expect("Tinfoil GLM after Continuum account limit");
+        assert_eq!(glm.provider, ProviderId::Tinfoil);
+
+        let kimi = router
+            .select_active_completion_route(
+                &proxy_router,
+                &intent(POWERFUL_MODEL_ID, POWERFUL_MODEL_ID),
+                None,
+            )
+            .expect("Kimi remains on its legacy route in Stack 6");
+        assert_eq!(kimi.provider, ProviderId::Continuum);
+        assert_eq!(kimi.provider_model_id, "kimi-k2.6");
+    }
+
+    #[test]
+    fn active_glm_health_filter_is_inert_for_auto_and_other_models() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+        router.observe_attempt_terminal(
+            &capacity_terminal(
+                ProviderId::Tinfoil,
+                GLM_5_2_MODEL_ID,
+                GLM_5_2_MODEL_ID,
+                429,
+                Duration::from_secs(60),
+            ),
+            ShadowObservationMode::Update,
+        );
+
+        let synthetic_auto_glm = intent(AUTO_POWERFUL_MODEL_ID, GLM_5_2_MODEL_ID);
+        let auto_route = router
+            .select_active_completion_route(&proxy_router, &synthetic_auto_glm, None)
+            .expect("Auto stays on legacy selection until Stack 7");
+        assert_eq!(auto_route.provider, ProviderId::Tinfoil);
+
+        for (requested, public, expected_provider) in [
+            (KIMI_K3_MODEL_ID, KIMI_K3_MODEL_ID, ProviderId::Tinfoil),
+            (POWERFUL_MODEL_ID, POWERFUL_MODEL_ID, ProviderId::Continuum),
+            (QUICK_MODEL_ID, QUICK_MODEL_ID, ProviderId::Tinfoil),
+        ] {
+            let selected = router
+                .select_active_completion_route(&proxy_router, &intent(requested, public), None)
+                .expect("non-canary route");
+            assert_eq!(selected.provider, expected_provider, "{requested}");
+        }
+    }
+
+    #[test]
+    fn only_would_open_blocks_a_new_canary_request() {
+        assert!(route_is_available_for_new_request(
+            ShadowDisposition::Healthy
+        ));
+        assert!(route_is_available_for_new_request(
+            ShadowDisposition::Watch {
+                consecutive_failures: 2
+            }
+        ));
+        assert!(route_is_available_for_new_request(
+            ShadowDisposition::WouldProbe
+        ));
+        assert!(!route_is_available_for_new_request(
+            ShadowDisposition::WouldOpen {
+                remaining: Duration::from_secs(1)
+            }
+        ));
+    }
+
+    #[test]
+    fn retry_after_rounds_up_and_never_returns_zero() {
+        assert_eq!(ceil_retry_after(Duration::ZERO), Duration::from_secs(1));
+        assert_eq!(
+            ceil_retry_after(Duration::from_nanos(1)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            ceil_retry_after(Duration::from_millis(1_001)),
+            Duration::from_secs(2)
+        );
     }
 
     #[test]

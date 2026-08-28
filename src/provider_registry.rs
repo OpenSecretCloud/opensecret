@@ -1,8 +1,8 @@
 //! Credential-free provider topology for completion routing.
 //!
-//! This registry is intentionally independent from the legacy execution
-//! router. Stack 3 exercises it in shadow mode so the topology and planner can
-//! be validated before either is allowed to select an executable proxy.
+//! This registry is intentionally independent from executable credentials.
+//! Stack 3 introduced it in shadow mode; Stack 6 consumes it for the explicit
+//! GLM same-model provider canary while other active routes remain unchanged.
 
 use crate::model_config::{
     DEEPSEEK_V4_FLASH_MODEL_ID, GLM_5_2_MODEL_ID, KIMI_K3_MODEL_ID, POWERFUL_MODEL_ID,

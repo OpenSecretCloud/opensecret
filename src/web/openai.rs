@@ -1459,7 +1459,7 @@ async fn proxy_openai(
         &pinned_completion,
     )
     .await
-    .map_err(CompletionExecutionError::into_api_error)?;
+    .map_err(CompletionExecutionError::into_pre_persistence_api_error)?;
 
     debug!(
         "Received completion stream: request_id={}, execution_id={}, attempt_id={}, provider={}, streaming={}",
@@ -3757,6 +3757,36 @@ mod tests {
                 }
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn pre_persistence_capacity_failure_marks_client_replay_safe() {
+        let provider_error = ProviderRequestError::Upstream(UpstreamProviderError {
+            status: 429,
+            retry_after: Some(Duration::from_secs(7)),
+            upstream_request_id: None,
+        });
+        let failure = attempt_failure_from_provider_error(&provider_error);
+        let pinned = pinned_test_completion();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let response = failed_completion_execution(
+            attempt,
+            failure.clone(),
+            public_completion_error(&provider_error, &failure),
+        )
+        .into_pre_persistence_api_error()
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[crate::CLIENT_REPLAY_HEADER], "safe");
+        assert_eq!(response.headers()[crate::ERROR_CONTRACT_HEADER], "1");
+        assert_eq!(
+            response.headers()[crate::ERROR_CODE_HEADER],
+            crate::INFERENCE_CAPACITY_ERROR_CODE
+        );
+        assert_eq!(response.headers()[header::RETRY_AFTER], "7");
     }
 
     #[tokio::test]

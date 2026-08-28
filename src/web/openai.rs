@@ -1,3 +1,8 @@
+use crate::inference::{
+    AttemptFailure, AttemptFailureKind, AttemptOutcome, AttemptStage, AttemptTerminal,
+    CompletionEvidence, InferenceAttempt, InferenceExecution, InferenceIntent, InferenceSurface,
+    ReplaySafety, WorkloadClass,
+};
 use crate::model_config::{
     model_alias_requires_flag_lookup, model_catalog_response, openai_models_response,
     ModelAliasTargets, ModelPlan,
@@ -8,9 +13,12 @@ use crate::provider_cache::{
     derive_tinfoil_cache_namespace, CacheNamespaceRoot, DerivedCacheNamespace,
 };
 use crate::provider_client::{
-    ProviderClient, ProviderRequest, ProviderRequestError, ProviderResponse,
+    ProviderClient, ProviderRequest, ProviderRequestError, ProviderResponse, ProviderSendTrace,
+    UpstreamProviderError,
 };
-use crate::provider_routing::{InferenceRoutingMode, ProviderName, ProviderRoutingError};
+use crate::provider_routing::{
+    InferenceRoutingMode, ProviderName, ProviderRoutingError, SelectedProviderRoute,
+};
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
@@ -20,7 +28,7 @@ use crate::web::encryption_middleware::{
 use crate::web::openai_auth::AuthMethod;
 use crate::web::responses::{ResponseExecution, ResponseExecutionTaskGuard};
 use crate::{ApiError, AppState};
-use axum::http::{header, HeaderMap};
+use axum::http::{header, HeaderMap, HeaderName};
 use axum::{
     body::Body,
     extract::State,
@@ -584,6 +592,18 @@ impl<'a> CompletionExecutionContext<'a> {
         }
     }
 
+    pub(crate) fn for_pinned(
+        billing: BillingContext,
+        pinned: &PinnedCompletionRequest,
+        cache: &'a CompletionCachePolicy,
+    ) -> Self {
+        Self::new(
+            billing,
+            InferenceRoutingContext::new(pinned.intent.model_plan, pinned.routing_mode()),
+            cache,
+        )
+    }
+
     fn with_response_execution(
         mut self,
         response_execution: ResponseExecution,
@@ -661,6 +681,7 @@ impl CompletionUsageObservation {
 enum StreamUsageFinalization {
     ProviderDone,
     EndOfStream,
+    ProviderError,
     TransportError,
     Timeout,
     ConsumerDropped,
@@ -757,10 +778,8 @@ pub enum CompletionChunk {
     FullResponse(Value),
     /// Usage information (for streaming with include_usage)
     Usage(CompletionUsage),
-    /// Stream finished
-    Done,
-    /// Stream error occurred
-    Error(String),
+    /// Exactly one typed terminal outcome for the upstream attempt.
+    Terminal(AttemptTerminal),
 }
 
 /// Metadata about the completion
@@ -769,6 +788,7 @@ pub struct CompletionMetadata {
     pub provider_name: String,
     pub model_name: String,
     pub is_streaming: bool,
+    pub(crate) attempt: InferenceAttempt,
 }
 
 /// Processed completion stream - billing happens automatically
@@ -779,8 +799,586 @@ pub struct CompletionStream {
     pub metadata: CompletionMetadata,
 }
 
-async fn finalize_stream_usage(
+#[derive(Debug, Clone)]
+pub(crate) struct PinnedCompletionRequest {
+    intent: InferenceIntent,
+    route: SelectedProviderRoute,
+    routing_mode: InferenceRoutingMode,
+}
+
+impl PinnedCompletionRequest {
+    pub(crate) fn intent(&self) -> &InferenceIntent {
+        &self.intent
+    }
+
+    pub(crate) const fn routing_mode(&self) -> InferenceRoutingMode {
+        self.routing_mode
+    }
+
+    fn begin_execution(&self) -> InferenceExecution {
+        self.intent.begin_execution()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum CompletionExecutionError {
+    Request(ApiError),
+    Attempt {
+        terminal: AttemptTerminal,
+        public_error: ApiError,
+    },
+}
+
+impl CompletionExecutionError {
+    pub(crate) fn terminal(&self) -> Option<&AttemptTerminal> {
+        match self {
+            Self::Request(_) => None,
+            Self::Attempt { terminal, .. } => Some(terminal),
+        }
+    }
+
+    pub(crate) fn into_api_error(self) -> ApiError {
+        let has_terminal = self.terminal().is_some();
+        match self {
+            Self::Request(error) => {
+                debug_assert!(!has_terminal);
+                error
+            }
+            Self::Attempt { public_error, .. } => {
+                debug_assert!(has_terminal);
+                public_error
+            }
+        }
+    }
+}
+
+impl From<ApiError> for CompletionExecutionError {
+    fn from(error: ApiError) -> Self {
+        Self::Request(error)
+    }
+}
+
+fn failed_completion_execution(
+    attempt: InferenceAttempt,
+    failure: AttemptFailure,
+    public_error: ApiError,
+) -> CompletionExecutionError {
+    let terminal = AttemptTerminal::Failed { attempt, failure };
+    record_attempt_outcome(&AttemptOutcome::Terminal(terminal.clone()));
+    CompletionExecutionError::Attempt {
+        terminal,
+        public_error,
+    }
+}
+
+/// Ensures cancellation or panic cannot make an in-flight attempt disappear
+/// from the typed terminal stream. Later routing layers may attach health
+/// observation to the same lifecycle without changing its exactly-once shape.
+struct AttemptTerminalGuard {
+    attempt: InferenceAttempt,
+    stage: AttemptStage,
+    armed: bool,
+}
+
+impl AttemptTerminalGuard {
+    fn new(attempt: InferenceAttempt, stage: AttemptStage) -> Self {
+        Self {
+            attempt,
+            stage,
+            armed: true,
+        }
+    }
+
+    fn set_stage(&mut self, stage: AttemptStage) {
+        self.stage = stage;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn record_terminal(&mut self, terminal: &AttemptTerminal) {
+        debug_assert_eq!(terminal.attempt(), &self.attempt);
+        record_attempt_outcome(&AttemptOutcome::Terminal(terminal.clone()));
+        self.disarm();
+    }
+
+    fn cancellation_terminal(&self) -> AttemptTerminal {
+        AttemptTerminal::Failed {
+            attempt: self.attempt.clone(),
+            failure: AttemptFailure::new(
+                AttemptFailureKind::ConsumerDropped,
+                self.stage,
+                ReplaySafety::NotProvenPreAcceptance,
+            ),
+        }
+    }
+}
+
+impl Drop for AttemptTerminalGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let terminal = self.cancellation_terminal();
+        record_attempt_outcome(&AttemptOutcome::Terminal(terminal));
+        warn!(
+            "Inference attempt abandoned before terminal processing: request_id={}, execution_id={}, attempt_id={}, stage={:?}",
+            self.attempt.request_id,
+            self.attempt.execution_id,
+            self.attempt.attempt_id,
+            self.stage
+        );
+    }
+}
+
+fn attempt_failure_from_provider_error(error: &ProviderRequestError) -> AttemptFailure {
+    match error {
+        ProviderRequestError::TinfoilUnavailable => AttemptFailure::new(
+            AttemptFailureKind::ProviderUnavailable,
+            AttemptStage::BeforeSend,
+            ReplaySafety::ProvenPreAcceptance,
+        ),
+        ProviderRequestError::Build(_) => AttemptFailure::new(
+            AttemptFailureKind::RequestBuild,
+            AttemptStage::BeforeSend,
+            ReplaySafety::ProvenPreAcceptance,
+        ),
+        ProviderRequestError::Connect(_) => AttemptFailure::new(
+            AttemptFailureKind::Connect,
+            AttemptStage::BeforeSend,
+            ReplaySafety::ProvenPreAcceptance,
+        ),
+        ProviderRequestError::Timeout(_) => AttemptFailure::new(
+            AttemptFailureKind::ResponseStartTimeout,
+            AttemptStage::AwaitingResponse,
+            ReplaySafety::NotProvenPreAcceptance,
+        ),
+        ProviderRequestError::Send(_) => AttemptFailure::new(
+            AttemptFailureKind::Transport,
+            AttemptStage::AwaitingResponse,
+            ReplaySafety::NotProvenPreAcceptance,
+        ),
+        ProviderRequestError::Upstream(upstream) => AttemptFailure::new(
+            AttemptFailureKind::HttpStatus,
+            AttemptStage::AwaitingResponse,
+            ReplaySafety::NotProvenPreAcceptance,
+        )
+        .with_upstream_response(
+            upstream.status,
+            upstream.retry_after,
+            upstream.upstream_request_id.clone(),
+        ),
+    }
+}
+
+fn terminalize_recovered_provider_failures(
+    execution: InferenceExecution,
+    route: &crate::inference::RouteIdentity,
+    prior_failures: Vec<ProviderRequestError>,
+) -> Vec<AttemptTerminal> {
+    prior_failures
+        .into_iter()
+        .map(|prior_error| {
+            let attempt = execution.begin_attempt(route.clone());
+            let failure = attempt_failure_from_provider_error(&prior_error);
+            let terminal = AttemptTerminal::Failed {
+                attempt: attempt.clone(),
+                failure: failure.clone(),
+            };
+            record_attempt_outcome(&AttemptOutcome::Terminal(terminal.clone()));
+            warn!(
+                "Inference transport recovered a failed attempt: request_id={}, execution_id={}, attempt_id={}, kind={:?}, replay_safety={:?}",
+                attempt.request_id,
+                attempt.execution_id,
+                attempt.attempt_id,
+                failure.kind,
+                failure.replay_safety
+            );
+            terminal
+        })
+        .collect()
+}
+
+fn record_attempt_outcome(outcome: &AttemptOutcome) {
+    match outcome {
+        AttemptOutcome::ResponseStarted { attempt, status } => {
+            let route_key = attempt.route.route_key();
+            debug!(
+                "Inference attempt response started: request_id={}, execution_id={}, attempt_id={}, provider={}, public_model={}, provider_model={}, response_model={}, route_provider={}, route_model={}, source={:?}, bucket={:?}, status={}",
+                attempt.request_id,
+                attempt.execution_id,
+                attempt.attempt_id,
+                attempt.route.provider.as_str(),
+                attempt.route.public_model_id,
+                attempt.route.provider_model_id,
+                attempt.route.response_model_id,
+                route_key.provider.as_str(),
+                route_key.provider_model_id,
+                attempt.route.selection_source,
+                attempt.route.bucket,
+                status
+            );
+        }
+        AttemptOutcome::Terminal(terminal) => {
+            let attempt = terminal.attempt();
+            match terminal {
+                AttemptTerminal::Completed { evidence, .. } => debug!(
+                    "Inference attempt completed: request_id={}, execution_id={}, attempt_id={}, provider={}, public_model={}, provider_model={}, evidence={:?}",
+                    attempt.request_id,
+                    attempt.execution_id,
+                    attempt.attempt_id,
+                    attempt.route.provider.as_str(),
+                    attempt.route.public_model_id,
+                    attempt.route.provider_model_id,
+                    evidence
+                ),
+                AttemptTerminal::Failed { failure, .. } => warn!(
+                    "Inference attempt failed: request_id={}, execution_id={}, attempt_id={}, provider={}, public_model={}, provider_model={}, kind={:?}, stage={:?}, replay_safety={:?}, status={:?}, retry_after_ms={:?}, upstream_request_id={:?}, upstream_code={:?}",
+                    attempt.request_id,
+                    attempt.execution_id,
+                    attempt.attempt_id,
+                    attempt.route.provider.as_str(),
+                    attempt.route.public_model_id,
+                    attempt.route.provider_model_id,
+                    failure.kind,
+                    failure.stage,
+                    failure.replay_safety,
+                    failure.status,
+                    failure.retry_after.map(|duration| duration.as_millis()),
+                    failure.upstream_request_id,
+                    failure.upstream_code
+                ),
+            }
+        }
+    }
+}
+
+fn stream_end_terminal(
+    attempt: InferenceAttempt,
+    saw_finish_signal: bool,
+    has_incomplete_frame: bool,
+    require_provider_done: bool,
+) -> AttemptTerminal {
+    if !require_provider_done && saw_finish_signal && !has_incomplete_frame {
+        AttemptTerminal::Completed {
+            attempt,
+            evidence: CompletionEvidence::FinishSignalThenEof,
+        }
+    } else {
+        AttemptTerminal::Failed {
+            attempt,
+            failure: AttemptFailure::new(
+                AttemptFailureKind::UnexpectedEof,
+                AttemptStage::Stream,
+                ReplaySafety::NotProvenPreAcceptance,
+            ),
+        }
+    }
+}
+
+struct StreamProcessResult {
+    terminal: AttemptTerminal,
+    finalization: StreamUsageFinalization,
+    usage: Option<CompletionUsage>,
+}
+
+fn finish_stream_processing(
     accumulator: &mut StreamUsageAccumulator,
+    finalization: StreamUsageFinalization,
+    terminal: AttemptTerminal,
+) -> StreamProcessResult {
+    StreamProcessResult {
+        terminal,
+        finalization,
+        usage: accumulator.take_final_usage(finalization),
+    }
+}
+
+fn bounded_upstream_error_code(error: &Value) -> Option<String> {
+    let code = error.get("code")?;
+    let code = match code {
+        Value::String(code) => code.clone(),
+        Value::Number(code) => code.to_string(),
+        _ => return None,
+    };
+    let code = code.trim();
+    (!code.is_empty() && code.len() <= 64 && code.chars().all(is_safe_identifier_char))
+        .then(|| code.to_string())
+}
+
+fn upstream_payload_failure(
+    json: &Value,
+    kind: AttemptFailureKind,
+    stage: AttemptStage,
+) -> Option<AttemptFailure> {
+    let error = json.get("error").filter(|error| !error.is_null())?;
+    Some(
+        AttemptFailure::new(kind, stage, ReplaySafety::NotProvenPreAcceptance)
+            .with_upstream_code(bounded_upstream_error_code(error)),
+    )
+}
+
+fn upstream_stream_failure(json: &Value) -> Option<AttemptFailure> {
+    upstream_payload_failure(
+        json,
+        AttemptFailureKind::UpstreamStreamError,
+        AttemptStage::Stream,
+    )
+}
+
+async fn read_non_streaming_completion_response(
+    response: ProviderResponse,
+    response_model_id: &str,
+    attempt: &InferenceAttempt,
+    body_limit: Option<usize>,
+) -> Result<Value, AttemptFailure> {
+    let body_bytes = match body_limit {
+        Some(limit_bytes) => bytes::Bytes::from(
+            collect_bounded_provider_response_body(response.bytes_stream(), limit_bytes)
+                .await
+                .map_err(|error| {
+                    error!(
+                        "Failed to read bounded inference response body: request_id={}, execution_id={}, attempt_id={}, error={}",
+                        attempt.request_id, attempt.execution_id, attempt.attempt_id, error
+                    );
+                    let kind = match error {
+                        BoundedProviderResponseBodyError::Read => {
+                            AttemptFailureKind::ResponseBody
+                        }
+                        BoundedProviderResponseBodyError::TooLarge { .. } => {
+                            AttemptFailureKind::InvalidResponse
+                        }
+                    };
+                    AttemptFailure::new(
+                        kind,
+                        AttemptStage::ResponseBody,
+                        ReplaySafety::NotProvenPreAcceptance,
+                    )
+                })?,
+        ),
+        None => response.bytes().await.map_err(|error| {
+            error!(
+                "Failed to read inference response body: request_id={}, execution_id={}, attempt_id={}, error={}",
+                attempt.request_id, attempt.execution_id, attempt.attempt_id, error
+            );
+            AttemptFailure::new(
+                AttemptFailureKind::ResponseBody,
+                AttemptStage::ResponseBody,
+                ReplaySafety::NotProvenPreAcceptance,
+            )
+        })?,
+    };
+
+    let mut response_json: Value = serde_json::from_slice(&body_bytes).map_err(|error| {
+        error!(
+            "Failed to parse inference response JSON: request_id={}, execution_id={}, attempt_id={}, error={}",
+            attempt.request_id, attempt.execution_id, attempt.attempt_id, error
+        );
+        AttemptFailure::new(
+            AttemptFailureKind::InvalidResponse,
+            AttemptStage::ResponseBody,
+            ReplaySafety::NotProvenPreAcceptance,
+        )
+    })?;
+
+    if let Some(failure) = upstream_payload_failure(
+        &response_json,
+        AttemptFailureKind::UpstreamResponseError,
+        AttemptStage::ResponseBody,
+    ) {
+        warn!(
+            "Inference provider emitted a non-streaming error payload: request_id={}, execution_id={}, attempt_id={}, upstream_code={:?}",
+            attempt.request_id,
+            attempt.execution_id,
+            attempt.attempt_id,
+            failure.upstream_code
+        );
+        return Err(failure);
+    }
+
+    canonicalize_response_model(&mut response_json, response_model_id);
+    Ok(response_json)
+}
+
+async fn process_completion_stream(
+    response: ProviderResponse,
+    response_model_id: &str,
+    attempt: InferenceAttempt,
+    tx_consumer: &mpsc::Sender<CompletionChunk>,
+    chunk_timeout: Duration,
+    response_execution: Option<&ResponseExecution>,
+    require_provider_done: bool,
+) -> StreamProcessResult {
+    let mut body_stream = response.bytes_stream();
+    let mut buffer = Vec::new();
+    let mut usage_accumulator = StreamUsageAccumulator::default();
+
+    loop {
+        let next_chunk = timeout(chunk_timeout, body_stream.next());
+        tokio::pin!(next_chunk);
+        let next_chunk = if let Some(execution) = response_execution {
+            tokio::select! {
+                biased;
+                _ = execution.cancelled() => {
+                    return finish_stream_processing(
+                        &mut usage_accumulator,
+                        StreamUsageFinalization::ConsumerDropped,
+                        AttemptTerminal::Failed {
+                            attempt,
+                            failure: AttemptFailure::new(
+                                AttemptFailureKind::ConsumerDropped,
+                                AttemptStage::Stream,
+                                ReplaySafety::NotProvenPreAcceptance,
+                            ),
+                        },
+                    );
+                }
+                result = &mut next_chunk => result,
+            }
+        } else {
+            next_chunk.await
+        };
+
+        match next_chunk {
+            Ok(Some(Ok(bytes))) => {
+                buffer.extend_from_slice(bytes.as_ref());
+
+                while let Some(frame) = extract_sse_frame(&mut buffer) {
+                    if frame == b"[DONE]" {
+                        return finish_stream_processing(
+                            &mut usage_accumulator,
+                            StreamUsageFinalization::ProviderDone,
+                            AttemptTerminal::Completed {
+                                attempt,
+                                evidence: CompletionEvidence::ProviderDone,
+                            },
+                        );
+                    }
+
+                    let mut json = match serde_json::from_slice::<Value>(&frame) {
+                        Ok(json) => json,
+                        Err(error) => {
+                            error!(
+                                "Received invalid inference stream data: request_id={}, execution_id={}, attempt_id={}, error={}",
+                                attempt.request_id,
+                                attempt.execution_id,
+                                attempt.attempt_id,
+                                error
+                            );
+                            return finish_stream_processing(
+                                &mut usage_accumulator,
+                                StreamUsageFinalization::InvalidData,
+                                AttemptTerminal::Failed {
+                                    attempt,
+                                    failure: AttemptFailure::new(
+                                        AttemptFailureKind::InvalidResponse,
+                                        AttemptStage::Stream,
+                                        ReplaySafety::NotProvenPreAcceptance,
+                                    ),
+                                },
+                            );
+                        }
+                    };
+
+                    if let Some(failure) = upstream_stream_failure(&json) {
+                        warn!(
+                            "Inference provider emitted an error stream frame: request_id={}, execution_id={}, attempt_id={}, upstream_code={:?}",
+                            attempt.request_id,
+                            attempt.execution_id,
+                            attempt.attempt_id,
+                            failure.upstream_code
+                        );
+                        return finish_stream_processing(
+                            &mut usage_accumulator,
+                            StreamUsageFinalization::ProviderError,
+                            AttemptTerminal::Failed { attempt, failure },
+                        );
+                    }
+
+                    usage_accumulator.observe(&json);
+                    canonicalize_response_model(&mut json, response_model_id);
+
+                    if tx_consumer
+                        .send(CompletionChunk::StreamChunk(json))
+                        .await
+                        .is_err()
+                    {
+                        return finish_stream_processing(
+                            &mut usage_accumulator,
+                            StreamUsageFinalization::ConsumerDropped,
+                            AttemptTerminal::Failed {
+                                attempt,
+                                failure: AttemptFailure::new(
+                                    AttemptFailureKind::ConsumerDropped,
+                                    AttemptStage::Stream,
+                                    ReplaySafety::NotProvenPreAcceptance,
+                                ),
+                            },
+                        );
+                    }
+                }
+            }
+            Ok(Some(Err(error))) => {
+                error!(
+                    "Inference stream transport error: request_id={}, execution_id={}, attempt_id={}, error={}",
+                    attempt.request_id, attempt.execution_id, attempt.attempt_id, error
+                );
+                return finish_stream_processing(
+                    &mut usage_accumulator,
+                    StreamUsageFinalization::TransportError,
+                    AttemptTerminal::Failed {
+                        attempt,
+                        failure: AttemptFailure::new(
+                            AttemptFailureKind::Transport,
+                            AttemptStage::Stream,
+                            ReplaySafety::NotProvenPreAcceptance,
+                        ),
+                    },
+                );
+            }
+            Ok(None) => {
+                let has_incomplete_frame = buffer.iter().any(|byte| !byte.is_ascii_whitespace());
+                let terminal = stream_end_terminal(
+                    attempt,
+                    usage_accumulator.saw_terminal_signal,
+                    has_incomplete_frame,
+                    require_provider_done,
+                );
+                return finish_stream_processing(
+                    &mut usage_accumulator,
+                    StreamUsageFinalization::EndOfStream,
+                    terminal,
+                );
+            }
+            Err(_) => {
+                error!(
+                    "Inference stream chunk timeout: request_id={}, execution_id={}, attempt_id={}, timeout_ms={}",
+                    attempt.request_id,
+                    attempt.execution_id,
+                    attempt.attempt_id,
+                    chunk_timeout.as_millis()
+                );
+                return finish_stream_processing(
+                    &mut usage_accumulator,
+                    StreamUsageFinalization::Timeout,
+                    AttemptTerminal::Failed {
+                        attempt,
+                        failure: AttemptFailure::new(
+                            AttemptFailureKind::StreamTimeout,
+                            AttemptStage::Stream,
+                            ReplaySafety::NotProvenPreAcceptance,
+                        ),
+                    },
+                );
+            }
+        }
+    }
+}
+
+async fn publish_stream_usage(
+    usage: Option<CompletionUsage>,
     finalization: StreamUsageFinalization,
     state: &Arc<AppState>,
     user: &User,
@@ -788,7 +1386,7 @@ async fn finalize_stream_usage(
     provider: &str,
     tx_consumer: &mpsc::Sender<CompletionChunk>,
 ) {
-    let Some(usage) = accumulator.take_final_usage(finalization) else {
+    let Some(usage) = usage else {
         return;
     };
 
@@ -909,6 +1507,17 @@ async fn proxy_openai(
         ModelAliasTargets::for_plan(model_plan)
     };
     let model_name = alias_targets.resolve(&requested_model_name).to_string();
+    let intent = InferenceIntent::new(
+        user.uuid,
+        requested_model_name.clone(),
+        model_name.clone(),
+        model_plan,
+        InferenceSurface::ChatCompletions,
+        WorkloadClass::Interactive,
+    );
+    let routing =
+        InferenceRoutingContext::new(model_plan, state.inference_routing_mode(user.uuid).await);
+    let pinned_completion = prepare_completion_request(&state, &user, intent, routing).await?;
     if requested_model_name != model_name {
         debug!(
             "Resolved chat model {} to {}",
@@ -921,8 +1530,6 @@ async fn proxy_openai(
 
     // Create billing context
     let billing_context = BillingContext::new(auth_method, requested_model_name);
-    let routing =
-        InferenceRoutingContext::new(model_plan, state.inference_routing_mode(user.uuid).await);
 
     // Get the completion stream - billing happens automatically inside!
     let completion = get_chat_completion_response(
@@ -931,12 +1538,18 @@ async fn proxy_openai(
         body,
         &headers,
         CompletionExecutionContext::new(billing_context, routing, &cache_policy),
+        &pinned_completion,
     )
-    .await?;
+    .await
+    .map_err(CompletionExecutionError::into_api_error)?;
 
     debug!(
-        "Received completion from provider: {} (streaming: {})",
-        completion.metadata.provider_name, completion.metadata.is_streaming
+        "Received completion stream: request_id={}, execution_id={}, attempt_id={}, provider={}, streaming={}",
+        completion.metadata.attempt.request_id,
+        completion.metadata.attempt.execution_id,
+        completion.metadata.attempt.attempt_id,
+        completion.metadata.provider_name,
+        completion.metadata.is_streaming
     );
 
     // Handle non-streaming vs streaming responses differently
@@ -972,11 +1585,6 @@ async fn proxy_openai(
                         Ok(event) => yield Ok::<Event, std::convert::Infallible>(event),
                         Err(e) => {
                             error!("Failed to encrypt event data: {:?}", e);
-                            // Encryption is down, so this frame cannot be
-                            // encrypted either; plaintext JSON at least
-                            // parses if the client tries.
-                            yield Ok(Event::default()
-                                .data(stream_error_payload("Encryption failed").to_string()));
                             break;
                         }
                     }
@@ -985,20 +1593,24 @@ async fn proxy_openai(
                     // Billing already handled internally, no need to send to client
                     trace!("Received usage chunk (billing already processed)");
                 }
-                CompletionChunk::Done => {
+                CompletionChunk::Terminal(terminal) => {
                     saw_terminal = true;
-                    yield Ok(Event::default().data("[DONE]"));
-                    break;
-                }
-                CompletionChunk::Error(error_msg) => {
-                    saw_terminal = true;
-                    error!("Stream error from completion API: {}", error_msg);
-                    match encrypt_sse_event(&state, &session_id, &stream_error_payload(&error_msg)).await {
-                        Ok(event) => yield Ok(event),
-                        Err(e) => {
-                            error!("Failed to encrypt error event: {:?}", e);
-                            yield Ok(Event::default()
-                                .data(stream_error_payload(&error_msg).to_string()));
+                    match terminal {
+                        AttemptTerminal::Completed { .. } => {
+                            yield Ok(Event::default().data("[DONE]"));
+                        }
+                        AttemptTerminal::Failed { failure, .. } => {
+                            error!(
+                                "Completion attempt failed: kind={:?}, stage={:?}",
+                                failure.kind, failure.stage
+                            );
+                            let error_payload = completion_error_payload(failure.client_message());
+                            match encrypt_sse_event(&state, &session_id, &error_payload).await {
+                                Ok(event) => yield Ok(event),
+                                Err(error) => {
+                                    error!("Failed to encrypt terminal error event: {error:?}");
+                                }
+                            }
                         }
                     }
                     break;
@@ -1007,12 +1619,11 @@ async fn proxy_openai(
                     saw_terminal = true;
                     // Shouldn't happen in streaming mode
                     error!("Received FullResponse in streaming mode");
-                    match encrypt_sse_event(&state, &session_id, &stream_error_payload("Invalid event format")).await {
+                    let error_payload = completion_error_payload("Invalid inference response");
+                    match encrypt_sse_event(&state, &session_id, &error_payload).await {
                         Ok(event) => yield Ok(event),
-                        Err(e) => {
-                            error!("Failed to encrypt error event: {:?}", e);
-                            yield Ok(Event::default()
-                                .data(stream_error_payload("Invalid event format").to_string()));
+                        Err(error) => {
+                            error!("Failed to encrypt invalid-format error event: {error:?}");
                         }
                     }
                     break;
@@ -1025,7 +1636,7 @@ async fn proxy_openai(
             match encrypt_sse_event(
                 &state,
                 &session_id,
-                &stream_error_payload("Completion stream ended unexpectedly"),
+                &completion_error_payload("Completion stream ended unexpectedly"),
             )
             .await
             {
@@ -1039,34 +1650,88 @@ async fn proxy_openai(
     Ok(Sse::new(stream).into_response())
 }
 
-/// OpenAI-style error payload for in-stream failures. Streaming
-/// clients decrypt and JSON-parse every `data:` frame, so a prose
-/// frame ("Error: ...") is indistinguishable from a corrupted
-/// stream; this shape lets them surface the actual cause.
-fn stream_error_payload(message: &str) -> Value {
-    json!({
-        "error": {
-            "message": message,
-            "type": "server_error",
-            "param": null,
-            "code": null,
-        }
+pub(crate) async fn prepare_completion_request(
+    state: &Arc<AppState>,
+    user: &User,
+    intent: InferenceIntent,
+    routing: InferenceRoutingContext,
+) -> Result<PinnedCompletionRequest, ApiError> {
+    if intent.account_uuid != user.uuid {
+        error!("Inference intent account did not match the authenticated user");
+        return Err(ApiError::InternalServerError);
+    }
+    if intent.model_plan != routing.model_plan() {
+        error!("Inference intent plan did not match the request-scoped routing context");
+        return Err(ApiError::InternalServerError);
+    }
+
+    ensure_completion_model_access(&intent.public_model_id, intent.model_plan)?;
+    let provider_preference = state
+        .provider_routing_preference(user.uuid, &intent.public_model_id)
+        .await;
+    let route = state
+        .provider_router
+        .select_completion_route_for_mode(
+            &state.proxy_router,
+            user.uuid,
+            &intent.public_model_id,
+            provider_preference,
+            routing.mode(),
+        )
+        .map_err(|err| match err {
+            ProviderRoutingError::UnsupportedModel(model) => {
+                error!("Unsupported completion model requested: {}", model);
+                ApiError::BadRequest
+            }
+            ProviderRoutingError::NoEligibleRoute(model) => {
+                error!("No eligible provider route for completion model: {}", model);
+                ApiError::InternalServerError
+            }
+        })?;
+
+    debug!(
+        "Pinned inference route: request_id={}, routing_mode={:?}, selection_mode={:?}, auto={}, surface={:?}, workload={:?}, requested_model={}, public_model={}, provider={}, provider_model={}, bucket={:?}, source={:?}",
+        intent.request_id,
+        routing.mode(),
+        intent.selection_mode,
+        intent.selection_mode.is_auto(),
+        intent.surface,
+        intent.workload_class,
+        intent.requested_model_id,
+        route.public_model_id,
+        route.provider.as_str(),
+        route.provider_model_id,
+        route.bucket,
+        route.selection_source
+    );
+
+    Ok(PinnedCompletionRequest {
+        intent,
+        route,
+        routing_mode: routing.mode(),
     })
 }
 
-/// Internal function to get chat completion response with automatic billing
-/// This can be used by both the proxy_openai endpoint and the responses API
-///
-/// Billing happens INTERNALLY within this function - consumers just receive processed chunks
-pub async fn get_chat_completion_response(
+/// Executes one model turn against a route pinned for the logical inference request.
+/// Billing remains internal until the usage-settlement stack separates the recorder.
+pub(crate) async fn get_chat_completion_response(
     state: &Arc<AppState>,
     user: &User,
     body: Value,
     headers: &HeaderMap,
     execution: CompletionExecutionContext<'_>,
-) -> Result<CompletionStream, ApiError> {
-    get_chat_completion_response_with_expected_route(state, user, body, headers, execution, None)
-        .await
+    pinned: &PinnedCompletionRequest,
+) -> Result<CompletionStream, CompletionExecutionError> {
+    get_chat_completion_response_with_options(
+        state,
+        user,
+        body,
+        headers,
+        execution,
+        pinned,
+        CompletionExecutionOptions::default(),
+    )
+    .await
 }
 
 /// Responses-only completion entry point with process-local task ownership.
@@ -1077,11 +1742,20 @@ pub(crate) async fn get_chat_completion_response_for_execution(
     body: Value,
     headers: &HeaderMap,
     execution: CompletionExecutionContext<'_>,
+    pinned: &PinnedCompletionRequest,
     response_execution: ResponseExecution,
-) -> Result<CompletionStream, ApiError> {
+) -> Result<CompletionStream, CompletionExecutionError> {
     let execution = execution.with_response_execution(response_execution)?;
-    get_chat_completion_response_with_expected_route(state, user, body, headers, execution, None)
-        .await
+    get_chat_completion_response_with_options(
+        state,
+        user,
+        body,
+        headers,
+        execution,
+        pinned,
+        CompletionExecutionOptions::default(),
+    )
+    .await
 }
 
 /// Run an entitled completion only if routing resolves to the server-selected
@@ -1095,20 +1769,48 @@ pub(crate) async fn get_chat_completion_response_for_expected_route(
     headers: &HeaderMap,
     execution: CompletionExecutionContext<'_>,
     route: ServerSelectedCompletionRoute<'_>,
-) -> Result<CompletionStream, ApiError> {
+) -> Result<CompletionStream, CompletionExecutionError> {
+    let routing = execution.routing;
+    let public_model_id = body
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(CompletionExecutionError::Request(ApiError::BadRequest))?
+        .to_string();
+    let intent = InferenceIntent::new(
+        user.uuid,
+        public_model_id.clone(),
+        public_model_id,
+        routing.model_plan(),
+        InferenceSurface::Internal,
+        WorkloadClass::Interactive,
+    );
+    let pinned = prepare_completion_request(state, user, intent, routing)
+        .await
+        .map_err(|error| {
+            error!(
+                "Failed to prepare server-selected completion route: expected_provider={}, expected_provider_model={}, error={error:?}",
+                route.provider_name, route.provider_model_id
+            );
+            CompletionExecutionError::Request(ApiError::ServiceUnavailable)
+        })?;
+
     let continuum_cache_salt = (route.provider_name == ProviderName::Continuum.as_str())
         .then(|| format!("server-selected-{}", Uuid::new_v4().simple()));
-    get_chat_completion_response_with_expected_route(
+    get_chat_completion_response_with_options(
         state,
         user,
         body,
         headers,
         execution,
-        Some(ExpectedCompletionRoute {
-            provider_name: route.provider_name,
-            provider_model_id: route.provider_model_id,
+        &pinned,
+        CompletionExecutionOptions {
+            exact_route: Some(ExactCompletionRoute {
+                provider_name: route.provider_name.to_string(),
+                provider_model_id: route.provider_model_id.to_string(),
+            }),
             continuum_cache_salt,
-        }),
+            non_streaming_body_limit: Some(MAX_BOUNDED_PROVIDER_RESPONSE_BYTES),
+        },
     )
     .await
 }
@@ -1119,20 +1821,36 @@ pub(crate) struct ServerSelectedCompletionRoute<'a> {
     pub provider_model_id: &'a str,
 }
 
-struct ExpectedCompletionRoute<'a> {
-    provider_name: &'a str,
-    provider_model_id: &'a str,
-    continuum_cache_salt: Option<String>,
+struct ExactCompletionRoute {
+    provider_name: String,
+    provider_model_id: String,
 }
 
-async fn get_chat_completion_response_with_expected_route(
+fn completion_route_matches_exact_constraint(
+    route: &SelectedProviderRoute,
+    expected: &ExactCompletionRoute,
+) -> bool {
+    route.provider.as_str() == expected.provider_name
+        && route.proxy.provider_name == expected.provider_name
+        && route.provider_model_id == expected.provider_model_id
+}
+
+#[derive(Default)]
+struct CompletionExecutionOptions {
+    exact_route: Option<ExactCompletionRoute>,
+    continuum_cache_salt: Option<String>,
+    non_streaming_body_limit: Option<usize>,
+}
+
+async fn get_chat_completion_response_with_options(
     state: &Arc<AppState>,
     user: &User,
     body: Value,
     headers: &HeaderMap,
     execution: CompletionExecutionContext<'_>,
-    expected_route: Option<ExpectedCompletionRoute<'_>>,
-) -> Result<CompletionStream, ApiError> {
+    pinned: &PinnedCompletionRequest,
+    options: CompletionExecutionOptions,
+) -> Result<CompletionStream, CompletionExecutionError> {
     let CompletionExecutionContext {
         mut billing,
         routing,
@@ -1140,13 +1858,16 @@ async fn get_chat_completion_response_with_expected_route(
         response_execution,
         response_execution_guard,
     } = execution;
-    let model_plan = routing.model_plan();
+    if routing.model_plan() != pinned.intent.model_plan || routing.mode() != pinned.routing_mode() {
+        error!("Completion policy did not match its pinned inference route");
+        return Err(ApiError::InternalServerError.into());
+    }
     let billing_context = &mut billing;
     let cache_policy = cache;
     let require_provider_done = cache_policy.requires_provider_done();
     if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
-        return Err(ApiError::BadRequest);
+        return Err(ApiError::BadRequest.into());
     }
 
     let mut modified_body = body
@@ -1163,7 +1884,7 @@ async fn get_chat_completion_response_with_expected_route(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
-    let requested_model_name = modified_body
+    let body_model_name = modified_body
         .get("model")
         .and_then(|m| m.as_str())
         .ok_or_else(|| {
@@ -1172,79 +1893,35 @@ async fn get_chat_completion_response_with_expected_route(
         })?
         .to_string();
 
-    let is_server_selected_route = expected_route.is_some();
-    if let Err(error) = ensure_completion_model_access(&requested_model_name, model_plan) {
-        if is_server_selected_route {
-            error!(
-                "Server-selected completion model is not available to the internal paid route: {}",
-                requested_model_name
-            );
-            return Err(ApiError::ServiceUnavailable);
-        }
-        return Err(error);
+    if body_model_name != pinned.intent.public_model_id {
+        error!(
+            "Prepared inference model did not match execution body: request_id={}, prepared_model={}, body_model={}",
+            pinned.intent.request_id, pinned.intent.public_model_id, body_model_name
+        );
+        return Err(ApiError::InternalServerError.into());
     }
 
-    let provider_preference = state
-        .provider_routing_preference(user.uuid, &requested_model_name)
-        .await;
-    let selected_route = state
-        .provider_router
-        .select_completion_route_for_mode(
-            &state.proxy_router,
-            user.uuid,
-            &requested_model_name,
-            provider_preference,
-            routing.mode(),
-        )
-        .map_err(|err| match err {
-            ProviderRoutingError::UnsupportedModel(model) => {
-                error!("Unsupported completion model requested: {}", model);
-                if is_server_selected_route {
-                    ApiError::ServiceUnavailable
-                } else {
-                    ApiError::BadRequest
-                }
-            }
-            ProviderRoutingError::NoEligibleRoute(model) => {
-                error!("No eligible provider route for completion model: {}", model);
-                if is_server_selected_route {
-                    ApiError::ServiceUnavailable
-                } else {
-                    ApiError::InternalServerError
-                }
-            }
-        })?;
-
-    if let Some(expected_route) = &expected_route {
-        if selected_route.proxy.provider_name != expected_route.provider_name
-            || selected_route.provider_model_id != expected_route.provider_model_id
-        {
+    ensure_completion_model_access(&pinned.intent.public_model_id, pinned.intent.model_plan)?;
+    let selected_route = pinned.route.clone();
+    if let Some(expected_route) = &options.exact_route {
+        if !completion_route_matches_exact_constraint(&selected_route, expected_route) {
             error!(
-                "Completion route did not match the server-selected constraint: public_model={}, expected_provider={}, expected_provider_model={}, selected_provider={}, selected_provider_model={}",
+                "Completion route did not match the server-selected constraint: request_id={}, public_model={}, expected_provider={}, expected_provider_model={}, selected_provider={}, selected_proxy_provider={}, selected_provider_model={}",
+                pinned.intent.request_id,
                 selected_route.public_model_id,
                 expected_route.provider_name,
                 expected_route.provider_model_id,
+                selected_route.provider.as_str(),
                 selected_route.proxy.provider_name,
                 selected_route.provider_model_id
             );
-            return Err(ApiError::ServiceUnavailable);
+            return Err(CompletionExecutionError::Request(
+                ApiError::ServiceUnavailable,
+            ));
         }
     }
-
-    if requested_model_name != selected_route.public_model_id
-        || selected_route.public_model_id != selected_route.provider_model_id
-    {
-        debug!(
-            "Selected completion route: routing_mode={:?}, requested_model={}, public_model={}, provider={}, provider_model={}, bucket={:?}, source={:?}",
-            routing.mode(),
-            requested_model_name,
-            selected_route.public_model_id,
-            selected_route.proxy.provider_name,
-            selected_route.provider_model_id,
-            selected_route.bucket,
-            selected_route.selection_source
-        );
-    }
+    let route_identity = selected_route.identity();
+    let execution = pinned.begin_execution();
     modified_body.insert(
         "model".to_string(),
         json!(selected_route.provider_model_id.clone()),
@@ -1255,24 +1932,29 @@ async fn get_chat_completion_response_with_expected_route(
         user.uuid,
         cache_policy,
     );
-    if let Some(expected_route) = &expected_route {
+    if options.exact_route.is_some() {
         apply_server_selected_cache_isolation(
             &mut modified_body,
             &selected_route.proxy.provider_name,
-            expected_route.continuum_cache_salt.as_deref(),
+            options.continuum_cache_salt.as_deref(),
         )?;
     }
     billing_context.model_name = selected_route.public_model_id.clone();
 
-    // Prepare the request to proxies
+    // Prepare one logical model-turn execution. The provider transport may
+    // report more than one attempt when Tinfoil safely refreshes a stale
+    // attested route after a proven pre-connect failure.
     debug!(
-        "Sending request for public model {} as provider model {} via {}",
+        "Sending inference execution: request_id={}, execution_id={}, routing_mode={:?}, public_model={}, provider_model={}, provider={}",
+        execution.request_id,
+        execution.execution_id,
+        pinned.routing_mode(),
         selected_route.public_model_id,
         selected_route.provider_model_id,
-        selected_route.proxy.provider_name
+        selected_route.provider.as_str()
     );
 
-    let (res, successful_provider) = {
+    let (res, successful_provider, attempt, mut terminal_guard) = {
         let mut request_body = modified_body.clone();
         let proxy_config = selected_route.proxy.clone();
         let provider_model_name = selected_route.provider_model_id.clone();
@@ -1280,47 +1962,88 @@ async fn get_chat_completion_response_with_expected_route(
         ensure_stream_usage(&mut request_body);
 
         let request_body_value = Value::Object(request_body);
-        let request_body_json = serde_json::to_string(&request_body_value).map_err(|e| {
-            error!("Failed to serialize request body: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        let request_body_json = match serde_json::to_string(&request_body_value) {
+            Ok(json) => json,
+            Err(error) => {
+                let attempt = execution.begin_attempt(route_identity.clone());
+                let failure = AttemptFailure::new(
+                    AttemptFailureKind::RequestBuild,
+                    AttemptStage::BeforeSend,
+                    ReplaySafety::ProvenPreAcceptance,
+                );
+                error!(
+                    "Failed to serialize inference request: request_id={}, execution_id={}, attempt_id={}, error={:?}",
+                    attempt.request_id, attempt.execution_id, attempt.attempt_id, error
+                );
+                return Err(failed_completion_execution(
+                    attempt,
+                    failure,
+                    ApiError::InternalServerError,
+                ));
+            }
+        };
         let request_log_metadata =
             CompletionRequestLogMetadata::from_body(&request_body_value, request_body_json.len());
 
         debug!(
-            "Completion request metadata before provider call: user_uuid={}, provider={}, model={}, metadata={:?}",
-            user.uuid, proxy_config.provider_name, provider_model_name, request_log_metadata
+            "Completion request metadata before provider call: request_id={}, execution_id={}, provider={}, model={}, metadata={:?}",
+            execution.request_id,
+            execution.execution_id,
+            proxy_config.provider_name,
+            provider_model_name,
+            request_log_metadata
         );
 
-        match try_provider(
+        let attempt = execution.begin_attempt(route_identity.clone());
+        let mut terminal_guard =
+            AttemptTerminalGuard::new(attempt.clone(), AttemptStage::AwaitingResponse);
+        let ProviderSendTrace {
+            prior_failures,
+            result,
+        } = try_provider(
             &state.provider_client,
             &proxy_config,
             request_body_json,
             headers,
         )
-        .await
-        {
+        .await;
+
+        let _recovered_terminals =
+            terminalize_recovered_provider_failures(execution, &route_identity, prior_failures);
+
+        match result {
             Ok(response) => {
+                record_attempt_outcome(&AttemptOutcome::ResponseStarted {
+                    attempt: attempt.clone(),
+                    status: response.status_code(),
+                });
                 info!(
-                    "Successfully got response from provider {} for model {}",
-                    proxy_config.provider_name, provider_model_name
+                    "Inference response started: request_id={}, execution_id={}, attempt_id={}",
+                    attempt.request_id, attempt.execution_id, attempt.attempt_id
                 );
-                (response, proxy_config.provider_name.clone())
+                terminal_guard.set_stage(AttemptStage::ResponseBody);
+                (
+                    response,
+                    selected_route.provider.as_str().to_string(),
+                    attempt,
+                    terminal_guard,
+                )
             }
             Err(err) => {
+                let failure = attempt_failure_from_provider_error(&err);
                 error!(
-                    "Completion request metadata at provider failure: user_uuid={}, provider={}, model={}, error={}, metadata={:?}",
-                    user.uuid,
-                    proxy_config.provider_name,
-                    provider_model_name,
-                    err,
+                    "Completion provider attempt failed: request_id={}, execution_id={}, attempt_id={}, kind={:?}, stage={:?}, metadata={:?}",
+                    attempt.request_id,
+                    attempt.execution_id,
+                    attempt.attempt_id,
+                    failure.kind,
+                    failure.stage,
                     request_log_metadata
                 );
-                error!(
-                    "Chat completion request failed for provider {} and model {}: {}",
-                    proxy_config.provider_name, provider_model_name, err
-                );
-                return Err(ApiError::from(err));
+                let execution_error =
+                    failed_completion_execution(attempt, failure, ApiError::from(err));
+                terminal_guard.disarm();
+                return Err(execution_error);
             }
         }
     };
@@ -1336,35 +2059,25 @@ async fn get_chat_completion_response_with_expected_route(
         debug!("Processing non-streaming response with internal billing");
         // The request's streaming fields are forwarded unchanged, but this
         // encrypted endpoint currently buffers one byte-exact response carrier.
-        let body_bytes = if expected_route.is_some() {
-            bytes::Bytes::from(
-                collect_bounded_provider_response_body(
-                    res.bytes_stream(),
-                    MAX_BOUNDED_PROVIDER_RESPONSE_BYTES,
-                )
-                .await
-                .map_err(|error| {
-                    error!("Failed to read bounded server-selected response body: {error}");
-                    ApiError::InternalServerError
-                })?,
-            )
-        } else {
-            // Preserve the ordinary Chat Completions path's existing unbounded
-            // response-body behavior. Only server-selected image descriptor
-            // calls opt into the defensive cap above.
-            res.bytes().await.map_err(|e| {
-                error!("Failed to read response body: {:?}", e);
-                ApiError::InternalServerError
-            })?
+        let response_json = match read_non_streaming_completion_response(
+            res,
+            &selected_route.response_model_id,
+            &attempt,
+            options.non_streaming_body_limit,
+        )
+        .await
+        {
+            Ok(response_json) => response_json,
+            Err(failure) => {
+                let execution_error = failed_completion_execution(
+                    attempt.clone(),
+                    failure,
+                    ApiError::InternalServerError,
+                );
+                terminal_guard.disarm();
+                return Err(execution_error);
+            }
         };
-
-        let mut response_json: Value = serde_json::from_str(&String::from_utf8_lossy(&body_bytes))
-            .map_err(|e| {
-                error!("Failed to parse response JSON: {:?}", e);
-                ApiError::InternalServerError
-            })?;
-
-        canonicalize_response_model(&mut response_json, &selected_route.response_model_id);
 
         // ✅ Handle billing HERE, inside completions API
         if let Some(usage) = extract_usage(&response_json) {
@@ -1373,9 +2086,14 @@ async fn get_chat_completion_response_with_expected_route(
         }
 
         // Return the full response as a single chunk
-        let (tx, rx) = mpsc::channel(2); // Need space for FullResponse + Done
+        let terminal = AttemptTerminal::Completed {
+            attempt: attempt.clone(),
+            evidence: CompletionEvidence::NonStreamingResponse,
+        };
+        terminal_guard.record_terminal(&terminal);
+        let (tx, rx) = mpsc::channel(2); // Need space for FullResponse + terminal
         let _ = tx.send(CompletionChunk::FullResponse(response_json)).await;
-        let _ = tx.send(CompletionChunk::Done).await;
+        let _ = tx.send(CompletionChunk::Terminal(terminal)).await;
 
         return Ok(CompletionStream {
             stream: rx,
@@ -1383,6 +2101,7 @@ async fn get_chat_completion_response_with_expected_route(
                 provider_name: successful_provider,
                 model_name: billing_context.model_name.clone(),
                 is_streaming: false,
+                attempt,
             },
         });
     }
@@ -1397,176 +2116,35 @@ async fn get_chat_completion_response_with_expected_route(
     let billing_ctx = billing_context.clone();
     let provider = successful_provider.clone();
     let response_model_id = selected_route.response_model_id.clone();
+    let stream_attempt = attempt.clone();
+    terminal_guard.set_stage(AttemptStage::Stream);
 
     tokio::spawn(async move {
         let _response_execution_guard = response_execution_guard;
-        let mut body_stream = res.bytes_stream();
-        let mut buffer = Vec::new();
-        let mut usage_accumulator = StreamUsageAccumulator::default();
-
-        loop {
-            let next_chunk = timeout(
-                Duration::from_secs(STREAM_CHUNK_TIMEOUT_SECS),
-                body_stream.next(),
-            );
-            tokio::pin!(next_chunk);
-            let next_chunk = if let Some(execution) = response_execution.as_ref() {
-                tokio::select! {
-                    biased;
-                    _ = execution.cancelled() => {
-                        finalize_stream_usage(
-                            &mut usage_accumulator,
-                            StreamUsageFinalization::ConsumerDropped,
-                            &state_clone,
-                            &user_clone,
-                            &billing_ctx,
-                            &provider,
-                            &tx_consumer,
-                        )
-                        .await;
-                        return;
-                    }
-                    result = &mut next_chunk => result,
-                }
-            } else {
-                next_chunk.await
-            };
-
-            match next_chunk {
-                Ok(Some(chunk_result)) => {
-                    match chunk_result {
-                        Ok(bytes) => {
-                            buffer.extend_from_slice(bytes.as_ref());
-
-                            // Parse SSE frames
-                            while let Some(frame) = extract_sse_frame(&mut buffer) {
-                                if frame == b"[DONE]" {
-                                    finalize_stream_usage(
-                                        &mut usage_accumulator,
-                                        StreamUsageFinalization::ProviderDone,
-                                        &state_clone,
-                                        &user_clone,
-                                        &billing_ctx,
-                                        &provider,
-                                        &tx_consumer,
-                                    )
-                                    .await;
-                                    let _ = tx_consumer.send(CompletionChunk::Done).await;
-                                    return;
-                                }
-
-                                match serde_json::from_slice::<Value>(&frame) {
-                                    Ok(mut json) => {
-                                        // vLLM can report cumulative usage on every delta, while
-                                        // providers may add cache details after finish_reason.
-                                        // Accumulate observations and publish only when the stream
-                                        // lifecycle confirms completion.
-                                        usage_accumulator.observe(&json);
-
-                                        canonicalize_response_model(&mut json, &response_model_id);
-
-                                        // Send full JSON chunk to consumer (preserves all metadata)
-                                        if tx_consumer
-                                            .send(CompletionChunk::StreamChunk(json))
-                                            .await
-                                            .is_err()
-                                        {
-                                            finalize_stream_usage(
-                                                &mut usage_accumulator,
-                                                StreamUsageFinalization::ConsumerDropped,
-                                                &state_clone,
-                                                &user_clone,
-                                                &billing_ctx,
-                                                &provider,
-                                                &tx_consumer,
-                                            )
-                                            .await;
-                                            return;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        error!("Received non-JSON data event. Error: {:?}", e);
-                                        finalize_stream_usage(
-                                            &mut usage_accumulator,
-                                            StreamUsageFinalization::InvalidData,
-                                            &state_clone,
-                                            &user_clone,
-                                            &billing_ctx,
-                                            &provider,
-                                            &tx_consumer,
-                                        )
-                                        .await;
-                                        let _ = tx_consumer
-                                            .send(CompletionChunk::Error(
-                                                "Invalid JSON".to_string(),
-                                            ))
-                                            .await;
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            error!("Stream error: {:?}", e);
-                            finalize_stream_usage(
-                                &mut usage_accumulator,
-                                StreamUsageFinalization::TransportError,
-                                &state_clone,
-                                &user_clone,
-                                &billing_ctx,
-                                &provider,
-                                &tx_consumer,
-                            )
-                            .await;
-                            let _ = tx_consumer
-                                .send(CompletionChunk::Error(e.to_string()))
-                                .await;
-                            return;
-                        }
-                    }
-                }
-                Ok(None) => {
-                    // Stream ended without explicit [DONE]
-                    finalize_stream_usage(
-                        &mut usage_accumulator,
-                        StreamUsageFinalization::EndOfStream,
-                        &state_clone,
-                        &user_clone,
-                        &billing_ctx,
-                        &provider,
-                        &tx_consumer,
-                    )
-                    .await;
-                    let terminal = if require_provider_done {
-                        CompletionChunk::Error(
-                            "Provider stream ended before its completion marker".to_string(),
-                        )
-                    } else {
-                        CompletionChunk::Done
-                    };
-                    let _ = tx_consumer.send(terminal).await;
-                    return;
-                }
-                Err(_) => {
-                    // Timeout waiting for next chunk
-                    error!("Stream chunk timeout after {}s", STREAM_CHUNK_TIMEOUT_SECS);
-                    finalize_stream_usage(
-                        &mut usage_accumulator,
-                        StreamUsageFinalization::Timeout,
-                        &state_clone,
-                        &user_clone,
-                        &billing_ctx,
-                        &provider,
-                        &tx_consumer,
-                    )
-                    .await;
-                    let _ = tx_consumer
-                        .send(CompletionChunk::Error("Stream timeout".to_string()))
-                        .await;
-                    return;
-                }
-            }
-        }
+        let result = process_completion_stream(
+            res,
+            &response_model_id,
+            stream_attempt,
+            &tx_consumer,
+            Duration::from_secs(STREAM_CHUNK_TIMEOUT_SECS),
+            response_execution.as_ref(),
+            require_provider_done,
+        )
+        .await;
+        publish_stream_usage(
+            result.usage,
+            result.finalization,
+            &state_clone,
+            &user_clone,
+            &billing_ctx,
+            &provider,
+            &tx_consumer,
+        )
+        .await;
+        terminal_guard.record_terminal(&result.terminal);
+        let _ = tx_consumer
+            .send(CompletionChunk::Terminal(result.terminal))
+            .await;
     });
 
     Ok(CompletionStream {
@@ -1575,6 +2153,7 @@ async fn get_chat_completion_response_with_expected_route(
             provider_name: successful_provider,
             model_name: billing_context.model_name.clone(),
             is_streaming: true,
+            attempt,
         },
     })
 }
@@ -1923,7 +2502,26 @@ async fn encrypt_sse_event(
             error!("Failed to encode SSE event data: {:?}", e);
             ApiError::InternalServerError
         })?;
-    Ok(Event::default().data(event_data))
+
+    Ok(sse_event_from_encoded_data(&event_data))
+}
+
+/// OpenAI-style error payload for encrypted in-stream failures. Clients
+/// decrypt and JSON-parse every `data:` frame, so terminal failures must keep
+/// the same object shape as non-streaming OpenAI-compatible errors.
+fn completion_error_payload(message: &str) -> Value {
+    json!({
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "param": null,
+            "code": null,
+        }
+    })
+}
+
+fn sse_event_from_encoded_data(event_data: &str) -> Event {
+    Event::default().data(event_data)
 }
 
 async fn proxy_models(
@@ -2757,11 +3355,14 @@ async fn try_provider(
     proxy_config: &ProxyConfig,
     body_json: String,
     headers: &HeaderMap,
-) -> Result<ProviderResponse, ProviderRequestError> {
+) -> ProviderSendTrace {
     debug!("Making request to {}", proxy_config.provider_name);
 
-    match client
-        .send(
+    let ProviderSendTrace {
+        prior_failures,
+        result,
+    } = client
+        .send_traced(
             proxy_config,
             ProviderRequest::new(
                 Method::POST,
@@ -2774,28 +3375,28 @@ async fn try_provider(
             // retry templates then clone that buffer by reference.
             .body(body_json),
         )
-        .await
-    {
+        .await;
+
+    let result = match result {
         Ok(response) => {
             if response.is_success() {
                 Ok(response)
             } else {
                 let status = response.status_code();
+                let retry_after = parse_retry_after_hint(response.header_str(&header::RETRY_AFTER));
+                let upstream_request_id = upstream_request_id(&response);
                 error!(
                     "Provider {} returned non-success status: {}",
                     proxy_config.provider_name, status
                 );
-                // Drain only a bounded amount and never log provider response
-                // bodies because they may echo user content.
-                let _ = collect_bounded_provider_response_body(
-                    response.bytes_stream(),
-                    MAX_BOUNDED_PROVIDER_RESPONSE_BYTES,
-                )
-                .await;
-                Err(ProviderRequestError::Send(format!(
-                    "Provider {} returned status {}",
-                    proxy_config.provider_name, status
-                )))
+                // The status and bounded safe headers are the complete routing
+                // contract. Never wait for or buffer an untrusted error body.
+                drop(response);
+                Err(ProviderRequestError::Upstream(UpstreamProviderError {
+                    status,
+                    retry_after,
+                    upstream_request_id,
+                }))
             }
         }
         Err(e) => {
@@ -2805,7 +3406,35 @@ async fn try_provider(
             );
             Err(e)
         }
+    };
+
+    ProviderSendTrace {
+        prior_failures,
+        result,
     }
+}
+
+fn parse_retry_after_hint(value: Option<&str>) -> Option<Duration> {
+    const MAX_RETRY_AFTER_HINT_SECS: u64 = 60 * 60;
+
+    let seconds = value?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds.min(MAX_RETRY_AFTER_HINT_SECS)))
+}
+
+fn upstream_request_id(response: &ProviderResponse) -> Option<String> {
+    const REQUEST_ID_HEADERS: &[&str] =
+        &["x-request-id", "request-id", "x-amzn-requestid", "cf-ray"];
+
+    REQUEST_ID_HEADERS.iter().find_map(|name| {
+        let name = HeaderName::from_static(name);
+        let value = response.header_str(&name)?.trim();
+        (!value.is_empty() && value.len() <= 128 && value.chars().all(is_safe_identifier_char))
+            .then(|| value.to_string())
+    })
+}
+
+fn is_safe_identifier_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':')
 }
 
 #[cfg(test)]
@@ -2813,8 +3442,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stream_error_payload_is_openai_shaped_json() {
-        let payload = stream_error_payload("Stream timeout");
+    fn completion_error_payload_is_openai_shaped_json() {
+        let payload = completion_error_payload("Stream timeout");
 
         assert_eq!(payload["error"]["message"], "Stream timeout");
         assert_eq!(payload["error"]["type"], "server_error");
@@ -2854,6 +3483,274 @@ mod tests {
         );
     }
 
+    async fn call_mock_provider(app: Router) -> (ProviderSendTrace, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock provider");
+        let address = listener.local_addr().expect("mock provider address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock provider");
+        });
+        let base_url = format!("http://{address}");
+        let client = ProviderClient::for_test(base_url.clone()).expect("mock provider client");
+        let proxy = ProxyConfig {
+            base_url,
+            api_key: None,
+            provider_name: ProviderName::Tinfoil.as_str().to_string(),
+        };
+        let trace = try_provider(
+            &client,
+            &proxy,
+            r#"{"model":"kimi-k3","messages":[]}"#.to_string(),
+            &HeaderMap::new(),
+        )
+        .await;
+        (trace, server)
+    }
+
+    fn static_sse_app(body: &'static str) -> Router {
+        Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move {
+                axum::http::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from(body))
+                    .expect("mock SSE response")
+            }),
+        )
+    }
+
+    async fn process_mock_sse(body: &'static str) -> (StreamProcessResult, Vec<Value>) {
+        process_mock_sse_with_policy(body, false).await
+    }
+
+    async fn process_mock_sse_with_policy(
+        body: &'static str,
+        require_provider_done: bool,
+    ) -> (StreamProcessResult, Vec<Value>) {
+        let (trace, server) = call_mock_provider(static_sse_app(body)).await;
+        assert!(trace.prior_failures.is_empty());
+        let response = match trace.result {
+            Ok(response) => response,
+            Err(error) => panic!("mock provider failed before stream processing: {error}"),
+        };
+        let pinned = pinned_test_completion();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let (tx, mut rx) = mpsc::channel(16);
+        let result = process_completion_stream(
+            response,
+            "kimi-k3",
+            attempt,
+            &tx,
+            Duration::from_secs(1),
+            None,
+            require_provider_done,
+        )
+        .await;
+        drop(tx);
+        server.abort();
+
+        let mut chunks = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                CompletionChunk::StreamChunk(json) => chunks.push(json),
+                unexpected => panic!("parser emitted unexpected chunk: {unexpected:?}"),
+            }
+        }
+        (result, chunks)
+    }
+
+    fn pinned_test_completion() -> PinnedCompletionRequest {
+        PinnedCompletionRequest {
+            intent: InferenceIntent::new(
+                Uuid::nil(),
+                crate::model_config::AUTO_POWERFUL_MODEL_ID,
+                "glm-5-2",
+                ModelPlan::Paid,
+                InferenceSurface::Responses,
+                WorkloadClass::Interactive,
+            ),
+            route: SelectedProviderRoute {
+                provider: ProviderName::Tinfoil,
+                proxy: ProxyConfig {
+                    base_url: "http://tinfoil.example.com".to_string(),
+                    api_key: None,
+                    provider_name: "tinfoil".to_string(),
+                },
+                public_model_id: "glm-5-2".to_string(),
+                provider_model_id: "glm-5-2".to_string(),
+                response_model_id: "glm-5-2".to_string(),
+                bucket: None,
+                selection_source: crate::provider_routing::ProviderSelectionSource::DefaultProvider,
+            },
+            routing_mode: InferenceRoutingMode::V2,
+        }
+    }
+
+    #[test]
+    fn exact_completion_constraint_checks_typed_and_transport_route() {
+        let pinned = pinned_test_completion();
+        let matching = ExactCompletionRoute {
+            provider_name: "tinfoil".to_string(),
+            provider_model_id: "glm-5-2".to_string(),
+        };
+        assert!(completion_route_matches_exact_constraint(
+            &pinned.route,
+            &matching
+        ));
+
+        let wrong_provider = ExactCompletionRoute {
+            provider_name: "continuum".to_string(),
+            provider_model_id: "glm-5.3".to_string(),
+        };
+        assert!(!completion_route_matches_exact_constraint(
+            &pinned.route,
+            &wrong_provider
+        ));
+
+        let wrong_model = ExactCompletionRoute {
+            provider_name: "tinfoil".to_string(),
+            provider_model_id: "gemma4-31b".to_string(),
+        };
+        assert!(!completion_route_matches_exact_constraint(
+            &pinned.route,
+            &wrong_model
+        ));
+    }
+
+    #[tokio::test]
+    async fn mock_provider_streams_produce_one_sanitized_terminal_result() {
+        enum ExpectedTerminal {
+            Completed(CompletionEvidence),
+            Failed(AttemptFailureKind),
+        }
+
+        let cases = [
+            (
+                "provider done",
+                concat!(
+                    "data: {\"model\":\"upstream-k3\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                ExpectedTerminal::Completed(CompletionEvidence::ProviderDone),
+                1,
+            ),
+            (
+                "finish then eof",
+                "data: {\"model\":\"upstream-k3\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                ExpectedTerminal::Completed(CompletionEvidence::FinishSignalThenEof),
+                1,
+            ),
+            (
+                "bare eof",
+                "data: {\"model\":\"upstream-k3\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                ExpectedTerminal::Failed(AttemptFailureKind::UnexpectedEof),
+                1,
+            ),
+            (
+                "truncated trailing frame",
+                concat!(
+                    "data: {\"model\":\"upstream-k3\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                    "data: {\"choices\":["
+                ),
+                ExpectedTerminal::Failed(AttemptFailureKind::UnexpectedEof),
+                1,
+            ),
+            (
+                "invalid json",
+                "data: not-json\n\n",
+                ExpectedTerminal::Failed(AttemptFailureKind::InvalidResponse),
+                0,
+            ),
+            (
+                "provider error then done",
+                concat!(
+                    "data: {\"model\":\"upstream-k3\",\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                    "data: {\"error\":{\"message\":\"private upstream detail\",\"code\":\"capacity_error-17\"}}\n\n",
+                    "data: [DONE]\n\n"
+                ),
+                ExpectedTerminal::Failed(AttemptFailureKind::UpstreamStreamError),
+                1,
+            ),
+        ];
+
+        for (name, body, expected, expected_chunks) in cases {
+            let (result, chunks) = process_mock_sse(body).await;
+            assert_eq!(chunks.len(), expected_chunks, "{name}");
+            assert!(
+                chunks.iter().all(|chunk| chunk.get("error").is_none()),
+                "{name}"
+            );
+            assert!(
+                chunks.iter().all(|chunk| chunk["model"] == "kimi-k3"),
+                "{name}"
+            );
+
+            match (expected, result.terminal) {
+                (
+                    ExpectedTerminal::Completed(expected_evidence),
+                    AttemptTerminal::Completed { evidence, .. },
+                ) => assert_eq!(evidence, expected_evidence, "{name}"),
+                (
+                    ExpectedTerminal::Failed(expected_kind),
+                    AttemptTerminal::Failed { failure, .. },
+                ) => {
+                    assert_eq!(failure.kind, expected_kind, "{name}");
+                    assert_eq!(
+                        failure.replay_safety,
+                        ReplaySafety::NotProvenPreAcceptance,
+                        "{name}"
+                    );
+                    if expected_kind == AttemptFailureKind::UpstreamStreamError {
+                        assert_eq!(failure.upstream_code.as_deref(), Some("capacity_error-17"));
+                    }
+                }
+                (_, terminal) => panic!("{name}: unexpected terminal {terminal:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_provider_429_preserves_bounded_metadata_without_body_leak() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                axum::http::Response::builder()
+                    .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+                    .header(header::RETRY_AFTER, "17")
+                    .header("x-request-id", "req-429_a.b:c")
+                    .body(axum::body::Body::from("private upstream capacity detail"))
+                    .expect("mock rate-limit response")
+            }),
+        );
+        let (trace, server) = call_mock_provider(app).await;
+        server.abort();
+        assert!(trace.prior_failures.is_empty());
+        let error = match trace.result {
+            Err(error) => error,
+            Ok(_) => panic!("mock 429 unexpectedly succeeded"),
+        };
+        assert!(!error
+            .to_string()
+            .contains("private upstream capacity detail"));
+
+        let failure = attempt_failure_from_provider_error(&error);
+        assert_eq!(failure.kind, AttemptFailureKind::HttpStatus);
+        assert_eq!(failure.stage, AttemptStage::AwaitingResponse);
+        assert_eq!(failure.replay_safety, ReplaySafety::NotProvenPreAcceptance);
+        assert_eq!(failure.status, Some(429));
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(17)));
+        assert_eq!(
+            failure.upstream_request_id.as_deref(),
+            Some("req-429_a.b:c")
+        );
+    }
+
     #[tokio::test]
     async fn bounded_provider_response_body_maps_stream_errors_without_content() {
         let body_stream = futures::stream::iter([
@@ -2865,6 +3762,483 @@ mod tests {
             collect_bounded_provider_response_body(body_stream, 6).await,
             Err(BoundedProviderResponseBodyError::Read)
         );
+    }
+
+    #[tokio::test]
+    async fn mock_provider_429_does_not_wait_for_pending_error_body() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let pending = futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+                axum::http::Response::builder()
+                    .status(axum::http::StatusCode::TOO_MANY_REQUESTS)
+                    .header(header::RETRY_AFTER, "23")
+                    .body(axum::body::Body::from_stream(pending))
+                    .expect("mock pending rate-limit response")
+            }),
+        );
+
+        let (trace, server) = timeout(Duration::from_secs(1), call_mock_provider(app))
+            .await
+            .expect("429 classification must finish after headers without reading the body");
+        server.abort();
+
+        let error = match trace.result {
+            Err(error) => error,
+            Ok(_) => panic!("mock 429 unexpectedly succeeded"),
+        };
+        let failure = attempt_failure_from_provider_error(&error);
+        assert_eq!(failure.kind, AttemptFailureKind::HttpStatus);
+        assert_eq!(failure.status, Some(429));
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(23)));
+    }
+
+    #[tokio::test]
+    async fn mock_provider_non_streaming_error_payload_is_a_sanitized_failure() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                axum::http::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"error":{"message":"private upstream detail","code":"capacity_error-17"}}"#,
+                    ))
+                    .expect("mock non-streaming error response")
+            }),
+        );
+        let (trace, server) = call_mock_provider(app).await;
+        let response = match trace.result {
+            Ok(response) => response,
+            Err(error) => panic!("mock provider failed before response parsing: {error}"),
+        };
+        let pinned = pinned_test_completion();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let failure = read_non_streaming_completion_response(response, "kimi-k3", &attempt, None)
+            .await
+            .expect_err("top-level provider error payload must fail the attempt");
+        server.abort();
+
+        assert_eq!(failure.kind, AttemptFailureKind::UpstreamResponseError);
+        assert_eq!(failure.stage, AttemptStage::ResponseBody);
+        assert_eq!(failure.replay_safety, ReplaySafety::NotProvenPreAcceptance);
+        assert_eq!(failure.upstream_code.as_deref(), Some("capacity_error-17"));
+        assert!(!format!("{failure:?}").contains("private upstream detail"));
+    }
+
+    #[tokio::test]
+    async fn bounded_non_streaming_response_is_a_typed_invalid_response() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                axum::http::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"model":"upstream-k3","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+                    ))
+                    .expect("mock bounded response")
+            }),
+        );
+        let (trace, server) = call_mock_provider(app).await;
+        let response = match trace.result {
+            Ok(response) => response,
+            Err(error) => panic!("mock provider failed before bounded read: {error}"),
+        };
+        let pinned = pinned_test_completion();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let failure =
+            read_non_streaming_completion_response(response, "kimi-k3", &attempt, Some(8))
+                .await
+                .expect_err("response over the descriptor cap must fail");
+        server.abort();
+
+        assert_eq!(failure.kind, AttemptFailureKind::InvalidResponse);
+        assert_eq!(failure.stage, AttemptStage::ResponseBody);
+        assert_eq!(failure.replay_safety, ReplaySafety::NotProvenPreAcceptance);
+    }
+
+    #[tokio::test]
+    async fn terminal_error_event_round_trips_through_maple_encrypted_sse_contract() {
+        use axum::body::to_bytes;
+        use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, Key, KeyInit, Nonce};
+        use std::convert::Infallible;
+
+        let payload = completion_error_payload("Inference provider request failed");
+        let plaintext = payload.to_string();
+        let key_bytes = [0x42; 32];
+        let nonce_bytes = [0x24; 12];
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_bytes())
+            .expect("encrypt mock SSE error payload");
+        let encrypted = [nonce_bytes.as_slice(), ciphertext.as_slice()].concat();
+
+        let event = sse_event_from_encoded_data(&general_purpose::STANDARD.encode(encrypted));
+        let response =
+            Sse::new(futures::stream::iter([Ok::<Event, Infallible>(event)])).into_response();
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("serialize SSE event");
+        let body = std::str::from_utf8(&body).expect("SSE body is UTF-8");
+        let encoded = body
+            .strip_prefix("data: ")
+            .and_then(|value| value.strip_suffix("\n\n"))
+            .expect("one SSE data event");
+
+        assert_ne!(encoded, plaintext);
+        let decoded = general_purpose::STANDARD
+            .decode(encoded)
+            .expect("Maple SDK base64 contract");
+        let (nonce, ciphertext) = decoded.split_at(12);
+        let nonce: [u8; 12] = nonce.try_into().expect("12-byte nonce");
+        let decrypted = crate::web::attestation_routes::SessionState::new(key_bytes)
+            .decrypt(ciphertext, &nonce)
+            .expect("Maple SDK AEAD contract");
+        assert_eq!(decrypted, plaintext.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn mock_provider_pending_stream_has_one_timeout_terminal_result() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let pending = futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+                axum::http::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from_stream(pending))
+                    .expect("mock pending response")
+            }),
+        );
+        let (trace, server) = call_mock_provider(app).await;
+        let response = match trace.result {
+            Ok(response) => response,
+            Err(error) => panic!("mock provider failed before timeout test: {error}"),
+        };
+        let pinned = pinned_test_completion();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let (tx, mut rx) = mpsc::channel(1);
+        let result = process_completion_stream(
+            response,
+            "kimi-k3",
+            attempt,
+            &tx,
+            Duration::from_millis(20),
+            None,
+            false,
+        )
+        .await;
+        drop(tx);
+        server.abort();
+
+        assert!(rx.recv().await.is_none());
+        assert!(matches!(
+            result.terminal,
+            AttemptTerminal::Failed {
+                failure: AttemptFailure {
+                    kind: AttemptFailureKind::StreamTimeout,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn mock_provider_truncated_http_body_has_one_transport_terminal_result() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind truncated-body provider");
+        let address = listener
+            .local_addr()
+            .expect("truncated-body provider address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept provider request");
+            let mut request = vec![0u8; 4096];
+            let _ = socket
+                .read(&mut request)
+                .await
+                .expect("read provider request");
+
+            let body = concat!(
+                "data: {\"model\":\"upstream-k3\",",
+                "\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"
+            );
+            let declared_length = body.len() + 128;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared_length}\r\nConnection: close\r\n\r\n"
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write response headers");
+            socket
+                .write_all(body.as_bytes())
+                .await
+                .expect("write partial response body");
+            socket.shutdown().await.expect("close partial response");
+        });
+
+        let base_url = format!("http://{address}");
+        let client = ProviderClient::for_test(base_url.clone()).expect("mock provider client");
+        let proxy = ProxyConfig {
+            base_url,
+            api_key: None,
+            provider_name: ProviderName::Tinfoil.as_str().to_string(),
+        };
+        let trace = try_provider(
+            &client,
+            &proxy,
+            r#"{"model":"kimi-k3","messages":[]}"#.to_string(),
+            &HeaderMap::new(),
+        )
+        .await;
+        let response = match trace.result {
+            Ok(response) => response,
+            Err(error) => panic!("mock provider failed before body truncation: {error}"),
+        };
+        let pinned = pinned_test_completion();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let (tx, mut rx) = mpsc::channel(4);
+        let result = process_completion_stream(
+            response,
+            "kimi-k3",
+            attempt,
+            &tx,
+            Duration::from_secs(1),
+            None,
+            false,
+        )
+        .await;
+        drop(tx);
+        server.await.expect("truncated-body provider task");
+
+        let chunk = rx.recv().await.expect("partial stream chunk");
+        assert!(matches!(chunk, CompletionChunk::StreamChunk(_)));
+        assert!(rx.recv().await.is_none());
+        assert!(matches!(
+            result.terminal,
+            AttemptTerminal::Failed {
+                failure: AttemptFailure {
+                    kind: AttemptFailureKind::Transport,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pinned_completion_keeps_route_and_request_identity_across_model_turns() {
+        let pinned = pinned_test_completion();
+        let first = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let second = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+
+        assert_eq!(first.request_id, second.request_id);
+        assert_ne!(first.execution_id, second.execution_id);
+        assert_ne!(first.attempt_id, second.attempt_id);
+        assert_eq!(first.route, second.route);
+        assert_eq!(first.route.public_model_id, "glm-5-2");
+        assert_eq!(first.route.provider_model_id, "glm-5-2");
+        assert_eq!(
+            pinned.intent().requested_model_id,
+            crate::model_config::AUTO_POWERFUL_MODEL_ID
+        );
+        assert!(pinned.intent().selection_mode.is_auto());
+        assert_eq!(pinned.routing_mode(), InferenceRoutingMode::V2);
+    }
+
+    #[test]
+    fn provider_request_replay_safety_is_conservative() {
+        let cases = [
+            (
+                ProviderRequestError::TinfoilUnavailable,
+                AttemptFailureKind::ProviderUnavailable,
+                ReplaySafety::ProvenPreAcceptance,
+            ),
+            (
+                ProviderRequestError::Build("invalid request".to_string()),
+                AttemptFailureKind::RequestBuild,
+                ReplaySafety::ProvenPreAcceptance,
+            ),
+            (
+                ProviderRequestError::Connect("connection refused".to_string()),
+                AttemptFailureKind::Connect,
+                ReplaySafety::ProvenPreAcceptance,
+            ),
+            (
+                ProviderRequestError::Timeout(Duration::from_secs(30)),
+                AttemptFailureKind::ResponseStartTimeout,
+                ReplaySafety::NotProvenPreAcceptance,
+            ),
+            (
+                ProviderRequestError::Send("connection reset".to_string()),
+                AttemptFailureKind::Transport,
+                ReplaySafety::NotProvenPreAcceptance,
+            ),
+        ];
+
+        for (error, expected_kind, expected_replay_safety) in cases {
+            let failure = attempt_failure_from_provider_error(&error);
+            assert_eq!(failure.kind, expected_kind);
+            assert_eq!(failure.replay_safety, expected_replay_safety);
+            assert_eq!(failure.status, None);
+        }
+
+        let upstream = ProviderRequestError::Upstream(UpstreamProviderError {
+            status: 429,
+            retry_after: Some(Duration::from_secs(60)),
+            upstream_request_id: Some("request-123".to_string()),
+        });
+        let failure = attempt_failure_from_provider_error(&upstream);
+        assert_eq!(failure.kind, AttemptFailureKind::HttpStatus);
+        assert_eq!(failure.replay_safety, ReplaySafety::NotProvenPreAcceptance);
+        assert_eq!(failure.status, Some(429));
+        assert_eq!(failure.retry_after, Some(Duration::from_secs(60)));
+        assert_eq!(failure.upstream_request_id.as_deref(), Some("request-123"));
+    }
+
+    #[test]
+    fn cancelled_in_flight_attempt_has_one_conservative_terminal_shape() {
+        let pinned = pinned_test_completion();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+        let mut guard = AttemptTerminalGuard::new(attempt.clone(), AttemptStage::AwaitingResponse);
+
+        assert!(matches!(
+            guard.cancellation_terminal(),
+            AttemptTerminal::Failed {
+                attempt: terminal_attempt,
+                failure: AttemptFailure {
+                    kind: AttemptFailureKind::ConsumerDropped,
+                    stage: AttemptStage::AwaitingResponse,
+                    replay_safety: ReplaySafety::NotProvenPreAcceptance,
+                    ..
+                },
+            } if terminal_attempt == attempt
+        ));
+        guard.disarm();
+    }
+
+    #[test]
+    fn recovered_transport_retry_gets_a_distinct_attempt_in_the_same_execution() {
+        let pinned = pinned_test_completion();
+        let execution = pinned.begin_execution();
+        let route = pinned.route.identity();
+        let recovered = terminalize_recovered_provider_failures(
+            execution,
+            &route,
+            vec![ProviderRequestError::Connect(
+                "attested route changed before connect".to_string(),
+            )],
+        );
+        let final_attempt = execution.begin_attempt(route);
+
+        let recovered_attempt = match recovered.as_slice() {
+            [AttemptTerminal::Failed { attempt, failure }] => {
+                assert_eq!(failure.kind, AttemptFailureKind::Connect);
+                assert_eq!(failure.replay_safety, ReplaySafety::ProvenPreAcceptance);
+                attempt
+            }
+            terminals => panic!("unexpected recovered terminal sequence: {terminals:?}"),
+        };
+        assert_eq!(recovered_attempt.request_id, final_attempt.request_id);
+        assert_eq!(recovered_attempt.execution_id, final_attempt.execution_id);
+        assert_ne!(recovered_attempt.attempt_id, final_attempt.attempt_id);
+    }
+
+    #[tokio::test]
+    async fn transport_v2_stream_requires_provider_done_despite_finish_evidence() {
+        let (without_done, chunks) = process_mock_sse_with_policy(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            true,
+        )
+        .await;
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(
+            without_done.terminal,
+            AttemptTerminal::Failed {
+                failure: AttemptFailure {
+                    kind: AttemptFailureKind::UnexpectedEof,
+                    replay_safety: ReplaySafety::NotProvenPreAcceptance,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let (with_done, _) = process_mock_sse_with_policy(
+            concat!(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            true,
+        )
+        .await;
+        assert!(matches!(
+            with_done.terminal,
+            AttemptTerminal::Completed {
+                evidence: CompletionEvidence::ProviderDone,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stream_eof_requires_prior_finish_evidence() {
+        let pinned = pinned_test_completion();
+        let attempt = pinned
+            .begin_execution()
+            .begin_attempt(pinned.route.identity());
+
+        assert!(matches!(
+            stream_end_terminal(attempt.clone(), true, false, false),
+            AttemptTerminal::Completed {
+                evidence: CompletionEvidence::FinishSignalThenEof,
+                ..
+            }
+        ));
+        assert!(matches!(
+            stream_end_terminal(attempt, false, false, false),
+            AttemptTerminal::Failed {
+                failure: AttemptFailure {
+                    kind: AttemptFailureKind::UnexpectedEof,
+                    replay_safety: ReplaySafety::NotProvenPreAcceptance,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn retry_after_seconds_are_bounded_and_invalid_values_are_ignored() {
+        assert_eq!(
+            parse_retry_after_hint(Some("60")),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            parse_retry_after_hint(Some("7200")),
+            Some(Duration::from_secs(3600))
+        );
+        assert_eq!(parse_retry_after_hint(Some("not-seconds")), None);
+        assert_eq!(parse_retry_after_hint(None), None);
     }
 
     #[test]

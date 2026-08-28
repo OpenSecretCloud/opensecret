@@ -5,6 +5,10 @@ use crate::{
     billing::{BillingError, ChatBillingAccess},
     db::DBError,
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
+    inference::{
+        AttemptFailure, AttemptFailureKind, AttemptTerminal, InferenceIntent, InferenceSurface,
+        ReplaySafety, WorkloadClass,
+    },
     jwt::AuthContext,
     model_config::{
         model_alias_requires_flag_lookup, model_config, model_reasoning_history_strategy,
@@ -22,8 +26,9 @@ use crate::{
         openai::{
             ensure_completion_model_access, get_chat_completion_response,
             get_chat_completion_response_for_execution,
-            get_chat_completion_response_for_expected_route, BillingContext, CompletionCachePolicy,
-            CompletionChunk, CompletionExecutionContext, InferenceRoutingContext,
+            get_chat_completion_response_for_expected_route, prepare_completion_request,
+            BillingContext, CompletionCachePolicy, CompletionChunk, CompletionExecutionContext,
+            CompletionExecutionError, InferenceRoutingContext, PinnedCompletionRequest,
             ServerSelectedCompletionRoute,
         },
         openai_auth::AuthMethod,
@@ -461,9 +466,10 @@ mod tests {
         build_model_turn_request, build_provider_tools, client_cancellation_terminal_decision,
         final_assistant_finish_reason, finalize_first_model_tool_call,
         has_streamed_tool_call_entries, image_attachments, image_description_access,
-        image_description_api_error, maple_kagi_web_search_prompt,
-        model_turn_request_without_user_payload, next_client_message_after_durable_completion,
-        resolve_responses_model, resolve_responses_sampling, response_cancellation_ack_decision,
+        image_description_api_error, image_description_attempt_failure_class,
+        maple_kagi_web_search_prompt, model_turn_request_without_user_payload,
+        next_client_message_after_durable_completion, resolve_responses_model,
+        resolve_responses_sampling, response_cancellation_ack_decision,
         response_execution_for_status, send_storage_message,
         wait_for_local_response_execution_quiescence, web_search_is_selected,
         web_search_tool_turn_limit, web_search_tool_turn_limit_error,
@@ -477,6 +483,7 @@ mod tests {
     use crate::web::responses::{tools, StorageTaskOutcome};
     use crate::{
         billing::{BillingClient, ChatBillingAccess},
+        inference::{AttemptFailure, AttemptFailureKind, AttemptStage, ReplaySafety},
         model_config::{ModelAliasTargets, ModelPlan},
         models::responses::ResponseStatus,
         ApiError,
@@ -752,6 +759,63 @@ mod tests {
         );
         assert_eq!(
             image_description_api_error(ApiError::InternalServerError).class,
+            ImageDescriptionFailureClass::AmbiguousAfterSend
+        );
+    }
+
+    #[test]
+    fn test_image_description_typed_failures_preserve_fallback_safety() {
+        let pre_acceptance = AttemptFailure::new(
+            AttemptFailureKind::Connect,
+            AttemptStage::BeforeSend,
+            ReplaySafety::ProvenPreAcceptance,
+        );
+        assert_eq!(
+            image_description_attempt_failure_class(&pre_acceptance),
+            ImageDescriptionFailureClass::PreAcceptance
+        );
+
+        for status in [408, 425, 429, 500, 503, 529] {
+            let retryable = AttemptFailure::new(
+                AttemptFailureKind::HttpStatus,
+                AttemptStage::AwaitingResponse,
+                ReplaySafety::NotProvenPreAcceptance,
+            )
+            .with_upstream_response(status, None, None);
+            assert_eq!(
+                image_description_attempt_failure_class(&retryable),
+                ImageDescriptionFailureClass::RetryableResponse
+            );
+        }
+
+        let deterministic_rejection = AttemptFailure::new(
+            AttemptFailureKind::HttpStatus,
+            AttemptStage::AwaitingResponse,
+            ReplaySafety::NotProvenPreAcceptance,
+        )
+        .with_upstream_response(400, None, None);
+        assert_eq!(
+            image_description_attempt_failure_class(&deterministic_rejection),
+            ImageDescriptionFailureClass::Terminal
+        );
+
+        let invalid_response = AttemptFailure::new(
+            AttemptFailureKind::InvalidResponse,
+            AttemptStage::ResponseBody,
+            ReplaySafety::NotProvenPreAcceptance,
+        );
+        assert_eq!(
+            image_description_attempt_failure_class(&invalid_response),
+            ImageDescriptionFailureClass::InvalidResponse
+        );
+
+        let ambiguous = AttemptFailure::new(
+            AttemptFailureKind::ResponseBody,
+            AttemptStage::ResponseBody,
+            ReplaySafety::NotProvenPreAcceptance,
+        );
+        assert_eq!(
+            image_description_attempt_failure_class(&ambiguous),
             ImageDescriptionFailureClass::AmbiguousAfterSend
         );
     }
@@ -2901,6 +2965,58 @@ fn image_description_api_error(error: ApiError) -> ImageDescriptionAttemptError 
     ImageDescriptionAttemptError::new(class, format!("descriptor request failed: {error}"))
 }
 
+fn image_description_attempt_failure_class(
+    failure: &AttemptFailure,
+) -> ImageDescriptionFailureClass {
+    if failure.replay_safety == ReplaySafety::ProvenPreAcceptance {
+        return ImageDescriptionFailureClass::PreAcceptance;
+    }
+
+    match failure.kind {
+        AttemptFailureKind::HttpStatus
+            if failure.status.is_some_and(|status| {
+                matches!(status, 408 | 425 | 429) || (500..=599).contains(&status)
+            }) =>
+        {
+            ImageDescriptionFailureClass::RetryableResponse
+        }
+        AttemptFailureKind::HttpStatus
+            if failure
+                .status
+                .is_some_and(|status| (400..=499).contains(&status)) =>
+        {
+            ImageDescriptionFailureClass::Terminal
+        }
+        AttemptFailureKind::InvalidResponse | AttemptFailureKind::UpstreamResponseError => {
+            ImageDescriptionFailureClass::InvalidResponse
+        }
+        _ => ImageDescriptionFailureClass::AmbiguousAfterSend,
+    }
+}
+
+fn image_description_execution_error(
+    error: CompletionExecutionError,
+) -> ImageDescriptionAttemptError {
+    match error {
+        CompletionExecutionError::Request(error) => image_description_api_error(error),
+        CompletionExecutionError::Attempt {
+            terminal,
+            public_error,
+        } => {
+            let class = match &terminal {
+                AttemptTerminal::Failed { failure, .. } => {
+                    image_description_attempt_failure_class(failure)
+                }
+                AttemptTerminal::Completed { .. } => ImageDescriptionFailureClass::InvalidResponse,
+            };
+            ImageDescriptionAttemptError::new(
+                class,
+                format!("descriptor request failed: {public_error}"),
+            )
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ImageDescriptionAttemptExecutor for ResponsesImageDescriptionExecutor<'_> {
     async fn execute(
@@ -2930,7 +3046,7 @@ impl ImageDescriptionAttemptExecutor for ResponsesImageDescriptionExecutor<'_> {
             },
         )
         .await
-        .map_err(image_description_api_error)?;
+        .map_err(image_description_execution_error)?;
 
         if completion.metadata.provider_name != candidate.provider.as_str()
             || completion.metadata.model_name != candidate.public_model_id
@@ -2950,11 +3066,15 @@ impl ImageDescriptionAttemptExecutor for ResponsesImageDescriptionExecutor<'_> {
                     )
                 })
             }
-            Some(CompletionChunk::Error(_)) => Err(ImageDescriptionAttemptError::new(
-                ImageDescriptionFailureClass::AmbiguousAfterSend,
-                "descriptor response stream returned an error",
-            )),
-            Some(_) => Err(ImageDescriptionAttemptError::new(
+            Some(CompletionChunk::Terminal(AttemptTerminal::Failed { failure, .. })) => {
+                Err(ImageDescriptionAttemptError::new(
+                    image_description_attempt_failure_class(&failure),
+                    "descriptor response ended with a failed terminal",
+                ))
+            }
+            Some(CompletionChunk::Terminal(AttemptTerminal::Completed { .. }))
+            | Some(CompletionChunk::StreamChunk(_))
+            | Some(CompletionChunk::Usage(_)) => Err(ImageDescriptionAttemptError::new(
                 ImageDescriptionFailureClass::InvalidResponse,
                 "descriptor response had an unexpected chunk type",
             )),
@@ -3132,6 +3252,25 @@ fn spawn_title_generation_task(
             crate::web::openai_auth::AuthMethod::Jwt,
             "llama3-3-70b".to_string(),
         );
+        let title_intent = InferenceIntent::new(
+            user.uuid,
+            "llama3-3-70b",
+            "llama3-3-70b",
+            ModelPlan::Free,
+            InferenceSurface::Internal,
+            WorkloadClass::Background,
+        );
+        let pinned_completion =
+            match prepare_completion_request(&state, &user, title_intent, routing).await {
+                Ok(pinned) => pinned,
+                Err(error) => {
+                    error!(
+                        "Title generation: failed to prepare inference route: {:?}",
+                        error
+                    );
+                    return;
+                }
+            };
 
         debug!("Title generation: about to call get_chat_completion_response");
         match get_chat_completion_response(
@@ -3140,6 +3279,7 @@ fn spawn_title_generation_task(
             title_request,
             &headers,
             CompletionExecutionContext::new(billing_context, routing, &cache_policy),
+            &pinned_completion,
         )
         .await
         {
@@ -3159,7 +3299,6 @@ fn spawn_title_generation_task(
                         {
                             let title = title.trim();
                             trace!("Generated title for conversation {}", conversation_uuid);
-
                             // Get current conversation metadata
                             match state
                                 .db
@@ -3222,7 +3361,7 @@ fn spawn_title_generation_task(
                             );
                         }
                     }
-                    Some(_other_chunk) => {
+                    Some(_) => {
                         error!("Expected FullResponse chunk for title generation but got unexpected chunk type");
                     }
                     None => {
@@ -3986,7 +4125,7 @@ async fn stream_one_assistant_turn(
     state: &Arc<AppState>,
     user: &User,
     body: &ResponsesCreateRequest,
-    routing: InferenceRoutingContext,
+    pinned_completion: &PinnedCompletionRequest,
     headers: &HeaderMap,
     prompt_messages: &[Value],
     tools_enabled: bool,
@@ -4007,8 +4146,8 @@ async fn stream_one_assistant_turn(
         .unwrap_or_default();
 
     debug!(
-        "Responses assistant turn request metadata: user_uuid={}, conversation_uuid={}, response_uuid={}, model={}, tool_turn_count={}, prompt_token_estimate={}, prompt_message_count={}, tools_enabled={}, chat_request_bytes={}",
-        user.uuid,
+        "Responses assistant turn request metadata: request_id={}, conversation_uuid={}, response_uuid={}, model={}, tool_turn_count={}, prompt_token_estimate={}, prompt_message_count={}, tools_enabled={}, chat_request_bytes={}",
+        pinned_completion.intent().request_id,
         conversation_uuid,
         response_uuid,
         body.model,
@@ -4021,7 +4160,7 @@ async fn stream_one_assistant_turn(
 
     let billing_context = crate::web::openai::BillingContext::new(
         crate::web::openai_auth::AuthMethod::Jwt,
-        body.model.clone(),
+        pinned_completion.intent().requested_model_id.clone(),
     );
 
     let mut completion = get_chat_completion_response_for_execution(
@@ -4029,14 +4168,20 @@ async fn stream_one_assistant_turn(
         user,
         chat_request.take(),
         headers,
-        CompletionExecutionContext::new(billing_context, routing, cache_policy),
+        CompletionExecutionContext::for_pinned(billing_context, pinned_completion, cache_policy),
+        pinned_completion,
         response_execution,
     )
-    .await?;
+    .await
+    .map_err(CompletionExecutionError::into_api_error)?;
 
     debug!(
-        "Received completion from provider: {} (model: {})",
-        completion.metadata.provider_name, completion.metadata.model_name
+        "Received Responses completion stream: request_id={}, execution_id={}, attempt_id={}, provider={}, model={}",
+        completion.metadata.attempt.request_id,
+        completion.metadata.attempt.execution_id,
+        completion.metadata.attempt.attempt_id,
+        completion.metadata.provider_name,
+        completion.metadata.model_name
     );
 
     let mut streamed_tool_calls = Vec::new();
@@ -4196,7 +4341,9 @@ async fn stream_one_assistant_turn(
                 )
                 .await?;
             }
-            crate::web::openai::CompletionChunk::Done => {
+            crate::web::openai::CompletionChunk::Terminal(AttemptTerminal::Completed {
+                ..
+            }) => {
                 close_reasoning_if_active(&mut reasoning, tx_storage, tx_client).await?;
 
                 if assistant_turn_finished_with_tool_call(
@@ -4258,8 +4405,14 @@ async fn stream_one_assistant_turn(
                 .await?;
                 return Ok(AssistantTurnOutcome::Final);
             }
-            crate::web::openai::CompletionChunk::Error(error_msg) => {
-                error!("Received error from completion stream: {}", error_msg);
+            crate::web::openai::CompletionChunk::Terminal(AttemptTerminal::Failed {
+                failure,
+                ..
+            }) => {
+                error!(
+                    "Received failed inference terminal: kind={:?}, stage={:?}",
+                    failure.kind, failure.stage
+                );
                 return Err(ApiError::InternalServerError);
             }
             crate::web::openai::CompletionChunk::FullResponse(_) => {
@@ -4283,7 +4436,7 @@ async fn setup_completion_processor(
     state: &Arc<AppState>,
     user: &User,
     body: &ResponsesCreateRequest,
-    routing: InferenceRoutingContext,
+    pinned_completion: &PinnedCompletionRequest,
     context: &BuiltContext,
     user_key: &SecretKey,
     assistant_message_id: Uuid,
@@ -4295,7 +4448,7 @@ async fn setup_completion_processor(
     response_execution: ResponseExecution,
     cache_policy: &CompletionCachePolicy,
 ) -> Result<crate::models::responses::Response, ApiError> {
-    let model_plan = routing.model_plan();
+    let model_plan = pinned_completion.intent().model_plan;
     let tools_enabled = context.web_search_enabled;
     let mut prompt_messages = Arc::as_ref(&context.prompt_messages).clone();
     let mut prompt_token_estimate = context.total_prompt_tokens;
@@ -4309,7 +4462,7 @@ async fn setup_completion_processor(
                 state,
                 user,
                 body,
-                routing,
+                pinned_completion,
                 headers,
                 &prompt_messages,
                 tools_enabled,
@@ -4391,7 +4544,6 @@ async fn create_response_stream(
         cache_namespace_root.map(|Extension(root)| root),
         user.uuid,
     )?;
-    trace!("User: {}", user.uuid);
     let requested_model = body.model.clone();
     let billing_access = state.chat_billing_access(user.uuid, false).await;
     let model_plan =
@@ -4503,6 +4655,20 @@ async fn create_response_stream(
         )
         .await?
     };
+
+    // Descriptor attempts are independent internal requests. Pin the user's
+    // main Responses route only after preprocessing so it observes the latest
+    // local routing state, then fail before persistence if no route is usable.
+    let inference_intent = InferenceIntent::new(
+        user.uuid,
+        requested_model,
+        body.model.clone(),
+        model_plan,
+        InferenceSurface::Responses,
+        WorkloadClass::Interactive,
+    );
+    let pinned_completion =
+        prepare_completion_request(&state, &user, inference_intent, routing).await?;
 
     // Phase 3: Persist request data
     let persisted = persist_request_data(
@@ -4636,6 +4802,7 @@ async fn create_response_stream(
     let web_search_enabled = context.web_search_enabled;
     let image_descriptions_for_stream = Arc::new(image_descriptions);
     let model_turn_body = model_turn_request_without_user_payload(&body);
+    let pinned_completion_for_stream = pinned_completion.clone();
 
     // Install every response-owned worker eagerly. An HTTP body is lazy and
     // may be dropped before its first poll; leaving worker startup inside the
@@ -4685,6 +4852,7 @@ async fn create_response_stream(
     let orchestrator_last_item_created_at = persisted.last_item_created_at;
     let orchestrator_conversation = conversation_for_stream.clone();
     let orchestrator_prompt_messages = prompt_messages.clone();
+    let orchestrator_pinned_completion = pinned_completion_for_stream.clone();
     let orchestrator_execution = response_execution.clone();
     let orchestrator_cache_policy = cache_policy.clone();
 
@@ -4715,7 +4883,7 @@ async fn create_response_stream(
                     &orchestrator_state,
                     &orchestrator_user,
                     &orchestrator_body,
-                    routing,
+                    &orchestrator_pinned_completion,
                     &context_for_completion,
                     &user_key,
                     assistant_message_id,
@@ -4838,6 +5006,7 @@ async fn create_response_stream(
                     yield Ok(ResponseEvent::ContentPartAdded(content_part_added_event).to_sse_event(&mut emitter).await);
                 }
                 StorageMessage::ContentDelta { item_id, delta } => {
+                    trace!("Client stream received content delta bytes={}", delta.len());
                     let Some(output_index) = client_state.append_message_delta(item_id, &delta) else {
                         warn!("Received content delta for unknown message item {}", item_id);
                         continue;
@@ -4915,6 +5084,7 @@ async fn create_response_stream(
                     yield Ok(ResponseEvent::OutputItemAdded(reasoning_item_added).to_sse_event(&mut emitter).await);
                 }
                 StorageMessage::ReasoningDelta { item_id, delta } => {
+                    trace!("Client stream received reasoning delta bytes={}", delta.len());
                     let Some(output_index) = client_state.append_reasoning_delta(item_id, &delta) else {
                         warn!("Received reasoning delta for unknown item {}", item_id);
                         continue;

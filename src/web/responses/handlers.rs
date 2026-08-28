@@ -23,7 +23,8 @@ use crate::{
             ensure_completion_model_access, get_chat_completion_response,
             get_chat_completion_response_for_execution,
             get_chat_completion_response_for_expected_route, BillingContext, CompletionCachePolicy,
-            CompletionChunk, CompletionExecutionContext, ServerSelectedCompletionRoute,
+            CompletionChunk, CompletionExecutionContext, InferenceRoutingContext,
+            ServerSelectedCompletionRoute,
         },
         openai_auth::AuthMethod,
         responses::{
@@ -1362,6 +1363,60 @@ mod tests {
             build_model_turn_request(&body, &[json!({"role": "user", "content": "hello"})], false);
 
         assert_eq!(chat_request["model"], crate::model_config::QUICK_MODEL_ID);
+    }
+
+    #[test]
+    fn test_golden_responses_alias_resolution_matrix() {
+        struct Case {
+            name: &'static str,
+            plan: ModelPlan,
+            selector: &'static str,
+            expected_model: &'static str,
+            expected_access: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "free auto quick",
+                plan: ModelPlan::Free,
+                selector: crate::model_config::AUTO_QUICK_MODEL_ID,
+                expected_model: crate::model_config::QUICK_MODEL_ID,
+                expected_access: true,
+            },
+            Case {
+                name: "free auto powerful",
+                plan: ModelPlan::Free,
+                selector: crate::model_config::AUTO_POWERFUL_MODEL_ID,
+                expected_model: crate::model_config::GLM_5_2_MODEL_ID,
+                expected_access: false,
+            },
+            Case {
+                name: "paid auto quick",
+                plan: ModelPlan::Paid,
+                selector: crate::model_config::AUTO_QUICK_MODEL_ID,
+                expected_model: crate::model_config::DEEPSEEK_V4_FLASH_MODEL_ID,
+                expected_access: true,
+            },
+            Case {
+                name: "paid auto powerful",
+                plan: ModelPlan::Paid,
+                selector: crate::model_config::AUTO_POWERFUL_MODEL_ID,
+                expected_model: crate::model_config::GLM_5_2_MODEL_ID,
+                expected_access: true,
+            },
+        ];
+
+        for case in cases {
+            let targets = ModelAliasTargets::for_plan(case.plan);
+            let selected_model = targets.resolve(case.selector);
+
+            assert_eq!(selected_model, case.expected_model, "{}", case.name);
+            let result = resolve_responses_model(selected_model, "tinfoil", case.plan);
+            assert_eq!(result.is_ok(), case.expected_access, "{}", case.name);
+            if case.expected_access {
+                assert_eq!(result.unwrap(), case.expected_model, "{}", case.name);
+            }
+        }
     }
 
     #[test]
@@ -2830,6 +2885,7 @@ struct ResponsesImageDescriptionExecutor<'a> {
     state: &'a Arc<AppState>,
     user: &'a User,
     cache_policy: &'a CompletionCachePolicy,
+    routing: InferenceRoutingContext,
     _access: PaidImageDescriptionAccess,
 }
 
@@ -2867,7 +2923,7 @@ impl ImageDescriptionAttemptExecutor for ResponsesImageDescriptionExecutor<'_> {
             self.user,
             request,
             &headers,
-            CompletionExecutionContext::new(billing_context, ModelPlan::Paid, self.cache_policy),
+            CompletionExecutionContext::new(billing_context, self.routing, self.cache_policy),
             ServerSelectedCompletionRoute {
                 provider_name: candidate.provider.as_str(),
                 provider_model_id: candidate.provider_model_id,
@@ -2914,6 +2970,7 @@ async fn describe_images(
     state: &Arc<AppState>,
     user: &User,
     cache_policy: &CompletionCachePolicy,
+    routing: InferenceRoutingContext,
     access: PaidImageDescriptionAccess,
     images: &[ImageAttachment],
 ) -> Result<Vec<ImageDescriptionToolPair>, ApiError> {
@@ -2921,6 +2978,7 @@ async fn describe_images(
         state,
         user,
         cache_policy,
+        routing,
         _access: access,
     };
     let fallback_policy = RetryNonTerminalImageDescriptionFallbackPolicy;
@@ -3030,6 +3088,7 @@ struct PersistedData {
 /// * `user` - The user who owns the conversation
 /// * `user_key` - User's encryption key for metadata
 /// * `user_content` - The user's first message content
+#[allow(clippy::too_many_arguments)]
 fn spawn_title_generation_task(
     state: Arc<AppState>,
     conversation_id: i64,
@@ -3038,6 +3097,7 @@ fn spawn_title_generation_task(
     user_key: SecretKey,
     user_content: String,
     cache_policy: CompletionCachePolicy,
+    routing: InferenceRoutingContext,
 ) {
     tokio::spawn(async move {
         debug!(
@@ -3079,7 +3139,7 @@ fn spawn_title_generation_task(
             &user,
             title_request,
             &headers,
-            CompletionExecutionContext::new(billing_context, ModelPlan::Free, &cache_policy),
+            CompletionExecutionContext::new(billing_context, routing, &cache_policy),
         )
         .await
         {
@@ -3926,7 +3986,7 @@ async fn stream_one_assistant_turn(
     state: &Arc<AppState>,
     user: &User,
     body: &ResponsesCreateRequest,
-    model_plan: ModelPlan,
+    routing: InferenceRoutingContext,
     headers: &HeaderMap,
     prompt_messages: &[Value],
     tools_enabled: bool,
@@ -3969,7 +4029,7 @@ async fn stream_one_assistant_turn(
         user,
         chat_request.take(),
         headers,
-        CompletionExecutionContext::new(billing_context, model_plan, cache_policy),
+        CompletionExecutionContext::new(billing_context, routing, cache_policy),
         response_execution,
     )
     .await?;
@@ -4223,7 +4283,7 @@ async fn setup_completion_processor(
     state: &Arc<AppState>,
     user: &User,
     body: &ResponsesCreateRequest,
-    model_plan: ModelPlan,
+    routing: InferenceRoutingContext,
     context: &BuiltContext,
     user_key: &SecretKey,
     assistant_message_id: Uuid,
@@ -4235,6 +4295,7 @@ async fn setup_completion_processor(
     response_execution: ResponseExecution,
     cache_policy: &CompletionCachePolicy,
 ) -> Result<crate::models::responses::Response, ApiError> {
+    let model_plan = routing.model_plan();
     let tools_enabled = context.web_search_enabled;
     let mut prompt_messages = Arc::as_ref(&context.prompt_messages).clone();
     let mut prompt_token_estimate = context.total_prompt_tokens;
@@ -4248,7 +4309,7 @@ async fn setup_completion_processor(
                 state,
                 user,
                 body,
-                model_plan,
+                routing,
                 headers,
                 &prompt_messages,
                 tools_enabled,
@@ -4348,6 +4409,8 @@ async fn create_response_stream(
         ModelAliasTargets::for_plan(model_plan)
     };
     let selected_model = alias_targets.resolve(&requested_model).to_string();
+    let routing =
+        InferenceRoutingContext::new(model_plan, state.inference_routing_mode(user.uuid).await);
     let completion_provider = state.proxy_router.get_completion_proxy();
     let resolved_model = resolve_responses_model(
         &selected_model,
@@ -4415,6 +4478,7 @@ async fn create_response_stream(
                 &state,
                 &user,
                 &cache_policy,
+                routing.with_model_plan(ModelPlan::Paid),
                 access,
                 &prepared.image_attachments,
             )
@@ -4551,6 +4615,7 @@ async fn create_response_stream(
             prepared.user_key,
             user_content,
             cache_policy.clone(),
+            routing.with_model_plan(ModelPlan::Free),
         );
     }
 
@@ -4650,7 +4715,7 @@ async fn create_response_stream(
                     &orchestrator_state,
                     &orchestrator_user,
                     &orchestrator_body,
-                    model_plan,
+                    routing,
                     &context_for_completion,
                     &user_key,
                     assistant_message_id,

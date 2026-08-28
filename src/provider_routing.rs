@@ -11,6 +11,26 @@ pub(crate) enum ProviderName {
     Continuum,
 }
 
+/// Selects the completion-routing implementation once at an authenticated
+/// inference entrypoint. The choice is carried through the complete logical
+/// request so feature-flag changes cannot switch routers between provider
+/// turns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum InferenceRoutingMode {
+    #[default]
+    Legacy,
+    V2,
+}
+
+impl InferenceRoutingMode {
+    pub(crate) const fn from_router_v2_flag(value: Option<bool>) -> Self {
+        match value {
+            Some(true) => Self::V2,
+            Some(false) | None => Self::Legacy,
+        }
+    }
+}
+
 impl ProviderName {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
@@ -254,6 +274,49 @@ impl ProviderRouter {
         self.fallback_completion_route(proxy_router, requested_model)
     }
 
+    /// Dispatch completion routing through the request-scoped implementation
+    /// selected at the public inference entrypoint. Router v2 intentionally
+    /// delegates to the legacy implementation in this foundation stack; later
+    /// stacks may evolve only the v2 branch while the legacy path stays intact.
+    pub(crate) fn select_completion_route_for_mode(
+        &self,
+        proxy_router: &ProxyRouter,
+        account_uuid: Uuid,
+        requested_model: &str,
+        provider_preference: Option<ProviderPreference>,
+        routing_mode: InferenceRoutingMode,
+    ) -> Result<SelectedProviderRoute, ProviderRoutingError> {
+        match routing_mode {
+            InferenceRoutingMode::Legacy => self.select_completion_route_with_preference(
+                proxy_router,
+                account_uuid,
+                requested_model,
+                provider_preference,
+            ),
+            InferenceRoutingMode::V2 => self.select_completion_route_v2(
+                proxy_router,
+                account_uuid,
+                requested_model,
+                provider_preference,
+            ),
+        }
+    }
+
+    fn select_completion_route_v2(
+        &self,
+        proxy_router: &ProxyRouter,
+        account_uuid: Uuid,
+        requested_model: &str,
+        provider_preference: Option<ProviderPreference>,
+    ) -> Result<SelectedProviderRoute, ProviderRoutingError> {
+        self.select_completion_route_with_preference(
+            proxy_router,
+            account_uuid,
+            requested_model,
+            provider_preference,
+        )
+    }
+
     pub(crate) fn provider_routing_flag_for_completion_model(
         &self,
         requested_model: &str,
@@ -470,7 +533,11 @@ fn proxy_for_provider(proxy_router: &ProxyRouter, provider: ProviderName) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_config::{ModelAliasTargets, ModelPlan, PaidModelAliasOverrides};
+    use crate::model_config::{
+        ModelAliasTargets, ModelPlan, PaidModelAliasOverrides, AUTO_POWERFUL_MODEL_ID,
+        AUTO_QUICK_MODEL_ID, DEEPSEEK_V4_FLASH_MODEL_ID, GLM_5_2_MODEL_ID, GLM_5_3_FLASH_MODEL_ID,
+        GLM_5_3_MODEL_ID, KIMI_K3_MODEL_ID, QUICK_MODEL_ID,
+    };
     use crate::os_flags::PAID_POWERFUL_GLM_5_3_ALIAS_FLAG_KEY;
     use std::collections::HashMap;
 
@@ -492,6 +559,262 @@ mod tests {
         assert_eq!(stable_account_bucket(uuid_for_bucket(49)), 49);
         assert_eq!(stable_account_bucket(uuid_for_bucket(50)), 50);
         assert_eq!(stable_account_bucket(uuid_for_bucket(99)), 99);
+    }
+
+    #[test]
+    fn router_v2_flag_is_strictly_opt_in() {
+        assert_eq!(
+            InferenceRoutingMode::from_router_v2_flag(Some(true)),
+            InferenceRoutingMode::V2
+        );
+        assert_eq!(
+            InferenceRoutingMode::from_router_v2_flag(Some(false)),
+            InferenceRoutingMode::Legacy
+        );
+        assert_eq!(
+            InferenceRoutingMode::from_router_v2_flag(None),
+            InferenceRoutingMode::Legacy
+        );
+    }
+
+    #[test]
+    fn initial_router_v2_seam_is_route_identical_to_legacy() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+        let cases = [
+            (GLM_5_2_MODEL_ID, None),
+            (
+                GLM_5_2_MODEL_ID,
+                Some(ProviderPreference::feature_flag(ProviderName::Continuum)),
+            ),
+            (GLM_5_3_MODEL_ID, None),
+            (
+                GLM_5_3_MODEL_ID,
+                Some(ProviderPreference::feature_flag(ProviderName::Tinfoil)),
+            ),
+            (GLM_5_3_FLASH_MODEL_ID, None),
+            ("kimi-k2-6", None),
+            ("gpt-oss-120b", None),
+        ];
+
+        for (model, preference) in cases {
+            let legacy = router
+                .select_completion_route_for_mode(
+                    &proxy_router,
+                    uuid_for_bucket(73),
+                    model,
+                    preference,
+                    InferenceRoutingMode::Legacy,
+                )
+                .expect("legacy route");
+            let v2 = router
+                .select_completion_route_for_mode(
+                    &proxy_router,
+                    uuid_for_bucket(73),
+                    model,
+                    preference,
+                    InferenceRoutingMode::V2,
+                )
+                .expect("v2 route");
+
+            assert_eq!(
+                legacy.proxy.provider_name, v2.proxy.provider_name,
+                "{model}"
+            );
+            assert_eq!(legacy.proxy.base_url, v2.proxy.base_url, "{model}");
+            assert_eq!(legacy.public_model_id, v2.public_model_id, "{model}");
+            assert_eq!(legacy.provider_model_id, v2.provider_model_id, "{model}");
+            assert_eq!(legacy.response_model_id, v2.response_model_id, "{model}");
+            assert_eq!(legacy.bucket, v2.bucket, "{model}");
+            assert_eq!(legacy.selection_source, v2.selection_source, "{model}");
+        }
+    }
+
+    #[test]
+    fn test_golden_completion_route_matrix_by_selector_plan_and_provider_preference() {
+        #[derive(Clone, Copy)]
+        struct Case {
+            name: &'static str,
+            selector: &'static str,
+            plan: ModelPlan,
+            provider_preference: Option<ProviderPreference>,
+            continuum_available: bool,
+            expected_access: bool,
+            expected_public_model: &'static str,
+            expected_provider: &'static str,
+            expected_provider_model: &'static str,
+            expected_source: ProviderSelectionSource,
+        }
+
+        let cases = [
+            Case {
+                name: "free auto quick",
+                selector: AUTO_QUICK_MODEL_ID,
+                plan: ModelPlan::Free,
+                provider_preference: None,
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: QUICK_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: QUICK_MODEL_ID,
+                expected_source: ProviderSelectionSource::StaticSplit,
+            },
+            Case {
+                name: "free auto powerful remains unavailable",
+                selector: AUTO_POWERFUL_MODEL_ID,
+                plan: ModelPlan::Free,
+                provider_preference: None,
+                continuum_available: true,
+                expected_access: false,
+                expected_public_model: GLM_5_2_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: GLM_5_2_MODEL_ID,
+                expected_source: ProviderSelectionSource::DefaultProvider,
+            },
+            Case {
+                name: "paid auto quick",
+                selector: AUTO_QUICK_MODEL_ID,
+                plan: ModelPlan::Paid,
+                provider_preference: None,
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: DEEPSEEK_V4_FLASH_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: DEEPSEEK_V4_FLASH_MODEL_ID,
+                expected_source: ProviderSelectionSource::StaticSplit,
+            },
+            Case {
+                name: "paid auto powerful uses GLM default",
+                selector: AUTO_POWERFUL_MODEL_ID,
+                plan: ModelPlan::Paid,
+                provider_preference: None,
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: GLM_5_2_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: GLM_5_2_MODEL_ID,
+                expected_source: ProviderSelectionSource::DefaultProvider,
+            },
+            Case {
+                name: "explicit K3 is independent of the auto target",
+                selector: KIMI_K3_MODEL_ID,
+                plan: ModelPlan::Paid,
+                provider_preference: None,
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: KIMI_K3_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: KIMI_K3_MODEL_ID,
+                expected_source: ProviderSelectionSource::StaticSplit,
+            },
+            Case {
+                name: "explicit GLM default",
+                selector: GLM_5_2_MODEL_ID,
+                plan: ModelPlan::Paid,
+                provider_preference: None,
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: GLM_5_2_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: GLM_5_2_MODEL_ID,
+                expected_source: ProviderSelectionSource::DefaultProvider,
+            },
+            Case {
+                name: "explicit GLM 5.3 Tinfoil preference",
+                selector: GLM_5_3_MODEL_ID,
+                plan: ModelPlan::Paid,
+                provider_preference: Some(ProviderPreference::feature_flag(ProviderName::Tinfoil)),
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: GLM_5_3_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: GLM_5_3_MODEL_ID,
+                expected_source: ProviderSelectionSource::FeatureFlag,
+            },
+            Case {
+                name: "explicit GLM 5.3 Continuum preference",
+                selector: GLM_5_3_MODEL_ID,
+                plan: ModelPlan::Paid,
+                provider_preference: Some(ProviderPreference::feature_flag(
+                    ProviderName::Continuum,
+                )),
+                continuum_available: true,
+                expected_access: true,
+                expected_public_model: GLM_5_3_MODEL_ID,
+                expected_provider: "continuum",
+                expected_provider_model: "glm-5.3",
+                expected_source: ProviderSelectionSource::FeatureFlag,
+            },
+            Case {
+                name: "explicit GLM 5.3 Tinfoil preference without a Continuum proxy",
+                selector: GLM_5_3_MODEL_ID,
+                plan: ModelPlan::Paid,
+                provider_preference: Some(ProviderPreference::feature_flag(ProviderName::Tinfoil)),
+                continuum_available: false,
+                expected_access: true,
+                expected_public_model: GLM_5_3_MODEL_ID,
+                expected_provider: "tinfoil",
+                expected_provider_model: GLM_5_3_MODEL_ID,
+                expected_source: ProviderSelectionSource::FeatureFlag,
+            },
+        ];
+
+        let router = ProviderRouter::default();
+        for case in cases {
+            let alias_targets = ModelAliasTargets::for_plan(case.plan);
+            let resolved_model = alias_targets.resolve(case.selector);
+            let access = case.plan.allows_model(resolved_model);
+
+            assert_eq!(access, case.expected_access, "{}", case.name);
+            if !case.expected_access {
+                continue;
+            }
+
+            let proxy_router = if case.continuum_available {
+                proxy_router_with_both_providers()
+            } else {
+                ProxyRouter::new(
+                    "https://api.openai.com".to_string(),
+                    None,
+                    "http://tinfoil.example.com".to_string(),
+                )
+            };
+            let selected = router
+                .select_completion_route_with_preference(
+                    &proxy_router,
+                    uuid_for_bucket(73),
+                    resolved_model,
+                    case.provider_preference,
+                )
+                .unwrap_or_else(|error| panic!("{}: {error:?}", case.name));
+
+            assert_eq!(
+                selected.public_model_id, case.expected_public_model,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                selected.provider_model_id, case.expected_provider_model,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                selected.response_model_id, case.expected_public_model,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                selected.proxy.provider_name, case.expected_provider,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                selected.selection_source, case.expected_source,
+                "{}",
+                case.name
+            );
+            assert_eq!(selected.bucket, None, "{}", case.name);
+        }
     }
 
     #[test]

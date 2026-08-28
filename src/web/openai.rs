@@ -10,7 +10,7 @@ use crate::provider_cache::{
 use crate::provider_client::{
     ProviderClient, ProviderRequest, ProviderRequestError, ProviderResponse,
 };
-use crate::provider_routing::{ProviderName, ProviderRoutingError};
+use crate::provider_routing::{InferenceRoutingMode, ProviderName, ProviderRoutingError};
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
@@ -563,7 +563,7 @@ pub struct BillingContext {
 /// completion implementation used by Chat and Responses.
 pub(crate) struct CompletionExecutionContext<'a> {
     billing: BillingContext,
-    model_plan: ModelPlan,
+    routing: InferenceRoutingContext,
     cache: &'a CompletionCachePolicy,
     response_execution: Option<ResponseExecution>,
     response_execution_guard: Option<ResponseExecutionTaskGuard>,
@@ -572,12 +572,12 @@ pub(crate) struct CompletionExecutionContext<'a> {
 impl<'a> CompletionExecutionContext<'a> {
     pub(crate) const fn new(
         billing: BillingContext,
-        model_plan: ModelPlan,
+        routing: InferenceRoutingContext,
         cache: &'a CompletionCachePolicy,
     ) -> Self {
         Self {
             billing,
-            model_plan,
+            routing,
             cache,
             response_execution: None,
             response_execution_guard: None,
@@ -604,6 +604,33 @@ impl BillingContext {
             auth_method,
             model_name,
         }
+    }
+}
+
+/// Immutable routing policy captured at an authenticated inference entrypoint.
+/// Internal child requests may use a different entitlement plan while retaining
+/// the same Router v1/v2 decision for the parent request's complete lifetime.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InferenceRoutingContext {
+    model_plan: ModelPlan,
+    mode: InferenceRoutingMode,
+}
+
+impl InferenceRoutingContext {
+    pub(crate) const fn new(model_plan: ModelPlan, mode: InferenceRoutingMode) -> Self {
+        Self { model_plan, mode }
+    }
+
+    pub(crate) const fn with_model_plan(self, model_plan: ModelPlan) -> Self {
+        Self { model_plan, ..self }
+    }
+
+    pub(crate) const fn model_plan(self) -> ModelPlan {
+        self.model_plan
+    }
+
+    pub(crate) const fn mode(self) -> InferenceRoutingMode {
+        self.mode
     }
 }
 
@@ -894,6 +921,8 @@ async fn proxy_openai(
 
     // Create billing context
     let billing_context = BillingContext::new(auth_method, requested_model_name);
+    let routing =
+        InferenceRoutingContext::new(model_plan, state.inference_routing_mode(user.uuid).await);
 
     // Get the completion stream - billing happens automatically inside!
     let completion = get_chat_completion_response(
@@ -901,7 +930,7 @@ async fn proxy_openai(
         &user,
         body,
         &headers,
-        CompletionExecutionContext::new(billing_context, model_plan, &cache_policy),
+        CompletionExecutionContext::new(billing_context, routing, &cache_policy),
     )
     .await?;
 
@@ -1106,11 +1135,12 @@ async fn get_chat_completion_response_with_expected_route(
 ) -> Result<CompletionStream, ApiError> {
     let CompletionExecutionContext {
         mut billing,
-        model_plan,
+        routing,
         cache,
         response_execution,
         response_execution_guard,
     } = execution;
+    let model_plan = routing.model_plan();
     let billing_context = &mut billing;
     let cache_policy = cache;
     let require_provider_done = cache_policy.requires_provider_done();
@@ -1159,11 +1189,12 @@ async fn get_chat_completion_response_with_expected_route(
         .await;
     let selected_route = state
         .provider_router
-        .select_completion_route_with_preference(
+        .select_completion_route_for_mode(
             &state.proxy_router,
             user.uuid,
             &requested_model_name,
             provider_preference,
+            routing.mode(),
         )
         .map_err(|err| match err {
             ProviderRoutingError::UnsupportedModel(model) => {
@@ -1204,7 +1235,8 @@ async fn get_chat_completion_response_with_expected_route(
         || selected_route.public_model_id != selected_route.provider_model_id
     {
         debug!(
-            "Selected completion route: requested_model={}, public_model={}, provider={}, provider_model={}, bucket={:?}, source={:?}",
+            "Selected completion route: routing_mode={:?}, requested_model={}, public_model={}, provider={}, provider_model={}, bucket={:?}, source={:?}",
+            routing.mode(),
             requested_model_name,
             selected_route.public_model_id,
             selected_route.proxy.provider_name,
@@ -3379,6 +3411,67 @@ mod tests {
         assert!(event.is_api_request);
         assert_eq!(event.provider_name, "continuum");
         assert_eq!(event.model_name, "kimi-k2-6");
+    }
+
+    #[test]
+    fn route_identity_is_preserved_in_usage_events() {
+        let usage = CompletionUsage {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            cached_prompt_tokens: Some(42),
+        };
+
+        for (provider, public_model) in [
+            ("tinfoil", "gpt-oss-120b"),
+            ("tinfoil", "deepseek-v4-flash"),
+            ("tinfoil", "kimi-k3"),
+            ("tinfoil", "glm-5-2"),
+            ("tinfoil", "glm-5-3"),
+            ("tinfoil", "glm-5-3-flash"),
+            ("continuum", "kimi-k2-6"),
+            ("continuum", "glm-5-3"),
+        ] {
+            let event = build_usage_event(
+                Uuid::parse_str("6142db59-fc0c-413d-8792-579fc1457fe2").unwrap(),
+                usage.clone(),
+                BigDecimal::from_str("0.001").unwrap(),
+                false,
+                provider.to_string(),
+                public_model.to_string(),
+            );
+
+            assert_eq!(event.provider_name, provider);
+            assert_eq!(event.model_name, public_model);
+            assert_eq!(event.input_tokens, 100);
+            assert_eq!(event.output_tokens, 20);
+            assert_eq!(event.cached_input_tokens, Some(42));
+        }
+    }
+
+    #[test]
+    fn provider_model_ids_are_canonicalized_in_client_responses() {
+        for (provider_model, public_model) in [
+            ("kimi-k2.6", "kimi-k2-6"),
+            ("glm-5.3", "glm-5-3"),
+            ("kimi-k3", "kimi-k3"),
+            ("glm-5-3-flash", "glm-5-3-flash"),
+        ] {
+            let mut response = json!({
+                "id": "completion-id",
+                "model": provider_model,
+                "choices": [],
+            });
+
+            canonicalize_response_model(&mut response, public_model);
+
+            assert_eq!(response["model"], public_model);
+            assert_eq!(response["id"], "completion-id");
+            assert_eq!(response["choices"], json!([]));
+        }
+
+        let mut response_without_model = json!({"choices": []});
+        canonicalize_response_model(&mut response_without_model, "glm-5-3-flash");
+        assert!(response_without_model.get("model").is_none());
     }
 
     fn stream_usage_chunk(

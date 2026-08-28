@@ -1153,6 +1153,45 @@ mod tests {
     }
 
     #[test]
+    fn test_golden_auto_alias_resolution_matrix_by_plan() {
+        for (plan, selector, expected_target) in [
+            (ModelPlan::Free, AUTO_QUICK_MODEL_ID, QUICK_MODEL_ID),
+            (
+                ModelPlan::Paid,
+                AUTO_QUICK_MODEL_ID,
+                DEEPSEEK_V4_FLASH_MODEL_ID,
+            ),
+            (ModelPlan::Free, AUTO_POWERFUL_MODEL_ID, GLM_5_2_MODEL_ID),
+            (ModelPlan::Paid, AUTO_POWERFUL_MODEL_ID, GLM_5_2_MODEL_ID),
+        ] {
+            let targets = ModelAliasTargets::for_plan(plan);
+            assert_eq!(targets.resolve(selector), expected_target, "plan={plan:?}");
+        }
+    }
+
+    #[test]
+    fn test_golden_explicit_model_resolution_is_plan_invariant() {
+        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+            let targets = ModelAliasTargets::for_plan(plan);
+            for model in [
+                QUICK_MODEL_ID,
+                "kimi-k2-6",
+                KIMI_K3_MODEL_ID,
+                GLM_5_2_MODEL_ID,
+                GLM_5_3_MODEL_ID,
+                GLM_5_3_FLASH_MODEL_ID,
+                DEEPSEEK_V4_FLASH_MODEL_ID,
+            ] {
+                assert_eq!(
+                    targets.resolve(model),
+                    model,
+                    "explicit model changed for plan={plan:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_catalog_alias_metadata_tracks_paid_targets() {
         let targets = ModelAliasTargets::for_plan(ModelPlan::Paid);
         let catalog = model_catalog_response(targets);

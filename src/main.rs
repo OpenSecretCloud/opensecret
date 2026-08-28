@@ -134,7 +134,7 @@ mod aead_db_tamper_tests;
 use apple_signin::AppleJwtVerifier;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
 use provider_client::{ProviderClient, ProviderRequestError};
-use provider_routing::{ProviderPreference, ProviderRouter};
+use provider_routing::{InferenceRoutingMode, ProviderPreference, ProviderRouter};
 use proxy_config::ProxyRouter;
 
 const ENCLAVE_KEY_NAME: &str = "enclave_key";
@@ -155,6 +155,7 @@ const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
 const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
 const MODEL_ALIAS_FLAGS_TIMEOUT_SECS: u64 = 5;
 const PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS: u64 = 5;
+const ROUTING_FLAGS_FAILURE_BACKOFF_SECS: u64 = 30;
 const BILLING_ACCESS_TIMEOUT_SECS: u64 = 5;
 const MAX_ATTESTATION_NONCE_BYTES: usize = 512;
 const MAX_PENDING_ATTESTATIONS: usize = 65_536;
@@ -792,9 +793,66 @@ pub struct AppState {
     sqs_publisher: Option<Arc<SqsEventPublisher>>,
     billing_client: Option<BillingClient>,
     os_flags_client: Option<os_flags::OsFlagsClient>,
+    router_v2_flag_failure_backoff: RoutingFlagsFailureBackoff,
     apple_jwt_verifier: Arc<AppleJwtVerifier>,
     response_executions: web::responses::ResponseExecutionRegistry,
     kagi_client: Option<Arc<crate::kagi::KagiClient>>,
+}
+
+#[derive(Clone, Debug)]
+struct RoutingFlagsFailureBackoff {
+    unavailable_until: Arc<RwLock<Option<tokio::time::Instant>>>,
+    duration: Duration,
+}
+
+impl Default for RoutingFlagsFailureBackoff {
+    fn default() -> Self {
+        Self {
+            unavailable_until: Arc::new(RwLock::new(None)),
+            duration: Duration::from_secs(ROUTING_FLAGS_FAILURE_BACKOFF_SECS),
+        }
+    }
+}
+
+impl RoutingFlagsFailureBackoff {
+    async fn is_active(&self) -> bool {
+        self.unavailable_until
+            .read()
+            .await
+            .is_some_and(|deadline| deadline > tokio::time::Instant::now())
+    }
+
+    async fn record_failure(&self) {
+        *self.unavailable_until.write().await = Some(tokio::time::Instant::now() + self.duration);
+    }
+
+    async fn record_success(&self) {
+        *self.unavailable_until.write().await = None;
+    }
+}
+
+#[cfg(test)]
+mod routing_flags_failure_backoff_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failure_backoff_opens_closes_and_expires() {
+        let backoff = RoutingFlagsFailureBackoff {
+            unavailable_until: Arc::new(RwLock::new(None)),
+            duration: Duration::from_millis(1),
+        };
+
+        assert!(!backoff.is_active().await);
+        backoff.record_failure().await;
+        assert!(backoff.is_active().await);
+
+        backoff.record_success().await;
+        assert!(!backoff.is_active().await);
+
+        backoff.record_failure().await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(!backoff.is_active().await);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1133,6 +1191,7 @@ impl AppStateBuilder {
             sqs_publisher,
             billing_client,
             os_flags_client,
+            router_v2_flag_failure_backoff: RoutingFlagsFailureBackoff::default(),
             apple_jwt_verifier,
             response_executions: web::responses::ResponseExecutionRegistry::default(),
             kagi_client,
@@ -1208,6 +1267,76 @@ impl AppState {
         ModelAliasTargets::for_plan_with_overrides(model_plan, overrides)
     }
 
+    /// Resolve the inference router exactly once for an authenticated external
+    /// request. Router v2 is opt-in: absent configuration, a missing or false
+    /// flag, service failure, and timeout all retain the legacy router.
+    pub(crate) async fn inference_routing_mode(&self, user_uuid: Uuid) -> InferenceRoutingMode {
+        let flag_key = os_flags::INFERENCE_ROUTER_V2_FLAG_KEY;
+        let Some(client) = &self.os_flags_client else {
+            trace!(
+                user_uuid = %user_uuid,
+                flag_key,
+                "os-flags client not configured; retaining legacy inference router"
+            );
+            return InferenceRoutingMode::Legacy;
+        };
+        if self.router_v2_flag_failure_backoff.is_active().await {
+            let cached_value = client.get_cached_bool_flag(user_uuid, flag_key).await;
+            let mode = cached_value
+                .flatten()
+                .map(|value| InferenceRoutingMode::from_router_v2_flag(Some(value)))
+                .unwrap_or(InferenceRoutingMode::Legacy);
+            trace!(
+                user_uuid = %user_uuid,
+                flag_key,
+                cache_hit = cached_value.is_some(),
+                routing_mode = ?mode,
+                "os-flags routing checks are in failure backoff; using cached inference-router decision"
+            );
+            return mode;
+        }
+
+        let mode = match tokio::time::timeout(
+            Duration::from_secs(PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS),
+            client.get_bool_flag(user_uuid, flag_key),
+        )
+        .await
+        {
+            Ok(Ok(value)) => {
+                self.router_v2_flag_failure_backoff.record_success().await;
+                InferenceRoutingMode::from_router_v2_flag(value)
+            }
+            Ok(Err(error)) => {
+                self.router_v2_flag_failure_backoff.record_failure().await;
+                warn!(
+                    user_uuid = %user_uuid,
+                    flag_key,
+                    %error,
+                    "os-flags inference-router check failed; retaining legacy router"
+                );
+                InferenceRoutingMode::Legacy
+            }
+            Err(_) => {
+                self.router_v2_flag_failure_backoff.record_failure().await;
+                warn!(
+                    user_uuid = %user_uuid,
+                    flag_key,
+                    timeout_seconds = PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS,
+                    "os-flags inference-router check timed out; retaining legacy router"
+                );
+                InferenceRoutingMode::Legacy
+            }
+        };
+
+        debug!(
+            user_uuid = %user_uuid,
+            flag_key,
+            routing_mode = ?mode,
+            "Resolved request-scoped inference router"
+        );
+        mode
+    }
+
     /// Resolve an explicit provider preference only for models configured for
     /// flag-controlled routing. Missing configuration, flags, failures, and
     /// timeouts retain the model's default provider.
@@ -1228,7 +1357,6 @@ impl AppState {
             );
             return None;
         };
-
         match tokio::time::timeout(
             Duration::from_secs(PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS),
             client.get_bool_flag(user_uuid, flag_key),

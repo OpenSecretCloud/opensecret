@@ -5,6 +5,7 @@
 //! functions, and returns plaintext logical results for the gateway to encrypt
 //! through the request's original session lease.
 
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,8 +25,9 @@ use crate::web::login_routes::{
     RegisterCredentials,
 };
 use crate::web::protected_routes::{
-    private_key_bytes_data, private_key_data, protected_user_data, public_key_data,
-    sign_message_data, third_party_token_data, DerivationPathQuery, PublicKeyQuery,
+    decrypt_data_value, encrypt_data_value, private_key_bytes_data, private_key_data,
+    protected_user_data, public_key_data, sign_message_data, third_party_token_data,
+    DecryptDataRequest, DerivationPathQuery, EncryptDataRequest, PublicKeyQuery,
     SignMessageRequest, ThirdPartyTokenRequest,
 };
 use crate::{ApiError, AppState, VerifiedUserAuthentication};
@@ -41,6 +43,12 @@ use super::session::{
 use super::session_cache::V2SessionLease;
 
 const JSON_CONTENT_TYPE: &[u8] = b"application/json";
+const AES_GCM_NONCE_AND_TAG_BYTES: usize = 12 + 16;
+const ENCRYPTED_DATA_JSON_OVERHEAD_BYTES: usize = "{\"encrypted_data\":\"".len() + "\"}".len();
+const MAX_ENCRYPTED_DATA_BASE64_BYTES: usize =
+    ((EnvelopeLimits::DEFAULT.logical_body_bytes - ENCRYPTED_DATA_JSON_OVERHEAD_BYTES) / 4) * 4;
+const MAX_ENCRYPTION_PLAINTEXT_BYTES: usize =
+    (MAX_ENCRYPTED_DATA_BASE64_BYTES / 4) * 3 - AES_GCM_NONCE_AND_TAG_BYTES;
 
 type SensitiveBytes = Zeroizing<Vec<u8>>;
 
@@ -73,6 +81,8 @@ pub(crate) enum ProtectedUserOperation {
     GetPublicKey { query: Option<String> },
     SignMessage { body: SensitiveBytes },
     IssueThirdPartyToken { body: SensitiveBytes },
+    EncryptData { body: SensitiveBytes },
+    DecryptData { body: SensitiveBytes },
 }
 
 #[derive(Clone)]
@@ -80,6 +90,53 @@ pub(crate) struct BoundUserAuthority {
     user_id: uuid::Uuid,
     project_id: i32,
     auth_context: AuthContext,
+}
+
+struct BoundedJsonBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl BoundedJsonBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            exceeded: false,
+        }
+    }
+
+    fn into_bytes(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl Write for BoundedJsonBuffer {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.bytes.len().checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("serialized JSON length overflow"));
+        };
+        if next > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::other(
+                "serialized JSON exceeds logical response limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for BoundedJsonBuffer {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
 }
 
 impl UserOperation {
@@ -107,17 +164,18 @@ impl LogicalUnaryResponse {
         value: &T,
         logical_body_bytes: usize,
     ) -> Result<Self, ApiError> {
-        let mut body = serde_json::to_vec(value).map_err(|error| {
+        let mut buffer = BoundedJsonBuffer::new(logical_body_bytes);
+        if let Err(error) = serde_json::to_writer(&mut buffer, value) {
+            if buffer.exceeded {
+                return Err(ApiError::PayloadTooLarge);
+            }
             tracing::error!(
                 "Could not serialize transport-v2 logical response: {:?}",
                 error
             );
-            ApiError::InternalServerError
-        })?;
-        if body.len() > logical_body_bytes {
-            body.zeroize();
-            return Err(ApiError::PayloadTooLarge);
+            return Err(ApiError::InternalServerError);
         }
+        let body = buffer.into_bytes();
         Ok(Self {
             status,
             headers: vec![HeaderField {
@@ -209,6 +267,8 @@ pub(crate) fn prepare_user_operation(
         GetPublicKey,
         SignMessage,
         IssueThirdPartyToken,
+        EncryptData,
+        DecryptData,
     }
 
     let route = match (request.method, request.path.as_str()) {
@@ -221,6 +281,8 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Get, "/protected/public_key") => Route::GetPublicKey,
         (LogicalMethod::Post, "/protected/sign_message") => Route::SignMessage,
         (LogicalMethod::Post, "/protected/third_party_token") => Route::IssueThirdPartyToken,
+        (LogicalMethod::Post, "/protected/encrypt") => Route::EncryptData,
+        (LogicalMethod::Post, "/protected/decrypt") => Route::DecryptData,
         _ => return OperationPreparation::Unsupported,
     };
 
@@ -313,7 +375,10 @@ pub(crate) fn prepare_user_operation(
                 operation,
             })
         }
-        Route::SignMessage | Route::IssueThirdPartyToken => {
+        Route::SignMessage
+        | Route::IssueThirdPartyToken
+        | Route::EncryptData
+        | Route::DecryptData => {
             if credential.is_some()
                 || request.query.is_some()
                 || !has_exact_json_content_type(&request.headers)
@@ -338,6 +403,8 @@ pub(crate) fn prepare_user_operation(
                 Route::IssueThirdPartyToken => {
                     ProtectedUserOperation::IssueThirdPartyToken { body }
                 }
+                Route::EncryptData => ProtectedUserOperation::EncryptData { body },
+                Route::DecryptData => ProtectedUserOperation::DecryptData { body },
                 _ => unreachable!("fixed protected POST classifier is exhaustive"),
             };
             OperationPreparation::Ready(UserOperation::Protected {
@@ -546,6 +613,25 @@ async fn execute_protected_user_operation(
             let value = third_party_token_data(app_state, user, request)?;
             LogicalUnaryResponse::json(StatusCode::OK, &value)
         }
+        ProtectedUserOperation::EncryptData { body } => {
+            let mut request = parse_json_body::<EncryptDataRequest>(body)?;
+            if let Err(error) = validate_encryption_plaintext_length(request.data.len()) {
+                request.data.zeroize();
+                return Err(error);
+            }
+            let value = encrypt_data_value(app_state, user, auth_context, request).await?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::DecryptData { body } => {
+            let mut request = parse_json_body::<DecryptDataRequest>(body)?;
+            if let Err(error) = validate_encrypted_data_base64_length(request.encrypted_data.len())
+            {
+                request.encrypted_data.zeroize();
+                return Err(error);
+            }
+            let value = decrypt_data_value(app_state, user, auth_context, request).await?;
+            LogicalUnaryResponse::json(StatusCode::OK, &*value)
+        }
     }
 }
 
@@ -564,6 +650,22 @@ fn parse_logical_query<T: DeserializeOwned>(query: Option<String>) -> Result<T, 
     Query::<T>::try_from_uri(&uri)
         .map(|Query(value)| value)
         .map_err(|_| ApiError::BadRequest)
+}
+
+fn validate_encryption_plaintext_length(length: usize) -> Result<(), ApiError> {
+    if length > MAX_ENCRYPTION_PLAINTEXT_BYTES {
+        Err(ApiError::PayloadTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_encrypted_data_base64_length(length: usize) -> Result<(), ApiError> {
+    if length > MAX_ENCRYPTED_DATA_BASE64_BYTES {
+        Err(ApiError::PayloadTooLarge)
+    } else {
+        Ok(())
+    }
 }
 
 enum UserAuthResponseKind {
@@ -709,7 +811,8 @@ fn has_exact_json_content_type(headers: &[HeaderField]) -> bool {
 mod tests {
     use super::*;
     use crate::jwt::AuthMethod;
-    use crate::transport_v2::envelope::{LogicalRequest, Version2};
+    use crate::transport_v2::envelope::{LogicalRequest, UnaryResponseEnvelope, Version2};
+    use crate::web::protected_routes::EncryptDataResponse;
 
     fn envelope(
         method: LogicalMethod,
@@ -868,6 +971,8 @@ mod tests {
         for (path, expected) in [
             ("/protected/sign_message", "sign"),
             ("/protected/third_party_token", "third_party"),
+            ("/protected/encrypt", "encrypt"),
+            ("/protected/decrypt", "decrypt"),
         ] {
             let prepared = prepare_user_operation(
                 envelope(LogicalMethod::Post, path, json_header(), Some(b"{}"), None),
@@ -888,20 +993,22 @@ mod tests {
                             ..
                         }),
                         "third_party"
+                    ) | (
+                        OperationPreparation::Ready(UserOperation::Protected {
+                            operation: ProtectedUserOperation::EncryptData { .. },
+                            ..
+                        }),
+                        "encrypt"
+                    ) | (
+                        OperationPreparation::Ready(UserOperation::Protected {
+                            operation: ProtectedUserOperation::DecryptData { .. },
+                            ..
+                        }),
+                        "decrypt"
                     )
                 ),
                 "{path}"
             );
-        }
-
-        for path in ["/protected/encrypt", "/protected/decrypt"] {
-            assert!(matches!(
-                prepare_user_operation(
-                    envelope(LogicalMethod::Post, path, json_header(), Some(b"{}"), None,),
-                    bound_user_authority(),
-                ),
-                OperationPreparation::Unsupported
-            ));
         }
     }
 
@@ -1036,7 +1143,12 @@ mod tests {
             ));
         }
 
-        for path in ["/protected/sign_message", "/protected/third_party_token"] {
+        for path in [
+            "/protected/sign_message",
+            "/protected/third_party_token",
+            "/protected/encrypt",
+            "/protected/decrypt",
+        ] {
             assert!(matches!(
                 prepare_user_operation(
                     envelope(LogicalMethod::Post, path, json_header(), Some(b"{}"), None),
@@ -1104,6 +1216,72 @@ mod tests {
         assert!(LogicalUnaryResponse::json_with_limit(StatusCode::OK, &"abc", 5).is_ok());
         assert!(matches!(
             LogicalUnaryResponse::json_with_limit(StatusCode::OK, &"abcd", 5),
+            Err(ApiError::PayloadTooLarge)
+        ));
+
+        let escaped = "\0";
+        assert!(LogicalUnaryResponse::json_with_limit(StatusCode::OK, &escaped, 8).is_ok());
+        assert!(matches!(
+            LogicalUnaryResponse::json_with_limit(StatusCode::OK, &escaped, 7),
+            Err(ApiError::PayloadTooLarge)
+        ));
+
+        let mut buffer = BoundedJsonBuffer::new(7);
+        assert!(serde_json::to_writer(&mut buffer, &escaped).is_err());
+        assert!(buffer.exceeded);
+        assert!(buffer.bytes.len() <= 7);
+    }
+
+    #[test]
+    fn crypto_utility_response_bounds_are_exact() {
+        let empty_response = EncryptDataResponse {
+            encrypted_data: String::new(),
+        };
+        assert_eq!(
+            serde_json::to_vec(&empty_response).unwrap().len(),
+            ENCRYPTED_DATA_JSON_OVERHEAD_BYTES
+        );
+
+        let max_encrypted_bytes = MAX_ENCRYPTION_PLAINTEXT_BYTES + AES_GCM_NONCE_AND_TAG_BYTES;
+        let encoded_bytes = max_encrypted_bytes.div_ceil(3) * 4;
+        assert_eq!(encoded_bytes, MAX_ENCRYPTED_DATA_BASE64_BYTES);
+        assert_eq!(
+            encoded_bytes + ENCRYPTED_DATA_JSON_OVERHEAD_BYTES,
+            EnvelopeLimits::DEFAULT.logical_body_bytes - 3
+        );
+
+        let next_encoded_bytes = (max_encrypted_bytes + 1).div_ceil(3) * 4;
+        assert_eq!(
+            next_encoded_bytes + ENCRYPTED_DATA_JSON_OVERHEAD_BYTES,
+            EnvelopeLimits::DEFAULT.logical_body_bytes + 1
+        );
+
+        let response_envelope_overhead = serde_json::to_vec(&UnaryResponseEnvelope {
+            version: Version2,
+            request_id: RequestId::from_bytes([0x31; 16]),
+            status: StatusCode::OK.as_u16(),
+            headers: json_header(),
+            body_base64: Some(EncodedBytes::from_bytes(Vec::new())),
+        })
+        .unwrap()
+        .len();
+        let logical_response_bytes = encoded_bytes + ENCRYPTED_DATA_JSON_OVERHEAD_BYTES;
+        let response_record_plaintext_bytes =
+            response_envelope_overhead + logical_response_bytes.div_ceil(3) * 4;
+        let response_record_bytes = response_record_plaintext_bytes + 12 + 16;
+        let encrypted_outer_response_bytes =
+            "{\"encrypted\":\"\"}".len() + response_record_bytes.div_ceil(3) * 4;
+        assert_eq!(encrypted_outer_response_bytes, 52_196_060);
+        assert!(encrypted_outer_response_bytes <= 50 * 1024 * 1024);
+
+        assert!(validate_encryption_plaintext_length(MAX_ENCRYPTION_PLAINTEXT_BYTES).is_ok());
+        assert!(matches!(
+            validate_encryption_plaintext_length(MAX_ENCRYPTION_PLAINTEXT_BYTES + 1),
+            Err(ApiError::PayloadTooLarge)
+        ));
+        assert!(validate_encrypted_data_base64_length(MAX_ENCRYPTED_DATA_BASE64_BYTES).is_ok());
+        assert!(matches!(
+            validate_encrypted_data_base64_length(MAX_ENCRYPTED_DATA_BASE64_BYTES + 1),
             Err(ApiError::PayloadTooLarge)
         ));
     }

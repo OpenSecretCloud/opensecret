@@ -355,22 +355,24 @@ pub struct ThirdPartyTokenResponse {
     pub token: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct EncryptDataRequest {
     pub data: String,
     #[serde(default)]
+    #[zeroize(skip)]
     pub key_options: KeyOptions,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct EncryptDataResponse {
     pub encrypted_data: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct DecryptDataRequest {
     pub encrypted_data: String,
     #[serde(default)]
+    #[zeroize(skip)]
     pub key_options: KeyOptions,
 }
 
@@ -1137,6 +1139,18 @@ pub async fn encrypt_data(
     Extension(request): Extension<EncryptDataRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<EncryptDataResponse>>, ApiError> {
+    let response = encrypt_data_value(&data, &user, &auth_context, request).await?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn encrypt_data_value(
+    data: &AppState,
+    user: &User,
+    auth_context: &AuthContext,
+    mut request: EncryptDataRequest,
+) -> Result<EncryptDataResponse, ApiError> {
+    let plaintext = Zeroizing::new(std::mem::take(&mut request.data));
+
     // Validate key_options
     let validation_query = DerivationPathQuery {
         key_options: request.key_options.clone(),
@@ -1150,8 +1164,8 @@ pub async fn encrypt_data(
     // Get the user's key
     let user_key = data
         .get_user_key(
-            &user,
-            &auth_context,
+            user,
+            auth_context,
             derivation_path,
             seed_phrase_derivation_path,
         )
@@ -1172,8 +1186,8 @@ pub async fn encrypt_data(
         })?;
 
     // Encrypt the data
-    let data_bytes = request.data.as_bytes();
-    let encrypted_data = encrypt::encrypt_with_key(&user_key, data_bytes).await;
+    let encrypted_data =
+        Zeroizing::new(encrypt::encrypt_with_key(&user_key, plaintext.as_bytes()).await);
 
     // Convert to base64 for easy transport
     let encrypted_data_base64 = general_purpose::STANDARD.encode(&encrypted_data);
@@ -1181,7 +1195,7 @@ pub async fn encrypt_data(
     let response = EncryptDataResponse {
         encrypted_data: encrypted_data_base64,
     };
-    encrypt_response(&data, &session_id, &response).await
+    Ok(response)
 }
 
 pub async fn decrypt_data(
@@ -1191,6 +1205,18 @@ pub async fn decrypt_data(
     Extension(request): Extension<DecryptDataRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<String>>, ApiError> {
+    let response = decrypt_data_value(&data, &user, &auth_context, request).await?;
+    encrypt_response(&data, &session_id, &*response).await
+}
+
+pub(crate) async fn decrypt_data_value(
+    data: &AppState,
+    user: &User,
+    auth_context: &AuthContext,
+    mut request: DecryptDataRequest,
+) -> Result<Zeroizing<String>, ApiError> {
+    let encrypted_data_base64 = Zeroizing::new(std::mem::take(&mut request.encrypted_data));
+
     // Validate key_options
     let validation_query = DerivationPathQuery {
         key_options: request.key_options.clone(),
@@ -1204,8 +1230,8 @@ pub async fn decrypt_data(
     // Get the user's key
     let user_key = data
         .get_user_key(
-            &user,
-            &auth_context,
+            user,
+            auth_context,
             derivation_path,
             seed_phrase_derivation_path,
         )
@@ -1226,8 +1252,8 @@ pub async fn decrypt_data(
         })?;
 
     // Decode the base64 encrypted data
-    let encrypted_data = match general_purpose::STANDARD.decode(&request.encrypted_data) {
-        Ok(data) => data,
+    let encrypted_data = match general_purpose::STANDARD.decode(encrypted_data_base64.as_bytes()) {
+        Ok(data) => Zeroizing::new(data),
         Err(e) => {
             error!("Failed to decode base64 data: {e}");
             return Err(ApiError::BadRequest);
@@ -1245,13 +1271,15 @@ pub async fn decrypt_data(
 
     // Convert decrypted bytes to string
     let decrypted_string = match String::from_utf8(decrypted_data) {
-        Ok(s) => s,
+        Ok(s) => Zeroizing::new(s),
         Err(e) => {
             error!("Failed to convert decrypted data to string: {e}");
+            let mut bytes = e.into_bytes();
+            bytes.zeroize();
             return Err(ApiError::BadRequest);
         }
     };
-    encrypt_response(&data, &session_id, &decrypted_string).await
+    Ok(decrypted_string)
 }
 
 pub async fn initiate_account_deletion(
@@ -1460,6 +1488,9 @@ mod tests {
         assert_zeroize_on_drop::<PrivateKeyResponse>();
         assert_zeroize_on_drop::<PrivateKeyBytesResponse>();
         assert_zeroize_on_drop::<ThirdPartyTokenResponse>();
+        assert_zeroize_on_drop::<EncryptDataRequest>();
+        assert_zeroize_on_drop::<EncryptDataResponse>();
+        assert_zeroize_on_drop::<DecryptDataRequest>();
     }
 
     #[test]
@@ -1605,6 +1636,7 @@ mod tests {
 
         // First encryption
         let encrypted1 = encrypt_with_key(&test_key, empty_array).await;
+        assert_eq!(encrypted1.len(), empty_array.len() + 12 + 16);
         // Second encryption of the same data
         let encrypted2 = encrypt_with_key(&test_key, empty_array).await;
 

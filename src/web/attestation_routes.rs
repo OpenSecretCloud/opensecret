@@ -65,7 +65,7 @@ struct KeyExchangeResponse {
 }
 
 #[derive(Serialize)]
-struct AttestationResponse {
+pub(crate) struct AttestationResponse {
     attestation_document: String,
 }
 
@@ -85,6 +85,21 @@ async fn get_attestation(
     let enclave_public_key = data.create_ephemeral_key(&nonce).await?;
     trace!("Ephemeral key created");
 
+    attestation_document_for_public_key(data, nonce, enclave_public_key).await
+}
+
+/// Produces the attestation document for an already-created enclave ephemeral
+/// key without choosing which transport-version cache owns its secret half.
+///
+/// Transport v1 creates and stores its key before calling this helper, while
+/// transport v2 does the same in its independent pending-attestation cache.
+/// Keeping document generation shared prevents the attestation bytes and
+/// production NSM behavior from drifting between the two additive protocols.
+pub(crate) async fn attestation_document_for_public_key(
+    data: Arc<AppState>,
+    nonce: String,
+    enclave_public_key: x25519_dalek::PublicKey,
+) -> Result<(StatusCode, Json<AttestationResponse>), ApiError> {
     // Create a request for the attestation document
     let request = Request::Attestation {
         user_data: None,

@@ -1,16 +1,18 @@
-//! Dormant implementation core for the additive encrypted transport protocol.
+//! Additive encrypted transport-v2 protocol and isolated HTTP gateway.
 //!
-//! This module is intentionally compiled but not wired into [`crate::AppState`]
-//! or any router yet. The next stacked change activates it after its wire bytes,
-//! parsing, replay, expiry, and state-machine behavior are independently fixed
-//! by tests.
+//! The gateway owns independent attestation/session state and never re-enters
+//! the transport-v1 router. Application authentication and operation projection
+//! are added in later stack layers over the independently tested protocol core.
 
 #![allow(dead_code)]
 
 mod crypto;
 mod envelope;
+mod gateway;
 mod session;
 mod session_cache;
+
+pub(crate) use gateway::{router, TransportV2State};
 
 pub(crate) const MAX_PENDING_ATTESTATIONS: usize = 65_536;
 pub(crate) const MAX_LIVE_SESSIONS: usize = 65_536;

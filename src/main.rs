@@ -95,6 +95,7 @@ use x25519_dalek::{EphemeralSecret, PublicKey};
 mod apple_signin;
 mod aws_credentials;
 mod billing;
+mod bounded_json;
 mod bounded_ttl_cache;
 #[cfg(test)]
 mod crypto_property_tests;

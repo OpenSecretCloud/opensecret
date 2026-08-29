@@ -5,7 +5,6 @@
 //! functions, and returns plaintext logical results for the gateway to encrypt
 //! through the request's original session lease.
 
-use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -17,6 +16,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::bounded_json::BoundedJsonBuffer;
 use crate::jwt::{
     issue_transport_v2_user_tokens, validate_transport_v2_user_resumption, AuthContext,
 };
@@ -114,53 +114,6 @@ pub(crate) struct BoundUserAuthority {
     auth_context: AuthContext,
 }
 
-struct BoundedJsonBuffer {
-    bytes: Vec<u8>,
-    limit: usize,
-    exceeded: bool,
-}
-
-impl BoundedJsonBuffer {
-    fn new(limit: usize) -> Self {
-        Self {
-            bytes: Vec::new(),
-            limit,
-            exceeded: false,
-        }
-    }
-
-    fn into_bytes(mut self) -> Vec<u8> {
-        std::mem::take(&mut self.bytes)
-    }
-}
-
-impl Write for BoundedJsonBuffer {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let Some(next) = self.bytes.len().checked_add(buffer.len()) else {
-            self.exceeded = true;
-            return Err(io::Error::other("serialized JSON length overflow"));
-        };
-        if next > self.limit {
-            self.exceeded = true;
-            return Err(io::Error::other(
-                "serialized JSON exceeds logical response limit",
-            ));
-        }
-        self.bytes.extend_from_slice(buffer);
-        Ok(buffer.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Drop for BoundedJsonBuffer {
-    fn drop(&mut self) {
-        self.bytes.zeroize();
-    }
-}
-
 impl UserOperation {
     pub(crate) const fn requires_authentication_transition(&self) -> bool {
         matches!(
@@ -188,7 +141,7 @@ impl LogicalUnaryResponse {
     ) -> Result<Self, ApiError> {
         let mut buffer = BoundedJsonBuffer::new(logical_body_bytes);
         if let Err(error) = serde_json::to_writer(&mut buffer, value) {
-            if buffer.exceeded {
+            if buffer.exceeded() {
                 return Err(ApiError::PayloadTooLarge);
             }
             tracing::error!(
@@ -204,7 +157,7 @@ impl LogicalUnaryResponse {
                 name: "content-type".to_owned(),
                 value_base64: EncodedBytes::from_bytes(JSON_CONTENT_TYPE.to_vec()),
             }],
-            body: Some(Zeroizing::new(body)),
+            body: Some(body),
         })
     }
 
@@ -1546,8 +1499,8 @@ mod tests {
 
         let mut buffer = BoundedJsonBuffer::new(7);
         assert!(serde_json::to_writer(&mut buffer, &escaped).is_err());
-        assert!(buffer.exceeded);
-        assert!(buffer.bytes.len() <= 7);
+        assert!(buffer.exceeded());
+        assert!(buffer.len() <= 7);
     }
 
     #[test]

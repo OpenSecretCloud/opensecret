@@ -52,6 +52,11 @@ OpenAI-compatible wire endpoint. Use an OpenSecret SDK or Maple for
 protected-route integration tests; plain `curl` is suitable only for public
 health probes.
 
+The additive, fail-closed next-generation network contract is specified in
+[`docs/transport-v2-protocol.md`](docs/transport-v2-protocol.md). Existing
+clients and routes retain their current transport behavior during the staged
+rollout.
+
 Contributor and coding-agent standards live in [`AGENTS.md`](AGENTS.md).
 Task-specific development, API, provider, security, and validation workflows
 live under [`.agents/skills/`](.agents/skills/).

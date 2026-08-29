@@ -91,6 +91,7 @@ use uuid::Uuid;
 use vsock::{VsockAddr, VsockStream};
 use web::attestation_routes;
 use x25519_dalek::{EphemeralSecret, PublicKey};
+use zeroize::Zeroizing;
 
 mod apple_signin;
 mod aws_credentials;
@@ -2642,13 +2643,13 @@ impl AppState {
     pub async fn confirm_account_deletion(
         &self,
         user_id: Uuid,
-        confirmation_code: String,
-        plaintext_secret: String,
+        confirmation_code: Zeroizing<String>,
+        plaintext_secret: Zeroizing<String>,
     ) -> Result<(), Error> {
         let user = self.db.get_user_by_uuid(user_id)?;
 
         // Parse the confirmation code UUID from string
-        let confirmation_code_uuid = match Uuid::parse_str(&confirmation_code) {
+        let confirmation_code_uuid = match Uuid::parse_str(confirmation_code.as_str()) {
             Ok(uuid) => uuid,
             Err(_) => return Err(Error::InvalidAccountDeletionRequest),
         };
@@ -2673,7 +2674,8 @@ impl AppState {
             }
 
             // Hash the plaintext secret again for comparison
-            let hashed_plaintext = generate_reset_hash(plaintext_secret.clone());
+            let hashed_plaintext =
+                Zeroizing::new(generate_reset_hash_bytes(plaintext_secret.as_bytes()));
 
             // Compare the hashed values using constant-time comparison
             if hashed_plaintext
@@ -3403,10 +3405,14 @@ impl RngCore for AsyncRngWrapper {
 // Implement CryptoRng for AsyncRngWrapper
 impl CryptoRng for AsyncRngWrapper {}
 
-pub fn generate_reset_hash(password: String) -> String {
+fn generate_reset_hash_bytes(password: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(password.as_bytes());
+    hasher.update(password);
     format!("{:x}", hasher.finalize())
+}
+
+pub fn generate_reset_hash(password: String) -> String {
+    generate_reset_hash_bytes(password.as_bytes())
 }
 
 async fn retrieve_billing_api_key(

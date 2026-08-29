@@ -55,6 +55,9 @@ const REQUEST_WORKING_SET_UNIT_BYTES: usize = 64 * 1024;
 const REQUEST_WORKING_SET_MULTIPLIER: usize = 4;
 const REQUEST_WORKING_SET_UNITS: usize =
     REQUEST_WORKING_SET_BUDGET_BYTES / REQUEST_WORKING_SET_UNIT_BYTES;
+const STORED_OUTPUT_WORKING_SET_BYTES: usize = 200 * 1024 * 1024;
+const STORED_OUTPUT_WORKING_SET_UNITS: usize =
+    STORED_OUTPUT_WORKING_SET_BYTES / REQUEST_WORKING_SET_UNIT_BYTES;
 const SESSION_ID_HEADER: &str = "x-session-id";
 
 type PendingAttestationKey = [u8; 32];
@@ -333,6 +336,25 @@ impl TransportV2State {
             .map_err(|_| GatewayError::Unavailable)
     }
 
+    fn promote_stored_output_working_set(
+        &self,
+        permit: &mut OwnedSemaphorePermit,
+    ) -> Result<(), GatewayError> {
+        let additional_units = STORED_OUTPUT_WORKING_SET_UNITS
+            .checked_sub(permit.num_permits())
+            .unwrap_or_default();
+        if additional_units == 0 {
+            return Ok(());
+        }
+        let additional_units =
+            u32::try_from(additional_units).map_err(|_| GatewayError::Internal)?;
+        let additional = Arc::clone(&self.request_working_set)
+            .try_acquire_many_owned(additional_units)
+            .map_err(|_| GatewayError::Unavailable)?;
+        permit.merge(additional);
+        Ok(())
+    }
+
     /// Removes expired v2 pending handshakes and terminal v2 sessions.
     ///
     /// Both retirement collections outlive their respective lock guards. The
@@ -361,6 +383,7 @@ impl TransportV2State {
         app_state: Arc<AppState>,
         session_id: Uuid,
         encrypted: &[u8],
+        working_set_permit: &mut OwnedSemaphorePermit,
         now: Instant,
     ) -> Result<EncryptedOuterResponse, GatewayError> {
         let (lease, envelope) = self
@@ -390,6 +413,7 @@ impl TransportV2State {
             &lease,
             request_id,
             operation,
+            working_set_permit,
             now,
             move |dispatch_lease, operation, authentication, admitted_at| {
                 execute_user_operation(
@@ -409,6 +433,7 @@ impl TransportV2State {
         lease: &V2SessionLease,
         request_id: super::envelope::RequestId,
         operation: super::application::UserOperation,
+        working_set_permit: &mut OwnedSemaphorePermit,
         now: Instant,
         dispatch: Dispatch,
     ) -> Result<EncryptedOuterResponse, GatewayError>
@@ -428,6 +453,22 @@ impl TransportV2State {
             .state()
             .begin_unary_response()
             .map_err(GatewayError::from_session_record)?;
+        if operation.requires_stored_output_reservation()
+            && self
+                .promote_stored_output_working_set(working_set_permit)
+                .is_err()
+        {
+            return encrypt_reserved_logical_response(
+                lease,
+                request_id,
+                reservation,
+                LogicalUnaryResponse::protocol_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "stored_output_unavailable",
+                    "Stored response capacity is unavailable",
+                ),
+            );
+        }
         match lease.state().claim_request_id(request_id) {
             ReplayClaim::Claimed => {}
             ReplayClaim::Duplicate => {
@@ -591,7 +632,7 @@ async fn encrypted_request(
 ) -> Result<Response, GatewayError> {
     let session_id = parse_request_session_id(request.uri(), request.headers())?;
     validate_json_content_type(request.headers())?;
-    let working_set_permit = app_state
+    let mut working_set_permit = app_state
         .transport_v2_state
         .reserve_request_working_set(request.headers())?;
 
@@ -609,6 +650,7 @@ async fn encrypted_request(
             Arc::clone(&app_state),
             session_id,
             &encrypted,
+            &mut working_set_permit,
             Instant::now(),
         )
         .await?;
@@ -1304,6 +1346,27 @@ mod tests {
             .is_ok());
     }
 
+    #[test]
+    fn stored_output_promotion_reaches_the_conservative_response_reservation() {
+        let state = TransportV2State::new();
+        let mut permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        state
+            .promote_stored_output_working_set(&mut permit)
+            .unwrap();
+        assert_eq!(permit.num_permits(), STORED_OUTPUT_WORKING_SET_UNITS);
+        assert_eq!(
+            state.request_working_set.available_permits(),
+            REQUEST_WORKING_SET_UNITS - STORED_OUTPUT_WORKING_SET_UNITS
+        );
+
+        state
+            .promote_stored_output_working_set(&mut permit)
+            .unwrap();
+        assert_eq!(permit.num_permits(), STORED_OUTPUT_WORKING_SET_UNITS);
+    }
+
     #[tokio::test]
     async fn encrypted_outer_response_holds_working_set_through_body_lifetime() {
         let working_set = Arc::new(Semaphore::new(1));
@@ -1473,11 +1536,15 @@ mod tests {
             panic!("valid login operation must be ready");
         };
         let first_dispatches = Arc::clone(&dispatches);
+        let mut working_set_permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
         let first = state
             .process_ready_operation(
                 &lease,
                 request_id,
                 operation,
+                &mut working_set_permit,
                 now,
                 move |_lease, _operation, authentication, _| async move {
                     first_dispatches.fetch_add(1, Ordering::SeqCst);
@@ -1507,6 +1574,7 @@ mod tests {
                 &lease,
                 request_id,
                 operation,
+                &mut working_set_permit,
                 now,
                 move |_lease, _operation, authentication, _| async move {
                     second_dispatches.fetch_add(1, Ordering::SeqCst);
@@ -1593,11 +1661,15 @@ mod tests {
         else {
             panic!("a null body is a valid bodyless protected request");
         };
+        let mut working_set_permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
         let response = state
             .process_ready_operation(
                 &lease,
                 request_id,
                 operation,
+                &mut working_set_permit,
                 now,
                 |_lease, _operation, authentication, _| async move {
                     assert!(authentication.is_none());
@@ -1611,6 +1683,75 @@ mod tests {
             200
         );
         assert_eq!(lease.state().replay_id_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stored_output_contention_is_authenticated_before_replay_or_dispatch() {
+        let mut state = TransportV2State::new();
+        state.request_working_set = Arc::new(Semaphore::new(1));
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        let master_bytes = [0x71; 32];
+        let session = test_session(
+            session_id,
+            master_bytes,
+            now + Duration::from_secs(60),
+            Arc::clone(&state.global_replay_budget),
+        );
+        let auth_context = AuthContext::new(AuthMethod::Password, 7, [0x72; 32]);
+        session
+            .begin_authentication(RequestId::from_bytes([0x73; 16]))
+            .unwrap()
+            .commit_at(
+                BoundAuthority::user(
+                    Uuid::from_bytes([0x74; 16]),
+                    7,
+                    &auth_context,
+                    now + Duration::from_secs(30),
+                ),
+                now,
+            )
+            .unwrap();
+        state.insert_session(session).await.unwrap();
+
+        let request_id = RequestId::from_bytes([0x75; 16]);
+        let mut envelope = get_user_envelope(request_id, None);
+        envelope.request.path = "/protected/kv".to_owned();
+        let lease = state.acquire_session(&session_id, now).await.unwrap();
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(envelope, lease.state().authority())
+        else {
+            panic!("valid KV list operation must be ready");
+        };
+        let mut working_set_permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let observed_dispatches = Arc::clone(&dispatches);
+        let response = state
+            .process_ready_operation(
+                &lease,
+                request_id,
+                operation,
+                &mut working_set_permit,
+                now,
+                move |_lease, _operation, _authentication, _| async move {
+                    observed_dispatches.fetch_add(1, Ordering::SeqCst);
+                    successful_test_outcome()
+                },
+            )
+            .await
+            .unwrap();
+
+        let master = SessionMaster::from_bytes(master_bytes);
+        let client_keys = DirectionalKeys::derive(&master).unwrap();
+        assert_eq!(
+            response_status(&client_keys, &session_id, &request_id, &response),
+            503
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(lease.state().replay_id_count(), 0);
+        assert_eq!(working_set_permit.num_permits(), 1);
     }
 
     #[tokio::test]

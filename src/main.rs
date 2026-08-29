@@ -1874,21 +1874,21 @@ impl AppState {
         &self,
         user: &User,
         auth_context: &AuthContext,
-        key: String,
+        key: &str,
     ) -> StoreResult<Option<String>> {
         let user_key = self
             .get_user_key(user, auth_context, None, None)
             .await
             .map_err(|_| StoreError::Unauthorized)?;
-        kv::get(self.db.get_pool(), user.uuid, &key, &user_key)
+        kv::get(self.db.get_pool(), user.uuid, key, &user_key)
     }
 
     async fn put(
         &self,
         user: &User,
         auth_context: &AuthContext,
-        key: String,
-        value: String,
+        key: &str,
+        value: &str,
     ) -> StoreResult<()> {
         let user_key = self
             .get_user_key(user, auth_context, None, None)
@@ -1905,17 +1905,12 @@ impl AppState {
         .await
     }
 
-    async fn delete(
-        &self,
-        user: &User,
-        auth_context: &AuthContext,
-        key: String,
-    ) -> StoreResult<()> {
+    async fn delete(&self, user: &User, auth_context: &AuthContext, key: &str) -> StoreResult<()> {
         let user_key = self
             .get_user_key(user, auth_context, None, None)
             .await
             .map_err(|_| StoreError::Unauthorized)?;
-        kv::delete(self.db.get_pool(), user.uuid, &key, &user_key)
+        kv::delete(self.db.get_pool(), user.uuid, key, &user_key)
     }
 
     async fn delete_all(&self, user_id: Uuid) -> StoreResult<()> {

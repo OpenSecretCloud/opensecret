@@ -332,8 +332,8 @@ async fn db_copied_kv_rows_do_not_decrypt_under_attacker_auth_context() {
         .put(
             &victim_login.user,
             &victim_login.auth_context,
-            "copied-kv-secret".to_string(),
-            "victim plaintext must not leak".to_string(),
+            "copied-kv-secret",
+            "victim plaintext must not leak",
         )
         .await
         .expect("victim KV insert should succeed");
@@ -353,7 +353,7 @@ async fn db_copied_kv_rows_do_not_decrypt_under_attacker_auth_context() {
         .get(
             &attacker_login.user,
             &attacker_login.auth_context,
-            "copied-kv-secret".to_string(),
+            "copied-kv-secret",
         )
         .await
         .expect("attacker get should not error for a missing attacker-encrypted key");

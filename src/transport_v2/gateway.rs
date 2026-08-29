@@ -724,7 +724,9 @@ fn encrypt_reserved_logical_response(
         request_id,
         status: response.status.as_u16(),
         headers: response.headers,
-        body_base64: response.body.map(EncodedBytes::from_bytes),
+        body_base64: response
+            .body
+            .map(|mut body| EncodedBytes::from_bytes(std::mem::take(&mut *body))),
     };
     if response.validate(&EnvelopeLimits::default()).is_err() {
         zeroize_response_body(&mut response);
@@ -1054,7 +1056,7 @@ mod tests {
             response: LogicalUnaryResponse {
                 status: StatusCode::OK,
                 headers: Vec::new(),
-                body: Some(br#"{"ok":true}"#.to_vec()),
+                body: Some(zeroize::Zeroizing::new(br#"{"ok":true}"#.to_vec())),
             },
             bound_session: false,
         }

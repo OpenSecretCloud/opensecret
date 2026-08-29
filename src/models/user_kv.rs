@@ -1,6 +1,7 @@
 use crate::models::schema::user_kv;
 use chrono::{DateTime, Utc};
 use diesel::prelude::*;
+use diesel::upsert::excluded;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -47,6 +48,20 @@ impl UserKV {
             .map_err(UserKVError::DatabaseError)
     }
 
+    pub fn get_id_by_user_and_key(
+        conn: &mut PgConnection,
+        lookup_user_id: Uuid,
+        lookup_key: &[u8],
+    ) -> Result<Option<i64>, UserKVError> {
+        user_kv::table
+            .filter(user_kv::user_id.eq(lookup_user_id))
+            .filter(user_kv::key_enc.eq(lookup_key))
+            .select(user_kv::id)
+            .first::<i64>(conn)
+            .optional()
+            .map_err(UserKVError::DatabaseError)
+    }
+
     pub fn get_all_for_user(
         conn: &mut PgConnection,
         lookup_user_id: Uuid,
@@ -67,8 +82,12 @@ impl UserKV {
     }
 
     pub fn delete(&self, conn: &mut PgConnection) -> Result<(), UserKVError> {
+        Self::delete_by_id(conn, self.id)
+    }
+
+    pub fn delete_by_id(conn: &mut PgConnection, lookup_id: i64) -> Result<(), UserKVError> {
         diesel::delete(user_kv::table)
-            .filter(user_kv::id.eq(self.id))
+            .filter(user_kv::id.eq(lookup_id))
             .execute(conn)
             .map(|_| ())
             .map_err(UserKVError::DatabaseError)
@@ -103,13 +122,14 @@ impl NewUserKV {
         }
     }
 
-    pub fn insert(&self, conn: &mut PgConnection) -> Result<UserKV, UserKVError> {
+    pub fn insert(&self, conn: &mut PgConnection) -> Result<(), UserKVError> {
         diesel::insert_into(user_kv::table)
             .values(self)
             .on_conflict((user_kv::user_id, user_kv::key_enc))
             .do_update()
-            .set(user_kv::value_enc.eq(self.value_enc.clone()))
-            .get_result::<UserKV>(conn)
+            .set(user_kv::value_enc.eq(excluded(user_kv::value_enc)))
+            .execute(conn)
+            .map(|_| ())
             .map_err(UserKVError::DatabaseError)
     }
 }

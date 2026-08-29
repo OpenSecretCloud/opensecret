@@ -376,6 +376,16 @@ pub struct DecryptDataRequest {
     pub key_options: KeyOptions,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(transparent)]
+pub(crate) struct KvValue(String);
+
+impl KvValue {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 // API Key Management Types
 
 // Validation function for API key names
@@ -452,7 +462,7 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
             "/protected/kv/:key",
             put(put_kv).layer(from_fn_with_state(
                 app_state.clone(),
-                decrypt_request::<String>,
+                decrypt_request::<KvValue>,
             )),
         )
         .route(
@@ -637,7 +647,8 @@ pub async fn get_kv(
     Extension(session_id): Extension<TransportSession>,
     Path(key): Path<String>,
 ) -> Result<Json<EncryptedResponse<Option<String>>>, ApiError> {
-    let value = match data.get(&user, &auth_context, key).await {
+    let key = Zeroizing::new(key);
+    let value = match data.get(&user, &auth_context, &key).await {
         Ok(kv) => kv,
         Err(e) => {
             tracing::error!("Error getting key-value pair: {:?}", e);
@@ -653,16 +664,24 @@ pub async fn put_kv(
     Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<TransportSession>,
     Path(key): Path<String>,
-    Extension(value): Extension<String>,
-) -> Result<Json<EncryptedResponse<String>>, ApiError> {
-    match data.put(&user, &auth_context, key, value.clone()).await {
-        Ok(kv) => kv,
-        Err(e) => {
-            tracing::error!("Error putting key-value pair: {:?}", e);
-            return Err(ApiError::InternalServerError);
-        }
-    };
+    Extension(value): Extension<KvValue>,
+) -> Result<Json<EncryptedResponse<KvValue>>, ApiError> {
+    let key = Zeroizing::new(key);
+    put_kv_value(&data, &user, &auth_context, &key, value.as_str()).await?;
     encrypt_response(&data, &session_id, &value).await
+}
+
+pub(crate) async fn put_kv_value(
+    data: &AppState,
+    user: &User,
+    auth_context: &AuthContext,
+    key: &str,
+    value: &str,
+) -> Result<(), ApiError> {
+    data.put(user, auth_context, key, value).await.map_err(|_| {
+        tracing::error!("Error putting key-value pair");
+        ApiError::InternalServerError
+    })
 }
 
 pub async fn delete_kv(
@@ -672,16 +691,22 @@ pub async fn delete_kv(
     Extension(session_id): Extension<TransportSession>,
     Path(key): Path<String>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    match data.delete(&user, &auth_context, key).await {
-        Ok(_) => {
-            let response = json!({ "message": "Resource deleted successfully" });
-            encrypt_response(&data, &session_id, &response).await
-        }
-        Err(e) => {
-            tracing::error!("Error deleting key-value pair: {:?}", e);
-            Err(ApiError::InternalServerError)
-        }
-    }
+    let key = Zeroizing::new(key);
+    delete_kv_value(&data, &user, &auth_context, &key).await?;
+    let response = json!({ "message": "Resource deleted successfully" });
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn delete_kv_value(
+    data: &AppState,
+    user: &User,
+    auth_context: &AuthContext,
+    key: &str,
+) -> Result<(), ApiError> {
+    data.delete(user, auth_context, key).await.map_err(|_| {
+        tracing::error!("Error deleting key-value pair");
+        ApiError::InternalServerError
+    })
 }
 
 pub async fn delete_all_kv(
@@ -689,18 +714,18 @@ pub async fn delete_all_kv(
     Extension(user): Extension<User>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
-    match data.delete_all(user.uuid).await {
-        Ok(_) => {
-            let response = json!({
-                "message": "All key-value pairs deleted successfully"
-            });
-            encrypt_response(&data, &session_id, &response).await
-        }
-        Err(e) => {
-            tracing::error!("Error deleting all key-value pairs: {:?}", e);
-            Err(ApiError::InternalServerError)
-        }
-    }
+    delete_all_kv_values(&data, user.uuid).await?;
+    let response = json!({
+        "message": "All key-value pairs deleted successfully"
+    });
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn delete_all_kv_values(data: &AppState, user_id: Uuid) -> Result<(), ApiError> {
+    data.delete_all(user_id).await.map_err(|_| {
+        tracing::error!("Error deleting all key-value pairs");
+        ApiError::InternalServerError
+    })
 }
 
 pub async fn list_kv(
@@ -1491,6 +1516,7 @@ mod tests {
         assert_zeroize_on_drop::<EncryptDataRequest>();
         assert_zeroize_on_drop::<EncryptDataResponse>();
         assert_zeroize_on_drop::<DecryptDataRequest>();
+        assert_zeroize_on_drop::<KvValue>();
     }
 
     #[test]

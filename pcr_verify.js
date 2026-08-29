@@ -1,187 +1,177 @@
 #!/usr/bin/env node
 
-"use strict";
+const fs = require('fs');
+const crypto = require('crypto');
 
-// TRANSITION-ONLY COMPATIBILITY: verifies the PCR0 signatures consumed by
-// already-released clients. Sigstore manifest verification is a separate path.
-
-const fs = require("fs");
-const {
-  LEGACY_PCR_VERIFICATION_PUBLIC_KEY_B64,
-  validateAppendOnlyTransition,
-  validateLegacyHistory,
-  validateLegacyHistories,
-  verifyLegacyPcr0Signature,
-} = require("./scripts/legacy_pcr_compatibility.js");
-
-function usage() {
-  console.error(
-    "Usage: pcr_verify.js <dev|prod> [--history-file <path>] [--other-history-file <path>] [--base-history-file <path>] [--require-pcr-file <path>]",
-  );
-}
-
-function parseArguments(argv) {
-  const environment = argv[0];
-  if (environment !== "dev" && environment !== "prod") {
-    throw new Error("environment must be exactly dev or prod");
-  }
-
-  let historyFile =
-    environment === "dev" ? "./pcrDevHistory.json" : "./pcrProdHistory.json";
-  let otherHistoryFile =
-    environment === "dev" ? "./pcrProdHistory.json" : "./pcrDevHistory.json";
-  let baseHistoryFile;
-  let requiredPcrFile;
-
-  for (let index = 1; index < argv.length; index += 1) {
-    const option = argv[index];
-    const value = argv[index + 1];
-    if (
-      (option !== "--history-file" &&
-        option !== "--other-history-file" &&
-        option !== "--base-history-file" &&
-        option !== "--require-pcr-file") ||
-      value === undefined
-    ) {
-      throw new Error(`invalid argument ${option}`);
-    }
-    if (option === "--history-file") {
-      historyFile = value;
-    } else if (option === "--other-history-file") {
-      otherHistoryFile = value;
-    } else if (option === "--base-history-file") {
-      baseHistoryFile = value;
-    } else {
-      requiredPcrFile = value;
-    }
-    index += 1;
-  }
-
-  return {
-    environment,
-    historyFile,
-    otherHistoryFile,
-    baseHistoryFile,
-    requiredPcrFile,
-  };
-}
-
-function readContents(file, label) {
+/**
+ * Verifies a PCR0 signature
+ * @param {string} pcr0 - The PCR0 value
+ * @param {string} signatureBase64 - Base64-encoded signature
+ * @param {Object} publicKey - Public key object
+ * @returns {boolean} True if valid, false otherwise
+ */
+function verifyPcr0Signature(pcr0, signatureBase64, publicKey) {
   try {
-    return fs.readFileSync(file, "utf8");
+    // Create the verifier
+    const verifier = crypto.createVerify('SHA384');
+    verifier.update(pcr0);
+    
+    // Decode the base64 signature
+    const signature = Buffer.from(signatureBase64, 'base64');
+    
+    // Verify using the P1363 format
+    return verifier.verify({
+      key: publicKey,
+      dsaEncoding: 'ieee-p1363'
+    }, signature);
   } catch (error) {
-    throw new Error(`could not read ${label} ${file}: ${error.message}`);
+    console.error(`Error verifying signature: ${error.message}`);
+    return false;
   }
 }
 
-function parseJson(contents, label) {
+/**
+ * Extract public key from different formats
+ * @param {string} publicKeyString - Base64-encoded public key
+ * @returns {Object} Public key object
+ */
+function extractPublicKey(publicKeyString) {
   try {
-    return JSON.parse(contents);
+    return crypto.createPublicKey({
+      key: Buffer.from(publicKeyString, 'base64'),
+      format: 'der',
+      type: 'spki'
+    });
   } catch (error) {
-    throw new Error(`${label} is not valid JSON: ${error.message}`);
+    // Try to parse as base64-encoded PEM
+    try {
+      const decodedKey = Buffer.from(publicKeyString, 'base64').toString('utf8');
+      
+      // If it's a PEM format, extract the key
+      if (decodedKey.includes('-----BEGIN PUBLIC KEY-----')) {
+        return crypto.createPublicKey(decodedKey);
+      } else if (decodedKey.includes('-----BEGIN PRIVATE KEY-----')) {
+        console.error('ERROR: You provided a private key instead of a public key!');
+        console.error('Please use SIGNING_PUBLIC_KEY, not SIGNING_PRIVATE_KEY');
+        process.exit(1);
+      }
+    } catch (error) {
+      console.error("Error processing public key:", error.message);
+      process.exit(1);
+    }
   }
+
+  console.error("Failed to parse public key");
+  process.exit(1);
 }
 
-function readJson(file, label) {
-  return parseJson(readContents(file, label), `${label} ${file}`);
-}
-
-function parseCanonicalHistory(contents, label) {
-  const history = parseJson(contents, label);
-  const canonical = `${JSON.stringify(history, null, 2)}\n`;
-  if (contents !== canonical) {
-    throw new Error(
-      `${label} is not canonical JSON; reformatting, reordered keys, and duplicate shadow keys are forbidden`,
-    );
-  }
-  return history;
-}
-
-function readCanonicalHistory(file, label) {
-  return parseCanonicalHistory(
-    readContents(file, label),
-    `${label} ${file}`,
-  );
-}
-
-function verifyFiles({
-  environment,
-  historyFile,
-  otherHistoryFile,
-  baseHistoryFile,
-  requiredPcrFile,
-}) {
-  const history = readCanonicalHistory(historyFile, "legacy PCR history");
-  const otherHistory = readCanonicalHistory(
-    otherHistoryFile,
-    "other legacy PCR history",
-  );
-  const baseHistory =
-    baseHistoryFile === undefined
-      ? undefined
-      : readCanonicalHistory(baseHistoryFile, "base legacy PCR history");
-  const requiredMeasurements =
-    requiredPcrFile === undefined
-      ? undefined
-      : readJson(requiredPcrFile, "required PCR file");
-  const histories =
-    environment === "dev"
-      ? validateLegacyHistories(history, otherHistory)
-      : validateLegacyHistories(otherHistory, history);
-  const result = validateLegacyHistory(history, requiredMeasurements);
-  const transition =
-    baseHistory === undefined
-      ? undefined
-      : validateAppendOnlyTransition(baseHistory, history);
-  return {
-    ...result,
-    ...transition,
-    environment,
-    historyFile,
-    otherHistoryFile,
-    baseHistoryFile,
-    requiredPcrFile,
-    ...histories,
-  };
-}
-
+/**
+ * Main verification function
+ */
 function main() {
-  const options = parseArguments(process.argv.slice(2));
-  const result = verifyFiles(options);
-  const requirement =
-    result.requiredPcrFile === undefined
-      ? ""
-      : ` and contains the complete tuple from ${result.requiredPcrFile}`;
-  console.log(
-    `Verified ${result.entries} ${result.environment} legacy entries in ${result.historyFile}${requirement}.`,
-  );
-  console.log(
-    `Verified dev/prod PCR0 separation with ${result.otherHistoryFile}.`,
-  );
-  if (result.baseHistoryFile !== undefined) {
-    console.log(
-      `Append-only transition from ${result.baseHistoryFile}: ${result.addedEntries} added entries.`,
-    );
+  // Get environment from command line
+  const env = process.argv[2];
+  
+  if (!env || (env !== 'dev' && env !== 'prod')) {
+    console.log("Usage: pcr_verify.js <env>");
+    console.log("  env: Environment to verify (dev or prod)");
+    process.exit(1);
   }
-  console.log(
-    `Pinned legacy public key: ${LEGACY_PCR_VERIFICATION_PUBLIC_KEY_B64.slice(0, 20)}...`,
-  );
-}
-
-if (require.main === module) {
+  
+  // Determine which history file to use
+  const historyFile = env === 'dev' ? './pcrDevHistory.json' : './pcrProdHistory.json';
+  
+  // Check if the file exists
+  if (!fs.existsSync(historyFile)) {
+    console.error(`Error: History file ${historyFile} does not exist`);
+    process.exit(1);
+  }
+  
+  // Get public key from environment variable
+  const publicKeyBase64 = process.env.SIGNING_PUBLIC_KEY;
+  if (!publicKeyBase64) {
+    console.error("Error: SIGNING_PUBLIC_KEY environment variable is not set");
+    console.log("Set it with: export SIGNING_PUBLIC_KEY='your-base64-public-key'");
+    process.exit(1);
+  }
+  
+  // Import the public key
+  const publicKey = extractPublicKey(publicKeyBase64);
+  
+  // Read and parse the history file
+  let history;
   try {
-    main();
+    const historyData = fs.readFileSync(historyFile, 'utf8');
+    history = JSON.parse(historyData);
   } catch (error) {
-    usage();
-    console.error(`Legacy PCR verification failed: ${error.message}`);
-    process.exitCode = 1;
+    console.error(`Error reading history file: ${error.message}`);
+    process.exit(1);
+  }
+  
+  // Validate that history is an array
+  if (!Array.isArray(history)) {
+    console.error(`Error: ${historyFile} does not contain a valid array`);
+    process.exit(1);
+  }
+  
+  console.log(`\n🔍 Verifying ${history.length} PCR entries in ${historyFile}...\n`);
+  
+  // Track verification results
+  let validCount = 0;
+  let invalidCount = 0;
+  
+  // Verify each entry
+  for (let i = 0; i < history.length; i++) {
+    const entry = history[i];
+    
+    // Check if entry has required fields
+    if (!entry.PCR0 || !entry.signature) {
+      console.error(`❌ Entry ${i}: Missing required fields (PCR0 or signature)`);
+      invalidCount++;
+      continue;
+    }
+    
+    // Verify the signature (only for PCR0)
+    const isValid = verifyPcr0Signature(entry.PCR0, entry.signature, publicKey);
+    
+    if (isValid) {
+      validCount++;
+      const dateStr = entry.timestamp 
+        ? new Date(entry.timestamp * 1000).toLocaleString() 
+        : 'unknown date';
+        
+      console.log(`✅ Entry ${i}: Valid (${dateStr})`);
+      console.log(`   PCR0: ${entry.PCR0.substring(0, 40)}...`);
+    } else {
+      invalidCount++;
+      console.log(`❌ Entry ${i}: INVALID signature`);
+      console.log(`   PCR0: ${entry.PCR0.substring(0, 40)}...`);
+    }
+  }
+  
+  // Print summary
+  console.log(`\n📊 Verification Summary:`);
+  console.log(`   Total entries: ${history.length}`);
+  console.log(`   Valid signatures: ${validCount}`);
+  console.log(`   Invalid signatures: ${invalidCount}`);
+  
+  // Exit with appropriate code
+  if (invalidCount > 0) {
+    console.log(`\n⚠️  Warning: ${invalidCount} entries have invalid signatures!`);
+    process.exit(1);
+  } else {
+    console.log(`\n✅ All ${validCount} signatures are valid!`);
+    process.exit(0);
   }
 }
 
+// Run the main function if this script is executed directly
+if (require.main === module) {
+  main();
+}
+
+// Export functions for potential module usage
 module.exports = {
-  parseCanonicalHistory,
-  parseArguments,
-  readJson,
-  verifyFiles,
-  verifyPcr0Signature: verifyLegacyPcr0Signature,
-};
+  verifyPcr0Signature,
+  extractPublicKey
+}; 

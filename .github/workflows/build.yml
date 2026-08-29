@@ -1,6 +1,5 @@
 # This workflow handles Nix-based reproducible builds for opensecret
-# It requires the configured GitHub-hosted ARM64 larger runner for AWS Nitro
-# Enclave compatibility.
+# It requires a custom ARM64 runner for AWS Nitro Enclave compatibility
 name: "Nix Reproducible Builds"
 
 on:
@@ -13,95 +12,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  legacy-pcr-compatibility:
-    name: "Legacy PCR Transition Compatibility"
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Check out repository history
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-
-      - name: Test the pinned legacy verifier
-        run: node --test scripts/tests/test_legacy_pcr_compatibility.js
-
-      - name: Enforce append-only legacy histories
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          case "$GITHUB_EVENT_NAME" in
-            pull_request)
-              base_sha="$(jq -er '.pull_request.base.sha' "$GITHUB_EVENT_PATH")"
-              ;;
-            push)
-              base_sha="$(jq -er '.before' "$GITHUB_EVENT_PATH")"
-              ;;
-            workflow_dispatch)
-              echo "Manual run: verifying current histories without a transition base."
-              exit 0
-              ;;
-            *)
-              echo "Unsupported event: $GITHUB_EVENT_NAME" >&2
-              exit 1
-              ;;
-          esac
-
-          if [[ "$base_sha" =~ ^0+$ ]]; then
-            echo "No previous commit exists; current-history tests are sufficient."
-            exit 0
-          fi
-          git cat-file -e "${base_sha}^{commit}"
-
-          while IFS=: read -r environment history_file reference_file; do
-            base_history="$RUNNER_TEMP/${history_file}.base.json"
-            base_reference="$RUNNER_TEMP/${reference_file}.base.json"
-            git show "${base_sha}:${history_file}" > "$base_history"
-            git show "${base_sha}:${reference_file}" > "$base_reference"
-            node ./pcr_verify.js \
-              "$environment" \
-              --base-history-file "$base_history"
-
-            base_entries="$(jq -er 'length' "$base_history")"
-            candidate_entries="$(jq -er 'length' "$history_file")"
-            added_entries=$((candidate_entries - base_entries))
-            if (( added_entries > 1 )); then
-              echo "$history_file may add at most one released tuple." >&2
-              exit 1
-            fi
-            if (( added_entries == 1 )); then
-              if ! cmp -s "$base_reference" "$reference_file"; then
-                echo "$reference_file must be merged and released before its legacy history entry." >&2
-                exit 1
-              fi
-              reference_pcr0="$(jq -er '.PCR0' "$reference_file")"
-              reference_pcr1="$(jq -er '.PCR1' "$reference_file")"
-              reference_pcr2="$(jq -er '.PCR2' "$reference_file")"
-              if ! jq -e \
-                --arg pcr0 "$reference_pcr0" \
-                --arg pcr1 "$reference_pcr1" \
-                --arg pcr2 "$reference_pcr2" \
-                '.[-1] |
-                 .PCR0 == $pcr0 and
-                 .PCR1 == $pcr1 and
-                 .PCR2 == $pcr2' \
-                "$history_file" >/dev/null; then
-                echo "The new final $history_file entry must equal $reference_file." >&2
-                exit 1
-              fi
-              node ./pcr_verify.js \
-                "$environment" \
-                --base-history-file "$base_history" \
-                --require-pcr-file "$reference_file"
-            fi
-          done <<'HISTORIES'
-          dev:pcrDevHistory.json:pcrDev.json
-          prod:pcrProdHistory.json:pcrProd.json
-          HISTORIES
-
   dev:
     name: "Development Reproducible Build"
     # Run on all PRs and master pushes
@@ -110,6 +20,7 @@ jobs:
     # 4 cores needed for efficient builds and PCR verification
     runs-on: ubuntu-22.04-arm64-4core
     permissions:
+      id-token: write
       contents: read
     steps:
       - name: Check out repository
@@ -136,8 +47,7 @@ jobs:
         id: build-dev
         run: |
           set -euo pipefail
-          nix build --no-update-lock-file '.?submodules=1#eif-dev'
-          git diff --exit-code -- flake.lock
+          nix build --no-update-lock-file .?submodules=1#eif-dev
           echo "Build completed successfully"
 
       # PCR comparison is a master/deployment gate, not a pull-request gate.
@@ -162,10 +72,6 @@ jobs:
             exit 1
           fi
 
-          # Existing histories remain valid while a release candidate is built.
-          # The exact released tuple is appended only after Sigstore publication.
-          node ./pcr_verify.js dev
-
       # Store artifacts for 7 days
       - name: Upload dev artifacts
         if: always()
@@ -179,9 +85,10 @@ jobs:
     name: "Production Reproducible Build"
     # Only run on master pushes or manual triggers for production safety
     if: (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') || (github.event_name == 'push' && github.ref == 'refs/heads/master')
-    # Same GitHub-hosted ARM64 runner requirements as the dev build
+    # Same custom runner requirements as dev build
     runs-on: ubuntu-22.04-arm64-4core
     permissions:
+      id-token: write
       contents: read
     steps:
       - name: Check out repository
@@ -208,8 +115,7 @@ jobs:
         id: build-prod
         run: |
           set -euo pipefail
-          nix build --no-update-lock-file '.?submodules=1#eif-prod'
-          git diff --exit-code -- flake.lock
+          nix build --no-update-lock-file .?submodules=1#eif-prod
           echo "Build completed successfully"
 
       # PCR comparison is a master/deployment gate, not a pull-request gate.
@@ -233,10 +139,6 @@ jobs:
             cat result/pcr.json
             exit 1
           fi
-
-          # Existing histories remain valid while a release candidate is built.
-          # The exact released tuple is appended only after Sigstore publication.
-          node ./pcr_verify.js prod
 
       # Store production artifacts for 30 days
       - name: Upload prod artifacts

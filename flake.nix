@@ -57,31 +57,6 @@
         nitroRustToolchainVersion = nitroHelperUpstreams.rust.version;
         nitroRustToolchain = nitroRustPkgs.rust-bin.stable."${nitroRustToolchainVersion}".minimal;
 
-        cosignPlatforms = {
-          x86_64-linux = "linux-amd64";
-          aarch64-linux = "linux-arm64";
-          x86_64-darwin = "darwin-amd64";
-          aarch64-darwin = "darwin-arm64";
-        };
-        cosignHashes = {
-          x86_64-linux = "sha256-92Iu088i5V4a5jd8CAl5/3eiLamYHBHfIiouREmR588=";
-          aarch64-linux = "sha256-kOeuC139YPIIFrUsASrd9/wFXrzHvqTOgcQoyoUYwwI=";
-          x86_64-darwin = "sha256-rNGA+LAVviUkDKM6vuih5WTrZc3xo87kclRW0tzrfaY=";
-          aarch64-darwin = "sha256-3sHD+AIyCxnC+88tx7z7PyWOHBgaBGwjoaB0vfky8Qo=";
-        };
-        cosign_3_1_2 = pkgs.stdenvNoCC.mkDerivation {
-          pname = "cosign";
-          version = "3.1.2";
-          src = pkgs.fetchurl {
-            url = "https://github.com/sigstore/cosign/releases/download/v3.1.2/cosign-${cosignPlatforms.${system}}";
-            hash = cosignHashes.${system};
-          };
-          dontUnpack = true;
-          installPhase = ''
-            install -Dm755 "$src" "$out/bin/cosign"
-          '';
-        };
-
         # Development environment setup
         # Get rust-analyzer matching the channel in rust-toolchain.toml
         rustToolchain = builtins.fromTOML (builtins.readFile ./rust-toolchain.toml);
@@ -102,14 +77,15 @@
           pkgs.clang
           pkgs.jq
           pkgs.just
-          pkgs.gh
-          cosign_3_1_2
           pkgs.postgresql
           pkgs.diesel-cli
           pkgs.python3
           (pkgs.python3.withPackages (ps: with ps; [
             cryptography
+            securesystemslib
+            tuf
           ]))
+          pkgs.bun
           pkgs.go
         ];
         linuxOnlyInputs = [

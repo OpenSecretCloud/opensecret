@@ -438,13 +438,14 @@ pub struct CreateApiKeyResponse {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct ApiKeyInfo {
     pub name: String,
+    #[zeroize(skip)]
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct ListApiKeysResponse {
     pub keys: Vec<ApiKeyInfo>,
 }
@@ -1485,6 +1486,46 @@ pub async fn list_api_keys(
     encrypt_response(&data, &session_id, &response).await
 }
 
+pub(crate) fn list_bounded_api_keys_data(
+    data: &AppState,
+    user: &User,
+    logical_body_limit: usize,
+    row_limit: usize,
+) -> Result<ListApiKeysResponse, ApiError> {
+    debug!("Listing bounded API keys for user: {}", user.uuid);
+
+    let mut conn = data.db.get_pool().get().map_err(|error| {
+        error!("Failed to get a database connection for bounded API-key listing: {error:?}");
+        ApiError::InternalServerError
+    })?;
+    let mut rows = crate::models::user_api_keys::UserApiKey::get_bounded_list_for_user(
+        &mut conn,
+        user.uuid,
+        logical_body_limit,
+        row_limit,
+    )
+    .map_err(|error| {
+        if matches!(
+            error,
+            crate::models::user_api_keys::UserApiKeyError::OutputTooLarge
+        ) {
+            ApiError::PayloadTooLarge
+        } else {
+            error!("Failed to read bounded API-key metadata");
+            ApiError::InternalServerError
+        }
+    })?;
+
+    let keys = rows
+        .iter_mut()
+        .map(|row| ApiKeyInfo {
+            name: std::mem::take(&mut row.name),
+            created_at: row.created_at,
+        })
+        .collect();
+    Ok(ListApiKeysResponse { keys })
+}
+
 pub async fn delete_api_key(
     State(data): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -1534,6 +1575,8 @@ mod tests {
         assert_zeroize_on_drop::<PrivateKeyBytesResponse>();
         assert_zeroize_on_drop::<ThirdPartyTokenResponse>();
         assert_zeroize_on_drop::<CreateApiKeyResponse>();
+        assert_zeroize_on_drop::<ApiKeyInfo>();
+        assert_zeroize_on_drop::<ListApiKeysResponse>();
         assert_zeroize_on_drop::<EncryptDataRequest>();
         assert_zeroize_on_drop::<EncryptDataResponse>();
         assert_zeroize_on_drop::<DecryptDataRequest>();

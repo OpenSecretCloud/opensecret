@@ -27,10 +27,10 @@ use crate::web::login_routes::{
 };
 use crate::web::protected_routes::{
     create_api_key_data, decrypt_data_value, delete_all_kv_values, delete_api_key_by_name,
-    delete_kv_value, encrypt_data_value, private_key_bytes_data, private_key_data,
-    protected_user_data, public_key_data, put_kv_value, sign_message_data, third_party_token_data,
-    CreateApiKeyRequest, DecryptDataRequest, DerivationPathQuery, EncryptDataRequest, KvValue,
-    PublicKeyQuery, SignMessageRequest, ThirdPartyTokenRequest,
+    delete_kv_value, encrypt_data_value, list_bounded_api_keys_data, private_key_bytes_data,
+    private_key_data, protected_user_data, public_key_data, put_kv_value, sign_message_data,
+    third_party_token_data, CreateApiKeyRequest, DecryptDataRequest, DerivationPathQuery,
+    EncryptDataRequest, KvValue, PublicKeyQuery, SignMessageRequest, ThirdPartyTokenRequest,
 };
 use crate::{ApiError, AppState, VerifiedUserAuthentication};
 
@@ -52,6 +52,7 @@ const MAX_ENCRYPTED_DATA_BASE64_BYTES: usize =
 const MAX_ENCRYPTION_PLAINTEXT_BYTES: usize =
     (MAX_ENCRYPTED_DATA_BASE64_BYTES / 4) * 3 - AES_GCM_NONCE_AND_TAG_BYTES;
 const MAX_V2_KV_LIST_ROWS: usize = 65_536;
+const MAX_V2_API_KEY_LIST_ROWS: usize = 65_536;
 
 type SensitiveBytes = Zeroizing<Vec<u8>>;
 
@@ -115,6 +116,7 @@ pub(crate) enum ProtectedUserOperation {
     CreateApiKey {
         body: SensitiveBytes,
     },
+    ListApiKeys,
     DeleteApiKey {
         name: Zeroizing<String>,
     },
@@ -139,7 +141,9 @@ impl UserOperation {
         matches!(
             self,
             Self::Protected {
-                operation: ProtectedUserOperation::GetKv { .. } | ProtectedUserOperation::ListKv,
+                operation: ProtectedUserOperation::GetKv { .. }
+                    | ProtectedUserOperation::ListKv
+                    | ProtectedUserOperation::ListApiKeys,
                 ..
             }
         )
@@ -273,6 +277,7 @@ pub(crate) fn prepare_user_operation(
         DeleteKv,
         DeleteAllKv,
         CreateApiKey,
+        ListApiKeys,
         DeleteApiKey,
     }
 
@@ -305,6 +310,7 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Get, "/protected/kv") => Some(Route::ListKv),
         (LogicalMethod::Delete, "/protected/kv") => Some(Route::DeleteAllKv),
         (LogicalMethod::Post, "/protected/api-keys") => Some(Route::CreateApiKey),
+        (LogicalMethod::Get, "/protected/api-keys") => Some(Route::ListApiKeys),
         (LogicalMethod::Get, _) if kv_key.is_some() => Some(Route::GetKv),
         (LogicalMethod::Put, _) if kv_key.is_some() => Some(Route::PutKv),
         (LogicalMethod::Delete, _) if kv_key.is_some() => Some(Route::DeleteKv),
@@ -544,6 +550,23 @@ pub(crate) fn prepare_user_operation(
                 operation: ProtectedUserOperation::CreateApiKey {
                     body: Zeroizing::new(body),
                 },
+            })
+        }
+        Route::ListApiKeys => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::ListApiKeys,
             })
         }
         Route::DeleteApiKey => {
@@ -837,6 +860,15 @@ async fn execute_protected_user_operation(
         ProtectedUserOperation::CreateApiKey { body } => {
             let request = parse_json_body::<CreateApiKeyRequest>(body)?;
             let value = create_api_key_data(app_state, user, request).await?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::ListApiKeys => {
+            let value = list_bounded_api_keys_data(
+                app_state,
+                user,
+                EnvelopeLimits::default().logical_body_bytes,
+                MAX_V2_API_KEY_LIST_ROWS,
+            )?;
             LogicalUnaryResponse::json(StatusCode::OK, &value)
         }
         ProtectedUserOperation::DeleteApiKey { name } => {
@@ -1340,23 +1372,31 @@ mod tests {
             }) if &*name == "Production Key-1_test"
         ));
 
-        assert!(matches!(
-            prepare_user_operation(
-                envelope(
-                    LogicalMethod::Get,
-                    "/protected/api-keys",
-                    Vec::new(),
-                    None,
-                    None,
-                ),
-                bound_user_authority(),
+        let list = prepare_user_operation(
+            envelope(
+                LogicalMethod::Get,
+                "/protected/api-keys",
+                Vec::new(),
+                None,
+                None,
             ),
-            OperationPreparation::Unsupported
+            bound_user_authority(),
+        );
+        assert!(matches!(
+            &list,
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::ListApiKeys,
+                ..
+            })
         ));
+        let OperationPreparation::Ready(list) = list else {
+            unreachable!("matched ready API-key list operation")
+        };
+        assert!(list.requires_stored_output_reservation());
     }
 
     #[test]
-    fn api_key_mutations_reject_anonymous_and_transplanted_metadata() {
+    fn api_key_administration_rejects_anonymous_and_transplanted_metadata() {
         let create = || {
             envelope(
                 LogicalMethod::Post,
@@ -1427,6 +1467,55 @@ mod tests {
         delete_with_query.request.query = Some("transplanted=true".to_owned());
         assert!(matches!(
             prepare_user_operation(delete_with_query, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let list = || {
+            envelope(
+                LogicalMethod::Get,
+                "/protected/api-keys",
+                Vec::new(),
+                None,
+                None,
+            )
+        };
+        assert!(matches!(
+            prepare_user_operation(list(), AuthorityState::Anonymous),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::UNAUTHORIZED
+        ));
+
+        let mut list_with_query = list();
+        list_with_query.request.query = Some("transplanted=true".to_owned());
+        assert!(matches!(
+            prepare_user_operation(list_with_query, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut list_with_header = list();
+        list_with_header.request.headers = json_header();
+        assert!(matches!(
+            prepare_user_operation(list_with_header, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut list_with_body = list();
+        list_with_body.request.body_base64 = Some(EncodedBytes::from_bytes(b"{}".to_vec()));
+        assert!(matches!(
+            prepare_user_operation(list_with_body, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut list_with_credential = list();
+        list_with_credential.credential = Some(Credential::Resumption {
+            value_base64: EncodedBytes::from_bytes(b"transplanted".to_vec()),
+        });
+        assert!(matches!(
+            prepare_user_operation(list_with_credential, bound_user_authority()),
             OperationPreparation::Rejected(response)
                 if response.status == StatusCode::BAD_REQUEST
         ));
@@ -1503,6 +1592,31 @@ mod tests {
         assert_eq!(
             &*list.body.unwrap(),
             br#"[{"key":"key","value":"value","created_at":1,"updated_at":2}]"#
+        );
+    }
+
+    #[test]
+    fn api_key_list_keeps_existing_json_wire_shape() {
+        use crate::web::protected_routes::{ApiKeyInfo, ListApiKeysResponse};
+
+        let empty =
+            LogicalUnaryResponse::json(StatusCode::OK, &ListApiKeysResponse { keys: Vec::new() })
+                .unwrap();
+        assert_eq!(&*empty.body.unwrap(), br#"{"keys":[]}"#);
+
+        let populated = LogicalUnaryResponse::json(
+            StatusCode::OK,
+            &ListApiKeysResponse {
+                keys: vec![ApiKeyInfo {
+                    name: "Production Key".to_owned(),
+                    created_at: "2026-08-29T12:34:56Z".parse().unwrap(),
+                }],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            &*populated.body.unwrap(),
+            br#"{"keys":[{"name":"Production Key","created_at":"2026-08-29T12:34:56Z"}]}"#
         );
     }
 

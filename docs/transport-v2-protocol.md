@@ -692,9 +692,13 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
    administration with bounded create/delete mutations: retain the existing
    raw UUID key format without rotation, return it only through the original
    bound-session response, wipe its plaintext response value on drop, and use
-   the canonical validated name segment for deletion. Keep list unsupported
-   until a following slice adds stored-output admission and a bounded narrow
-   database projection. Password/account deletion must explicitly close the
+   the canonical validated name segment for deletion. Add list in a following
+   slice using the same conservative stored-output admission as KV reads and a
+   v2-only read-only repeatable-read database path. Preflight the user-scoped
+   row count and aggregate name bytes, cap the list at 65,536 rows, fetch only
+   `name` and `created_at`, recheck the snapshot totals, retain unspecified
+   server ordering, and bound final JSON serialization. The v1 full-row query
+   remains untouched. Password/account deletion must explicitly close the
    now-invalid bound session.
 12. **Stored user unary operations**: project conversations, conversation
    projects, instructions, response control, and web-provider unary routes in

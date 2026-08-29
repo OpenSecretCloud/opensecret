@@ -701,8 +701,12 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
    remains untouched. Project verification-email resend as a bound-user unary
    mutation with no logical body or metadata; preserve its existing 200 JSON
    outcomes while claiming replay state before any database or email side
-   effect. Password/account deletion must explicitly close the now-invalid
-   bound session.
+   effect. Project `GET /verify-email/{code}` as a code-authorized operation
+   that accepts either an anonymous or already-bound session without changing
+   its authority. Require one lowercase hyphenated UUID path spelling, reject
+   all logical metadata, and preserve the existing invalid/expired 400 plus
+   success/already-verified 200 outcomes. Password/account deletion must
+   explicitly close the now-invalid bound session.
 12. **Stored user unary operations**: project conversations, conversation
    projects, instructions, response control, and web-provider unary routes in
    ownership-preserving families before the client cutover.

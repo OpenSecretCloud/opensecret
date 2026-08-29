@@ -22,8 +22,8 @@ use crate::jwt::{
 };
 use crate::kv::StoreError;
 use crate::web::login_routes::{
-    authenticate_login, register_and_authenticate, AuthResponse, Credentials, RefreshResponse,
-    RegisterCredentials,
+    authenticate_login, register_and_authenticate, verify_email_data, AuthResponse, Credentials,
+    RefreshResponse, RegisterCredentials,
 };
 use crate::web::protected_routes::{
     create_api_key_data, decrypt_data_value, delete_all_kv_values, delete_api_key_by_name,
@@ -36,8 +36,9 @@ use crate::web::protected_routes::{
 use crate::{ApiError, AppState, VerifiedUserAuthentication};
 
 use super::envelope::{
-    decode_canonical_api_key_name_path, decode_canonical_kv_item_path, Credential, EncodedBytes,
-    EnvelopeLimits, HeaderField, LogicalMethod, RequestEnvelope, RequestId, ResponseMode,
+    decode_canonical_api_key_name_path, decode_canonical_kv_item_path,
+    decode_canonical_verify_email_path, Credential, EncodedBytes, EnvelopeLimits, HeaderField,
+    LogicalMethod, RequestEnvelope, RequestId, ResponseMode,
 };
 use super::session::{
     AuthenticationReservation, AuthenticationStartError, AuthorityState, BoundAuthority,
@@ -72,6 +73,9 @@ pub(crate) enum UserOperation {
     },
     Resume {
         credential: SensitiveBytes,
+    },
+    VerifyEmail {
+        code: uuid::Uuid,
     },
     Protected {
         authority: BoundUserAuthority,
@@ -265,6 +269,7 @@ pub(crate) fn prepare_user_operation(
         Login,
         Register,
         Resume,
+        VerifyEmail,
         GetUser,
         RequestVerification,
         GetPrivateKey,
@@ -298,10 +303,19 @@ pub(crate) fn prepare_user_operation(
             return rejected_bad_request();
         }
     };
+    let verification_code = match decode_canonical_verify_email_path(request.method, &request.path)
+    {
+        Ok(code) => code,
+        Err(_) => {
+            request.path.zeroize();
+            return rejected_bad_request();
+        }
+    };
     let route = match (request.method, request.path.as_str()) {
         (LogicalMethod::Post, "/login") => Some(Route::Login),
         (LogicalMethod::Post, "/register") => Some(Route::Register),
         (LogicalMethod::Post, "/refresh") => Some(Route::Resume),
+        (LogicalMethod::Get, _) if verification_code.is_some() => Some(Route::VerifyEmail),
         (LogicalMethod::Get, "/protected/user") => Some(Route::GetUser),
         (LogicalMethod::Post, "/protected/request_verification") => {
             Some(Route::RequestVerification)
@@ -323,7 +337,7 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Delete, _) if api_key_name.is_some() => Some(Route::DeleteApiKey),
         _ => None,
     };
-    if kv_key.is_some() || api_key_name.is_some() {
+    if kv_key.is_some() || api_key_name.is_some() || verification_code.is_some() {
         request.path.zeroize();
     }
     let Some(route) = route else {
@@ -387,6 +401,31 @@ pub(crate) fn prepare_user_operation(
             }
             OperationPreparation::Ready(UserOperation::Resume {
                 credential: Zeroizing::new(value_base64.into_bytes()),
+            })
+        }
+        Route::VerifyEmail => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            match authority {
+                AuthorityState::Anonymous | AuthorityState::Bound(_) => {}
+                AuthorityState::Authenticating(_) => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::AuthenticationInProgress,
+                    ));
+                }
+                AuthorityState::Closing => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::Closing,
+                    ));
+                }
+            }
+            OperationPreparation::Ready(UserOperation::VerifyEmail {
+                code: verification_code.expect("classified verification route must have a code"),
             })
         }
         Route::GetUser | Route::GetPrivateKey | Route::GetPrivateKeyBytes | Route::GetPublicKey => {
@@ -737,6 +776,16 @@ pub(crate) async fn execute_user_operation(
                 monotonic_now,
                 UserAuthResponseKind::Refresh,
             )
+        }
+        UserOperation::VerifyEmail { code } => {
+            debug_assert!(authentication.is_none());
+            let response = match verify_email_data(&app_state, code)
+                .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+            {
+                Ok(response) => response,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            ApplicationOutcome::success(response, false)
         }
         UserOperation::Protected {
             authority,
@@ -1260,6 +1309,80 @@ mod tests {
         });
         assert!(matches!(
             prepare_user_operation(with_credential, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+    }
+
+    #[test]
+    fn email_verification_is_a_canonical_code_operation_without_rebinding() {
+        let path = "/verify-email/123e4567-e89b-12d3-a456-426614174000";
+        let request = || envelope(LogicalMethod::Get, path, Vec::new(), None, None);
+        for authority in [AuthorityState::Anonymous, bound_user_authority()] {
+            assert!(matches!(
+                prepare_user_operation(request(), authority),
+                OperationPreparation::Ready(UserOperation::VerifyEmail { code })
+                    if code == uuid::Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").unwrap()
+            ));
+        }
+
+        assert!(matches!(
+            prepare_user_operation(
+                request(),
+                AuthorityState::Authenticating(RequestId::from_bytes([0x41; 16])),
+            ),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::CONFLICT
+        ));
+        assert!(matches!(
+            prepare_user_operation(request(), AuthorityState::Closing),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::CONFLICT
+        ));
+
+        let mut with_query = request();
+        with_query.request.query = Some("transplanted=true".to_owned());
+        assert!(matches!(
+            prepare_user_operation(with_query, AuthorityState::Anonymous),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_header = request();
+        with_header.request.headers = json_header();
+        assert!(matches!(
+            prepare_user_operation(with_header, AuthorityState::Anonymous),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_body = request();
+        with_body.request.body_base64 = Some(EncodedBytes::from_bytes(b"{}".to_vec()));
+        assert!(matches!(
+            prepare_user_operation(with_body, AuthorityState::Anonymous),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_credential = request();
+        with_credential.credential = Some(Credential::Resumption {
+            value_base64: EncodedBytes::from_bytes(b"transplanted".to_vec()),
+        });
+        assert!(matches!(
+            prepare_user_operation(with_credential, AuthorityState::Anonymous),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let uppercase = envelope(
+            LogicalMethod::Get,
+            "/verify-email/123E4567-E89B-12D3-A456-426614174000",
+            Vec::new(),
+            None,
+            None,
+        );
+        assert!(matches!(
+            prepare_user_operation(uppercase, AuthorityState::Anonymous),
             OperationPreparation::Rejected(response)
                 if response.status == StatusCode::BAD_REQUEST
         ));

@@ -430,10 +430,11 @@ pub struct CreateApiKeyRequest {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct CreateApiKeyResponse {
     pub key: String, // UUID format with dashes - only returned on creation
     pub name: String,
+    #[zeroize(skip)]
     pub created_at: DateTime<Utc>,
 }
 
@@ -1395,6 +1396,15 @@ pub async fn create_api_key(
     Extension(request): Extension<CreateApiKeyRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<CreateApiKeyResponse>>, ApiError> {
+    let response = create_api_key_data(&data, &user, request).await?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn create_api_key_data(
+    data: &AppState,
+    user: &User,
+    request: CreateApiKeyRequest,
+) -> Result<CreateApiKeyResponse, ApiError> {
     debug!("Creating new API key for user: {}", user.uuid);
 
     // Validate the request
@@ -1410,11 +1420,12 @@ pub async fn create_api_key(
     let random_bytes: [u8; 16] =
         crate::encrypt::generate_random_enclave::<16>(data.aws_credential_manager.clone()).await;
     let api_key_uuid = Uuid::from_bytes(random_bytes);
+    let mut api_key = Zeroizing::new(api_key_uuid.to_string());
 
     // Hash the UUID string (with dashes) using SHA-256
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(api_key_uuid.to_string().as_bytes());
+    hasher.update(api_key.as_bytes());
     let key_hash = format!("{:x}", hasher.finalize());
 
     // Create the database record
@@ -1437,13 +1448,13 @@ pub async fn create_api_key(
     })?;
 
     let response = CreateApiKeyResponse {
-        key: api_key_uuid.to_string(), // Return the actual UUID to the user (only time it's shown)
+        key: std::mem::take(&mut *api_key), // Return the actual UUID to the user only once
         name: api_key_record.name,
         created_at: api_key_record.created_at,
     };
 
     info!("Created API key '{}' for user {}", response.name, user.uuid);
-    encrypt_response(&data, &session_id, &response).await
+    Ok(response)
 }
 
 pub async fn list_api_keys(
@@ -1480,10 +1491,21 @@ pub async fn delete_api_key(
     Extension(user): Extension<User>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    delete_api_key_by_name(&data, &user, &name)?;
+
+    let response = json!({ "success": true });
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) fn delete_api_key_by_name(
+    data: &AppState,
+    user: &User,
+    name: &str,
+) -> Result<(), ApiError> {
     debug!("Deleting API key '{}' for user: {}", name, user.uuid);
 
     data.db
-        .delete_user_api_key_by_name(&name, user.uuid)
+        .delete_user_api_key_by_name(name, user.uuid)
         .map_err(|e| {
             error!("Failed to delete API key: {:?}", e);
             match e {
@@ -1495,9 +1517,7 @@ pub async fn delete_api_key(
         })?;
 
     info!("Deleted API key '{}' for user {}", name, user.uuid);
-
-    let response = json!({ "success": true });
-    encrypt_response(&data, &session_id, &response).await
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1513,6 +1533,7 @@ mod tests {
         assert_zeroize_on_drop::<PrivateKeyResponse>();
         assert_zeroize_on_drop::<PrivateKeyBytesResponse>();
         assert_zeroize_on_drop::<ThirdPartyTokenResponse>();
+        assert_zeroize_on_drop::<CreateApiKeyResponse>();
         assert_zeroize_on_drop::<EncryptDataRequest>();
         assert_zeroize_on_drop::<EncryptDataResponse>();
         assert_zeroize_on_drop::<DecryptDataRequest>();

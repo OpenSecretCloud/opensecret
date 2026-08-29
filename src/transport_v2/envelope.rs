@@ -370,6 +370,7 @@ impl LogicalRequest {
 }
 
 const KV_ITEM_PATH_PREFIX: &str = "/protected/kv/";
+const API_KEY_ITEM_PATH_PREFIX: &str = "/protected/api-keys/";
 
 fn validate_logical_path(
     method: LogicalMethod,
@@ -378,6 +379,9 @@ fn validate_logical_path(
 ) -> Result<(), EnvelopeError> {
     check_limit(path.len(), limits.path_bytes, "path")?;
     if decode_canonical_kv_item_path(method, path)?.is_some() {
+        return Ok(());
+    }
+    if decode_canonical_api_key_name_path(method, path)?.is_some() {
         return Ok(());
     }
     validate_path(path, limits)
@@ -401,6 +405,42 @@ pub(crate) fn decode_canonical_kv_item_path(
     let Some(segment) = path.strip_prefix(KV_ITEM_PATH_PREFIX) else {
         return Ok(None);
     };
+    decode_canonical_opaque_segment(segment).map(Some)
+}
+
+/// Decodes the validated API-key name carried by the DELETE item route.
+///
+/// API-key names are ASCII alphanumeric characters, spaces, hyphens, and
+/// underscores. V2 uses the same route-scoped opaque-segment spelling as KV:
+/// alphanumeric bytes remain literal and every other byte is one uppercase
+/// `%HH` triplet. Rejecting equivalent aliases gives the operation one path
+/// spelling across clients before the name reaches the database lookup.
+pub(crate) fn decode_canonical_api_key_name_path(
+    method: LogicalMethod,
+    path: &str,
+) -> Result<Option<Zeroizing<String>>, EnvelopeError> {
+    if method != LogicalMethod::Delete {
+        return Ok(None);
+    }
+    let Some(segment) = path.strip_prefix(API_KEY_ITEM_PATH_PREFIX) else {
+        return Ok(None);
+    };
+    let decoded = decode_canonical_opaque_segment(segment)?;
+    if decoded.len() > 50
+        || decoded.starts_with(' ')
+        || decoded.ends_with(' ')
+        || !decoded
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'_'))
+    {
+        return Err(EnvelopeError::InvalidPath(
+            "API-key name segment violates the name contract",
+        ));
+    }
+    Ok(Some(decoded))
+}
+
+fn decode_canonical_opaque_segment(segment: &str) -> Result<Zeroizing<String>, EnvelopeError> {
     if segment.is_empty() {
         return Err(EnvelopeError::InvalidPath(
             "opaque path segment must not be empty",
@@ -439,7 +479,7 @@ pub(crate) fn decode_canonical_kv_item_path(
     }
 
     match String::from_utf8(std::mem::take(&mut *decoded)) {
-        Ok(value) => Ok(Some(Zeroizing::new(value))),
+        Ok(value) => Ok(Zeroizing::new(value)),
         Err(error) => {
             let mut bytes = error.into_bytes();
             bytes.zeroize();
@@ -1086,6 +1126,76 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn api_key_delete_paths_use_one_restricted_canonical_name_segment() {
+        for (encoded, decoded) in [
+            ("Production%20Key", "Production Key"),
+            ("agent%2Dproxy%5F42", "agent-proxy_42"),
+            ("a%20%20b", "a  b"),
+            ("%2D", "-"),
+            ("%5F", "_"),
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ] {
+            let path = format!("{API_KEY_ITEM_PATH_PREFIX}{encoded}");
+            let value = decode_canonical_api_key_name_path(LogicalMethod::Delete, &path)
+                .unwrap()
+                .expect("API-key item route must decode");
+            assert_eq!(&*value, decoded, "{encoded}");
+            validate_logical_path(LogicalMethod::Delete, &path, &EnvelopeLimits::default())
+                .unwrap();
+        }
+
+        assert!(decode_canonical_api_key_name_path(
+            LogicalMethod::Get,
+            "/protected/api-keys/Production%20Key",
+        )
+        .unwrap()
+        .is_none());
+        assert!(decode_canonical_api_key_name_path(
+            LogicalMethod::Delete,
+            "/protected/api-keysx/Production%20Key",
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn api_key_delete_paths_reject_aliases_and_invalid_names() {
+        let overlong = format!("{API_KEY_ITEM_PATH_PREFIX}{}", "a".repeat(51));
+        for invalid in [
+            "/protected/api-keys/",
+            "/protected/api-keys/%20leading",
+            "/protected/api-keys/trailing%20",
+            "/protected/api-keys/literal-hyphen",
+            "/protected/api-keys/literal_underscore",
+            "/protected/api-keys/%2d",
+            "/protected/api-keys/%5f",
+            "/protected/api-keys/%41",
+            "/protected/api-keys/plus+alias",
+            "/protected/api-keys/literal space",
+            "/protected/api-keys/%252D",
+            "/protected/api-keys/%2F",
+            "/protected/api-keys/%5C",
+            "/protected/api-keys/%2E",
+            "/protected/api-keys/%FF",
+            "/protected/api-keys/%",
+            "/protected/api-keys/%2",
+            "/protected/api-keys/%GG",
+            "/protected/api-keys/name/part",
+            "/protected/api-keys/caf%C3%A9",
+            overlong.as_str(),
+        ] {
+            assert!(
+                validate_logical_path(LogicalMethod::Delete, invalid, &EnvelopeLimits::default())
+                    .is_err(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

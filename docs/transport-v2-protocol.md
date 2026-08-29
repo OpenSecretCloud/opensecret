@@ -698,8 +698,11 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
    row count and aggregate name bytes, cap the list at 65,536 rows, fetch only
    `name` and `created_at`, recheck the snapshot totals, retain unspecified
    server ordering, and bound final JSON serialization. The v1 full-row query
-   remains untouched. Password/account deletion must explicitly close the
-   now-invalid bound session.
+   remains untouched. Project verification-email resend as a bound-user unary
+   mutation with no logical body or metadata; preserve its existing 200 JSON
+   outcomes while claiming replay state before any database or email side
+   effect. Password/account deletion must explicitly close the now-invalid
+   bound session.
 12. **Stored user unary operations**: project conversations, conversation
    projects, instructions, response control, and web-provider unary routes in
    ownership-preserving families before the client cutover.

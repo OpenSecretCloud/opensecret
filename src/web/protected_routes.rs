@@ -751,12 +751,19 @@ pub async fn request_new_verification_code(
     Extension(user): Extension<User>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    let response = request_new_verification_code_data(&data, &user).await?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn request_new_verification_code_data(
+    data: &AppState,
+    user: &User,
+) -> Result<serde_json::Value, ApiError> {
     // First check if user has an email
     let email = match user.get_email() {
         Some(email) => email.to_string(),
         None => {
-            let response = json!({ "error": "No email associated with account" });
-            return encrypt_response(&data, &session_id, &response).await;
+            return Ok(json!({ "error": "No email associated with account" }));
         }
     };
 
@@ -764,8 +771,7 @@ pub async fn request_new_verification_code(
     match data.db.get_email_verification_by_user_id(user.uuid) {
         Ok(verification) => {
             if verification.is_verified {
-                let response = json!({ "error": "User is already verified" });
-                return encrypt_response(&data, &session_id, &response).await;
+                return Ok(json!({ "error": "User is already verified" }));
             }
             // Delete the old verification
             if let Err(e) = data.db.delete_email_verification(&verification) {
@@ -793,20 +799,14 @@ pub async fn request_new_verification_code(
     };
 
     // Send the new verification email
-    if let Err(e) = send_verification_email(
-        &data,
-        user.project_id,
-        email,
-        verification.verification_code,
-    )
-    .await
+    if let Err(e) =
+        send_verification_email(data, user.project_id, email, verification.verification_code).await
     {
         tracing::error!("Error sending verification email: {:?}", e);
         return Err(ApiError::InternalServerError);
     }
 
-    let response = json!({ "message": "New verification code sent successfully" });
-    encrypt_response(&data, &session_id, &response).await
+    Ok(json!({ "message": "New verification code sent successfully" }))
 }
 
 pub async fn change_password(

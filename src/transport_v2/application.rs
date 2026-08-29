@@ -28,9 +28,10 @@ use crate::web::login_routes::{
 use crate::web::protected_routes::{
     create_api_key_data, decrypt_data_value, delete_all_kv_values, delete_api_key_by_name,
     delete_kv_value, encrypt_data_value, list_bounded_api_keys_data, private_key_bytes_data,
-    private_key_data, protected_user_data, public_key_data, put_kv_value, sign_message_data,
-    third_party_token_data, CreateApiKeyRequest, DecryptDataRequest, DerivationPathQuery,
-    EncryptDataRequest, KvValue, PublicKeyQuery, SignMessageRequest, ThirdPartyTokenRequest,
+    private_key_data, protected_user_data, public_key_data, put_kv_value,
+    request_new_verification_code_data, sign_message_data, third_party_token_data,
+    CreateApiKeyRequest, DecryptDataRequest, DerivationPathQuery, EncryptDataRequest, KvValue,
+    PublicKeyQuery, SignMessageRequest, ThirdPartyTokenRequest,
 };
 use crate::{ApiError, AppState, VerifiedUserAuthentication};
 
@@ -80,6 +81,7 @@ pub(crate) enum UserOperation {
 
 pub(crate) enum ProtectedUserOperation {
     GetUser,
+    RequestVerification,
     GetPrivateKey {
         query: Option<String>,
     },
@@ -264,6 +266,7 @@ pub(crate) fn prepare_user_operation(
         Register,
         Resume,
         GetUser,
+        RequestVerification,
         GetPrivateKey,
         GetPrivateKeyBytes,
         GetPublicKey,
@@ -300,6 +303,9 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Post, "/register") => Some(Route::Register),
         (LogicalMethod::Post, "/refresh") => Some(Route::Resume),
         (LogicalMethod::Get, "/protected/user") => Some(Route::GetUser),
+        (LogicalMethod::Post, "/protected/request_verification") => {
+            Some(Route::RequestVerification)
+        }
         (LogicalMethod::Get, "/protected/private_key") => Some(Route::GetPrivateKey),
         (LogicalMethod::Get, "/protected/private_key_bytes") => Some(Route::GetPrivateKeyBytes),
         (LogicalMethod::Get, "/protected/public_key") => Some(Route::GetPublicKey),
@@ -411,6 +417,23 @@ pub(crate) fn prepare_user_operation(
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
                 operation,
+            })
+        }
+        Route::RequestVerification => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::RequestVerification,
             })
         }
         Route::SignMessage
@@ -763,6 +786,10 @@ async fn execute_protected_user_operation(
     match operation {
         ProtectedUserOperation::GetUser => {
             let value = protected_user_data(app_state, user)?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::RequestVerification => {
+            let value = request_new_verification_code_data(app_state, user).await?;
             LogicalUnaryResponse::json(StatusCode::OK, &value)
         }
         ProtectedUserOperation::GetPrivateKey { query } => {
@@ -1167,6 +1194,74 @@ mod tests {
                 operation: ProtectedUserOperation::GetUser,
                 ..
             })
+        ));
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Post,
+                    "/protected/request_verification",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                bound_user_authority(),
+            ),
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::RequestVerification,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn verification_resend_rejects_unbound_and_transplanted_metadata() {
+        let request = || {
+            envelope(
+                LogicalMethod::Post,
+                "/protected/request_verification",
+                Vec::new(),
+                None,
+                None,
+            )
+        };
+        assert!(matches!(
+            prepare_user_operation(request(), AuthorityState::Anonymous),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::UNAUTHORIZED
+        ));
+
+        let mut with_query = request();
+        with_query.request.query = Some("transplanted=true".to_owned());
+        assert!(matches!(
+            prepare_user_operation(with_query, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_header = request();
+        with_header.request.headers = json_header();
+        assert!(matches!(
+            prepare_user_operation(with_header, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_body = request();
+        with_body.request.body_base64 = Some(EncodedBytes::from_bytes(b"{}".to_vec()));
+        assert!(matches!(
+            prepare_user_operation(with_body, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_credential = request();
+        with_credential.credential = Some(Credential::Resumption {
+            value_base64: EncodedBytes::from_bytes(b"transplanted".to_vec()),
+        });
+        assert!(matches!(
+            prepare_user_operation(with_credential, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
         ));
     }
 

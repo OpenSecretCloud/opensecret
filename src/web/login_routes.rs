@@ -1,4 +1,3 @@
-use crate::User;
 use crate::{
     db::DBError,
     email::{send_hello_email, send_verification_email},
@@ -14,6 +13,7 @@ use crate::{
     Error,
 };
 use crate::{ApiError, AppState};
+use crate::{User, VerifiedUserAuthentication};
 use axum::{
     extract::{Path, State},
     middleware::from_fn_with_state,
@@ -125,8 +125,8 @@ pub struct RefreshRequest {
 
 #[derive(Serialize)]
 pub struct RefreshResponse {
-    access_token: String,
-    refresh_token: String,
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
 }
 
 #[derive(Deserialize, Clone)]
@@ -147,6 +147,14 @@ pub async fn login(
 }
 
 async fn login_internal(data: Arc<AppState>, creds: Credentials) -> Result<AuthResponse, ApiError> {
+    let verified = authenticate_login(data.clone(), creds).await?;
+    v1_auth_response(&data, &verified)
+}
+
+pub(crate) async fn authenticate_login(
+    data: Arc<AppState>,
+    creds: Credentials,
+) -> Result<VerifiedUserAuthentication, ApiError> {
     // First get the project by client_id and verify it's active
     let project = data
         .db
@@ -211,27 +219,7 @@ async fn login_internal(data: Arc<AppState>, creds: Credentials) -> Result<AuthR
         .authenticate_user(creds.email, creds.id, creds.password, project.id)
         .await
     {
-        Ok(Some(authenticated_user)) => {
-            let access_token = NewToken::new_with_auth_context(
-                &authenticated_user.user,
-                TokenType::Access,
-                &data,
-                &authenticated_user.auth_context,
-            )?;
-            let refresh_token = NewToken::new_with_auth_context(
-                &authenticated_user.user,
-                TokenType::Refresh,
-                &data,
-                &authenticated_user.auth_context,
-            )?;
-            let auth_response = AuthResponse {
-                id: authenticated_user.user.get_id(),
-                email: authenticated_user.user.get_email().map(|s| s.to_string()),
-                access_token: access_token.token,
-                refresh_token: refresh_token.token,
-            };
-            Ok(auth_response)
-        }
+        Ok(Some(authenticated_user)) => Ok(authenticated_user),
         Ok(None) => {
             error!("Invalid password attempt");
             Err(ApiError::InvalidUsernameOrPassword)
@@ -241,6 +229,30 @@ async fn login_internal(data: Arc<AppState>, creds: Credentials) -> Result<AuthR
             Err(ApiError::InternalServerError)
         }
     }
+}
+
+pub(crate) fn v1_auth_response(
+    data: &AppState,
+    verified: &VerifiedUserAuthentication,
+) -> Result<AuthResponse, ApiError> {
+    let access_token = NewToken::new_with_auth_context(
+        &verified.user,
+        TokenType::Access,
+        data,
+        &verified.auth_context,
+    )?;
+    let refresh_token = NewToken::new_with_auth_context(
+        &verified.user,
+        TokenType::Refresh,
+        data,
+        &verified.auth_context,
+    )?;
+    Ok(AuthResponse {
+        id: verified.user.get_id(),
+        email: verified.user.get_email().map(|s| s.to_string()),
+        access_token: access_token.token,
+        refresh_token: refresh_token.token,
+    })
 }
 
 pub async fn logout(
@@ -263,6 +275,17 @@ pub async fn register(
 ) -> Result<Json<EncryptedResponse<AuthResponse>>, ApiError> {
     tracing::trace!("call register");
 
+    let verified = register_and_authenticate(data.clone(), creds).await?;
+    let auth_response = v1_auth_response(&data, &verified)?;
+
+    let result = encrypt_response(&data, &session_id, &auth_response).await;
+    result
+}
+
+pub(crate) async fn register_and_authenticate(
+    data: Arc<AppState>,
+    creds: RegisterCredentials,
+) -> Result<VerifiedUserAuthentication, ApiError> {
     let user = match data.register_user(creds.clone()).await {
         Ok(user) => user,
         Err(Error::UserAlreadyExists) => {
@@ -279,7 +302,7 @@ pub async fn register(
     handle_new_user_registration(&data, &user, true).await?;
 
     // After registration, proceed with login
-    let login_result = login_internal(
+    authenticate_login(
         data.clone(),
         Credentials {
             email: creds.email,
@@ -288,10 +311,7 @@ pub async fn register(
             client_id: creds.client_id,
         },
     )
-    .await?;
-
-    let result = encrypt_response(&data, &session_id, &login_result).await;
-    result
+    .await
 }
 
 pub async fn handle_new_user_registration(

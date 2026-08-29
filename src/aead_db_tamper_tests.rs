@@ -398,6 +398,9 @@ async fn db_password_change_invalidates_old_auth_context_and_preserves_seed() {
         .get_user_key(&old_login.user, &old_login.auth_context, None, None)
         .await
         .expect("old key should derive before password change");
+    app_state
+        .verify_bound_user(old_login.user.uuid, project.id, &old_login.auth_context)
+        .expect("transport-v2 bound authority should be live before password change");
 
     let new_auth_context = app_state
         .update_user_password_and_seed_wrap(
@@ -414,6 +417,10 @@ async fn db_password_change_invalidates_old_auth_context_and_preserves_seed() {
         matches!(old_context_after_change, Err(Error::AuthenticationError)),
         "old password auth context must not unwrap after password change"
     );
+    assert!(matches!(
+        app_state.verify_bound_user(old_login.user.uuid, project.id, &old_login.auth_context,),
+        Err(crate::ApiError::Unauthorized)
+    ));
 
     let old_password_login_after_change = app_state
         .authenticate_user(

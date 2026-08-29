@@ -913,9 +913,9 @@ fn password_registration_and_login_issue_tokens_only_after_seed_wrap_verificatio
 
     let register_route = extract_function_body(&login_contents, "pub async fn register");
     for required_pattern in [
-        "data.register_user(creds.clone()).await",
-        "login_internal(",
-        "password: creds.password",
+        "register_and_authenticate(data.clone(), creds).await",
+        "v1_auth_response(&data, &verified)",
+        "encrypt_response(&data, &session_id, &auth_response).await",
     ] {
         assert!(
             register_route.contains(required_pattern),
@@ -923,13 +923,27 @@ fn password_registration_and_login_issue_tokens_only_after_seed_wrap_verificatio
         );
     }
 
+    let register_and_authenticate = extract_function_body(
+        &login_contents,
+        "pub(crate) async fn register_and_authenticate",
+    );
+    assert_patterns_in_order(
+        register_and_authenticate,
+        &[
+            "data.register_user(creds.clone()).await",
+            "handle_new_user_registration(&data, &user, true).await",
+            "authenticate_login(",
+            "password: creds.password",
+        ],
+    );
+
     let authenticate_body = extract_function_body(&main_contents, "async fn authenticate_user");
     for required_pattern in [
         "decrypt_with_key(&secret_key, user.password_enc.as_ref().unwrap())",
         "verify_password(user_password, &decrypted_password_hash)",
         "password_auth_context_for_user(&user, &verifier_for_binding)",
         "verify_seed_wrap_for_auth_context(&user, &auth_context)",
-        "AuthenticatedUser { user, auth_context }",
+        "VerifiedUserAuthentication { user, auth_context }",
     ] {
         assert!(
             authenticate_body.contains(required_pattern),
@@ -938,16 +952,34 @@ fn password_registration_and_login_issue_tokens_only_after_seed_wrap_verificatio
     }
 
     let login_internal_body = extract_function_body(&login_contents, "async fn login_internal");
+    assert_patterns_in_order(
+        login_internal_body,
+        &[
+            "authenticate_login(data.clone(), creds).await",
+            "v1_auth_response(&data, &verified)",
+        ],
+    );
+
+    let authenticate_login_body =
+        extract_function_body(&login_contents, "pub(crate) async fn authenticate_login");
+    for required_pattern in [".authenticate_user(", "Ok(Some(authenticated_user))"] {
+        assert!(
+            authenticate_login_body.contains(required_pattern),
+            "password login verification must contain `{required_pattern}`"
+        );
+    }
+
+    let v1_auth_response_body =
+        extract_function_body(&login_contents, "pub(crate) fn v1_auth_response");
     for required_pattern in [
-        ".authenticate_user(",
         "NewToken::new_with_auth_context(",
         "TokenType::Access",
         "TokenType::Refresh",
-        "&authenticated_user.auth_context",
+        "&verified.auth_context",
     ] {
         assert!(
-            login_internal_body.contains(required_pattern),
-            "password login must contain `{required_pattern}`"
+            v1_auth_response_body.contains(required_pattern),
+            "v1 token response must contain `{required_pattern}`"
         );
     }
 }

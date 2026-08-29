@@ -5,6 +5,9 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
+use crate::jwt::AuthContext;
+use crate::VerifiedUserAuthentication;
+
 use super::crypto::{CryptoError, DirectionalKeys};
 use super::envelope::RequestId;
 
@@ -196,17 +199,27 @@ impl Drop for ReplayRegistry {
 
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) enum BoundPrincipal {
-    User { user_id: Uuid, project_id: i32 },
-    Platform { platform_user_id: Uuid },
-    ApiKey { api_key_id: i32, user_id: Uuid },
+    User {
+        user_id: Uuid,
+        project_id: i32,
+        auth_context: AuthContext,
+    },
+    Platform {
+        platform_user_id: Uuid,
+    },
+    ApiKey {
+        api_key_id: i32,
+        user_id: Uuid,
+    },
 }
 
 /// Stable authority identity retained by the transport session.
 ///
-/// Credential-derived authorization context remains an application concern in
-/// the binding PR. API keys have no independent token expiry, so their
-/// authority remains bounded by the session's absolute expiry and live
-/// database checks.
+/// User authorities retain the exact credential-derived authorization context
+/// accepted at binding so later requests can revalidate that same authority
+/// against live application state. API keys have no independent token expiry,
+/// so their authority remains bounded by the session's absolute expiry and
+/// live database checks.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct BoundAuthority {
     principal: BoundPrincipal,
@@ -214,15 +227,32 @@ pub(crate) struct BoundAuthority {
 }
 
 impl BoundAuthority {
-    pub(crate) const fn user(
+    pub(crate) fn verified_user(
+        verified: &VerifiedUserAuthentication,
+        authentication_expires_at: Instant,
+    ) -> Self {
+        Self {
+            principal: BoundPrincipal::User {
+                user_id: verified.user.get_id(),
+                project_id: verified.user.project_id,
+                auth_context: verified.auth_context.clone(),
+            },
+            authentication_expires_at: Some(authentication_expires_at),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn user(
         user_id: Uuid,
         project_id: i32,
+        auth_context: &AuthContext,
         authentication_expires_at: Instant,
     ) -> Self {
         Self {
             principal: BoundPrincipal::User {
                 user_id,
                 project_id,
+                auth_context: auth_context.clone(),
             },
             authentication_expires_at: Some(authentication_expires_at),
         }
@@ -933,6 +963,8 @@ mod tests {
     use std::sync::Barrier;
     use std::thread;
 
+    use crate::jwt::AuthMethod;
+
     use super::super::crypto::SessionMaster;
     use super::*;
 
@@ -954,6 +986,10 @@ mod tests {
             global,
             limits,
         )
+    }
+
+    fn user_auth_context(project_id: i32) -> AuthContext {
+        AuthContext::new(AuthMethod::Password, project_id, [0x7a; 32])
     }
 
     #[test]
@@ -1077,22 +1113,30 @@ mod tests {
         let authority = Arc::new(AuthorityCell::new());
         let now = Instant::now();
         let user = Uuid::new_v4();
+        let mut auth_context = user_auth_context(17);
+        let expected_auth_context = auth_context.clone();
 
         authority
             .begin(request_id(1))
             .expect("reserve auth")
             .commit_at(
-                BoundAuthority::user(user, 17, now + Duration::from_secs(30)),
+                BoundAuthority::user(user, 17, &auth_context, now + Duration::from_secs(30)),
                 now,
             )
             .expect("commit auth");
+        auth_context.auth_binding = [0x33; 32];
 
         match authority.snapshot() {
             AuthorityState::Bound(bound) => {
                 assert!(matches!(
                     bound.principal(),
-                    BoundPrincipal::User { user_id, project_id }
-                        if *user_id == user && *project_id == 17
+                    BoundPrincipal::User {
+                        user_id,
+                        project_id,
+                        auth_context: bound_auth_context,
+                    } if *user_id == user
+                        && *project_id == 17
+                        && bound_auth_context == &expected_auth_context
                 ));
             }
             _ => panic!("authority was not bound"),
@@ -1122,11 +1166,17 @@ mod tests {
         let authority = Arc::new(AuthorityCell::new());
         let now = Instant::now();
         let reservation = authority.begin(request_id(1)).expect("reserve auth");
+        let auth_context = user_auth_context(7);
 
         *lock_unpoisoned(&authority.state) = AuthorityState::Authenticating(request_id(2));
         let error = reservation
             .commit_at(
-                BoundAuthority::user(Uuid::new_v4(), 7, now + Duration::from_secs(30)),
+                BoundAuthority::user(
+                    Uuid::new_v4(),
+                    7,
+                    &auth_context,
+                    now + Duration::from_secs(30),
+                ),
                 now,
             )
             .expect_err("stale reservation must not commit");
@@ -1233,7 +1283,10 @@ mod tests {
         state
             .begin_authentication(request_id(1))
             .expect("reserve auth")
-            .commit_at(BoundAuthority::user(Uuid::new_v4(), 3, auth_expiry), now)
+            .commit_at(
+                BoundAuthority::user(Uuid::new_v4(), 3, &user_auth_context(3), auth_expiry),
+                now,
+            )
             .expect("bind authority");
 
         assert!(state.accepts_new_requests_at(auth_expiry - Duration::from_nanos(1)));

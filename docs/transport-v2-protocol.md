@@ -627,15 +627,28 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
 4. **Isolated v2 gateway**: separate attestation/key-exchange/request endpoints,
    bounded session allocation, strict outer parsing, exact-session decryption,
    and encrypted unsupported-operation responses; no application dispatch.
-5. **Session binding**: atomic anonymous authentication transitions, v2-only
-   resumption, and immutable user, platform, and API-key authority.
-6. **Application projection and streaming**: existing operation families over
-   v2, live authorization checks, unary responses, and ordered streaming.
-7. **Additive SDK v2 internals**: TypeScript and Rust codecs/session managers
+5. **User binding and first unary slice**: password login, registration,
+   v2-only resumption, immutable user/project/`AuthContext` authority, live
+   seed-wrap revalidation, and bodyless `GET /protected/user`. This layer also
+   activates exact unordered replay claims for supported operations. Platform,
+   API-key, OAuth, and all other application paths still receive the encrypted
+   unsupported-operation response.
+6. **Protected user unary projection**: project the remaining user-authorized
+   unary operation families, including third-party token issuance, through the
+   live bound-user checks without changing their application semantics.
+7. **API-key and platform binding**: bind existing raw API keys inside
+   ciphertext without rotating them, enforce their current inference-only
+   scope, and add platform authentication/authorization with live organization
+   checks. OAuth continuation receives an explicit session-binding design in
+   this layer rather than being inferred from password login.
+8. **Streaming projection**: project current inference streams with ordered,
+   request-bound, authenticated terminal records while preserving the SDK's
+   caller-visible SSE behavior.
+9. **Additive SDK v2 internals**: TypeScript and Rust codecs/session managers
    behind private seams, still not selected by public calls.
-8. **Atomic SDK cutover**: v2-only network behavior, no downgrade, one-time
+10. **Atomic SDK cutover**: v2-only network behavior, no downgrade, one-time
    fresh login, and Maple/proxy integration.
-9. **SDK major/version packaging**: package metadata, locks, integration pin,
+11. **SDK major/version packaging**: package metadata, locks, integration pin,
    compatibility matrix, and release rehearsal. Publication/deployment remain
    separate authorized actions.
 

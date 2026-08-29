@@ -11,7 +11,7 @@ use axum::{
     response::IntoResponse,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use jwt_compact::{alg::Es256k, prelude::*, AlgorithmExt};
 use secp256k1::{All, PublicKey, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ use sha2::Sha256;
 use uuid::Uuid;
 
 use crate::db::DBError;
-use crate::{ApiError, AppState};
+use crate::{ApiError, AppState, VerifiedUserAuthentication};
 use jsonwebtoken::{
     encode as jwt_encode, Algorithm as JwtAlgorithm, EncodingKey, Header as JwtHeader,
 };
@@ -32,6 +32,13 @@ pub const USER_REFRESH: &str = "refresh";
 
 pub const PLATFORM_ACCESS: &str = "platform_access";
 pub const PLATFORM_REFRESH: &str = "platform_refresh";
+
+pub(crate) const TRANSPORT_V2_USER_ACCESS_AUDIENCE: &str =
+    "urn:opensecret:internal:transport-v2:user:access-descriptor";
+pub(crate) const TRANSPORT_V2_USER_RESUMPTION_AUDIENCE: &str =
+    "urn:opensecret:internal:transport-v2:user:resumption";
+const TRANSPORT_V2_TOKEN_ISSUER: &str = "urn:opensecret:transport-v2";
+const TRANSPORT_V2_TOKEN_VERSION: u8 = 2;
 
 pub const USER_TOKEN_FORMAT_V2: u8 = 2;
 
@@ -172,11 +179,54 @@ impl AuthContext {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TransportV2TokenKind {
+    AccessDescriptor,
+    Resumption,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TransportV2PrincipalKind {
+    User,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TransportV2UserClaims {
+    sub: String,
+    iss: String,
+    aud: String,
+    tv: u8,
+    tk: TransportV2TokenKind,
+    pk: TransportV2PrincipalKind,
+    #[serde(rename = "tf")]
+    token_format: u8,
+    #[serde(rename = "am")]
+    auth_method: String,
+    #[serde(rename = "pid")]
+    project_id: i32,
+    #[serde(rename = "ab")]
+    auth_binding: String,
+}
+
+pub(crate) struct IssuedTransportV2UserTokens {
+    pub(crate) access_token: String,
+    pub(crate) resumption_token: String,
+    pub(crate) access_expires_at: DateTime<Utc>,
+}
+
 impl TokenType {
     pub fn validate_third_party_audience(aud: &str) -> Result<(), ApiError> {
         // Validate third party audience can't use our internal audience types
-        const RESERVED_AUDIENCES: [&str; 4] =
-            [USER_ACCESS, USER_REFRESH, PLATFORM_ACCESS, PLATFORM_REFRESH];
+        const RESERVED_AUDIENCES: [&str; 6] = [
+            USER_ACCESS,
+            USER_REFRESH,
+            PLATFORM_ACCESS,
+            PLATFORM_REFRESH,
+            TRANSPORT_V2_USER_ACCESS_AUDIENCE,
+            TRANSPORT_V2_USER_RESUMPTION_AUDIENCE,
+        ];
 
         // 1. Check for reserved audiences
         if RESERVED_AUDIENCES.contains(&aud) {
@@ -555,6 +605,175 @@ impl NewToken {
     }
 }
 
+pub(crate) fn issue_transport_v2_user_tokens(
+    user: &User,
+    auth_context: &AuthContext,
+    app_state: &AppState,
+) -> Result<IssuedTransportV2UserTokens, ApiError> {
+    if user.project_id != auth_context.project_id {
+        tracing::error!("Transport-v2 user token auth context project mismatch");
+        return Err(ApiError::BadRequest);
+    }
+
+    let (access_token, access_expires_at) = issue_transport_v2_user_token(
+        user,
+        auth_context,
+        app_state,
+        TransportV2TokenKind::AccessDescriptor,
+        TRANSPORT_V2_USER_ACCESS_AUDIENCE,
+        Duration::minutes(app_state.config.access_token_maxage),
+    )?;
+    let (resumption_token, _) = issue_transport_v2_user_token(
+        user,
+        auth_context,
+        app_state,
+        TransportV2TokenKind::Resumption,
+        TRANSPORT_V2_USER_RESUMPTION_AUDIENCE,
+        Duration::days(app_state.config.refresh_token_maxage),
+    )?;
+
+    Ok(IssuedTransportV2UserTokens {
+        access_token,
+        resumption_token,
+        access_expires_at,
+    })
+}
+
+fn issue_transport_v2_user_token(
+    user: &User,
+    auth_context: &AuthContext,
+    app_state: &AppState,
+    token_kind: TransportV2TokenKind,
+    audience: &str,
+    duration: Duration,
+) -> Result<(String, DateTime<Utc>), ApiError> {
+    let custom_claims = TransportV2UserClaims {
+        sub: user.get_id().to_string(),
+        iss: TRANSPORT_V2_TOKEN_ISSUER.to_owned(),
+        aud: audience.to_owned(),
+        tv: TRANSPORT_V2_TOKEN_VERSION,
+        tk: token_kind,
+        pk: TransportV2PrincipalKind::User,
+        token_format: auth_context.token_format,
+        auth_method: auth_context.method.as_str().to_owned(),
+        project_id: auth_context.project_id,
+        auth_binding: URL_SAFE_NO_PAD.encode(auth_context.auth_binding),
+    };
+
+    // Match the existing first-party clock-skew policy without changing the
+    // v1 token constructors.
+    let issued_at = Utc::now() - Duration::minutes(1);
+    let expiration = issued_at + duration;
+    let mut claims = Claims::new(custom_claims);
+    claims.issued_at = Some(issued_at);
+    claims.not_before = Some(issued_at);
+    claims.expiration = Some(expiration);
+
+    let header = Header::empty().with_token_type("JWT");
+    let es256k = Es256k::<Sha256>::new(app_state.config.jwt_keys.secp.clone());
+    let token = es256k
+        .token(&header, &claims, &app_state.config.jwt_keys.signing_key)
+        .map_err(|error| {
+            tracing::error!("Error creating transport-v2 user token: {:?}", error);
+            ApiError::InternalServerError
+        })?;
+
+    Ok((token, expiration))
+}
+
+pub(crate) fn validate_transport_v2_user_resumption(
+    original_token: &str,
+    data: &AppState,
+) -> Result<VerifiedUserAuthentication, ApiError> {
+    let claims =
+        validate_transport_v2_user_resumption_claims(original_token, &data.config.jwt_keys)?;
+    let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::InvalidJwt)?;
+    let auth_context = transport_v2_auth_context(&claims)?;
+    let user = match data.verify_bound_user(user_id, claims.project_id, &auth_context) {
+        Ok(user) => user,
+        Err(ApiError::InternalServerError) => return Err(ApiError::InternalServerError),
+        Err(_) => return Err(ApiError::InvalidJwt),
+    };
+
+    Ok(VerifiedUserAuthentication { user, auth_context })
+}
+
+fn validate_transport_v2_user_resumption_claims(
+    original_token: &str,
+    jwt_keys: &JwtKeys,
+) -> Result<TransportV2UserClaims, ApiError> {
+    let parsed_token = UntrustedToken::new(original_token).map_err(|error| {
+        tracing::error!("Failed to parse transport-v2 resumption token: {:?}", error);
+        ApiError::InvalidJwt
+    })?;
+    let es256k = Es256k::<Sha256>::new(jwt_keys.secp.clone());
+    let public_key = jwt_keys.public_key();
+    let token: Token<TransportV2UserClaims> = es256k
+        .validator(&public_key)
+        .validate(&parsed_token)
+        .map_err(|error| {
+            tracing::debug!(
+                "Transport-v2 resumption signature validation failed: {:?}",
+                error
+            );
+            ApiError::InvalidJwt
+        })?;
+    let claims = token.claims();
+
+    if claims.custom.iss != TRANSPORT_V2_TOKEN_ISSUER
+        || claims.custom.aud != TRANSPORT_V2_USER_RESUMPTION_AUDIENCE
+        || claims.custom.tv != TRANSPORT_V2_TOKEN_VERSION
+        || claims.custom.tk != TransportV2TokenKind::Resumption
+        || claims.custom.pk != TransportV2PrincipalKind::User
+    {
+        return Err(ApiError::InvalidJwt);
+    }
+
+    let time_options = TimeOptions::default();
+    claims
+        .validate_expiration(&time_options)
+        .and_then(|claims| claims.validate_maturity(&time_options))
+        .map_err(|error| {
+            tracing::error!(
+                "Transport-v2 resumption time validation failed: {:?}",
+                error
+            );
+            ApiError::InvalidJwt
+        })?;
+
+    let issued_at = claims.issued_at.ok_or(ApiError::InvalidJwt)?;
+    let not_before = claims.not_before.ok_or(ApiError::InvalidJwt)?;
+    let expiration = claims.expiration.ok_or(ApiError::InvalidJwt)?;
+    let latest_acceptable_issuance = Utc::now()
+        .checked_add_signed(time_options.leeway)
+        .ok_or(ApiError::InvalidJwt)?;
+    if issued_at > latest_acceptable_issuance || issued_at > not_before || not_before >= expiration
+    {
+        return Err(ApiError::InvalidJwt);
+    }
+
+    Ok(claims.custom.clone())
+}
+
+fn transport_v2_auth_context(claims: &TransportV2UserClaims) -> Result<AuthContext, ApiError> {
+    if claims.token_format != USER_TOKEN_FORMAT_V2 {
+        return Err(ApiError::InvalidJwt);
+    }
+    let method = AuthMethod::from_str(&claims.auth_method)?;
+    let auth_binding_bytes = URL_SAFE_NO_PAD
+        .decode(&claims.auth_binding)
+        .map_err(|_| ApiError::InvalidJwt)?;
+    let auth_binding: [u8; 32] = auth_binding_bytes
+        .try_into()
+        .map_err(|_| ApiError::InvalidJwt)?;
+    Ok(AuthContext {
+        token_format: USER_TOKEN_FORMAT_V2,
+        method,
+        project_id: claims.project_id,
+        auth_binding,
+    })
+}
+
 pub async fn generate_jwt_secret(
     aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
 ) -> Result<Vec<u8>, Error> {
@@ -804,6 +1023,7 @@ fn validate_token_with_keys_for_auth(
 mod tests {
     use super::*;
     use jsonwebtoken::{decode as jwt_decode, DecodingKey, Validation};
+    use serde::Serialize;
 
     fn test_keys(byte: u8) -> JwtKeys {
         JwtKeys::new(vec![byte; 32]).unwrap()
@@ -850,6 +1070,58 @@ mod tests {
                 &keys.signing_key,
             )
             .unwrap()
+    }
+
+    fn transport_v2_test_claims(
+        token_kind: TransportV2TokenKind,
+        audience: &str,
+    ) -> TransportV2UserClaims {
+        TransportV2UserClaims {
+            sub: Uuid::nil().to_string(),
+            iss: TRANSPORT_V2_TOKEN_ISSUER.to_owned(),
+            aud: audience.to_owned(),
+            tv: TRANSPORT_V2_TOKEN_VERSION,
+            tk: token_kind,
+            pk: TransportV2PrincipalKind::User,
+            token_format: USER_TOKEN_FORMAT_V2,
+            auth_method: AuthMethod::Password.as_str().to_owned(),
+            project_id: 1,
+            auth_binding: URL_SAFE_NO_PAD.encode([7_u8; 32]),
+        }
+    }
+
+    fn signed_transport_v2_test_token<T: Serialize>(
+        keys: &JwtKeys,
+        custom: T,
+        issued_at: Option<DateTime<Utc>>,
+        not_before: Option<DateTime<Utc>>,
+        expiration: Option<DateTime<Utc>>,
+    ) -> String {
+        let mut claims = Claims::new(custom);
+        claims.issued_at = issued_at;
+        claims.not_before = not_before;
+        claims.expiration = expiration;
+        Es256k::<Sha256>::new(keys.secp.clone())
+            .token(
+                &Header::empty().with_token_type("JWT"),
+                &claims,
+                &keys.signing_key,
+            )
+            .unwrap()
+    }
+
+    fn valid_transport_v2_resumption(keys: &JwtKeys) -> String {
+        let now = Utc::now();
+        signed_transport_v2_test_token(
+            keys,
+            transport_v2_test_claims(
+                TransportV2TokenKind::Resumption,
+                TRANSPORT_V2_USER_RESUMPTION_AUDIENCE,
+            ),
+            Some(now - Duration::minutes(2)),
+            Some(now - Duration::minutes(2)),
+            Some(now + Duration::minutes(5)),
+        )
     }
 
     #[test]
@@ -1052,5 +1324,193 @@ mod tests {
         claims.auth_binding = Some(URL_SAFE_NO_PAD.encode([5u8; 31]));
 
         assert!(AuthContext::from_claims(&claims).is_err());
+    }
+
+    #[test]
+    fn transport_v2_tokens_are_cryptographically_separate_from_v1_tokens() {
+        let keys = test_keys(6);
+        let now = Utc::now();
+        let resumption = valid_transport_v2_resumption(&keys);
+        assert!(validate_transport_v2_user_resumption_claims(&resumption, &keys).is_ok());
+        assert!(matches!(
+            validate_token_with_keys(&resumption, &keys, USER_ACCESS),
+            Err(ApiError::InvalidJwt)
+        ));
+        assert!(matches!(
+            validate_token_with_keys(&resumption, &keys, USER_REFRESH),
+            Err(ApiError::InvalidJwt)
+        ));
+
+        let descriptor = signed_transport_v2_test_token(
+            &keys,
+            transport_v2_test_claims(
+                TransportV2TokenKind::AccessDescriptor,
+                TRANSPORT_V2_USER_ACCESS_AUDIENCE,
+            ),
+            Some(now - Duration::minutes(2)),
+            Some(now - Duration::minutes(2)),
+            Some(now + Duration::minutes(5)),
+        );
+        assert!(matches!(
+            validate_transport_v2_user_resumption_claims(&descriptor, &keys),
+            Err(ApiError::InvalidJwt)
+        ));
+        assert!(matches!(
+            validate_token_with_keys(&descriptor, &keys, USER_ACCESS),
+            Err(ApiError::InvalidJwt)
+        ));
+
+        for audience in [USER_ACCESS, USER_REFRESH] {
+            let legacy = signed_test_token(&keys, audience, Some(now + Duration::minutes(5)));
+            assert!(matches!(
+                validate_transport_v2_user_resumption_claims(&legacy, &keys),
+                Err(ApiError::InvalidJwt)
+            ));
+        }
+
+        for audience in [
+            TRANSPORT_V2_USER_ACCESS_AUDIENCE,
+            TRANSPORT_V2_USER_RESUMPTION_AUDIENCE,
+        ] {
+            assert!(matches!(
+                TokenType::validate_third_party_audience(audience),
+                Err(ApiError::BadRequest)
+            ));
+        }
+    }
+
+    #[test]
+    fn transport_v2_resumption_rejects_wrong_identity_and_purpose_claims() {
+        let keys = test_keys(7);
+        let now = Utc::now();
+        let sign = |claims: TransportV2UserClaims| {
+            signed_transport_v2_test_token(
+                &keys,
+                claims,
+                Some(now - Duration::minutes(2)),
+                Some(now - Duration::minutes(2)),
+                Some(now + Duration::minutes(5)),
+            )
+        };
+
+        let mut wrong_issuer = transport_v2_test_claims(
+            TransportV2TokenKind::Resumption,
+            TRANSPORT_V2_USER_RESUMPTION_AUDIENCE,
+        );
+        wrong_issuer.iss = "urn:attacker".to_owned();
+        let mut wrong_audience = transport_v2_test_claims(
+            TransportV2TokenKind::Resumption,
+            TRANSPORT_V2_USER_RESUMPTION_AUDIENCE,
+        );
+        wrong_audience.aud = TRANSPORT_V2_USER_ACCESS_AUDIENCE.to_owned();
+        let mut wrong_version = transport_v2_test_claims(
+            TransportV2TokenKind::Resumption,
+            TRANSPORT_V2_USER_RESUMPTION_AUDIENCE,
+        );
+        wrong_version.tv += 1;
+        let mut wrong_kind = transport_v2_test_claims(
+            TransportV2TokenKind::Resumption,
+            TRANSPORT_V2_USER_RESUMPTION_AUDIENCE,
+        );
+        wrong_kind.tk = TransportV2TokenKind::AccessDescriptor;
+
+        for token in [
+            sign(wrong_issuer),
+            sign(wrong_audience),
+            sign(wrong_version),
+            sign(wrong_kind),
+        ] {
+            assert!(matches!(
+                validate_transport_v2_user_resumption_claims(&token, &keys),
+                Err(ApiError::InvalidJwt)
+            ));
+        }
+
+        let mut wrong_principal = serde_json::to_value(transport_v2_test_claims(
+            TransportV2TokenKind::Resumption,
+            TRANSPORT_V2_USER_RESUMPTION_AUDIENCE,
+        ))
+        .unwrap();
+        wrong_principal["pk"] = serde_json::Value::String("platform".to_owned());
+        let token = signed_transport_v2_test_token(
+            &keys,
+            wrong_principal,
+            Some(now - Duration::minutes(2)),
+            Some(now - Duration::minutes(2)),
+            Some(now + Duration::minutes(5)),
+        );
+        assert!(matches!(
+            validate_transport_v2_user_resumption_claims(&token, &keys),
+            Err(ApiError::InvalidJwt)
+        ));
+
+        let other_keys = test_keys(8);
+        assert!(matches!(
+            validate_transport_v2_user_resumption_claims(
+                &valid_transport_v2_resumption(&other_keys),
+                &keys
+            ),
+            Err(ApiError::InvalidJwt)
+        ));
+    }
+
+    #[test]
+    fn transport_v2_resumption_requires_strict_freshness_and_auth_binding() {
+        let keys = test_keys(9);
+        let now = Utc::now();
+        let claims = || {
+            transport_v2_test_claims(
+                TransportV2TokenKind::Resumption,
+                TRANSPORT_V2_USER_RESUMPTION_AUDIENCE,
+            )
+        };
+        let cases = [
+            (None, Some(now), Some(now + Duration::minutes(5))),
+            (Some(now), None, Some(now + Duration::minutes(5))),
+            (Some(now), Some(now), None),
+            (
+                Some(now - Duration::minutes(10)),
+                Some(now - Duration::minutes(10)),
+                Some(now - Duration::minutes(5)),
+            ),
+            (
+                Some(now + Duration::minutes(10)),
+                Some(now + Duration::minutes(10)),
+                Some(now + Duration::minutes(15)),
+            ),
+        ];
+        for (issued_at, not_before, expiration) in cases {
+            let token =
+                signed_transport_v2_test_token(&keys, claims(), issued_at, not_before, expiration);
+            assert!(matches!(
+                validate_transport_v2_user_resumption_claims(&token, &keys),
+                Err(ApiError::InvalidJwt)
+            ));
+        }
+
+        let mut malformed_base64 = claims();
+        malformed_base64.auth_binding = "not-base64".to_owned();
+        assert!(matches!(
+            transport_v2_auth_context(&malformed_base64),
+            Err(ApiError::InvalidJwt)
+        ));
+        let mut wrong_length = claims();
+        wrong_length.auth_binding = URL_SAFE_NO_PAD.encode([1_u8; 31]);
+        assert!(matches!(
+            transport_v2_auth_context(&wrong_length),
+            Err(ApiError::InvalidJwt)
+        ));
+        let mut wrong_format = claims();
+        wrong_format.token_format += 1;
+        assert!(matches!(
+            transport_v2_auth_context(&wrong_format),
+            Err(ApiError::InvalidJwt)
+        ));
+        let mut wrong_method = claims();
+        wrong_method.auth_method = "api_key".to_owned();
+        assert!(matches!(
+            transport_v2_auth_context(&wrong_method),
+            Err(ApiError::InvalidJwt)
+        ));
     }
 }

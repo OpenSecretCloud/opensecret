@@ -129,17 +129,28 @@ handshake_key = HKDF-SHA256(
 )
 ```
 
-The encrypted key payload contains the protocol version, session UUID, session
-master, and absolute expiry. The outer and encrypted session UUIDs must match.
-The record uses ChaCha20-Poly1305 and this AAD:
+The encrypted key payload is a fixed 57-byte binary value:
+
+```text
+version_u8
+|| session_uuid_bytes[16]
+|| session_master[32]
+|| expires_at_unix_seconds_u64_be
+```
+
+The version byte is exactly `2`. The UUID uses its RFC 9562 network-order
+bytes. The expiry is an unsigned Unix timestamp in whole seconds and is a
+client renewal hint; the enclave enforces the 65-minute lifetime with a
+monotonic clock. The outer and encrypted session UUIDs must match. The record
+uses ChaCha20-Poly1305 and this AAD:
 
 ```text
 UTF8("opensecret/transport-v2/key-exchange")
 ```
 
 This domain-separates v2 from the legacy direct-shared-secret wrapping format.
-The exact payload encoding and golden bytes are frozen by the cross-language
-test vectors before the endpoint is registered.
+The exact golden bytes are frozen by the cross-language test vectors before the
+endpoint is registered.
 
 ## 5. Session key schedule
 
@@ -240,7 +251,12 @@ Fields have these meanings:
   APIs preserve a server-selected unary or streaming response. Explicit modes
   must agree with the selected route and application request.
 - `credential` is normally `null`. It is used only for a permitted anonymous
-  authentication transition such as initial API-key binding.
+  authentication transition. The initial strict variants are
+  `{"kind":"api_key","value_base64":"..."}` and
+  `{"kind":"resumption","value_base64":"..."}`. The value is the exact
+  credential bytes in canonical padded standard base64. Password, registration,
+  OAuth, and recovery credentials remain part of their logical operation body;
+  they do not become generic transport credentials.
 - `method` is a supported uppercase HTTP method.
 - `path` is one origin-relative application path with no query or fragment.
 - `query` is either `null` or the exact query string without a leading `?`.
@@ -287,9 +303,16 @@ The enclave processes every v2 request in this order:
 5. Strictly parse and structurally validate the envelope.
 6. Validate method, path, query, headers, body presence, credential use, and
    response mode for the selected application operation.
-7. Atomically claim the decoded 16-byte request identifier.
-8. Only then authenticate, dispatch, mutate state, bill, send email, or call a
+7. Reserve response capacity before dispatch: one record for unary, or start
+   and terminal records atomically for streaming.
+8. Atomically claim the decoded 16-byte request identifier.
+9. Only then authenticate, dispatch, mutate state, bill, send email, or call a
    provider.
+
+Unused pre-dispatch response reservations are released. Once encryption of a
+reserved record is attempted, its slot remains charged even if encryption
+fails. Later stream chunks charge capacity individually while the terminal
+reservation remains unavailable to them.
 
 Replay rules are:
 
@@ -476,6 +499,8 @@ Rules are:
   SSE or other streaming body without parsing application events in the
   transport layer.
 - Exactly one authenticated `end` or `error` terminal record is required.
+- The enclave reserves both `start` and terminal record capacity before
+  dispatch; later chunks cannot consume either reservation.
 - EOF before a terminal record, a duplicate/out-of-order sequence, plaintext
   application data, or an undecryptable record fails the stream.
 - The exact request lease remains held until terminal delivery or body drop.
@@ -505,6 +530,33 @@ At minimum v2 bounds:
 The initial outer ceiling may retain the current 50 MiB limit. Base64 expansion
 and simultaneous outer/decoded/decrypted buffers must be included in memory
 accounting rather than described as only wire overhead.
+
+The initial v2-core limits are:
+
+| Resource | Limit |
+| --- | ---: |
+| Absolute session lifetime | 3,900 seconds |
+| Pending attestations | 65,536 |
+| Live sessions | 65,536 |
+| Request records per session | 65,536 |
+| Response records per session | 65,536 |
+| Replay identifiers per session | 65,536 |
+| Replay identifiers globally | 2,097,152 |
+| Decrypted envelope | 50 MiB |
+| Logical body | 28 MiB |
+
+The separate v2 cache budget is 256 MiB. Capacity accounting reserves 512
+bytes per live session, 64 bytes per replay identifier, and 192 bytes per
+pending attestation entry: approximately 172 MiB at the independent hard
+limits, leaving headroom for allocator and cache metadata. Replay sets allocate
+lazily. The dormant core defines and tests these limits but does not allocate a
+cache until the v2 gateway is wired.
+
+The 28 MiB logical-body limit is deliberate. A body is base64-encoded inside
+the JSON envelope, then the envelope is encrypted and base64-encoded again for
+the outer request. Keeping a 50 MiB outer ceiling therefore cannot preserve
+transport v1's larger effective plaintext ceiling. Raising the v2 outer limit
+requires separate enclave-memory measurement rather than an implicit change.
 
 No outer content encoding or decompression is accepted. Application-layer
 payload validation remains owned by the existing application operation.

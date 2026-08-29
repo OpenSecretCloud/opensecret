@@ -16,7 +16,9 @@ use crate::{
     models::users::User,
     tokens::count_tokens,
     web::{
-        encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+        encryption_middleware::{
+            decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
+        },
         openai::{
             ensure_completion_model_access, get_chat_completion_response,
             get_chat_completion_response_for_expected_route, BillingContext, CompletionChunk,
@@ -3758,7 +3760,7 @@ async fn wait_for_response_cancellation(
 async fn create_response_stream(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
     Extension(mut body): Extension<ResponsesCreateRequest>,
@@ -4451,14 +4453,14 @@ where
 /// Helper to create encrypted SSE event
 pub async fn encrypt_event(
     state: &AppState,
-    session_id: &Uuid,
+    transport_session: &TransportSession,
     event_type: &str,
     payload: &Value,
 ) -> Result<Event, ApiError> {
     trace!("encrypt_event called for event type: {}", event_type);
     let payload_str = payload.to_string();
-    let encrypted = state
-        .encrypt_session_data(session_id, payload_str.as_bytes())
+    let encrypted = transport_session
+        .encrypt_response_bytes(state, payload_str.as_bytes())
         .await
         .map_err(|e| {
             error!("Failed to encrypt event data: {:?}", e);
@@ -4475,7 +4477,7 @@ async fn get_response(
     Path(id): Path<Uuid>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<ResponsesRetrieveResponse>>, ApiError> {
     debug!("Getting response {} for user {}", id, user.uuid);
 
@@ -4637,7 +4639,7 @@ async fn cancel_response(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     Extension(user): Extension<User>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<ResponsesRetrieveResponse>>, ApiError> {
     debug!("Cancelling response {} for user {}", id, user.uuid);
 
@@ -4705,7 +4707,7 @@ async fn delete_response(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     Extension(user): Extension<User>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
     debug!("Deleting response {} for user {}", id, user.uuid);
 

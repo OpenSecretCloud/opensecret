@@ -1,6 +1,8 @@
 use crate::{
     models::{org_memberships::OrgRole, orgs::NewOrg, platform_users::PlatformUser},
-    web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+    web::encryption_middleware::{
+        decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
+    },
     ApiError, AppState,
 };
 use axum::{
@@ -41,7 +43,7 @@ async fn create_org(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Extension(create_request): Extension<CreateOrgRequest>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<OrgResponse>>, ApiError> {
     debug!("Creating new organization");
 
@@ -72,7 +74,7 @@ async fn create_org(
 async fn list_orgs(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<Vec<OrgResponse>>>, ApiError> {
     debug!("Listing organizations");
 
@@ -112,7 +114,7 @@ async fn delete_org(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path(org_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     debug!("Deleting organization");
 

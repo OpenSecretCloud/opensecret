@@ -20,6 +20,42 @@ use crate::{ApiError, AppState};
 
 const MAX_ENCRYPTED_BODY_BYTES: usize = 50 * 1024 * 1024; // 50MB
 
+/// Identifies the transport context that must encrypt a handler response.
+///
+/// Keeping this distinct from the application's authenticated principal makes
+/// the response transport explicit at the handler boundary. V1 contains only
+/// the legacy session identifier; future protocol versions can carry their
+/// exact response-encryption context without changing every handler again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransportSession {
+    kind: TransportSessionKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TransportSessionKind {
+    V1 { session_id: Uuid },
+}
+
+impl TransportSession {
+    fn v1(session_id: Uuid) -> Self {
+        Self {
+            kind: TransportSessionKind::V1 { session_id },
+        }
+    }
+
+    pub(crate) async fn encrypt_response_bytes(
+        &self,
+        state: &AppState,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ApiError> {
+        match &self.kind {
+            TransportSessionKind::V1 { session_id } => {
+                state.encrypt_session_data(session_id, plaintext).await
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct EncryptedRequest {
     pub encrypted: String,
@@ -73,7 +109,9 @@ where
     if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>() {
         request.extensions_mut().insert(());
     }
-    request.extensions_mut().insert(session_id);
+    request
+        .extensions_mut()
+        .insert(TransportSession::v1(session_id));
     let response = run_next(request).await;
     Ok(hold_resource_through_response_body(response, resource))
 }
@@ -128,7 +166,9 @@ where
     })?;
 
     request.extensions_mut().insert(decrypted);
-    request.extensions_mut().insert(session_id);
+    request
+        .extensions_mut()
+        .insert(TransportSession::v1(session_id));
     let response = next.run(request).await;
     Ok(hold_resource_through_response_body(response, session_lease))
 }
@@ -175,12 +215,12 @@ where
 
 pub async fn encrypt_response<T: Serialize>(
     state: &AppState,
-    session_id: &Uuid,
+    transport_session: &TransportSession,
     response: &T,
 ) -> Result<Json<EncryptedResponse<T>>, ApiError> {
     let response_json = serde_json::to_vec(response).map_err(|_| ApiError::InternalServerError)?;
-    let encrypted_response = state
-        .encrypt_session_data(session_id, &response_json)
+    let encrypted_response = transport_session
+        .encrypt_response_bytes(state, &response_json)
         .await?;
     Ok(Json(EncryptedResponse::new(
         base64::engine::general_purpose::STANDARD.encode(encrypted_response),
@@ -274,7 +314,10 @@ mod tests {
                 .body(Body::empty())
                 .unwrap(),
             move |request| {
-                assert_eq!(request.extensions().get::<Uuid>(), Some(&session_id));
+                assert_eq!(
+                    request.extensions().get::<TransportSession>(),
+                    Some(&TransportSession::v1(session_id))
+                );
                 assert!(request.extensions().get::<()>().is_some());
                 observed_calls.fetch_add(1, Ordering::SeqCst);
                 async { Response::new(Body::empty()) }

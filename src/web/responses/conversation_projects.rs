@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::debug;
 use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 struct ConversationProjectContext {
     project: crate::models::responses::ConversationProject,
@@ -63,7 +64,7 @@ impl ConversationProjectContext {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct CreateConversationProjectRequest {
     pub name: String,
 }
@@ -76,13 +77,17 @@ pub struct UpdateConversationProjectRequest {
     pub instructions: NullableField<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct ConversationProjectResponse {
+    #[zeroize(skip)]
     pub id: Uuid,
+    #[zeroize(skip)]
     pub object: &'static str,
     pub name: String,
     pub instructions: Option<String>,
+    #[zeroize(skip)]
     pub created_at: i64,
+    #[zeroize(skip)]
     pub updated_at: i64,
 }
 
@@ -121,7 +126,7 @@ fn default_order() -> String {
     DEFAULT_PAGINATION_ORDER.to_string()
 }
 
-fn validate_project_name(name: &str) -> Result<String, ApiError> {
+pub(crate) fn validate_project_name(name: &str) -> Result<String, ApiError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         Err(ApiError::BadRequest)
@@ -164,9 +169,28 @@ async fn create_conversation_project(
     Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<CreateConversationProjectRequest>,
 ) -> Result<Json<EncryptedResponse<ConversationProjectResponse>>, ApiError> {
-    let name = validate_project_name(&body.name)?;
+    let response = create_conversation_project_data(&state, &user, &auth_context, body).await?;
+    encrypt_response(&state, &session_id, &response).await
+}
+
+pub(crate) async fn create_conversation_project_data(
+    state: &AppState,
+    user: &User,
+    auth_context: &AuthContext,
+    body: CreateConversationProjectRequest,
+) -> Result<ConversationProjectResponse, ApiError> {
+    let name = Zeroizing::new(validate_project_name(&body.name)?);
+    create_conversation_project_with_name_data(state, user, auth_context, name).await
+}
+
+pub(crate) async fn create_conversation_project_with_name_data(
+    state: &AppState,
+    user: &User,
+    auth_context: &AuthContext,
+    mut name: Zeroizing<String>,
+) -> Result<ConversationProjectResponse, ApiError> {
     let user_key = state
-        .get_user_key(&user, &auth_context, None, None)
+        .get_user_key(user, auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
@@ -179,8 +203,11 @@ async fn create_conversation_project(
         })
         .map_err(error_mapping::map_conversation_project_error)?;
 
-    let response = build_project_response(&project, name, None);
-    encrypt_response(&state, &session_id, &response).await
+    Ok(build_project_response(
+        &project,
+        std::mem::take(&mut *name),
+        None,
+    ))
 }
 
 async fn list_conversation_projects(
@@ -326,6 +353,16 @@ async fn delete_conversation_project(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
 ) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
+    delete_conversation_project_data(&state, &user, project_id)?;
+    let response = DeletedObjectResponse::conversation_project(project_id);
+    encrypt_response(&state, &session_id, &response).await
+}
+
+pub(crate) fn delete_conversation_project_data(
+    state: &AppState,
+    user: &User,
+    project_id: Uuid,
+) -> Result<(), ApiError> {
     debug!(
         "Deleting conversation project {} for user {}",
         project_id, user.uuid
@@ -341,8 +378,20 @@ async fn delete_conversation_project(
         .delete_conversation_project(project.id, user.uuid)
         .map_err(error_mapping::map_conversation_project_error)?;
 
-    let response = DeletedObjectResponse::conversation_project(project.uuid);
-    encrypt_response(&state, &session_id, &response).await
+    Ok(())
+}
+
+pub(crate) fn delete_conversation_project_by_uuid_data(
+    state: &AppState,
+    user: &User,
+    project_id: Uuid,
+) -> Result<(), ApiError> {
+    let deleted_project_id = state
+        .db
+        .delete_conversation_project_by_uuid_and_user(project_id, user.uuid)
+        .map_err(error_mapping::map_conversation_project_error)?;
+    debug_assert_eq!(deleted_project_id, project_id);
+    Ok(())
 }
 
 pub fn router(state: Arc<AppState>) -> Router {

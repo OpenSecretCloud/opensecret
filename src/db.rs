@@ -589,6 +589,11 @@ pub trait DBConnection {
     fn delete_conversation(&self, conversation_id: i64, user_id: Uuid) -> Result<(), DBError>;
     fn delete_all_conversations(&self, user_id: Uuid) -> Result<(), DBError>;
     fn delete_conversation_project(&self, project_id: i64, user_id: Uuid) -> Result<(), DBError>;
+    fn delete_conversation_project_by_uuid_and_user(
+        &self,
+        project_uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<Uuid, DBError>;
 
     // Responses (job tracker)
     fn create_response(&self, new_response: NewResponse) -> Result<Response, DBError>;
@@ -2423,6 +2428,16 @@ impl DBConnection for PostgresConnection {
     fn delete_conversation_project(&self, project_id: i64, user_id: Uuid) -> Result<(), DBError> {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         ConversationProject::delete_by_id_and_user(conn, project_id, user_id).map_err(DBError::from)
+    }
+
+    fn delete_conversation_project_by_uuid_and_user(
+        &self,
+        project_uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<Uuid, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        ConversationProject::delete_by_uuid_and_user(conn, project_uuid, user_id)
+            .map_err(DBError::from)
     }
 
     // Responses (job tracker) implementations

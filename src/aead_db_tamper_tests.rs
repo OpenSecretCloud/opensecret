@@ -1188,6 +1188,85 @@ async fn db_password_change_deletes_tampered_stale_password_wraps() {
 
 #[tokio::test]
 #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_conversation_project_uuid_delete_is_owner_scoped_and_cascades() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let org_project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let owner =
+        create_response_transaction_test_user(&app_state, org_project.id, marker, "project-owner");
+    let attacker = create_response_transaction_test_user(
+        &app_state,
+        org_project.id,
+        marker,
+        "project-attacker",
+    );
+    let project_uuid = Uuid::new_v4();
+    let project = app_state
+        .db
+        .create_conversation_project(NewConversationProject {
+            uuid: project_uuid,
+            user_id: owner.uuid,
+            name_enc: vec![0x5a; 1024 * 1024],
+        })
+        .expect("owner conversation project should insert");
+    let conversation_uuid = Uuid::new_v4();
+    app_state
+        .db
+        .create_conversation(NewConversation {
+            uuid: conversation_uuid,
+            user_id: owner.uuid,
+            project_id: Some(project.id),
+            is_pinned: false,
+            metadata_enc: None,
+        })
+        .expect("assigned conversation should insert");
+
+    assert!(matches!(
+        app_state
+            .db
+            .delete_conversation_project_by_uuid_and_user(project_uuid, attacker.uuid),
+        Err(DBError::ResponsesError(
+            ResponsesError::ConversationProjectNotFound
+        ))
+    ));
+    app_state
+        .db
+        .get_conversation_project_by_uuid_and_user(project_uuid, owner.uuid)
+        .expect("foreign deletion must preserve the owner project");
+
+    let deleted = app_state
+        .db
+        .delete_conversation_project_by_uuid_and_user(project_uuid, owner.uuid)
+        .expect("owner-scoped UUID deletion should succeed");
+    assert_eq!(deleted, project_uuid);
+    assert!(matches!(
+        app_state
+            .db
+            .get_conversation_project_by_uuid_and_user(project_uuid, owner.uuid),
+        Err(DBError::ResponsesError(
+            ResponsesError::ConversationProjectNotFound
+        ))
+    ));
+    assert!(matches!(
+        app_state
+            .db
+            .get_conversation_by_uuid_and_user(conversation_uuid, owner.uuid),
+        Err(DBError::ResponsesError(
+            ResponsesError::ConversationNotFound
+        ))
+    ));
+
+    let _ = app_state.db.delete_user(&owner);
+    let _ = app_state.db.delete_user(&attacker);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
 async fn db_password_change_cannot_commit_after_destructive_reset_rotates_seed() {
     let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
         eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");

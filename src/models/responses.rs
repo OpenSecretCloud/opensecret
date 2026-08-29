@@ -390,6 +390,29 @@ impl ConversationProject {
         Ok(())
     }
 
+    /// Deletes one owner-scoped project without loading its encrypted name.
+    ///
+    /// Transport v2 uses this narrow statement so a bodyless deletion cannot
+    /// materialize attacker-sized stored ciphertext merely to resolve the
+    /// internal row ID. Existing v1 lookup/delete behavior remains unchanged.
+    pub fn delete_by_uuid_and_user(
+        conn: &mut PgConnection,
+        project_uuid: Uuid,
+        user_id: Uuid,
+    ) -> Result<Uuid, ResponsesError> {
+        diesel::delete(
+            conversation_projects::table
+                .filter(conversation_projects::uuid.eq(project_uuid))
+                .filter(conversation_projects::user_id.eq(user_id)),
+        )
+        .returning(conversation_projects::uuid)
+        .get_result::<Uuid>(conn)
+        .map_err(|error| match error {
+            diesel::result::Error::NotFound => ResponsesError::ConversationProjectNotFound,
+            error => ResponsesError::DatabaseError(error),
+        })
+    }
+
     pub fn count_for_user(conn: &mut PgConnection, user_id: Uuid) -> Result<i64, ResponsesError> {
         use diesel::dsl::count;
 

@@ -36,12 +36,20 @@ use crate::web::protected_routes::{
     InitiateAccountDeletionRequest, KvValue, PublicKeyQuery, SignMessageRequest,
     ThirdPartyTokenRequest,
 };
+use crate::web::responses::{
+    constants::OBJECT_TYPE_CONVERSATION_PROJECT,
+    conversation_projects::{
+        create_conversation_project_with_name_data, delete_conversation_project_by_uuid_data,
+        validate_project_name, CreateConversationProjectRequest,
+    },
+    DeletedObjectResponse,
+};
 use crate::{ApiError, AppState, VerifiedUserAuthentication};
 
 use super::envelope::{
-    decode_canonical_api_key_name_path, decode_canonical_kv_item_path,
-    decode_canonical_verify_email_path, Credential, EncodedBytes, EnvelopeLimits, HeaderField,
-    LogicalMethod, RequestEnvelope, RequestId, ResponseMode,
+    decode_canonical_api_key_name_path, decode_canonical_conversation_project_path,
+    decode_canonical_kv_item_path, decode_canonical_verify_email_path, Credential, EncodedBytes,
+    EnvelopeLimits, HeaderField, LogicalMethod, RequestEnvelope, RequestId, ResponseMode,
 };
 use super::session::{
     AuthenticationReservation, AuthenticationStartError, AuthorityState, BoundAuthority,
@@ -136,6 +144,12 @@ pub(crate) enum ProtectedUserOperation {
     DeleteApiKey {
         name: Zeroizing<String>,
     },
+    CreateConversationProject {
+        body: SensitiveBytes,
+    },
+    DeleteConversationProject {
+        project_id: uuid::Uuid,
+    },
     RequestAccountDeletion {
         body: SensitiveBytes,
     },
@@ -194,6 +208,45 @@ pub(crate) struct LogicalUnaryResponse {
     pub(crate) status: StatusCode,
     pub(crate) headers: Vec<HeaderField>,
     pub(crate) body: Option<Zeroizing<Vec<u8>>>,
+}
+
+#[derive(Serialize)]
+struct ConversationProjectCreationResponsePreflight<'a> {
+    id: uuid::Uuid,
+    object: &'static str,
+    name: &'a str,
+    instructions: Option<&'a str>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn preflight_conversation_project_creation_response(name: &str) -> Result<(), ApiError> {
+    preflight_conversation_project_creation_response_with_limit(
+        name,
+        EnvelopeLimits::default().logical_body_bytes,
+    )
+}
+
+fn preflight_conversation_project_creation_response_with_limit(
+    name: &str,
+    logical_body_bytes: usize,
+) -> Result<(), ApiError> {
+    let candidate = ConversationProjectCreationResponsePreflight {
+        id: uuid::Uuid::nil(),
+        object: OBJECT_TYPE_CONVERSATION_PROJECT,
+        name,
+        instructions: None,
+        created_at: i64::MIN,
+        updated_at: i64::MIN,
+    };
+    // Creation assigns the UUID and timestamps in PostgreSQL. Prove before
+    // insertion that the request-derived response fits; the actual UUID has
+    // the same width and real timestamps are shorter. Drop the bounded copy
+    // before entering storage so the preflight does not inflate the mutation.
+    let response =
+        LogicalUnaryResponse::json_with_limit(StatusCode::OK, &candidate, logical_body_bytes)?;
+    drop(response);
+    Ok(())
 }
 
 impl LogicalUnaryResponse {
@@ -335,6 +388,8 @@ pub(crate) fn prepare_user_operation(
         CreateApiKey,
         ListApiKeys,
         DeleteApiKey,
+        CreateConversationProject,
+        DeleteConversationProject,
         RequestAccountDeletion,
         ConfirmAccountDeletion,
         Logout,
@@ -363,6 +418,14 @@ pub(crate) fn prepare_user_operation(
             return rejected_bad_request();
         }
     };
+    let conversation_project_id =
+        match decode_canonical_conversation_project_path(request.method, &request.path) {
+            Ok(project_id) => project_id,
+            Err(_) => {
+                request.path.zeroize();
+                return rejected_bad_request();
+            }
+        };
     let route = match (request.method, request.path.as_str()) {
         (LogicalMethod::Post, "/login") => Some(Route::Login),
         (LogicalMethod::Post, "/register") => Some(Route::Register),
@@ -383,6 +446,9 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Delete, "/protected/kv") => Some(Route::DeleteAllKv),
         (LogicalMethod::Post, "/protected/api-keys") => Some(Route::CreateApiKey),
         (LogicalMethod::Get, "/protected/api-keys") => Some(Route::ListApiKeys),
+        (LogicalMethod::Post, "/v1/conversation-projects") => {
+            Some(Route::CreateConversationProject)
+        }
         (LogicalMethod::Post, "/protected/delete-account/request") => {
             Some(Route::RequestAccountDeletion)
         }
@@ -395,9 +461,16 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Put, _) if kv_key.is_some() => Some(Route::PutKv),
         (LogicalMethod::Delete, _) if kv_key.is_some() => Some(Route::DeleteKv),
         (LogicalMethod::Delete, _) if api_key_name.is_some() => Some(Route::DeleteApiKey),
+        (LogicalMethod::Delete, _) if conversation_project_id.is_some() => {
+            Some(Route::DeleteConversationProject)
+        }
         _ => None,
     };
-    if kv_key.is_some() || api_key_name.is_some() || verification_code.is_some() {
+    if kv_key.is_some()
+        || api_key_name.is_some()
+        || verification_code.is_some()
+        || conversation_project_id.is_some()
+    {
         request.path.zeroize();
     }
     let Some(route) = route else {
@@ -746,6 +819,52 @@ pub(crate) fn prepare_user_operation(
                 operation: ProtectedUserOperation::DeleteApiKey {
                     name: api_key_name
                         .expect("classified API-key item route must have a decoded name"),
+                },
+            })
+        }
+        Route::CreateConversationProject => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            let body = request
+                .body_base64
+                .expect("validated conversation-project creation body presence")
+                .into_bytes();
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::CreateConversationProject {
+                    body: Zeroizing::new(body),
+                },
+            })
+        }
+        Route::DeleteConversationProject => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::DeleteConversationProject {
+                    project_id: conversation_project_id
+                        .expect("classified conversation-project route must have an ID"),
                 },
             })
         }
@@ -1166,6 +1285,21 @@ async fn execute_protected_user_operation(
                 &serde_json::json!({ "success": true }),
             )?;
             delete_api_key_by_name(app_state, user, &name)?;
+            Ok(response)
+        }
+        ProtectedUserOperation::CreateConversationProject { body } => {
+            let request = parse_json_body::<CreateConversationProjectRequest>(body)?;
+            let name = Zeroizing::new(validate_project_name(&request.name)?);
+            preflight_conversation_project_creation_response(&name)?;
+            let value =
+                create_conversation_project_with_name_data(app_state, user, auth_context, name)
+                    .await?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::DeleteConversationProject { project_id } => {
+            let value = DeletedObjectResponse::conversation_project(project_id);
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value)?;
+            delete_conversation_project_by_uuid_data(app_state, user, project_id)?;
             Ok(response)
         }
         ProtectedUserOperation::RequestAccountDeletion { body } => {
@@ -2178,6 +2312,147 @@ mod tests {
             unreachable!("matched ready API-key list operation")
         };
         assert!(list.requires_stored_output_reservation());
+    }
+
+    #[test]
+    fn conversation_project_create_and_delete_are_exact_bound_mutations() {
+        let create = || {
+            envelope(
+                LogicalMethod::Post,
+                "/v1/conversation-projects",
+                json_header(),
+                Some(br#"{"name":"  Project name  "}"#),
+                None,
+            )
+        };
+        let create_operation = prepare_user_operation(create(), bound_user_authority());
+        assert!(matches!(
+            &create_operation,
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::CreateConversationProject { .. },
+                ..
+            })
+        ));
+        let OperationPreparation::Ready(create_operation) = create_operation else {
+            unreachable!("matched ready conversation-project creation")
+        };
+        assert!(!create_operation.requires_stored_output_reservation());
+
+        let project_id = "123e4567-e89b-12d3-a456-426614174000";
+        let delete = || {
+            envelope(
+                LogicalMethod::Delete,
+                &format!("/v1/conversation-projects/{project_id}"),
+                Vec::new(),
+                None,
+                None,
+            )
+        };
+        let delete_operation = prepare_user_operation(delete(), bound_user_authority());
+        assert!(matches!(
+            &delete_operation,
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::DeleteConversationProject {
+                    project_id: decoded,
+                },
+                ..
+            }) if *decoded == uuid::Uuid::parse_str(project_id).unwrap()
+        ));
+        let OperationPreparation::Ready(delete_operation) = delete_operation else {
+            unreachable!("matched ready conversation-project deletion")
+        };
+        assert!(!delete_operation.requires_stored_output_reservation());
+
+        for request in [create(), delete()] {
+            assert!(matches!(
+                prepare_user_operation(request, AuthorityState::Anonymous),
+                OperationPreparation::Rejected(response)
+                    if response.status == StatusCode::UNAUTHORIZED
+            ));
+        }
+
+        let mut create_with_query = create();
+        create_with_query.request.query = Some("transplanted=true".to_owned());
+        assert!(matches!(
+            prepare_user_operation(create_with_query, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut create_with_credential = create();
+        create_with_credential.credential = Some(Credential::Resumption {
+            value_base64: EncodedBytes::from_bytes(b"transplanted".to_vec()),
+        });
+        assert!(matches!(
+            prepare_user_operation(create_with_credential, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut delete_with_body = delete();
+        delete_with_body.request.body_base64 = Some(EncodedBytes::from_bytes(b"{}".to_vec()));
+        assert!(matches!(
+            prepare_user_operation(delete_with_body, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut streaming = create();
+        streaming.response_mode = ResponseMode::Stream;
+        assert!(matches!(
+            prepare_user_operation(streaming, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        for (method, path) in [
+            (LogicalMethod::Get, "/v1/conversation-projects"),
+            (
+                LogicalMethod::Get,
+                "/v1/conversation-projects/123e4567-e89b-12d3-a456-426614174000",
+            ),
+            (
+                LogicalMethod::Post,
+                "/v1/conversation-projects/123e4567-e89b-12d3-a456-426614174000",
+            ),
+        ] {
+            assert!(matches!(
+                prepare_user_operation(
+                    envelope(method, path, Vec::new(), None, None),
+                    bound_user_authority(),
+                ),
+                OperationPreparation::Unsupported
+            ));
+        }
+    }
+
+    #[test]
+    fn conversation_project_creation_preflight_matches_wire_shape_and_bounds_before_insert() {
+        let name = "quoted \\\" project ☃";
+        let candidate = ConversationProjectCreationResponsePreflight {
+            id: uuid::Uuid::nil(),
+            object: OBJECT_TYPE_CONVERSATION_PROJECT,
+            name,
+            instructions: None,
+            created_at: i64::MIN,
+            updated_at: i64::MIN,
+        };
+        let actual = crate::web::responses::conversation_projects::ConversationProjectResponse {
+            id: uuid::Uuid::nil(),
+            object: OBJECT_TYPE_CONVERSATION_PROJECT,
+            name: name.to_owned(),
+            instructions: None,
+            created_at: i64::MIN,
+            updated_at: i64::MIN,
+        };
+        assert_eq!(
+            serde_json::to_vec(&candidate).unwrap(),
+            serde_json::to_vec(&actual).unwrap(),
+        );
+        assert!(matches!(
+            preflight_conversation_project_creation_response_with_limit(name, 8),
+            Err(ApiError::PayloadTooLarge)
+        ));
     }
 
     #[test]

@@ -373,6 +373,7 @@ impl LogicalRequest {
 const KV_ITEM_PATH_PREFIX: &str = "/protected/kv/";
 const API_KEY_ITEM_PATH_PREFIX: &str = "/protected/api-keys/";
 const VERIFY_EMAIL_PATH_PREFIX: &str = "/verify-email/";
+const CONVERSATION_PROJECT_ITEM_PATH_PREFIX: &str = "/v1/conversation-projects/";
 
 fn validate_logical_path(
     method: LogicalMethod,
@@ -387,6 +388,9 @@ fn validate_logical_path(
         return Ok(());
     }
     if decode_canonical_verify_email_path(method, path)?.is_some() {
+        return Ok(());
+    }
+    if decode_canonical_conversation_project_path(method, path)?.is_some() {
         return Ok(());
     }
     validate_path(path, limits)
@@ -469,6 +473,35 @@ pub(crate) fn decode_canonical_verify_email_path(
         ));
     }
     Ok(Some(code))
+}
+
+/// Decodes the canonical UUID segment used by one conversation-project item.
+///
+/// Axum's v1 UUID aliases remain untouched. Transport v2 accepts one lowercase
+/// hyphenated spelling for GET, POST, and DELETE so the authenticated logical
+/// path identifies exactly one project operation.
+pub(crate) fn decode_canonical_conversation_project_path(
+    method: LogicalMethod,
+    path: &str,
+) -> Result<Option<Uuid>, EnvelopeError> {
+    if !matches!(
+        method,
+        LogicalMethod::Get | LogicalMethod::Post | LogicalMethod::Delete
+    ) {
+        return Ok(None);
+    }
+    let Some(segment) = path.strip_prefix(CONVERSATION_PROJECT_ITEM_PATH_PREFIX) else {
+        return Ok(None);
+    };
+    let project_id = Uuid::parse_str(segment).map_err(|_| {
+        EnvelopeError::InvalidPath("conversation project ID must be a canonical UUID")
+    })?;
+    if project_id.hyphenated().to_string() != segment {
+        return Err(EnvelopeError::InvalidPath(
+            "conversation project ID must use lowercase hyphenated UUID spelling",
+        ));
+    }
+    Ok(Some(project_id))
 }
 
 fn decode_canonical_opaque_segment(segment: &str) -> Result<Zeroizing<String>, EnvelopeError> {
@@ -1269,6 +1302,59 @@ mod tests {
                     .is_err(),
                 "{invalid}"
             );
+        }
+    }
+
+    #[test]
+    fn conversation_project_item_paths_use_one_canonical_uuid_spelling() {
+        let encoded = "123e4567-e89b-12d3-a456-426614174000";
+        let path = format!("{CONVERSATION_PROJECT_ITEM_PATH_PREFIX}{encoded}");
+        for method in [
+            LogicalMethod::Get,
+            LogicalMethod::Post,
+            LogicalMethod::Delete,
+        ] {
+            assert_eq!(
+                decode_canonical_conversation_project_path(method, &path).unwrap(),
+                Some(Uuid::parse_str(encoded).unwrap())
+            );
+            validate_logical_path(method, &path, &EnvelopeLimits::default()).unwrap();
+        }
+
+        assert!(
+            decode_canonical_conversation_project_path(LogicalMethod::Put, &path)
+                .unwrap()
+                .is_none()
+        );
+        assert!(decode_canonical_conversation_project_path(
+            LogicalMethod::Get,
+            "/v1/conversation-project/123e4567-e89b-12d3-a456-426614174000",
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn conversation_project_item_paths_reject_uuid_aliases_and_malformed_ids() {
+        for method in [
+            LogicalMethod::Get,
+            LogicalMethod::Post,
+            LogicalMethod::Delete,
+        ] {
+            for invalid in [
+                "/v1/conversation-projects/",
+                "/v1/conversation-projects/123E4567-E89B-12D3-A456-426614174000",
+                "/v1/conversation-projects/123e4567e89b12d3a456426614174000",
+                "/v1/conversation-projects/{123e4567-e89b-12d3-a456-426614174000}",
+                "/v1/conversation-projects/123e4567%2De89b%2D12d3%2Da456%2D426614174000",
+                "/v1/conversation-projects/123e4567-e89b-12d3-a456-426614174000/extra",
+                "/v1/conversation-projects/not-a-uuid",
+            ] {
+                assert!(
+                    validate_logical_path(method, invalid, &EnvelopeLimits::default()).is_err(),
+                    "{method:?} {invalid}"
+                );
+            }
         }
     }
 

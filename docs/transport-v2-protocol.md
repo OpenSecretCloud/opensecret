@@ -391,8 +391,11 @@ Once bound:
 - login, registration, resumption, and API-key rebinding are rejected;
 - protected authorization comes from the bound session, never an outer bearer;
   and
-- logout encrypts its response with the admitting lease before closing and
-  zeroizing the session.
+- a successful terminal operation moves the exact session to `Closing` before
+  encrypting its final response through the already-admitted lease. Closing
+  fences new work but does not invalidate the held response key or reservation;
+  secret state is retired after active leases drop and cache cleanup detaches
+  it.
 
 The SDK owns each v2 session within exactly one authentication/client context;
 it never reuses the current origin-and-PCR-only global cache across users,

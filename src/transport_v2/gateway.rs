@@ -31,7 +31,7 @@ use crate::{AppState, AsyncRngWrapper};
 
 use super::application::{
     begin_authentication_transition, execute_user_operation, prepare_user_operation,
-    LogicalUnaryResponse, OperationPreparation,
+    LogicalUnaryResponse, OperationPreparation, SessionEffect,
 };
 use super::crypto::{
     encrypt_key_exchange_record, CryptoError, DirectionalKeys, HandshakePayload, SessionMaster,
@@ -519,10 +519,16 @@ impl TransportV2State {
         }
 
         let outcome = dispatch(lease.clone(), operation, authentication, now).await;
-        let bound_session = outcome.bound_session;
+        let session_effect = outcome.session_effect;
+        if session_effect == SessionEffect::Close {
+            // Stop new admission before producing the terminal response. The
+            // exact held lease and pre-dispatch reservation intentionally stay
+            // usable while Closing so this admitted response can still finish.
+            lease.state().close();
+        }
         let encrypted =
             encrypt_reserved_logical_response(lease, request_id, reservation, outcome.response);
-        if encrypted.is_err() && bound_session {
+        if encrypted.is_err() && session_effect == SessionEffect::NewlyBound {
             // Never leave a newly authenticated session reachable when its
             // only binding response could not be authenticated to the client.
             lease.state().close();
@@ -1100,7 +1106,7 @@ mod tests {
                 headers: Vec::new(),
                 body: Some(zeroize::Zeroizing::new(br#"{"ok":true}"#.to_vec())),
             },
-            bound_session: false,
+            session_effect: SessionEffect::Retain,
         }
     }
 
@@ -1683,6 +1689,276 @@ mod tests {
             200
         );
         assert_eq!(lease.state().replay_id_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_effect_closes_before_encrypting_the_admitted_response() {
+        let state = TransportV2State::new();
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        let master_bytes = [0x81; 32];
+        let session = test_session(
+            session_id,
+            master_bytes,
+            now + Duration::from_secs(60),
+            Arc::clone(&state.global_replay_budget),
+        );
+        session
+            .begin_authentication(RequestId::from_bytes([0x82; 16]))
+            .unwrap()
+            .commit_at(
+                BoundAuthority::user(
+                    Uuid::from_bytes([0x83; 16]),
+                    7,
+                    &AuthContext::new(AuthMethod::Password, 7, [0x84; 32]),
+                    now + Duration::from_secs(30),
+                ),
+                now,
+            )
+            .unwrap();
+        state.insert_session(session).await.unwrap();
+
+        let request_id = RequestId::from_bytes([0x85; 16]);
+        let lease = state.acquire_session(&session_id, now).await.unwrap();
+        let OperationPreparation::Ready(operation) = prepare_user_operation(
+            get_user_envelope(request_id, None),
+            lease.state().authority(),
+        ) else {
+            panic!("bound user operation must be ready");
+        };
+        let mut working_set_permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        let response = state
+            .process_ready_operation(
+                &lease,
+                request_id,
+                operation,
+                &mut working_set_permit,
+                now,
+                |_lease, _operation, authentication, _| async move {
+                    assert!(authentication.is_none());
+                    let mut outcome = successful_test_outcome();
+                    outcome.session_effect = SessionEffect::Close;
+                    outcome
+                },
+            )
+            .await
+            .expect("held terminal response must still encrypt");
+
+        let client_keys =
+            DirectionalKeys::derive(&SessionMaster::from_bytes(master_bytes)).unwrap();
+        assert_eq!(
+            response_status(&client_keys, &session_id, &request_id, &response),
+            200
+        );
+        assert!(lease.state().is_closing());
+        assert!(state.acquire_session(&session_id, now).await.is_err());
+        assert_eq!(state.cleanup_expired_at(now).await, 0);
+        drop(lease);
+        assert_eq!(state.cleanup_expired_at(now).await, 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_effect_stays_closed_when_response_encryption_fails() {
+        let state = TransportV2State::new();
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        let session = test_session(
+            session_id,
+            [0x91; 32],
+            now + Duration::from_secs(60),
+            Arc::clone(&state.global_replay_budget),
+        );
+        session
+            .begin_authentication(RequestId::from_bytes([0x92; 16]))
+            .unwrap()
+            .commit_at(
+                BoundAuthority::user(
+                    Uuid::from_bytes([0x93; 16]),
+                    7,
+                    &AuthContext::new(AuthMethod::Password, 7, [0x94; 32]),
+                    now + Duration::from_secs(30),
+                ),
+                now,
+            )
+            .unwrap();
+        state.insert_session(session).await.unwrap();
+
+        let request_id = RequestId::from_bytes([0x95; 16]);
+        let lease = state.acquire_session(&session_id, now).await.unwrap();
+        let OperationPreparation::Ready(operation) = prepare_user_operation(
+            get_user_envelope(request_id, None),
+            lease.state().authority(),
+        ) else {
+            panic!("bound user operation must be ready");
+        };
+        let mut working_set_permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        let result = state
+            .process_ready_operation(
+                &lease,
+                request_id,
+                operation,
+                &mut working_set_permit,
+                now,
+                |_lease, _operation, authentication, _| async move {
+                    assert!(authentication.is_none());
+                    super::super::application::ApplicationOutcome {
+                        response: LogicalUnaryResponse {
+                            status: StatusCode::OK,
+                            headers: vec![HeaderField {
+                                name: "invalid header name".to_owned(),
+                                value_base64: EncodedBytes::from_bytes(b"x".to_vec()),
+                            }],
+                            body: None,
+                        },
+                        session_effect: SessionEffect::Close,
+                    }
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(GatewayError::Internal)));
+        assert!(lease.state().is_closing());
+        assert!(state.acquire_session(&session_id, now).await.is_err());
+        assert_eq!(state.cleanup_expired_at(now).await, 0);
+        drop(lease);
+        assert_eq!(state.cleanup_expired_at(now).await, 1);
+    }
+
+    #[tokio::test]
+    async fn newly_bound_effect_keeps_a_successfully_delivered_session_open() {
+        let state = TransportV2State::new();
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        let master_bytes = [0xa1; 32];
+        state
+            .insert_session(test_session(
+                session_id,
+                master_bytes,
+                now + Duration::from_secs(60),
+                Arc::clone(&state.global_replay_budget),
+            ))
+            .await
+            .unwrap();
+
+        let request_id = RequestId::from_bytes([0xa2; 16]);
+        let lease = state.acquire_session(&session_id, now).await.unwrap();
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(login_envelope(request_id), lease.state().authority())
+        else {
+            panic!("anonymous login operation must be ready");
+        };
+        let mut working_set_permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        let response = state
+            .process_ready_operation(
+                &lease,
+                request_id,
+                operation,
+                &mut working_set_permit,
+                now,
+                |_lease, _operation, authentication, _| async move {
+                    authentication
+                        .expect("login must reserve authentication")
+                        .commit_at(
+                            BoundAuthority::user(
+                                Uuid::from_bytes([0xa3; 16]),
+                                7,
+                                &AuthContext::new(AuthMethod::Password, 7, [0xa4; 32]),
+                                now + Duration::from_secs(30),
+                            ),
+                            now,
+                        )
+                        .unwrap();
+                    let mut outcome = successful_test_outcome();
+                    outcome.session_effect = SessionEffect::NewlyBound;
+                    outcome
+                },
+            )
+            .await
+            .expect("binding response must encrypt");
+
+        let client_keys =
+            DirectionalKeys::derive(&SessionMaster::from_bytes(master_bytes)).unwrap();
+        assert_eq!(
+            response_status(&client_keys, &session_id, &request_id, &response),
+            200
+        );
+        assert!(matches!(
+            lease.state().authority(),
+            AuthorityState::Bound(_)
+        ));
+        assert!(!lease.state().is_closing());
+        assert!(state.acquire_session(&session_id, now).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn newly_bound_effect_closes_when_its_binding_response_cannot_encrypt() {
+        let state = TransportV2State::new();
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        state
+            .insert_session(test_session(
+                session_id,
+                [0xb1; 32],
+                now + Duration::from_secs(60),
+                Arc::clone(&state.global_replay_budget),
+            ))
+            .await
+            .unwrap();
+
+        let request_id = RequestId::from_bytes([0xb2; 16]);
+        let lease = state.acquire_session(&session_id, now).await.unwrap();
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(login_envelope(request_id), lease.state().authority())
+        else {
+            panic!("anonymous login operation must be ready");
+        };
+        let mut working_set_permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        let result = state
+            .process_ready_operation(
+                &lease,
+                request_id,
+                operation,
+                &mut working_set_permit,
+                now,
+                |_lease, _operation, authentication, _| async move {
+                    authentication
+                        .expect("login must reserve authentication")
+                        .commit_at(
+                            BoundAuthority::user(
+                                Uuid::from_bytes([0xb3; 16]),
+                                7,
+                                &AuthContext::new(AuthMethod::Password, 7, [0xb4; 32]),
+                                now + Duration::from_secs(30),
+                            ),
+                            now,
+                        )
+                        .unwrap();
+                    super::super::application::ApplicationOutcome {
+                        response: LogicalUnaryResponse {
+                            status: StatusCode::OK,
+                            headers: vec![HeaderField {
+                                name: "invalid header name".to_owned(),
+                                value_base64: EncodedBytes::from_bytes(b"x".to_vec()),
+                            }],
+                            body: None,
+                        },
+                        session_effect: SessionEffect::NewlyBound,
+                    }
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(GatewayError::Internal)));
+        assert!(lease.state().is_closing());
+        assert!(state.acquire_session(&session_id, now).await.is_err());
     }
 
     #[tokio::test]

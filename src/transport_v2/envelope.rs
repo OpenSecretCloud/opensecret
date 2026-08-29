@@ -2,7 +2,7 @@ use std::fmt;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const MIB: usize = 1024 * 1024;
 const KIB: usize = 1024;
@@ -357,7 +357,7 @@ impl RequestEnvelope {
 
 impl LogicalRequest {
     pub(crate) fn validate(&self, limits: &EnvelopeLimits) -> Result<(), EnvelopeError> {
-        validate_path(&self.path, limits)?;
+        validate_logical_path(self.method, &self.path, limits)?;
         if let Some(query) = self.query.as_deref() {
             validate_query(query, limits)?;
         }
@@ -366,6 +366,97 @@ impl LogicalRequest {
             check_limit(body.len(), limits.logical_body_bytes, "logical body")?;
         }
         Ok(())
+    }
+}
+
+const KV_ITEM_PATH_PREFIX: &str = "/protected/kv/";
+
+fn validate_logical_path(
+    method: LogicalMethod,
+    path: &str,
+    limits: &EnvelopeLimits,
+) -> Result<(), EnvelopeError> {
+    check_limit(path.len(), limits.path_bytes, "path")?;
+    if decode_canonical_kv_item_path(method, path)?.is_some() {
+        return Ok(());
+    }
+    validate_path(path, limits)
+}
+
+/// Decodes the one opaque UTF-8 segment admitted by the released KV item API.
+///
+/// Literal separators select the route before this function runs. Every
+/// non-alphanumeric key byte must use one uppercase `%HH` triplet, matching the
+/// Rust SDK's `NON_ALPHANUMERIC` encoder. The result is decoded exactly once.
+pub(crate) fn decode_canonical_kv_item_path(
+    method: LogicalMethod,
+    path: &str,
+) -> Result<Option<Zeroizing<String>>, EnvelopeError> {
+    if !matches!(
+        method,
+        LogicalMethod::Get | LogicalMethod::Put | LogicalMethod::Delete
+    ) {
+        return Ok(None);
+    }
+    let Some(segment) = path.strip_prefix(KV_ITEM_PATH_PREFIX) else {
+        return Ok(None);
+    };
+    if segment.is_empty() {
+        return Err(EnvelopeError::InvalidPath(
+            "opaque path segment must not be empty",
+        ));
+    }
+
+    let encoded = segment.as_bytes();
+    let mut decoded = Zeroizing::new(Vec::with_capacity(encoded.len()));
+    let mut index = 0;
+    while index < encoded.len() {
+        let byte = encoded[index];
+        if byte.is_ascii_alphanumeric() {
+            decoded.push(byte);
+            index += 1;
+            continue;
+        }
+        if byte != b'%' {
+            return Err(EnvelopeError::InvalidPath(
+                "opaque path segment is not canonically encoded",
+            ));
+        }
+        let high = *encoded
+            .get(index + 1)
+            .ok_or(EnvelopeError::InvalidPath("invalid percent encoding"))?;
+        let low = *encoded
+            .get(index + 2)
+            .ok_or(EnvelopeError::InvalidPath("invalid percent encoding"))?;
+        let decoded_byte = (canonical_uri_hex_nibble(high)? << 4) | canonical_uri_hex_nibble(low)?;
+        if decoded_byte.is_ascii_alphanumeric() {
+            return Err(EnvelopeError::InvalidPath(
+                "opaque path segment over-encodes an alphanumeric byte",
+            ));
+        }
+        decoded.push(decoded_byte);
+        index += 3;
+    }
+
+    match String::from_utf8(std::mem::take(&mut *decoded)) {
+        Ok(value) => Ok(Some(Zeroizing::new(value))),
+        Err(error) => {
+            let mut bytes = error.into_bytes();
+            bytes.zeroize();
+            Err(EnvelopeError::InvalidPath(
+                "opaque path segment is not valid UTF-8",
+            ))
+        }
+    }
+}
+
+fn canonical_uri_hex_nibble(byte: u8) -> Result<u8, EnvelopeError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(EnvelopeError::InvalidPath(
+            "opaque path segment requires uppercase percent encoding",
+        )),
     }
 }
 
@@ -913,6 +1004,88 @@ mod tests {
             &EnvelopeLimits::default(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn kv_item_paths_use_one_route_scoped_canonical_utf8_segment() {
+        for (encoded, decoded) in [
+            ("simple123", "simple123"),
+            ("key%2Fwith%2Fslashes", "key/with/slashes"),
+            ("key%3Fwith%3Dquery%26params", "key?with=query&params"),
+            ("key%23with%23hash", "key#with#hash"),
+            ("key%20with%20spaces", "key with spaces"),
+            ("key%25with%25percents", "key%with%percents"),
+            ("key%40with%21special%24chars", "key@with!special$chars"),
+            ("%2D%5F%2E%21%7E%2A%27%28%29", "-_.!~*'()"),
+            ("%2E", "."),
+            ("%2E%2E", ".."),
+            ("%2F", "/"),
+            ("%5C", "\\"),
+            ("%252F", "%2F"),
+            ("caf%C3%A9", "café"),
+            ("%F0%9F%94%90", "🔐"),
+        ] {
+            for method in [
+                LogicalMethod::Get,
+                LogicalMethod::Put,
+                LogicalMethod::Delete,
+            ] {
+                let path = format!("{KV_ITEM_PATH_PREFIX}{encoded}");
+                let value = decode_canonical_kv_item_path(method, &path)
+                    .unwrap()
+                    .expect("KV item route must decode");
+                assert_eq!(&*value, decoded, "{method:?} {encoded}");
+                validate_logical_path(method, &path, &EnvelopeLimits::default()).unwrap();
+            }
+        }
+
+        let json = request_json("null")
+            .replace("\"method\":\"POST\"", "\"method\":\"GET\"")
+            .replace("/v1/responses", "/protected/kv/key%2Fpart");
+        let envelope =
+            RequestEnvelope::from_json_slice(json.as_bytes(), &EnvelopeLimits::default()).unwrap();
+        assert_eq!(envelope.request.path, "/protected/kv/key%2Fpart");
+    }
+
+    #[test]
+    fn kv_item_paths_reject_noncanonical_or_ambiguous_segments() {
+        for invalid in [
+            "/protected/kv/",
+            "/protected/kv/a/b",
+            "/protected/kv/%2f",
+            "/protected/kv/%5c",
+            "/protected/kv/%2e",
+            "/protected/kv/%41",
+            "/protected/kv/%",
+            "/protected/kv/%0",
+            "/protected/kv/%GG",
+            "/protected/kv/raw_punctuation",
+            "/protected/kv/café",
+            "/protected/kv/%FF",
+        ] {
+            assert!(
+                validate_logical_path(LogicalMethod::Get, invalid, &EnvelopeLimits::default())
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+
+        assert!(
+            decode_canonical_kv_item_path(LogicalMethod::Post, "/protected/kv/key%2Fpart")
+                .unwrap()
+                .is_none()
+        );
+        assert!(validate_logical_path(
+            LogicalMethod::Post,
+            "/protected/kv/key%2Fpart",
+            &EnvelopeLimits::default()
+        )
+        .is_err());
+        assert!(
+            decode_canonical_kv_item_path(LogicalMethod::Get, "/protected/kvx/key")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

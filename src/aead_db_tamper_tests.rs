@@ -17,7 +17,7 @@ use crate::{
             org_projects, password_reset_requests, reasoning_items, responses, tool_calls,
             tool_outputs, user_messages, user_oauth_connections, user_seed_wrappings,
         },
-        user_api_keys::NewUserApiKey,
+        user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError},
         user_kv::{NewUserKV, UserKV},
         user_seed_wrappings::NewUserSeedWrapping,
         users::{NewUser, User},
@@ -547,6 +547,114 @@ async fn db_bounded_kv_reads_preserve_wire_data_and_enforce_limits() {
         other_list.is_empty(),
         "bounded LIST must remain scoped to its user"
     );
+
+    let _ = app_state.db.delete_user(&owner);
+    let _ = app_state.db.delete_user(&other);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_bounded_api_key_list_preserves_metadata_and_enforces_limits() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let owner_email = format!("aead-bounded-api-keys-owner-{marker}@example.com");
+    let other_email = format!("aead-bounded-api-keys-other-{marker}@example.com");
+    let owner = create_password_wrapped_user(
+        &app_state,
+        project.id,
+        owner_email,
+        test_credential("bounded-api-keys-owner"),
+    )
+    .await;
+    let other = create_password_wrapped_user(
+        &app_state,
+        project.id,
+        other_email,
+        test_credential("bounded-api-keys-other"),
+    )
+    .await;
+
+    let names = ["bounded API key-1", "bounded API key_2"];
+    for (index, name) in names.iter().enumerate() {
+        app_state
+            .db
+            .create_user_api_key(NewUserApiKey::new(
+                owner.uuid,
+                format!("{:064x}", marker.as_u128().wrapping_add(index as u128)),
+                (*name).to_owned(),
+            ))
+            .expect("API-key metadata insert should succeed");
+    }
+
+    let aggregate_name_bytes = names.iter().map(|name| name.len()).sum();
+    let mut conn = app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("bounded API-key test connection should open");
+    let mut bounded = UserApiKey::get_bounded_list_for_user(
+        &mut conn,
+        owner.uuid,
+        aggregate_name_bytes,
+        names.len(),
+    )
+    .expect("bounded API-key list should succeed at its exact limits");
+    let mut legacy = app_state
+        .db
+        .get_all_user_api_keys_for_user(owner.uuid)
+        .expect("legacy API-key list comparison should succeed");
+    bounded.sort_by(|left, right| left.name.cmp(&right.name));
+    legacy.sort_by(|left, right| left.name.cmp(&right.name));
+    assert_eq!(bounded.len(), names.len());
+    for (actual, expected) in bounded.iter().zip(&legacy) {
+        assert_eq!(actual.name, expected.name);
+        assert_eq!(actual.created_at, expected.created_at);
+    }
+
+    assert!(matches!(
+        UserApiKey::get_bounded_list_for_user(
+            &mut conn,
+            owner.uuid,
+            aggregate_name_bytes - 1,
+            names.len(),
+        ),
+        Err(UserApiKeyError::OutputTooLarge)
+    ));
+    assert!(matches!(
+        UserApiKey::get_bounded_list_for_user(
+            &mut conn,
+            owner.uuid,
+            aggregate_name_bytes,
+            names.len() - 1,
+        ),
+        Err(UserApiKeyError::OutputTooLarge)
+    ));
+    let other_rows = UserApiKey::get_bounded_list_for_user(&mut conn, other.uuid, 0, 0)
+        .expect("empty other-user API-key list should succeed");
+    assert!(
+        other_rows.is_empty(),
+        "API-key list must remain user-scoped"
+    );
+    drop(conn);
+
+    let response = crate::web::protected_routes::list_bounded_api_keys_data(
+        &app_state,
+        &owner,
+        aggregate_name_bytes,
+        names.len(),
+    )
+    .expect("bounded API-key response data should succeed");
+    assert_eq!(response.keys.len(), names.len());
+    for key in &response.keys {
+        assert!(names.contains(&key.name.as_str()));
+        assert!(key.created_at.timestamp() > 0);
+    }
 
     let _ = app_state.db.delete_user(&owner);
     let _ = app_state.db.delete_user(&other);

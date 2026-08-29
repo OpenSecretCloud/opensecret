@@ -712,7 +712,10 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
    an exact bound-user JSON mutation, preserving the generic success response,
    independent fresh attempts, and background email behavior while claiming
    replay state before request creation. Account-deletion confirmation must
-   explicitly close the now-invalid bound session.
+   pre-serialize its fixed success response before committing deletion, then
+   explicitly close the now-invalid bound session only after that commit.
+   Invalid codes, secrets, requests, expiry, and database failures return their
+   existing encrypted errors without closing an otherwise valid session.
 12. **Stored user unary operations**: project conversations, conversation
    projects, instructions, response control, and web-provider unary routes in
    ownership-preserving families before the client cutover.

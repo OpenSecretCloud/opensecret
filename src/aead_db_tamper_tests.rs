@@ -1,9 +1,10 @@
 use crate::{
     db::{setup_db, DBError},
-    encrypt::encrypt_with_key,
+    encrypt::{encrypt_key_deterministic, encrypt_with_key},
     generate_reset_hash,
     login_routes::RegisterCredentials,
     models::{
+        account_deletion::NewAccountDeletionRequest,
         email_verification::NewEmailVerification,
         oauth::NewUserOAuthConnection,
         org_projects::OrgProject,
@@ -818,6 +819,124 @@ async fn db_account_deletion_request_preserves_generic_response_and_distinct_att
     .execute(conn)
     .expect("test account deletion requests should delete");
     let _ = app_state.db.delete_user(&user);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_account_deletion_confirmation_preserves_failures_and_completed_audit_row() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let user = app_state
+        .db
+        .create_user(NewUser::new(None, None, project.id))
+        .expect("guest deletion-confirmation test user should insert");
+    let confirmation_code = Uuid::new_v4();
+    let sibling_code = Uuid::new_v4();
+    let plaintext_secret = format!("deletion-secret-{}", Uuid::new_v4());
+    let enclave_key = SecretKey::from_slice(&app_state.enclave_key)
+        .expect("test enclave key must be a valid secp256k1 secret");
+    let selected = app_state
+        .db
+        .create_account_deletion_request(NewAccountDeletionRequest::new(
+            user.uuid,
+            project.id,
+            generate_reset_hash(plaintext_secret.clone()),
+            encrypt_key_deterministic(&enclave_key, confirmation_code.as_bytes()),
+            24,
+        ))
+        .expect("selected deletion request should insert");
+    let sibling = app_state
+        .db
+        .create_account_deletion_request(NewAccountDeletionRequest::new(
+            user.uuid,
+            project.id,
+            generate_reset_hash("sibling-secret".to_owned()),
+            encrypt_key_deterministic(&enclave_key, sibling_code.as_bytes()),
+            24,
+        ))
+        .expect("sibling deletion request should insert");
+
+    let invalid_code = crate::web::protected_routes::confirm_account_deletion_data(
+        &app_state,
+        &user,
+        crate::web::protected_routes::ConfirmAccountDeletionRequest {
+            confirmation_code: "not-a-uuid".to_owned(),
+            plaintext_secret: plaintext_secret.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(invalid_code, Err(crate::ApiError::BadRequest)));
+
+    let invalid_secret = crate::web::protected_routes::confirm_account_deletion_data(
+        &app_state,
+        &user,
+        crate::web::protected_routes::ConfirmAccountDeletionRequest {
+            confirmation_code: confirmation_code.to_string(),
+            plaintext_secret: "wrong-secret".to_owned(),
+        },
+    )
+    .await;
+    assert!(matches!(invalid_secret, Err(crate::ApiError::BadRequest)));
+    app_state
+        .db
+        .get_user_by_uuid(user.uuid)
+        .expect("failed confirmation must preserve the user");
+
+    crate::web::protected_routes::confirm_account_deletion_data(
+        &app_state,
+        &user,
+        crate::web::protected_routes::ConfirmAccountDeletionRequest {
+            confirmation_code: confirmation_code.to_string(),
+            plaintext_secret,
+        },
+    )
+    .await
+    .expect("valid account deletion confirmation should succeed");
+    assert!(matches!(
+        app_state.db.get_user_by_uuid(user.uuid),
+        Err(DBError::UserNotFound)
+    ));
+
+    let conn = &mut app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("test database connection should be available");
+    let rows = account_deletion_requests::table
+        .filter(account_deletion_requests::id.eq_any([selected.id, sibling.id]))
+        .order(account_deletion_requests::id.asc())
+        .select((
+            account_deletion_requests::id,
+            account_deletion_requests::is_deleted,
+            account_deletion_requests::completed_at,
+        ))
+        .load::<(i32, bool, Option<chrono::DateTime<Utc>>)>(conn)
+        .expect("orphan-preserving deletion audit rows should remain readable");
+    assert_eq!(rows.len(), 2);
+    let selected_row = rows
+        .iter()
+        .find(|(id, _, _)| *id == selected.id)
+        .expect("selected deletion audit row should remain");
+    assert!(selected_row.1);
+    assert!(selected_row.2.is_some());
+    let sibling_row = rows
+        .iter()
+        .find(|(id, _, _)| *id == sibling.id)
+        .expect("sibling deletion audit row should remain");
+    assert!(!sibling_row.1);
+    assert!(sibling_row.2.is_none());
+
+    diesel::delete(
+        account_deletion_requests::table
+            .filter(account_deletion_requests::id.eq_any([selected.id, sibling.id])),
+    )
+    .execute(conn)
+    .expect("test account deletion audit rows should delete");
 }
 
 #[tokio::test]

@@ -95,7 +95,7 @@ pub struct InitiateAccountDeletionRequest {
     pub hashed_secret: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct ConfirmAccountDeletionRequest {
     pub confirmation_code: String,
     pub plaintext_secret: String,
@@ -1352,25 +1352,29 @@ pub async fn confirm_account_deletion(
     Extension(confirm_request): Extension<ConfirmAccountDeletionRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    confirm_account_deletion_data(&data, &user, confirm_request).await?;
+
+    let response = json!({
+        "message": "Your account has been successfully deleted."
+    });
+
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn confirm_account_deletion_data(
+    data: &AppState,
+    user: &User,
+    mut confirm_request: ConfirmAccountDeletionRequest,
+) -> Result<(), ApiError> {
     info!("User {} is confirming account deletion", user.uuid);
 
-    // Confirm the account deletion
+    let confirmation_code = Zeroizing::new(std::mem::take(&mut confirm_request.confirmation_code));
+    let plaintext_secret = Zeroizing::new(std::mem::take(&mut confirm_request.plaintext_secret));
     match data
-        .confirm_account_deletion(
-            user.uuid,
-            confirm_request.confirmation_code.clone(),
-            confirm_request.plaintext_secret.clone(),
-        )
+        .confirm_account_deletion(user.uuid, confirmation_code, plaintext_secret)
         .await
     {
-        Ok(_) => {
-            let response = json!({
-                "message": "Your account has been successfully deleted."
-            });
-
-            let result = encrypt_response(&data, &session_id, &response).await;
-            result
-        }
+        Ok(()) => Ok(()),
         Err(e) => match e {
             Error::AccountDeletionExpired => {
                 warn!("Account deletion confirmation has expired: {:?}", e);

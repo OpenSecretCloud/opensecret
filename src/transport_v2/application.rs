@@ -25,16 +25,16 @@ use crate::web::login_routes::{
     RegisterCredentials,
 };
 use crate::web::protected_routes::{
-    decrypt_data_value, encrypt_data_value, private_key_bytes_data, private_key_data,
-    protected_user_data, public_key_data, sign_message_data, third_party_token_data,
-    DecryptDataRequest, DerivationPathQuery, EncryptDataRequest, PublicKeyQuery,
-    SignMessageRequest, ThirdPartyTokenRequest,
+    decrypt_data_value, delete_all_kv_values, delete_kv_value, encrypt_data_value,
+    private_key_bytes_data, private_key_data, protected_user_data, public_key_data, put_kv_value,
+    sign_message_data, third_party_token_data, DecryptDataRequest, DerivationPathQuery,
+    EncryptDataRequest, KvValue, PublicKeyQuery, SignMessageRequest, ThirdPartyTokenRequest,
 };
 use crate::{ApiError, AppState, VerifiedUserAuthentication};
 
 use super::envelope::{
-    Credential, EncodedBytes, EnvelopeLimits, HeaderField, LogicalMethod, RequestEnvelope,
-    RequestId, ResponseMode,
+    decode_canonical_kv_item_path, Credential, EncodedBytes, EnvelopeLimits, HeaderField,
+    LogicalMethod, RequestEnvelope, RequestId, ResponseMode,
 };
 use super::session::{
     AuthenticationReservation, AuthenticationStartError, AuthorityState, BoundAuthority,
@@ -76,13 +76,35 @@ pub(crate) enum UserOperation {
 
 pub(crate) enum ProtectedUserOperation {
     GetUser,
-    GetPrivateKey { query: Option<String> },
-    GetPrivateKeyBytes { query: Option<String> },
-    GetPublicKey { query: Option<String> },
-    SignMessage { body: SensitiveBytes },
-    IssueThirdPartyToken { body: SensitiveBytes },
-    EncryptData { body: SensitiveBytes },
-    DecryptData { body: SensitiveBytes },
+    GetPrivateKey {
+        query: Option<String>,
+    },
+    GetPrivateKeyBytes {
+        query: Option<String>,
+    },
+    GetPublicKey {
+        query: Option<String>,
+    },
+    SignMessage {
+        body: SensitiveBytes,
+    },
+    IssueThirdPartyToken {
+        body: SensitiveBytes,
+    },
+    EncryptData {
+        body: SensitiveBytes,
+    },
+    DecryptData {
+        body: SensitiveBytes,
+    },
+    PutKv {
+        key: Zeroizing<String>,
+        body: SensitiveBytes,
+    },
+    DeleteKv {
+        key: Zeroizing<String>,
+    },
+    DeleteAllKv,
 }
 
 #[derive(Clone)]
@@ -151,7 +173,7 @@ impl UserOperation {
 pub(crate) struct LogicalUnaryResponse {
     pub(crate) status: StatusCode,
     pub(crate) headers: Vec<HeaderField>,
-    pub(crate) body: Option<Vec<u8>>,
+    pub(crate) body: Option<Zeroizing<Vec<u8>>>,
 }
 
 impl LogicalUnaryResponse {
@@ -182,7 +204,7 @@ impl LogicalUnaryResponse {
                 name: "content-type".to_owned(),
                 value_base64: EncodedBytes::from_bytes(JSON_CONTENT_TYPE.to_vec()),
             }],
-            body: Some(body),
+            body: Some(Zeroizing::new(body)),
         })
     }
 
@@ -219,7 +241,7 @@ impl LogicalUnaryResponse {
                 name: "content-type".to_owned(),
                 value_base64: EncodedBytes::from_bytes(JSON_CONTENT_TYPE.to_vec()),
             }],
-            body: Some(body),
+            body: Some(Zeroizing::new(body)),
         }
     }
 }
@@ -252,7 +274,7 @@ pub(crate) fn prepare_user_operation(
     let RequestEnvelope {
         response_mode,
         credential,
-        request,
+        mut request,
         ..
     } = envelope;
 
@@ -269,21 +291,40 @@ pub(crate) fn prepare_user_operation(
         IssueThirdPartyToken,
         EncryptData,
         DecryptData,
+        PutKv,
+        DeleteKv,
+        DeleteAllKv,
     }
 
+    let kv_key = match decode_canonical_kv_item_path(request.method, &request.path) {
+        Ok(key) => key,
+        Err(_) => {
+            request.path.zeroize();
+            return rejected_bad_request();
+        }
+    };
     let route = match (request.method, request.path.as_str()) {
-        (LogicalMethod::Post, "/login") => Route::Login,
-        (LogicalMethod::Post, "/register") => Route::Register,
-        (LogicalMethod::Post, "/refresh") => Route::Resume,
-        (LogicalMethod::Get, "/protected/user") => Route::GetUser,
-        (LogicalMethod::Get, "/protected/private_key") => Route::GetPrivateKey,
-        (LogicalMethod::Get, "/protected/private_key_bytes") => Route::GetPrivateKeyBytes,
-        (LogicalMethod::Get, "/protected/public_key") => Route::GetPublicKey,
-        (LogicalMethod::Post, "/protected/sign_message") => Route::SignMessage,
-        (LogicalMethod::Post, "/protected/third_party_token") => Route::IssueThirdPartyToken,
-        (LogicalMethod::Post, "/protected/encrypt") => Route::EncryptData,
-        (LogicalMethod::Post, "/protected/decrypt") => Route::DecryptData,
-        _ => return OperationPreparation::Unsupported,
+        (LogicalMethod::Post, "/login") => Some(Route::Login),
+        (LogicalMethod::Post, "/register") => Some(Route::Register),
+        (LogicalMethod::Post, "/refresh") => Some(Route::Resume),
+        (LogicalMethod::Get, "/protected/user") => Some(Route::GetUser),
+        (LogicalMethod::Get, "/protected/private_key") => Some(Route::GetPrivateKey),
+        (LogicalMethod::Get, "/protected/private_key_bytes") => Some(Route::GetPrivateKeyBytes),
+        (LogicalMethod::Get, "/protected/public_key") => Some(Route::GetPublicKey),
+        (LogicalMethod::Post, "/protected/sign_message") => Some(Route::SignMessage),
+        (LogicalMethod::Post, "/protected/third_party_token") => Some(Route::IssueThirdPartyToken),
+        (LogicalMethod::Post, "/protected/encrypt") => Some(Route::EncryptData),
+        (LogicalMethod::Post, "/protected/decrypt") => Some(Route::DecryptData),
+        (LogicalMethod::Delete, "/protected/kv") => Some(Route::DeleteAllKv),
+        (LogicalMethod::Put, _) if kv_key.is_some() => Some(Route::PutKv),
+        (LogicalMethod::Delete, _) if kv_key.is_some() => Some(Route::DeleteKv),
+        _ => None,
+    };
+    if kv_key.is_some() {
+        request.path.zeroize();
+    }
+    let Some(route) = route else {
+        return OperationPreparation::Unsupported;
     };
 
     if response_mode != ResponseMode::Unary {
@@ -406,6 +447,58 @@ pub(crate) fn prepare_user_operation(
                 Route::EncryptData => ProtectedUserOperation::EncryptData { body },
                 Route::DecryptData => ProtectedUserOperation::DecryptData { body },
                 _ => unreachable!("fixed protected POST classifier is exhaustive"),
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation,
+            })
+        }
+        Route::PutKv => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            let body = request
+                .body_base64
+                .expect("validated KV value body presence")
+                .into_bytes();
+            let operation = ProtectedUserOperation::PutKv {
+                key: kv_key.expect("classified KV item route must have a decoded key"),
+                body: Zeroizing::new(body),
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation,
+            })
+        }
+        Route::DeleteKv | Route::DeleteAllKv => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            let operation = if matches!(route, Route::DeleteKv) {
+                ProtectedUserOperation::DeleteKv {
+                    key: kv_key.expect("classified KV item route must have a decoded key"),
+                }
+            } else {
+                ProtectedUserOperation::DeleteAllKv
             };
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
@@ -631,6 +724,30 @@ async fn execute_protected_user_operation(
             }
             let value = decrypt_data_value(app_state, user, auth_context, request).await?;
             LogicalUnaryResponse::json(StatusCode::OK, &*value)
+        }
+        ProtectedUserOperation::PutKv { key, body } => {
+            let value = parse_json_body::<KvValue>(body)?;
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value)?;
+            put_kv_value(app_state, user, auth_context, &key, value.as_str()).await?;
+            Ok(response)
+        }
+        ProtectedUserOperation::DeleteKv { key } => {
+            let response = LogicalUnaryResponse::json(
+                StatusCode::OK,
+                &serde_json::json!({ "message": "Resource deleted successfully" }),
+            )?;
+            delete_kv_value(app_state, user, auth_context, &key).await?;
+            Ok(response)
+        }
+        ProtectedUserOperation::DeleteAllKv => {
+            let response = LogicalUnaryResponse::json(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "message": "All key-value pairs deleted successfully"
+                }),
+            )?;
+            delete_all_kv_values(app_state, user.uuid).await?;
+            Ok(response)
         }
     }
 }
@@ -1013,6 +1130,96 @@ mod tests {
     }
 
     #[test]
+    fn exact_kv_mutation_contracts_are_admitted_with_decoded_keys() {
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Put,
+                    "/protected/kv/key%2Fpart",
+                    json_header(),
+                    Some(br#""value""#),
+                    None,
+                ),
+                bound_user_authority(),
+            ),
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::PutKv { key, .. },
+                ..
+            }) if &*key == "key/part"
+        ));
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Put,
+                    "/protected/kv/empty",
+                    json_header(),
+                    Some(br#""""#),
+                    None,
+                ),
+                bound_user_authority(),
+            ),
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::PutKv { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Delete,
+                    "/protected/kv/%252F",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                bound_user_authority(),
+            ),
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::DeleteKv { key },
+                ..
+            }) if &*key == "%2F"
+        ));
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Delete,
+                    "/protected/kv",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                bound_user_authority(),
+            ),
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::DeleteAllKv,
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Get,
+                    "/protected/kv/key%2Fpart",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                bound_user_authority(),
+            ),
+            OperationPreparation::Unsupported
+        ));
+    }
+
+    #[test]
+    fn kv_value_keeps_the_existing_json_string_wire_shape() {
+        let wire = "\"line\\né\"";
+        let value: KvValue = serde_json::from_slice(wire.as_bytes()).unwrap();
+        assert_eq!(value.as_str(), "line\né");
+        assert_eq!(serde_json::to_vec(&value).unwrap(), wire.as_bytes());
+    }
+
+    #[test]
     fn near_miss_user_operations_are_rejected_before_dispatch() {
         let mut wrong_mode = envelope(
             LogicalMethod::Post,
@@ -1179,6 +1386,117 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn kv_mutations_reject_unbound_and_transplanted_metadata() {
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Put,
+                    "/protected/kv/key",
+                    json_header(),
+                    Some(br#""value""#),
+                    None,
+                ),
+                AuthorityState::Anonymous,
+            ),
+            OperationPreparation::Rejected(_)
+        ));
+
+        let mut put_query = envelope(
+            LogicalMethod::Put,
+            "/protected/kv/key",
+            json_header(),
+            Some(br#""value""#),
+            None,
+        );
+        put_query.request.query = Some("x=1".to_owned());
+        for request in [
+            envelope(
+                LogicalMethod::Put,
+                "/protected/kv/key",
+                Vec::new(),
+                Some(br#""value""#),
+                None,
+            ),
+            envelope(
+                LogicalMethod::Put,
+                "/protected/kv/key",
+                json_header(),
+                None,
+                None,
+            ),
+            put_query,
+            envelope(
+                LogicalMethod::Put,
+                "/protected/kv/key",
+                json_header(),
+                Some(br#""value""#),
+                Some(Credential::Resumption {
+                    value_base64: EncodedBytes::from_bytes(b"token".to_vec()),
+                }),
+            ),
+        ] {
+            assert!(matches!(
+                prepare_user_operation(request, bound_user_authority()),
+                OperationPreparation::Rejected(_)
+            ));
+        }
+
+        let mut delete_query = envelope(
+            LogicalMethod::Delete,
+            "/protected/kv/key",
+            Vec::new(),
+            None,
+            None,
+        );
+        delete_query.request.query = Some("x=1".to_owned());
+        for request in [
+            envelope(
+                LogicalMethod::Delete,
+                "/protected/kv/key",
+                json_header(),
+                None,
+                None,
+            ),
+            envelope(
+                LogicalMethod::Delete,
+                "/protected/kv/key",
+                Vec::new(),
+                Some(b""),
+                None,
+            ),
+            delete_query,
+            envelope(
+                LogicalMethod::Delete,
+                "/protected/kv",
+                Vec::new(),
+                None,
+                Some(Credential::ApiKey {
+                    value_base64: EncodedBytes::from_bytes(b"key".to_vec()),
+                }),
+            ),
+        ] {
+            assert!(matches!(
+                prepare_user_operation(request, bound_user_authority()),
+                OperationPreparation::Rejected(_)
+            ));
+        }
+
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Delete,
+                    "/protected/kv/%2f",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                bound_user_authority(),
+            ),
+            OperationPreparation::Rejected(_)
+        ));
     }
 
     #[test]

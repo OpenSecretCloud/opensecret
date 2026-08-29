@@ -15,8 +15,8 @@ use uuid::Uuid;
 
 #[derive(Error, Debug)]
 pub enum StoreError {
-    #[error("Key not found: {0}")]
-    KeyNotFound(String),
+    #[error("Key not found")]
+    KeyNotFound,
     #[error("Unauthorized access")]
     Unauthorized,
     #[error("Decryption error")]
@@ -74,8 +74,8 @@ pub fn get(
 pub async fn put(
     pool: &diesel::r2d2::Pool<diesel::r2d2::ConnectionManager<PgConnection>>,
     user_id: Uuid,
-    key: String,
-    value: String,
+    key: &str,
+    value: &str,
     encryption_key: &SecretKey,
     _aws_credential_manager: Arc<tokio::sync::RwLock<Option<AwsCredentialManager>>>,
 ) -> StoreResult<()> {
@@ -109,13 +109,13 @@ pub fn delete(
 
     let encrypted_key = encrypt_key_deterministic(user_secret_key, key.as_bytes());
 
-    let user_kv = UserKV::get_by_user_and_key(&mut conn, user_id, &encrypted_key)?;
+    let user_kv_id = UserKV::get_id_by_user_and_key(&mut conn, user_id, &encrypted_key)?;
 
-    if let Some(user_kv) = user_kv {
-        user_kv.delete(&mut conn)?;
+    if let Some(user_kv_id) = user_kv_id {
+        UserKV::delete_by_id(&mut conn, user_kv_id)?;
         Ok(())
     } else {
-        Err(StoreError::KeyNotFound(key.to_string()))
+        Err(StoreError::KeyNotFound)
     }
 }
 

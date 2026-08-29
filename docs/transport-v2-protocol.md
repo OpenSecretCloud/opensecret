@@ -662,27 +662,37 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
    exact v2-only plaintext ceiling derived from AES-GCM, base64, and JSON
    expansion. Logical JSON serialization writes through a bounded buffer so a
    highly escaped decrypted string cannot allocate beyond the response limit.
-8. **Remaining protected user operations**: project KV, account-lifecycle, and
-   user API-key-management families in reviewable sub-stacks. Dynamic path
-   parameters must preserve released SDK semantics without weakening the v2
-   route classifier, and password/account deletion must explicitly close the
-   now-invalid bound session.
-9. **Stored user unary operations**: project conversations, conversation
+8. **Dynamic-path and response-resource seams**: admit only route-scoped,
+   canonical KV item segments and retain request working-set reservations
+   through final response serialization/body lifetime. Tiny-request operations
+   with uncorrelated stored output remain unsupported until they reserve that
+   output before dispatch.
+9. **KV mutations**: project PUT item, DELETE item, and DELETE all through
+   transport-neutral helpers. Preserve existing response and error behavior,
+   claim replay identifiers before every mutation, sanitize storage errors, and
+   wipe decoded keys and values. GET item and list remain unsupported here.
+10. **Bounded KV reads**: project GET item and list only after ciphertext/output
+   admission and bounded row processing prevent a tiny request from building an
+   unbounded decrypted result in enclave memory.
+11. **Remaining protected user operations**: project account-lifecycle and user
+   API-key-management families in reviewable sub-stacks. Password/account
+   deletion must explicitly close the now-invalid bound session.
+12. **Stored user unary operations**: project conversations, conversation
    projects, instructions, response control, and web-provider unary routes in
    ownership-preserving families before the client cutover.
-10. **API-key and platform binding**: bind existing raw API keys inside
+13. **API-key and platform binding**: bind existing raw API keys inside
    ciphertext without rotating them, enforce their current inference-only
    scope, and add platform authentication/authorization with live organization
    checks. OAuth continuation receives an explicit session-binding design in
    this layer rather than being inferred from password login.
-11. **Streaming projection**: project current inference streams with ordered,
+14. **Streaming projection**: project current inference streams with ordered,
    request-bound, authenticated terminal records while preserving the SDK's
    caller-visible SSE behavior.
-12. **Additive SDK v2 internals**: TypeScript and Rust codecs/session managers
+15. **Additive SDK v2 internals**: TypeScript and Rust codecs/session managers
    behind private seams, still not selected by public calls.
-13. **Atomic SDK cutover**: v2-only network behavior, no downgrade, one-time
+16. **Atomic SDK cutover**: v2-only network behavior, no downgrade, one-time
    fresh login, and Maple/proxy integration.
-14. **SDK major/version packaging**: package metadata, locks, integration pin,
+17. **SDK major/version packaging**: package metadata, locks, integration pin,
    compatibility matrix, and release rehearsal. Publication/deployment remain
    separate authorized actions.
 

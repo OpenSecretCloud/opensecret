@@ -12,6 +12,7 @@ mod envelope;
 mod gateway;
 mod session;
 mod session_cache;
+pub(crate) mod stored_conversations;
 pub(crate) mod stored_resources;
 
 pub(crate) use gateway::{router, TransportV2State};

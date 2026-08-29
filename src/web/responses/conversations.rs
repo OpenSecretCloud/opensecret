@@ -267,7 +267,7 @@ pub struct ListConversationsParams {
 }
 
 impl ListConversationsParams {
-    fn validate(&self) -> Result<(), ApiError> {
+    pub(crate) fn validate(&self) -> Result<(), ApiError> {
         if self.project_id.is_some() && self.unassigned_project == Some(true) {
             return Err(ApiError::BadRequest);
         }
@@ -322,7 +322,7 @@ fn resolve_conversation_project_filter(
     Ok(ConversationProjectFilter::Any)
 }
 
-fn validate_metadata(metadata: &Value) -> Result<(), ApiError> {
+pub(crate) fn validate_metadata(metadata: &Value) -> Result<(), ApiError> {
     if metadata.is_object() {
         Ok(())
     } else {
@@ -769,7 +769,7 @@ async fn delete_all_conversations(
 }
 
 /// Maximum number of conversations allowed in a single batch operation request
-const MAX_CONVERSATION_BATCH_SIZE: usize = 20;
+pub(crate) const MAX_CONVERSATION_BATCH_SIZE: usize = 20;
 
 /// POST /v1/conversations/batch-delete - Delete multiple specific conversations
 async fn batch_delete_conversations(

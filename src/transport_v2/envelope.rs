@@ -17,6 +17,7 @@ pub(crate) struct EnvelopeLimits {
     pub(crate) header_name_bytes: usize,
     pub(crate) header_value_bytes: usize,
     pub(crate) aggregate_header_bytes: usize,
+    pub(crate) credential_bytes: usize,
 }
 
 impl EnvelopeLimits {
@@ -29,6 +30,7 @@ impl EnvelopeLimits {
         header_name_bytes: 128,
         header_value_bytes: 16 * KIB,
         aggregate_header_bytes: 64 * KIB,
+        credential_bytes: 16 * KIB,
     };
 }
 
@@ -339,7 +341,16 @@ impl RequestEnvelope {
     }
 
     pub(crate) fn validate(&self, limits: &EnvelopeLimits) -> Result<(), EnvelopeError> {
-        self.request.validate(limits)
+        self.request.validate(limits)?;
+        if let Some(credential) = &self.credential {
+            let credential_bytes = match credential {
+                Credential::ApiKey { value_base64 } | Credential::Resumption { value_base64 } => {
+                    value_base64.len()
+                }
+            };
+            check_limit(credential_bytes, limits.credential_bytes, "credential")?;
+        }
+        Ok(())
     }
 }
 
@@ -970,6 +981,27 @@ mod tests {
         let oversized_body = request_json(r#""YWI=""#);
         assert!(RequestEnvelope::from_json_slice(oversized_body.as_bytes(), &limits).is_err());
         assert!(RequestEnvelope::from_json_slice(&vec![b' '; 1025], &limits).is_err());
+    }
+
+    #[test]
+    fn credential_bytes_have_an_independent_limit() {
+        let limits = EnvelopeLimits {
+            credential_bytes: 2,
+            ..EnvelopeLimits::default()
+        };
+        for kind in ["api_key", "resumption"] {
+            let at_limit = request_json("null").replace(
+                "\"credential\":null",
+                &format!("\"credential\":{{\"kind\":\"{kind}\",\"value_base64\":\"YWI=\"}}"),
+            );
+            assert!(RequestEnvelope::from_json_slice(at_limit.as_bytes(), &limits).is_ok());
+
+            let oversized = request_json("null").replace(
+                "\"credential\":null",
+                &format!("\"credential\":{{\"kind\":\"{kind}\",\"value_base64\":\"YWJj\"}}"),
+            );
+            assert!(RequestEnvelope::from_json_slice(oversized.as_bytes(), &limits).is_err());
+        }
     }
 
     #[test]

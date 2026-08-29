@@ -558,7 +558,15 @@ pub async fn user_protected(
     Extension(user): Extension<User>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<ProtectedUserData>>, ApiError> {
-    let mut app_user: AppUser = AppUser::from(&user);
+    let response = protected_user_data(&data, &user)?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) fn protected_user_data(
+    data: &AppState,
+    user: &User,
+) -> Result<ProtectedUserData, ApiError> {
+    let mut app_user: AppUser = AppUser::from(user);
 
     // Set email verification status - only if not a guest user
     app_user.email_verified = if user.is_guest() {
@@ -616,8 +624,7 @@ pub async fn user_protected(
         }
     }
 
-    let response = ProtectedUserData { user: app_user };
-    encrypt_response(&data, &session_id, &response).await
+    Ok(ProtectedUserData { user: app_user })
 }
 
 pub async fn get_kv(

@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+mod application;
 mod crypto;
 mod envelope;
 mod gateway;

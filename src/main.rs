@@ -433,9 +433,9 @@ pub enum ApiError {
     TooManyRequests,
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> axum::response::Response {
-        let status = match &self {
+impl ApiError {
+    pub(crate) fn status_code(&self) -> StatusCode {
+        match self {
             ApiError::InvalidUsernameOrPassword => StatusCode::UNAUTHORIZED,
             ApiError::InvalidJwt => StatusCode::UNAUTHORIZED,
             ApiError::AccessTokenExpired => StatusCode::UNAUTHORIZED,
@@ -462,21 +462,32 @@ impl IntoResponse for ApiError {
             ApiError::UnprocessableEntity => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
-        };
-        let error_code = match &self {
+        }
+    }
+
+    pub(crate) fn response_body(&self) -> ErrorResponse {
+        let status = self.status_code();
+        ErrorResponse {
+            status: status.as_u16(),
+            message: self.to_string(),
+        }
+    }
+
+    fn error_code(&self) -> Option<&'static str> {
+        match self {
             ApiError::SessionNotFound => Some(SESSION_NOT_FOUND_ERROR_CODE),
             ApiError::AccessTokenExpired => Some(ACCESS_TOKEN_EXPIRED_ERROR_CODE),
             ApiError::ImageDescriptionUnavailable => Some(IMAGE_DESCRIPTION_UNAVAILABLE_ERROR_CODE),
             _ => None,
-        };
-        let mut response = (
-            status,
-            Json(ErrorResponse {
-                status: status.as_u16(),
-                message: self.to_string(),
-            }),
-        )
-            .into_response();
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let status = self.status_code();
+        let error_code = self.error_code();
+        let mut response = (status, Json(self.response_body())).into_response();
         response.headers_mut().insert(
             ERROR_CONTRACT_HEADER,
             HeaderValue::from_static(ERROR_CONTRACT_VERSION),
@@ -796,9 +807,9 @@ pub struct AppState {
 }
 
 #[derive(Debug, Clone)]
-struct AuthenticatedUser {
-    user: User,
-    auth_context: AuthContext,
+pub(crate) struct VerifiedUserAuthentication {
+    pub(crate) user: User,
+    pub(crate) auth_context: AuthContext,
 }
 
 #[derive(Default)]
@@ -1743,7 +1754,7 @@ impl AppState {
         user_id: Option<Uuid>,
         user_password: String,
         user_project_id: i32,
-    ) -> Result<Option<AuthenticatedUser>, Error> {
+    ) -> Result<Option<VerifiedUserAuthentication>, Error> {
         // Ensure at least one identifier is provided
         if user_email.is_none() && user_id.is_none() {
             return Err(Error::AuthenticationError);
@@ -1791,7 +1802,7 @@ impl AppState {
                 let auth_context =
                     self.password_auth_context_for_user(&user, &verifier_for_binding)?;
                 self.verify_seed_wrap_for_auth_context(&user, &auth_context)?;
-                Ok(Some(AuthenticatedUser { user, auth_context }))
+                Ok(Some(VerifiedUserAuthentication { user, auth_context }))
             }
             Err(_) => Ok(None),
         }
@@ -1802,6 +1813,51 @@ impl AppState {
             .db
             .get_user_by_uuid(user_uuid)
             .map_err(|_| Error::UserNotFound)?;
+        Ok(user)
+    }
+
+    /// Reloads and validates the live authority retained by a transport-v2 user session.
+    ///
+    /// The session stores only immutable identity and the credential-derived
+    /// `AuthContext`; the current user row and active seed wrapping remain
+    /// authoritative for every protected operation.
+    pub(crate) fn verify_bound_user(
+        &self,
+        user_uuid: Uuid,
+        expected_project_id: i32,
+        auth_context: &AuthContext,
+    ) -> Result<User, ApiError> {
+        let user = match self.db.get_user_by_uuid(user_uuid) {
+            Ok(user) => user,
+            Err(DBError::UserNotFound) => return Err(ApiError::Unauthorized),
+            Err(error) => {
+                tracing::error!(
+                    "Error reloading transport-v2 bound user {}: {:?}",
+                    user_uuid,
+                    error
+                );
+                return Err(ApiError::InternalServerError);
+            }
+        };
+
+        if user.project_id != expected_project_id || auth_context.project_id != expected_project_id
+        {
+            tracing::error!(
+                "Transport-v2 bound user/project/auth context no longer agree for {}",
+                user_uuid
+            );
+            return Err(ApiError::Unauthorized);
+        }
+
+        self.verify_seed_wrap_for_auth_context(&user, auth_context)
+            .map_err(|error| {
+                tracing::error!(
+                    "Transport-v2 bound user no longer has an active seed wrap: {:?}",
+                    error
+                );
+                ApiError::Unauthorized
+            })?;
+
         Ok(user)
     }
 

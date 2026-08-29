@@ -1,13 +1,13 @@
 //! Isolated HTTP gateway for encrypted transport v2.
 //!
-//! This layer deliberately exposes no application operations yet. It owns the
-//! v2-only attestation and session caches, authenticates a complete encrypted
-//! request envelope, and returns an authenticated logical 404 through the exact
-//! session lease that decrypted the request. Later stack layers add explicit
-//! authentication and application-operation projections without re-entering
-//! the transport-v1 router.
+//! This layer owns the v2-only attestation and session caches, authenticates a
+//! complete encrypted request envelope, and dispatches only the explicitly
+//! projected application operations. Unsupported operations receive an
+//! authenticated logical 404 through the exact session lease that decrypted
+//! the request; transport v1 is never re-entered.
 
 use std::collections::hash_map::RandomState;
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,15 +28,19 @@ use crate::encrypt::CustomRng;
 use crate::web::attestation_routes;
 use crate::{AppState, AsyncRngWrapper};
 
+use super::application::{
+    begin_authentication_transition, execute_user_operation, prepare_user_operation,
+    LogicalUnaryResponse, OperationPreparation,
+};
 use super::crypto::{
     encrypt_key_exchange_record, CryptoError, DirectionalKeys, HandshakePayload, SessionMaster,
 };
 use super::envelope::{
-    EncodedBytes, EnvelopeLimits, HeaderField, RequestEnvelope, UnaryResponseEnvelope, Version2,
+    EncodedBytes, EnvelopeLimits, RequestEnvelope, UnaryResponseEnvelope, Version2,
 };
 use super::session::{
-    GlobalReplayBudget, SessionRecordError, V2SessionState, DEFAULT_ABSOLUTE_SESSION_LIFETIME,
-    DEFAULT_GLOBAL_REPLAY_IDS,
+    GlobalReplayBudget, ReplayClaim, SessionRecordError, UnaryResponseReservation, V2SessionState,
+    DEFAULT_ABSOLUTE_SESSION_LIFETIME, DEFAULT_GLOBAL_REPLAY_IDS,
 };
 use super::session_cache::{V2SessionCache, V2SessionInsertError, V2SessionLease};
 use super::{MAX_LIVE_SESSIONS, MAX_PENDING_ATTESTATIONS};
@@ -353,26 +357,152 @@ impl TransportV2State {
 
     async fn process_encrypted_request(
         &self,
+        app_state: Arc<AppState>,
         session_id: Uuid,
         encrypted: &[u8],
         now: Instant,
     ) -> Result<EncryptedOuterResponse, GatewayError> {
+        let (lease, envelope) = self
+            .decrypt_request_envelope(session_id, encrypted, now)
+            .await?;
+        let request_id = envelope.request_id;
+
+        let operation = match prepare_user_operation(envelope, lease.state().authority()) {
+            OperationPreparation::Unsupported => {
+                return encrypt_new_logical_response(
+                    &lease,
+                    request_id,
+                    LogicalUnaryResponse::protocol_error(
+                        StatusCode::NOT_FOUND,
+                        "not_found",
+                        "Not found",
+                    ),
+                );
+            }
+            OperationPreparation::Rejected(response) => {
+                return encrypt_new_logical_response(&lease, request_id, response);
+            }
+            OperationPreparation::Ready(operation) => operation,
+        };
+
+        self.process_ready_operation(
+            &lease,
+            request_id,
+            operation,
+            now,
+            move |dispatch_lease, operation, authentication, admitted_at| {
+                execute_user_operation(
+                    app_state,
+                    dispatch_lease,
+                    operation,
+                    authentication,
+                    admitted_at,
+                )
+            },
+        )
+        .await
+    }
+
+    async fn process_ready_operation<Dispatch, DispatchFuture>(
+        &self,
+        lease: &V2SessionLease,
+        request_id: super::envelope::RequestId,
+        operation: super::application::UserOperation,
+        now: Instant,
+        dispatch: Dispatch,
+    ) -> Result<EncryptedOuterResponse, GatewayError>
+    where
+        Dispatch: FnOnce(
+            V2SessionLease,
+            super::application::UserOperation,
+            Option<super::session::AuthenticationReservation>,
+            Instant,
+        ) -> DispatchFuture,
+        DispatchFuture: Future<Output = super::application::ApplicationOutcome>,
+    {
+        // Reserve a response before consuming replay capacity or dispatching
+        // application work. Every admitted request can therefore receive one
+        // authenticated terminal result through this exact session lease.
+        let reservation = lease
+            .state()
+            .begin_unary_response()
+            .map_err(GatewayError::from_session_record)?;
+        match lease.state().claim_request_id(request_id) {
+            ReplayClaim::Claimed => {}
+            ReplayClaim::Duplicate => {
+                return encrypt_reserved_logical_response(
+                    lease,
+                    request_id,
+                    reservation,
+                    LogicalUnaryResponse::protocol_error(
+                        StatusCode::CONFLICT,
+                        "replay_detected",
+                        "Request identifier has already been used",
+                    ),
+                );
+            }
+            ReplayClaim::Exhausted => {
+                return encrypt_reserved_logical_response(
+                    lease,
+                    request_id,
+                    reservation,
+                    LogicalUnaryResponse::protocol_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "session_exhausted",
+                        "Session request capacity is exhausted",
+                    ),
+                );
+            }
+        }
+
+        let authentication = match begin_authentication_transition(&operation, lease, request_id) {
+            Ok(authentication) => authentication,
+            Err(response) => {
+                return encrypt_reserved_logical_response(lease, request_id, reservation, response);
+            }
+        };
+
+        if !self.mark_admitted(lease).await {
+            lease.state().close();
+            return encrypt_reserved_logical_response(
+                lease,
+                request_id,
+                reservation,
+                LogicalUnaryResponse::protocol_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session_unavailable",
+                    "Session is unavailable",
+                ),
+            );
+        }
+
+        let outcome = dispatch(lease.clone(), operation, authentication, now).await;
+        let bound_session = outcome.bound_session;
+        let encrypted =
+            encrypt_reserved_logical_response(lease, request_id, reservation, outcome.response);
+        if encrypted.is_err() && bound_session {
+            // Never leave a newly authenticated session reachable when its
+            // only binding response could not be authenticated to the client.
+            lease.state().close();
+        }
+        encrypted
+    }
+
+    async fn decrypt_request_envelope(
+        &self,
+        session_id: Uuid,
+        encrypted: &[u8],
+        now: Instant,
+    ) -> Result<(V2SessionLease, RequestEnvelope), GatewayError> {
         let lease = self.acquire_session(&session_id, now).await?;
-        let plaintext = lease
+        let mut plaintext = lease
             .state()
             .decrypt_request_record(encrypted)
             .map_err(GatewayError::from_session_record)?;
-        let envelope = RequestEnvelope::from_json_slice(&plaintext, &EnvelopeLimits::default())
-            .map_err(|_| GatewayError::InvalidRequest)?;
-        drop(plaintext);
-        let request_id = envelope.request_id;
-        drop(envelope);
-
-        // This gateway stack intentionally exposes no application operations.
-        // Route validation therefore fails before the replay gate and before
-        // LRU promotion. The recovered request ID still permits an authenticated
-        // logical error through the exact lease selected above.
-        encrypt_unsupported_route(&lease, request_id)
+        let parsed = RequestEnvelope::from_json_slice(&plaintext, &EnvelopeLimits::default());
+        plaintext.zeroize();
+        let envelope = parsed.map_err(|_| GatewayError::InvalidRequest)?;
+        Ok((lease, envelope))
     }
 }
 
@@ -474,7 +604,12 @@ async fn encrypted_request(
 
     let response = app_state
         .transport_v2_state
-        .process_encrypted_request(session_id, &encrypted, Instant::now())
+        .process_encrypted_request(
+            Arc::clone(&app_state),
+            session_id,
+            &encrypted,
+            Instant::now(),
+        )
         .await?;
     drop(encrypted);
     drop(working_set_permit);
@@ -558,55 +693,61 @@ struct EncryptedOuterResponse {
     encrypted: EncodedBytes,
 }
 
-#[derive(Serialize)]
-struct LogicalErrorBody<'a> {
-    error: LogicalError<'a>,
-}
-
-#[derive(Serialize)]
-struct LogicalError<'a> {
-    code: &'a str,
-    message: &'a str,
-}
-
-fn encrypt_unsupported_route(
+fn encrypt_new_logical_response(
     lease: &V2SessionLease,
     request_id: super::envelope::RequestId,
+    response: LogicalUnaryResponse,
 ) -> Result<EncryptedOuterResponse, GatewayError> {
-    let body = serde_json::to_vec(&LogicalErrorBody {
-        error: LogicalError {
-            code: "not_found",
-            message: "Not found",
-        },
-    })
-    .map_err(|_| GatewayError::Internal)?;
-    let response = UnaryResponseEnvelope {
-        version: Version2,
-        request_id,
-        status: StatusCode::NOT_FOUND.as_u16(),
-        headers: vec![HeaderField {
-            name: "content-type".to_owned(),
-            value_base64: EncodedBytes::from_bytes(b"application/json".to_vec()),
-        }],
-        body_base64: Some(EncodedBytes::from_bytes(body)),
-    };
-    response
-        .validate(&EnvelopeLimits::default())
-        .map_err(|_| GatewayError::Internal)?;
-    let plaintext = serde_json::to_vec(&response).map_err(|_| GatewayError::Internal)?;
-
-    let mut reservation = lease
+    let reservation = lease
         .state()
         .begin_unary_response()
         .map_err(GatewayError::from_session_record)?;
-    let encrypted = lease
+    encrypt_reserved_logical_response(lease, request_id, reservation, response)
+}
+
+fn encrypt_reserved_logical_response(
+    lease: &V2SessionLease,
+    request_id: super::envelope::RequestId,
+    mut reservation: UnaryResponseReservation,
+    response: LogicalUnaryResponse,
+) -> Result<EncryptedOuterResponse, GatewayError> {
+    let mut response = UnaryResponseEnvelope {
+        version: Version2,
+        request_id,
+        status: response.status.as_u16(),
+        headers: response.headers,
+        body_base64: response.body.map(EncodedBytes::from_bytes),
+    };
+    if response.validate(&EnvelopeLimits::default()).is_err() {
+        zeroize_response_body(&mut response);
+        return Err(GatewayError::Internal);
+    }
+    let mut plaintext = match serde_json::to_vec(&response) {
+        Ok(plaintext) => plaintext,
+        Err(_) => {
+            zeroize_response_body(&mut response);
+            return Err(GatewayError::Internal);
+        }
+    };
+    zeroize_response_body(&mut response);
+
+    let result = lease
         .state()
         .encrypt_unary_response_record(&mut reservation, &request_id, &plaintext)
-        .map_err(GatewayError::from_session_record)?;
+        .map_err(GatewayError::from_session_record);
+    plaintext.zeroize();
+    let encrypted = result?;
 
     Ok(EncryptedOuterResponse {
         encrypted: EncodedBytes::from_bytes(encrypted),
     })
+}
+
+fn zeroize_response_body(response: &mut UnaryResponseEnvelope) {
+    if let Some(body) = response.body_base64.take() {
+        let mut bytes = body.into_bytes();
+        bytes.zeroize();
+    }
 }
 
 fn parse_key_exchange_request(
@@ -823,9 +964,15 @@ impl IntoResponse for GatewayError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+    use crate::jwt::{AuthContext, AuthMethod};
     use crate::transport_v2::crypto::{decrypt_key_exchange_record, SessionMaster};
-    use crate::transport_v2::envelope::{LogicalMethod, LogicalRequest, RequestId, ResponseMode};
+    use crate::transport_v2::envelope::{
+        HeaderField, LogicalMethod, LogicalRequest, RequestId, ResponseMode,
+    };
+    use crate::transport_v2::session::{AuthorityState, BoundAuthority};
 
     fn test_session(
         session_id: Uuid,
@@ -857,6 +1004,66 @@ mod tests {
                 body_base64: None,
             },
         }
+    }
+
+    fn login_envelope(request_id: RequestId) -> RequestEnvelope {
+        RequestEnvelope {
+            version: Version2,
+            request_id,
+            response_mode: ResponseMode::Unary,
+            credential: None,
+            request: LogicalRequest {
+                method: LogicalMethod::Post,
+                path: "/login".to_owned(),
+                query: None,
+                headers: vec![HeaderField {
+                    name: "content-type".to_owned(),
+                    value_base64: EncodedBytes::from_bytes(b"application/json".to_vec()),
+                }],
+                body_base64: Some(EncodedBytes::from_bytes(b"{}".to_vec())),
+            },
+        }
+    }
+
+    fn get_user_envelope(request_id: RequestId, body: Option<Vec<u8>>) -> RequestEnvelope {
+        RequestEnvelope {
+            version: Version2,
+            request_id,
+            response_mode: ResponseMode::Unary,
+            credential: None,
+            request: LogicalRequest {
+                method: LogicalMethod::Get,
+                path: "/protected/user".to_owned(),
+                query: None,
+                headers: Vec::new(),
+                body_base64: body.map(EncodedBytes::from_bytes),
+            },
+        }
+    }
+
+    fn successful_test_outcome() -> super::super::application::ApplicationOutcome {
+        super::super::application::ApplicationOutcome {
+            response: LogicalUnaryResponse {
+                status: StatusCode::OK,
+                headers: Vec::new(),
+                body: Some(br#"{"ok":true}"#.to_vec()),
+            },
+            bound_session: false,
+        }
+    }
+
+    fn response_status(
+        keys: &DirectionalKeys,
+        session_id: &Uuid,
+        request_id: &RequestId,
+        response: &EncryptedOuterResponse,
+    ) -> u16 {
+        let plaintext = keys
+            .decrypt_unary_response_record(session_id, request_id, response.encrypted.as_slice())
+            .expect("decrypt authenticated unary response");
+        UnaryResponseEnvelope::from_json_slice(&plaintext, &EnvelopeLimits::default())
+            .expect("parse authenticated unary response")
+            .status
     }
 
     #[test]
@@ -1157,10 +1364,21 @@ mod tests {
             .encrypt_request_record_with_nonce(&first_id, &request_plaintext, [0x12; 12])
             .unwrap();
 
-        let response = state
-            .process_encrypted_request(first_id, &encrypted_request, now)
+        let (lease, envelope) = state
+            .decrypt_request_envelope(first_id, &encrypted_request, now)
             .await
-            .expect("authenticated logical error");
+            .expect("authenticated logical request");
+        let request_id = envelope.request_id;
+        assert!(matches!(
+            prepare_user_operation(envelope, lease.state().authority()),
+            OperationPreparation::Unsupported
+        ));
+        let response = encrypt_new_logical_response(
+            &lease,
+            request_id,
+            LogicalUnaryResponse::protocol_error(StatusCode::NOT_FOUND, "not_found", "Not found"),
+        )
+        .expect("authenticated logical error");
         let response_plaintext = client_keys
             .decrypt_unary_response_record(&first_id, &request_id, response.encrypted.as_slice())
             .expect("first session opens its response");
@@ -1185,6 +1403,181 @@ mod tests {
         // admission promotion.
         let first_lease = state.acquire_session(&first_id, now).await.unwrap();
         assert_eq!(first_lease.state().replay_id_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_request_id_dispatches_exactly_once() {
+        let state = TransportV2State::new();
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        let master_bytes = [0x51; 32];
+        state
+            .insert_session(test_session(
+                session_id,
+                master_bytes,
+                now + Duration::from_secs(60),
+                Arc::clone(&state.global_replay_budget),
+            ))
+            .await
+            .unwrap();
+
+        let request_id = RequestId::from_bytes([0x52; 16]);
+        let plaintext = serde_json::to_vec(&login_envelope(request_id)).unwrap();
+        let master = SessionMaster::from_bytes(master_bytes);
+        let client_keys = DirectionalKeys::derive(&master).unwrap();
+        let encrypted = client_keys
+            .encrypt_request_record_with_nonce(&session_id, &plaintext, [0x53; 12])
+            .unwrap();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+
+        let (lease, envelope) = state
+            .decrypt_request_envelope(session_id, &encrypted, now)
+            .await
+            .unwrap();
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(envelope, lease.state().authority())
+        else {
+            panic!("valid login operation must be ready");
+        };
+        let first_dispatches = Arc::clone(&dispatches);
+        let first = state
+            .process_ready_operation(
+                &lease,
+                request_id,
+                operation,
+                now,
+                move |_lease, _operation, authentication, _| async move {
+                    first_dispatches.fetch_add(1, Ordering::SeqCst);
+                    drop(authentication);
+                    successful_test_outcome()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response_status(&client_keys, &session_id, &request_id, &first),
+            200
+        );
+
+        let (lease, envelope) = state
+            .decrypt_request_envelope(session_id, &encrypted, now)
+            .await
+            .unwrap();
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(envelope, lease.state().authority())
+        else {
+            panic!("failed authentication reservation must restore anonymous authority");
+        };
+        let second_dispatches = Arc::clone(&dispatches);
+        let duplicate = state
+            .process_ready_operation(
+                &lease,
+                request_id,
+                operation,
+                now,
+                move |_lease, _operation, authentication, _| async move {
+                    second_dispatches.fetch_add(1, Ordering::SeqCst);
+                    drop(authentication);
+                    successful_test_outcome()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response_status(&client_keys, &session_id, &request_id, &duplicate),
+            409
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(lease.state().replay_id_count(), 1);
+        assert!(matches!(
+            lease.state().authority(),
+            AuthorityState::Anonymous
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_bodyless_shape_does_not_consume_replay_id() {
+        let state = TransportV2State::new();
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        let master_bytes = [0x61; 32];
+        let session = test_session(
+            session_id,
+            master_bytes,
+            now + Duration::from_secs(60),
+            Arc::clone(&state.global_replay_budget),
+        );
+        let auth_context = AuthContext::new(AuthMethod::Password, 7, [0x62; 32]);
+        session
+            .begin_authentication(RequestId::from_bytes([0x63; 16]))
+            .unwrap()
+            .commit_at(
+                BoundAuthority::user(
+                    Uuid::from_bytes([0x64; 16]),
+                    7,
+                    &auth_context,
+                    now + Duration::from_secs(30),
+                ),
+                now,
+            )
+            .unwrap();
+        state.insert_session(session).await.unwrap();
+
+        let request_id = RequestId::from_bytes([0x65; 16]);
+        let master = SessionMaster::from_bytes(master_bytes);
+        let client_keys = DirectionalKeys::derive(&master).unwrap();
+        let invalid_plaintext =
+            serde_json::to_vec(&get_user_envelope(request_id, Some(Vec::new()))).unwrap();
+        let invalid_encrypted = client_keys
+            .encrypt_request_record_with_nonce(&session_id, &invalid_plaintext, [0x66; 12])
+            .unwrap();
+        let (lease, envelope) = state
+            .decrypt_request_envelope(session_id, &invalid_encrypted, now)
+            .await
+            .unwrap();
+        let OperationPreparation::Rejected(rejection) =
+            prepare_user_operation(envelope, lease.state().authority())
+        else {
+            panic!("an explicit empty body is not a bodyless request");
+        };
+        let response = encrypt_new_logical_response(&lease, request_id, rejection).unwrap();
+        assert_eq!(
+            response_status(&client_keys, &session_id, &request_id, &response),
+            400
+        );
+        assert_eq!(lease.state().replay_id_count(), 0);
+
+        let valid_plaintext = serde_json::to_vec(&get_user_envelope(request_id, None)).unwrap();
+        let valid_encrypted = client_keys
+            .encrypt_request_record_with_nonce(&session_id, &valid_plaintext, [0x67; 12])
+            .unwrap();
+        let (lease, envelope) = state
+            .decrypt_request_envelope(session_id, &valid_encrypted, now)
+            .await
+            .unwrap();
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(envelope, lease.state().authority())
+        else {
+            panic!("a null body is a valid bodyless protected request");
+        };
+        let response = state
+            .process_ready_operation(
+                &lease,
+                request_id,
+                operation,
+                now,
+                |_lease, _operation, authentication, _| async move {
+                    assert!(authentication.is_none());
+                    successful_test_outcome()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response_status(&client_keys, &session_id, &request_id, &response),
+            200
+        );
+        assert_eq!(lease.state().replay_id_count(), 1);
     }
 
     #[tokio::test]

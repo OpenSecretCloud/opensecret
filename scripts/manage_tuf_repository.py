@@ -53,6 +53,7 @@ TIMESTAMP_EXPIRY_HOURS = 47
 ROOT_EXPIRY_DAYS = 365
 MAX_LIVE_FILE_BYTES = 16 * 1024 * 1024
 MAX_SAFE_INTEGER = (1 << 53) - 1
+MAX_ROOT_VERSIONS = 33
 MAX_ROOT_BYTES = 64 * 1024
 MAX_TIMESTAMP_BYTES = 32 * 1024
 MAX_SNAPSHOT_BYTES = 128 * 1024
@@ -228,6 +229,39 @@ def validate_root_client_subset(
         ):
             raise RepositoryError(f"{context} has an invalid {role_name} role")
 
+    root_material = {
+        normalized_public_key_material(root.keys[keyid])
+        for keyid in root.roles["root"].keyids
+    }
+    for role_name in ONLINE_ROLES:
+        online_material = {
+            normalized_public_key_material(root.keys[keyid])
+            for keyid in root.roles[role_name].keyids
+        }
+        if root_material & online_material:
+            raise RepositoryError(
+                f"{context} shares root-role key material with online {role_name}"
+            )
+
+
+def normalized_public_key_material(key: Any) -> bytes:
+    """Return identity-bearing key bytes independent of a caller-supplied key ID."""
+
+    public = key.keyval.get("public")
+    if not isinstance(public, str):
+        raise RepositoryError("TUF key lacks normalized Ed25519 public material")
+    try:
+        return bytes.fromhex(public)
+    except ValueError as error:
+        raise RepositoryError("TUF key contains invalid Ed25519 public material") from error
+
+
+def role_public_key_material(root: Root, role_name: str) -> set[bytes]:
+    return {
+        normalized_public_key_material(root.keys[keyid])
+        for keyid in root.roles[role_name].keyids
+    }
+
 
 def target_size_limit(logical: str) -> int:
     if logical == "policy/builders.json" or logical.startswith("channels/"):
@@ -279,8 +313,14 @@ def load_root_chain(repository: Path) -> Metadata[Root]:
     roots.sort()
     if [version for version, _ in roots] != list(range(1, roots[-1][0] + 1)):
         raise RepositoryError("root metadata versions must be contiguous starting at 1")
+    if len(roots) > MAX_ROOT_VERSIONS:
+        raise RepositoryError(
+            f"root metadata history exceeds the {MAX_ROOT_VERSIONS}-version client limit"
+        )
 
     previous: Metadata[Root] | None = None
+    historical_root_material: set[bytes] = set()
+    historical_online_material: set[bytes] = set()
     for version, path in roots:
         current = load_metadata(path, Root)
         validate_root_client_subset(
@@ -295,6 +335,21 @@ def load_root_chain(repository: Path) -> Metadata[Root]:
                 "root", current.signed_bytes, current.signatures
             )
         current.signed.verify_delegate("root", current.signed_bytes, current.signatures)
+
+        current_root_material = role_public_key_material(current.signed, "root")
+        current_online_material = set().union(
+            *(role_public_key_material(current.signed, role) for role in ONLINE_ROLES)
+        )
+        if current_root_material & historical_online_material:
+            raise RepositoryError(
+                f"{path} reassigns historical online key material to the root role"
+            )
+        if current_online_material & historical_root_material:
+            raise RepositoryError(
+                f"{path} reassigns historical root key material to an online role"
+            )
+        historical_root_material.update(current_root_material)
+        historical_online_material.update(current_online_material)
         previous = current
     assert previous is not None
     if previous.signed.expires <= utcnow():
@@ -1071,8 +1126,12 @@ def bootstrap(
     check_key_permissions(online_key)
     root_signer = load_signer(root_key)
     online_signer = load_signer(online_key)
-    if root_signer.public_key.keyid == online_signer.public_key.keyid:
-        raise RepositoryError("offline root and online signing keys must differ")
+    if normalized_public_key_material(
+        root_signer.public_key
+    ) == normalized_public_key_material(online_signer.public_key):
+        raise RepositoryError(
+            "offline root and online signing key material must differ"
+        )
     policy = require_file(builder_policy, "builder policy")
     trusted_root = require_file(sigstore_root, "Sigstore trusted root")
     validate_builder_policy(policy)

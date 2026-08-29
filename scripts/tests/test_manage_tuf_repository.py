@@ -185,7 +185,54 @@ class TufRepositoryTests(unittest.TestCase):
 
         return fetch
 
-    def test_bootstrap_creates_standard_top_level_roles_without_root_key_in_state(
+    def generate_signer(self, name: str):
+        path = self.root / f"{name}.pem"
+        tuf_repo.generate_key(path)
+        return tuf_repo.load_signer(path)
+
+    def write_root_transition(
+        self,
+        version: int,
+        previous_root_signer,
+        root_signer,
+        online_signer,
+        *,
+        root_aliases: tuple[tuple[str, object], ...] = (),
+        online_alias: tuple[str, object] | None = None,
+    ):
+        previous = tuf_repo.load_metadata(
+            self.repository / "metadata" / f"{version - 1}.root.json",
+            tuf_repo.Root,
+        )
+        current = tuf_repo.Metadata.from_bytes(previous.to_bytes())
+        current.signed.version = version
+        current.signed.keys[root_signer.public_key.keyid] = root_signer.public_key
+        root_keyids = [root_signer.public_key.keyid]
+        for alias_keyid, alias_key in root_aliases:
+            current.signed.keys[alias_keyid] = alias_key
+            root_keyids.append(alias_keyid)
+        current.signed.roles["root"].keyids = root_keyids
+        current.signed.roles["root"].threshold = 1
+
+        if online_alias is None:
+            online_keyid = online_signer.public_key.keyid
+            current.signed.keys[online_keyid] = online_signer.public_key
+        else:
+            online_keyid, online_key = online_alias
+            current.signed.keys[online_keyid] = online_key
+        for role_name in tuf_repo.ONLINE_ROLES:
+            current.signed.roles[role_name].keyids = [online_keyid]
+            current.signed.roles[role_name].threshold = 1
+
+        current.signatures.clear()
+        current.sign(previous_root_signer)
+        if root_signer.public_key.keyid != previous_root_signer.public_key.keyid:
+            current.sign(root_signer, append=True)
+        path = self.repository / "metadata" / f"{version}.root.json"
+        path.write_bytes(current.to_bytes())
+        return current
+
+    def test_bootstrap_separates_root_material_and_allows_shared_online_roles(
         self,
     ) -> None:
         root = tuf_repo.load_root_chain(self.repository)
@@ -200,6 +247,121 @@ class TufRepositoryTests(unittest.TestCase):
         self.assertFalse(
             any(path.suffix == ".pem" for path in self.repository.rglob("*"))
         )
+
+        with self.assertRaisesRegex(
+            tuf_repo.RepositoryError, "root and online signing key material must differ"
+        ):
+            tuf_repo.bootstrap(
+                self.root / "same-key-state",
+                self.root / "same-key-public",
+                self.root_key,
+                self.root_key,
+                self.policy,
+                self.trusted_root,
+            )
+
+    def test_parsed_root_chain_rejects_root_material_under_online_alias_key_ids(
+        self,
+    ) -> None:
+        root_v1_path = self.repository / "metadata/1.root.json"
+        root_signer = tuf_repo.load_signer(self.root_key)
+
+        for role_name in tuf_repo.ONLINE_ROLES:
+            with self.subTest(role=role_name):
+                root_v2 = tuf_repo.Metadata.from_bytes(root_v1_path.read_bytes())
+                root_v2.signed.version = 2
+                root_keyid = next(iter(root_v2.signed.roles["root"].keyids))
+                alias_keyid = "0" * 64
+                self.assertNotIn(alias_keyid, root_v2.signed.keys)
+                root_v2.signed.keys[alias_keyid] = root_v2.signed.keys[root_keyid]
+                root_v2.signed.roles[role_name].keyids = [alias_keyid]
+                root_v2.signatures.clear()
+                root_v2.sign(root_signer)
+                root_v2_path = self.repository / "metadata/2.root.json"
+                root_v2_path.write_bytes(root_v2.to_bytes())
+                try:
+                    with self.assertRaisesRegex(
+                        tuf_repo.RepositoryError,
+                        f"root-role key material with online {role_name}",
+                    ):
+                        tuf_repo.load_root_chain(self.repository)
+                finally:
+                    root_v2_path.unlink()
+
+    def test_root_chain_allows_fresh_root_and_shared_online_key_rotation(self) -> None:
+        old_root = tuf_repo.load_signer(self.root_key)
+        fresh_root = self.generate_signer("fresh-root")
+        fresh_online = self.generate_signer("fresh-online")
+        self.write_root_transition(2, old_root, fresh_root, fresh_online)
+
+        current = tuf_repo.load_root_chain(self.repository)
+        self.assertEqual(current.signed.version, 2)
+        for role_name in tuf_repo.ONLINE_ROLES:
+            self.assertEqual(
+                current.signed.roles[role_name].keyids,
+                [fresh_online.public_key.keyid],
+            )
+
+    def test_root_chain_rejects_historical_root_material_moved_online_by_alias(
+        self,
+    ) -> None:
+        old_root = tuf_repo.load_signer(self.root_key)
+        old_online = tuf_repo.load_signer(self.online_key)
+        fresh_root = self.generate_signer("fresh-root")
+        self.write_root_transition(2, old_root, fresh_root, old_online)
+        self.write_root_transition(
+            3,
+            fresh_root,
+            fresh_root,
+            old_online,
+            online_alias=("1" * 64, old_root.public_key),
+        )
+
+        with self.assertRaisesRegex(
+            tuf_repo.RepositoryError,
+            "historical root key material to an online role",
+        ):
+            tuf_repo.load_root_chain(self.repository)
+
+    def test_root_chain_rejects_historical_online_material_moved_to_root_by_alias(
+        self,
+    ) -> None:
+        old_root = tuf_repo.load_signer(self.root_key)
+        old_online = tuf_repo.load_signer(self.online_key)
+        fresh_root = self.generate_signer("fresh-root")
+        fresh_online = self.generate_signer("fresh-online")
+        self.write_root_transition(2, old_root, fresh_root, fresh_online)
+        self.write_root_transition(
+            3,
+            fresh_root,
+            fresh_root,
+            fresh_online,
+            root_aliases=(("2" * 64, old_online.public_key),),
+        )
+
+        with self.assertRaisesRegex(
+            tuf_repo.RepositoryError,
+            "historical online key material to the root role",
+        ):
+            tuf_repo.load_root_chain(self.repository)
+
+    def test_root_history_cannot_exceed_late_client_rotation_limit(self) -> None:
+        root_v1_path = self.repository / "metadata/1.root.json"
+        root_signer = tuf_repo.load_signer(self.root_key)
+        for version in range(2, tuf_repo.MAX_ROOT_VERSIONS + 2):
+            current = tuf_repo.Metadata.from_bytes(root_v1_path.read_bytes())
+            current.signed.version = version
+            current.signatures.clear()
+            current.sign(root_signer)
+            (self.repository / "metadata" / f"{version}.root.json").write_bytes(
+                current.to_bytes()
+            )
+
+        with self.assertRaisesRegex(
+            tuf_repo.RepositoryError,
+            f"{tuf_repo.MAX_ROOT_VERSIONS}-version client limit",
+        ):
+            tuf_repo.load_root_chain(self.repository)
 
     def test_workflow_shaped_python_cli_verify_and_refresh(self) -> None:
         script = SCRIPT_DIR / "manage_tuf_repository.py"
@@ -342,6 +504,45 @@ class TufRepositoryTests(unittest.TestCase):
         self.assertIsNotNone(target)
         downloaded = Path(updater.download_target(target))
         self.assertEqual(json.loads(downloaded.read_bytes())["sequence"], 1)
+
+    def test_late_root_v1_client_traverses_retained_v2_and_v3(self) -> None:
+        root_signer = tuf_repo.load_signer(self.root_key)
+        for version in (2, 3):
+            previous = tuf_repo.load_metadata(
+                self.repository / "metadata" / f"{version - 1}.root.json",
+                tuf_repo.Root,
+            )
+            current = tuf_repo.Metadata.from_bytes(previous.to_bytes())
+            current.signed.version = version
+            current.signatures.clear()
+            current.sign(root_signer)
+            (self.repository / "metadata" / f"{version}.root.json").write_bytes(
+                current.to_bytes()
+            )
+
+        tuf_repo.render_public(self.repository, self.public)
+        self.assertEqual(
+            {
+                path.name
+                for path in (self.public / "metadata").glob("*.root.json")
+            },
+            {"1.root.json", "2.root.json", "3.root.json"},
+        )
+
+        client_metadata = self.root / "late-client-metadata"
+        updater = Updater(
+            str(client_metadata),
+            "https://attestations.trymaple.ai/tuf/metadata/",
+            str(self.root / "late-client-targets"),
+            "https://attestations.trymaple.ai/tuf/targets/",
+            fetcher=LocalRepositoryFetcher(self.public),
+            bootstrap=(self.public / "metadata/1.root.json").read_bytes(),
+        )
+        updater.refresh()
+        trusted_root = tuf_repo.Metadata.from_bytes(
+            (client_metadata / "root.json").read_bytes()
+        )
+        self.assertEqual(trusted_root.signed.version, 3)
 
     def test_historical_metadata_and_hashed_targets_are_required(self) -> None:
         self.promote("5.0.0")

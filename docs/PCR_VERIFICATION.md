@@ -216,6 +216,17 @@ therefore learn newly promoted releases without publishing a new SDK. TUF root
 rotation is standard sequential root metadata; a client pinned to version N
 downloads and verifies N+1 before trusting it.
 
+The production SDK bootstrap remains root version 1. Every later root is a
+numbered online transition (`2.root.json`, `3.root.json`, and so on), and the
+attestation repository retains and serves every intermediate version. Do not
+replace the SDK's embedded root with a later version merely to shorten that
+chain: doing so could hide intermediate online-role authority history from a
+new installation. A future embedded-root advance requires a separately
+reviewed, authenticated bridge-history design that preserves that history.
+The current v1 bootstrap accepts at most 32 sequential rotations (root versions
+1 through 33), matching the client update bound; the repository manager refuses
+a longer history until that bridge design exists.
+
 Both clients reject redirects, expired metadata, rollback, freeze, unknown
 schemas, wrong environment, incomplete tuples, unexpected builder IDs, and any
 target whose length or digest differs. Rust additionally rejects any local
@@ -246,6 +257,11 @@ updates that add separate online keys or raise role thresholds, and existing
 clients verify a new root through the preceding root. The initial manager only
 implements bootstrap and ordinary online publication; online-role key rotation
 needs a dedicated transition command before operators attempt that upgrade.
+Before adding that command or manually publishing rotated roots, the backend
+must also reject same-class retired-online key reintroduction (`A -> B -> A`)
+and enforce the clients' cumulative 128-fingerprint history bound per
+role/class before publication; clients currently fail closed on either
+violation.
 
 ## Operator setup: deliberately not performed by this change
 

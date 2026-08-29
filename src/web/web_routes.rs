@@ -211,8 +211,23 @@ struct WebErrorBody {
     trace_id: Option<String>,
 }
 
+/// The exact sanitized JSON body returned for a failed logical web operation.
+///
+/// Transport v1 wraps this body in an Axum response, while transport v2 can
+/// serialize the same value inside its authenticated response envelope.
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub(crate) struct WebRouteErrorBody(WebRouteErrorBodyKind);
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum WebRouteErrorBodyKind {
+    Web(WebErrorBody),
+    Api(crate::ErrorResponse),
+}
+
 #[derive(Debug)]
-enum WebRouteError {
+pub(crate) enum WebRouteError {
     InvalidRequest,
     ProviderUnavailable { trace_id: Option<String> },
     Api(ApiError),
@@ -224,30 +239,48 @@ impl From<ApiError> for WebRouteError {
     }
 }
 
-impl IntoResponse for WebRouteError {
-    fn into_response(self) -> Response {
+impl WebRouteError {
+    /// Split a logical failure into the status and JSON body shared by every
+    /// encrypted transport. Dynamic provider trace IDs are sanitized and
+    /// bounded before crossing the public API boundary.
+    pub(crate) fn into_logical_parts(self) -> (StatusCode, WebRouteErrorBody) {
         match self {
             Self::InvalidRequest => (
                 StatusCode::UNPROCESSABLE_ENTITY,
-                Json(WebErrorBody {
+                WebRouteErrorBody(WebRouteErrorBodyKind::Web(WebErrorBody {
                     status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
                     code: "invalid_request",
                     message: "The web request is invalid.",
                     trace_id: None,
-                }),
-            )
-                .into_response(),
+                })),
+            ),
             Self::ProviderUnavailable { trace_id } => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(WebErrorBody {
+                WebRouteErrorBody(WebRouteErrorBodyKind::Web(WebErrorBody {
                     status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
                     code: "web_provider_unavailable",
                     message: "The web provider is temporarily unavailable.",
-                    trace_id,
-                }),
-            )
-                .into_response(),
+                    trace_id: trace_id
+                        .as_deref()
+                        .and_then(|trace_id| meaningful_trace_id(Some(trace_id))),
+                })),
+            ),
+            Self::Api(error) => (
+                error.status_code(),
+                WebRouteErrorBody(WebRouteErrorBodyKind::Api(error.response_body())),
+            ),
+        }
+    }
+}
+
+impl IntoResponse for WebRouteError {
+    fn into_response(self) -> Response {
+        match self {
             Self::Api(error) => error.into_response(),
+            error => {
+                let (status, body) = error.into_logical_parts();
+                (status, Json(body)).into_response()
+            }
         }
     }
 }
@@ -277,18 +310,33 @@ async fn search_web(
     Extension(user): Extension<User>,
     Extension(body): Extension<Value>,
 ) -> Result<Json<EncryptedResponse<WebSearchResponse>>, WebRouteError> {
-    let request = serde_json::from_value::<WebSearchRequest>(body)
-        .map_err(|_| WebRouteError::InvalidRequest)?;
+    let request = parse_web_search_request(body)?;
+    let response = execute_web_search(&state, &user, request).await?;
+    encrypt_response(&state, &session_id, &response)
+        .await
+        .map_err(WebRouteError::from)
+}
+
+/// Deserialize a structurally valid web-search body using the public web API's
+/// sanitized validation error contract.
+pub(crate) fn parse_web_search_request(body: Value) -> Result<WebSearchRequest, WebRouteError> {
+    serde_json::from_value::<WebSearchRequest>(body).map_err(|_| WebRouteError::InvalidRequest)
+}
+
+/// Execute a validated, authenticated web-search operation without depending
+/// on a particular encrypted transport.
+pub(crate) async fn execute_web_search(
+    state: &AppState,
+    user: &User,
+    request: WebSearchRequest,
+) -> Result<WebSearchResponse, WebRouteError> {
     let options = validate_search_request(request)?;
     let client = state.kagi_client.as_ref().ok_or_else(|| {
         warn!("Web search requested while the provider client is unavailable");
         WebRouteError::ProviderUnavailable { trace_id: None }
     })?;
-    ensure_paid_web_access(&state, &user).await?;
-    let response = execute_search(client, options).await?;
-    encrypt_response(&state, &session_id, &response)
-        .await
-        .map_err(WebRouteError::from)
+    ensure_paid_web_access(state, user).await?;
+    execute_search(client, options).await
 }
 
 async fn extract_web(
@@ -297,18 +345,33 @@ async fn extract_web(
     Extension(user): Extension<User>,
     Extension(body): Extension<Value>,
 ) -> Result<Json<EncryptedResponse<WebExtractResponse>>, WebRouteError> {
-    let request = serde_json::from_value::<WebExtractRequest>(body)
-        .map_err(|_| WebRouteError::InvalidRequest)?;
+    let request = parse_web_extract_request(body)?;
+    let response = execute_web_extract(&state, &user, request).await?;
+    encrypt_response(&state, &session_id, &response)
+        .await
+        .map_err(WebRouteError::from)
+}
+
+/// Deserialize a structurally valid web-extraction body using the public web
+/// API's sanitized validation error contract.
+pub(crate) fn parse_web_extract_request(body: Value) -> Result<WebExtractRequest, WebRouteError> {
+    serde_json::from_value::<WebExtractRequest>(body).map_err(|_| WebRouteError::InvalidRequest)
+}
+
+/// Execute a validated, authenticated web-extraction operation without
+/// depending on a particular encrypted transport.
+pub(crate) async fn execute_web_extract(
+    state: &AppState,
+    user: &User,
+    request: WebExtractRequest,
+) -> Result<WebExtractResponse, WebRouteError> {
     let (urls, timeout) = validate_extract_request(request)?;
     let client = state.kagi_client.as_ref().ok_or_else(|| {
         warn!("Web extraction requested while the provider client is unavailable");
         WebRouteError::ProviderUnavailable { trace_id: None }
     })?;
-    ensure_paid_web_access(&state, &user).await?;
-    let response = execute_extract(client, urls, timeout).await?;
-    encrypt_response(&state, &session_id, &response)
-        .await
-        .map_err(WebRouteError::from)
+    ensure_paid_web_access(state, user).await?;
+    execute_extract(client, urls, timeout).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -984,6 +1047,57 @@ mod tests {
             assert!(body.contains("invalid_request"));
             assert!(!body.contains("private provider diagnostic"));
         }
+    }
+
+    async fn assert_logical_error_matches_v1(
+        logical_error: WebRouteError,
+        v1_error: WebRouteError,
+    ) {
+        let (logical_status, logical_body) = logical_error.into_logical_parts();
+        let logical_body = serde_json::to_vec(&logical_body).unwrap();
+
+        let v1_response = v1_error.into_response();
+        assert_eq!(logical_status, v1_response.status());
+        let v1_body = axum::body::to_bytes(v1_response.into_body(), 8 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(logical_body.as_slice(), v1_body.as_ref());
+    }
+
+    #[tokio::test]
+    async fn logical_errors_preserve_exact_v1_status_and_json_body() {
+        assert_logical_error_matches_v1(
+            WebRouteError::InvalidRequest,
+            WebRouteError::InvalidRequest,
+        )
+        .await;
+        assert_logical_error_matches_v1(
+            WebRouteError::ProviderUnavailable {
+                trace_id: Some("safe-trace".to_owned()),
+            },
+            WebRouteError::ProviderUnavailable {
+                trace_id: Some("safe-trace".to_owned()),
+            },
+        )
+        .await;
+        assert_logical_error_matches_v1(
+            WebRouteError::Api(ApiError::UsageLimitReached),
+            WebRouteError::Api(ApiError::UsageLimitReached),
+        )
+        .await;
+    }
+
+    #[test]
+    fn logical_provider_errors_bound_and_sanitize_trace_ids() {
+        let (_, body) = WebRouteError::ProviderUnavailable {
+            trace_id: Some(format!("safe<script>{}", "x".repeat(512))),
+        }
+        .into_logical_parts();
+        let body = serde_json::to_string(&body).unwrap();
+
+        assert!(!body.contains('<'));
+        assert!(!body.contains('>'));
+        assert!(body.len() < 512);
     }
 
     #[test]

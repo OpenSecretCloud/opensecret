@@ -114,6 +114,7 @@ mod models;
 mod oauth;
 mod os_flags;
 mod private_key;
+mod provider_cache;
 mod provider_client;
 mod provider_routing;
 mod proxy_config;

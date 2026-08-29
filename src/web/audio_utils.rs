@@ -35,6 +35,12 @@ pub struct AudioSplitter {
     overlap_seconds: f64,
 }
 
+#[derive(Clone, Copy)]
+struct AudioSplitBounds {
+    max_chunks: usize,
+    max_total_chunk_bytes: usize,
+}
+
 impl Default for AudioSplitter {
     fn default() -> Self {
         Self {
@@ -54,6 +60,81 @@ impl AudioSplitter {
     }
 
     pub fn split_audio(
+        &self,
+        audio_data: &[u8],
+        content_type: &str,
+    ) -> Result<Vec<AudioChunk>, String> {
+        self.split_audio_unbounded(audio_data, content_type)
+    }
+
+    /// Split owned audio while bounding both the number of output chunks and
+    /// their aggregate allocation. The ordinary v1 path intentionally
+    /// continues through [`Self::split_audio`] with no new behavior change.
+    ///
+    /// Taking ownership lets the bounded caller move a non-WAV or already-small
+    /// upload directly into its only chunk instead of retaining a second copy.
+    pub fn split_audio_bounded(
+        &self,
+        audio_data: Vec<u8>,
+        content_type: &str,
+        max_chunks: usize,
+        max_total_chunk_bytes: usize,
+    ) -> Result<Vec<AudioChunk>, String> {
+        if max_chunks == 0 {
+            return Err("Audio chunk limit must be non-zero".to_string());
+        }
+        if max_total_chunk_bytes == 0 {
+            return Err("Audio chunk byte limit must be non-zero".to_string());
+        }
+
+        if !self.should_split(&audio_data) {
+            if audio_data.len() > max_total_chunk_bytes {
+                return Err("Audio exceeds bounded aggregate chunk bytes".to_string());
+            }
+            info!(
+                "File size {} bytes is under limit, returning as single chunk",
+                audio_data.len()
+            );
+            return Ok(vec![AudioChunk {
+                data: audio_data,
+                start_time: 0.0,
+                end_time: 0.0,
+                index: 0,
+            }]);
+        }
+
+        info!(
+            "File size {} bytes exceeds limit, splitting audio",
+            audio_data.len()
+        );
+
+        match content_type {
+            "audio/wav" | "audio/wave" => self.split_wav(
+                &audio_data,
+                Some(AudioSplitBounds {
+                    max_chunks,
+                    max_total_chunk_bytes,
+                }),
+            ),
+            _ => {
+                if audio_data.len() > max_total_chunk_bytes {
+                    return Err("Audio exceeds bounded aggregate chunk bytes".to_string());
+                }
+                info!(
+                    "Non-WAV format ({}), returning entire file as single chunk",
+                    content_type
+                );
+                Ok(vec![AudioChunk {
+                    data: audio_data,
+                    start_time: 0.0,
+                    end_time: 0.0,
+                    index: 0,
+                }])
+            }
+        }
+    }
+
+    fn split_audio_unbounded(
         &self,
         audio_data: &[u8],
         content_type: &str,
@@ -80,7 +161,7 @@ impl AudioSplitter {
         // For WAV files, use simple WAV splitting
         // For other formats, we'll need to decode and re-encode
         match content_type {
-            "audio/wav" | "audio/wave" => self.split_wav(audio_data),
+            "audio/wav" | "audio/wave" => self.split_wav(audio_data, None),
             _ => {
                 // For MP3 and other formats return full file as 1 chunk
                 info!(
@@ -97,7 +178,11 @@ impl AudioSplitter {
         }
     }
 
-    fn split_wav(&self, audio_data: &[u8]) -> Result<Vec<AudioChunk>, String> {
+    fn split_wav(
+        &self,
+        audio_data: &[u8],
+        bounds: Option<AudioSplitBounds>,
+    ) -> Result<Vec<AudioChunk>, String> {
         // WAV file structure:
         // - RIFF header (12 bytes)
         // - fmt chunk (usually 24 bytes)
@@ -256,6 +341,20 @@ impl AudioSplitter {
             overlap_bytes = 0; // Disable overlap if it would exceed chunk size
         }
 
+        // A large untrusted metadata header is copied into every generated WAV
+        // chunk. Preflight the complete bounded plan before allocating the
+        // first chunk so hostile metadata cannot create a partial amplification
+        // up to the point at which a later limit check fails.
+        if let Some(bounds) = bounds {
+            Self::preflight_bounded_wav_chunks(
+                audio_samples.len(),
+                header_overhead,
+                chunk_duration_bytes,
+                overlap_bytes,
+                bounds,
+            )?;
+        }
+
         let mut chunks = Vec::new();
         let mut offset = 0;
         let mut index = 0;
@@ -307,12 +406,65 @@ impl AudioSplitter {
         Ok(chunks)
     }
 
+    fn preflight_bounded_wav_chunks(
+        audio_sample_bytes: usize,
+        header_overhead: usize,
+        chunk_duration_bytes: usize,
+        overlap_bytes: usize,
+        bounds: AudioSplitBounds,
+    ) -> Result<(), String> {
+        let mut aggregate_chunk_bytes = 0_usize;
+        let mut offset = 0_usize;
+        let mut chunk_count = 0_usize;
+
+        while offset < audio_sample_bytes {
+            if chunk_count >= bounds.max_chunks {
+                return Err("WAV file requires too many bounded audio chunks".to_string());
+            }
+            let start = if chunk_count > 0 && offset >= overlap_bytes {
+                offset - overlap_bytes
+            } else {
+                offset
+            };
+            let end = start
+                .checked_add(chunk_duration_bytes)
+                .ok_or_else(|| "WAV chunk plan overflow".to_string())?
+                .min(audio_sample_bytes);
+            if end <= offset {
+                return Err(
+                    "Split produced a non-progressing window; check max_chunk_size/overlap"
+                        .to_string(),
+                );
+            }
+
+            let chunk_bytes = header_overhead
+                .checked_add(end - start)
+                .ok_or_else(|| "WAV chunk allocation overflow".to_string())?;
+            aggregate_chunk_bytes = aggregate_chunk_bytes
+                .checked_add(chunk_bytes)
+                .ok_or_else(|| "WAV aggregate chunk allocation overflow".to_string())?;
+            if aggregate_chunk_bytes > bounds.max_total_chunk_bytes {
+                return Err("WAV chunks exceed bounded aggregate chunk bytes".to_string());
+            }
+
+            offset = end;
+            chunk_count += 1;
+        }
+
+        Ok(())
+    }
+
     fn create_wav_from_samples(
         &self,
         original_header: &[u8],
         samples: &[u8],
     ) -> Result<Vec<u8>, String> {
-        let mut wav = Vec::new();
+        let output_bytes = original_header
+            .len()
+            .checked_add(8)
+            .and_then(|length| length.checked_add(samples.len()))
+            .ok_or_else(|| "WAV chunk allocation overflow".to_string())?;
+        let mut wav = Vec::with_capacity(output_bytes);
 
         // Copy the original header up to the data chunk
         wav.extend_from_slice(original_header);
@@ -398,6 +550,30 @@ pub fn merge_transcriptions(
 mod tests {
     use super::*;
 
+    fn wav_with_large_header(junk_bytes: usize, sample_bytes: usize) -> Vec<u8> {
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&0_u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(b"fmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_000_u32.to_le_bytes());
+        wav.extend_from_slice(&1_000_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&8_u16.to_le_bytes());
+        wav.extend_from_slice(b"JUNK");
+        wav.extend_from_slice(&(junk_bytes as u32).to_le_bytes());
+        wav.resize(wav.len() + junk_bytes, 0);
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(sample_bytes as u32).to_le_bytes());
+        wav.resize(wav.len() + sample_bytes, 0x7f);
+        let riff_size = u32::try_from(wav.len() - 8).unwrap();
+        wav[4..8].copy_from_slice(&riff_size.to_le_bytes());
+        wav
+    }
+
     #[test]
     fn test_should_split() {
         let splitter = AudioSplitter::new();
@@ -417,6 +593,52 @@ mod tests {
         // Test data significantly over limit
         let large_data = vec![0u8; MAX_CHUNK_SIZE * 2];
         assert!(splitter.should_split(&large_data));
+    }
+
+    #[test]
+    fn bounded_split_rejects_header_amplified_chunk_counts() {
+        let splitter = AudioSplitter {
+            max_chunk_size: 128,
+            overlap_seconds: 0.0,
+        };
+        let wav = wav_with_large_header(72, 32);
+        assert!(wav.len() > splitter.max_chunk_size);
+
+        let error = splitter
+            .split_audio_bounded(wav, "audio/wav", 1, usize::MAX)
+            .expect_err("large header should exceed bounded chunk count");
+        assert_eq!(error, "WAV file requires too many bounded audio chunks");
+    }
+
+    #[test]
+    fn bounded_split_preflights_hostile_header_aggregate_before_chunking() {
+        let splitter = AudioSplitter {
+            max_chunk_size: 128,
+            overlap_seconds: 0.0,
+        };
+        // The 124-byte per-chunk header leaves only four sample bytes in each
+        // 128-byte output. Without an aggregate preflight, this tiny input
+        // expands into eight almost-all-metadata WAV allocations.
+        let wav = wav_with_large_header(72, 32);
+
+        let error = splitter
+            .split_audio_bounded(wav, "audio/wav", 16, 512)
+            .expect_err("repeated hostile metadata must exceed the aggregate bound");
+        assert_eq!(error, "WAV chunks exceed bounded aggregate chunk bytes");
+    }
+
+    #[test]
+    fn bounded_unsplit_audio_moves_the_owned_allocation() {
+        let splitter = AudioSplitter::new();
+        let audio = vec![0x5a; 1024];
+        let allocation = audio.as_ptr();
+
+        let chunks = splitter
+            .split_audio_bounded(audio, "audio/mpeg", 1, 1024)
+            .expect("small bounded audio should remain one chunk");
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].data.as_ptr(), allocation);
     }
 
     #[test]
@@ -450,13 +672,13 @@ mod tests {
 
         // Test with file too small to be valid WAV
         let tiny_file = vec![0u8; 10];
-        let result = splitter.split_wav(&tiny_file);
+        let result = splitter.split_wav(&tiny_file, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("too small"));
 
         // Test with file that's large enough but not a WAV
         let not_wav = vec![0u8; 100];
-        let result = splitter.split_wav(&not_wav);
+        let result = splitter.split_wav(&not_wav, None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Not a valid WAV"));
     }

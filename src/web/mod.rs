@@ -4,7 +4,7 @@ pub mod encryption_middleware;
 mod health_routes;
 pub mod login_routes;
 mod oauth_routes;
-mod openai;
+pub(crate) mod openai;
 pub mod openai_auth;
 pub mod platform;
 pub mod protected_routes;

@@ -3,6 +3,7 @@ use crate::model_config::{
 };
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
+use crate::provider_cache::DerivedCacheNamespace;
 use crate::provider_client::{
     ProviderClient, ProviderRequest, ProviderRequestError, ProviderResponse,
 };
@@ -49,9 +50,110 @@ const TTS_BILLING_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const TTS_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_TTS_INPUT_CHARS: usize = 100_000;
 const MAX_BOUNDED_PROVIDER_RESPONSE_BYTES: usize = 256 * 1024;
+const V2_MAX_PROVIDER_RESPONSE_BYTES: usize = 28 * 1024 * 1024;
+// TTS wraps provider bytes in padded base64 plus a small JSON object. Keep the
+// raw response below three quarters of the logical v2 response ceiling so the
+// transport's bounded serializer always has room for that expansion.
+const V2_MAX_TTS_PROVIDER_RESPONSE_BYTES: usize = (V2_MAX_PROVIDER_RESPONSE_BYTES - 1024) / 4 * 3;
+const V2_MAX_PROVIDER_JSON_DEPTH: usize = 128;
+const V2_MAX_PROVIDER_JSON_STRUCTURAL_TOKENS: usize = 1_048_576;
+const V2_MAX_TRANSCRIPTION_CHUNKS: usize = 4;
+// The v2 gateway holds a 128 MiB provider working-set reservation. Bound
+// retained chunk allocations to 64 MiB, then process them sequentially. With
+// one at-most-32 MiB multipart body and the per-chunk share of the 28 MiB
+// provider response bound, this leaves allocator and metadata headroom.
+const V2_MAX_TRANSCRIPTION_CHUNK_BYTES: usize = 64 * 1024 * 1024;
+const V2_MAX_TRANSCRIPTION_MULTIPART_BYTES: usize = 32 * 1024 * 1024;
 
 const PROVIDER_MANAGED_CACHE_SALT_FIELD: &str = "cache_salt";
 const PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD: &str = "user_cache_secret";
+
+/// Cache isolation is a required input to every completion dispatch. Keeping
+/// the legacy derivation as an explicit variant prevents a new transport from
+/// silently inheriting the v1 SHA256(UUID) namespace.
+pub(crate) enum CompletionCachePolicy<'a> {
+    LegacyV1,
+    BoundV2(&'a DerivedCacheNamespace),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderResponseBodyPolicy {
+    Unbounded,
+    Bounded {
+        limit_bytes: usize,
+        max_json_structural_tokens: Option<usize>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderErrorBodyPolicy {
+    LegacyBody,
+    StatusOnly { drain_limit_bytes: usize },
+}
+
+impl ProviderResponseBodyPolicy {
+    const fn error_body(self) -> ProviderErrorBodyPolicy {
+        match self {
+            Self::Unbounded => ProviderErrorBodyPolicy::LegacyBody,
+            Self::Bounded { .. } => ProviderErrorBodyPolicy::StatusOnly {
+                drain_limit_bytes: MAX_BOUNDED_PROVIDER_RESPONSE_BYTES,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderRetryPolicy {
+    LegacyV1,
+    NoAmbiguousRetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnaryProviderPolicy {
+    response_body: ProviderResponseBodyPolicy,
+    retry: ProviderRetryPolicy,
+}
+
+impl UnaryProviderPolicy {
+    const LEGACY_V1: Self = Self {
+        response_body: ProviderResponseBodyPolicy::Unbounded,
+        retry: ProviderRetryPolicy::LegacyV1,
+    };
+
+    const V2: Self = Self {
+        response_body: ProviderResponseBodyPolicy::Bounded {
+            limit_bytes: V2_MAX_PROVIDER_RESPONSE_BYTES,
+            max_json_structural_tokens: Some(V2_MAX_PROVIDER_JSON_STRUCTURAL_TOKENS),
+        },
+        retry: ProviderRetryPolicy::NoAmbiguousRetry,
+    };
+
+    const V2_TTS: Self = Self {
+        response_body: ProviderResponseBodyPolicy::Bounded {
+            limit_bytes: V2_MAX_TTS_PROVIDER_RESPONSE_BYTES,
+            max_json_structural_tokens: None,
+        },
+        retry: ProviderRetryPolicy::NoAmbiguousRetry,
+    };
+
+    fn divide_bounded_response_across(self, parts: usize) -> Self {
+        let response_body = match self.response_body {
+            ProviderResponseBodyPolicy::Unbounded => ProviderResponseBodyPolicy::Unbounded,
+            ProviderResponseBodyPolicy::Bounded {
+                limit_bytes,
+                max_json_structural_tokens,
+            } => ProviderResponseBodyPolicy::Bounded {
+                limit_bytes: limit_bytes / parts.max(1),
+                max_json_structural_tokens: max_json_structural_tokens
+                    .map(|limit| limit / parts.max(1)),
+            },
+        };
+        Self {
+            response_body,
+            retry: self.retry,
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 struct CompletionRequestLogMetadata {
@@ -343,6 +445,98 @@ fn json_value_len(value: &Value) -> usize {
         .unwrap_or_default()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderJsonShapeError {
+    TooLarge,
+    Malformed,
+}
+
+/// Bound JSON container amplification before serde allocates provider-owned
+/// arrays and maps. Strings are skipped without allocation; serde remains the
+/// authoritative syntax validator after this v2-only preflight.
+fn validate_provider_json_shape(
+    bytes: &[u8],
+    max_structural_tokens: usize,
+) -> Result<(), ProviderJsonShapeError> {
+    let mut depth = 0usize;
+    let mut structural_tokens = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for byte in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match *byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or(ProviderJsonShapeError::TooLarge)?;
+                structural_tokens = structural_tokens
+                    .checked_add(1)
+                    .ok_or(ProviderJsonShapeError::TooLarge)?;
+                if depth > V2_MAX_PROVIDER_JSON_DEPTH || structural_tokens > max_structural_tokens {
+                    return Err(ProviderJsonShapeError::TooLarge);
+                }
+            }
+            b'}' | b']' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or(ProviderJsonShapeError::Malformed)?;
+                structural_tokens = structural_tokens
+                    .checked_add(1)
+                    .ok_or(ProviderJsonShapeError::TooLarge)?;
+                if structural_tokens > max_structural_tokens {
+                    return Err(ProviderJsonShapeError::TooLarge);
+                }
+            }
+            b',' | b':' => {
+                structural_tokens = structural_tokens
+                    .checked_add(1)
+                    .ok_or(ProviderJsonShapeError::TooLarge)?;
+                if structural_tokens > max_structural_tokens {
+                    return Err(ProviderJsonShapeError::TooLarge);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if in_string || depth != 0 {
+        Err(ProviderJsonShapeError::Malformed)
+    } else {
+        Ok(())
+    }
+}
+
+fn preflight_provider_json(
+    bytes: &[u8],
+    response_body_policy: ProviderResponseBodyPolicy,
+) -> Result<(), ApiError> {
+    let ProviderResponseBodyPolicy::Bounded {
+        max_json_structural_tokens: Some(max_structural_tokens),
+        ..
+    } = response_body_policy
+    else {
+        return Ok(());
+    };
+
+    match validate_provider_json_shape(bytes, max_structural_tokens) {
+        Ok(()) => Ok(()),
+        Err(ProviderJsonShapeError::TooLarge) => Err(ApiError::PayloadTooLarge),
+        Err(ProviderJsonShapeError::Malformed) => Err(ApiError::InternalServerError),
+    }
+}
+
 fn image_part_url(part: &Value) -> Option<&str> {
     part.get("image_url")
         .and_then(|image| {
@@ -368,7 +562,7 @@ struct TranscriptionParams<'a> {
 /// Request structure for TTS (Text-to-Speech) endpoints
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(transparent)]
-struct TTSRequest {
+pub(crate) struct TTSRequest {
     provider_payload: serde_json::Map<String, Value>,
 }
 
@@ -446,8 +640,17 @@ fn prepare_tts_request(
     })
 }
 
-fn build_tts_response_payload(body_bytes: &[u8], content_type: &str) -> (Value, bool) {
-    let is_json_response = serde_json::from_slice::<Value>(body_bytes).is_ok();
+fn build_tts_response_payload_with_policy(
+    body_bytes: &[u8],
+    content_type: &str,
+    avoid_provider_value_allocation: bool,
+) -> (Value, bool) {
+    let is_json_response = if avoid_provider_value_allocation {
+        serde_json::from_slice::<serde::de::IgnoredAny>(body_bytes).is_ok()
+    } else {
+        // Preserve v1's exact JSON detection behavior.
+        serde_json::from_slice::<Value>(body_bytes).is_ok()
+    };
     (
         json!({
             "content_base64": general_purpose::STANDARD.encode(body_bytes),
@@ -459,7 +662,7 @@ fn build_tts_response_payload(body_bytes: &[u8], content_type: &str) -> (Value, 
 
 /// Request structure for transcription endpoints
 #[derive(Debug, Clone, serde::Deserialize)]
-struct TranscriptionRequest {
+pub(crate) struct TranscriptionRequest {
     file: String, // Base64 encoded audio file
     #[serde(default = "default_transcription_filename")]
     filename: String,
@@ -492,7 +695,7 @@ fn default_transcription_response_format() -> String {
 
 /// Request structure for embeddings endpoints
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-struct EmbeddingRequest {
+pub(crate) struct EmbeddingRequest {
     input: serde_json::Value, // string or array of strings
     #[serde(default = "default_embedding_model")]
     model: String,
@@ -758,8 +961,32 @@ async fn proxy_openai(
     axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(auth_method): axum::Extension<AuthMethod>,
-    axum::Extension(mut body): axum::Extension<Value>,
+    axum::Extension(body): axum::Extension<Value>,
 ) -> Result<Response, ApiError> {
+    let completion = openai_chat_completion_data(
+        &state,
+        &user,
+        auth_method,
+        body,
+        &headers,
+        CompletionCachePolicy::LegacyV1,
+        ProviderResponseBodyPolicy::Unbounded,
+    )
+    .await?;
+
+    openai_completion_v1_response(&state, &session_id, completion).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn openai_chat_completion_data(
+    state: &Arc<AppState>,
+    user: &User,
+    auth_method: AuthMethod,
+    mut body: Value,
+    headers: &HeaderMap,
+    cache_policy: CompletionCachePolicy<'_>,
+    response_body_policy: ProviderResponseBodyPolicy,
+) -> Result<CompletionStream, ApiError> {
     let billing_access = state
         .chat_billing_access(user.uuid, auth_method == AuthMethod::ApiKey)
         .await;
@@ -807,10 +1034,75 @@ async fn proxy_openai(
     let billing_context = BillingContext::new(auth_method, requested_model_name);
 
     // Get the completion stream - billing happens automatically inside!
-    let completion =
-        get_chat_completion_response(&state, &user, body, &headers, billing_context, model_plan)
-            .await?;
+    get_chat_completion_response_with_expected_route(
+        state,
+        user,
+        body,
+        headers,
+        billing_context,
+        model_plan,
+        None,
+        cache_policy,
+        response_body_policy,
+    )
+    .await
+}
 
+/// Execute the non-streaming Chat Completions application contract and return
+/// plaintext logical JSON for transport v2. Provider output is collected under
+/// the v2 bound before JSON allocation, and the cache namespace must come from
+/// the session's already-bound authority.
+pub(crate) async fn openai_nonstream_chat_completion_v2_data(
+    state: &Arc<AppState>,
+    user: &User,
+    auth_method: AuthMethod,
+    body: Value,
+    headers: &HeaderMap,
+    cache_namespace: &DerivedCacheNamespace,
+) -> Result<Value, ApiError> {
+    ensure_nonstream_chat_completion(&body)?;
+
+    let completion = openai_chat_completion_data(
+        state,
+        user,
+        auth_method,
+        body,
+        headers,
+        CompletionCachePolicy::BoundV2(cache_namespace),
+        UnaryProviderPolicy::V2.response_body,
+    )
+    .await?;
+
+    if completion.metadata.is_streaming {
+        error!("Unary Chat Completions unexpectedly produced a stream");
+        return Err(ApiError::InternalServerError);
+    }
+
+    let mut stream = completion.stream;
+    match stream.recv().await {
+        Some(CompletionChunk::FullResponse(response)) => Ok(response),
+        _ => {
+            error!("Unary Chat Completions did not produce a full response");
+            Err(ApiError::InternalServerError)
+        }
+    }
+}
+
+fn ensure_nonstream_chat_completion(body: &Value) -> Result<(), ApiError> {
+    match body.get("stream") {
+        None | Some(Value::Bool(false)) => Ok(()),
+        Some(_) => {
+            error!("Chat Completions stream must be absent or Boolean false for unary v2");
+            Err(ApiError::BadRequest)
+        }
+    }
+}
+
+async fn openai_completion_v1_response(
+    state: &Arc<AppState>,
+    session_id: &TransportSession,
+    completion: CompletionStream,
+) -> Result<Response, ApiError> {
     debug!(
         "Received completion from provider: {} (streaming: {})",
         completion.metadata.provider_name, completion.metadata.is_streaming
@@ -826,7 +1118,7 @@ async fn proxy_openai(
         if let Some(CompletionChunk::FullResponse(response_json)) = rx.recv().await {
             // Billing already happened in get_chat_completion_response!
             // Just encrypt and return
-            let encrypted_response = encrypt_response(&state, &session_id, &response_json).await?;
+            let encrypted_response = encrypt_response(state, session_id, &response_json).await?;
             return Ok(encrypted_response.into_response());
         } else {
             error!("Expected FullResponse chunk but got something else");
@@ -837,13 +1129,15 @@ async fn proxy_openai(
     // For streaming responses, process CompletionChunk stream
     debug!("Handling streaming response");
     let mut rx = completion.stream;
+    let stream_state = Arc::clone(state);
+    let stream_session = session_id.clone();
 
     let stream = async_stream::stream! {
         while let Some(chunk) = rx.recv().await {
             match chunk {
                 CompletionChunk::StreamChunk(json) => {
                     // Pass through full JSON (includes all metadata from upstream)
-                    match encrypt_sse_event(&state, &session_id, &json).await {
+                    match encrypt_sse_event(&stream_state, &stream_session, &json).await {
                         Ok(event) => yield Ok::<Event, std::convert::Infallible>(event),
                         Err(e) => {
                             error!("Failed to encrypt event data: {:?}", e);
@@ -897,6 +1191,8 @@ pub async fn get_chat_completion_response(
         billing_context,
         model_plan,
         None,
+        CompletionCachePolicy::LegacyV1,
+        ProviderResponseBodyPolicy::Unbounded,
     )
     .await
 }
@@ -928,6 +1224,8 @@ pub(crate) async fn get_chat_completion_response_for_expected_route(
             provider_model_id: route.provider_model_id,
             continuum_cache_salt,
         }),
+        CompletionCachePolicy::LegacyV1,
+        ProviderResponseBodyPolicy::Unbounded,
     )
     .await
 }
@@ -953,6 +1251,8 @@ async fn get_chat_completion_response_with_expected_route(
     mut billing_context: BillingContext,
     model_plan: ModelPlan,
     expected_route: Option<ExpectedCompletionRoute<'_>>,
+    cache_policy: CompletionCachePolicy<'_>,
+    response_body_policy: ProviderResponseBodyPolicy,
 ) -> Result<CompletionStream, ApiError> {
     if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
@@ -1061,6 +1361,7 @@ async fn get_chat_completion_response_with_expected_route(
         &mut modified_body,
         &selected_route.proxy.provider_name,
         user.uuid,
+        &cache_policy,
     );
     if let Some(expected_route) = &expected_route {
         apply_server_selected_cache_isolation(
@@ -1144,26 +1445,30 @@ async fn get_chat_completion_response_with_expected_route(
         // The request's streaming fields are forwarded unchanged, but this
         // encrypted endpoint currently buffers one byte-exact response carrier.
         let body_bytes = if expected_route.is_some() {
-            bytes::Bytes::from(
-                collect_bounded_provider_response_body(
-                    res.bytes_stream(),
-                    MAX_BOUNDED_PROVIDER_RESPONSE_BYTES,
-                )
-                .await
-                .map_err(|error| {
-                    error!("Failed to read bounded server-selected response body: {error}");
-                    ApiError::InternalServerError
-                })?,
+            collect_provider_response_body(
+                res,
+                ProviderResponseBodyPolicy::Bounded {
+                    limit_bytes: MAX_BOUNDED_PROVIDER_RESPONSE_BYTES,
+                    max_json_structural_tokens: None,
+                },
             )
-        } else {
-            // Preserve the ordinary Chat Completions path's existing unbounded
-            // response-body behavior. Only server-selected image descriptor
-            // calls opt into the defensive cap above.
-            res.bytes().await.map_err(|e| {
-                error!("Failed to read response body: {:?}", e);
+            .await
+            .map_err(|error| {
+                error!("Failed to read bounded server-selected response body: {error}");
                 ApiError::InternalServerError
             })?
+        } else {
+            collect_provider_response_body(res, response_body_policy)
+                .await
+                .map_err(|error| {
+                    error!("Failed to read response body: {error}");
+                    error
+                })?
         };
+
+        preflight_provider_json(&body_bytes, response_body_policy).inspect_err(|_| {
+            error!("Completion provider response failed structural JSON preflight");
+        })?;
 
         let mut response_json: Value = serde_json::from_str(&String::from_utf8_lossy(&body_bytes))
             .map_err(|e| {
@@ -1451,6 +1756,7 @@ fn apply_provider_managed_request_fields(
     body: &mut serde_json::Map<String, Value>,
     provider_name: &str,
     user_uuid: Uuid,
+    cache_policy: &CompletionCachePolicy<'_>,
 ) {
     if body.remove(PROVIDER_MANAGED_CACHE_SALT_FIELD).is_some() {
         debug!("Stripped provider-managed completion request field: cache_salt");
@@ -1461,9 +1767,13 @@ fn apply_provider_managed_request_fields(
         .is_some();
 
     if provider_name == ProviderName::Tinfoil.as_str() {
+        let user_cache_secret = match cache_policy {
+            CompletionCachePolicy::LegacyV1 => tinfoil_user_cache_secret(user_uuid),
+            CompletionCachePolicy::BoundV2(namespace) => namespace.tinfoil_user_cache_secret(),
+        };
         body.insert(
             PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD.to_string(),
-            json!(tinfoil_user_cache_secret(user_uuid)),
+            json!(user_cache_secret),
         );
         if replaced_user_cache_secret {
             debug!("Replaced provider-managed completion request field: user_cache_secret");
@@ -1712,18 +2022,37 @@ async fn proxy_models(
     user: Option<axum::Extension<User>>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
     let _ = user;
-    let proxy_config = state.proxy_router.get_completion_proxy();
-    let models_response = if proxy_config.provider_name == "tinfoil" {
-        openai_models_response()
-    } else {
-        fetch_provider_models(&state.provider_client, &proxy_config).await?
-    };
+    let models_response = openai_models_data(&state, UnaryProviderPolicy::LEGACY_V1).await?;
     encrypt_response(&state, &session_id, &models_response).await
+}
+
+async fn openai_models_data(
+    state: &Arc<AppState>,
+    provider_policy: UnaryProviderPolicy,
+) -> Result<Value, ApiError> {
+    let proxy_config = state.proxy_router.get_completion_proxy();
+    if proxy_config.provider_name == "tinfoil" {
+        Ok(openai_models_response())
+    } else {
+        fetch_provider_models(
+            &state.provider_client,
+            &proxy_config,
+            provider_policy.response_body,
+        )
+        .await
+    }
+}
+
+/// Fetch the OpenAI-shaped model listing without applying either transport's
+/// response encryption. The v2 adapter owns the bounded logical response.
+pub(crate) async fn openai_models_v2_data(state: &Arc<AppState>) -> Result<Value, ApiError> {
+    openai_models_data(state, UnaryProviderPolicy::V2).await
 }
 
 async fn fetch_provider_models(
     client: &ProviderClient,
     proxy_config: &ProxyConfig,
+    response_body_policy: ProviderResponseBodyPolicy,
 ) -> Result<Value, ApiError> {
     let res = client
         .send(
@@ -1745,20 +2074,27 @@ async fn fetch_provider_models(
 
     if !res.is_success() {
         let status = res.status_code();
-        let body_bytes = res.bytes().await.ok();
-        let error_msg = body_bytes
-            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-            .unwrap_or_else(|| status.to_string());
-        error!(
-            "Provider {} returned non-success status for models: {} - {}",
-            proxy_config.provider_name, status, error_msg
-        );
+        match collect_provider_error_body_for_log(res, response_body_policy, status).await {
+            ProviderErrorBodyForLog::Legacy(error_msg) => error!(
+                "Provider {} returned non-success status for models: {} - {}",
+                proxy_config.provider_name, status, error_msg
+            ),
+            ProviderErrorBodyForLog::StatusOnly => error!(
+                "Provider {} returned non-success status for models: {}",
+                proxy_config.provider_name, status
+            ),
+        }
         return Err(ApiError::InternalServerError);
     }
 
-    let body_bytes = res.bytes().await.map_err(|e| {
-        error!("Failed to read models response body: {:?}", e);
-        ApiError::InternalServerError
+    let body_bytes = collect_provider_response_body(res, response_body_policy)
+        .await
+        .map_err(|error| {
+            error!("Failed to read models response body: {error}");
+            error
+        })?;
+    preflight_provider_json(&body_bytes, response_body_policy).inspect_err(|_| {
+        error!("Models provider response failed structural JSON preflight");
     })?;
 
     serde_json::from_slice(&body_bytes).map_err(|e| {
@@ -1775,13 +2111,18 @@ async fn proxy_model_catalog(
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(_body): axum::Extension<()>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+    let catalog_response = openai_model_catalog_data(&state, &user).await;
+    encrypt_response(&state, &session_id, &catalog_response).await
+}
+
+/// Build the entitled model catalog independently of the outer transport.
+pub(crate) async fn openai_model_catalog_data(state: &Arc<AppState>, user: &User) -> Value {
     let billing_access = state.chat_billing_access(user.uuid, false).await;
     let model_plan = ModelPlan::from_is_paid(
         billing_access.is_some_and(crate::billing::ChatBillingAccess::is_paid),
     );
-    let alias_targets = ModelAliasTargets::for_plan(model_plan);
-    let catalog_response = model_catalog_response(alias_targets);
-    encrypt_response(&state, &session_id, &catalog_response).await
+    let alias_targets = state.model_alias_targets(user.uuid, model_plan).await;
+    model_catalog_response(alias_targets)
 }
 
 fn transcription_model_for_provider(model_name: &str, provider_name: &str) -> String {
@@ -1801,8 +2142,12 @@ async fn send_transcription_with_retries(
     fallback_provider: Option<&ProxyConfig>,
     model_name: &str,
     params: &TranscriptionParams<'_>,
+    provider_policy: UnaryProviderPolicy,
 ) -> Result<Value, ApiError> {
-    let max_cycles = 3;
+    let max_cycles = match provider_policy.retry {
+        ProviderRetryPolicy::LegacyV1 => 3,
+        ProviderRetryPolicy::NoAmbiguousRetry => 1,
+    };
     let mut last_error = None;
 
     for cycle in 0..max_cycles {
@@ -1821,7 +2166,15 @@ async fn send_transcription_with_retries(
         let primary_model =
             transcription_model_for_provider(model_name, &primary_provider.provider_name);
 
-        match send_transcription_request(client, primary_provider, &primary_model, params).await {
+        match send_transcription_request(
+            client,
+            primary_provider,
+            &primary_model,
+            params,
+            provider_policy.response_body,
+        )
+        .await
+        {
             Ok(response) => {
                 info!(
                     "Successfully got transcription from primary provider {} on cycle {}",
@@ -1841,7 +2194,10 @@ async fn send_transcription_with_retries(
             }
         }
 
-        if let Some(fallback_provider) = fallback_provider {
+        if provider_policy.retry == ProviderRetryPolicy::LegacyV1 {
+            let Some(fallback_provider) = fallback_provider else {
+                continue;
+            };
             debug!(
                 "Cycle {}: Trying fallback provider {} for transcription",
                 cycle + 1,
@@ -1851,8 +2207,14 @@ async fn send_transcription_with_retries(
             let fallback_model =
                 transcription_model_for_provider(model_name, &fallback_provider.provider_name);
 
-            match send_transcription_request(client, fallback_provider, &fallback_model, params)
-                .await
+            match send_transcription_request(
+                client,
+                fallback_provider,
+                &fallback_model,
+                params,
+                provider_policy.response_body,
+            )
+            .await
             {
                 Ok(response) => {
                     info!(
@@ -1890,6 +2252,22 @@ async fn proxy_transcription(
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(transcription_request): axum::Extension<TranscriptionRequest>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+    let response = openai_transcription_data(
+        &state,
+        &user,
+        transcription_request,
+        UnaryProviderPolicy::LEGACY_V1,
+    )
+    .await?;
+    encrypt_response(&state, &session_id, &response).await
+}
+
+async fn openai_transcription_data(
+    state: &Arc<AppState>,
+    user: &User,
+    mut transcription_request: TranscriptionRequest,
+    provider_policy: UnaryProviderPolicy,
+) -> Result<Value, ApiError> {
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
         if let Some(billing_client) = &state.billing_client {
@@ -1918,13 +2296,22 @@ async fn proxy_transcription(
         }
     }
 
-    // Decode base64 audio file
+    let bounded_chunking = provider_policy.retry == ProviderRetryPolicy::NoAmbiguousRetry;
+
+    // V2 moves the encoded input out of the request and drops it immediately
+    // after decoding. The v1 path deliberately retains its existing request
+    // shape and lifetime.
+    let encoded_file = bounded_chunking.then(|| std::mem::take(&mut transcription_request.file));
+    let encoded_file_for_decode = encoded_file
+        .as_deref()
+        .unwrap_or(transcription_request.file.as_str());
     let file_bytes = general_purpose::STANDARD
-        .decode(&transcription_request.file)
+        .decode(encoded_file_for_decode)
         .map_err(|e| {
             error!("Failed to decode base64 audio file: {:?}", e);
             ApiError::BadRequest
         })?;
+    drop(encoded_file);
 
     // Validate file size (100MB limit as sanity check, CF already limits to 50MB)
     let file_size = file_bytes.len();
@@ -1950,92 +2337,73 @@ async fn proxy_transcription(
     let client = state.provider_client.clone();
 
     // Always split the audio (returns single chunk if no splitting needed)
-    let chunks = splitter
-        .split_audio(&file_bytes, &transcription_request.content_type)
-        .map_err(|e| {
-            error!("Failed to split audio: {}", e);
+    let chunks = if bounded_chunking {
+        splitter.split_audio_bounded(
+            file_bytes,
+            &transcription_request.content_type,
+            V2_MAX_TRANSCRIPTION_CHUNKS,
+            V2_MAX_TRANSCRIPTION_CHUNK_BYTES,
+        )
+    } else {
+        splitter.split_audio(&file_bytes, &transcription_request.content_type)
+    }
+    .map_err(|e| {
+        error!("Failed to split audio: {}", e);
+        if bounded_chunking
+            && matches!(
+                e.as_str(),
+                "WAV file requires too many bounded audio chunks"
+                    | "WAV chunks exceed bounded aggregate chunk bytes"
+                    | "Audio exceeds bounded aggregate chunk bytes"
+            )
+        {
+            ApiError::PayloadTooLarge
+        } else {
             ApiError::InternalServerError
-        })?;
+        }
+    })?;
+    // V2 admits one bounded logical response, not one full response budget per
+    // parallel audio chunk. Dividing only the bounded policy keeps aggregate
+    // provider bytes under the same 28 MiB ceiling while v1 stays unbounded.
+    let provider_policy = provider_policy.divide_bounded_response_across(chunks.len());
 
     info!("Processing {} chunk(s)", chunks.len());
 
-    // Process chunks in parallel (even if it's just one)
-    let mut futures = Vec::new();
-
-    for chunk in chunks {
-        let client = client.clone();
-        let model_name = transcription_request.model.clone();
-        let filename = transcription_request.filename.clone();
-        let content_type = transcription_request.content_type.clone();
-        let language = transcription_request.language.clone();
-        let prompt = transcription_request.prompt.clone();
-        let response_format = transcription_request.response_format.clone();
-        let temperature = transcription_request.temperature;
-        let default_proxy = default_proxy.clone();
-        let tinfoil_proxy = tinfoil_proxy.clone();
-
-        let future = async move {
-            let chunk_size = chunk.data.len();
-            info!(
-                "Processing chunk {} (size: {} bytes)",
-                chunk.index, chunk_size
-            );
-
-            let mut primary_provider = tinfoil_proxy.clone();
-            let mut fallback_provider = Some(default_proxy.clone());
-
-            if chunk_size > TINFOIL_MAX_SIZE && primary_provider.provider_name == "tinfoil" {
-                info!(
-                    "Chunk {} size {} bytes exceeds Tinfoil's 0.5MB limit, using fallback only",
-                    chunk.index, chunk_size
-                );
-
-                if let Some(fallback) = fallback_provider.take() {
-                    primary_provider = fallback;
-                } else {
-                    error!(
-                        "Chunk {} size {} bytes exceeds Tinfoil's limit and no fallback is available",
-                        chunk.index, chunk_size
-                    );
-                    return Err(ApiError::InternalServerError);
-                }
-            }
-
-            let params = TranscriptionParams {
-                audio_data: &chunk.data,
-                filename: &filename,
-                content_type: &content_type,
-                language: language.as_deref(),
-                prompt: prompt.as_deref(),
-                response_format: &response_format,
-                temperature,
-            };
-
-            match send_transcription_with_retries(
+    // Keep v1's parallel chunk dispatch unchanged. V2 processes one owned
+    // chunk and one multipart body at a time so the aggregate audio working set
+    // remains inside the gateway's provider reservation.
+    let results: Vec<Result<(usize, Value), ApiError>> = if bounded_chunking {
+        let mut results = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let result = transcribe_audio_chunk(
                 &client,
-                &primary_provider,
-                fallback_provider.as_ref(),
-                &model_name,
-                &params,
+                &default_proxy,
+                &tinfoil_proxy,
+                &transcription_request,
+                chunk,
+                provider_policy,
             )
-            .await
-            {
-                Ok(response) => {
-                    info!("Chunk {} transcribed successfully", chunk.index);
-                    Ok((chunk.index, response))
-                }
-                Err(err) => {
-                    error!("Chunk {} failed: {}", chunk.index, err);
-                    Err(err)
-                }
+            .await;
+            let failed = result.is_err();
+            results.push(result);
+            if failed {
+                break;
             }
-        };
-
-        futures.push(future);
-    }
-
-    // Execute all futures in parallel
-    let results: Vec<Result<(usize, Value), ApiError>> = futures::future::join_all(futures).await;
+        }
+        results
+    } else {
+        futures::future::join_all(chunks.into_iter().map(|chunk| {
+            transcribe_audio_chunk(
+                &client,
+                &default_proxy,
+                &tinfoil_proxy,
+                &transcription_request,
+                chunk,
+                provider_policy,
+            )
+        }))
+        .await
+    };
 
     // Check if all chunks succeeded
     let mut successful_results = Vec::new();
@@ -2089,17 +2457,188 @@ async fn proxy_transcription(
     // TODO: Add SQS-based billing events for transcription usage
     // Should track: audio duration/size, model used, user ID, timestamp, provider
 
-    // Encrypt and return the response
-    encrypt_response(&state, &session_id, &response).await
+    Ok(response)
 }
 
-/// Sanitize form field values to prevent HTTP header injection attacks
-/// Removes or replaces any CRLF sequences that could be used to inject headers
-fn sanitize_form_field(value: &str) -> String {
+async fn transcribe_audio_chunk(
+    client: &ProviderClient,
+    default_proxy: &ProxyConfig,
+    tinfoil_proxy: &ProxyConfig,
+    transcription_request: &TranscriptionRequest,
+    chunk: crate::web::audio_utils::AudioChunk,
+    provider_policy: UnaryProviderPolicy,
+) -> Result<(usize, Value), ApiError> {
+    let chunk_size = chunk.data.len();
+    info!(
+        "Processing chunk {} (size: {} bytes)",
+        chunk.index, chunk_size
+    );
+
+    let (primary_provider, fallback_provider) =
+        if chunk_size > TINFOIL_MAX_SIZE && tinfoil_proxy.provider_name == "tinfoil" {
+            info!(
+                "Chunk {} size {} bytes exceeds Tinfoil's 0.5MB limit, using fallback only",
+                chunk.index, chunk_size
+            );
+            (default_proxy, None)
+        } else {
+            (tinfoil_proxy, Some(default_proxy))
+        };
+
+    let params = TranscriptionParams {
+        audio_data: &chunk.data,
+        filename: &transcription_request.filename,
+        content_type: &transcription_request.content_type,
+        language: transcription_request.language.as_deref(),
+        prompt: transcription_request.prompt.as_deref(),
+        response_format: &transcription_request.response_format,
+        temperature: transcription_request.temperature,
+    };
+
+    match send_transcription_with_retries(
+        client,
+        primary_provider,
+        fallback_provider,
+        &transcription_request.model,
+        &params,
+        provider_policy,
+    )
+    .await
+    {
+        Ok(response) => {
+            info!("Chunk {} transcribed successfully", chunk.index);
+            Ok((chunk.index, response))
+        }
+        Err(err) => {
+            error!("Chunk {} failed: {}", chunk.index, err);
+            Err(err)
+        }
+    }
+}
+
+/// Execute transcription without transport encryption. V2 performs no
+/// post-send provider retry or fallback and bounds each provider JSON response
+/// before structural preflight and serde allocation.
+pub(crate) async fn openai_transcription_v2_data(
+    state: &Arc<AppState>,
+    user: &User,
+    transcription_request: TranscriptionRequest,
+) -> Result<Value, ApiError> {
+    openai_transcription_data(state, user, transcription_request, UnaryProviderPolicy::V2).await
+}
+
+/// Count and append form values after removing CRLF without allocating an
+/// intermediate sanitized copy. This matters when an optional transcription
+/// prompt consumes most of the bounded logical request.
+fn sanitized_form_field_bytes(value: &str) -> usize {
     value
-        .chars()
-        .filter(|c| !matches!(c, '\r' | '\n'))
-        .collect()
+        .as_bytes()
+        .iter()
+        .filter(|byte| !matches!(byte, b'\r' | b'\n'))
+        .count()
+}
+
+fn extend_sanitized_form_field(output: &mut Vec<u8>, value: &str) {
+    let mut retained_start = 0_usize;
+    for (index, byte) in value.as_bytes().iter().enumerate() {
+        if matches!(byte, b'\r' | b'\n') {
+            output.extend_from_slice(&value.as_bytes()[retained_start..index]);
+            retained_start = index + 1;
+        }
+    }
+    output.extend_from_slice(&value.as_bytes()[retained_start..]);
+}
+
+fn sanitized_filename_bytes(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn extend_sanitized_filename(output: &mut Vec<u8>, value: &str) {
+    output.extend(value.chars().map(|character| {
+        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+            character as u8
+        } else {
+            b'_'
+        }
+    }));
+}
+
+fn checked_byte_sum(parts: &[usize]) -> Option<usize> {
+    parts
+        .iter()
+        .try_fold(0_usize, |total, part| total.checked_add(*part))
+}
+
+fn multipart_text_field_bytes(boundary: &str, name: &str, value_bytes: usize) -> Option<usize> {
+    checked_byte_sum(&[
+        2,
+        boundary.len(),
+        2,
+        b"Content-Disposition: form-data; name=\"".len(),
+        name.len(),
+        b"\"\r\n\r\n".len(),
+        value_bytes,
+        2,
+    ])
+}
+
+struct TranscriptionMultipartLengths {
+    model_bytes: usize,
+    filename_bytes: usize,
+    content_type_bytes: usize,
+    language_bytes: Option<usize>,
+    prompt_bytes: Option<usize>,
+    response_format_bytes: usize,
+    temperature_bytes: Option<usize>,
+    audio_bytes: usize,
+}
+
+fn transcription_multipart_bytes(
+    boundary: &str,
+    lengths: &TranscriptionMultipartLengths,
+) -> Option<usize> {
+    let mut total = multipart_text_field_bytes(boundary, "model", lengths.model_bytes)?;
+    let file_part = checked_byte_sum(&[
+        2,
+        boundary.len(),
+        2,
+        b"Content-Disposition: form-data; name=\"file\"; filename=\"".len(),
+        lengths.filename_bytes,
+        b"\"\r\n".len(),
+        b"Content-Type: ".len(),
+        lengths.content_type_bytes,
+        b"\r\n\r\n".len(),
+        lengths.audio_bytes,
+        2,
+    ])?;
+    total = total.checked_add(file_part)?;
+    if let Some(language_bytes) = lengths.language_bytes {
+        total = total.checked_add(multipart_text_field_bytes(
+            boundary,
+            "language",
+            language_bytes,
+        )?)?;
+    }
+    if let Some(prompt_bytes) = lengths.prompt_bytes {
+        total = total.checked_add(multipart_text_field_bytes(
+            boundary,
+            "prompt",
+            prompt_bytes,
+        )?)?;
+    }
+    total = total.checked_add(multipart_text_field_bytes(
+        boundary,
+        "response_format",
+        lengths.response_format_bytes,
+    )?)?;
+    if let Some(temperature_bytes) = lengths.temperature_bytes {
+        total = total.checked_add(multipart_text_field_bytes(
+            boundary,
+            "temperature",
+            temperature_bytes,
+        )?)?;
+    }
+    total.checked_add(checked_byte_sum(&[2, boundary.len(), 4])?)
 }
 
 async fn send_transcription_request(
@@ -2107,75 +2646,84 @@ async fn send_transcription_request(
     provider: &ProxyConfig,
     model: &str,
     params: &TranscriptionParams<'_>,
+    response_body_policy: ProviderResponseBodyPolicy,
 ) -> Result<Value, ApiError> {
     // Build multipart form data
     let boundary = format!("----FormBoundary{}", Uuid::new_v4().simple());
-    let mut form_data = Vec::new();
+    let temperature = params.temperature.map(|value| value.to_string());
+
+    let bounded_form_bytes = match response_body_policy {
+        ProviderResponseBodyPolicy::Unbounded => None,
+        ProviderResponseBodyPolicy::Bounded { .. } => {
+            let form_bytes = transcription_multipart_bytes(
+                &boundary,
+                &TranscriptionMultipartLengths {
+                    model_bytes: sanitized_form_field_bytes(model),
+                    filename_bytes: sanitized_filename_bytes(params.filename),
+                    content_type_bytes: sanitized_form_field_bytes(params.content_type),
+                    language_bytes: params.language.map(sanitized_form_field_bytes),
+                    prompt_bytes: params.prompt.map(sanitized_form_field_bytes),
+                    response_format_bytes: sanitized_form_field_bytes(params.response_format),
+                    temperature_bytes: temperature.as_deref().map(str::len),
+                    audio_bytes: params.audio_data.len(),
+                },
+            )
+            .ok_or(ApiError::PayloadTooLarge)?;
+            if form_bytes > V2_MAX_TRANSCRIPTION_MULTIPART_BYTES {
+                return Err(ApiError::PayloadTooLarge);
+            }
+            Some(form_bytes)
+        }
+    };
+    let mut form_data = bounded_form_bytes
+        .map(Vec::with_capacity)
+        .unwrap_or_default();
 
     // Add model field (sanitized to prevent header injection)
-    let safe_model = sanitize_form_field(model);
     form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
     form_data.extend_from_slice(b"Content-Disposition: form-data; name=\"model\"\r\n\r\n");
-    form_data.extend_from_slice(safe_model.as_bytes());
+    extend_sanitized_form_field(&mut form_data, model);
     form_data.extend_from_slice(b"\r\n");
 
     // Add file field with sanitized filename to prevent header injection
-    let safe_filename: String = params
-        .filename
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
     form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-    form_data.extend_from_slice(
-        format!(
-            "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n",
-            safe_filename
-        )
-        .as_bytes(),
-    );
-    let safe_content_type = sanitize_form_field(params.content_type);
-    form_data.extend_from_slice(format!("Content-Type: {}\r\n\r\n", safe_content_type).as_bytes());
+    form_data.extend_from_slice(b"Content-Disposition: form-data; name=\"file\"; filename=\"");
+    extend_sanitized_filename(&mut form_data, params.filename);
+    form_data.extend_from_slice(b"\"\r\nContent-Type: ");
+    extend_sanitized_form_field(&mut form_data, params.content_type);
+    form_data.extend_from_slice(b"\r\n\r\n");
     form_data.extend_from_slice(params.audio_data);
     form_data.extend_from_slice(b"\r\n");
 
     // Add optional fields (sanitized to prevent header injection)
-    if let Some(lang) = params.language {
-        let safe_lang = sanitize_form_field(lang);
+    if let Some(language) = params.language {
         form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
         form_data.extend_from_slice(b"Content-Disposition: form-data; name=\"language\"\r\n\r\n");
-        form_data.extend_from_slice(safe_lang.as_bytes());
+        extend_sanitized_form_field(&mut form_data, language);
         form_data.extend_from_slice(b"\r\n");
     }
-    if let Some(p) = params.prompt {
-        let safe_prompt = sanitize_form_field(p);
+    if let Some(prompt) = params.prompt {
         form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
         form_data.extend_from_slice(b"Content-Disposition: form-data; name=\"prompt\"\r\n\r\n");
-        form_data.extend_from_slice(safe_prompt.as_bytes());
+        extend_sanitized_form_field(&mut form_data, prompt);
         form_data.extend_from_slice(b"\r\n");
     }
-    let safe_response_format = sanitize_form_field(params.response_format);
     form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
     form_data
         .extend_from_slice(b"Content-Disposition: form-data; name=\"response_format\"\r\n\r\n");
-    form_data.extend_from_slice(safe_response_format.as_bytes());
+    extend_sanitized_form_field(&mut form_data, params.response_format);
     form_data.extend_from_slice(b"\r\n");
-    if let Some(temp) = params.temperature {
+    if let Some(temperature) = temperature.as_deref() {
         form_data.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
         form_data
             .extend_from_slice(b"Content-Disposition: form-data; name=\"temperature\"\r\n\r\n");
-        form_data.extend_from_slice(temp.to_string().as_bytes());
+        form_data.extend_from_slice(temperature.as_bytes());
         form_data.extend_from_slice(b"\r\n");
     }
 
     // End boundary
     form_data.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+    debug_assert!(bounded_form_bytes.is_none_or(|expected| form_data.len() == expected));
 
     let content_type = format!("multipart/form-data; boundary={boundary}");
     match client
@@ -2193,9 +2741,14 @@ async fn send_transcription_request(
     {
         Ok(res) => {
             if res.is_success() {
-                let body_bytes = res.bytes().await.map_err(|e| {
-                    error!("Failed to read transcription response body: {:?}", e);
-                    ApiError::InternalServerError
+                let body_bytes = collect_provider_response_body(res, response_body_policy)
+                    .await
+                    .map_err(|error| {
+                        error!("Failed to read transcription response body: {error}");
+                        error
+                    })?;
+                preflight_provider_json(&body_bytes, response_body_policy).inspect_err(|_| {
+                    error!("Transcription provider response failed structural JSON preflight");
                 })?;
 
                 let response_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
@@ -2206,15 +2759,16 @@ async fn send_transcription_request(
                 Ok(response_json)
             } else {
                 let status = res.status_code();
-                let body_bytes = res.bytes().await.ok();
-                let error_msg = body_bytes
-                    .map(|b| String::from_utf8_lossy(&b).to_string())
-                    .unwrap_or_else(|| status.to_string());
-
-                error!(
-                    "Provider {} returned transcription error: {} - {}",
-                    provider.provider_name, status, error_msg
-                );
+                match collect_provider_error_body_for_log(res, response_body_policy, status).await {
+                    ProviderErrorBodyForLog::Legacy(error_msg) => error!(
+                        "Provider {} returned transcription error: {} - {}",
+                        provider.provider_name, status, error_msg
+                    ),
+                    ProviderErrorBodyForLog::StatusOnly => error!(
+                        "Provider {} returned transcription error: {}",
+                        provider.provider_name, status
+                    ),
+                }
                 Err(ApiError::InternalServerError)
             }
         }
@@ -2295,6 +2849,17 @@ async fn proxy_tts(
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(tts_request): axum::Extension<TTSRequest>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+    let response =
+        openai_tts_data(&state, &user, tts_request, UnaryProviderPolicy::LEGACY_V1).await?;
+    encrypt_response(&state, &session_id, &response).await
+}
+
+async fn openai_tts_data(
+    state: &Arc<AppState>,
+    user: &User,
+    tts_request: TTSRequest,
+    provider_policy: UnaryProviderPolicy,
+) -> Result<Value, ApiError> {
     let prepared = prepare_tts_request(tts_request).map_err(|validation_error| {
         warn!(
             error = %validation_error,
@@ -2305,7 +2870,7 @@ async fn proxy_tts(
             _ => ApiError::BadRequest,
         }
     })?;
-    ensure_paid_tts_access(&state, &user).await?;
+    ensure_paid_tts_access(state, user).await?;
 
     let proxy_config = state.proxy_router.get_tinfoil_proxy();
     let request_body = serde_json::to_vec(&prepared.provider_payload).map_err(|e| {
@@ -2341,10 +2906,12 @@ async fn proxy_tts(
             .content_type()
             .unwrap_or("application/octet-stream")
             .to_string();
-        let body_bytes = res.bytes().await.map_err(|e| {
-            error!("Failed to read TTS response body: {:?}", e);
-            ApiError::InternalServerError
-        })?;
+        let body_bytes = collect_provider_response_body(res, provider_policy.response_body)
+            .await
+            .map_err(|error| {
+                error!("Failed to read TTS response body: {error}");
+                error
+            })?;
         Ok((body_bytes, content_type))
     })
     .await
@@ -2357,8 +2924,11 @@ async fn proxy_tts(
         ApiError::InternalServerError
     })??;
 
-    let (response_payload, is_json_response) =
-        build_tts_response_payload(&body_bytes, &response_content_type);
+    let (response_payload, is_json_response) = build_tts_response_payload_with_policy(
+        &body_bytes,
+        &response_content_type,
+        provider_policy.retry == ProviderRetryPolicy::NoAmbiguousRetry,
+    );
     if is_json_response {
         warn!(
             model = %prepared.model,
@@ -2376,8 +2946,18 @@ async fn proxy_tts(
         );
     }
 
-    // Encrypt and return the response
-    encrypt_response(&state, &session_id, &response_payload).await
+    Ok(response_payload)
+}
+
+/// Execute speech synthesis without transport encryption. The raw provider
+/// audio is capped so padded base64 plus the JSON wrapper fits the v2 logical
+/// response ceiling.
+pub(crate) async fn openai_tts_v2_data(
+    state: &Arc<AppState>,
+    user: &User,
+    tts_request: TTSRequest,
+) -> Result<Value, ApiError> {
+    openai_tts_data(state, user, tts_request, UnaryProviderPolicy::V2_TTS).await
 }
 
 async fn proxy_embeddings(
@@ -2385,9 +2965,27 @@ async fn proxy_embeddings(
     _headers: HeaderMap,
     axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
-    axum::Extension(_auth_method): axum::Extension<AuthMethod>,
+    axum::Extension(auth_method): axum::Extension<AuthMethod>,
     axum::Extension(embedding_request): axum::Extension<EmbeddingRequest>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+    let response = openai_embeddings_data(
+        &state,
+        &user,
+        auth_method,
+        embedding_request,
+        UnaryProviderPolicy::LEGACY_V1,
+    )
+    .await?;
+    encrypt_response(&state, &session_id, &response).await
+}
+
+async fn openai_embeddings_data(
+    state: &Arc<AppState>,
+    user: &User,
+    auth_method: AuthMethod,
+    embedding_request: EmbeddingRequest,
+    provider_policy: UnaryProviderPolicy,
+) -> Result<Value, ApiError> {
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
         if let Some(billing_client) = &state.billing_client {
@@ -2455,21 +3053,28 @@ async fn proxy_embeddings(
 
     if !res.is_success() {
         let status = res.status_code();
-        let body_bytes = res.bytes().await.ok();
-        let error_msg = body_bytes
-            .map(|b| String::from_utf8_lossy(&b).to_string())
-            .unwrap_or_else(|| status.to_string());
-        error!(
-            "Embeddings proxy returned non-success status: {} - {}",
-            status, error_msg
-        );
+        match collect_provider_error_body_for_log(res, provider_policy.response_body, status).await
+        {
+            ProviderErrorBodyForLog::Legacy(error_msg) => error!(
+                "Embeddings proxy returned non-success status: {} - {}",
+                status, error_msg
+            ),
+            ProviderErrorBodyForLog::StatusOnly => {
+                error!("Embeddings proxy returned non-success status: {}", status)
+            }
+        }
         return Err(ApiError::InternalServerError);
     }
 
     // Parse response
-    let body_bytes = res.bytes().await.map_err(|e| {
-        error!("Failed to read embeddings response body: {:?}", e);
-        ApiError::InternalServerError
+    let body_bytes = collect_provider_response_body(res, provider_policy.response_body)
+        .await
+        .map_err(|error| {
+            error!("Failed to read embeddings response body: {error}");
+            error
+        })?;
+    preflight_provider_json(&body_bytes, provider_policy.response_body).inspect_err(|_| {
+        error!("Embeddings provider response failed structural JSON preflight");
     })?;
 
     let response_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
@@ -2485,16 +3090,15 @@ async fn proxy_embeddings(
             .unwrap_or(0) as i32;
 
         if prompt_tokens > 0 {
-            let billing_context =
-                BillingContext::new(_auth_method, embedding_request.model.clone());
+            let billing_context = BillingContext::new(auth_method, embedding_request.model.clone());
             let embedding_usage = CompletionUsage {
                 prompt_tokens,
                 completion_tokens: 0, // Embeddings don't have completion tokens
                 cached_prompt_tokens: None,
             };
             publish_usage_event_internal(
-                &state,
-                &user,
+                state,
+                user,
                 &billing_context,
                 embedding_usage,
                 &proxy_config.provider_name,
@@ -2503,8 +3107,25 @@ async fn proxy_embeddings(
         }
     }
 
-    // Encrypt and return the response
-    encrypt_response(&state, &session_id, &response_json).await
+    Ok(response_json)
+}
+
+/// Execute embeddings without transport encryption. Provider JSON is bounded
+/// and structurally preflighted before serde allocation.
+pub(crate) async fn openai_embeddings_v2_data(
+    state: &Arc<AppState>,
+    user: &User,
+    auth_method: AuthMethod,
+    embedding_request: EmbeddingRequest,
+) -> Result<Value, ApiError> {
+    openai_embeddings_data(
+        state,
+        user,
+        auth_method,
+        embedding_request,
+        UnaryProviderPolicy::V2,
+    )
+    .await
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -2513,6 +3134,59 @@ enum BoundedProviderResponseBodyError {
     Read,
     #[error("provider response body exceeded the {limit_bytes}-byte limit")]
     TooLarge { limit_bytes: usize },
+}
+
+enum ProviderErrorBodyForLog {
+    Legacy(String),
+    StatusOnly,
+}
+
+async fn collect_provider_error_body_for_log(
+    response: ProviderResponse,
+    response_body_policy: ProviderResponseBodyPolicy,
+    status: u16,
+) -> ProviderErrorBodyForLog {
+    match response_body_policy.error_body() {
+        ProviderErrorBodyPolicy::LegacyBody => {
+            let error_msg = response
+                .bytes()
+                .await
+                .ok()
+                .map(|body| String::from_utf8_lossy(&body).to_string())
+                .unwrap_or_else(|| status.to_string());
+            ProviderErrorBodyForLog::Legacy(error_msg)
+        }
+        ProviderErrorBodyPolicy::StatusOnly { drain_limit_bytes } => {
+            // V2 provider errors are status-only. Consume at most a small
+            // prefix for connection hygiene without copying or retaining it,
+            // and never make provider-controlled error text loggable.
+            let _ =
+                drain_bounded_provider_response_body(response.bytes_stream(), drain_limit_bytes)
+                    .await;
+            ProviderErrorBodyForLog::StatusOnly
+        }
+    }
+}
+
+async fn collect_provider_response_body(
+    response: ProviderResponse,
+    policy: ProviderResponseBodyPolicy,
+) -> Result<bytes::Bytes, ApiError> {
+    match policy {
+        ProviderResponseBodyPolicy::Unbounded => response
+            .bytes()
+            .await
+            .map_err(|_| ApiError::InternalServerError),
+        ProviderResponseBodyPolicy::Bounded { limit_bytes, .. } => {
+            collect_bounded_provider_response_body(response.bytes_stream(), limit_bytes)
+                .await
+                .map(bytes::Bytes::from)
+                .map_err(|error| match error {
+                    BoundedProviderResponseBodyError::Read => ApiError::InternalServerError,
+                    BoundedProviderResponseBodyError::TooLarge { .. } => ApiError::PayloadTooLarge,
+                })
+        }
+    }
 }
 
 async fn collect_bounded_provider_response_body<S>(
@@ -2533,6 +3207,30 @@ where
     }
 
     Ok(body)
+}
+
+async fn drain_bounded_provider_response_body<S>(
+    mut body_stream: S,
+    limit_bytes: usize,
+) -> Result<usize, BoundedProviderResponseBodyError>
+where
+    S: futures::Stream<Item = Result<bytes::Bytes, String>> + Unpin,
+{
+    let mut drained_bytes = 0_usize;
+
+    while drained_bytes < limit_bytes {
+        let Some(chunk) = body_stream.next().await else {
+            break;
+        };
+        let chunk = chunk.map_err(|_| BoundedProviderResponseBodyError::Read)?;
+        let remaining = limit_bytes - drained_bytes;
+        drained_bytes += chunk.len().min(remaining);
+        if chunk.len() >= remaining {
+            break;
+        }
+    }
+
+    Ok(drained_bytes)
 }
 
 /// Helper function to try a provider once
@@ -2596,6 +3294,140 @@ async fn try_provider(
 mod tests {
     use super::*;
 
+    #[test]
+    fn unary_provider_policies_keep_v1_legacy_and_v2_bounded_nonretrying() {
+        assert_eq!(
+            UnaryProviderPolicy::LEGACY_V1,
+            UnaryProviderPolicy {
+                response_body: ProviderResponseBodyPolicy::Unbounded,
+                retry: ProviderRetryPolicy::LegacyV1,
+            }
+        );
+        assert_eq!(
+            UnaryProviderPolicy::V2,
+            UnaryProviderPolicy {
+                response_body: ProviderResponseBodyPolicy::Bounded {
+                    limit_bytes: V2_MAX_PROVIDER_RESPONSE_BYTES,
+                    max_json_structural_tokens: Some(V2_MAX_PROVIDER_JSON_STRUCTURAL_TOKENS,),
+                },
+                retry: ProviderRetryPolicy::NoAmbiguousRetry,
+            }
+        );
+        assert_eq!(
+            UnaryProviderPolicy::V2_TTS,
+            UnaryProviderPolicy {
+                response_body: ProviderResponseBodyPolicy::Bounded {
+                    limit_bytes: V2_MAX_TTS_PROVIDER_RESPONSE_BYTES,
+                    max_json_structural_tokens: None,
+                },
+                retry: ProviderRetryPolicy::NoAmbiguousRetry,
+            }
+        );
+        assert_eq!(
+            UnaryProviderPolicy::LEGACY_V1.response_body.error_body(),
+            ProviderErrorBodyPolicy::LegacyBody
+        );
+        assert_eq!(
+            UnaryProviderPolicy::V2.response_body.error_body(),
+            ProviderErrorBodyPolicy::StatusOnly {
+                drain_limit_bytes: MAX_BOUNDED_PROVIDER_RESPONSE_BYTES,
+            }
+        );
+    }
+
+    #[test]
+    fn v2_unary_chat_helper_accepts_only_absent_or_boolean_false_stream() {
+        assert!(ensure_nonstream_chat_completion(&json!({"stream": false})).is_ok());
+        assert!(ensure_nonstream_chat_completion(&json!({})).is_ok());
+        for rejected in [
+            json!({"stream": true}),
+            json!({"stream": null}),
+            json!({"stream": "false"}),
+            json!({"stream": 0}),
+            json!({"stream": {}}),
+            json!({"stream": []}),
+        ] {
+            assert!(ensure_nonstream_chat_completion(&rejected).is_err());
+        }
+    }
+
+    #[test]
+    fn v2_provider_json_preflight_bounds_depth_and_structure_only_for_v2() {
+        let too_deep = format!(
+            "{}0{}",
+            "[".repeat(V2_MAX_PROVIDER_JSON_DEPTH + 1),
+            "]".repeat(V2_MAX_PROVIDER_JSON_DEPTH + 1)
+        );
+        assert!(matches!(
+            preflight_provider_json(too_deep.as_bytes(), UnaryProviderPolicy::V2.response_body),
+            Err(ApiError::PayloadTooLarge)
+        ));
+        assert!(preflight_provider_json(
+            too_deep.as_bytes(),
+            UnaryProviderPolicy::LEGACY_V1.response_body
+        )
+        .is_ok());
+
+        let mut too_many_tokens =
+            String::with_capacity(V2_MAX_PROVIDER_JSON_STRUCTURAL_TOKENS.saturating_add(3));
+        too_many_tokens.push('[');
+        for index in 0..=V2_MAX_PROVIDER_JSON_STRUCTURAL_TOKENS {
+            if index > 0 {
+                too_many_tokens.push(',');
+            }
+            too_many_tokens.push('0');
+        }
+        too_many_tokens.push(']');
+        assert!(matches!(
+            preflight_provider_json(
+                too_many_tokens.as_bytes(),
+                UnaryProviderPolicy::V2.response_body
+            ),
+            Err(ApiError::PayloadTooLarge)
+        ));
+    }
+
+    #[test]
+    fn bounded_transcription_chunks_share_one_provider_response_budget() {
+        let divided = UnaryProviderPolicy::V2.divide_bounded_response_across(4);
+        let per_chunk_structural_tokens = V2_MAX_PROVIDER_JSON_STRUCTURAL_TOKENS / 4;
+        assert_eq!(
+            divided.response_body,
+            ProviderResponseBodyPolicy::Bounded {
+                limit_bytes: V2_MAX_PROVIDER_RESPONSE_BYTES / 4,
+                max_json_structural_tokens: Some(per_chunk_structural_tokens),
+            }
+        );
+        assert_eq!(divided.retry, ProviderRetryPolicy::NoAmbiguousRetry);
+
+        let numeric_array = |elements: usize| {
+            let mut json = String::with_capacity(elements.saturating_mul(2).saturating_add(1));
+            json.push('[');
+            for index in 0..elements {
+                if index > 0 {
+                    json.push(',');
+                }
+                json.push('0');
+            }
+            json.push(']');
+            json
+        };
+        let exact_limit = numeric_array(per_chunk_structural_tokens - 1);
+        assert!(preflight_provider_json(exact_limit.as_bytes(), divided.response_body).is_ok());
+        let over_limit = numeric_array(per_chunk_structural_tokens);
+        assert!(matches!(
+            preflight_provider_json(over_limit.as_bytes(), divided.response_body),
+            Err(ApiError::PayloadTooLarge)
+        ));
+
+        assert_eq!(
+            UnaryProviderPolicy::LEGACY_V1
+                .divide_bounded_response_across(4)
+                .response_body,
+            ProviderResponseBodyPolicy::Unbounded
+        );
+    }
+
     #[tokio::test]
     async fn bounded_provider_response_body_accepts_exact_limit_across_chunks() {
         let body_stream = futures::stream::iter([
@@ -2633,6 +3465,20 @@ mod tests {
         assert_eq!(
             collect_bounded_provider_response_body(body_stream, 6).await,
             Err(BoundedProviderResponseBodyError::Read)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_provider_error_drain_stops_without_polling_past_limit() {
+        let body_stream = futures::stream::iter([
+            Ok::<_, String>(bytes::Bytes::from_static(b"abcd")),
+            Ok(bytes::Bytes::from_static(b"efgh")),
+            Err("must not be polled after the bounded prefix".to_string()),
+        ]);
+
+        assert_eq!(
+            drain_bounded_provider_response_body(body_stream, 6).await,
+            Ok(6)
         );
     }
 
@@ -2888,7 +3734,8 @@ mod tests {
     #[test]
     fn tts_binary_response_preserves_bytes_and_mime_type() {
         let audio_bytes = [b'R', b'I', b'F', b'F', 0, 0xff, b'W', b'A', b'V', b'E'];
-        let (response, is_json_response) = build_tts_response_payload(&audio_bytes, "audio/flac");
+        let (response, is_json_response) =
+            build_tts_response_payload_with_policy(&audio_bytes, "audio/flac", false);
         let decoded = general_purpose::STANDARD
             .decode(response["content_base64"].as_str().unwrap())
             .unwrap();
@@ -2902,8 +3749,11 @@ mod tests {
     fn tts_json_response_preserves_exact_bytes_and_problem_mime_type() {
         let body = br#"{ "error" : { "message" : "voice generation failed" } }"#;
 
-        let (response, is_json_response) =
-            build_tts_response_payload(body, "application/problem+json; charset=utf-8");
+        let (response, is_json_response) = build_tts_response_payload_with_policy(
+            body,
+            "application/problem+json; charset=utf-8",
+            false,
+        );
         let decoded = general_purpose::STANDARD
             .decode(response["content_base64"].as_str().unwrap())
             .unwrap();
@@ -2981,7 +3831,12 @@ mod tests {
             ("messages".to_string(), json!([])),
         ]);
 
-        apply_provider_managed_request_fields(&mut body, ProviderName::Tinfoil.as_str(), user_uuid);
+        apply_provider_managed_request_fields(
+            &mut body,
+            ProviderName::Tinfoil.as_str(),
+            user_uuid,
+            &CompletionCachePolicy::LegacyV1,
+        );
 
         assert_eq!(body.get("model"), Some(&json!("kimi-k2-6")));
         assert_eq!(body.get("messages"), Some(&json!([])));
@@ -2993,7 +3848,39 @@ mod tests {
     }
 
     #[test]
+    fn bound_v2_cache_namespace_replaces_legacy_and_client_values() {
+        let user_uuid = Uuid::from_u128(42);
+        let root = crate::provider_cache::CacheNamespaceRoot::from_bytes([0x55; 32]);
+        let namespace = crate::provider_cache::derive_tinfoil_cache_namespace(&root, user_uuid);
+        let expected = namespace.tinfoil_user_cache_secret();
+        let mut body = serde_json::Map::from_iter([
+            ("cache_salt".to_string(), json!("user-supplied")),
+            ("user_cache_secret".to_string(), json!("client-controlled")),
+        ]);
+
+        apply_provider_managed_request_fields(
+            &mut body,
+            ProviderName::Tinfoil.as_str(),
+            user_uuid,
+            &CompletionCachePolicy::BoundV2(&namespace),
+        );
+
+        assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
+        assert_eq!(
+            body.get(PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD),
+            Some(&json!(expected))
+        );
+        assert_ne!(
+            body.get(PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD),
+            Some(&json!(tinfoil_user_cache_secret(user_uuid)))
+        );
+    }
+
+    #[test]
     fn strips_tinfoil_cache_fields_from_non_tinfoil_requests() {
+        let user_uuid = Uuid::from_u128(42);
+        let root = crate::provider_cache::CacheNamespaceRoot::from_bytes([0x55; 32]);
+        let namespace = crate::provider_cache::derive_tinfoil_cache_namespace(&root, user_uuid);
         let mut body = serde_json::Map::from_iter([
             ("cache_salt".to_string(), json!("user-supplied")),
             ("user_cache_secret".to_string(), json!("client-controlled")),
@@ -3002,7 +3889,8 @@ mod tests {
         apply_provider_managed_request_fields(
             &mut body,
             ProviderName::Continuum.as_str(),
-            Uuid::from_u128(42),
+            user_uuid,
+            &CompletionCachePolicy::BoundV2(&namespace),
         );
 
         assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
@@ -3021,6 +3909,7 @@ mod tests {
             &mut body,
             ProviderName::Continuum.as_str(),
             user_uuid,
+            &CompletionCachePolicy::LegacyV1,
         );
         assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
 

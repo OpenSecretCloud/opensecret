@@ -69,7 +69,7 @@ pub struct CreateConversationProjectRequest {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct UpdateConversationProjectRequest {
     #[serde(default)]
     pub name: Option<String>,
@@ -91,21 +91,29 @@ pub struct ConversationProjectResponse {
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct ConversationProjectListItem {
+    #[zeroize(skip)]
     pub id: Uuid,
+    #[zeroize(skip)]
     pub object: &'static str,
     pub name: String,
+    #[zeroize(skip)]
     pub created_at: i64,
+    #[zeroize(skip)]
     pub updated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct ConversationProjectListResponse {
+    #[zeroize(skip)]
     pub object: &'static str,
     pub data: Vec<ConversationProjectListItem>,
+    #[zeroize(skip)]
     pub has_more: bool,
+    #[zeroize(skip)]
     pub first_id: Option<Uuid>,
+    #[zeroize(skip)]
     pub last_id: Option<Uuid>,
 }
 

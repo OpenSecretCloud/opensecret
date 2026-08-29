@@ -4,6 +4,7 @@
 //! to represent message content in various formats.
 
 use serde::{Deserialize, Deserializer, Serialize};
+use zeroize::Zeroize;
 
 // ============================================================================
 // Message Content Types (Input)
@@ -80,6 +81,15 @@ impl<T> Default for NullableField<T> {
 impl<T> NullableField<T> {
     pub fn is_missing(&self) -> bool {
         matches!(self, Self::Missing)
+    }
+}
+
+impl<T: Zeroize> Zeroize for NullableField<T> {
+    fn zeroize(&mut self) {
+        if let Self::Value(value) = self {
+            value.zeroize();
+        }
+        *self = Self::Missing;
     }
 }
 

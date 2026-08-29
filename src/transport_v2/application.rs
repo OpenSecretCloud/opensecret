@@ -17,10 +17,12 @@ use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::bounded_json::BoundedJsonBuffer;
+use crate::encrypt::{decrypt_with_key, encrypt_with_key};
 use crate::jwt::{
     issue_transport_v2_user_tokens, validate_transport_v2_user_resumption, AuthContext,
 };
 use crate::kv::StoreError;
+use crate::tokens::count_tokens;
 use crate::web::login_routes::{
     authenticate_login, logout_data, register_and_authenticate, verify_email_data, AuthResponse,
     Credentials, LogoutRequest, RefreshResponse, RegisterCredentials,
@@ -37,25 +39,37 @@ use crate::web::protected_routes::{
     ThirdPartyTokenRequest,
 };
 use crate::web::responses::{
-    constants::OBJECT_TYPE_CONVERSATION_PROJECT,
+    constants::{
+        DEFAULT_PAGINATION_LIMIT, MAX_PAGINATION_LIMIT, OBJECT_TYPE_CONVERSATION_PROJECT,
+        OBJECT_TYPE_LIST,
+    },
     conversation_projects::{
         create_conversation_project_with_name_data, delete_conversation_project_by_uuid_data,
-        validate_project_name, CreateConversationProjectRequest,
+        validate_project_name, ConversationProjectListItem, ConversationProjectListResponse,
+        ConversationProjectResponse, CreateConversationProjectRequest,
+        ListConversationProjectsParams, UpdateConversationProjectRequest,
     },
-    DeletedObjectResponse,
+    instructions::{
+        create_instruction_with_content_data, validate_instruction_content,
+        CreateInstructionRequest, InstructionListResponse, InstructionResponse,
+        ListInstructionsParams, UpdateInstructionRequest,
+    },
+    DeletedObjectResponse, NullableField,
 };
 use crate::{ApiError, AppState, VerifiedUserAuthentication};
 
 use super::envelope::{
     decode_canonical_api_key_name_path, decode_canonical_conversation_project_path,
-    decode_canonical_kv_item_path, decode_canonical_verify_email_path, Credential, EncodedBytes,
-    EnvelopeLimits, HeaderField, LogicalMethod, RequestEnvelope, RequestId, ResponseMode,
+    decode_canonical_instruction_path, decode_canonical_kv_item_path,
+    decode_canonical_verify_email_path, Credential, EncodedBytes, EnvelopeLimits, HeaderField,
+    InstructionItemPath, LogicalMethod, RequestEnvelope, RequestId, ResponseMode,
 };
 use super::session::{
     AuthenticationReservation, AuthenticationStartError, AuthorityState, BoundAuthority,
     BoundPrincipal,
 };
 use super::session_cache::V2SessionLease;
+use super::stored_resources::{self, StoredResourceError};
 
 const JSON_CONTENT_TYPE: &[u8] = b"application/json";
 const AES_GCM_NONCE_AND_TAG_BYTES: usize = 12 + 16;
@@ -147,8 +161,37 @@ pub(crate) enum ProtectedUserOperation {
     CreateConversationProject {
         body: SensitiveBytes,
     },
+    ListConversationProjects {
+        query: Option<String>,
+    },
+    GetConversationProject {
+        project_id: uuid::Uuid,
+    },
+    UpdateConversationProject {
+        project_id: uuid::Uuid,
+        body: SensitiveBytes,
+    },
     DeleteConversationProject {
         project_id: uuid::Uuid,
+    },
+    CreateInstruction {
+        body: SensitiveBytes,
+    },
+    ListInstructions {
+        query: Option<String>,
+    },
+    GetInstruction {
+        instruction_id: uuid::Uuid,
+    },
+    UpdateInstruction {
+        instruction_id: uuid::Uuid,
+        body: SensitiveBytes,
+    },
+    DeleteInstruction {
+        instruction_id: uuid::Uuid,
+    },
+    SetDefaultInstruction {
+        instruction_id: uuid::Uuid,
     },
     RequestAccountDeletion {
         body: SensitiveBytes,
@@ -189,7 +232,14 @@ impl UserOperation {
             Self::Protected {
                 operation: ProtectedUserOperation::GetKv { .. }
                     | ProtectedUserOperation::ListKv
-                    | ProtectedUserOperation::ListApiKeys,
+                    | ProtectedUserOperation::ListApiKeys
+                    | ProtectedUserOperation::ListConversationProjects { .. }
+                    | ProtectedUserOperation::GetConversationProject { .. }
+                    | ProtectedUserOperation::UpdateConversationProject { .. }
+                    | ProtectedUserOperation::ListInstructions { .. }
+                    | ProtectedUserOperation::GetInstruction { .. }
+                    | ProtectedUserOperation::UpdateInstruction { .. }
+                    | ProtectedUserOperation::SetDefaultInstruction { .. },
                 ..
             }
         )
@@ -220,22 +270,47 @@ struct ConversationProjectCreationResponsePreflight<'a> {
     updated_at: i64,
 }
 
+#[derive(Serialize)]
+struct InstructionResponsePreflight<'a> {
+    id: uuid::Uuid,
+    object: &'static str,
+    name: &'a str,
+    prompt: &'a str,
+    prompt_tokens: i32,
+    is_default: bool,
+    created_at: i64,
+    updated_at: i64,
+}
+
 fn preflight_conversation_project_creation_response(name: &str) -> Result<(), ApiError> {
-    preflight_conversation_project_creation_response_with_limit(
+    preflight_conversation_project_response_with_limit(
         name,
+        None,
         EnvelopeLimits::default().logical_body_bytes,
     )
 }
 
-fn preflight_conversation_project_creation_response_with_limit(
+fn preflight_conversation_project_response(
     name: &str,
+    instructions: Option<&str>,
+) -> Result<(), ApiError> {
+    preflight_conversation_project_response_with_limit(
+        name,
+        instructions,
+        EnvelopeLimits::default().logical_body_bytes,
+    )
+}
+
+fn preflight_conversation_project_response_with_limit(
+    name: &str,
+    instructions: Option<&str>,
     logical_body_bytes: usize,
 ) -> Result<(), ApiError> {
     let candidate = ConversationProjectCreationResponsePreflight {
         id: uuid::Uuid::nil(),
         object: OBJECT_TYPE_CONVERSATION_PROJECT,
         name,
-        instructions: None,
+        instructions,
         created_at: i64::MIN,
         updated_at: i64::MIN,
     };
@@ -243,6 +318,41 @@ fn preflight_conversation_project_creation_response_with_limit(
     // insertion that the request-derived response fits; the actual UUID has
     // the same width and real timestamps are shorter. Drop the bounded copy
     // before entering storage so the preflight does not inflate the mutation.
+    let response =
+        LogicalUnaryResponse::json_with_limit(StatusCode::OK, &candidate, logical_body_bytes)?;
+    drop(response);
+    Ok(())
+}
+
+fn preflight_instruction_response(
+    name: &str,
+    prompt: &str,
+    is_default: bool,
+) -> Result<(), ApiError> {
+    preflight_instruction_response_with_limit(
+        name,
+        prompt,
+        is_default,
+        EnvelopeLimits::default().logical_body_bytes,
+    )
+}
+
+fn preflight_instruction_response_with_limit(
+    name: &str,
+    prompt: &str,
+    is_default: bool,
+    logical_body_bytes: usize,
+) -> Result<(), ApiError> {
+    let candidate = InstructionResponsePreflight {
+        id: uuid::Uuid::nil(),
+        object: "instruction",
+        name,
+        prompt,
+        prompt_tokens: i32::MIN,
+        is_default,
+        created_at: i64::MIN,
+        updated_at: i64::MIN,
+    };
     let response =
         LogicalUnaryResponse::json_with_limit(StatusCode::OK, &candidate, logical_body_bytes)?;
     drop(response);
@@ -389,7 +499,16 @@ pub(crate) fn prepare_user_operation(
         ListApiKeys,
         DeleteApiKey,
         CreateConversationProject,
+        ListConversationProjects,
+        GetConversationProject,
+        UpdateConversationProject,
         DeleteConversationProject,
+        CreateInstruction,
+        ListInstructions,
+        GetInstruction,
+        UpdateInstruction,
+        DeleteInstruction,
+        SetDefaultInstruction,
         RequestAccountDeletion,
         ConfirmAccountDeletion,
         Logout,
@@ -426,6 +545,13 @@ pub(crate) fn prepare_user_operation(
                 return rejected_bad_request();
             }
         };
+    let instruction_path = match decode_canonical_instruction_path(request.method, &request.path) {
+        Ok(path) => path,
+        Err(_) => {
+            request.path.zeroize();
+            return rejected_bad_request();
+        }
+    };
     let route = match (request.method, request.path.as_str()) {
         (LogicalMethod::Post, "/login") => Some(Route::Login),
         (LogicalMethod::Post, "/register") => Some(Route::Register),
@@ -449,6 +575,9 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Post, "/v1/conversation-projects") => {
             Some(Route::CreateConversationProject)
         }
+        (LogicalMethod::Get, "/v1/conversation-projects") => Some(Route::ListConversationProjects),
+        (LogicalMethod::Post, "/v1/instructions") => Some(Route::CreateInstruction),
+        (LogicalMethod::Get, "/v1/instructions") => Some(Route::ListInstructions),
         (LogicalMethod::Post, "/protected/delete-account/request") => {
             Some(Route::RequestAccountDeletion)
         }
@@ -464,12 +593,39 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Delete, _) if conversation_project_id.is_some() => {
             Some(Route::DeleteConversationProject)
         }
+        (LogicalMethod::Get, _) if conversation_project_id.is_some() => {
+            Some(Route::GetConversationProject)
+        }
+        (LogicalMethod::Post, _) if conversation_project_id.is_some() => {
+            Some(Route::UpdateConversationProject)
+        }
+        (LogicalMethod::Get, _)
+            if matches!(instruction_path, Some(InstructionItemPath::Item(_))) =>
+        {
+            Some(Route::GetInstruction)
+        }
+        (LogicalMethod::Post, _)
+            if matches!(instruction_path, Some(InstructionItemPath::Item(_))) =>
+        {
+            Some(Route::UpdateInstruction)
+        }
+        (LogicalMethod::Delete, _)
+            if matches!(instruction_path, Some(InstructionItemPath::Item(_))) =>
+        {
+            Some(Route::DeleteInstruction)
+        }
+        (LogicalMethod::Post, _)
+            if matches!(instruction_path, Some(InstructionItemPath::SetDefault(_))) =>
+        {
+            Some(Route::SetDefaultInstruction)
+        }
         _ => None,
     };
     if kv_key.is_some()
         || api_key_name.is_some()
         || verification_code.is_some()
         || conversation_project_id.is_some()
+        || instruction_path.is_some()
     {
         request.path.zeroize();
     }
@@ -848,6 +1004,71 @@ pub(crate) fn prepare_user_operation(
                 },
             })
         }
+        Route::ListConversationProjects => {
+            if credential.is_some() || !request.headers.is_empty() || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::ListConversationProjects {
+                    query: request.query,
+                },
+            })
+        }
+        Route::GetConversationProject => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::GetConversationProject {
+                    project_id: conversation_project_id
+                        .expect("classified conversation-project route must have an ID"),
+                },
+            })
+        }
+        Route::UpdateConversationProject => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::UpdateConversationProject {
+                    project_id: conversation_project_id
+                        .expect("classified conversation-project route must have an ID"),
+                    body: Zeroizing::new(
+                        request
+                            .body_base64
+                            .expect("validated conversation-project update body")
+                            .into_bytes(),
+                    ),
+                },
+            })
+        }
         Route::DeleteConversationProject => {
             if credential.is_some()
                 || request.query.is_some()
@@ -865,6 +1086,112 @@ pub(crate) fn prepare_user_operation(
                 operation: ProtectedUserOperation::DeleteConversationProject {
                     project_id: conversation_project_id
                         .expect("classified conversation-project route must have an ID"),
+                },
+            })
+        }
+        Route::CreateInstruction => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::CreateInstruction {
+                    body: Zeroizing::new(
+                        request
+                            .body_base64
+                            .expect("validated instruction creation body")
+                            .into_bytes(),
+                    ),
+                },
+            })
+        }
+        Route::ListInstructions => {
+            if credential.is_some() || !request.headers.is_empty() || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::ListInstructions {
+                    query: request.query,
+                },
+            })
+        }
+        Route::GetInstruction | Route::DeleteInstruction | Route::SetDefaultInstruction => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            let instruction_id = match instruction_path
+                .expect("classified instruction route must have a decoded path")
+            {
+                InstructionItemPath::Item(id) | InstructionItemPath::SetDefault(id) => id,
+            };
+            let operation = match route {
+                Route::GetInstruction => ProtectedUserOperation::GetInstruction { instruction_id },
+                Route::DeleteInstruction => {
+                    ProtectedUserOperation::DeleteInstruction { instruction_id }
+                }
+                Route::SetDefaultInstruction => {
+                    ProtectedUserOperation::SetDefaultInstruction { instruction_id }
+                }
+                _ => unreachable!("instruction route group is exhaustive"),
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation,
+            })
+        }
+        Route::UpdateInstruction => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            let Some(InstructionItemPath::Item(instruction_id)) = instruction_path else {
+                unreachable!("classified instruction update must use an item path")
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::UpdateInstruction {
+                    instruction_id,
+                    body: Zeroizing::new(
+                        request
+                            .body_base64
+                            .expect("validated instruction update body")
+                            .into_bytes(),
+                    ),
                 },
             })
         }
@@ -1296,11 +1623,397 @@ async fn execute_protected_user_operation(
                     .await?;
             LogicalUnaryResponse::json(StatusCode::OK, &value)
         }
+        ProtectedUserOperation::ListConversationProjects { query } => {
+            let params = parse_logical_query::<ListConversationProjectsParams>(query)?;
+            let limit = if params.limit <= 0 {
+                DEFAULT_PAGINATION_LIMIT
+            } else {
+                params.limit.min(MAX_PAGINATION_LIMIT)
+            };
+            let (mut projects, has_more) = stored_resources::list_projects(
+                app_state.db.get_pool(),
+                user.uuid,
+                limit,
+                params.after,
+                &params.order,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_project_storage_error)?;
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+            let first_id = projects.first().map(|project| project.uuid);
+            let last_id = projects.last().map(|project| project.uuid);
+            let mut data = Vec::with_capacity(projects.len());
+            for project in &mut projects {
+                let mut name = decrypt_required_string(
+                    &user_key,
+                    &project.name_enc,
+                    "conversation project name",
+                )?;
+                data.push(ConversationProjectListItem {
+                    id: project.uuid,
+                    object: OBJECT_TYPE_CONVERSATION_PROJECT,
+                    name: std::mem::take(&mut *name),
+                    created_at: project.created_at.timestamp(),
+                    updated_at: project.updated_at.timestamp(),
+                });
+            }
+            let value = ConversationProjectListResponse {
+                object: OBJECT_TYPE_LIST,
+                data,
+                has_more,
+                first_id,
+                last_id,
+            };
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::GetConversationProject { project_id } => {
+            let mut stored = stored_resources::get_project(
+                app_state.db.get_pool(),
+                user.uuid,
+                project_id,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_project_storage_error)?;
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+            let mut name = decrypt_required_string(
+                &user_key,
+                &stored.project.name_enc,
+                "conversation project name",
+            )?;
+            let mut instructions = decrypt_optional_string(
+                &user_key,
+                stored.prompt_enc.as_ref(),
+                "conversation project instruction",
+            )?;
+            let value = ConversationProjectResponse {
+                id: stored.project.uuid,
+                object: OBJECT_TYPE_CONVERSATION_PROJECT,
+                name: std::mem::take(&mut *name),
+                instructions: instructions
+                    .as_mut()
+                    .map(|value| std::mem::take(&mut **value)),
+                created_at: stored.project.created_at.timestamp(),
+                updated_at: stored.project.updated_at.timestamp(),
+            };
+            stored.zeroize();
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::UpdateConversationProject { project_id, body } => {
+            let mut request = parse_json_body::<UpdateConversationProjectRequest>(body)?;
+            if request.name.is_none() && request.instructions.is_missing() {
+                return Err(ApiError::BadRequest);
+            }
+
+            let mut stored = stored_resources::get_project(
+                app_state.db.get_pool(),
+                user.uuid,
+                project_id,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_project_storage_error)?;
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+
+            let supplied_name = request.name.is_some();
+            let mut final_name = if let Some(name) = request.name.take() {
+                let name = Zeroizing::new(name);
+                Zeroizing::new(validate_project_name(&name)?)
+            } else {
+                decrypt_required_string(
+                    &user_key,
+                    &stored.project.name_enc,
+                    "conversation project name",
+                )?
+            };
+
+            enum InstructionMutation {
+                Unchanged,
+                Set,
+                Clear,
+            }
+            let (instruction_mutation, mut final_instructions) =
+                match std::mem::take(&mut request.instructions) {
+                    NullableField::Missing => (
+                        InstructionMutation::Unchanged,
+                        decrypt_optional_string(
+                            &user_key,
+                            stored.prompt_enc.as_ref(),
+                            "conversation project instruction",
+                        )?,
+                    ),
+                    NullableField::Null => (InstructionMutation::Clear, None),
+                    NullableField::Value(prompt) => {
+                        if prompt.trim().is_empty() {
+                            return Err(ApiError::BadRequest);
+                        }
+                        (InstructionMutation::Set, Some(Zeroizing::new(prompt)))
+                    }
+                };
+
+            preflight_conversation_project_response(
+                &final_name,
+                final_instructions.as_deref().map(String::as_str),
+            )?;
+
+            let name_enc = if supplied_name {
+                Some(encrypt_with_key(&user_key, final_name.as_bytes()).await)
+            } else {
+                None
+            };
+            let instruction_update = match instruction_mutation {
+                InstructionMutation::Unchanged => {
+                    crate::models::responses::ProjectInstructionUpdate::Unchanged
+                }
+                InstructionMutation::Clear => {
+                    crate::models::responses::ProjectInstructionUpdate::Clear
+                }
+                InstructionMutation::Set => {
+                    let prompt = final_instructions
+                        .as_ref()
+                        .expect("set instruction must retain its plaintext");
+                    crate::models::responses::ProjectInstructionUpdate::Set {
+                        prompt_enc: encrypt_with_key(&user_key, prompt.as_bytes()).await,
+                        prompt_tokens: count_tokens(prompt).min(i32::MAX as usize) as i32,
+                    }
+                }
+            };
+            let metadata = stored_resources::update_project(
+                app_state.db.get_pool(),
+                user.uuid,
+                project_id,
+                stored.project.updated_at,
+                name_enc,
+                instruction_update,
+            )
+            .map_err(map_project_storage_error)?;
+            stored.zeroize();
+
+            let value = ConversationProjectResponse {
+                id: metadata.uuid,
+                object: OBJECT_TYPE_CONVERSATION_PROJECT,
+                name: std::mem::take(&mut *final_name),
+                instructions: final_instructions
+                    .as_mut()
+                    .map(|value| std::mem::take(&mut **value)),
+                created_at: metadata.created_at.timestamp(),
+                updated_at: metadata.updated_at.timestamp(),
+            };
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
         ProtectedUserOperation::DeleteConversationProject { project_id } => {
             let value = DeletedObjectResponse::conversation_project(project_id);
             let response = LogicalUnaryResponse::json(StatusCode::OK, &value)?;
             delete_conversation_project_by_uuid_data(app_state, user, project_id)?;
             Ok(response)
+        }
+        ProtectedUserOperation::CreateInstruction { body } => {
+            let mut request = parse_json_body::<CreateInstructionRequest>(body)?;
+            validate_instruction_content(&request.name, &request.prompt)?;
+            preflight_instruction_response(&request.name, &request.prompt, request.is_default)?;
+            let name = Zeroizing::new(std::mem::take(&mut request.name));
+            let prompt = Zeroizing::new(std::mem::take(&mut request.prompt));
+            let value = create_instruction_with_content_data(
+                app_state,
+                user,
+                auth_context,
+                name,
+                prompt,
+                request.is_default,
+            )
+            .await?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::ListInstructions { query } => {
+            let params = parse_logical_query::<ListInstructionsParams>(query)?;
+            let limit = if params.limit <= 0 {
+                DEFAULT_PAGINATION_LIMIT
+            } else {
+                params.limit.min(MAX_PAGINATION_LIMIT)
+            };
+            let (mut instructions, has_more) = stored_resources::list_instructions(
+                app_state.db.get_pool(),
+                user.uuid,
+                limit,
+                params.after,
+                &params.order,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_instruction_storage_error)?;
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+            let first_id = instructions.first().map(|instruction| instruction.uuid);
+            let last_id = instructions.last().map(|instruction| instruction.uuid);
+            let mut data = Vec::with_capacity(instructions.len());
+            for instruction in &mut instructions {
+                let (mut name, mut prompt) = decrypt_instruction_content(&user_key, instruction)?;
+                data.push(InstructionResponse {
+                    id: instruction.uuid,
+                    object: "instruction",
+                    name: std::mem::take(&mut *name),
+                    prompt: std::mem::take(&mut *prompt),
+                    prompt_tokens: instruction.prompt_tokens,
+                    is_default: instruction.is_default,
+                    created_at: instruction.created_at.timestamp(),
+                    updated_at: instruction.updated_at.timestamp(),
+                });
+            }
+            let value = InstructionListResponse {
+                object: OBJECT_TYPE_LIST,
+                data,
+                has_more,
+                first_id,
+                last_id,
+            };
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::GetInstruction { instruction_id } => {
+            let mut instruction = stored_resources::get_instruction(
+                app_state.db.get_pool(),
+                user.uuid,
+                instruction_id,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_instruction_storage_error)?;
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+            let (mut name, mut prompt) = decrypt_instruction_content(&user_key, &instruction)?;
+            let value = InstructionResponse {
+                id: instruction.uuid,
+                object: "instruction",
+                name: std::mem::take(&mut *name),
+                prompt: std::mem::take(&mut *prompt),
+                prompt_tokens: instruction.prompt_tokens,
+                is_default: instruction.is_default,
+                created_at: instruction.created_at.timestamp(),
+                updated_at: instruction.updated_at.timestamp(),
+            };
+            instruction.zeroize();
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::UpdateInstruction {
+            instruction_id,
+            body,
+        } => {
+            let mut request = parse_json_body::<UpdateInstructionRequest>(body)?;
+            if request.name.is_none() && request.prompt.is_none() && request.is_default.is_none() {
+                return Err(ApiError::BadRequest);
+            }
+            let mut instruction = stored_resources::get_instruction(
+                app_state.db.get_pool(),
+                user.uuid,
+                instruction_id,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_instruction_storage_error)?;
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+            let (mut current_name, mut current_prompt) =
+                decrypt_instruction_content(&user_key, &instruction)?;
+            let mut final_name = request
+                .name
+                .take()
+                .map(Zeroizing::new)
+                .unwrap_or_else(|| Zeroizing::new(std::mem::take(&mut *current_name)));
+            let mut final_prompt = request
+                .prompt
+                .take()
+                .map(Zeroizing::new)
+                .unwrap_or_else(|| Zeroizing::new(std::mem::take(&mut *current_prompt)));
+            validate_instruction_content(&final_name, &final_prompt)?;
+            let is_default = request.is_default.unwrap_or(instruction.is_default);
+            preflight_instruction_response(&final_name, &final_prompt, is_default)?;
+            let name_enc = encrypt_with_key(&user_key, final_name.as_bytes()).await;
+            let prompt_enc = encrypt_with_key(&user_key, final_prompt.as_bytes()).await;
+            let prompt_tokens = count_tokens(&final_prompt).min(i32::MAX as usize) as i32;
+            let metadata = stored_resources::update_instruction(
+                app_state.db.get_pool(),
+                user.uuid,
+                instruction_id,
+                instruction.updated_at,
+                stored_resources::InstructionUpdateCiphertext {
+                    name_enc,
+                    prompt_enc,
+                    prompt_tokens,
+                    is_default,
+                },
+            )
+            .map_err(map_instruction_storage_error)?;
+            instruction.zeroize();
+            let value = InstructionResponse {
+                id: metadata.uuid,
+                object: "instruction",
+                name: std::mem::take(&mut *final_name),
+                prompt: std::mem::take(&mut *final_prompt),
+                prompt_tokens: metadata.prompt_tokens,
+                is_default: metadata.is_default,
+                created_at: metadata.created_at.timestamp(),
+                updated_at: metadata.updated_at.timestamp(),
+            };
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::DeleteInstruction { instruction_id } => {
+            let value = DeletedObjectResponse {
+                id: instruction_id,
+                object: "instruction.deleted",
+                deleted: true,
+            };
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value)?;
+            let deleted = stored_resources::delete_instruction(
+                app_state.db.get_pool(),
+                user.uuid,
+                instruction_id,
+            )
+            .map_err(map_instruction_storage_error)?;
+            debug_assert_eq!(deleted, instruction_id);
+            Ok(response)
+        }
+        ProtectedUserOperation::SetDefaultInstruction { instruction_id } => {
+            let mut instruction = stored_resources::get_instruction(
+                app_state.db.get_pool(),
+                user.uuid,
+                instruction_id,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_instruction_storage_error)?;
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+            let (mut name, mut prompt) = decrypt_instruction_content(&user_key, &instruction)?;
+            preflight_instruction_response(&name, &prompt, true)?;
+            let metadata = stored_resources::set_default_instruction(
+                app_state.db.get_pool(),
+                user.uuid,
+                instruction_id,
+                instruction.updated_at,
+            )
+            .map_err(map_instruction_storage_error)?;
+            instruction.zeroize();
+            let value = InstructionResponse {
+                id: metadata.uuid,
+                object: "instruction",
+                name: std::mem::take(&mut *name),
+                prompt: std::mem::take(&mut *prompt),
+                prompt_tokens: metadata.prompt_tokens,
+                is_default: metadata.is_default,
+                created_at: metadata.created_at.timestamp(),
+                updated_at: metadata.updated_at.timestamp(),
+            };
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
         }
         ProtectedUserOperation::RequestAccountDeletion { body } => {
             let request = parse_json_body::<InitiateAccountDeletionRequest>(body)?;
@@ -1328,6 +2041,79 @@ fn map_bounded_kv_read_error(error: StoreError) -> ApiError {
         tracing::error!("Error reading bounded key-value output");
         ApiError::InternalServerError
     }
+}
+
+fn map_project_storage_error(error: StoredResourceError) -> ApiError {
+    match error {
+        StoredResourceError::ConversationProjectNotFound => ApiError::NotFound,
+        StoredResourceError::OutputTooLarge => ApiError::PayloadTooLarge,
+        StoredResourceError::StaleResource => ApiError::Conflict,
+        error => {
+            tracing::error!(?error, "Failed to read bounded conversation-project state");
+            ApiError::InternalServerError
+        }
+    }
+}
+
+fn map_instruction_storage_error(error: StoredResourceError) -> ApiError {
+    match error {
+        StoredResourceError::InstructionNotFound => ApiError::NotFound,
+        StoredResourceError::OutputTooLarge => ApiError::PayloadTooLarge,
+        StoredResourceError::StaleResource => ApiError::Conflict,
+        error => {
+            tracing::error!(?error, "Failed to read bounded instruction state");
+            ApiError::InternalServerError
+        }
+    }
+}
+
+fn decrypt_instruction_content(
+    user_key: &secp256k1::SecretKey,
+    instruction: &stored_resources::InstructionCiphertextRow,
+) -> Result<(Zeroizing<String>, Zeroizing<String>), ApiError> {
+    let name = decrypt_required_string(
+        user_key,
+        instruction
+            .name_enc
+            .as_ref()
+            .ok_or(ApiError::InternalServerError)?,
+        "instruction name",
+    )?;
+    let prompt = decrypt_required_string(user_key, &instruction.prompt_enc, "instruction prompt")?;
+    Ok((name, prompt))
+}
+
+fn decrypt_required_string(
+    user_key: &secp256k1::SecretKey,
+    ciphertext: &Vec<u8>,
+    description: &'static str,
+) -> Result<Zeroizing<String>, ApiError> {
+    decrypt_optional_string(user_key, Some(ciphertext), description)?
+        .ok_or(ApiError::InternalServerError)
+}
+
+fn decrypt_optional_string(
+    user_key: &secp256k1::SecretKey,
+    ciphertext: Option<&Vec<u8>>,
+    description: &'static str,
+) -> Result<Option<Zeroizing<String>>, ApiError> {
+    let Some(ciphertext) = ciphertext else {
+        return Ok(None);
+    };
+    let mut plaintext = Zeroizing::new(decrypt_with_key(user_key, ciphertext).map_err(|_| {
+        tracing::error!(description, "Failed to decrypt bounded stored output");
+        ApiError::InternalServerError
+    })?);
+    let value = match String::from_utf8(std::mem::take(&mut *plaintext)) {
+        Ok(value) => value,
+        Err(error) => {
+            let mut invalid_bytes = error.into_bytes();
+            let value = String::from_utf8_lossy(&invalid_bytes).into_owned();
+            invalid_bytes.zeroize();
+            value
+        }
+    };
+    Ok(Some(Zeroizing::new(value)))
 }
 
 fn parse_json_body<T: DeserializeOwned>(body: SensitiveBytes) -> Result<T, ApiError> {
@@ -2315,7 +3101,7 @@ mod tests {
     }
 
     #[test]
-    fn conversation_project_create_and_delete_are_exact_bound_mutations() {
+    fn conversation_project_family_is_exact_bound_and_classified_by_storage_risk() {
         let create = || {
             envelope(
                 LogicalMethod::Post,
@@ -2405,25 +3191,133 @@ mod tests {
                 if response.status == StatusCode::BAD_REQUEST
         ));
 
-        for (method, path) in [
-            (LogicalMethod::Get, "/v1/conversation-projects"),
-            (
+        let list = prepare_user_operation(
+            envelope(
                 LogicalMethod::Get,
-                "/v1/conversation-projects/123e4567-e89b-12d3-a456-426614174000",
+                "/v1/conversation-projects",
+                Vec::new(),
+                None,
+                None,
             ),
-            (
+            bound_user_authority(),
+        );
+        let get = prepare_user_operation(
+            envelope(
+                LogicalMethod::Get,
+                &format!("/v1/conversation-projects/{project_id}"),
+                Vec::new(),
+                None,
+                None,
+            ),
+            bound_user_authority(),
+        );
+        let update = prepare_user_operation(
+            envelope(
                 LogicalMethod::Post,
-                "/v1/conversation-projects/123e4567-e89b-12d3-a456-426614174000",
+                &format!("/v1/conversation-projects/{project_id}"),
+                json_header(),
+                Some(br#"{"instructions":null}"#),
+                None,
             ),
-        ] {
-            assert!(matches!(
-                prepare_user_operation(
-                    envelope(method, path, Vec::new(), None, None),
-                    bound_user_authority(),
-                ),
-                OperationPreparation::Unsupported
-            ));
+            bound_user_authority(),
+        );
+        for operation in [list, get, update] {
+            let OperationPreparation::Ready(operation) = operation else {
+                panic!("bounded conversation-project operation must be admitted");
+            };
+            assert!(operation.requires_stored_output_reservation());
         }
+    }
+
+    #[test]
+    fn instruction_family_is_exact_bound_and_classified_by_storage_risk() {
+        let instruction_id = "123e4567-e89b-12d3-a456-426614174000";
+        let item_path = format!("/v1/instructions/{instruction_id}");
+        let create = prepare_user_operation(
+            envelope(
+                LogicalMethod::Post,
+                "/v1/instructions",
+                json_header(),
+                Some(br#"{"name":"n","prompt":"p"}"#),
+                None,
+            ),
+            bound_user_authority(),
+        );
+        let delete = prepare_user_operation(
+            envelope(LogicalMethod::Delete, &item_path, Vec::new(), None, None),
+            bound_user_authority(),
+        );
+        for operation in [create, delete] {
+            let OperationPreparation::Ready(operation) = operation else {
+                panic!("fixed-output instruction mutation must be admitted");
+            };
+            assert!(!operation.requires_stored_output_reservation());
+        }
+
+        let list = prepare_user_operation(
+            envelope(
+                LogicalMethod::Get,
+                "/v1/instructions",
+                Vec::new(),
+                None,
+                None,
+            ),
+            bound_user_authority(),
+        );
+        let get = prepare_user_operation(
+            envelope(LogicalMethod::Get, &item_path, Vec::new(), None, None),
+            bound_user_authority(),
+        );
+        let update = prepare_user_operation(
+            envelope(
+                LogicalMethod::Post,
+                &item_path,
+                json_header(),
+                Some(br#"{"is_default":false}"#),
+                None,
+            ),
+            bound_user_authority(),
+        );
+        let set_default = prepare_user_operation(
+            envelope(
+                LogicalMethod::Post,
+                &format!("{item_path}/set-default"),
+                Vec::new(),
+                None,
+                None,
+            ),
+            bound_user_authority(),
+        );
+        for operation in [list, get, update, set_default] {
+            let OperationPreparation::Ready(operation) = operation else {
+                panic!("stored instruction operation must be admitted");
+            };
+            assert!(operation.requires_stored_output_reservation());
+        }
+
+        let mut transplanted = envelope(
+            LogicalMethod::Post,
+            &item_path,
+            json_header(),
+            Some(br#"{"name":"n"}"#),
+            None,
+        );
+        transplanted.credential = Some(Credential::Resumption {
+            value_base64: EncodedBytes::from_bytes(b"stolen".to_vec()),
+        });
+        assert!(matches!(
+            prepare_user_operation(transplanted, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(LogicalMethod::Get, &item_path, Vec::new(), None, None),
+                AuthorityState::Anonymous,
+            ),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::UNAUTHORIZED
+        ));
     }
 
     #[test]
@@ -2450,7 +3344,41 @@ mod tests {
             serde_json::to_vec(&actual).unwrap(),
         );
         assert!(matches!(
-            preflight_conversation_project_creation_response_with_limit(name, 8),
+            preflight_conversation_project_response_with_limit(name, None, 8),
+            Err(ApiError::PayloadTooLarge)
+        ));
+    }
+
+    #[test]
+    fn instruction_preflight_matches_wire_shape_and_bounds_before_default_mutation() {
+        let name = "  quoted \" instruction  ";
+        let prompt = "  preserve prompt whitespace ☃  ";
+        let candidate = InstructionResponsePreflight {
+            id: uuid::Uuid::nil(),
+            object: "instruction",
+            name,
+            prompt,
+            prompt_tokens: i32::MIN,
+            is_default: true,
+            created_at: i64::MIN,
+            updated_at: i64::MIN,
+        };
+        let actual = InstructionResponse {
+            id: uuid::Uuid::nil(),
+            object: "instruction",
+            name: name.to_owned(),
+            prompt: prompt.to_owned(),
+            prompt_tokens: i32::MIN,
+            is_default: true,
+            created_at: i64::MIN,
+            updated_at: i64::MIN,
+        };
+        assert_eq!(
+            serde_json::to_vec(&candidate).unwrap(),
+            serde_json::to_vec(&actual).unwrap(),
+        );
+        assert!(matches!(
+            preflight_instruction_response_with_limit(name, prompt, true, 8),
             Err(ApiError::PayloadTooLarge)
         ));
     }

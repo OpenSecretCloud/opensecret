@@ -12,13 +12,13 @@ use crate::{
         password_reset::NewPasswordResetRequest,
         responses::{
             NewAssistantMessage, NewConversation, NewConversationProject, NewReasoningItem,
-            NewResponse, NewToolCall, NewToolOutput, NewUserMessage, ResponseStatus,
-            ResponsesError,
+            NewResponse, NewToolCall, NewToolOutput, NewUserInstruction, NewUserMessage,
+            ProjectInstructionUpdate, ResponseStatus, ResponsesError,
         },
         schema::{
             account_deletion_requests, assistant_messages, conversation_projects,
             conversation_summaries, conversations, org_projects, password_reset_requests,
-            reasoning_items, responses, tool_calls, tool_outputs, user_messages,
+            reasoning_items, responses, tool_calls, tool_outputs, user_instructions, user_messages,
             user_oauth_connections, user_seed_wrappings,
         },
         user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError},
@@ -28,6 +28,7 @@ use crate::{
     },
     private_key::generate_twelve_word_seed,
     seed_wrapping::{password_reset_code_mac, CredentialKind},
+    transport_v2::stored_resources::{self, InstructionUpdateCiphertext, StoredResourceError},
     AppMode, AppState, AppStateBuilder, Error,
 };
 use chrono::Utc;
@@ -1263,6 +1264,387 @@ async fn db_conversation_project_uuid_delete_is_owner_scoped_and_cascades() {
 
     let _ = app_state.db.delete_user(&owner);
     let _ = app_state.db.delete_user(&attacker);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_v2_project_and_instruction_reads_are_bounded_scoped_and_sentinel_safe() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let org_project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let owner =
+        create_response_transaction_test_user(&app_state, org_project.id, marker, "bounded-owner");
+    let other =
+        create_response_transaction_test_user(&app_state, org_project.id, marker, "bounded-other");
+
+    let safe_project = app_state
+        .db
+        .create_conversation_project(NewConversationProject {
+            uuid: Uuid::new_v4(),
+            user_id: owner.uuid,
+            name_enc: vec![0x11; 32],
+        })
+        .expect("safe project should insert");
+    app_state
+        .db
+        .create_user_instruction(NewUserInstruction {
+            uuid: Uuid::new_v4(),
+            user_id: owner.uuid,
+            project_id: Some(safe_project.id),
+            name_enc: None,
+            prompt_enc: vec![0x22; 33],
+            prompt_tokens: 1,
+            is_default: false,
+        })
+        .expect("safe project instruction should insert");
+    app_state
+        .db
+        .create_conversation_project(NewConversationProject {
+            uuid: Uuid::new_v4(),
+            user_id: owner.uuid,
+            name_enc: vec![0x33; 1024 * 1024],
+        })
+        .expect("oversized sentinel project should insert");
+
+    let project =
+        stored_resources::get_project(app_state.db.get_pool(), owner.uuid, safe_project.uuid, 9)
+            .expect("project should fit the exact aggregate plaintext limit");
+    assert_eq!(project.project.uuid, safe_project.uuid);
+    assert_eq!(project.prompt_enc.as_ref().map(Vec::len), Some(33));
+    assert!(matches!(
+        stored_resources::get_project(app_state.db.get_pool(), owner.uuid, safe_project.uuid, 8,),
+        Err(StoredResourceError::OutputTooLarge)
+    ));
+    assert!(matches!(
+        stored_resources::get_project(
+            app_state.db.get_pool(),
+            other.uuid,
+            safe_project.uuid,
+            usize::MAX,
+        ),
+        Err(StoredResourceError::ConversationProjectNotFound)
+    ));
+    let (project_page, project_has_more) =
+        stored_resources::list_projects(app_state.db.get_pool(), owner.uuid, 1, None, "asc", 4)
+            .expect("oversized lookahead project must not reject the safe returned page");
+    assert!(project_has_more);
+    assert_eq!(project_page.len(), 1);
+    assert_eq!(project_page[0].uuid, safe_project.uuid);
+
+    let safe_instruction = app_state
+        .db
+        .create_user_instruction(NewUserInstruction {
+            uuid: Uuid::new_v4(),
+            user_id: owner.uuid,
+            project_id: None,
+            name_enc: Some(vec![0x44; 32]),
+            prompt_enc: vec![0x55; 33],
+            prompt_tokens: 1,
+            is_default: false,
+        })
+        .expect("safe global instruction should insert");
+    let oversized_instruction = app_state
+        .db
+        .create_user_instruction(NewUserInstruction {
+            uuid: Uuid::new_v4(),
+            user_id: owner.uuid,
+            project_id: None,
+            name_enc: Some(vec![0x66; 1024 * 1024]),
+            prompt_enc: vec![0x77; 1024 * 1024],
+            prompt_tokens: 1,
+            is_default: false,
+        })
+        .expect("oversized sentinel instruction should insert");
+
+    let instruction = stored_resources::get_instruction(
+        app_state.db.get_pool(),
+        owner.uuid,
+        safe_instruction.uuid,
+        9,
+    )
+    .expect("instruction should fit the exact aggregate plaintext limit");
+    assert_eq!(instruction.uuid, safe_instruction.uuid);
+    assert!(matches!(
+        stored_resources::get_instruction(
+            app_state.db.get_pool(),
+            other.uuid,
+            safe_instruction.uuid,
+            usize::MAX,
+        ),
+        Err(StoredResourceError::InstructionNotFound)
+    ));
+    let (instruction_page, instruction_has_more) =
+        stored_resources::list_instructions(app_state.db.get_pool(), owner.uuid, 1, None, "asc", 9)
+            .expect("oversized lookahead instruction must not reject the safe returned page");
+    assert!(instruction_has_more);
+    assert_eq!(instruction_page.len(), 1);
+    assert_eq!(instruction_page[0].uuid, safe_instruction.uuid);
+
+    assert!(matches!(
+        stored_resources::delete_instruction(
+            app_state.db.get_pool(),
+            other.uuid,
+            oversized_instruction.uuid,
+        ),
+        Err(StoredResourceError::InstructionNotFound)
+    ));
+    assert_eq!(
+        stored_resources::delete_instruction(
+            app_state.db.get_pool(),
+            owner.uuid,
+            oversized_instruction.uuid,
+        )
+        .expect("owner narrow deletion should succeed"),
+        oversized_instruction.uuid
+    );
+    let remaining = user_instructions::table
+        .filter(user_instructions::uuid.eq(oversized_instruction.uuid))
+        .count()
+        .get_result::<i64>(
+            &mut app_state
+                .db
+                .get_pool()
+                .get()
+                .expect("verification connection should open"),
+        )
+        .expect("instruction deletion should be queryable");
+    assert_eq!(remaining, 0);
+
+    let _ = app_state.db.delete_user(&owner);
+    let _ = app_state.db.delete_user(&other);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_v2_project_and_instruction_mutations_are_atomic_and_reject_stale_state() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let org_project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let owner =
+        create_response_transaction_test_user(&app_state, org_project.id, marker, "mutation-owner");
+
+    let project = app_state
+        .db
+        .create_conversation_project(NewConversationProject {
+            uuid: Uuid::new_v4(),
+            user_id: owner.uuid,
+            name_enc: vec![0x11; 32],
+        })
+        .expect("project should insert");
+    app_state
+        .db
+        .create_user_instruction(NewUserInstruction {
+            uuid: Uuid::new_v4(),
+            user_id: owner.uuid,
+            project_id: Some(project.id),
+            name_enc: None,
+            prompt_enc: vec![0x22; 33],
+            prompt_tokens: 1,
+            is_default: false,
+        })
+        .expect("project instruction should insert");
+
+    let updated_project = stored_resources::update_project(
+        app_state.db.get_pool(),
+        owner.uuid,
+        project.uuid,
+        project.updated_at,
+        Some(vec![0x31; 34]),
+        ProjectInstructionUpdate::Set {
+            prompt_enc: vec![0x32; 35],
+            prompt_tokens: 2,
+        },
+    )
+    .expect("current project snapshot should update atomically");
+    assert_eq!(updated_project.uuid, project.uuid);
+
+    let stored_project = stored_resources::get_project(
+        app_state.db.get_pool(),
+        owner.uuid,
+        project.uuid,
+        usize::MAX,
+    )
+    .expect("updated project should remain readable");
+    assert_eq!(stored_project.project.name_enc, vec![0x31; 34]);
+    assert_eq!(stored_project.prompt_enc, Some(vec![0x32; 35]));
+
+    assert!(matches!(
+        stored_resources::update_project(
+            app_state.db.get_pool(),
+            owner.uuid,
+            project.uuid,
+            project.updated_at - chrono::Duration::seconds(1),
+            Some(vec![0x41; 36]),
+            ProjectInstructionUpdate::Set {
+                prompt_enc: vec![0x42; 37],
+                prompt_tokens: 3,
+            },
+        ),
+        Err(StoredResourceError::StaleResource)
+    ));
+    let unchanged_project = stored_resources::get_project(
+        app_state.db.get_pool(),
+        owner.uuid,
+        project.uuid,
+        usize::MAX,
+    )
+    .expect("stale project update must leave both rows unchanged");
+    assert_eq!(unchanged_project.project.name_enc, vec![0x31; 34]);
+    assert_eq!(unchanged_project.prompt_enc, Some(vec![0x32; 35]));
+
+    let first_instruction = app_state
+        .db
+        .create_user_instruction(NewUserInstruction {
+            uuid: Uuid::new_v4(),
+            user_id: owner.uuid,
+            project_id: None,
+            name_enc: Some(vec![0x51; 32]),
+            prompt_enc: vec![0x52; 33],
+            prompt_tokens: 4,
+            is_default: true,
+        })
+        .expect("first general instruction should insert");
+    let second_instruction = app_state
+        .db
+        .create_user_instruction(NewUserInstruction {
+            uuid: Uuid::new_v4(),
+            user_id: owner.uuid,
+            project_id: None,
+            name_enc: Some(vec![0x61; 32]),
+            prompt_enc: vec![0x62; 33],
+            prompt_tokens: 5,
+            is_default: false,
+        })
+        .expect("second general instruction should insert");
+
+    let updated_instruction = stored_resources::update_instruction(
+        app_state.db.get_pool(),
+        owner.uuid,
+        second_instruction.uuid,
+        second_instruction.updated_at,
+        InstructionUpdateCiphertext {
+            name_enc: vec![0x71; 34],
+            prompt_enc: vec![0x72; 35],
+            prompt_tokens: 6,
+            is_default: true,
+        },
+    )
+    .expect("current instruction snapshot should update and become default atomically");
+    assert!(updated_instruction.is_default);
+
+    let mut conn = app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("verification connection should open");
+    let instruction_state = user_instructions::table
+        .filter(user_instructions::uuid.eq_any([first_instruction.uuid, second_instruction.uuid]))
+        .select((
+            user_instructions::uuid,
+            user_instructions::name_enc,
+            user_instructions::prompt_enc,
+            user_instructions::prompt_tokens,
+            user_instructions::is_default,
+        ))
+        .load::<(Uuid, Option<Vec<u8>>, Vec<u8>, i32, bool)>(&mut conn)
+        .expect("instruction mutation should be queryable");
+    let first_state = instruction_state
+        .iter()
+        .find(|row| row.0 == first_instruction.uuid)
+        .expect("first instruction should remain");
+    let second_state = instruction_state
+        .iter()
+        .find(|row| row.0 == second_instruction.uuid)
+        .expect("second instruction should remain");
+    assert!(!first_state.4);
+    assert_eq!(second_state.1, Some(vec![0x71; 34]));
+    assert_eq!(second_state.2, vec![0x72; 35]);
+    assert_eq!(second_state.3, 6);
+    assert!(second_state.4);
+
+    assert!(matches!(
+        stored_resources::update_instruction(
+            app_state.db.get_pool(),
+            owner.uuid,
+            second_instruction.uuid,
+            second_instruction.updated_at - chrono::Duration::seconds(1),
+            InstructionUpdateCiphertext {
+                name_enc: vec![0x81; 36],
+                prompt_enc: vec![0x82; 37],
+                prompt_tokens: 7,
+                is_default: false,
+            },
+        ),
+        Err(StoredResourceError::StaleResource)
+    ));
+    let second_after_stale = stored_resources::get_instruction(
+        app_state.db.get_pool(),
+        owner.uuid,
+        second_instruction.uuid,
+        usize::MAX,
+    )
+    .expect("stale instruction update must leave the row unchanged");
+    assert_eq!(second_after_stale.name_enc, Some(vec![0x71; 34]));
+    assert_eq!(second_after_stale.prompt_enc, vec![0x72; 35]);
+    assert_eq!(second_after_stale.prompt_tokens, 6);
+    assert!(second_after_stale.is_default);
+
+    let first_after_clear = stored_resources::get_instruction(
+        app_state.db.get_pool(),
+        owner.uuid,
+        first_instruction.uuid,
+        usize::MAX,
+    )
+    .expect("cleared default instruction should remain readable");
+    let first_default = stored_resources::set_default_instruction(
+        app_state.db.get_pool(),
+        owner.uuid,
+        first_instruction.uuid,
+        first_after_clear.updated_at,
+    )
+    .expect("current instruction snapshot should become default atomically");
+    assert!(first_default.is_default);
+
+    assert!(matches!(
+        stored_resources::set_default_instruction(
+            app_state.db.get_pool(),
+            owner.uuid,
+            second_instruction.uuid,
+            second_instruction.updated_at - chrono::Duration::seconds(1),
+        ),
+        Err(StoredResourceError::StaleResource)
+    ));
+    let default_state = user_instructions::table
+        .filter(user_instructions::uuid.eq_any([first_instruction.uuid, second_instruction.uuid]))
+        .select((user_instructions::uuid, user_instructions::is_default))
+        .load::<(Uuid, bool)>(&mut conn)
+        .expect("default state should be queryable");
+    assert_eq!(
+        default_state
+            .iter()
+            .find(|row| row.0 == first_instruction.uuid)
+            .map(|row| row.1),
+        Some(true)
+    );
+    assert_eq!(
+        default_state
+            .iter()
+            .find(|row| row.0 == second_instruction.uuid)
+            .map(|row| row.1),
+        Some(false)
+    );
+
+    let _ = app_state.db.delete_user(&owner);
 }
 
 #[tokio::test]

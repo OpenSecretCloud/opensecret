@@ -32,6 +32,7 @@ use std::sync::Arc;
 use tracing::warn;
 use tracing::{debug, error, trace};
 use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 // ============================================================================
 // Context Helper
@@ -116,7 +117,7 @@ impl InstructionContext {
 // ============================================================================
 
 /// Request to create a new user instruction
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct CreateInstructionRequest {
     /// Name of the instruction
     pub name: String,
@@ -126,11 +127,12 @@ pub struct CreateInstructionRequest {
 
     /// Whether this should be the default instruction
     #[serde(default)]
+    #[zeroize(skip)]
     pub is_default: bool,
 }
 
 /// Request to update a user instruction
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct UpdateInstructionRequest {
     /// Updated name (optional)
     pub name: Option<String>,
@@ -139,16 +141,19 @@ pub struct UpdateInstructionRequest {
     pub prompt: Option<String>,
 
     /// Whether this should be the default instruction (optional)
+    #[zeroize(skip)]
     pub is_default: Option<bool>,
 }
 
 /// Response for a user instruction object
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct InstructionResponse {
     /// Instruction ID
+    #[zeroize(skip)]
     pub id: Uuid,
 
     /// Object type (always "instruction")
+    #[zeroize(skip)]
     pub object: &'static str,
 
     /// Name of the instruction
@@ -158,25 +163,33 @@ pub struct InstructionResponse {
     pub prompt: String,
 
     /// Token count for the prompt
+    #[zeroize(skip)]
     pub prompt_tokens: i32,
 
     /// Whether this is the default instruction
+    #[zeroize(skip)]
     pub is_default: bool,
 
     /// Unix timestamp when created
+    #[zeroize(skip)]
     pub created_at: i64,
 
     /// Unix timestamp when last updated
+    #[zeroize(skip)]
     pub updated_at: i64,
 }
 
 /// Response for listing user instructions
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct InstructionListResponse {
+    #[zeroize(skip)]
     pub object: &'static str,
     pub data: Vec<InstructionResponse>,
+    #[zeroize(skip)]
     pub has_more: bool,
+    #[zeroize(skip)]
     pub first_id: Option<Uuid>,
+    #[zeroize(skip)]
     pub last_id: Option<Uuid>,
 }
 
@@ -252,29 +265,52 @@ async fn create_instruction(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(body): Extension<CreateInstructionRequest>,
+    Extension(mut body): Extension<CreateInstructionRequest>,
 ) -> Result<Json<EncryptedResponse<InstructionResponse>>, ApiError> {
     debug!("Creating new instruction for user: {}", user.uuid);
+    validate_instruction_content(&body.name, &body.prompt)?;
+    let name = Zeroizing::new(std::mem::take(&mut body.name));
+    let prompt = Zeroizing::new(std::mem::take(&mut body.prompt));
+    let response = create_instruction_with_content_data(
+        &state,
+        &user,
+        &auth_context,
+        name,
+        prompt,
+        body.is_default,
+    )
+    .await?;
+    encrypt_response(&state, &session_id, &response).await
+}
 
-    // Validate input
-    if body.name.trim().is_empty() {
+pub(crate) fn validate_instruction_content(name: &str, prompt: &str) -> Result<(), ApiError> {
+    if name.trim().is_empty() {
         error!("Empty instruction name provided");
         return Err(ApiError::BadRequest);
     }
-
-    if body.prompt.trim().is_empty() {
+    if prompt.trim().is_empty() {
         error!("Empty instruction prompt provided");
         return Err(ApiError::BadRequest);
     }
+    Ok(())
+}
 
+pub(crate) async fn create_instruction_with_content_data(
+    state: &AppState,
+    user: &User,
+    auth_context: &AuthContext,
+    mut name: Zeroizing<String>,
+    mut prompt: Zeroizing<String>,
+    is_default: bool,
+) -> Result<InstructionResponse, ApiError> {
     // Get user's encryption key
     let user_key = state
-        .get_user_key(&user, &auth_context, None, None)
+        .get_user_key(user, auth_context, None, None)
         .await
         .map_err(|_| error_mapping::map_key_retrieval_error())?;
 
     // Count tokens for the prompt
-    let token_count = count_tokens(&body.prompt);
+    let token_count = count_tokens(&prompt);
     let prompt_tokens = if token_count > i32::MAX as usize {
         warn!(
             "Prompt token count {} exceeds i32::MAX, clamping to i32::MAX",
@@ -286,8 +322,8 @@ async fn create_instruction(
     };
 
     // Encrypt name and prompt
-    let name_enc = encrypt_with_key(&user_key, body.name.as_bytes()).await;
-    let prompt_enc = encrypt_with_key(&user_key, body.prompt.as_bytes()).await;
+    let name_enc = encrypt_with_key(&user_key, name.as_bytes()).await;
+    let prompt_enc = encrypt_with_key(&user_key, prompt.as_bytes()).await;
 
     let new_instruction = NewUserInstruction {
         uuid: Uuid::new_v4(),
@@ -296,7 +332,7 @@ async fn create_instruction(
         name_enc: Some(name_enc),
         prompt_enc,
         prompt_tokens,
-        is_default: body.is_default,
+        is_default,
     };
 
     trace!("Creating instruction with: {:?}", new_instruction);
@@ -308,12 +344,16 @@ async fn create_instruction(
 
     trace!("Created instruction: {:?}", instruction);
 
-    let response = InstructionResponseBuilder::new(instruction)
-        .name(body.name.clone())
-        .prompt(body.prompt.clone())
-        .build();
-
-    encrypt_response(&state, &session_id, &response).await
+    Ok(InstructionResponse {
+        id: instruction.uuid,
+        object: "instruction",
+        name: std::mem::take(&mut *name),
+        prompt: std::mem::take(&mut *prompt),
+        prompt_tokens: instruction.prompt_tokens,
+        is_default: instruction.is_default,
+        created_at: instruction.created_at.timestamp(),
+        updated_at: instruction.updated_at.timestamp(),
+    })
 }
 
 /// GET /v1/instructions/{id} - Retrieve a single user instruction

@@ -374,6 +374,13 @@ const KV_ITEM_PATH_PREFIX: &str = "/protected/kv/";
 const API_KEY_ITEM_PATH_PREFIX: &str = "/protected/api-keys/";
 const VERIFY_EMAIL_PATH_PREFIX: &str = "/verify-email/";
 const CONVERSATION_PROJECT_ITEM_PATH_PREFIX: &str = "/v1/conversation-projects/";
+const INSTRUCTION_ITEM_PATH_PREFIX: &str = "/v1/instructions/";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum InstructionItemPath {
+    Item(Uuid),
+    SetDefault(Uuid),
+}
 
 fn validate_logical_path(
     method: LogicalMethod,
@@ -391,6 +398,9 @@ fn validate_logical_path(
         return Ok(());
     }
     if decode_canonical_conversation_project_path(method, path)?.is_some() {
+        return Ok(());
+    }
+    if decode_canonical_instruction_path(method, path)?.is_some() {
         return Ok(());
     }
     validate_path(path, limits)
@@ -502,6 +512,47 @@ pub(crate) fn decode_canonical_conversation_project_path(
         ));
     }
     Ok(Some(project_id))
+}
+
+/// Decodes canonical general-instruction item and set-default paths.
+///
+/// The fixed `/set-default` suffix is recognized before the ordinary item
+/// form, preventing the action route from being confused with an alternate
+/// UUID spelling. Project-linked instructions remain outside this route
+/// family and are filtered by the owner-scoped storage projection.
+pub(crate) fn decode_canonical_instruction_path(
+    method: LogicalMethod,
+    path: &str,
+) -> Result<Option<InstructionItemPath>, EnvelopeError> {
+    let Some(segment) = path.strip_prefix(INSTRUCTION_ITEM_PATH_PREFIX) else {
+        return Ok(None);
+    };
+    let (segment, set_default) = if let Some(segment) = segment.strip_suffix("/set-default") {
+        if method != LogicalMethod::Post {
+            return Ok(None);
+        }
+        (segment, true)
+    } else {
+        if !matches!(
+            method,
+            LogicalMethod::Get | LogicalMethod::Post | LogicalMethod::Delete
+        ) {
+            return Ok(None);
+        }
+        (segment, false)
+    };
+    let instruction_id = Uuid::parse_str(segment)
+        .map_err(|_| EnvelopeError::InvalidPath("instruction ID must be a canonical UUID"))?;
+    if instruction_id.hyphenated().to_string() != segment {
+        return Err(EnvelopeError::InvalidPath(
+            "instruction ID must use lowercase hyphenated UUID spelling",
+        ));
+    }
+    Ok(Some(if set_default {
+        InstructionItemPath::SetDefault(instruction_id)
+    } else {
+        InstructionItemPath::Item(instruction_id)
+    }))
 }
 
 fn decode_canonical_opaque_segment(segment: &str) -> Result<Zeroizing<String>, EnvelopeError> {
@@ -1355,6 +1406,60 @@ mod tests {
                     "{method:?} {invalid}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn instruction_item_and_set_default_paths_are_canonical_and_distinct() {
+        let encoded = "123e4567-e89b-12d3-a456-426614174000";
+        let id = Uuid::parse_str(encoded).unwrap();
+        let item = format!("{INSTRUCTION_ITEM_PATH_PREFIX}{encoded}");
+        for method in [
+            LogicalMethod::Get,
+            LogicalMethod::Post,
+            LogicalMethod::Delete,
+        ] {
+            assert_eq!(
+                decode_canonical_instruction_path(method, &item).unwrap(),
+                Some(InstructionItemPath::Item(id))
+            );
+            validate_logical_path(method, &item, &EnvelopeLimits::default()).unwrap();
+        }
+
+        let set_default = format!("{item}/set-default");
+        assert_eq!(
+            decode_canonical_instruction_path(LogicalMethod::Post, &set_default).unwrap(),
+            Some(InstructionItemPath::SetDefault(id))
+        );
+        validate_logical_path(
+            LogicalMethod::Post,
+            &set_default,
+            &EnvelopeLimits::default(),
+        )
+        .unwrap();
+        assert!(
+            decode_canonical_instruction_path(LogicalMethod::Get, &set_default)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn instruction_paths_reject_uuid_aliases_and_suffix_ambiguity() {
+        for invalid in [
+            "/v1/instructions/",
+            "/v1/instructions/123E4567-E89B-12D3-A456-426614174000",
+            "/v1/instructions/123e4567e89b12d3a456426614174000",
+            "/v1/instructions/{123e4567-e89b-12d3-a456-426614174000}",
+            "/v1/instructions/123e4567-e89b-12d3-a456-426614174000/extra",
+            "/v1/instructions/123e4567-e89b-12d3-a456-426614174000/set-default/extra",
+            "/v1/instructions/not-a-uuid",
+        ] {
+            assert!(
+                validate_logical_path(LogicalMethod::Post, invalid, &EnvelopeLimits::default())
+                    .is_err(),
+                "{invalid}"
+            );
         }
     }
 

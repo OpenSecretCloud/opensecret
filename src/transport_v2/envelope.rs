@@ -2,6 +2,7 @@ use std::fmt;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const MIB: usize = 1024 * 1024;
@@ -371,6 +372,7 @@ impl LogicalRequest {
 
 const KV_ITEM_PATH_PREFIX: &str = "/protected/kv/";
 const API_KEY_ITEM_PATH_PREFIX: &str = "/protected/api-keys/";
+const VERIFY_EMAIL_PATH_PREFIX: &str = "/verify-email/";
 
 fn validate_logical_path(
     method: LogicalMethod,
@@ -382,6 +384,9 @@ fn validate_logical_path(
         return Ok(());
     }
     if decode_canonical_api_key_name_path(method, path)?.is_some() {
+        return Ok(());
+    }
+    if decode_canonical_verify_email_path(method, path)?.is_some() {
         return Ok(());
     }
     validate_path(path, limits)
@@ -438,6 +443,32 @@ pub(crate) fn decode_canonical_api_key_name_path(
         ));
     }
     Ok(Some(decoded))
+}
+
+/// Decodes the one canonical UUID credential admitted by email verification.
+///
+/// Axum's v1 `Path<Uuid>` parser remains untouched. Transport v2 deliberately
+/// accepts only the lowercase hyphenated UUID spelling so one verification
+/// action has one authenticated logical path.
+pub(crate) fn decode_canonical_verify_email_path(
+    method: LogicalMethod,
+    path: &str,
+) -> Result<Option<Uuid>, EnvelopeError> {
+    if method != LogicalMethod::Get {
+        return Ok(None);
+    }
+    let Some(segment) = path.strip_prefix(VERIFY_EMAIL_PATH_PREFIX) else {
+        return Ok(None);
+    };
+    let code = Uuid::parse_str(segment).map_err(|_| {
+        EnvelopeError::InvalidPath("email verification code must be a canonical UUID")
+    })?;
+    if code.hyphenated().to_string() != segment {
+        return Err(EnvelopeError::InvalidPath(
+            "email verification code must use lowercase hyphenated UUID spelling",
+        ));
+    }
+    Ok(Some(code))
 }
 
 fn decode_canonical_opaque_segment(segment: &str) -> Result<Zeroizing<String>, EnvelopeError> {
@@ -1192,6 +1223,49 @@ mod tests {
         ] {
             assert!(
                 validate_logical_path(LogicalMethod::Delete, invalid, &EnvelopeLimits::default())
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn email_verification_path_uses_one_canonical_uuid_spelling() {
+        let encoded = "123e4567-e89b-12d3-a456-426614174000";
+        let path = format!("{VERIFY_EMAIL_PATH_PREFIX}{encoded}");
+        assert_eq!(
+            decode_canonical_verify_email_path(LogicalMethod::Get, &path).unwrap(),
+            Some(Uuid::parse_str(encoded).unwrap())
+        );
+        validate_logical_path(LogicalMethod::Get, &path, &EnvelopeLimits::default()).unwrap();
+
+        assert!(
+            decode_canonical_verify_email_path(LogicalMethod::Post, &path)
+                .unwrap()
+                .is_none()
+        );
+        assert!(decode_canonical_verify_email_path(
+            LogicalMethod::Get,
+            "/verify-emails/123e4567-e89b-12d3-a456-426614174000",
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn email_verification_path_rejects_uuid_aliases_and_malformed_codes() {
+        for invalid in [
+            "/verify-email/",
+            "/verify-email/123E4567-E89B-12D3-A456-426614174000",
+            "/verify-email/123e4567e89b12d3a456426614174000",
+            "/verify-email/{123e4567-e89b-12d3-a456-426614174000}",
+            "/verify-email/urn:uuid:123e4567-e89b-12d3-a456-426614174000",
+            "/verify-email/123e4567%2De89b%2D12d3%2Da456%2D426614174000",
+            "/verify-email/123e4567-e89b-12d3-a456-426614174000/extra",
+            "/verify-email/not-a-uuid",
+        ] {
+            assert!(
+                validate_logical_path(LogicalMethod::Get, invalid, &EnvelopeLimits::default())
                     .is_err(),
                 "{invalid}"
             );

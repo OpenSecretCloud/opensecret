@@ -401,6 +401,14 @@ pub async fn verify_email(
     Path(code): Path<Uuid>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    let response = verify_email_data(&data, code)?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) fn verify_email_data(
+    data: &AppState,
+    code: Uuid,
+) -> Result<serde_json::Value, ApiError> {
     let verification = match data.db.get_email_verification_by_code(code) {
         Ok(v) => v,
         Err(DBError::EmailVerificationNotFound) => return Err(ApiError::BadRequest),
@@ -412,10 +420,9 @@ pub async fn verify_email(
     }
 
     if verification.is_verified {
-        let response = json!({
+        return Ok(json!({
             "message": "Email already verified"
-        });
-        return encrypt_response(&data, &session_id, &response).await;
+        }));
     }
 
     let mut verification = verification;
@@ -423,11 +430,9 @@ pub async fn verify_email(
         return Err(ApiError::InternalServerError);
     }
 
-    let response = json!({
+    Ok(json!({
         "message": "Email verified successfully"
-    });
-    let result = encrypt_response(&data, &session_id, &response).await;
-    result
+    }))
 }
 
 pub async fn password_reset_request(

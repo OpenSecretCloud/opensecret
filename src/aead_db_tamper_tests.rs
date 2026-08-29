@@ -4,6 +4,7 @@ use crate::{
     generate_reset_hash,
     login_routes::RegisterCredentials,
     models::{
+        email_verification::NewEmailVerification,
         oauth::NewUserOAuthConnection,
         org_projects::OrgProject,
         password_reset::NewPasswordResetRequest,
@@ -658,6 +659,91 @@ async fn db_bounded_api_key_list_preserves_metadata_and_enforces_limits() {
 
     let _ = app_state.db.delete_user(&owner);
     let _ = app_state.db.delete_user(&other);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_email_verification_preserves_success_idempotency_and_expiry_contracts() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let user = create_password_wrapped_user(
+        &app_state,
+        project.id,
+        format!("aead-email-verification-{marker}@example.com"),
+        test_credential("email-verification"),
+    )
+    .await;
+
+    let verification = app_state
+        .db
+        .create_email_verification(NewEmailVerification::new(user.uuid, 24, false))
+        .expect("unverified email code should insert");
+    let first =
+        crate::web::login_routes::verify_email_data(&app_state, verification.verification_code)
+            .expect("fresh email code should verify");
+    assert_eq!(
+        first,
+        serde_json::json!({ "message": "Email verified successfully" })
+    );
+    assert!(
+        app_state
+            .db
+            .get_email_verification_by_code(verification.verification_code)
+            .expect("verified email row should remain readable")
+            .is_verified
+    );
+
+    let repeated =
+        crate::web::login_routes::verify_email_data(&app_state, verification.verification_code)
+            .expect("verified code should be application-idempotent");
+    assert_eq!(
+        repeated,
+        serde_json::json!({ "message": "Email already verified" })
+    );
+
+    let expired = app_state
+        .db
+        .create_email_verification(NewEmailVerification::new(user.uuid, -1, false))
+        .expect("expired email code should insert for the contract test");
+    assert!(matches!(
+        crate::web::login_routes::verify_email_data(&app_state, expired.verification_code),
+        Err(crate::ApiError::BadRequest)
+    ));
+    assert!(
+        !app_state
+            .db
+            .get_email_verification_by_code(expired.verification_code)
+            .expect("expired email row should remain readable")
+            .is_verified
+    );
+
+    let expired_verified = app_state
+        .db
+        .create_email_verification(NewEmailVerification::new(user.uuid, -1, true))
+        .expect("expired verified email code should insert for the contract test");
+    assert!(matches!(
+        crate::web::login_routes::verify_email_data(&app_state, expired_verified.verification_code,),
+        Err(crate::ApiError::BadRequest)
+    ));
+    assert!(
+        app_state
+            .db
+            .get_email_verification_by_code(expired_verified.verification_code)
+            .expect("expired verified email row should remain readable")
+            .is_verified
+    );
+    assert!(matches!(
+        crate::web::login_routes::verify_email_data(&app_state, Uuid::new_v4()),
+        Err(crate::ApiError::BadRequest)
+    ));
+
+    let _ = app_state.db.delete_user(&user);
 }
 
 #[tokio::test]

@@ -5,6 +5,8 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use crate::provider_cache::CacheNamespaceRoot;
+
 const MIB: usize = 1024 * 1024;
 const KIB: usize = 1024;
 
@@ -328,6 +330,8 @@ pub(crate) struct RequestEnvelope {
     pub(crate) response_mode: ResponseMode,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) credential: Option<Credential>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
+    pub(crate) cache_namespace_root_base64: Option<CacheNamespaceRoot>,
     pub(crate) request: LogicalRequest,
 }
 
@@ -1100,6 +1104,7 @@ mod tests {
         fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
 
         assert_zeroize_on_drop::<EncodedBytes>();
+        assert_zeroize_on_drop::<CacheNamespaceRoot>();
     }
 
     fn request_json(body: &str) -> String {
@@ -1109,6 +1114,7 @@ mod tests {
                 "request_id":"{REQUEST_ID}",
                 "response_mode":"auto",
                 "credential":null,
+                "cache_namespace_root_base64":null,
                 "request":{{
                     "method":"POST",
                     "path":"/v1/responses",
@@ -1189,6 +1195,49 @@ mod tests {
             &EnvelopeLimits::default()
         )
         .is_err());
+
+        let missing_cache_namespace_root =
+            request_json("null").replace("\"cache_namespace_root_base64\":null,", "");
+        assert!(RequestEnvelope::from_json_slice(
+            missing_cache_namespace_root.as_bytes(),
+            &EnvelopeLimits::default()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn cache_namespace_root_requires_canonical_padded_base64_for_exactly_32_bytes() {
+        let encoded_root = STANDARD.encode([0x5a; 32]);
+        let with_root = request_json("null").replace(
+            "\"cache_namespace_root_base64\":null",
+            &format!("\"cache_namespace_root_base64\":\"{encoded_root}\""),
+        );
+        let parsed =
+            RequestEnvelope::from_json_slice(with_root.as_bytes(), &EnvelopeLimits::default())
+                .expect("canonical 32-byte cache namespace root");
+        assert_eq!(
+            serde_json::to_value(parsed.cache_namespace_root_base64.as_ref().unwrap()).unwrap(),
+            serde_json::Value::String(encoded_root.clone())
+        );
+
+        for invalid_root in [
+            STANDARD.encode([0x5a; 31]),
+            STANDARD.encode([0x5a; 33]),
+            encoded_root.trim_end_matches('=').to_string(),
+            format!("{}A", encoded_root.trim_end_matches('=')),
+            format!("{}p=", &encoded_root[..42]),
+            "___________________________________________=".to_string(),
+        ] {
+            let invalid = request_json("null").replace(
+                "\"cache_namespace_root_base64\":null",
+                &format!("\"cache_namespace_root_base64\":\"{invalid_root}\""),
+            );
+            assert!(
+                RequestEnvelope::from_json_slice(invalid.as_bytes(), &EnvelopeLimits::default(),)
+                    .is_err(),
+                "accepted invalid cache namespace root: {invalid_root}"
+            );
+        }
     }
 
     #[test]

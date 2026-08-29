@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::jwt::AuthContext;
+use crate::provider_cache::DerivedCacheNamespace;
 use crate::VerifiedUserAuthentication;
 
 use super::crypto::{CryptoError, DirectionalKeys};
@@ -203,6 +204,7 @@ pub(crate) enum BoundPrincipal {
         user_id: Uuid,
         project_id: i32,
         auth_context: AuthContext,
+        cache_namespace: DerivedCacheNamespace,
     },
     Platform {
         platform_user_id: Uuid,
@@ -210,6 +212,7 @@ pub(crate) enum BoundPrincipal {
     ApiKey {
         api_key_id: i32,
         user_id: Uuid,
+        cache_namespace: DerivedCacheNamespace,
     },
 }
 
@@ -219,7 +222,9 @@ pub(crate) enum BoundPrincipal {
 /// accepted at binding so later requests can revalidate that same authority
 /// against live application state. API keys have no independent token expiry,
 /// so their authority remains bounded by the session's absolute expiry and
-/// live database checks.
+/// live database checks. Both retain only the provider cache namespace derived
+/// from the client root and verified owner UUID; the root itself is not session
+/// state.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct BoundAuthority {
     principal: BoundPrincipal,
@@ -230,12 +235,14 @@ impl BoundAuthority {
     pub(crate) fn verified_user(
         verified: &VerifiedUserAuthentication,
         authentication_expires_at: Instant,
+        cache_namespace: DerivedCacheNamespace,
     ) -> Self {
         Self {
             principal: BoundPrincipal::User {
                 user_id: verified.user.get_id(),
                 project_id: verified.user.project_id,
                 auth_context: verified.auth_context.clone(),
+                cache_namespace,
             },
             authentication_expires_at: Some(authentication_expires_at),
         }
@@ -247,12 +254,14 @@ impl BoundAuthority {
         project_id: i32,
         auth_context: &AuthContext,
         authentication_expires_at: Instant,
+        cache_namespace: DerivedCacheNamespace,
     ) -> Self {
         Self {
             principal: BoundPrincipal::User {
                 user_id,
                 project_id,
                 auth_context: auth_context.clone(),
+                cache_namespace,
             },
             authentication_expires_at: Some(authentication_expires_at),
         }
@@ -268,11 +277,16 @@ impl BoundAuthority {
         }
     }
 
-    pub(crate) const fn api_key(api_key_id: i32, user_id: Uuid) -> Self {
+    pub(crate) fn api_key(
+        api_key_id: i32,
+        user_id: Uuid,
+        cache_namespace: DerivedCacheNamespace,
+    ) -> Self {
         Self {
             principal: BoundPrincipal::ApiKey {
                 api_key_id,
                 user_id,
+                cache_namespace,
             },
             authentication_expires_at: None,
         }
@@ -284,6 +298,18 @@ impl BoundAuthority {
 
     pub(crate) const fn authentication_expires_at(&self) -> Option<Instant> {
         self.authentication_expires_at
+    }
+
+    pub(crate) fn cache_namespace(&self) -> Option<&DerivedCacheNamespace> {
+        match &self.principal {
+            BoundPrincipal::User {
+                cache_namespace, ..
+            }
+            | BoundPrincipal::ApiKey {
+                cache_namespace, ..
+            } => Some(cache_namespace),
+            BoundPrincipal::Platform { .. } => None,
+        }
     }
 
     fn is_expired_at(&self, now: Instant) -> bool {
@@ -964,12 +990,17 @@ mod tests {
     use std::thread;
 
     use crate::jwt::AuthMethod;
+    use crate::provider_cache::{derive_tinfoil_cache_namespace, CacheNamespaceRoot};
 
     use super::super::crypto::SessionMaster;
     use super::*;
 
     fn request_id(value: u128) -> RequestId {
         RequestId::from_bytes(value.to_be_bytes())
+    }
+
+    fn cache_namespace(user_id: Uuid) -> DerivedCacheNamespace {
+        derive_tinfoil_cache_namespace(&CacheNamespaceRoot::from_bytes([0x42; 32]), user_id)
     }
 
     fn session(
@@ -1120,7 +1151,13 @@ mod tests {
             .begin(request_id(1))
             .expect("reserve auth")
             .commit_at(
-                BoundAuthority::user(user, 17, &auth_context, now + Duration::from_secs(30)),
+                BoundAuthority::user(
+                    user,
+                    17,
+                    &auth_context,
+                    now + Duration::from_secs(30),
+                    cache_namespace(user),
+                ),
                 now,
             )
             .expect("commit auth");
@@ -1134,6 +1171,7 @@ mod tests {
                         user_id,
                         project_id,
                         auth_context: bound_auth_context,
+                        ..
                     } if *user_id == user
                         && *project_id == 17
                         && bound_auth_context == &expected_auth_context
@@ -1162,20 +1200,56 @@ mod tests {
     }
 
     #[test]
+    fn only_user_and_api_key_authorities_retain_cache_namespaces() {
+        let now = Instant::now();
+        let user_id = Uuid::new_v4();
+        let namespace = cache_namespace(user_id);
+        let expected_secret = namespace.tinfoil_user_cache_secret();
+
+        let user = BoundAuthority::user(
+            user_id,
+            7,
+            &user_auth_context(7),
+            now + Duration::from_secs(30),
+            namespace.clone(),
+        );
+        assert_eq!(
+            user.cache_namespace()
+                .expect("user cache namespace")
+                .tinfoil_user_cache_secret(),
+            expected_secret
+        );
+
+        let api_key = BoundAuthority::api_key(11, user_id, namespace);
+        assert_eq!(
+            api_key
+                .cache_namespace()
+                .expect("API-key cache namespace")
+                .tinfoil_user_cache_secret(),
+            expected_secret
+        );
+
+        let platform = BoundAuthority::platform(Uuid::new_v4(), now + Duration::from_secs(30));
+        assert!(platform.cache_namespace().is_none());
+    }
+
+    #[test]
     fn authentication_commit_only_changes_its_matching_request() {
         let authority = Arc::new(AuthorityCell::new());
         let now = Instant::now();
         let reservation = authority.begin(request_id(1)).expect("reserve auth");
         let auth_context = user_auth_context(7);
+        let user_id = Uuid::new_v4();
 
         *lock_unpoisoned(&authority.state) = AuthorityState::Authenticating(request_id(2));
         let error = reservation
             .commit_at(
                 BoundAuthority::user(
-                    Uuid::new_v4(),
+                    user_id,
                     7,
                     &auth_context,
                     now + Duration::from_secs(30),
+                    cache_namespace(user_id),
                 ),
                 now,
             )
@@ -1274,6 +1348,7 @@ mod tests {
     fn bound_authentication_expiry_is_exact_and_closes_fail_closed() {
         let now = Instant::now();
         let auth_expiry = now + Duration::from_secs(10);
+        let user_id = Uuid::new_v4();
         let state = session(
             now + Duration::from_secs(30),
             SessionLimits::new(4, 4, 4),
@@ -1284,7 +1359,13 @@ mod tests {
             .begin_authentication(request_id(1))
             .expect("reserve auth")
             .commit_at(
-                BoundAuthority::user(Uuid::new_v4(), 3, &user_auth_context(3), auth_expiry),
+                BoundAuthority::user(
+                    user_id,
+                    3,
+                    &user_auth_context(3),
+                    auth_expiry,
+                    cache_namespace(user_id),
+                ),
                 now,
             )
             .expect("bind authority");

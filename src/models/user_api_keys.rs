@@ -1,4 +1,5 @@
-use crate::models::schema::user_api_keys;
+use crate::models::schema::{user_api_keys, users};
+use crate::models::users::User;
 use chrono::{DateTime, Utc};
 use diesel::dsl::{count_star, sql};
 use diesel::prelude::*;
@@ -33,6 +34,25 @@ pub struct UserApiKey {
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// The authority resolved from a live API-key row and its current owning user.
+///
+/// This deliberately excludes the stored key hash so callers cannot retain or
+/// accidentally log authentication material after the lookup completes.
+#[derive(Clone)]
+pub struct ResolvedUserApiKey {
+    pub api_key_id: i32,
+    pub user: User,
+}
+
+impl std::fmt::Debug for ResolvedUserApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedUserApiKey")
+            .field("api_key_id", &self.api_key_id)
+            .field("user_id", &self.user.uuid)
+            .finish()
+    }
 }
 
 /// Narrow metadata projection used only by bounded transport-v2 list reads.
@@ -131,6 +151,40 @@ impl UserApiKey {
             .map_err(UserApiKeyError::DatabaseError)
     }
 
+    /// Resolve a canonical API-key hash and its current owner in one query.
+    pub fn resolve_by_key_hash(
+        conn: &mut PgConnection,
+        canonical_key_hash: &str,
+    ) -> Result<Option<ResolvedUserApiKey>, UserApiKeyError> {
+        user_api_keys::table
+            .inner_join(users::table.on(users::uuid.eq(user_api_keys::user_id)))
+            .filter(user_api_keys::key_hash.eq(canonical_key_hash))
+            .select((user_api_keys::id, users::all_columns))
+            .first::<(i32, User)>(conn)
+            .optional()
+            .map(|resolved| {
+                resolved.map(|(api_key_id, user)| ResolvedUserApiKey { api_key_id, user })
+            })
+            .map_err(UserApiKeyError::DatabaseError)
+    }
+
+    /// Revalidate that a previously bound API-key ID still belongs to the
+    /// exact user and return that current user row in one query.
+    pub fn revalidate_owner(
+        conn: &mut PgConnection,
+        lookup_api_key_id: i32,
+        lookup_user_id: Uuid,
+    ) -> Result<Option<User>, UserApiKeyError> {
+        users::table
+            .inner_join(user_api_keys::table.on(users::uuid.eq(user_api_keys::user_id)))
+            .filter(user_api_keys::id.eq(lookup_api_key_id))
+            .filter(user_api_keys::user_id.eq(lookup_user_id))
+            .select(users::all_columns)
+            .first::<User>(conn)
+            .optional()
+            .map_err(UserApiKeyError::DatabaseError)
+    }
+
     pub fn get_all_for_user(
         conn: &mut PgConnection,
         user_id: Uuid,
@@ -224,6 +278,65 @@ impl UserApiKey {
         } else {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::schema::org_projects;
+    use crate::models::users::NewUser;
+    use sha2::Digest;
+
+    #[test]
+    #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+    fn joined_resolution_and_live_owner_revalidation_fail_closed() {
+        let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+            eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let mut conn = PgConnection::establish(&database_url)
+            .expect("connect to disposable migrated PostgreSQL");
+
+        conn.test_transaction::<_, diesel::result::Error, _>(|conn| {
+            let project_id = org_projects::table
+                .select(org_projects::id)
+                .first::<i32>(conn)
+                .expect("disposable database must contain an organization project");
+            let user = NewUser::new(None, None, project_id)
+                .insert(conn)
+                .expect("insert API-key owner");
+            let key_hash = hex::encode(sha2::Sha256::digest(b"v2-api-key-storage-test"));
+            let key = NewUserApiKey::new(user.uuid, key_hash.clone(), "v2-test".to_owned())
+                .insert(conn)
+                .expect("insert API key");
+            let key_id = key.id;
+
+            let resolved = UserApiKey::resolve_by_key_hash(conn, &key_hash)
+                .expect("joined authentication lookup")
+                .expect("live key must resolve");
+            assert_eq!(resolved.api_key_id, key_id);
+            assert_eq!(resolved.user.uuid, user.uuid);
+            assert!(UserApiKey::resolve_by_key_hash(conn, "missing")
+                .unwrap()
+                .is_none());
+
+            assert_eq!(
+                UserApiKey::revalidate_owner(conn, key_id, user.uuid)
+                    .unwrap()
+                    .map(|owner| owner.uuid),
+                Some(user.uuid)
+            );
+            assert!(UserApiKey::revalidate_owner(conn, key_id, Uuid::new_v4())
+                .unwrap()
+                .is_none());
+
+            key.delete(conn).expect("delete API key");
+            assert!(UserApiKey::revalidate_owner(conn, key_id, user.uuid)
+                .unwrap()
+                .is_none());
+            Ok(())
+        });
     }
 }
 

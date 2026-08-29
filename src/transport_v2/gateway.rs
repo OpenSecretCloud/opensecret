@@ -58,6 +58,9 @@ const REQUEST_WORKING_SET_UNITS: usize =
 const STORED_OUTPUT_WORKING_SET_BYTES: usize = 200 * 1024 * 1024;
 const STORED_OUTPUT_WORKING_SET_UNITS: usize =
     STORED_OUTPUT_WORKING_SET_BYTES / REQUEST_WORKING_SET_UNIT_BYTES;
+const PROVIDER_OUTPUT_WORKING_SET_BYTES: usize = 128 * 1024 * 1024;
+const PROVIDER_OUTPUT_WORKING_SET_UNITS: usize =
+    PROVIDER_OUTPUT_WORKING_SET_BYTES / REQUEST_WORKING_SET_UNIT_BYTES;
 const SESSION_ID_HEADER: &str = "x-session-id";
 
 type PendingAttestationKey = [u8; 32];
@@ -340,7 +343,22 @@ impl TransportV2State {
         &self,
         permit: &mut OwnedSemaphorePermit,
     ) -> Result<(), GatewayError> {
-        let additional_units = STORED_OUTPUT_WORKING_SET_UNITS
+        self.promote_working_set(permit, STORED_OUTPUT_WORKING_SET_UNITS)
+    }
+
+    fn promote_provider_output_working_set(
+        &self,
+        permit: &mut OwnedSemaphorePermit,
+    ) -> Result<(), GatewayError> {
+        self.promote_working_set(permit, PROVIDER_OUTPUT_WORKING_SET_UNITS)
+    }
+
+    fn promote_working_set(
+        &self,
+        permit: &mut OwnedSemaphorePermit,
+        target_units: usize,
+    ) -> Result<(), GatewayError> {
+        let additional_units = target_units
             .checked_sub(permit.num_permits())
             .unwrap_or_default();
         if additional_units == 0 {
@@ -466,6 +484,22 @@ impl TransportV2State {
                     StatusCode::SERVICE_UNAVAILABLE,
                     "stored_output_unavailable",
                     "Stored response capacity is unavailable",
+                ),
+            );
+        }
+        if operation.requires_provider_output_reservation()
+            && self
+                .promote_provider_output_working_set(working_set_permit)
+                .is_err()
+        {
+            return encrypt_reserved_logical_response(
+                lease,
+                request_id,
+                reservation,
+                LogicalUnaryResponse::protocol_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "provider_output_unavailable",
+                    "Provider response capacity is unavailable",
                 ),
             );
         }
@@ -872,6 +906,7 @@ fn reject_forbidden_outer_headers(
         "proxy-authorization",
         header::COOKIE.as_str(),
         header::CONTENT_ENCODING.as_str(),
+        header::TRANSFER_ENCODING.as_str(),
     ] {
         if headers.contains_key(name) {
             return Err(GatewayError::InvalidRequest);
@@ -1031,6 +1066,7 @@ mod tests {
         HeaderField, LogicalMethod, LogicalRequest, RequestId, ResponseMode,
     };
     use crate::transport_v2::session::{AuthorityState, BoundAuthority};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_session(
         session_id: Uuid,
@@ -1054,6 +1090,7 @@ mod tests {
             request_id,
             response_mode: ResponseMode::Unary,
             credential: None,
+            cache_namespace_root_base64: None,
             request: LogicalRequest {
                 method: LogicalMethod::Get,
                 path: "/v1/protected/private_key".to_owned(),
@@ -1070,6 +1107,9 @@ mod tests {
             request_id,
             response_mode: ResponseMode::Unary,
             credential: None,
+            cache_namespace_root_base64: Some(
+                crate::provider_cache::CacheNamespaceRoot::from_bytes([0x42; 32]),
+            ),
             request: LogicalRequest {
                 method: LogicalMethod::Post,
                 path: "/login".to_owned(),
@@ -1089,6 +1129,7 @@ mod tests {
             request_id,
             response_mode: ResponseMode::Unary,
             credential: None,
+            cache_namespace_root_base64: None,
             request: LogicalRequest {
                 method: LogicalMethod::Get,
                 path: "/protected/user".to_owned(),
@@ -1235,6 +1276,7 @@ mod tests {
             "proxy-authorization",
             header::COOKIE.as_str(),
             header::CONTENT_ENCODING.as_str(),
+            header::TRANSFER_ENCODING.as_str(),
         ] {
             let mut rejected = headers.clone();
             rejected.insert(forbidden, "value".parse().unwrap());
@@ -1243,6 +1285,59 @@ mod tests {
                 "{forbidden}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn content_length_before_chunked_transfer_is_rejected_at_outer_boundary() {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&handler_calls);
+        let app = Router::new().route(
+            "/v2/request",
+            post(move |request: Request<Body>| {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    match validate_fixed_outer_request(request.uri(), request.headers(), false) {
+                        Ok(()) => StatusCode::OK,
+                        Err(_) => StatusCode::BAD_REQUEST,
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("read test address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve raw HTTP regression");
+        });
+
+        let session_id = Uuid::new_v4();
+        let request = format!(
+            "POST /v2/request HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nx-session-id: {session_id}\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n0\r\n\r\n"
+        );
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect raw client");
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write raw request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read raw response");
+        server.abort();
+
+        let response = String::from_utf8(response).expect("HTTP response is ASCII");
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1624,6 +1719,10 @@ mod tests {
                     7,
                     &auth_context,
                     now + Duration::from_secs(30),
+                    crate::provider_cache::derive_tinfoil_cache_namespace(
+                        &crate::provider_cache::CacheNamespaceRoot::from_bytes([0x66; 32]),
+                        Uuid::from_bytes([0x64; 16]),
+                    ),
                 ),
                 now,
             )
@@ -1712,6 +1811,10 @@ mod tests {
                     7,
                     &AuthContext::new(AuthMethod::Password, 7, [0x84; 32]),
                     now + Duration::from_secs(30),
+                    crate::provider_cache::derive_tinfoil_cache_namespace(
+                        &crate::provider_cache::CacheNamespaceRoot::from_bytes([0x86; 32]),
+                        Uuid::from_bytes([0x83; 16]),
+                    ),
                 ),
                 now,
             )
@@ -1779,6 +1882,10 @@ mod tests {
                     7,
                     &AuthContext::new(AuthMethod::Password, 7, [0x94; 32]),
                     now + Duration::from_secs(30),
+                    crate::provider_cache::derive_tinfoil_cache_namespace(
+                        &crate::provider_cache::CacheNamespaceRoot::from_bytes([0x96; 32]),
+                        Uuid::from_bytes([0x93; 16]),
+                    ),
                 ),
                 now,
             )
@@ -1870,6 +1977,12 @@ mod tests {
                                 7,
                                 &AuthContext::new(AuthMethod::Password, 7, [0xa4; 32]),
                                 now + Duration::from_secs(30),
+                                crate::provider_cache::derive_tinfoil_cache_namespace(
+                                    &crate::provider_cache::CacheNamespaceRoot::from_bytes(
+                                        [0xa6; 32],
+                                    ),
+                                    Uuid::from_bytes([0xa3; 16]),
+                                ),
                             ),
                             now,
                         )
@@ -1937,6 +2050,12 @@ mod tests {
                                 7,
                                 &AuthContext::new(AuthMethod::Password, 7, [0xb4; 32]),
                                 now + Duration::from_secs(30),
+                                crate::provider_cache::derive_tinfoil_cache_namespace(
+                                    &crate::provider_cache::CacheNamespaceRoot::from_bytes(
+                                        [0xb6; 32],
+                                    ),
+                                    Uuid::from_bytes([0xb3; 16]),
+                                ),
                             ),
                             now,
                         )
@@ -1984,6 +2103,10 @@ mod tests {
                     7,
                     &auth_context,
                     now + Duration::from_secs(30),
+                    crate::provider_cache::derive_tinfoil_cache_namespace(
+                        &crate::provider_cache::CacheNamespaceRoot::from_bytes([0x76; 32]),
+                        Uuid::from_bytes([0x74; 16]),
+                    ),
                 ),
                 now,
             )
@@ -2079,5 +2202,83 @@ mod tests {
         let expired_at = Instant::now() + PENDING_ATTESTATION_TTL;
         assert_eq!(state.cleanup_expired_at(expired_at).await, 1);
         assert!(state.take_pending_attestation(&nonce).await.is_err());
+    }
+
+    #[test]
+    fn provider_output_promotion_reaches_the_bounded_response_reservation() {
+        let state = TransportV2State::new();
+        let mut permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        state
+            .promote_provider_output_working_set(&mut permit)
+            .unwrap();
+        assert_eq!(permit.num_permits(), PROVIDER_OUTPUT_WORKING_SET_UNITS);
+        assert_eq!(
+            state.request_working_set.available_permits(),
+            REQUEST_WORKING_SET_UNITS - PROVIDER_OUTPUT_WORKING_SET_UNITS
+        );
+
+        state
+            .promote_provider_output_working_set(&mut permit)
+            .unwrap();
+        assert_eq!(permit.num_permits(), PROVIDER_OUTPUT_WORKING_SET_UNITS);
+    }
+
+    #[tokio::test]
+    async fn provider_output_contention_is_authenticated_before_replay_or_dispatch() {
+        let mut state = TransportV2State::new();
+        state.request_working_set = Arc::new(Semaphore::new(1));
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        let master_bytes = [0xc1; 32];
+        let session = test_session(
+            session_id,
+            master_bytes,
+            now + Duration::from_secs(60),
+            Arc::clone(&state.global_replay_budget),
+        );
+        state.insert_session(session).await.unwrap();
+
+        let request_id = RequestId::from_bytes([0xc2; 16]);
+        let mut envelope = request_envelope(request_id);
+        envelope.request.path = "/v1/models".to_owned();
+        let lease = state.acquire_session(&session_id, now).await.unwrap();
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(envelope, lease.state().authority())
+        else {
+            panic!("public models operation must be ready");
+        };
+        assert!(operation.requires_provider_output_reservation());
+
+        let mut working_set_permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let observed_dispatches = Arc::clone(&dispatches);
+        let response = state
+            .process_ready_operation(
+                &lease,
+                request_id,
+                operation,
+                &mut working_set_permit,
+                now,
+                move |_lease, _operation, _authentication, _| async move {
+                    observed_dispatches.fetch_add(1, Ordering::SeqCst);
+                    successful_test_outcome()
+                },
+            )
+            .await
+            .unwrap();
+
+        let master = SessionMaster::from_bytes(master_bytes);
+        let client_keys = DirectionalKeys::derive(&master).unwrap();
+        assert_eq!(
+            response_status(&client_keys, &session_id, &request_id, &response),
+            503
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(lease.state().replay_id_count(), 0);
+        assert_eq!(working_set_permit.num_permits(), 1);
     }
 }

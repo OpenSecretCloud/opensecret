@@ -41,7 +41,9 @@ use crate::models::responses::{
 };
 use crate::models::schema::users;
 use crate::models::token_usage::{NewTokenUsage, TokenUsage, TokenUsageError};
-use crate::models::user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError};
+use crate::models::user_api_keys::{
+    NewUserApiKey, ResolvedUserApiKey, UserApiKey, UserApiKeyError,
+};
 use crate::models::user_seed_wrappings::{
     NewUserSeedWrapping, UserSeedWrapping, UserSeedWrappingError,
 };
@@ -504,6 +506,15 @@ pub trait DBConnection {
     fn get_user_api_key_by_id(&self, id: i32) -> Result<Option<UserApiKey>, DBError>;
     fn get_user_api_key_by_hash(&self, key_hash: &str) -> Result<Option<UserApiKey>, DBError>;
     fn get_user_by_api_key_hash(&self, key_hash: &str) -> Result<Option<User>, DBError>;
+    fn resolve_user_api_key_by_hash(
+        &self,
+        canonical_key_hash: &str,
+    ) -> Result<Option<ResolvedUserApiKey>, DBError>;
+    fn revalidate_user_api_key_owner(
+        &self,
+        api_key_id: i32,
+        user_id: Uuid,
+    ) -> Result<Option<User>, DBError>;
     fn get_all_user_api_keys_for_user(&self, user_id: Uuid) -> Result<Vec<UserApiKey>, DBError>;
     fn delete_user_api_key(&self, id: i32, user_id: Uuid) -> Result<(), DBError>;
     fn delete_user_api_key_by_name(&self, name: &str, user_id: Uuid) -> Result<(), DBError>;
@@ -2069,6 +2080,23 @@ impl DBConnection for PostgresConnection {
             .first::<User>(conn)
             .optional()
             .map_err(DBError::from)
+    }
+
+    fn resolve_user_api_key_by_hash(
+        &self,
+        canonical_key_hash: &str,
+    ) -> Result<Option<ResolvedUserApiKey>, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserApiKey::resolve_by_key_hash(conn, canonical_key_hash).map_err(DBError::from)
+    }
+
+    fn revalidate_user_api_key_owner(
+        &self,
+        api_key_id: i32,
+        user_id: Uuid,
+    ) -> Result<Option<User>, DBError> {
+        let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
+        UserApiKey::revalidate_owner(conn, api_key_id, user_id).map_err(DBError::from)
     }
 
     fn get_all_user_api_keys_for_user(&self, user_id: Uuid) -> Result<Vec<UserApiKey>, DBError> {

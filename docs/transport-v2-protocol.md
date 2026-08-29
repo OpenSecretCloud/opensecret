@@ -231,6 +231,7 @@ The decrypted request is a strict JSON envelope:
   "request_id": "00112233445566778899aabbccddeeff",
   "response_mode": "auto",
   "credential": null,
+  "cache_namespace_root_base64": null,
   "request": {
     "method": "POST",
     "path": "/v1/responses",
@@ -262,6 +263,12 @@ Fields have these meanings:
   credential bytes in canonical padded standard base64. Password, registration,
   OAuth, and recovery credentials remain part of their logical operation body;
   they do not become generic transport credentials.
+- `cache_namespace_root_base64` is a required-nullable field. When non-null it
+  is canonical padded standard base64 for exactly 32 client-generated random
+  bytes. The envelope codec accepts either shape, while application admission
+  permits a non-null value only on the request that transitions an anonymous
+  session to a user or API-key authority. It is `null` on platform transitions
+  and every request made after binding.
 - `method` is a supported uppercase HTTP method.
 - `path` is one origin-relative application path with no query or fragment.
 - `query` is either `null` or the exact query string without a leading `?`.
@@ -433,10 +440,87 @@ The existing raw API key is sent once inside the encrypted initial credential
 transition. It is not rotated. A successful transition binds a distinct
 inference-only API-key principal and the triggering request may proceed.
 
-The binding retains a non-secret key identity/hash and rechecks current key
-existence before every operation so deletion remains immediately effective.
-API-key sessions can reach only the same inference operation set that accepts
-API keys today; they never become general user sessions.
+The binding retains only the database key identity, owning user identity, and
+derived provider-cache namespace. It rechecks that exact key-to-owner
+relationship before every operation so deletion or ownership changes remain
+immediately effective. API-key sessions can reach only model catalog,
+non-streaming chat completions, speech synthesis, audio transcription, and
+embeddings. They never become general user sessions.
+
+### 8.4 Provider cache namespace binding
+
+User and API-key authentication transitions carry a client-generated cache
+namespace root in `cache_namespace_root_base64`. The client persists this root
+inside the corresponding local authentication/API-key context so a newly
+attested session can recover provider cache hits after application or enclave
+restart. Losing or deliberately replacing the root only creates a fresh cache
+namespace; it does not change account authority or data access.
+
+The enclave derives the namespace only after it has verified the user UUID (or
+the owning user UUID for an API key):
+
+```text
+HMAC-SHA256(
+  cache_namespace_root[32],
+  UTF8("opensecret/provider-cache/tinfoil/user-cache-namespace/v1")
+  || 0x00
+  || verified_user_uuid_bytes[16]
+)
+```
+
+UUID bytes are the 16 RFC 9562 network-order bytes, not UUID text. The fixed,
+versioned label domain-separates this value from every other use of the client
+root. Tinfoil receives the 32-byte result as 64 lowercase hexadecimal
+characters in its provider-managed `user_cache_secret` field. OpenSecret never
+logs or intentionally includes the client root, derived bytes, or encoded
+provider secret in an application response. Provider responses remain
+untrusted and could echo arbitrary request fields; any such echo remains inside
+the response encrypted to the same authenticated client and is never accepted
+as authority.
+
+The bound user or API-key authority retains only an `Arc`-backed derived
+namespace. Clones share that allocation and its bytes are zeroized when the
+last clone drops. The input root is zeroized when the transition request is
+released and is never retained in session state. Platform authorities retain
+neither value. This makes a user cache namespace stable for a cooperating
+client while preventing the parent/operator, which sees neither the root
+plaintext nor the enclave-held derivation result, from computing it from a
+UUID.
+
+### 8.5 Unary inference projection
+
+The initial unary-inference layer admits exactly these logical operations:
+
+| Logical operation | Bound user | API-key session | Anonymous |
+| --- | :---: | :---: | :---: |
+| `GET /v1/models` | yes | yes | yes |
+| `GET /v1/models/catalog` | yes | yes | no |
+| `POST /v1/chat/completions` with streaming absent or false | yes | yes | no |
+| `POST /v1/audio/speech` | yes | yes | no |
+| `POST /v1/audio/transcriptions` | yes | yes | no |
+| `POST /v1/embeddings` | yes | yes | no |
+| `POST /v1/web/search` | yes | no | no |
+| `POST /v1/web/extract` | yes | no | no |
+
+`GET /v1/models` is public and therefore never accepts a credential or cache
+root. The five API-key operations may perform the one-time encrypted API-key
+transition described above; web operations require a bound user. Platform
+authority is rejected for every operation in this layer. Chat streaming and
+the Responses API remain unsupported until the authenticated-streaming layer.
+
+Every admitted unary provider operation reserves 128 MiB of aggregate provider
+output working set before claiming replay identity or dispatching. V2 caps
+provider JSON at 28 MiB and structurally preflights it before deserialization.
+Speech synthesis uses a smaller raw-byte ceiling so base64 plus logical JSON
+still fits the 28 MiB response bound. Audio transcription additionally caps
+retained chunks at four and 64 MiB aggregate, caps each multipart provider
+request at 32 MiB, divides both raw response bytes and JSON structural-token
+allowance across the admitted chunks, processes chunks sequentially, and does
+not retry an ambiguous provider attempt. V2 provider failures log only provider
+identity and status while draining a small bounded prefix; provider-controlled
+error bodies never enter enclave logs. These are v2-only admission rules;
+transport v1 retains its existing limits, concurrency, retry behavior, error
+logging, and provider-cache derivation.
 
 ## 9. First-party and third-party tokens
 
@@ -498,7 +582,9 @@ does not look up a session again from an outer UUID. The SDK verifies response
 AAD and exact `request_id` before accepting status, headers, or body.
 
 Response headers use a strict allowlist and exclude transport framing, cookies,
-server internals, and credentials.
+server internals, and credentials. Application errors preserve the established
+`x-opensecret-error-contract` header and optional
+`x-opensecret-error-code` header inside this authenticated logical envelope.
 
 Failures before a valid session can be leased and the request identifier can be
 recovered are generic bounded plaintext transport errors. They are untrusted
@@ -648,112 +734,42 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
 
 ## 14. Planned pull-request stack
 
-1. **Protocol contract**: this document and byte-level review decisions.
-2. **V1 transport seam**: behavior-neutral response/session context and
-   characterization tests; no v2 routes.
-3. **Dormant v2 core**: codecs, key schedule, directional AEAD, separate session
-   state/cache, absolute expiry, replay registry, budgets, and vectors; no
-   public routes.
-4. **Isolated v2 gateway**: separate attestation/key-exchange/request endpoints,
-   bounded session allocation, strict outer parsing, exact-session decryption,
-   and encrypted unsupported-operation responses; no application dispatch.
-5. **User binding and first unary slice**: password login, registration,
-   v2-only resumption, immutable user/project/`AuthContext` authority, live
-   seed-wrap revalidation, and bodyless `GET /protected/user`. This layer also
-   activates exact unordered replay claims for supported operations. Platform,
-   API-key, OAuth, and all other application paths still receive the encrypted
-   unsupported-operation response.
-6. **Sensitive user-key projection**: project root/derived mnemonic and private
-   key export, public-key derivation, signing, and third-party token issuance
-   through the live bound-user check. Sensitive intermediate response values
-   are zeroized, decoded byte fields and prepared sensitive operations wipe on
-   drop across rejection/cancellation paths, and serialized logical responses
-   are bounded before gateway encryption. Large encrypt/decrypt utilities
-   remain unsupported until their base64 and JSON expansion has an exact
-   pre-dispatch limit.
-7. **Bounded user crypto utilities**: project user-key encrypt/decrypt with an
-   exact v2-only plaintext ceiling derived from AES-GCM, base64, and JSON
-   expansion. Logical JSON serialization writes through a bounded buffer so a
-   highly escaped decrypted string cannot allocate beyond the response limit.
-8. **Dynamic-path and response-resource seams**: admit only route-scoped,
-   canonical KV item segments and retain request working-set reservations
-   through final response serialization/body lifetime. Tiny-request operations
-   with uncorrelated stored output remain unsupported until they reserve that
-   output before dispatch.
-9. **KV mutations**: project PUT item, DELETE item, and DELETE all through
-   transport-neutral helpers. Preserve existing response and error behavior,
-   claim replay identifiers before every mutation, sanitize storage errors, and
-   wipe decoded keys and values. GET item and list remain unsupported here.
-10. **Bounded KV reads**: project GET item and list through a v2-only,
-   read-only repeatable-read storage seam. Promote each admitted read to a
-   conservative 200 MiB reservation from the shared 256 MiB request/response
-   pool before replay claim or dispatch; contention returns an authenticated
-   503 without consuming the request identifier. Bound item ciphertext, list
-   aggregate plaintext, and list rows before loading narrow ciphertext
-   projections, then retain the merged reservation through final HTTP body
-   consumption. Preserve `null`, string, bare-array, timestamp, ordering, and
-   whole-list failure behavior from v1 while leaving every v1 query untouched.
-11. **Remaining protected user operations**: project account-lifecycle and user
-   API-key-management families in reviewable sub-stacks. Start API-key
-   administration with bounded create/delete mutations: retain the existing
-   raw UUID key format without rotation, return it only through the original
-   bound-session response, wipe its plaintext response value on drop, and use
-   the canonical validated name segment for deletion. Add list in a following
-   slice using the same conservative stored-output admission as KV reads and a
-   v2-only read-only repeatable-read database path. Preflight the user-scoped
-   row count and aggregate name bytes, cap the list at 65,536 rows, fetch only
-   `name` and `created_at`, recheck the snapshot totals, retain unspecified
-   server ordering, and bound final JSON serialization. The v1 full-row query
-   remains untouched. Project verification-email resend as a bound-user unary
-   mutation with no logical body or metadata; preserve its existing 200 JSON
-   outcomes while claiming replay state before any database or email side
-   effect. Project `GET /verify-email/{code}` as a code-authorized operation
-   that accepts either an anonymous or already-bound session without changing
-   its authority. Require one lowercase hyphenated UUID path spelling, reject
-   all logical metadata, and preserve the existing invalid/expired 400 plus
-   success/already-verified 200 outcomes. Project account-deletion request as
-   an exact bound-user JSON mutation, preserving the generic success response,
-   independent fresh attempts, and background email behavior while claiming
-   replay state before request creation. Account-deletion confirmation must
-   pre-serialize its fixed success response before committing deletion, then
-   explicitly close the now-invalid bound session only after that commit.
-   Invalid codes, secrets, requests, expiry, and database failures return their
-   existing encrypted errors without closing an otherwise valid session.
-   Project user logout as an exact bound-user JSON operation with the existing
-   refresh-token request and success body, then close the admitted session only
-   after the response is prepared. This remains session-local logout: matching
-   transport-v1 behavior, the submitted resumption credential is not revoked
-   server-side. The v2 SDK must treat the request as terminal, never
-   transparently retry or resume the logout attempt, and use generation-safe
-   local cleanup after the final response attempt. Exact cleanup behavior for
-   an ambiguous outcome is fixed in the SDK cutover PR. Project password change
-   as an exact bound-user JSON mutation with its existing logical request and
-   response fields. Prepare and locally verify the replacement password wrap,
-   issue both replacement v2 credentials, and bound-serialize the success
-   response before attempting the existing password-ciphertext CAS transaction.
-   A successful commit or any failure after the commit attempt terminally
-   closes the old session; definite parse, current-password, preparation, and
-   serialization failures retain a still-valid session. A lost final response
-   is never retried: the client recovers through a fresh login with the
-   submitted new password.
-12. **Stored user unary operations**: project conversations, conversation
-   projects, instructions, response control, and web-provider unary routes in
-   ownership-preserving families before the client cutover.
-13. **API-key and platform binding**: bind existing raw API keys inside
-   ciphertext without rotating them, enforce their current inference-only
-   scope, and add platform authentication/authorization with live organization
-   checks. OAuth continuation receives an explicit session-binding design in
-   this layer rather than being inferred from password login.
-14. **Streaming projection**: project current inference streams with ordered,
-   request-bound, authenticated terminal records while preserving the SDK's
-   caller-visible SSE behavior.
-15. **Additive SDK v2 internals**: TypeScript and Rust codecs/session managers
-   behind private seams, still not selected by public calls.
-16. **Atomic SDK cutover**: v2-only network behavior, no downgrade, one-time
-   fresh login, and Maple/proxy integration.
-17. **SDK major/version packaging**: package metadata, locks, integration pin,
-   compatibility matrix, and release rehearsal. Publication/deployment remain
-   separate authorized actions.
+The implementation is intentionally consolidated into at most fourteen
+capability PRs. Each PR targets the branch immediately below it:
+
+1. **Protocol and v1-neutral seam**: freeze the contract and introduce shared
+   application seams without changing transport-v1 behavior.
+2. **Dormant crypto, session, and replay core**: codecs, key schedule,
+   directional AEAD, separate caches, exact unordered replay registry, budgets,
+   and golden vectors without a public v2 route.
+3. **Isolated gateway**: v2 attestation, key exchange, bounded request
+   admission, same-lease response encryption, and encrypted unsupported-route
+   responses.
+4. **User authority and sensitive crypto**: password registration/login,
+   resumption, immutable user binding, sensitive key operations, and bounded
+   encrypt/decrypt utilities.
+5. **Complete bounded KV**: canonical key routing, mutations, bounded reads,
+   and held output reservations.
+6. **User credentials and account lifecycle**: API-key administration,
+   verification, logout, password changes, and account deletion.
+7. **Conversation projects and instructions**: owner-scoped project and
+   instruction CRUD.
+8. **Conversations, items, and stored response control**: bounded encrypted
+   storage operations and response cancellation/deletion.
+9. **Unary providers and API-key binding**: the exact unary route table in
+   section 8.5, one-time encrypted API-key authority transition, live key-owner
+   revalidation, and client-random Tinfoil cache namespaces.
+10. **Session-bound user OAuth**: bind OAuth continuation to its originating
+    v2 session without exposing credentials outside ciphertext.
+11. **Platform v2 end to end**: platform authentication and authorization with
+    live organization checks.
+12. **Authenticated streaming**: ordered, request-bound records and an
+    authenticated terminal event while preserving caller-visible streaming.
+13. **Dormant TypeScript and Rust SDK engines**: shared vectors and private v2
+    session/transport implementations that public calls do not yet select.
+14. **Atomic v2 cutover and packaging**: switch new SDK majors to v2-only,
+    update Maple and maple-proxy dependencies, and run compatibility/release
+    rehearsal. Publication and deployment remain separately authorized.
 
 Each implementation PR receives one focused security review and one focused
 compatibility review. Reviews should report credible vulnerabilities,

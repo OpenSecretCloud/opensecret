@@ -9,11 +9,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::Query;
-use axum::http::StatusCode;
-use axum::http::Uri;
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
+use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::bounded_json::BoundedJsonBuffer;
@@ -23,11 +24,20 @@ use crate::jwt::{
 };
 use crate::kv::StoreError;
 use crate::models::responses::{ConversationProjectFilter, NewConversation, ResponseStatus};
+use crate::provider_cache::{
+    derive_tinfoil_cache_namespace, CacheNamespaceRoot, DerivedCacheNamespace,
+};
 use crate::tokens::count_tokens;
 use crate::web::login_routes::{
     authenticate_login, logout_data, register_and_authenticate, verify_email_data, AuthResponse,
     Credentials, LogoutRequest, RefreshResponse, RegisterCredentials,
 };
+use crate::web::openai::{
+    openai_embeddings_v2_data, openai_model_catalog_data, openai_models_v2_data,
+    openai_nonstream_chat_completion_v2_data, openai_transcription_v2_data, openai_tts_v2_data,
+    EmbeddingRequest, TTSRequest, TranscriptionRequest,
+};
+use crate::web::openai_auth::AuthMethod as OpenAiAuthMethod;
 use crate::web::protected_routes::{
     confirm_account_deletion_data, create_api_key_data, decrypt_data_value, delete_all_kv_values,
     delete_api_key_by_name, delete_kv_value, encrypt_data_value, initiate_account_deletion_data,
@@ -73,7 +83,13 @@ use crate::web::responses::{
     },
     ConversationItem, DeletedObjectResponse, MessageContent, NullableField,
 };
-use crate::{ApiError, AppState, VerifiedUserAuthentication};
+use crate::web::web_routes::{
+    execute_web_extract, execute_web_search, parse_web_extract_request, parse_web_search_request,
+    WebRouteError,
+};
+use crate::{
+    ApiError, AppState, VerifiedUserAuthentication, ERROR_CODE_HEADER, ERROR_CONTRACT_HEADER,
+};
 
 use super::envelope::{
     decode_canonical_api_key_name_path, decode_canonical_conversation_path,
@@ -120,12 +136,15 @@ pub(crate) enum OperationPreparation {
 pub(crate) enum UserOperation {
     Login {
         body: SensitiveBytes,
+        cache_namespace_root: CacheNamespaceRoot,
     },
     Register {
         body: SensitiveBytes,
+        cache_namespace_root: CacheNamespaceRoot,
     },
     Resume {
         credential: SensitiveBytes,
+        cache_namespace_root: CacheNamespaceRoot,
     },
     VerifyEmail {
         code: uuid::Uuid,
@@ -141,6 +160,51 @@ pub(crate) enum UserOperation {
         authority: BoundUserAuthority,
         operation: ProtectedUserOperation,
     },
+    Inference {
+        authority: InferenceAuthority,
+        operation: InferenceOperation,
+    },
+}
+
+pub(crate) enum InferenceOperation {
+    Models,
+    ModelCatalog,
+    Chat {
+        body: SensitiveBytes,
+        headers: HeaderMap,
+    },
+    TextToSpeech {
+        body: SensitiveBytes,
+    },
+    Transcription {
+        body: SensitiveBytes,
+    },
+    Embeddings {
+        body: SensitiveBytes,
+    },
+    WebSearch {
+        body: SensitiveBytes,
+    },
+    WebExtract {
+        body: SensitiveBytes,
+    },
+}
+
+pub(crate) enum InferenceAuthority {
+    Public,
+    User(BoundUserAuthority),
+    ApiKey(BoundApiKeyAuthority),
+    AuthenticateApiKey {
+        credential: SensitiveBytes,
+        cache_namespace_root: CacheNamespaceRoot,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) struct BoundApiKeyAuthority {
+    api_key_id: i32,
+    user_id: uuid::Uuid,
+    cache_namespace: DerivedCacheNamespace,
 }
 
 pub(crate) enum ProtectedUserOperation {
@@ -284,14 +348,25 @@ pub(crate) struct BoundUserAuthority {
     user_id: uuid::Uuid,
     project_id: i32,
     auth_context: AuthContext,
+    cache_namespace: DerivedCacheNamespace,
 }
 
 impl UserOperation {
     pub(crate) const fn requires_authentication_transition(&self) -> bool {
         matches!(
             self,
-            Self::Login { .. } | Self::Register { .. } | Self::Resume { .. }
+            Self::Login { .. }
+                | Self::Register { .. }
+                | Self::Resume { .. }
+                | Self::Inference {
+                    authority: InferenceAuthority::AuthenticateApiKey { .. },
+                    ..
+                }
         )
+    }
+
+    pub(crate) const fn requires_provider_output_reservation(&self) -> bool {
+        matches!(self, Self::Inference { .. })
     }
 
     pub(crate) const fn requires_stored_output_reservation(&self) -> bool {
@@ -324,6 +399,7 @@ impl UserOperation {
         match self {
             Self::Logout { .. } | Self::ChangePassword { .. } => SessionEffect::Close,
             Self::Protected { operation, .. } => operation.session_effect_on_success(),
+            Self::Inference { .. } => SessionEffect::Retain,
             _ => SessionEffect::Retain,
         }
     }
@@ -539,9 +615,20 @@ impl LogicalUnaryResponse {
         })
     }
 
-    pub(crate) fn api_error(error: &ApiError) -> Self {
+    pub(crate) fn api_error(error: ApiError) -> Self {
         match Self::json(error.status_code(), &error.response_body()) {
-            Ok(response) => response,
+            Ok(mut response) => {
+                let api_response = error.into_response();
+                for name in [ERROR_CONTRACT_HEADER, ERROR_CODE_HEADER] {
+                    if let Some(value) = api_response.headers().get(name) {
+                        response.headers.push(HeaderField {
+                            name: name.to_owned(),
+                            value_base64: EncodedBytes::from_bytes(value.as_bytes().to_vec()),
+                        });
+                    }
+                }
+                response
+            }
             Err(_) => Self::protocol_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -599,14 +686,14 @@ impl ApplicationOutcome {
 
     fn error(error: ApiError) -> Self {
         Self {
-            response: LogicalUnaryResponse::api_error(&error),
+            response: LogicalUnaryResponse::api_error(error),
             session_effect: SessionEffect::Retain,
         }
     }
 
     fn closing_error(error: ApiError) -> Self {
         Self {
-            response: LogicalUnaryResponse::api_error(&error),
+            response: LogicalUnaryResponse::api_error(error),
             session_effect: SessionEffect::Close,
         }
     }
@@ -619,6 +706,7 @@ pub(crate) fn prepare_user_operation(
     let RequestEnvelope {
         response_mode,
         credential,
+        cache_namespace_root_base64,
         mut request,
         ..
     } = envelope;
@@ -674,6 +762,14 @@ pub(crate) fn prepare_user_operation(
         ConfirmAccountDeletion,
         Logout,
         ChangePassword,
+        Models,
+        ModelCatalog,
+        ChatCompletions,
+        TextToSpeech,
+        Transcription,
+        Embeddings,
+        WebSearch,
+        WebExtract,
     }
 
     let kv_key = match decode_canonical_kv_item_path(request.method, &request.path) {
@@ -771,6 +867,14 @@ pub(crate) fn prepare_user_operation(
         }
         (LogicalMethod::Post, "/protected/change_password") => Some(Route::ChangePassword),
         (LogicalMethod::Post, "/logout") => Some(Route::Logout),
+        (LogicalMethod::Get, "/v1/models") => Some(Route::Models),
+        (LogicalMethod::Get, "/v1/models/catalog") => Some(Route::ModelCatalog),
+        (LogicalMethod::Post, "/v1/chat/completions") => Some(Route::ChatCompletions),
+        (LogicalMethod::Post, "/v1/audio/speech") => Some(Route::TextToSpeech),
+        (LogicalMethod::Post, "/v1/audio/transcriptions") => Some(Route::Transcription),
+        (LogicalMethod::Post, "/v1/embeddings") => Some(Route::Embeddings),
+        (LogicalMethod::Post, "/v1/web/search") => Some(Route::WebSearch),
+        (LogicalMethod::Post, "/v1/web/extract") => Some(Route::WebExtract),
         (LogicalMethod::Get, _) if kv_key.is_some() => Some(Route::GetKv),
         (LogicalMethod::Put, _) if kv_key.is_some() => Some(Route::PutKv),
         (LogicalMethod::Delete, _) if kv_key.is_some() => Some(Route::DeleteKv),
@@ -867,6 +971,22 @@ pub(crate) fn prepare_user_operation(
         return rejected_bad_request();
     }
 
+    if cache_namespace_root_base64.is_some()
+        && !matches!(
+            route,
+            Route::Login
+                | Route::Register
+                | Route::Resume
+                | Route::ModelCatalog
+                | Route::ChatCompletions
+                | Route::TextToSpeech
+                | Route::Transcription
+                | Route::Embeddings
+        )
+    {
+        return rejected_bad_request();
+    }
+
     match route {
         Route::Login | Route::Register => {
             if credential.is_some()
@@ -886,6 +1006,9 @@ pub(crate) fn prepare_user_operation(
                     "Session is already authenticated",
                 ));
             }
+            let Some(cache_namespace_root) = cache_namespace_root_base64 else {
+                return rejected_bad_request();
+            };
 
             let body = request
                 .body_base64
@@ -893,9 +1016,15 @@ pub(crate) fn prepare_user_operation(
                 .into_bytes();
             let body = Zeroizing::new(body);
             if matches!(route, Route::Login) {
-                OperationPreparation::Ready(UserOperation::Login { body })
+                OperationPreparation::Ready(UserOperation::Login {
+                    body,
+                    cache_namespace_root,
+                })
             } else {
-                OperationPreparation::Ready(UserOperation::Register { body })
+                OperationPreparation::Ready(UserOperation::Register {
+                    body,
+                    cache_namespace_root,
+                })
             }
         }
         Route::Resume => {
@@ -918,8 +1047,12 @@ pub(crate) fn prepare_user_operation(
             if value_base64.is_empty() {
                 return rejected_bad_request();
             }
+            let Some(cache_namespace_root) = cache_namespace_root_base64 else {
+                return rejected_bad_request();
+            };
             OperationPreparation::Ready(UserOperation::Resume {
                 credential: Zeroizing::new(value_base64.into_bytes()),
+                cache_namespace_root,
             })
         }
         Route::VerifyEmail => {
@@ -957,7 +1090,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             let operation = match route {
                 Route::GetUser => ProtectedUserOperation::GetUser,
@@ -987,7 +1120,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
@@ -1013,7 +1146,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             let body = request
                 .body_base64
@@ -1058,7 +1191,7 @@ pub(crate) fn prepare_user_operation(
                 return rejected_bad_request();
             }
             if let Err(rejection) = bound_user_authority(authority) {
-                return rejection;
+                return OperationPreparation::Rejected(rejection);
             }
             OperationPreparation::Ready(UserOperation::Logout {
                 body: Zeroizing::new(
@@ -1082,7 +1215,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             let body = request
                 .body_base64
@@ -1107,7 +1240,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             let operation = if matches!(route, Route::GetKv) {
                 ProtectedUserOperation::GetKv {
@@ -1131,7 +1264,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             let operation = if matches!(route, Route::DeleteKv) {
                 ProtectedUserOperation::DeleteKv {
@@ -1158,7 +1291,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             let body = request
                 .body_base64
@@ -1181,7 +1314,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
@@ -1198,7 +1331,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
@@ -1221,7 +1354,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             let body = request
                 .body_base64
@@ -1241,7 +1374,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
@@ -1260,7 +1393,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
@@ -1283,7 +1416,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
@@ -1309,7 +1442,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
@@ -1332,7 +1465,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
@@ -1353,7 +1486,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
@@ -1372,7 +1505,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             let instruction_id = match instruction_path
                 .expect("classified instruction route must have a decoded path")
@@ -1407,7 +1540,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             let Some(InstructionItemPath::Item(instruction_id)) = instruction_path else {
                 unreachable!("classified instruction update must use an item path")
@@ -1440,7 +1573,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             let body = Zeroizing::new(
                 request
@@ -1476,7 +1609,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             let Some(ConversationItemPath::Conversation(conversation_id)) = conversation_path
             else {
@@ -1502,7 +1635,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             let operation = if matches!(route, Route::ListConversations) {
                 ProtectedUserOperation::ListConversations {
@@ -1538,7 +1671,7 @@ pub(crate) fn prepare_user_operation(
             }
             let authority = match bound_user_authority(authority) {
                 Ok(authority) => authority,
-                Err(rejection) => return rejection,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             let operation = match route {
                 Route::GetConversation | Route::DeleteConversation => {
@@ -1590,28 +1723,217 @@ pub(crate) fn prepare_user_operation(
                 operation,
             })
         }
+        Route::Models => {
+            if credential.is_some()
+                || cache_namespace_root_base64.is_some()
+                || request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            match authority {
+                AuthorityState::Anonymous | AuthorityState::Bound(_) => {}
+                AuthorityState::Authenticating(_) => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::AuthenticationInProgress,
+                    ));
+                }
+                AuthorityState::Closing => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::Closing,
+                    ));
+                }
+            }
+            OperationPreparation::Ready(UserOperation::Inference {
+                authority: InferenceAuthority::Public,
+                operation: InferenceOperation::Models,
+            })
+        }
+        Route::ModelCatalog
+        | Route::ChatCompletions
+        | Route::TextToSpeech
+        | Route::Transcription
+        | Route::Embeddings => {
+            if request.query.is_some() {
+                return rejected_bad_request();
+            }
+
+            let operation = match route {
+                Route::ModelCatalog => {
+                    if !request.headers.is_empty() || request.body_base64.is_some() {
+                        return rejected_bad_request();
+                    }
+                    InferenceOperation::ModelCatalog
+                }
+                Route::ChatCompletions => {
+                    let Some(body) = request.body_base64.take() else {
+                        return rejected_bad_request();
+                    };
+                    if body.is_empty() {
+                        return rejected_bad_request();
+                    }
+                    let headers = match prepare_chat_provider_headers(request.headers) {
+                        Ok(headers) => headers,
+                        Err(()) => return rejected_bad_request(),
+                    };
+                    InferenceOperation::Chat {
+                        body: Zeroizing::new(body.into_bytes()),
+                        headers,
+                    }
+                }
+                Route::TextToSpeech | Route::Transcription | Route::Embeddings => {
+                    if !has_exact_json_content_type(&request.headers) {
+                        return rejected_bad_request();
+                    }
+                    let Some(body) = request.body_base64.take() else {
+                        return rejected_bad_request();
+                    };
+                    if body.is_empty() {
+                        return rejected_bad_request();
+                    }
+                    let body = Zeroizing::new(body.into_bytes());
+                    match route {
+                        Route::TextToSpeech => InferenceOperation::TextToSpeech { body },
+                        Route::Transcription => InferenceOperation::Transcription { body },
+                        Route::Embeddings => InferenceOperation::Embeddings { body },
+                        _ => unreachable!("typed OpenAI route group is exhaustive"),
+                    }
+                }
+                _ => unreachable!("OpenAI unary route group is exhaustive"),
+            };
+
+            let authority = match prepare_inference_authority(
+                authority,
+                credential,
+                cache_namespace_root_base64,
+            ) {
+                Ok(authority) => authority,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
+            };
+            OperationPreparation::Ready(UserOperation::Inference {
+                authority,
+                operation,
+            })
+        }
+        Route::WebSearch | Route::WebExtract => {
+            if credential.is_some()
+                || cache_namespace_root_base64.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+            {
+                return rejected_bad_request();
+            }
+            let Some(body) = request.body_base64.take() else {
+                return rejected_bad_request();
+            };
+            if body.is_empty() {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
+            };
+            let operation = if matches!(route, Route::WebSearch) {
+                InferenceOperation::WebSearch {
+                    body: Zeroizing::new(body.into_bytes()),
+                }
+            } else {
+                InferenceOperation::WebExtract {
+                    body: Zeroizing::new(body.into_bytes()),
+                }
+            };
+            OperationPreparation::Ready(UserOperation::Inference {
+                authority: InferenceAuthority::User(authority),
+                operation,
+            })
+        }
     }
 }
 
 fn bound_user_authority(
     authority: AuthorityState,
-) -> Result<BoundUserAuthority, OperationPreparation> {
+) -> Result<BoundUserAuthority, LogicalUnaryResponse> {
     let AuthorityState::Bound(bound) = authority else {
-        return Err(rejected_authentication_required());
+        return Err(authentication_required_response());
     };
     let BoundPrincipal::User {
         user_id,
         project_id,
         auth_context,
+        cache_namespace,
     } = bound.principal()
     else {
-        return Err(rejected_authentication_required());
+        return Err(authentication_required_response());
     };
     Ok(BoundUserAuthority {
         user_id: *user_id,
         project_id: *project_id,
         auth_context: auth_context.clone(),
+        cache_namespace: cache_namespace.clone(),
     })
+}
+
+fn prepare_inference_authority(
+    authority: AuthorityState,
+    credential: Option<Credential>,
+    cache_namespace_root: Option<CacheNamespaceRoot>,
+) -> Result<InferenceAuthority, LogicalUnaryResponse> {
+    match authority {
+        AuthorityState::Anonymous => {
+            let Some(Credential::ApiKey { value_base64 }) = credential else {
+                return Err(authentication_required_response());
+            };
+            let Some(cache_namespace_root) = cache_namespace_root else {
+                return Err(bad_request_response());
+            };
+            if value_base64.is_empty() {
+                return Err(bad_request_response());
+            }
+            Ok(InferenceAuthority::AuthenticateApiKey {
+                credential: Zeroizing::new(value_base64.into_bytes()),
+                cache_namespace_root,
+            })
+        }
+        AuthorityState::Bound(bound) => {
+            if credential.is_some() || cache_namespace_root.is_some() {
+                return Err(LogicalUnaryResponse::protocol_error(
+                    StatusCode::CONFLICT,
+                    "session_already_bound",
+                    "Session is already authenticated",
+                ));
+            }
+            match bound.principal() {
+                BoundPrincipal::User {
+                    user_id,
+                    project_id,
+                    auth_context,
+                    cache_namespace,
+                } => Ok(InferenceAuthority::User(BoundUserAuthority {
+                    user_id: *user_id,
+                    project_id: *project_id,
+                    auth_context: auth_context.clone(),
+                    cache_namespace: cache_namespace.clone(),
+                })),
+                BoundPrincipal::ApiKey {
+                    api_key_id,
+                    user_id,
+                    cache_namespace,
+                } => Ok(InferenceAuthority::ApiKey(BoundApiKeyAuthority {
+                    api_key_id: *api_key_id,
+                    user_id: *user_id,
+                    cache_namespace: cache_namespace.clone(),
+                })),
+                BoundPrincipal::Platform { .. } => Err(authentication_required_response()),
+            }
+        }
+        AuthorityState::Authenticating(_) => Err(authentication_start_error(
+            AuthenticationStartError::AuthenticationInProgress,
+        )),
+        AuthorityState::Closing => Err(authentication_start_error(
+            AuthenticationStartError::Closing,
+        )),
+    }
 }
 
 pub(crate) fn begin_authentication_transition(
@@ -1653,7 +1975,10 @@ pub(crate) async fn execute_user_operation(
 ) -> ApplicationOutcome {
     let session_effect_on_success = operation.session_effect_on_success();
     match operation {
-        UserOperation::Login { body } => {
+        UserOperation::Login {
+            body,
+            cache_namespace_root,
+        } => {
             let parsed =
                 serde_json::from_slice::<Credentials>(&body).map_err(|_| ApiError::BadRequest);
             let credentials = match parsed {
@@ -1671,9 +1996,13 @@ pub(crate) async fn execute_user_operation(
                 authentication.expect("login requires authentication reservation"),
                 monotonic_now,
                 UserAuthResponseKind::Login,
+                cache_namespace_root,
             )
         }
-        UserOperation::Register { body } => {
+        UserOperation::Register {
+            body,
+            cache_namespace_root,
+        } => {
             let parsed = serde_json::from_slice::<RegisterCredentials>(&body)
                 .map_err(|_| ApiError::BadRequest);
             let credentials = match parsed {
@@ -1692,9 +2021,13 @@ pub(crate) async fn execute_user_operation(
                 authentication.expect("registration requires authentication reservation"),
                 monotonic_now,
                 UserAuthResponseKind::Login,
+                cache_namespace_root,
             )
         }
-        UserOperation::Resume { mut credential } => {
+        UserOperation::Resume {
+            mut credential,
+            cache_namespace_root,
+        } => {
             let bytes = std::mem::take(&mut *credential);
             let credential = match String::from_utf8(bytes) {
                 Ok(credential) => Zeroizing::new(credential),
@@ -1715,6 +2048,7 @@ pub(crate) async fn execute_user_operation(
                 authentication.expect("resumption requires authentication reservation"),
                 monotonic_now,
                 UserAuthResponseKind::Refresh,
+                cache_namespace_root,
             )
         }
         UserOperation::VerifyEmail { code } => {
@@ -1858,7 +2192,259 @@ pub(crate) async fn execute_user_operation(
             };
             ApplicationOutcome::success(response, session_effect_on_success)
         }
+        UserOperation::Inference {
+            authority,
+            operation,
+        } => {
+            execute_inference_operation(
+                &app_state,
+                operation,
+                authority,
+                authentication,
+                monotonic_now,
+            )
+            .await
+        }
     }
+}
+
+async fn execute_inference_operation(
+    app_state: &Arc<AppState>,
+    operation: InferenceOperation,
+    authority: InferenceAuthority,
+    authentication: Option<AuthenticationReservation>,
+    monotonic_now: Instant,
+) -> ApplicationOutcome {
+    match authority {
+        InferenceAuthority::Public => {
+            debug_assert!(authentication.is_none());
+            if !matches!(operation, InferenceOperation::Models) {
+                return ApplicationOutcome::error(ApiError::Unauthorized);
+            }
+            let response = match openai_models_v2_data(app_state)
+                .await
+                .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+            {
+                Ok(response) => response,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            ApplicationOutcome::success(response, SessionEffect::Retain)
+        }
+        InferenceAuthority::User(authority) => {
+            debug_assert!(authentication.is_none());
+            let user = match app_state.verify_bound_user(
+                authority.user_id,
+                authority.project_id,
+                &authority.auth_context,
+            ) {
+                Ok(user) => user,
+                Err(error) => {
+                    if matches!(error, ApiError::Unauthorized | ApiError::InvalidJwt) {
+                        return ApplicationOutcome::closing_error(error);
+                    }
+                    return ApplicationOutcome::error(error);
+                }
+            };
+            let response = execute_inference_for_user(
+                app_state,
+                &user,
+                OpenAiAuthMethod::Jwt,
+                &authority.cache_namespace,
+                operation,
+            )
+            .await;
+            ApplicationOutcome::success(response, SessionEffect::Retain)
+        }
+        InferenceAuthority::ApiKey(authority) => {
+            debug_assert!(authentication.is_none());
+            let user = match app_state
+                .db
+                .revalidate_user_api_key_owner(authority.api_key_id, authority.user_id)
+            {
+                Ok(Some(user)) => user,
+                Ok(None) => return ApplicationOutcome::closing_error(ApiError::Unauthorized),
+                Err(error) => {
+                    tracing::error!(
+                        api_key_id = authority.api_key_id,
+                        "Failed to revalidate a bound API-key authority: {error:?}"
+                    );
+                    return ApplicationOutcome::error(ApiError::InternalServerError);
+                }
+            };
+            let response = execute_inference_for_user(
+                app_state,
+                &user,
+                OpenAiAuthMethod::ApiKey,
+                &authority.cache_namespace,
+                operation,
+            )
+            .await;
+            ApplicationOutcome::success(response, SessionEffect::Retain)
+        }
+        InferenceAuthority::AuthenticateApiKey {
+            credential,
+            cache_namespace_root,
+        } => {
+            let Some(authentication) = authentication else {
+                return ApplicationOutcome::error(ApiError::InternalServerError);
+            };
+            let key_hash = match canonical_api_key_hash(credential) {
+                Ok(key_hash) => key_hash,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            let resolved = match app_state.db.resolve_user_api_key_by_hash(&key_hash) {
+                Ok(Some(resolved)) => resolved,
+                Ok(None) => return ApplicationOutcome::error(ApiError::Unauthorized),
+                Err(error) => {
+                    tracing::error!("Failed to authenticate a v2 API key: {error:?}");
+                    return ApplicationOutcome::error(ApiError::InternalServerError);
+                }
+            };
+            drop(key_hash);
+            let cache_namespace =
+                derive_tinfoil_cache_namespace(&cache_namespace_root, resolved.user.get_id());
+            drop(cache_namespace_root);
+            let authority = BoundAuthority::api_key(
+                resolved.api_key_id,
+                resolved.user.get_id(),
+                cache_namespace.clone(),
+            );
+            if authentication.commit_at(authority, monotonic_now).is_err() {
+                return ApplicationOutcome::error(ApiError::InternalServerError);
+            }
+
+            let response = execute_inference_for_user(
+                app_state,
+                &resolved.user,
+                OpenAiAuthMethod::ApiKey,
+                &cache_namespace,
+                operation,
+            )
+            .await;
+            // Once the authority commits, every application outcome must carry
+            // NewlyBound. The gateway can then close the session if this first
+            // authenticated response cannot be encrypted for the client.
+            ApplicationOutcome::success(response, SessionEffect::NewlyBound)
+        }
+    }
+}
+
+async fn execute_inference_for_user(
+    app_state: &Arc<AppState>,
+    user: &crate::User,
+    auth_method: OpenAiAuthMethod,
+    cache_namespace: &DerivedCacheNamespace,
+    operation: InferenceOperation,
+) -> LogicalUnaryResponse {
+    let result = match operation {
+        InferenceOperation::Models => Err(ApiError::Unauthorized),
+        InferenceOperation::ModelCatalog => {
+            let value = openai_model_catalog_data(app_state, user).await;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        InferenceOperation::Chat { body, headers } => {
+            let body = match parse_provider_json_body::<serde_json::Value>(body) {
+                Ok(body) => body,
+                Err(error) => return LogicalUnaryResponse::api_error(error),
+            };
+            openai_nonstream_chat_completion_v2_data(
+                app_state,
+                user,
+                auth_method,
+                body,
+                &headers,
+                cache_namespace,
+            )
+            .await
+            .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+        }
+        InferenceOperation::TextToSpeech { body } => {
+            let request = match parse_provider_json_body::<TTSRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return LogicalUnaryResponse::api_error(error),
+            };
+            openai_tts_v2_data(app_state, user, request)
+                .await
+                .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+        }
+        InferenceOperation::Transcription { body } => {
+            let request = match parse_provider_json_body::<TranscriptionRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return LogicalUnaryResponse::api_error(error),
+            };
+            openai_transcription_v2_data(app_state, user, request)
+                .await
+                .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+        }
+        InferenceOperation::Embeddings { body } => {
+            let request = match parse_provider_json_body::<EmbeddingRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return LogicalUnaryResponse::api_error(error),
+            };
+            openai_embeddings_v2_data(app_state, user, auth_method, request)
+                .await
+                .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+        }
+        InferenceOperation::WebSearch { body } => {
+            let body = match parse_provider_json_body::<serde_json::Value>(body) {
+                Ok(body) => body,
+                Err(error) => return LogicalUnaryResponse::api_error(error),
+            };
+            let request = match parse_web_search_request(body) {
+                Ok(request) => request,
+                Err(error) => {
+                    return logical_web_error(error).unwrap_or_else(LogicalUnaryResponse::api_error)
+                }
+            };
+            match execute_web_search(app_state, user, request).await {
+                Ok(value) => LogicalUnaryResponse::json(StatusCode::OK, &value),
+                Err(error) => logical_web_error(error),
+            }
+        }
+        InferenceOperation::WebExtract { body } => {
+            let body = match parse_provider_json_body::<serde_json::Value>(body) {
+                Ok(body) => body,
+                Err(error) => return LogicalUnaryResponse::api_error(error),
+            };
+            let request = match parse_web_extract_request(body) {
+                Ok(request) => request,
+                Err(error) => {
+                    return logical_web_error(error).unwrap_or_else(LogicalUnaryResponse::api_error)
+                }
+            };
+            match execute_web_extract(app_state, user, request).await {
+                Ok(value) => LogicalUnaryResponse::json(StatusCode::OK, &value),
+                Err(error) => logical_web_error(error),
+            }
+        }
+    };
+
+    match result {
+        Ok(response) => response,
+        Err(error) => LogicalUnaryResponse::api_error(error),
+    }
+}
+
+fn logical_web_error(error: WebRouteError) -> Result<LogicalUnaryResponse, ApiError> {
+    let (status, body) = error.into_logical_parts();
+    LogicalUnaryResponse::json(status, &body)
+}
+
+fn canonical_api_key_hash(mut credential: SensitiveBytes) -> Result<Zeroizing<String>, ApiError> {
+    let bytes = std::mem::take(&mut *credential);
+    let value = match String::from_utf8(bytes) {
+        Ok(value) => Zeroizing::new(value),
+        Err(error) => {
+            let mut bytes = error.into_bytes();
+            bytes.zeroize();
+            return Err(ApiError::Unauthorized);
+        }
+    };
+    let key_id = uuid::Uuid::parse_str(&value).map_err(|_| ApiError::Unauthorized)?;
+    let canonical = Zeroizing::new(key_id.hyphenated().to_string());
+    Ok(Zeroizing::new(hex::encode(Sha256::digest(
+        canonical.as_bytes(),
+    ))))
 }
 
 fn bound_user_error_outcome(
@@ -3453,6 +4039,14 @@ fn parse_conversation_json_body<T: DeserializeOwned>(body: SensitiveBytes) -> Re
     }
 }
 
+fn parse_provider_json_body<T: DeserializeOwned>(body: SensitiveBytes) -> Result<T, ApiError> {
+    match validate_json_shape(&body) {
+        Ok(()) => parse_json_body(body),
+        Err(JsonShapeError::TooLarge) => Err(ApiError::PayloadTooLarge),
+        Err(JsonShapeError::Malformed) => Err(ApiError::BadRequest),
+    }
+}
+
 fn parse_logical_query<T: DeserializeOwned>(query: Option<String>) -> Result<T, ApiError> {
     let path_and_query = match query {
         Some(query) => format!("/?{query}"),
@@ -3494,6 +4088,7 @@ fn finish_user_binding(
     authentication: AuthenticationReservation,
     monotonic_now: Instant,
     response_kind: UserAuthResponseKind,
+    cache_namespace_root: CacheNamespaceRoot,
 ) -> ApplicationOutcome {
     let issued =
         match issue_transport_v2_user_tokens(&verified.user, &verified.auth_context, app_state) {
@@ -3542,7 +4137,11 @@ fn finish_user_binding(
         Err(error) => return ApplicationOutcome::error(error),
     };
 
-    let authority = BoundAuthority::verified_user(&verified, authentication_expires_at);
+    let cache_namespace =
+        derive_tinfoil_cache_namespace(&cache_namespace_root, verified.user.get_id());
+    drop(cache_namespace_root);
+    let authority =
+        BoundAuthority::verified_user(&verified, authentication_expires_at, cache_namespace);
     if authentication.commit_at(authority, monotonic_now).is_err() {
         return ApplicationOutcome::error(ApiError::InternalServerError);
     }
@@ -3570,19 +4169,27 @@ fn monotonic_authentication_expiry(
 }
 
 fn rejected_bad_request() -> OperationPreparation {
-    OperationPreparation::Rejected(LogicalUnaryResponse::protocol_error(
+    OperationPreparation::Rejected(bad_request_response())
+}
+
+fn bad_request_response() -> LogicalUnaryResponse {
+    LogicalUnaryResponse::protocol_error(
         StatusCode::BAD_REQUEST,
         "invalid_request",
         "Invalid request",
-    ))
+    )
 }
 
 fn rejected_authentication_required() -> OperationPreparation {
-    OperationPreparation::Rejected(LogicalUnaryResponse::protocol_error(
+    OperationPreparation::Rejected(authentication_required_response())
+}
+
+fn authentication_required_response() -> LogicalUnaryResponse {
+    LogicalUnaryResponse::protocol_error(
         StatusCode::UNAUTHORIZED,
         "authentication_required",
         "Authentication required",
-    ))
+    )
 }
 
 fn has_exact_json_content_type(headers: &[HeaderField]) -> bool {
@@ -3592,7 +4199,11 @@ fn has_exact_json_content_type(headers: &[HeaderField]) -> bool {
     if header.name != "content-type" {
         return false;
     }
-    let Ok(value) = std::str::from_utf8(header.value_base64.as_slice()) else {
+    is_json_content_type(header.value_base64.as_slice())
+}
+
+fn is_json_content_type(value: &[u8]) -> bool {
+    let Ok(value) = std::str::from_utf8(value) else {
         return false;
     };
     let mut parts = value.split(';');
@@ -3621,6 +4232,60 @@ fn has_exact_json_content_type(headers: &[HeaderField]) -> bool {
     true
 }
 
+fn prepare_chat_provider_headers(headers: Vec<HeaderField>) -> Result<HeaderMap, ()> {
+    let mut prepared = HeaderMap::new();
+    let mut saw_content_type = false;
+
+    for header in headers {
+        let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| ())?;
+        if is_forbidden_chat_provider_header(&name) {
+            return Err(());
+        }
+        if name == header::CONTENT_TYPE {
+            if saw_content_type || !is_json_content_type(header.value_base64.as_slice()) {
+                return Err(());
+            }
+            saw_content_type = true;
+        }
+        let mut value = HeaderValue::from_bytes(header.value_base64.as_slice()).map_err(|_| ())?;
+        value.set_sensitive(true);
+        prepared.append(name, value);
+    }
+
+    saw_content_type.then_some(prepared).ok_or(())
+}
+
+fn is_forbidden_chat_provider_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+            | "cookie"
+            | "set-cookie"
+            | "host"
+            | "content-length"
+            | "content-encoding"
+            | "accept-encoding"
+            | "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "x-session-id"
+            | "x-api-key"
+            | "api-key"
+            | "x-openai-api-key"
+            | "x-tinfoil-api-key"
+            | "x-goog-api-key"
+            | "x-anthropic-api-key"
+            | "openai-organization"
+            | "openai-project"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3635,11 +4300,15 @@ mod tests {
         body: Option<&[u8]>,
         credential: Option<Credential>,
     ) -> RequestEnvelope {
+        let cache_namespace_root_base64 = (matches!(path, "/login" | "/register")
+            || matches!(credential, Some(Credential::Resumption { .. })))
+        .then(|| CacheNamespaceRoot::from_bytes([0x30; 32]));
         RequestEnvelope {
             version: Version2,
             request_id: RequestId::from_bytes([0x31; 16]),
             response_mode: ResponseMode::Unary,
             credential,
+            cache_namespace_root_base64,
             request: LogicalRequest {
                 method,
                 path: path.to_owned(),
@@ -3657,13 +4326,29 @@ mod tests {
         }]
     }
 
+    fn logical_header_value<'a>(
+        response: &'a LogicalUnaryResponse,
+        name: &str,
+    ) -> Option<&'a [u8]> {
+        response
+            .headers
+            .iter()
+            .find(|header| header.name == name)
+            .map(|header| header.value_base64.as_slice())
+    }
+
     fn bound_user_authority() -> AuthorityState {
         let auth_context = AuthContext::new(AuthMethod::Password, 7, [0x32; 32]);
+        let cache_namespace = derive_tinfoil_cache_namespace(
+            &CacheNamespaceRoot::from_bytes([0x34; 32]),
+            uuid::Uuid::from_bytes([0x33; 16]),
+        );
         AuthorityState::Bound(BoundAuthority::user(
             uuid::Uuid::from_bytes([0x33; 16]),
             7,
             &auth_context,
             Instant::now() + std::time::Duration::from_secs(60),
+            cache_namespace,
         ))
     }
 
@@ -3995,6 +4680,10 @@ mod tests {
                 AuthorityState::Bound(BoundAuthority::api_key(
                     17,
                     uuid::Uuid::from_bytes([0x43; 16]),
+                    derive_tinfoil_cache_namespace(
+                        &CacheNamespaceRoot::from_bytes([0x44; 32]),
+                        uuid::Uuid::from_bytes([0x43; 16]),
+                    ),
                 )),
             ),
             OperationPreparation::Rejected(response)
@@ -5401,6 +6090,51 @@ mod tests {
     }
 
     #[test]
+    fn coded_api_errors_preserve_the_established_error_contract_inside_v2() {
+        let response = LogicalUnaryResponse::api_error(ApiError::SessionNotFound);
+
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.body.as_ref().map(|body| body.as_slice()),
+            Some(br#"{"status":400,"message":"Bad Request"}"#.as_slice())
+        );
+        assert_eq!(response.headers.len(), 3);
+        assert_eq!(
+            logical_header_value(&response, "content-type"),
+            Some(JSON_CONTENT_TYPE)
+        );
+        assert_eq!(
+            logical_header_value(&response, ERROR_CONTRACT_HEADER),
+            Some(b"1".as_slice())
+        );
+        assert_eq!(
+            logical_header_value(&response, ERROR_CODE_HEADER),
+            Some(b"session_not_found".as_slice())
+        );
+    }
+
+    #[test]
+    fn uncoded_api_errors_include_only_the_established_contract_header_inside_v2() {
+        let response = LogicalUnaryResponse::api_error(ApiError::BadRequest);
+
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.body.as_ref().map(|body| body.as_slice()),
+            Some(br#"{"status":400,"message":"Bad Request"}"#.as_slice())
+        );
+        assert_eq!(response.headers.len(), 2);
+        assert_eq!(
+            logical_header_value(&response, "content-type"),
+            Some(JSON_CONTENT_TYPE)
+        );
+        assert_eq!(
+            logical_header_value(&response, ERROR_CONTRACT_HEADER),
+            Some(b"1".as_slice())
+        );
+        assert_eq!(logical_header_value(&response, ERROR_CODE_HEADER), None);
+    }
+
+    #[test]
     fn api_key_list_keeps_existing_json_wire_shape() {
         use crate::web::protected_routes::{ApiKeyInfo, ListApiKeysResponse};
 
@@ -5842,6 +6576,606 @@ mod tests {
         assert!(matches!(
             validate_encrypted_data_base64_length(MAX_ENCRYPTED_DATA_BASE64_BYTES + 1),
             Err(ApiError::PayloadTooLarge)
+        ));
+    }
+
+    fn api_key_credential(value: &[u8]) -> Credential {
+        Credential::ApiKey {
+            value_base64: EncodedBytes::from_bytes(value.to_vec()),
+        }
+    }
+
+    fn api_key_binding_envelope(
+        method: LogicalMethod,
+        path: &str,
+        headers: Vec<HeaderField>,
+        body: Option<&[u8]>,
+    ) -> RequestEnvelope {
+        let mut request = envelope(
+            method,
+            path,
+            headers,
+            body,
+            Some(api_key_credential(b"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")),
+        );
+        request.cache_namespace_root_base64 = Some(CacheNamespaceRoot::from_bytes([0xa1; 32]));
+        request
+    }
+
+    fn bound_api_key_authority() -> AuthorityState {
+        let user_id = uuid::Uuid::from_bytes([0xa2; 16]);
+        let cache_namespace =
+            derive_tinfoil_cache_namespace(&CacheNamespaceRoot::from_bytes([0xa3; 32]), user_id);
+        AuthorityState::Bound(BoundAuthority::api_key(17, user_id, cache_namespace))
+    }
+
+    fn bound_platform_authority() -> AuthorityState {
+        AuthorityState::Bound(BoundAuthority::platform(
+            uuid::Uuid::from_bytes([0xa4; 16]),
+            Instant::now() + std::time::Duration::from_secs(60),
+        ))
+    }
+
+    fn inference_kind(operation: &InferenceOperation) -> &'static str {
+        match operation {
+            InferenceOperation::Models => "models",
+            InferenceOperation::ModelCatalog => "catalog",
+            InferenceOperation::Chat { .. } => "chat",
+            InferenceOperation::TextToSpeech { .. } => "speech",
+            InferenceOperation::Transcription { .. } => "transcription",
+            InferenceOperation::Embeddings { .. } => "embeddings",
+            InferenceOperation::WebSearch { .. } => "web-search",
+            InferenceOperation::WebExtract { .. } => "web-extract",
+        }
+    }
+
+    fn rejected_status(preparation: OperationPreparation) -> StatusCode {
+        match preparation {
+            OperationPreparation::Rejected(response) => response.status,
+            OperationPreparation::Unsupported => panic!("expected a classified rejection"),
+            OperationPreparation::Ready(_) => panic!("expected the request to be rejected"),
+        }
+    }
+
+    #[test]
+    fn exact_eight_route_unary_inference_matrix_is_classified_and_reserved() {
+        let cases = [
+            (
+                envelope(LogicalMethod::Get, "/v1/models", Vec::new(), None, None),
+                AuthorityState::Anonymous,
+                "models",
+                true,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Get,
+                    "/v1/models/catalog",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                bound_user_authority(),
+                "catalog",
+                false,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Post,
+                    "/v1/chat/completions",
+                    json_header(),
+                    Some(br#"{"model":"model","messages":[]}"#),
+                    None,
+                ),
+                bound_user_authority(),
+                "chat",
+                false,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Post,
+                    "/v1/audio/speech",
+                    json_header(),
+                    Some(br#"{"model":"model","input":"hello","voice":"alloy"}"#),
+                    None,
+                ),
+                bound_user_authority(),
+                "speech",
+                false,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Post,
+                    "/v1/audio/transcriptions",
+                    json_header(),
+                    Some(br#"{"model":"model","file":"AA=="}"#),
+                    None,
+                ),
+                bound_user_authority(),
+                "transcription",
+                false,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Post,
+                    "/v1/embeddings",
+                    json_header(),
+                    Some(br#"{"model":"model","input":"hello"}"#),
+                    None,
+                ),
+                bound_user_authority(),
+                "embeddings",
+                false,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Post,
+                    "/v1/web/search",
+                    json_header(),
+                    Some(br#"{"query":"maple"}"#),
+                    None,
+                ),
+                bound_user_authority(),
+                "web-search",
+                false,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Post,
+                    "/v1/web/extract",
+                    json_header(),
+                    Some(br#"{"urls":["https://example.com/"]}"#),
+                    None,
+                ),
+                bound_user_authority(),
+                "web-extract",
+                false,
+            ),
+        ];
+
+        for (request, authority, expected_kind, expects_public_authority) in cases {
+            let OperationPreparation::Ready(operation) = prepare_user_operation(request, authority)
+            else {
+                panic!("{expected_kind} must be admitted by the exact unary matrix");
+            };
+            assert!(
+                operation.requires_provider_output_reservation(),
+                "{expected_kind} must reserve bounded provider-output capacity"
+            );
+            let UserOperation::Inference {
+                authority,
+                operation,
+            } = operation
+            else {
+                panic!("{expected_kind} must classify as inference");
+            };
+            assert_eq!(inference_kind(&operation), expected_kind);
+            assert_eq!(
+                matches!(authority, InferenceAuthority::Public),
+                expects_public_authority,
+                "only the public models route may use public authority"
+            );
+            if !expects_public_authority {
+                assert!(matches!(authority, InferenceAuthority::User(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn exact_five_route_api_key_first_binding_matrix_requires_transition() {
+        let cases = [
+            (
+                api_key_binding_envelope(
+                    LogicalMethod::Get,
+                    "/v1/models/catalog",
+                    Vec::new(),
+                    None,
+                ),
+                "catalog",
+            ),
+            (
+                api_key_binding_envelope(
+                    LogicalMethod::Post,
+                    "/v1/chat/completions",
+                    json_header(),
+                    Some(br#"{"model":"model","messages":[]}"#),
+                ),
+                "chat",
+            ),
+            (
+                api_key_binding_envelope(
+                    LogicalMethod::Post,
+                    "/v1/audio/speech",
+                    json_header(),
+                    Some(br#"{"model":"model","input":"hello","voice":"alloy"}"#),
+                ),
+                "speech",
+            ),
+            (
+                api_key_binding_envelope(
+                    LogicalMethod::Post,
+                    "/v1/audio/transcriptions",
+                    json_header(),
+                    Some(br#"{"model":"model","file":"AA=="}"#),
+                ),
+                "transcription",
+            ),
+            (
+                api_key_binding_envelope(
+                    LogicalMethod::Post,
+                    "/v1/embeddings",
+                    json_header(),
+                    Some(br#"{"model":"model","input":"hello"}"#),
+                ),
+                "embeddings",
+            ),
+        ];
+
+        for (request, expected_kind) in cases {
+            let OperationPreparation::Ready(operation) =
+                prepare_user_operation(request, AuthorityState::Anonymous)
+            else {
+                panic!("{expected_kind} must admit an encrypted first-use API key");
+            };
+            assert!(operation.requires_authentication_transition());
+            assert!(operation.requires_provider_output_reservation());
+            let UserOperation::Inference {
+                authority:
+                    InferenceAuthority::AuthenticateApiKey {
+                        credential,
+                        cache_namespace_root: _,
+                    },
+                operation,
+            } = operation
+            else {
+                panic!("{expected_kind} must classify as an API-key binding operation");
+            };
+            assert_eq!(
+                credential.as_slice(),
+                b"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+            );
+            assert_eq!(inference_kind(&operation), expected_kind);
+        }
+    }
+
+    #[test]
+    fn public_models_refuses_credentials_and_cache_roots() {
+        for mut request in [
+            envelope(
+                LogicalMethod::Get,
+                "/v1/models",
+                Vec::new(),
+                None,
+                Some(api_key_credential(b"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")),
+            ),
+            envelope(LogicalMethod::Get, "/v1/models", Vec::new(), None, None),
+        ] {
+            if request.credential.is_none() {
+                request.cache_namespace_root_base64 =
+                    Some(CacheNamespaceRoot::from_bytes([0xa5; 32]));
+            }
+            assert_eq!(
+                rejected_status(prepare_user_operation(request, AuthorityState::Anonymous)),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                envelope(
+                    LogicalMethod::Get,
+                    "/v1/models",
+                    Vec::new(),
+                    None,
+                    Some(api_key_credential(b"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",)),
+                ),
+                bound_user_authority(),
+            )),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
+    fn web_routes_are_user_only_and_reject_authentication_transplants() {
+        for path in ["/v1/web/search", "/v1/web/extract"] {
+            for authority in [
+                AuthorityState::Anonymous,
+                bound_api_key_authority(),
+                bound_platform_authority(),
+            ] {
+                assert_eq!(
+                    rejected_status(prepare_user_operation(
+                        envelope(
+                            LogicalMethod::Post,
+                            path,
+                            json_header(),
+                            Some(br#"{"query":"maple"}"#),
+                            None,
+                        ),
+                        authority,
+                    )),
+                    StatusCode::UNAUTHORIZED
+                );
+            }
+
+            let with_credential = envelope(
+                LogicalMethod::Post,
+                path,
+                json_header(),
+                Some(br#"{"query":"maple"}"#),
+                Some(api_key_credential(b"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")),
+            );
+            assert_eq!(
+                rejected_status(prepare_user_operation(
+                    with_credential,
+                    AuthorityState::Anonymous,
+                )),
+                StatusCode::BAD_REQUEST
+            );
+
+            let mut with_root = envelope(
+                LogicalMethod::Post,
+                path,
+                json_header(),
+                Some(br#"{"query":"maple"}"#),
+                None,
+            );
+            with_root.cache_namespace_root_base64 =
+                Some(CacheNamespaceRoot::from_bytes([0xa6; 32]));
+            assert_eq!(
+                rejected_status(prepare_user_operation(with_root, bound_user_authority())),
+                StatusCode::BAD_REQUEST
+            );
+        }
+    }
+
+    #[test]
+    fn cache_namespace_root_is_required_only_for_authority_binding() {
+        let mut login = envelope(
+            LogicalMethod::Post,
+            "/login",
+            json_header(),
+            Some(b"{}"),
+            None,
+        );
+        login.cache_namespace_root_base64 = None;
+        let mut register = envelope(
+            LogicalMethod::Post,
+            "/register",
+            json_header(),
+            Some(b"{}"),
+            None,
+        );
+        register.cache_namespace_root_base64 = None;
+        let mut resume = envelope(
+            LogicalMethod::Post,
+            "/refresh",
+            Vec::new(),
+            None,
+            Some(Credential::Resumption {
+                value_base64: EncodedBytes::from_bytes(b"resumption".to_vec()),
+            }),
+        );
+        resume.cache_namespace_root_base64 = None;
+        let api_key_without_root = envelope(
+            LogicalMethod::Get,
+            "/v1/models/catalog",
+            Vec::new(),
+            None,
+            Some(api_key_credential(b"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")),
+        );
+
+        for request in [login, register, resume, api_key_without_root] {
+            assert_eq!(
+                rejected_status(prepare_user_operation(request, AuthorityState::Anonymous)),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        let mut protected_transplant = envelope(
+            LogicalMethod::Get,
+            "/protected/user",
+            Vec::new(),
+            None,
+            None,
+        );
+        protected_transplant.cache_namespace_root_base64 =
+            Some(CacheNamespaceRoot::from_bytes([0xa7; 32]));
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                protected_transplant,
+                bound_user_authority(),
+            )),
+            StatusCode::BAD_REQUEST
+        );
+
+        for authority in [bound_user_authority(), bound_api_key_authority()] {
+            let follow_up = envelope(
+                LogicalMethod::Get,
+                "/v1/models/catalog",
+                Vec::new(),
+                None,
+                None,
+            );
+            assert!(matches!(
+                prepare_user_operation(follow_up, authority),
+                OperationPreparation::Ready(UserOperation::Inference { .. })
+            ));
+        }
+
+        let mut user_root_transplant = envelope(
+            LogicalMethod::Get,
+            "/v1/models/catalog",
+            Vec::new(),
+            None,
+            None,
+        );
+        user_root_transplant.cache_namespace_root_base64 =
+            Some(CacheNamespaceRoot::from_bytes([0xa8; 32]));
+        let mut api_key_root_transplant = envelope(
+            LogicalMethod::Get,
+            "/v1/models/catalog",
+            Vec::new(),
+            None,
+            None,
+        );
+        api_key_root_transplant.cache_namespace_root_base64 =
+            Some(CacheNamespaceRoot::from_bytes([0xa9; 32]));
+
+        for (authority, request) in [
+            (
+                bound_user_authority(),
+                envelope(
+                    LogicalMethod::Get,
+                    "/v1/models/catalog",
+                    Vec::new(),
+                    None,
+                    Some(api_key_credential(b"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")),
+                ),
+            ),
+            (bound_user_authority(), user_root_transplant),
+            (
+                bound_api_key_authority(),
+                envelope(
+                    LogicalMethod::Get,
+                    "/v1/models/catalog",
+                    Vec::new(),
+                    None,
+                    Some(api_key_credential(b"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")),
+                ),
+            ),
+            (bound_api_key_authority(), api_key_root_transplant),
+        ] {
+            assert_eq!(
+                rejected_status(prepare_user_operation(request, authority)),
+                StatusCode::CONFLICT
+            );
+        }
+    }
+
+    #[test]
+    fn chat_classifier_rejects_non_unary_mode_missing_body_and_unsafe_headers() {
+        let mut streaming = envelope(
+            LogicalMethod::Post,
+            "/v1/chat/completions",
+            json_header(),
+            Some(br#"{"stream":true}"#),
+            None,
+        );
+        streaming.response_mode = ResponseMode::Stream;
+        assert!(matches!(
+            prepare_user_operation(streaming, bound_user_authority()),
+            OperationPreparation::Rejected(_)
+        ));
+
+        for body in [None, Some(&b""[..])] {
+            assert!(matches!(
+                prepare_user_operation(
+                    envelope(
+                        LogicalMethod::Post,
+                        "/v1/chat/completions",
+                        json_header(),
+                        body,
+                        None,
+                    ),
+                    bound_user_authority(),
+                ),
+                OperationPreparation::Rejected(_)
+            ));
+        }
+
+        for forbidden in [
+            "authorization",
+            "proxy-authorization",
+            "proxy-authenticate",
+            "cookie",
+            "set-cookie",
+            "host",
+            "content-length",
+            "content-encoding",
+            "accept-encoding",
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "x-session-id",
+            "x-api-key",
+            "api-key",
+            "x-openai-api-key",
+            "x-tinfoil-api-key",
+            "x-goog-api-key",
+            "x-anthropic-api-key",
+            "openai-organization",
+            "openai-project",
+        ] {
+            let mut headers = json_header();
+            headers.push(HeaderField {
+                name: forbidden.to_owned(),
+                value_base64: EncodedBytes::from_bytes(b"opaque".to_vec()),
+            });
+            assert!(
+                prepare_chat_provider_headers(headers).is_err(),
+                "{forbidden} must never cross the provider boundary"
+            );
+        }
+
+        let duplicate_content_type = vec![json_header()[0].clone(), json_header()[0].clone()];
+        assert!(prepare_chat_provider_headers(duplicate_content_type).is_err());
+        assert!(prepare_chat_provider_headers(vec![HeaderField {
+            name: "invalid header name".to_owned(),
+            value_base64: EncodedBytes::from_bytes(b"opaque".to_vec()),
+        }])
+        .is_err());
+
+        let safe_headers = vec![
+            json_header()[0].clone(),
+            HeaderField {
+                name: "x-client-hint".to_owned(),
+                value_base64: EncodedBytes::from_bytes(b"first".to_vec()),
+            },
+            HeaderField {
+                name: "x-client-hint".to_owned(),
+                value_base64: EncodedBytes::from_bytes(b"second".to_vec()),
+            },
+        ];
+        let prepared =
+            prepare_chat_provider_headers(safe_headers).expect("safe opaque headers are retained");
+        let values = prepared
+            .get_all("x-client-hint")
+            .iter()
+            .map(|value| value.as_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![&b"first"[..], &b"second"[..]]);
+        assert!(prepared
+            .get_all("x-client-hint")
+            .iter()
+            .all(HeaderValue::is_sensitive));
+    }
+
+    #[test]
+    fn canonical_api_key_hash_matches_v1_uuid_canonicalization() {
+        let parsed = uuid::Uuid::parse_str("AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE").unwrap();
+        let expected = hex::encode(Sha256::digest(parsed.to_string().as_bytes()));
+
+        for representation in [
+            parsed.to_string(),
+            parsed.to_string().to_ascii_uppercase(),
+            parsed.simple().to_string(),
+        ] {
+            let hash = canonical_api_key_hash(Zeroizing::new(representation.into_bytes()))
+                .expect("all UUID spellings accepted by v1 canonicalize identically");
+            assert_eq!(&*hash, &expected);
+        }
+
+        assert!(matches!(
+            canonical_api_key_hash(Zeroizing::new(vec![0xff])),
+            Err(ApiError::Unauthorized)
+        ));
+        assert!(matches!(
+            canonical_api_key_hash(Zeroizing::new(b"not-a-uuid".to_vec())),
+            Err(ApiError::Unauthorized)
         ));
     }
 }

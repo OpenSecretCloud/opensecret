@@ -20,6 +20,7 @@ use crate::bounded_json::BoundedJsonBuffer;
 use crate::jwt::{
     issue_transport_v2_user_tokens, validate_transport_v2_user_resumption, AuthContext,
 };
+use crate::kv::StoreError;
 use crate::web::login_routes::{
     authenticate_login, register_and_authenticate, AuthResponse, Credentials, RefreshResponse,
     RegisterCredentials,
@@ -49,6 +50,7 @@ const MAX_ENCRYPTED_DATA_BASE64_BYTES: usize =
     ((EnvelopeLimits::DEFAULT.logical_body_bytes - ENCRYPTED_DATA_JSON_OVERHEAD_BYTES) / 4) * 4;
 const MAX_ENCRYPTION_PLAINTEXT_BYTES: usize =
     (MAX_ENCRYPTED_DATA_BASE64_BYTES / 4) * 3 - AES_GCM_NONCE_AND_TAG_BYTES;
+const MAX_V2_KV_LIST_ROWS: usize = 65_536;
 
 type SensitiveBytes = Zeroizing<Vec<u8>>;
 
@@ -101,6 +103,10 @@ pub(crate) enum ProtectedUserOperation {
         key: Zeroizing<String>,
         body: SensitiveBytes,
     },
+    GetKv {
+        key: Zeroizing<String>,
+    },
+    ListKv,
     DeleteKv {
         key: Zeroizing<String>,
     },
@@ -119,6 +125,16 @@ impl UserOperation {
         matches!(
             self,
             Self::Login { .. } | Self::Register { .. } | Self::Resume { .. }
+        )
+    }
+
+    pub(crate) const fn requires_stored_output_reservation(&self) -> bool {
+        matches!(
+            self,
+            Self::Protected {
+                operation: ProtectedUserOperation::GetKv { .. } | ProtectedUserOperation::ListKv,
+                ..
+            }
         )
     }
 }
@@ -244,6 +260,8 @@ pub(crate) fn prepare_user_operation(
         IssueThirdPartyToken,
         EncryptData,
         DecryptData,
+        GetKv,
+        ListKv,
         PutKv,
         DeleteKv,
         DeleteAllKv,
@@ -268,7 +286,9 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Post, "/protected/third_party_token") => Some(Route::IssueThirdPartyToken),
         (LogicalMethod::Post, "/protected/encrypt") => Some(Route::EncryptData),
         (LogicalMethod::Post, "/protected/decrypt") => Some(Route::DecryptData),
+        (LogicalMethod::Get, "/protected/kv") => Some(Route::ListKv),
         (LogicalMethod::Delete, "/protected/kv") => Some(Route::DeleteAllKv),
+        (LogicalMethod::Get, _) if kv_key.is_some() => Some(Route::GetKv),
         (LogicalMethod::Put, _) if kv_key.is_some() => Some(Route::PutKv),
         (LogicalMethod::Delete, _) if kv_key.is_some() => Some(Route::DeleteKv),
         _ => None,
@@ -428,6 +448,30 @@ pub(crate) fn prepare_user_operation(
             let operation = ProtectedUserOperation::PutKv {
                 key: kv_key.expect("classified KV item route must have a decoded key"),
                 body: Zeroizing::new(body),
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation,
+            })
+        }
+        Route::GetKv | Route::ListKv => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            let operation = if matches!(route, Route::GetKv) {
+                ProtectedUserOperation::GetKv {
+                    key: kv_key.expect("classified KV item route must have a decoded key"),
+                }
+            } else {
+                ProtectedUserOperation::ListKv
             };
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
@@ -684,6 +728,30 @@ async fn execute_protected_user_operation(
             put_kv_value(app_state, user, auth_context, &key, value.as_str()).await?;
             Ok(response)
         }
+        ProtectedUserOperation::GetKv { key } => {
+            let value = app_state
+                .get_bounded_kv(
+                    user,
+                    auth_context,
+                    &key,
+                    EnvelopeLimits::default().logical_body_bytes,
+                )
+                .await
+                .map_err(map_bounded_kv_read_error)?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value.as_deref())
+        }
+        ProtectedUserOperation::ListKv => {
+            let values = app_state
+                .list_bounded_kv(
+                    user,
+                    auth_context,
+                    EnvelopeLimits::default().logical_body_bytes,
+                    MAX_V2_KV_LIST_ROWS,
+                )
+                .await
+                .map_err(map_bounded_kv_read_error)?;
+            LogicalUnaryResponse::json(StatusCode::OK, &*values)
+        }
         ProtectedUserOperation::DeleteKv { key } => {
             let response = LogicalUnaryResponse::json(
                 StatusCode::OK,
@@ -702,6 +770,15 @@ async fn execute_protected_user_operation(
             delete_all_kv_values(app_state, user.uuid).await?;
             Ok(response)
         }
+    }
+}
+
+fn map_bounded_kv_read_error(error: StoreError) -> ApiError {
+    if matches!(error, StoreError::OutputTooLarge) {
+        ApiError::PayloadTooLarge
+    } else {
+        tracing::error!("Error reading bounded key-value output");
+        ApiError::InternalServerError
     }
 }
 
@@ -1148,20 +1225,47 @@ mod tests {
                 ..
             })
         ));
+    }
 
-        assert!(matches!(
-            prepare_user_operation(
-                envelope(
-                    LogicalMethod::Get,
-                    "/protected/kv/key%2Fpart",
-                    Vec::new(),
-                    None,
-                    None,
-                ),
-                bound_user_authority(),
+    #[test]
+    fn exact_kv_read_contracts_are_admitted_and_require_stored_output_reservation() {
+        let item = prepare_user_operation(
+            envelope(
+                LogicalMethod::Get,
+                "/protected/kv/key%2Fpart",
+                Vec::new(),
+                None,
+                None,
             ),
-            OperationPreparation::Unsupported
+            bound_user_authority(),
+        );
+        assert!(matches!(
+            &item,
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::GetKv { key },
+                ..
+            }) if &**key == "key/part"
         ));
+        let OperationPreparation::Ready(item) = item else {
+            unreachable!("validated item read must be ready");
+        };
+        assert!(item.requires_stored_output_reservation());
+
+        let list = prepare_user_operation(
+            envelope(LogicalMethod::Get, "/protected/kv", Vec::new(), None, None),
+            bound_user_authority(),
+        );
+        assert!(matches!(
+            &list,
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::ListKv,
+                ..
+            })
+        ));
+        let OperationPreparation::Ready(list) = list else {
+            unreachable!("validated list read must be ready");
+        };
+        assert!(list.requires_stored_output_reservation());
     }
 
     #[test]
@@ -1170,6 +1274,31 @@ mod tests {
         let value: KvValue = serde_json::from_slice(wire.as_bytes()).unwrap();
         assert_eq!(value.as_str(), "line\né");
         assert_eq!(serde_json::to_vec(&value).unwrap(), wire.as_bytes());
+    }
+
+    #[test]
+    fn kv_reads_keep_existing_null_string_and_list_wire_shapes() {
+        let missing = LogicalUnaryResponse::json(StatusCode::OK, &Option::<&str>::None).unwrap();
+        assert_eq!(&*missing.body.unwrap(), b"null");
+
+        let present = LogicalUnaryResponse::json(StatusCode::OK, &Some("line\né")).unwrap();
+        assert_eq!(&*present.body.unwrap(), "\"line\\né\"".as_bytes());
+
+        let empty =
+            LogicalUnaryResponse::json(StatusCode::OK, &Vec::<crate::kv::KVPair>::new()).unwrap();
+        assert_eq!(&*empty.body.unwrap(), b"[]");
+
+        let rows = vec![crate::kv::KVPair {
+            key: "key".to_owned(),
+            value: "value".to_owned(),
+            created_at: 1,
+            updated_at: 2,
+        }];
+        let list = LogicalUnaryResponse::json(StatusCode::OK, &rows).unwrap();
+        assert_eq!(
+            &*list.body.unwrap(),
+            br#"[{"key":"key","value":"value","created_at":1,"updated_at":2}]"#
+        );
     }
 
     #[test]
@@ -1450,6 +1579,41 @@ mod tests {
             ),
             OperationPreparation::Rejected(_)
         ));
+    }
+
+    #[test]
+    fn kv_reads_reject_unbound_and_transplanted_metadata() {
+        for path in ["/protected/kv/key", "/protected/kv"] {
+            assert!(matches!(
+                prepare_user_operation(
+                    envelope(LogicalMethod::Get, path, Vec::new(), None, None),
+                    AuthorityState::Anonymous,
+                ),
+                OperationPreparation::Rejected(_)
+            ));
+
+            let mut query = envelope(LogicalMethod::Get, path, Vec::new(), None, None);
+            query.request.query = Some("x=1".to_owned());
+            for request in [
+                envelope(LogicalMethod::Get, path, json_header(), None, None),
+                envelope(LogicalMethod::Get, path, Vec::new(), Some(b""), None),
+                query,
+                envelope(
+                    LogicalMethod::Get,
+                    path,
+                    Vec::new(),
+                    None,
+                    Some(Credential::ApiKey {
+                        value_base64: EncodedBytes::from_bytes(b"key".to_vec()),
+                    }),
+                ),
+            ] {
+                assert!(matches!(
+                    prepare_user_operation(request, bound_user_authority()),
+                    OperationPreparation::Rejected(_)
+                ));
+            }
+        }
     }
 
     #[test]

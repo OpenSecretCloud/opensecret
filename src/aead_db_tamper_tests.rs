@@ -368,6 +368,192 @@ async fn db_copied_kv_rows_do_not_decrypt_under_attacker_auth_context() {
 
 #[tokio::test]
 #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_bounded_kv_reads_preserve_wire_data_and_enforce_limits() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let owner_email = format!("aead-bounded-kv-owner-{marker}@example.com");
+    let other_email = format!("aead-bounded-kv-other-{marker}@example.com");
+    let owner_password = test_credential("bounded-kv-owner");
+    let other_password = test_credential("bounded-kv-other");
+
+    let owner =
+        create_password_wrapped_user(&app_state, project.id, owner_email.clone(), owner_password)
+            .await;
+    let other =
+        create_password_wrapped_user(&app_state, project.id, other_email.clone(), other_password)
+            .await;
+
+    let owner_login = app_state
+        .authenticate_user(
+            Some(owner_email),
+            None,
+            owner_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("owner login should not error")
+        .expect("owner password should verify and unwrap");
+    let other_login = app_state
+        .authenticate_user(
+            Some(other_email),
+            None,
+            other_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("other-user login should not error")
+        .expect("other-user password should verify and unwrap");
+
+    let entries = [
+        ("bounded-kv-alpha", "first value"),
+        ("bounded-kv-beta", "quoted \"value\" and snowman ☃"),
+    ];
+    for (key, value) in entries {
+        app_state
+            .put(&owner_login.user, &owner_login.auth_context, key, value)
+            .await
+            .expect("owner KV insert should succeed");
+    }
+
+    let present = app_state
+        .get_bounded_kv(
+            &owner_login.user,
+            &owner_login.auth_context,
+            entries[1].0,
+            entries[1].1.len(),
+        )
+        .await
+        .expect("bounded GET at the exact plaintext limit should succeed")
+        .expect("stored owner value should be present");
+    assert_eq!(present.as_str(), entries[1].1);
+
+    let missing = app_state
+        .get_bounded_kv(
+            &owner_login.user,
+            &owner_login.auth_context,
+            "bounded-kv-missing",
+            0,
+        )
+        .await
+        .expect("bounded GET for a missing key should succeed");
+    assert!(
+        missing.is_none(),
+        "missing bounded GET should preserve null semantics"
+    );
+
+    let undersized_get = app_state
+        .get_bounded_kv(
+            &owner_login.user,
+            &owner_login.auth_context,
+            entries[1].0,
+            entries[1].1.len() - 1,
+        )
+        .await;
+    assert!(matches!(
+        undersized_get,
+        Err(crate::kv::StoreError::OutputTooLarge)
+    ));
+
+    let aggregate_plaintext_len = entries
+        .iter()
+        .map(|(key, value)| key.len() + value.len())
+        .sum();
+    let mut bounded_list = app_state
+        .list_bounded_kv(
+            &owner_login.user,
+            &owner_login.auth_context,
+            aggregate_plaintext_len,
+            entries.len(),
+        )
+        .await
+        .expect("bounded LIST at the exact aggregate limit should succeed");
+    let mut legacy_list = app_state
+        .list(&owner_login.user, &owner_login.auth_context)
+        .await
+        .expect("legacy LIST comparison should succeed");
+
+    bounded_list.sort_by(|left, right| left.key.cmp(&right.key));
+    legacy_list.sort_by(|left, right| left.key.cmp(&right.key));
+    assert_eq!(bounded_list.len(), entries.len());
+    assert_eq!(bounded_list.len(), legacy_list.len());
+    for (actual, expected) in bounded_list.iter().zip(&legacy_list) {
+        assert_eq!(actual.key, expected.key);
+        assert_eq!(actual.value, expected.value);
+        assert_eq!(actual.created_at, expected.created_at);
+        assert_eq!(actual.updated_at, expected.updated_at);
+        assert!(actual.created_at > 0);
+        assert!(actual.updated_at >= actual.created_at);
+        assert_eq!(
+            serde_json::to_value(actual).expect("bounded KV pair should serialize"),
+            serde_json::json!({
+                "key": expected.key,
+                "value": expected.value,
+                "created_at": expected.created_at,
+                "updated_at": expected.updated_at,
+            })
+        );
+    }
+
+    let undersized_list = app_state
+        .list_bounded_kv(
+            &owner_login.user,
+            &owner_login.auth_context,
+            aggregate_plaintext_len - 1,
+            entries.len(),
+        )
+        .await;
+    assert!(matches!(
+        undersized_list,
+        Err(crate::kv::StoreError::OutputTooLarge)
+    ));
+
+    let row_limited_list = app_state
+        .list_bounded_kv(
+            &owner_login.user,
+            &owner_login.auth_context,
+            aggregate_plaintext_len,
+            entries.len() - 1,
+        )
+        .await;
+    assert!(matches!(
+        row_limited_list,
+        Err(crate::kv::StoreError::OutputTooLarge)
+    ));
+
+    let other_get = app_state
+        .get_bounded_kv(
+            &other_login.user,
+            &other_login.auth_context,
+            entries[0].0,
+            entries[0].1.len(),
+        )
+        .await
+        .expect("cross-user bounded GET should not error");
+    assert!(
+        other_get.is_none(),
+        "bounded GET must remain scoped to its user"
+    );
+    let other_list = app_state
+        .list_bounded_kv(&other_login.user, &other_login.auth_context, 0, 0)
+        .await
+        .expect("empty cross-user bounded LIST should succeed");
+    assert!(
+        other_list.is_empty(),
+        "bounded LIST must remain scoped to its user"
+    );
+
+    let _ = app_state.db.delete_user(&owner);
+    let _ = app_state.db.delete_user(&other);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
 async fn db_password_change_invalidates_old_auth_context_and_preserves_seed() {
     let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
         eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");

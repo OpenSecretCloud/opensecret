@@ -1884,6 +1884,26 @@ impl AppState {
         kv::get(self.db.get_pool(), user.uuid, key, &user_key)
     }
 
+    async fn get_bounded_kv(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+        key: &str,
+        logical_body_limit: usize,
+    ) -> StoreResult<Option<zeroize::Zeroizing<String>>> {
+        let user_key = self
+            .get_user_key(user, auth_context, None, None)
+            .await
+            .map_err(|_| StoreError::Unauthorized)?;
+        kv::get_bounded(
+            self.db.get_pool(),
+            user.uuid,
+            key,
+            &user_key,
+            logical_body_limit,
+        )
+    }
+
     async fn put(
         &self,
         user: &User,
@@ -1924,6 +1944,26 @@ impl AppState {
             .await
             .map_err(|_| StoreError::Unauthorized)?;
         kv::list(self.db.get_pool(), user.uuid, &user_key)
+    }
+
+    async fn list_bounded_kv(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+        logical_body_limit: usize,
+        row_limit: usize,
+    ) -> StoreResult<zeroize::Zeroizing<Vec<KVPair>>> {
+        let user_key = self
+            .get_user_key(user, auth_context, None, None)
+            .await
+            .map_err(|_| StoreError::Unauthorized)?;
+        kv::list_bounded(
+            self.db.get_pool(),
+            user.uuid,
+            &user_key,
+            logical_body_limit,
+            row_limit,
+        )
     }
 
     pub async fn get_aws_credentials(&self) -> Option<AwsCredentials> {

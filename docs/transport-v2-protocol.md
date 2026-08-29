@@ -671,9 +671,15 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
    transport-neutral helpers. Preserve existing response and error behavior,
    claim replay identifiers before every mutation, sanitize storage errors, and
    wipe decoded keys and values. GET item and list remain unsupported here.
-10. **Bounded KV reads**: project GET item and list only after ciphertext/output
-   admission and bounded row processing prevent a tiny request from building an
-   unbounded decrypted result in enclave memory.
+10. **Bounded KV reads**: project GET item and list through a v2-only,
+   read-only repeatable-read storage seam. Promote each admitted read to a
+   conservative 200 MiB reservation from the shared 256 MiB request/response
+   pool before replay claim or dispatch; contention returns an authenticated
+   503 without consuming the request identifier. Bound item ciphertext, list
+   aggregate plaintext, and list rows before loading narrow ciphertext
+   projections, then retain the merged reservation through final HTTP body
+   consumption. Preserve `null`, string, bare-array, timestamp, ordering, and
+   whole-list failure behavior from v1 while leaving every v1 query untouched.
 11. **Remaining protected user operations**: project account-lifecycle and user
    API-key-management families in reviewable sub-stacks. Password/account
    deletion must explicitly close the now-invalid bound session.

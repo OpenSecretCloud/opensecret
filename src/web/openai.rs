@@ -11,7 +11,9 @@ use crate::provider_routing::{ProviderName, ProviderRoutingError};
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
-use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
+use crate::web::encryption_middleware::{
+    decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
+};
 use crate::web::openai_auth::AuthMethod;
 use crate::web::responses::{ResponseExecution, ResponseExecutionTaskGuard};
 use crate::{ApiError, AppState};
@@ -755,7 +757,7 @@ pub fn models_router(app_state: Arc<AppState>) -> Router<()> {
 async fn proxy_openai(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(auth_method): axum::Extension<AuthMethod>,
     axum::Extension(mut body): axum::Extension<Value>,
@@ -1785,12 +1787,12 @@ fn build_usage_event(
 /// Helper to encrypt an SSE event
 async fn encrypt_sse_event(
     state: &AppState,
-    session_id: &Uuid,
+    transport_session: &TransportSession,
     json: &Value,
 ) -> Result<Event, ApiError> {
     let json_str = json.to_string();
-    let encrypted_data = state
-        .encrypt_session_data(session_id, json_str.as_bytes())
+    let encrypted_data = transport_session
+        .encrypt_response_bytes(state, json_str.as_bytes())
         .await
         .map_err(|e| {
             error!("Failed to encrypt SSE event data: {:?}", e);
@@ -1803,7 +1805,7 @@ async fn encrypt_sse_event(
 
 async fn proxy_models(
     State(state): State<Arc<AppState>>,
-    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(session_id): axum::Extension<TransportSession>,
     user: Option<axum::Extension<User>>,
 ) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
     let _ = user;
@@ -1865,7 +1867,7 @@ async fn fetch_provider_models(
 async fn proxy_model_catalog(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
-    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(_body): axum::Extension<()>,
@@ -1980,7 +1982,7 @@ async fn send_transcription_with_retries(
 async fn proxy_transcription(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
-    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(transcription_request): axum::Extension<TranscriptionRequest>,
@@ -2385,7 +2387,7 @@ async fn ensure_paid_tts_access(state: &AppState, user: &User) -> Result<(), Api
 
 async fn proxy_tts(
     State(state): State<Arc<AppState>>,
-    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(tts_request): axum::Extension<TTSRequest>,
@@ -2478,7 +2480,7 @@ async fn proxy_tts(
 async fn proxy_embeddings(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
-    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(embedding_request): axum::Extension<EmbeddingRequest>,

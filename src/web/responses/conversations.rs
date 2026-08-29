@@ -7,7 +7,9 @@ use crate::{
     models::responses::{ConversationProjectFilter, NewConversation},
     models::users::User,
     web::{
-        encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+        encryption_middleware::{
+            decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
+        },
         responses::{
             constants::{
                 self, DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT,
@@ -382,7 +384,7 @@ fn build_conversation_response(
 /// POST /v1/conversations - Create a new conversation
 async fn create_conversation(
     State(state): State<Arc<AppState>>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<CreateConversationRequest>,
@@ -467,7 +469,7 @@ async fn create_conversation(
 async fn get_conversation(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationResponse>>, ApiError> {
@@ -489,7 +491,7 @@ async fn get_conversation(
 async fn update_conversation(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<UpdateConversationRequest>,
@@ -552,7 +554,7 @@ async fn update_conversation(
 async fn delete_conversation(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
@@ -574,7 +576,7 @@ async fn list_conversation_items(
     State(state): State<Arc<AppState>>,
     Path(conversation_id): Path<Uuid>,
     Query(params): Query<ListItemsParams>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationItemListResponse>>, ApiError> {
@@ -640,7 +642,7 @@ async fn list_conversation_items(
 async fn get_conversation_item(
     State(state): State<Arc<AppState>>,
     Path((conversation_id, item_id)): Path<(Uuid, Uuid)>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationItem>>, ApiError> {
@@ -675,7 +677,7 @@ async fn get_conversation_item(
 async fn list_conversations(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListConversationsParams>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationListResponse>>, ApiError> {
@@ -750,7 +752,7 @@ async fn list_conversations(
 /// DELETE /v1/conversations - Delete all conversations
 async fn delete_all_conversations(
     State(state): State<Arc<AppState>>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     state
@@ -772,7 +774,7 @@ const MAX_CONVERSATION_BATCH_SIZE: usize = 20;
 /// POST /v1/conversations/batch-delete - Delete multiple specific conversations
 async fn batch_delete_conversations(
     State(state): State<Arc<AppState>>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(body): Extension<BatchDeleteConversationsRequest>,
 ) -> Result<Json<EncryptedResponse<BatchDeleteConversationsResponse>>, ApiError> {
@@ -833,7 +835,7 @@ async fn batch_delete_conversations(
 /// POST /v1/conversations/batch-update-project - Update project assignment for multiple conversations
 async fn batch_update_conversation_project(
     State(state): State<Arc<AppState>>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(body): Extension<BatchUpdateConversationProjectRequest>,
 ) -> Result<Json<EncryptedResponse<BatchUpdateConversationProjectResponse>>, ApiError> {

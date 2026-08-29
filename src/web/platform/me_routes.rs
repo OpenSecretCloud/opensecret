@@ -2,7 +2,9 @@ use crate::{
     email::send_platform_verification_email,
     models::platform_email_verification::NewPlatformEmailVerification,
     models::platform_users::PlatformUser,
-    web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+    web::encryption_middleware::{
+        decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
+    },
     ApiError, AppState,
 };
 use axum::{
@@ -16,7 +18,6 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::spawn;
 use tracing::error;
-use uuid::Uuid;
 use validator::Validate;
 
 use super::common::{MeResponse, OrgResponse, PlatformUserResponse};
@@ -63,7 +64,7 @@ pub fn router(app_state: Arc<AppState>) -> Router {
 async fn get_platform_user(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<MeResponse>>, ApiError> {
     // Check if email is verified
     let email_verified = match data
@@ -130,7 +131,7 @@ async fn get_platform_user(
 async fn request_platform_verification(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     // Check if the user is already verified
     match data
@@ -200,7 +201,7 @@ pub async fn platform_change_password(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Extension(change_request): Extension<PlatformChangePasswordRequest>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     // Validate request
     if let Err(errors) = change_request.validate() {

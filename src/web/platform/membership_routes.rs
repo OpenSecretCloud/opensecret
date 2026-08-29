@@ -3,7 +3,9 @@ use crate::{
         org_memberships::{OrgMembershipError, OrgRole},
         platform_users::PlatformUser,
     },
-    web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+    web::encryption_middleware::{
+        decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
+    },
     ApiError, AppState, DBError,
 };
 use axum::{
@@ -44,7 +46,7 @@ async fn list_memberships(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path(org_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<Vec<MembershipResponse>>>, ApiError> {
     debug!("Listing memberships");
 
@@ -87,7 +89,7 @@ async fn update_membership(
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, user_id)): Path<(Uuid, Uuid)>,
     Extension(update_request): Extension<UpdateMembershipRequest>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<MembershipResponse>>, ApiError> {
     debug!(
         "Updating membership for user {} in org {} to role {:?}",
@@ -193,7 +195,7 @@ async fn delete_membership(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, user_id)): Path<(Uuid, Uuid)>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     debug!("Deleting membership");
 

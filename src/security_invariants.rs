@@ -176,6 +176,36 @@ fn openai_compatible_routes_do_not_request_user_storage_keys() {
 }
 
 #[test]
+fn response_encryption_routes_through_transport_session() {
+    let web_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/web");
+
+    let mut direct_session_encryption = Vec::new();
+    collect_pattern_matches(
+        &web_root,
+        ".encrypt_session_data(",
+        &mut direct_session_encryption,
+    );
+    assert_eq!(
+        direct_session_encryption.len(),
+        1,
+        "response encryption must stay centralized in TransportSession:\n{}",
+        direct_session_encryption.join("\n")
+    );
+    assert!(
+        direct_session_encryption[0].contains("encryption_middleware.rs"),
+        "the sole legacy session-encryption delegate must live in encryption_middleware.rs"
+    );
+
+    let mut bare_session_extensions = Vec::new();
+    collect_pattern_matches(&web_root, "Extension<Uuid>", &mut bare_session_extensions);
+    assert!(
+        bare_session_extensions.is_empty(),
+        "handlers must receive TransportSession rather than a bare session UUID:\n{}",
+        bare_session_extensions.join("\n")
+    );
+}
+
+#[test]
 fn models_route_allows_optional_identity_but_requires_session_e2ee() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let main_source = fs::read_to_string(manifest_dir.join("src/main.rs"))
@@ -200,7 +230,7 @@ fn models_route_allows_optional_identity_but_requires_session_e2ee() {
     let handler_body = extract_function_body(&openai_source, "async fn proxy_models");
     assert!(
         openai_source.contains(
-            "async fn proxy_models(\n    State(state): State<Arc<AppState>>,\n    axum::Extension(session_id): axum::Extension<Uuid>,\n    user: Option<axum::Extension<User>>"
+            "async fn proxy_models(\n    State(state): State<Arc<AppState>>,\n    axum::Extension(session_id): axum::Extension<TransportSession>,\n    user: Option<axum::Extension<User>>"
         )
             && handler_body.contains("encrypt_response(&state, &session_id, &models_response)"),
         "the models handler must require session E2EE while allowing optional identity"

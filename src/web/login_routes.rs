@@ -5,7 +5,10 @@ use crate::{
     jwt::{validate_token, AuthContext, NewToken, TokenType},
     models::email_verification::NewEmailVerification,
 };
-use crate::{jwt::USER_REFRESH, web::encryption_middleware::EncryptedResponse};
+use crate::{
+    jwt::USER_REFRESH,
+    web::encryption_middleware::{EncryptedResponse, TransportSession},
+};
 use crate::{
     web::encryption_middleware::{decrypt_request, encrypt_response},
     Error,
@@ -134,7 +137,7 @@ pub struct LogoutRequest {
 pub async fn login(
     State(data): State<Arc<AppState>>,
     Extension(creds): Extension<Credentials>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<AuthResponse>>, ApiError> {
     tracing::trace!("call login");
 
@@ -243,7 +246,7 @@ async fn login_internal(data: Arc<AppState>, creds: Credentials) -> Result<AuthR
 pub async fn logout(
     State(data): State<Arc<AppState>>,
     Extension(logout_request): Extension<LogoutRequest>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     info!("Logout request received");
     // TODO actually delete the refresh token
@@ -256,7 +259,7 @@ pub async fn logout(
 pub async fn register(
     State(data): State<Arc<AppState>>,
     Extension(creds): Extension<RegisterCredentials>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<AuthResponse>>, ApiError> {
     tracing::trace!("call register");
 
@@ -342,7 +345,7 @@ pub async fn handle_new_user_registration(
 pub async fn refresh_token(
     State(data): State<Arc<AppState>>,
     Extension(refresh_request): Extension<RefreshRequest>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<RefreshResponse>>, ApiError> {
     info!("Refresh token request received");
 
@@ -376,7 +379,7 @@ pub async fn refresh_token(
 pub async fn verify_email(
     State(data): State<Arc<AppState>>,
     Path(code): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     let verification = match data.db.get_email_verification_by_code(code) {
         Ok(v) => v,
@@ -410,7 +413,7 @@ pub async fn verify_email(
 pub async fn password_reset_request(
     State(data): State<Arc<AppState>>,
     Extension(payload): Extension<PasswordResetRequestPayload>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     // Get project by client_id
     let project = data
@@ -462,7 +465,7 @@ pub async fn password_reset_request(
 pub async fn password_reset_confirm(
     State(data): State<Arc<AppState>>,
     Extension(payload): Extension<PasswordResetConfirmPayload>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     // Get project by client_id
     let project = data

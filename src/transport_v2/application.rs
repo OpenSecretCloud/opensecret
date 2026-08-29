@@ -8,8 +8,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::extract::Query;
 use axum::http::StatusCode;
+use axum::http::Uri;
 use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -20,11 +23,16 @@ use crate::web::login_routes::{
     authenticate_login, register_and_authenticate, AuthResponse, Credentials, RefreshResponse,
     RegisterCredentials,
 };
-use crate::web::protected_routes::protected_user_data;
+use crate::web::protected_routes::{
+    private_key_bytes_data, private_key_data, protected_user_data, public_key_data,
+    sign_message_data, third_party_token_data, DerivationPathQuery, PublicKeyQuery,
+    SignMessageRequest, ThirdPartyTokenRequest,
+};
 use crate::{ApiError, AppState, VerifiedUserAuthentication};
 
 use super::envelope::{
-    Credential, EncodedBytes, HeaderField, LogicalMethod, RequestEnvelope, RequestId, ResponseMode,
+    Credential, EncodedBytes, EnvelopeLimits, HeaderField, LogicalMethod, RequestEnvelope,
+    RequestId, ResponseMode,
 };
 use super::session::{
     AuthenticationReservation, AuthenticationStartError, AuthorityState, BoundAuthority,
@@ -34,6 +42,8 @@ use super::session_cache::V2SessionLease;
 
 const JSON_CONTENT_TYPE: &[u8] = b"application/json";
 
+type SensitiveBytes = Zeroizing<Vec<u8>>;
+
 pub(crate) enum OperationPreparation {
     Unsupported,
     Rejected(LogicalUnaryResponse),
@@ -41,10 +51,28 @@ pub(crate) enum OperationPreparation {
 }
 
 pub(crate) enum UserOperation {
-    Login { body: Vec<u8> },
-    Register { body: Vec<u8> },
-    Resume { credential: Vec<u8> },
-    GetUser(BoundUserAuthority),
+    Login {
+        body: SensitiveBytes,
+    },
+    Register {
+        body: SensitiveBytes,
+    },
+    Resume {
+        credential: SensitiveBytes,
+    },
+    Protected {
+        authority: BoundUserAuthority,
+        operation: ProtectedUserOperation,
+    },
+}
+
+pub(crate) enum ProtectedUserOperation {
+    GetUser,
+    GetPrivateKey { query: Option<String> },
+    GetPrivateKeyBytes { query: Option<String> },
+    GetPublicKey { query: Option<String> },
+    SignMessage { body: SensitiveBytes },
+    IssueThirdPartyToken { body: SensitiveBytes },
 }
 
 #[derive(Clone)]
@@ -71,13 +99,25 @@ pub(crate) struct LogicalUnaryResponse {
 
 impl LogicalUnaryResponse {
     pub(crate) fn json<T: Serialize>(status: StatusCode, value: &T) -> Result<Self, ApiError> {
-        let body = serde_json::to_vec(value).map_err(|error| {
+        Self::json_with_limit(status, value, EnvelopeLimits::default().logical_body_bytes)
+    }
+
+    fn json_with_limit<T: Serialize>(
+        status: StatusCode,
+        value: &T,
+        logical_body_bytes: usize,
+    ) -> Result<Self, ApiError> {
+        let mut body = serde_json::to_vec(value).map_err(|error| {
             tracing::error!(
                 "Could not serialize transport-v2 logical response: {:?}",
                 error
             );
             ApiError::InternalServerError
         })?;
+        if body.len() > logical_body_bytes {
+            body.zeroize();
+            return Err(ApiError::PayloadTooLarge);
+        }
         Ok(Self {
             status,
             headers: vec![HeaderField {
@@ -158,21 +198,40 @@ pub(crate) fn prepare_user_operation(
         ..
     } = envelope;
 
-    let operation = match (request.method, request.path.as_str()) {
-        (LogicalMethod::Post, "/login") => 0,
-        (LogicalMethod::Post, "/register") => 1,
-        (LogicalMethod::Post, "/refresh") => 2,
-        (LogicalMethod::Get, "/protected/user") => 3,
+    #[derive(Clone, Copy)]
+    enum Route {
+        Login,
+        Register,
+        Resume,
+        GetUser,
+        GetPrivateKey,
+        GetPrivateKeyBytes,
+        GetPublicKey,
+        SignMessage,
+        IssueThirdPartyToken,
+    }
+
+    let route = match (request.method, request.path.as_str()) {
+        (LogicalMethod::Post, "/login") => Route::Login,
+        (LogicalMethod::Post, "/register") => Route::Register,
+        (LogicalMethod::Post, "/refresh") => Route::Resume,
+        (LogicalMethod::Get, "/protected/user") => Route::GetUser,
+        (LogicalMethod::Get, "/protected/private_key") => Route::GetPrivateKey,
+        (LogicalMethod::Get, "/protected/private_key_bytes") => Route::GetPrivateKeyBytes,
+        (LogicalMethod::Get, "/protected/public_key") => Route::GetPublicKey,
+        (LogicalMethod::Post, "/protected/sign_message") => Route::SignMessage,
+        (LogicalMethod::Post, "/protected/third_party_token") => Route::IssueThirdPartyToken,
         _ => return OperationPreparation::Unsupported,
     };
 
-    if response_mode != ResponseMode::Unary || request.query.is_some() {
+    if response_mode != ResponseMode::Unary {
         return rejected_bad_request();
     }
 
-    match operation {
-        0 | 1 => {
+    match route {
+        Route::Login | Route::Register => {
             if credential.is_some()
+                || request.query.is_some()
                 || !has_exact_json_content_type(&request.headers)
                 || request
                     .body_base64
@@ -193,14 +252,18 @@ pub(crate) fn prepare_user_operation(
                 .body_base64
                 .expect("validated body presence")
                 .into_bytes();
-            if operation == 0 {
+            let body = Zeroizing::new(body);
+            if matches!(route, Route::Login) {
                 OperationPreparation::Ready(UserOperation::Login { body })
             } else {
                 OperationPreparation::Ready(UserOperation::Register { body })
             }
         }
-        2 => {
-            if !request.headers.is_empty() || request.body_base64.is_some() {
+        Route::Resume => {
+            if request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
                 return rejected_bad_request();
             }
             if !matches!(authority, AuthorityState::Anonymous) {
@@ -217,33 +280,93 @@ pub(crate) fn prepare_user_operation(
                 return rejected_bad_request();
             }
             OperationPreparation::Ready(UserOperation::Resume {
-                credential: value_base64.into_bytes(),
+                credential: Zeroizing::new(value_base64.into_bytes()),
             })
         }
-        3 => {
+        Route::GetUser | Route::GetPrivateKey | Route::GetPrivateKeyBytes | Route::GetPublicKey => {
             if credential.is_some() || !request.headers.is_empty() || request.body_base64.is_some()
             {
                 return rejected_bad_request();
             }
-            let AuthorityState::Bound(bound) = authority else {
-                return rejected_authentication_required();
+            if matches!(route, Route::GetUser) && request.query.is_some() {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
             };
-            let BoundPrincipal::User {
-                user_id,
-                project_id,
-                auth_context,
-            } = bound.principal()
-            else {
-                return rejected_authentication_required();
+            let operation = match route {
+                Route::GetUser => ProtectedUserOperation::GetUser,
+                Route::GetPrivateKey => ProtectedUserOperation::GetPrivateKey {
+                    query: request.query,
+                },
+                Route::GetPrivateKeyBytes => ProtectedUserOperation::GetPrivateKeyBytes {
+                    query: request.query,
+                },
+                Route::GetPublicKey => ProtectedUserOperation::GetPublicKey {
+                    query: request.query,
+                },
+                _ => unreachable!("fixed protected GET classifier is exhaustive"),
             };
-            OperationPreparation::Ready(UserOperation::GetUser(BoundUserAuthority {
-                user_id: *user_id,
-                project_id: *project_id,
-                auth_context: auth_context.clone(),
-            }))
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation,
+            })
         }
-        _ => unreachable!("operation classifier is exhaustive"),
+        Route::SignMessage | Route::IssueThirdPartyToken => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            let body = request
+                .body_base64
+                .expect("validated protected JSON body presence")
+                .into_bytes();
+            let body = Zeroizing::new(body);
+            let operation = match route {
+                Route::SignMessage => ProtectedUserOperation::SignMessage { body },
+                Route::IssueThirdPartyToken => {
+                    ProtectedUserOperation::IssueThirdPartyToken { body }
+                }
+                _ => unreachable!("fixed protected POST classifier is exhaustive"),
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation,
+            })
+        }
     }
+}
+
+fn bound_user_authority(
+    authority: AuthorityState,
+) -> Result<BoundUserAuthority, OperationPreparation> {
+    let AuthorityState::Bound(bound) = authority else {
+        return Err(rejected_authentication_required());
+    };
+    let BoundPrincipal::User {
+        user_id,
+        project_id,
+        auth_context,
+    } = bound.principal()
+    else {
+        return Err(rejected_authentication_required());
+    };
+    Ok(BoundUserAuthority {
+        user_id: *user_id,
+        project_id: *project_id,
+        auth_context: auth_context.clone(),
+    })
 }
 
 pub(crate) fn begin_authentication_transition(
@@ -284,10 +407,9 @@ pub(crate) async fn execute_user_operation(
     monotonic_now: Instant,
 ) -> ApplicationOutcome {
     match operation {
-        UserOperation::Login { mut body } => {
+        UserOperation::Login { body } => {
             let parsed =
                 serde_json::from_slice::<Credentials>(&body).map_err(|_| ApiError::BadRequest);
-            body.zeroize();
             let credentials = match parsed {
                 Ok(credentials) => credentials,
                 Err(error) => return ApplicationOutcome::error(error),
@@ -305,10 +427,9 @@ pub(crate) async fn execute_user_operation(
                 UserAuthResponseKind::Login,
             )
         }
-        UserOperation::Register { mut body } => {
+        UserOperation::Register { body } => {
             let parsed = serde_json::from_slice::<RegisterCredentials>(&body)
                 .map_err(|_| ApiError::BadRequest);
-            body.zeroize();
             let credentials = match parsed {
                 Ok(credentials) => credentials,
                 Err(error) => return ApplicationOutcome::error(error),
@@ -327,8 +448,9 @@ pub(crate) async fn execute_user_operation(
                 UserAuthResponseKind::Login,
             )
         }
-        UserOperation::Resume { credential } => {
-            let credential = match String::from_utf8(credential) {
+        UserOperation::Resume { mut credential } => {
+            let bytes = std::mem::take(&mut *credential);
+            let credential = match String::from_utf8(bytes) {
                 Ok(credential) => Zeroizing::new(credential),
                 Err(error) => {
                     let mut bytes = error.into_bytes();
@@ -349,12 +471,15 @@ pub(crate) async fn execute_user_operation(
                 UserAuthResponseKind::Refresh,
             )
         }
-        UserOperation::GetUser(bound) => {
+        UserOperation::Protected {
+            authority,
+            operation,
+        } => {
             debug_assert!(authentication.is_none());
             let user = match app_state.verify_bound_user(
-                bound.user_id,
-                bound.project_id,
-                &bound.auth_context,
+                authority.user_id,
+                authority.project_id,
+                &authority.auth_context,
             ) {
                 Ok(user) => user,
                 Err(error) => {
@@ -364,15 +489,81 @@ pub(crate) async fn execute_user_operation(
                     return ApplicationOutcome::error(error);
                 }
             };
-            let response = match protected_user_data(&app_state, &user)
-                .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+            let response = match execute_protected_user_operation(
+                &app_state,
+                &user,
+                &authority.auth_context,
+                operation,
+            )
+            .await
             {
                 Ok(response) => response,
-                Err(error) => return ApplicationOutcome::error(error),
+                Err(error) => {
+                    if matches!(error, ApiError::Unauthorized | ApiError::InvalidJwt) {
+                        lease.state().close();
+                    }
+                    return ApplicationOutcome::error(error);
+                }
             };
             ApplicationOutcome::success(response, false)
         }
     }
+}
+
+async fn execute_protected_user_operation(
+    app_state: &AppState,
+    user: &crate::User,
+    auth_context: &AuthContext,
+    operation: ProtectedUserOperation,
+) -> Result<LogicalUnaryResponse, ApiError> {
+    match operation {
+        ProtectedUserOperation::GetUser => {
+            let value = protected_user_data(app_state, user)?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::GetPrivateKey { query } => {
+            let query = parse_logical_query::<DerivationPathQuery>(query)?;
+            let value = private_key_data(app_state, user, auth_context, query)?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::GetPrivateKeyBytes { query } => {
+            let query = parse_logical_query::<DerivationPathQuery>(query)?;
+            let value = private_key_bytes_data(app_state, user, auth_context, query).await?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::GetPublicKey { query } => {
+            let query = parse_logical_query::<PublicKeyQuery>(query)?;
+            let value = public_key_data(app_state, user, auth_context, query).await?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::SignMessage { body } => {
+            let request = parse_json_body::<SignMessageRequest>(body)?;
+            let value = sign_message_data(app_state, user, auth_context, request).await?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::IssueThirdPartyToken { body } => {
+            let request = parse_json_body::<ThirdPartyTokenRequest>(body)?;
+            let value = third_party_token_data(app_state, user, request)?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+    }
+}
+
+fn parse_json_body<T: DeserializeOwned>(body: SensitiveBytes) -> Result<T, ApiError> {
+    serde_json::from_slice::<T>(&body).map_err(|_| ApiError::BadRequest)
+}
+
+fn parse_logical_query<T: DeserializeOwned>(query: Option<String>) -> Result<T, ApiError> {
+    let path_and_query = match query {
+        Some(query) => format!("/?{query}"),
+        None => "/".to_owned(),
+    };
+    let uri = path_and_query
+        .parse::<Uri>()
+        .map_err(|_| ApiError::BadRequest)?;
+    Query::<T>::try_from_uri(&uri)
+        .map(|Query(value)| value)
+        .map_err(|_| ApiError::BadRequest)
 }
 
 enum UserAuthResponseKind {
@@ -613,8 +804,105 @@ mod tests {
                 ),
                 bound_user_authority(),
             ),
-            OperationPreparation::Ready(UserOperation::GetUser(_))
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::GetUser,
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn exact_sensitive_user_operation_contracts_are_admitted() {
+        let mut private_key = envelope(
+            LogicalMethod::Get,
+            "/protected/private_key",
+            Vec::new(),
+            None,
+            None,
+        );
+        let private_key_query =
+            "seed_phrase_derivation_path=m%2F83696968%27%2F39%27%2F0%27%2F12%27%2F0%27".to_owned();
+        private_key.request.query = Some(private_key_query.clone());
+        assert!(matches!(
+            prepare_user_operation(private_key, bound_user_authority()),
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::GetPrivateKey { query: Some(query) },
+                ..
+            }) if query == private_key_query
+        ));
+
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Get,
+                    "/protected/private_key_bytes",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                bound_user_authority(),
+            ),
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::GetPrivateKeyBytes { .. },
+                ..
+            })
+        ));
+
+        let mut public_key = envelope(
+            LogicalMethod::Get,
+            "/protected/public_key",
+            Vec::new(),
+            None,
+            None,
+        );
+        let public_key_query = "algorithm=schnorr".to_owned();
+        public_key.request.query = Some(public_key_query.clone());
+        assert!(matches!(
+            prepare_user_operation(public_key, bound_user_authority()),
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::GetPublicKey { query: Some(query) },
+                ..
+            }) if query == public_key_query
+        ));
+
+        for (path, expected) in [
+            ("/protected/sign_message", "sign"),
+            ("/protected/third_party_token", "third_party"),
+        ] {
+            let prepared = prepare_user_operation(
+                envelope(LogicalMethod::Post, path, json_header(), Some(b"{}"), None),
+                bound_user_authority(),
+            );
+            assert!(
+                matches!(
+                    (&prepared, expected),
+                    (
+                        OperationPreparation::Ready(UserOperation::Protected {
+                            operation: ProtectedUserOperation::SignMessage { .. },
+                            ..
+                        }),
+                        "sign"
+                    ) | (
+                        OperationPreparation::Ready(UserOperation::Protected {
+                            operation: ProtectedUserOperation::IssueThirdPartyToken { .. },
+                            ..
+                        }),
+                        "third_party"
+                    )
+                ),
+                "{path}"
+            );
+        }
+
+        for path in ["/protected/encrypt", "/protected/decrypt"] {
+            assert!(matches!(
+                prepare_user_operation(
+                    envelope(LogicalMethod::Post, path, json_header(), Some(b"{}"), None,),
+                    bound_user_authority(),
+                ),
+                OperationPreparation::Unsupported
+            ));
+        }
     }
 
     #[test]
@@ -723,5 +1011,100 @@ mod tests {
                 OperationPreparation::Rejected(_)
             ));
         }
+    }
+
+    #[test]
+    fn sensitive_user_contracts_reject_unbound_and_transplanted_metadata() {
+        for path in [
+            "/protected/private_key",
+            "/protected/private_key_bytes",
+            "/protected/public_key",
+        ] {
+            assert!(matches!(
+                prepare_user_operation(
+                    envelope(LogicalMethod::Get, path, Vec::new(), None, None),
+                    AuthorityState::Anonymous,
+                ),
+                OperationPreparation::Rejected(_)
+            ));
+            assert!(matches!(
+                prepare_user_operation(
+                    envelope(LogicalMethod::Get, path, json_header(), None, None),
+                    bound_user_authority(),
+                ),
+                OperationPreparation::Rejected(_)
+            ));
+        }
+
+        for path in ["/protected/sign_message", "/protected/third_party_token"] {
+            assert!(matches!(
+                prepare_user_operation(
+                    envelope(LogicalMethod::Post, path, json_header(), Some(b"{}"), None),
+                    AuthorityState::Anonymous,
+                ),
+                OperationPreparation::Rejected(_)
+            ));
+
+            let mut query = envelope(LogicalMethod::Post, path, json_header(), Some(b"{}"), None);
+            query.request.query = Some("x=1".to_owned());
+            for request in [
+                envelope(LogicalMethod::Post, path, Vec::new(), Some(b"{}"), None),
+                envelope(LogicalMethod::Post, path, json_header(), None, None),
+                query,
+                envelope(
+                    LogicalMethod::Post,
+                    path,
+                    json_header(),
+                    Some(b"{}"),
+                    Some(Credential::Resumption {
+                        value_base64: EncodedBytes::from_bytes(b"token".to_vec()),
+                    }),
+                ),
+            ] {
+                assert!(matches!(
+                    prepare_user_operation(request, bound_user_authority()),
+                    OperationPreparation::Rejected(_)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn logical_query_parsing_matches_axum_query_semantics() {
+        let no_derivation = parse_logical_query::<DerivationPathQuery>(None)
+            .expect("absent derivation query uses the existing default key options");
+        assert!(no_derivation
+            .key_options
+            .seed_phrase_derivation_path
+            .is_none());
+        assert!(no_derivation
+            .key_options
+            .private_key_derivation_path
+            .is_none());
+
+        let parsed = parse_logical_query::<DerivationPathQuery>(Some(
+            "private_key_derivation_path=m%2F44%27%2F0%27%2F0%27%2F0%2F0".to_owned(),
+        ))
+        .expect("valid encoded derivation path query");
+        assert_eq!(
+            parsed.key_options.private_key_derivation_path.as_deref(),
+            Some("m/44'/0'/0'/0/0")
+        );
+        assert!(
+            parse_logical_query::<PublicKeyQuery>(Some("algorithm=schnorr".to_owned())).is_ok()
+        );
+        assert!(parse_logical_query::<PublicKeyQuery>(None).is_err());
+        assert!(
+            parse_logical_query::<PublicKeyQuery>(Some("algorithm=unknown".to_owned())).is_err()
+        );
+    }
+
+    #[test]
+    fn oversized_logical_json_response_fails_before_gateway_encryption() {
+        assert!(LogicalUnaryResponse::json_with_limit(StatusCode::OK, &"abc", 5).is_ok());
+        assert!(matches!(
+            LogicalUnaryResponse::json_with_limit(StatusCode::OK, &"abcd", 5),
+            Err(ApiError::PayloadTooLarge)
+        ));
     }
 }

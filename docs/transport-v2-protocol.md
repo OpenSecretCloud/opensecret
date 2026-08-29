@@ -633,22 +633,35 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
    activates exact unordered replay claims for supported operations. Platform,
    API-key, OAuth, and all other application paths still receive the encrypted
    unsupported-operation response.
-6. **Protected user unary projection**: project the remaining user-authorized
-   unary operation families, including third-party token issuance, through the
-   live bound-user checks without changing their application semantics.
-7. **API-key and platform binding**: bind existing raw API keys inside
+6. **Sensitive user-key projection**: project root/derived mnemonic and private
+   key export, public-key derivation, signing, and third-party token issuance
+   through the live bound-user check. Sensitive intermediate response values
+   are zeroized, decoded byte fields and prepared sensitive operations wipe on
+   drop across rejection/cancellation paths, and serialized logical responses
+   are bounded before gateway encryption. Large encrypt/decrypt utilities
+   remain unsupported until their base64 and JSON expansion has an exact
+   pre-dispatch limit.
+7. **Remaining protected user operations**: project bounded crypto/KV,
+   account-lifecycle, and user API-key-management families in reviewable
+   sub-stacks. Dynamic path parameters must preserve released SDK semantics
+   without weakening the v2 route classifier, and password/account deletion
+   must explicitly close the now-invalid bound session.
+8. **Stored user unary operations**: project conversations, conversation
+   projects, instructions, response control, and web-provider unary routes in
+   ownership-preserving families before the client cutover.
+9. **API-key and platform binding**: bind existing raw API keys inside
    ciphertext without rotating them, enforce their current inference-only
    scope, and add platform authentication/authorization with live organization
    checks. OAuth continuation receives an explicit session-binding design in
    this layer rather than being inferred from password login.
-8. **Streaming projection**: project current inference streams with ordered,
+10. **Streaming projection**: project current inference streams with ordered,
    request-bound, authenticated terminal records while preserving the SDK's
    caller-visible SSE behavior.
-9. **Additive SDK v2 internals**: TypeScript and Rust codecs/session managers
+11. **Additive SDK v2 internals**: TypeScript and Rust codecs/session managers
    behind private seams, still not selected by public calls.
-10. **Atomic SDK cutover**: v2-only network behavior, no downgrade, one-time
+12. **Atomic SDK cutover**: v2-only network behavior, no downgrade, one-time
    fresh login, and Maple/proxy integration.
-11. **SDK major/version packaging**: package metadata, locks, integration pin,
+13. **SDK major/version packaging**: package metadata, locks, integration pin,
    compatibility matrix, and release rehearsal. Publication/deployment remain
    separate authorized actions.
 

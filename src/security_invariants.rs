@@ -442,11 +442,14 @@ fn legacy_token_constructor_is_only_used_for_third_party_tokens() {
     let protected_routes = manifest_dir.join("src/web/protected_routes.rs");
     let contents =
         fs::read_to_string(&protected_routes).expect("protected route source should be readable");
-    let third_party_body =
+    let third_party_route =
         extract_function_body(&contents, "pub async fn generate_third_party_token");
+    assert!(third_party_route.contains("third_party_token_data(&data, &user, request)"));
+    assert!(third_party_route.contains("encrypt_response(&data, &session_id, &response).await"));
 
-    assert!(third_party_body.contains("NewToken::new("));
-    assert!(third_party_body.contains("TokenType::ThirdParty"));
+    let third_party_core = extract_function_body(&contents, "pub(crate) fn third_party_token_data");
+    assert!(third_party_core.contains("NewToken::new("));
+    assert!(third_party_core.contains("TokenType::ThirdParty"));
 }
 
 #[test]

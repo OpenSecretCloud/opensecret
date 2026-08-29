@@ -271,10 +271,23 @@ Fields have these meanings:
   present empty body. Other values preserve exact request bytes without
   transport-layer JSON parsing or reserialization.
 
-Unknown and duplicate JSON fields are rejected. The implementation parses the
-path and query once, rejects schemes, authorities, fragments, backslashes,
+Unknown and duplicate JSON fields are rejected. The implementation validates
+the path and query once, rejects schemes, authorities, fragments, backslashes,
 dot-segments, encoded separator ambiguity, and invalid percent encoding, then
 maps `(method, path)` through an exact application allowlist.
+
+Registered routes may define an opaque dynamic segment without relaxing those
+rules for any other path. Route selection first matches an exact literal prefix
+and method. The initial exception is the final segment of
+`GET|PUT|DELETE /protected/kv/<key>`: ASCII alphanumeric key bytes remain
+literal and every other UTF-8 byte is one uppercase `%HH` triplet, matching the
+released Rust SDK's `NON_ALPHANUMERIC` encoding. The enclave rejects empty,
+noncanonical, malformed, over-encoded, or invalid-UTF-8 segments and decodes the
+accepted value exactly once after selecting the KV route. It performs no
+Unicode normalization. Thus `/`, a literal `%2F`, dot-only keys, backslashes,
+and distinct Unicode byte strings remain application data rather than routing
+syntax. The future TypeScript v2 SDK must implement the same UTF-8 byte codec;
+generic URI encoders that leave punctuation unescaped are insufficient.
 
 The gateway never hands an arbitrary URI to the full transport-v1 router.
 Application operations are projected deliberately onto shared application

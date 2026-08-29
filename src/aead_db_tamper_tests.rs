@@ -2,6 +2,7 @@ use crate::{
     db::{setup_db, DBError},
     encrypt::{encrypt_key_deterministic, encrypt_with_key},
     generate_reset_hash,
+    jwt::{issue_transport_v2_user_tokens, validate_transport_v2_user_resumption},
     login_routes::RegisterCredentials,
     models::{
         account_deletion::NewAccountDeletionRequest,
@@ -1038,6 +1039,81 @@ async fn db_password_change_invalidates_old_auth_context_and_preserves_seed() {
 
 #[tokio::test]
 #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_password_change_activates_only_new_v2_resumption_after_commit() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let email = format!("aead-v2-password-change-{marker}@example.com");
+    let old_password = test_credential("old-before-v2-change");
+    let new_password = test_credential("new-after-v2-change");
+
+    let user =
+        create_password_wrapped_user(&app_state, project.id, email.clone(), old_password).await;
+    let old_login = app_state
+        .authenticate_user(
+            Some(email.clone()),
+            None,
+            old_password.to_string(),
+            project.id,
+        )
+        .await
+        .expect("old password login should not error")
+        .expect("old password login should verify and unwrap");
+    let old_tokens =
+        issue_transport_v2_user_tokens(&old_login.user, &old_login.auth_context, &app_state)
+            .expect("old v2 credentials should issue");
+
+    let prepared = app_state
+        .prepare_user_password_and_seed_wrap(
+            &old_login.user,
+            &old_login.auth_context,
+            new_password.to_string(),
+        )
+        .await
+        .expect("replacement password state should prepare");
+    let replacement_tokens =
+        issue_transport_v2_user_tokens(&old_login.user, prepared.new_auth_context(), &app_state)
+            .expect("replacement v2 credentials should issue before commit");
+    assert!(
+        validate_transport_v2_user_resumption(&replacement_tokens.resumption_token, &app_state)
+            .is_err(),
+        "a preissued replacement resumption credential must remain dormant before commit"
+    );
+
+    let new_auth_context = app_state
+        .commit_prepared_user_password_and_seed_wrap(&old_login.user, prepared)
+        .expect("replacement password state should commit");
+    app_state
+        .verify_seed_wrap_for_auth_context(&old_login.user, &new_auth_context)
+        .expect("committed replacement auth context should unwrap");
+
+    assert!(
+        validate_transport_v2_user_resumption(&old_tokens.resumption_token, &app_state).is_err(),
+        "the prior resumption credential must stop validating after commit"
+    );
+    let resumed =
+        validate_transport_v2_user_resumption(&replacement_tokens.resumption_token, &app_state)
+            .expect("the replacement resumption credential should validate after commit");
+    assert_eq!(resumed.user.uuid, old_login.user.uuid);
+    assert_eq!(resumed.auth_context, new_auth_context);
+
+    let new_login = app_state
+        .authenticate_user(Some(email), None, new_password.to_string(), project.id)
+        .await
+        .expect("new password login should not error")
+        .expect("new password should authenticate after commit");
+    assert_eq!(new_login.auth_context, new_auth_context);
+
+    let _ = app_state.db.delete_user(&user);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
 async fn db_password_change_deletes_tampered_stale_password_wraps() {
     let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
         eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
@@ -1148,7 +1224,7 @@ async fn db_password_change_cannot_commit_after_destructive_reset_rotates_seed()
         .clone()
         .expect("password user should have old password verifier ciphertext");
     let (racing_password_hash, racing_password_enc) = app_state
-        .encrypt_user_password_verifier(racing_password.to_string())
+        .encrypt_user_password_verifier(zeroize::Zeroizing::new(racing_password.to_string()))
         .await
         .expect("racing password verifier should encrypt");
     let stale_racing_wrapping = app_state

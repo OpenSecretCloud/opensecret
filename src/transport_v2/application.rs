@@ -28,11 +28,13 @@ use crate::web::login_routes::{
 use crate::web::protected_routes::{
     confirm_account_deletion_data, create_api_key_data, decrypt_data_value, delete_all_kv_values,
     delete_api_key_by_name, delete_kv_value, encrypt_data_value, initiate_account_deletion_data,
-    list_bounded_api_keys_data, private_key_bytes_data, private_key_data, protected_user_data,
-    public_key_data, put_kv_value, request_new_verification_code_data, sign_message_data,
-    third_party_token_data, ConfirmAccountDeletionRequest, CreateApiKeyRequest, DecryptDataRequest,
-    DerivationPathQuery, EncryptDataRequest, InitiateAccountDeletionRequest, KvValue,
-    PublicKeyQuery, SignMessageRequest, ThirdPartyTokenRequest,
+    list_bounded_api_keys_data, map_password_change_error, private_key_bytes_data,
+    private_key_data, protected_user_data, public_key_data, put_kv_value,
+    request_new_verification_code_data, sign_message_data, third_party_token_data,
+    verify_password_change_request, ChangePasswordRequest, ConfirmAccountDeletionRequest,
+    CreateApiKeyRequest, DecryptDataRequest, DerivationPathQuery, EncryptDataRequest,
+    InitiateAccountDeletionRequest, KvValue, PublicKeyQuery, SignMessageRequest,
+    ThirdPartyTokenRequest,
 };
 use crate::{ApiError, AppState, VerifiedUserAuthentication};
 
@@ -79,6 +81,10 @@ pub(crate) enum UserOperation {
         code: uuid::Uuid,
     },
     Logout {
+        body: SensitiveBytes,
+    },
+    ChangePassword {
+        authority: BoundUserAuthority,
         body: SensitiveBytes,
     },
     Protected {
@@ -177,7 +183,7 @@ impl UserOperation {
 
     const fn session_effect_on_success(&self) -> SessionEffect {
         match self {
-            Self::Logout { .. } => SessionEffect::Close,
+            Self::Logout { .. } | Self::ChangePassword { .. } => SessionEffect::Close,
             Self::Protected { operation, .. } => operation.session_effect_on_success(),
             _ => SessionEffect::Retain,
         }
@@ -332,6 +338,7 @@ pub(crate) fn prepare_user_operation(
         RequestAccountDeletion,
         ConfirmAccountDeletion,
         Logout,
+        ChangePassword,
     }
 
     let kv_key = match decode_canonical_kv_item_path(request.method, &request.path) {
@@ -382,6 +389,7 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Post, "/protected/delete-account/confirm") => {
             Some(Route::ConfirmAccountDeletion)
         }
+        (LogicalMethod::Post, "/protected/change_password") => Some(Route::ChangePassword),
         (LogicalMethod::Post, "/logout") => Some(Route::Logout),
         (LogicalMethod::Get, _) if kv_key.is_some() => Some(Route::GetKv),
         (LogicalMethod::Put, _) if kv_key.is_some() => Some(Route::PutKv),
@@ -532,7 +540,8 @@ pub(crate) fn prepare_user_operation(
         | Route::EncryptData
         | Route::DecryptData
         | Route::RequestAccountDeletion
-        | Route::ConfirmAccountDeletion => {
+        | Route::ConfirmAccountDeletion
+        | Route::ChangePassword => {
             if credential.is_some()
                 || request.query.is_some()
                 || !has_exact_json_content_type(&request.headers)
@@ -552,6 +561,12 @@ pub(crate) fn prepare_user_operation(
                 .expect("validated protected JSON body presence")
                 .into_bytes();
             let body = Zeroizing::new(body);
+            if matches!(route, Route::ChangePassword) {
+                return OperationPreparation::Ready(UserOperation::ChangePassword {
+                    authority,
+                    body,
+                });
+            }
             let operation = match route {
                 Route::SignMessage => ProtectedUserOperation::SignMessage { body },
                 Route::IssueThirdPartyToken => {
@@ -883,6 +898,89 @@ pub(crate) async fn execute_user_operation(
             };
             ApplicationOutcome::success(response, session_effect_on_success)
         }
+        UserOperation::ChangePassword { authority, body } => {
+            debug_assert!(authentication.is_none());
+            let user = match app_state.verify_bound_user(
+                authority.user_id,
+                authority.project_id,
+                &authority.auth_context,
+            ) {
+                Ok(user) => user,
+                Err(error) => {
+                    if matches!(error, ApiError::Unauthorized | ApiError::InvalidJwt) {
+                        return ApplicationOutcome::closing_error(error);
+                    }
+                    return ApplicationOutcome::error(error);
+                }
+            };
+            let mut request = match parse_json_body::<ChangePasswordRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if let Err(error) =
+                verify_password_change_request(&app_state, &user, &mut request).await
+            {
+                return bound_user_error_outcome(&app_state, &authority, error);
+            }
+
+            let new_password = std::mem::take(&mut request.new_password);
+            let prepared = match app_state
+                .prepare_user_password_and_seed_wrap(&user, &authority.auth_context, new_password)
+                .await
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let error = map_password_change_error(error);
+                    return bound_user_error_outcome(&app_state, &authority, error);
+                }
+            };
+
+            let issued = match issue_transport_v2_user_tokens(
+                &user,
+                prepared.new_auth_context(),
+                &app_state,
+            ) {
+                Ok(issued) => issued,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            let mut access_token = issued.access_token;
+            let mut resumption_token = issued.resumption_token;
+            #[derive(Serialize)]
+            struct ChangePasswordResponse<'a> {
+                message: &'static str,
+                access_token: &'a str,
+                refresh_token: &'a str,
+            }
+            let response = LogicalUnaryResponse::json(
+                StatusCode::OK,
+                &ChangePasswordResponse {
+                    message: "Password changed successfully",
+                    access_token: &access_token,
+                    refresh_token: &resumption_token,
+                },
+            );
+            access_token.zeroize();
+            resumption_token.zeroize();
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+
+            let new_auth_context =
+                match app_state.commit_prepared_user_password_and_seed_wrap(&user, prepared) {
+                    Ok(auth_context) => auth_context,
+                    Err(error) => {
+                        return ApplicationOutcome::closing_error(map_password_change_error(error));
+                    }
+                };
+            if let Err(error) =
+                app_state.verify_seed_wrap_for_auth_context(&user, &new_auth_context)
+            {
+                return ApplicationOutcome::closing_error(map_password_change_error(error));
+            }
+
+            ApplicationOutcome::success(response, session_effect_on_success)
+        }
         UserOperation::Protected {
             authority,
             operation,
@@ -919,6 +1017,25 @@ pub(crate) async fn execute_user_operation(
             };
             ApplicationOutcome::success(response, session_effect_on_success)
         }
+    }
+}
+
+fn bound_user_error_outcome(
+    app_state: &AppState,
+    authority: &BoundUserAuthority,
+    error: ApiError,
+) -> ApplicationOutcome {
+    if matches!(
+        app_state.verify_bound_user(
+            authority.user_id,
+            authority.project_id,
+            &authority.auth_context,
+        ),
+        Err(ApiError::Unauthorized | ApiError::InvalidJwt)
+    ) {
+        ApplicationOutcome::closing_error(error)
+    } else {
+        ApplicationOutcome::error(error)
     }
 }
 
@@ -1627,6 +1744,85 @@ mod tests {
                     uuid::Uuid::from_bytes([0x43; 16]),
                 )),
             ),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::UNAUTHORIZED
+        ));
+
+        let mut with_query = request();
+        with_query.request.query = Some("transplanted=true".to_owned());
+        assert!(matches!(
+            prepare_user_operation(with_query, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_extra_header = request();
+        with_extra_header.request.headers.push(HeaderField {
+            name: "accept".to_owned(),
+            value_base64: EncodedBytes::from_bytes(b"application/json".to_vec()),
+        });
+        assert!(matches!(
+            prepare_user_operation(with_extra_header, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut without_body = request();
+        without_body.request.body_base64 = None;
+        assert!(matches!(
+            prepare_user_operation(without_body, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_empty_body = request();
+        with_empty_body.request.body_base64 = Some(EncodedBytes::from_bytes(Vec::new()));
+        assert!(matches!(
+            prepare_user_operation(with_empty_body, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_credential = request();
+        with_credential.credential = Some(Credential::Resumption {
+            value_base64: EncodedBytes::from_bytes(b"transplanted".to_vec()),
+        });
+        assert!(matches!(
+            prepare_user_operation(with_credential, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut streaming = request();
+        streaming.response_mode = ResponseMode::Stream;
+        assert!(matches!(
+            prepare_user_operation(streaming, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+    }
+
+    #[test]
+    fn password_change_is_exact_bound_and_terminal_only_on_success() {
+        let request = || {
+            envelope(
+                LogicalMethod::Post,
+                "/protected/change_password",
+                json_header(),
+                Some(br#"{"current_password":"old","new_password":"new"}"#),
+                None,
+            )
+        };
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(request(), bound_user_authority())
+        else {
+            panic!("exact password change must be admitted");
+        };
+        assert!(matches!(&operation, UserOperation::ChangePassword { .. }));
+        assert_eq!(operation.session_effect_on_success(), SessionEffect::Close);
+
+        assert!(matches!(
+            prepare_user_operation(request(), AuthorityState::Anonymous),
             OperationPreparation::Rejected(response)
                 if response.status == StatusCode::UNAUTHORIZED
         ));

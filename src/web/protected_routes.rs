@@ -84,7 +84,7 @@ pub struct ProtectedUserData {
     pub user: AppUser,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct ChangePasswordRequest {
     pub current_password: String,
     pub new_password: String,
@@ -813,7 +813,7 @@ pub async fn change_password(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(change_request): Extension<ChangePasswordRequest>,
+    Extension(mut change_request): Extension<ChangePasswordRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     // Check if user is an OAuth-only user
@@ -829,7 +829,7 @@ pub async fn change_password(
         .authenticate_user(
             email,
             Some(user.uuid),
-            change_request.current_password,
+            std::mem::take(&mut change_request.current_password),
             user.project_id,
         )
         .await
@@ -840,7 +840,7 @@ pub async fn change_password(
                 .update_user_password_and_seed_wrap(
                     &user,
                     &auth_context,
-                    change_request.new_password,
+                    std::mem::take(&mut change_request.new_password),
                 )
                 .await
             {
@@ -877,6 +877,39 @@ pub async fn change_password(
             // Current password is incorrect
             Err(ApiError::InvalidUsernameOrPassword)
         }
+    }
+}
+
+pub(crate) async fn verify_password_change_request(
+    data: &AppState,
+    user: &User,
+    change_request: &mut ChangePasswordRequest,
+) -> Result<(), ApiError> {
+    if user.password_enc.is_none() {
+        error!("OAuth-only user attempted to change password");
+        return Err(ApiError::InvalidUsernameOrPassword);
+    }
+
+    let email = user.get_email().map(str::to_owned);
+    match data
+        .authenticate_user(
+            email,
+            Some(user.uuid),
+            std::mem::take(&mut change_request.current_password),
+            user.project_id,
+        )
+        .await
+    {
+        Ok(Some(authenticated_user)) if authenticated_user.user.uuid == user.uuid => Ok(()),
+        _ => Err(ApiError::InvalidUsernameOrPassword),
+    }
+}
+
+pub(crate) fn map_password_change_error(error: Error) -> ApiError {
+    error!("Error changing password: {:?}", error);
+    match error {
+        Error::AuthenticationError => ApiError::InvalidUsernameOrPassword,
+        _ => ApiError::InternalServerError,
     }
 }
 
@@ -1580,6 +1613,7 @@ mod tests {
 
         assert_zeroize_on_drop::<PrivateKeyResponse>();
         assert_zeroize_on_drop::<PrivateKeyBytesResponse>();
+        assert_zeroize_on_drop::<ChangePasswordRequest>();
         assert_zeroize_on_drop::<ThirdPartyTokenResponse>();
         assert_zeroize_on_drop::<CreateApiKeyResponse>();
         assert_zeroize_on_drop::<ApiKeyInfo>();

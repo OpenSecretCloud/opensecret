@@ -90,7 +90,7 @@ use uuid::Uuid;
 use vsock::{VsockAddr, VsockStream};
 use web::attestation_routes;
 use x25519_dalek::{EphemeralSecret, PublicKey};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 mod apple_signin;
 mod aws_credentials;
@@ -812,6 +812,19 @@ pub(crate) struct VerifiedUserAuthentication {
     pub(crate) auth_context: AuthContext,
 }
 
+pub(crate) struct PreparedUserPasswordChange {
+    expected_password_enc: Vec<u8>,
+    new_password_enc: Vec<u8>,
+    new_wrapping: NewUserSeedWrapping,
+    new_auth_context: AuthContext,
+}
+
+impl PreparedUserPasswordChange {
+    pub(crate) fn new_auth_context(&self) -> &AuthContext {
+        &self.new_auth_context
+    }
+}
+
 #[derive(Default)]
 pub struct AppStateBuilder {
     app_mode: Option<AppMode>,
@@ -1347,7 +1360,7 @@ impl AppState {
         &self,
         user: &User,
         auth_context: &AuthContext,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
         if user.project_id != auth_context.project_id {
             return Err(Error::AuthenticationError);
         }
@@ -1374,7 +1387,7 @@ impl AppState {
                 credential_kind,
                 &auth_binding,
             ) {
-                Ok(seed) => return Ok(seed),
+                Ok(seed) => return Ok(Zeroizing::new(seed)),
                 Err(_) => continue,
             }
         }
@@ -1382,7 +1395,7 @@ impl AppState {
         Err(Error::AuthenticationError)
     }
 
-    fn verify_seed_wrap_for_auth_context(
+    pub(crate) fn verify_seed_wrap_for_auth_context(
         &self,
         user: &User,
         auth_context: &AuthContext,
@@ -1441,17 +1454,19 @@ impl AppState {
     ) -> Result<(), Error> {
         let auth_binding =
             self.password_auth_binding_for_user(user, decrypted_password_verifier)?;
-        let decrypted_seed = decrypt_seed_v1(
-            &self.enclave_key,
-            &new_wrapping.seed_enc,
-            user.uuid,
-            user.project_id,
-            CredentialKind::Password,
-            &auth_binding,
-        )
-        .map_err(|e| Error::EncryptionError(e.to_string()))?;
+        let decrypted_seed = Zeroizing::new(
+            decrypt_seed_v1(
+                &self.enclave_key,
+                &new_wrapping.seed_enc,
+                user.uuid,
+                user.project_id,
+                CredentialKind::Password,
+                &auth_binding,
+            )
+            .map_err(|e| Error::EncryptionError(e.to_string()))?,
+        );
 
-        if decrypted_seed != plaintext_seed {
+        if decrypted_seed.as_slice() != plaintext_seed {
             return Err(Error::EncryptionError(
                 "New password seed wrap verification failed".to_string(),
             ));
@@ -1709,6 +1724,8 @@ impl AppState {
         user_password: String,
         user_project_id: i32,
     ) -> Result<Option<VerifiedUserAuthentication>, Error> {
+        let user_password = Zeroizing::new(user_password);
+
         // Ensure at least one identifier is provided
         if user_email.is_none() && user_id.is_none() {
             return Err(Error::AuthenticationError);
@@ -1737,19 +1754,29 @@ impl AppState {
         let secret_key = SecretKey::from_slice(&self.enclave_key.clone())
             .map_err(|e| Error::EncryptionError(e.to_string()))?;
 
-        let decrypted_password_bytes =
+        let mut decrypted_password_bytes = Zeroizing::new(
             decrypt_with_key(&secret_key, user.password_enc.as_ref().unwrap())
-                .map_err(|e| Error::EncryptionError(e.to_string()))?;
+                .map_err(|e| Error::EncryptionError(e.to_string()))?,
+        );
 
-        let decrypted_password_hash = String::from_utf8(decrypted_password_bytes)
-            .map_err(|e| Error::EncryptionError(format!("Failed to decode UTF-8: {}", e)))?;
+        let decrypted_password_hash =
+            match String::from_utf8(std::mem::take(&mut *decrypted_password_bytes)) {
+                Ok(password_hash) => Zeroizing::new(password_hash),
+                Err(error) => {
+                    let message = format!("Failed to decode UTF-8: {}", error);
+                    let mut bytes = error.into_bytes();
+                    bytes.zeroize();
+                    return Err(Error::EncryptionError(message));
+                }
+            };
         let verifier_for_binding = decrypted_password_hash.clone();
 
         // Verifying the password is blocking and potentially slow, so we'll do so via
         // `spawn_blocking`.
-        let res =
-            task::spawn_blocking(move || verify_password(user_password, &decrypted_password_hash))
-                .await?;
+        let res = task::spawn_blocking(move || {
+            verify_password(user_password.as_bytes(), decrypted_password_hash.as_str())
+        })
+        .await?;
 
         match res {
             Ok(_) => {
@@ -2192,6 +2219,7 @@ impl AppState {
         new_password: String,
         project_id: i32,
     ) -> Result<(), Error> {
+        let new_password = Zeroizing::new(new_password);
         let user = self.db.get_user_by_email(email.clone(), project_id)?;
 
         // Verify user has an email
@@ -2452,16 +2480,18 @@ impl AppState {
         }
     }
 
-    async fn update_user_password_and_seed_wrap(
+    pub(crate) async fn prepare_user_password_and_seed_wrap(
         &self,
         user: &User,
         auth_context: &AuthContext,
         new_password: String,
-    ) -> Result<AuthContext, Error> {
+    ) -> Result<PreparedUserPasswordChange, Error> {
+        let new_password = Zeroizing::new(new_password);
         let expected_password_enc = user
             .password_enc
             .as_deref()
-            .ok_or(Error::AuthenticationError)?;
+            .ok_or(Error::AuthenticationError)?
+            .to_vec();
         let plaintext_seed = self.decrypt_seed_for_auth_context(user, auth_context)?;
         let (password_hash, encrypted_password) =
             self.encrypt_user_password_verifier(new_password).await?;
@@ -2469,27 +2499,53 @@ impl AppState {
             self.new_password_seed_wrapping_for_user(user, &password_hash, &plaintext_seed)?;
         let new_auth_context = self.password_auth_context_for_user(user, &password_hash)?;
 
+        Ok(PreparedUserPasswordChange {
+            expected_password_enc,
+            new_password_enc: encrypted_password,
+            new_wrapping,
+            new_auth_context,
+        })
+    }
+
+    pub(crate) fn commit_prepared_user_password_and_seed_wrap(
+        &self,
+        user: &User,
+        prepared: PreparedUserPasswordChange,
+    ) -> Result<AuthContext, Error> {
         self.db
             .update_user_password_and_seed_wrap(
                 user,
-                expected_password_enc,
-                encrypted_password,
-                new_wrapping,
+                &prepared.expected_password_enc,
+                prepared.new_password_enc,
+                prepared.new_wrapping,
             )
             .map_err(|err| match err {
                 DBError::StaleCredentialState => Error::AuthenticationError,
                 err => Error::from(err),
             })?;
-        self.verify_seed_wrap_for_auth_context(user, &new_auth_context)?;
 
+        Ok(prepared.new_auth_context)
+    }
+
+    async fn update_user_password_and_seed_wrap(
+        &self,
+        user: &User,
+        auth_context: &AuthContext,
+        new_password: String,
+    ) -> Result<AuthContext, Error> {
+        let prepared = self
+            .prepare_user_password_and_seed_wrap(user, auth_context, new_password)
+            .await?;
+        let new_auth_context = self.commit_prepared_user_password_and_seed_wrap(user, prepared)?;
+        self.verify_seed_wrap_for_auth_context(user, &new_auth_context)?;
         Ok(new_auth_context)
     }
 
     async fn encrypt_user_password_verifier(
         &self,
-        new_password: String,
-    ) -> Result<(String, Vec<u8>), Error> {
-        let password_hash = password_auth::generate_hash(new_password);
+        new_password: Zeroizing<String>,
+    ) -> Result<(Zeroizing<String>, Vec<u8>), Error> {
+        let password_hash = Zeroizing::new(password_auth::generate_hash(new_password.as_bytes()));
         let secret_key = SecretKey::from_slice(&self.enclave_key)
             .map_err(|e| Error::EncryptionError(e.to_string()))?;
         let encrypted_password = encrypt_with_key(&secret_key, password_hash.as_bytes()).await;

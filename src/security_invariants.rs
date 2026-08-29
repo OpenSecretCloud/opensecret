@@ -761,9 +761,9 @@ fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
         "password change must unwrap with the current signed AuthContext, not a DB-recomputed password auth context"
     );
 
-    let password_update_helper = extract_function_body(
+    let password_prepare_helper = extract_function_body(
         &main_contents,
-        "async fn update_user_password_and_seed_wrap",
+        "pub(crate) async fn prepare_user_password_and_seed_wrap",
     );
     for required_pattern in [
         "let expected_password_enc = user",
@@ -771,10 +771,40 @@ fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
         "encrypt_user_password_verifier(new_password)",
         "new_password_seed_wrapping_for_user(user, &password_hash, &plaintext_seed)",
         "password_auth_context_for_user(user, &password_hash)",
-        "expected_password_enc",
         "encrypted_password",
         "new_wrapping",
+        "PreparedUserPasswordChange",
+    ] {
+        assert!(
+            password_prepare_helper.contains(required_pattern),
+            "password-change preparation must contain `{required_pattern}`"
+        );
+    }
+
+    let password_commit_helper = extract_function_body(
+        &main_contents,
+        "pub(crate) fn commit_prepared_user_password_and_seed_wrap",
+    );
+    for required_pattern in [
+        ".update_user_password_and_seed_wrap(",
+        "&prepared.expected_password_enc",
+        "prepared.new_password_enc",
+        "prepared.new_wrapping",
         "DBError::StaleCredentialState => Error::AuthenticationError",
+    ] {
+        assert!(
+            password_commit_helper.contains(required_pattern),
+            "password-change commit must contain `{required_pattern}`"
+        );
+    }
+
+    let password_update_helper = extract_function_body(
+        &main_contents,
+        "async fn update_user_password_and_seed_wrap",
+    );
+    for required_pattern in [
+        "prepare_user_password_and_seed_wrap(user, auth_context, new_password)",
+        "commit_prepared_user_password_and_seed_wrap(user, prepared)",
         "verify_seed_wrap_for_auth_context(user, &new_auth_context)",
     ] {
         assert!(
@@ -942,8 +972,9 @@ fn password_registration_and_login_issue_tokens_only_after_seed_wrap_verificatio
 
     let authenticate_body = extract_function_body(&main_contents, "async fn authenticate_user");
     for required_pattern in [
+        "let user_password = Zeroizing::new(user_password)",
         "decrypt_with_key(&secret_key, user.password_enc.as_ref().unwrap())",
-        "verify_password(user_password, &decrypted_password_hash)",
+        "verify_password(user_password.as_bytes(), decrypted_password_hash.as_str())",
         "password_auth_context_for_user(&user, &verifier_for_binding)",
         "verify_seed_wrap_for_auth_context(&user, &auth_context)",
         "VerifiedUserAuthentication { user, auth_context }",

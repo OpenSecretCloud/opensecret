@@ -404,8 +404,11 @@ platform users, API keys, or anonymous clients. User/account changes and
 a fresh one. Distinct API keys can have concurrent sessions against one origin
 without sharing authority.
 
-A password change may replace the same user's credential-bound `AuthContext`.
-That is credential-context evolution for one principal, not principal rebinding.
+A password change never replaces a bound session's credential-derived
+`AuthContext` in place. It prepares a fresh access descriptor and resumption
+credential for the replacement `AuthContext`, commits the password and seed
+wrap atomically, and terminally closes the old session. The client establishes
+a fresh attested session before using the replacement credentials.
 
 ### 8.1 User sessions
 
@@ -723,7 +726,16 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
    server-side. The v2 SDK must treat the request as terminal, never
    transparently retry or resume the logout attempt, and use generation-safe
    local cleanup after the final response attempt. Exact cleanup behavior for
-   an ambiguous outcome is fixed in the SDK cutover PR.
+   an ambiguous outcome is fixed in the SDK cutover PR. Project password change
+   as an exact bound-user JSON mutation with its existing logical request and
+   response fields. Prepare and locally verify the replacement password wrap,
+   issue both replacement v2 credentials, and bound-serialize the success
+   response before attempting the existing password-ciphertext CAS transaction.
+   A successful commit or any failure after the commit attempt terminally
+   closes the old session; definite parse, current-password, preparation, and
+   serialization failures retain a still-valid session. A lost final response
+   is never retried: the client recovers through a fresh login with the
+   submitted new password.
 12. **Stored user unary operations**: project conversations, conversation
    projects, instructions, response control, and web-provider unary routes in
    ownership-preserving families before the client cutover.

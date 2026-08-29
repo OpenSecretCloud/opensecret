@@ -289,6 +289,13 @@ and distinct Unicode byte strings remain application data rather than routing
 syntax. The future TypeScript v2 SDK must implement the same UTF-8 byte codec;
 generic URI encoders that leave punctuation unescaped are insufficient.
 
+`DELETE /protected/api-keys/<name>` reuses that exact opaque-segment codec and
+then applies the existing API-key name contract after decoding: 1–50 ASCII
+alphanumeric, space, hyphen, or underscore characters, with no edge spaces.
+For example, `Production Key-1_test` has the single v2 spelling
+`Production%20Key%2D1%5Ftest`. Other encodings of the same name are rejected;
+transport-v1 path handling is unchanged.
+
 The gateway never hands an arbitrary URI to the full transport-v1 router.
 Application operations are projected deliberately onto shared application
 services/handlers.
@@ -681,8 +688,14 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
    consumption. Preserve `null`, string, bare-array, timestamp, ordering, and
    whole-list failure behavior from v1 while leaving every v1 query untouched.
 11. **Remaining protected user operations**: project account-lifecycle and user
-   API-key-management families in reviewable sub-stacks. Password/account
-   deletion must explicitly close the now-invalid bound session.
+   API-key-management families in reviewable sub-stacks. Start API-key
+   administration with bounded create/delete mutations: retain the existing
+   raw UUID key format without rotation, return it only through the original
+   bound-session response, wipe its plaintext response value on drop, and use
+   the canonical validated name segment for deletion. Keep list unsupported
+   until a following slice adds stored-output admission and a bounded narrow
+   database projection. Password/account deletion must explicitly close the
+   now-invalid bound session.
 12. **Stored user unary operations**: project conversations, conversation
    projects, instructions, response control, and web-provider unary routes in
    ownership-preserving families before the client cutover.

@@ -26,16 +26,17 @@ use crate::web::login_routes::{
     RegisterCredentials,
 };
 use crate::web::protected_routes::{
-    decrypt_data_value, delete_all_kv_values, delete_kv_value, encrypt_data_value,
-    private_key_bytes_data, private_key_data, protected_user_data, public_key_data, put_kv_value,
-    sign_message_data, third_party_token_data, DecryptDataRequest, DerivationPathQuery,
-    EncryptDataRequest, KvValue, PublicKeyQuery, SignMessageRequest, ThirdPartyTokenRequest,
+    create_api_key_data, decrypt_data_value, delete_all_kv_values, delete_api_key_by_name,
+    delete_kv_value, encrypt_data_value, private_key_bytes_data, private_key_data,
+    protected_user_data, public_key_data, put_kv_value, sign_message_data, third_party_token_data,
+    CreateApiKeyRequest, DecryptDataRequest, DerivationPathQuery, EncryptDataRequest, KvValue,
+    PublicKeyQuery, SignMessageRequest, ThirdPartyTokenRequest,
 };
 use crate::{ApiError, AppState, VerifiedUserAuthentication};
 
 use super::envelope::{
-    decode_canonical_kv_item_path, Credential, EncodedBytes, EnvelopeLimits, HeaderField,
-    LogicalMethod, RequestEnvelope, RequestId, ResponseMode,
+    decode_canonical_api_key_name_path, decode_canonical_kv_item_path, Credential, EncodedBytes,
+    EnvelopeLimits, HeaderField, LogicalMethod, RequestEnvelope, RequestId, ResponseMode,
 };
 use super::session::{
     AuthenticationReservation, AuthenticationStartError, AuthorityState, BoundAuthority,
@@ -111,6 +112,12 @@ pub(crate) enum ProtectedUserOperation {
         key: Zeroizing<String>,
     },
     DeleteAllKv,
+    CreateApiKey {
+        body: SensitiveBytes,
+    },
+    DeleteApiKey {
+        name: Zeroizing<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -265,10 +272,19 @@ pub(crate) fn prepare_user_operation(
         PutKv,
         DeleteKv,
         DeleteAllKv,
+        CreateApiKey,
+        DeleteApiKey,
     }
 
     let kv_key = match decode_canonical_kv_item_path(request.method, &request.path) {
         Ok(key) => key,
+        Err(_) => {
+            request.path.zeroize();
+            return rejected_bad_request();
+        }
+    };
+    let api_key_name = match decode_canonical_api_key_name_path(request.method, &request.path) {
+        Ok(name) => name,
         Err(_) => {
             request.path.zeroize();
             return rejected_bad_request();
@@ -288,12 +304,14 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Post, "/protected/decrypt") => Some(Route::DecryptData),
         (LogicalMethod::Get, "/protected/kv") => Some(Route::ListKv),
         (LogicalMethod::Delete, "/protected/kv") => Some(Route::DeleteAllKv),
+        (LogicalMethod::Post, "/protected/api-keys") => Some(Route::CreateApiKey),
         (LogicalMethod::Get, _) if kv_key.is_some() => Some(Route::GetKv),
         (LogicalMethod::Put, _) if kv_key.is_some() => Some(Route::PutKv),
         (LogicalMethod::Delete, _) if kv_key.is_some() => Some(Route::DeleteKv),
+        (LogicalMethod::Delete, _) if api_key_name.is_some() => Some(Route::DeleteApiKey),
         _ => None,
     };
-    if kv_key.is_some() {
+    if kv_key.is_some() || api_key_name.is_some() {
         request.path.zeroize();
     }
     let Some(route) = route else {
@@ -500,6 +518,52 @@ pub(crate) fn prepare_user_operation(
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
                 operation,
+            })
+        }
+        Route::CreateApiKey => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            let body = request
+                .body_base64
+                .expect("validated API-key creation body presence")
+                .into_bytes();
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::CreateApiKey {
+                    body: Zeroizing::new(body),
+                },
+            })
+        }
+        Route::DeleteApiKey => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::DeleteApiKey {
+                    name: api_key_name
+                        .expect("classified API-key item route must have a decoded name"),
+                },
             })
         }
     }
@@ -768,6 +832,19 @@ async fn execute_protected_user_operation(
                 }),
             )?;
             delete_all_kv_values(app_state, user.uuid).await?;
+            Ok(response)
+        }
+        ProtectedUserOperation::CreateApiKey { body } => {
+            let request = parse_json_body::<CreateApiKeyRequest>(body)?;
+            let value = create_api_key_data(app_state, user, request).await?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::DeleteApiKey { name } => {
+            let response = LogicalUnaryResponse::json(
+                StatusCode::OK,
+                &serde_json::json!({ "success": true }),
+            )?;
+            delete_api_key_by_name(app_state, user, &name)?;
             Ok(response)
         }
     }
@@ -1224,6 +1301,134 @@ mod tests {
                 operation: ProtectedUserOperation::DeleteAllKv,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn exact_api_key_mutation_contracts_are_admitted() {
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Post,
+                    "/protected/api-keys",
+                    json_header(),
+                    Some(br#"{"name":"Production Key-1_test"}"#),
+                    None,
+                ),
+                bound_user_authority(),
+            ),
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::CreateApiKey { .. },
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Delete,
+                    "/protected/api-keys/Production%20Key%2D1%5Ftest",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                bound_user_authority(),
+            ),
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::DeleteApiKey { name },
+                ..
+            }) if &*name == "Production Key-1_test"
+        ));
+
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Get,
+                    "/protected/api-keys",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                bound_user_authority(),
+            ),
+            OperationPreparation::Unsupported
+        ));
+    }
+
+    #[test]
+    fn api_key_mutations_reject_anonymous_and_transplanted_metadata() {
+        let create = || {
+            envelope(
+                LogicalMethod::Post,
+                "/protected/api-keys",
+                json_header(),
+                Some(br#"{"name":"Production Key"}"#),
+                None,
+            )
+        };
+        assert!(matches!(
+            prepare_user_operation(create(), AuthorityState::Anonymous),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::UNAUTHORIZED
+        ));
+
+        let mut create_with_query = create();
+        create_with_query.request.query = Some("transplanted=true".to_owned());
+        assert!(matches!(
+            prepare_user_operation(create_with_query, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut create_with_credential = create();
+        create_with_credential.credential = Some(Credential::Resumption {
+            value_base64: EncodedBytes::from_bytes(b"transplanted".to_vec()),
+        });
+        assert!(matches!(
+            prepare_user_operation(create_with_credential, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut create_stream = create();
+        create_stream.response_mode = ResponseMode::Stream;
+        assert!(matches!(
+            prepare_user_operation(create_stream, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let delete = || {
+            envelope(
+                LogicalMethod::Delete,
+                "/protected/api-keys/Production%20Key",
+                Vec::new(),
+                None,
+                None,
+            )
+        };
+        let mut delete_with_body = delete();
+        delete_with_body.request.body_base64 = Some(EncodedBytes::from_bytes(b"{}".to_vec()));
+        assert!(matches!(
+            prepare_user_operation(delete_with_body, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut delete_with_header = delete();
+        delete_with_header.request.headers = json_header();
+        assert!(matches!(
+            prepare_user_operation(delete_with_header, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut delete_with_query = delete();
+        delete_with_query.request.query = Some("transplanted=true".to_owned());
+        assert!(matches!(
+            prepare_user_operation(delete_with_query, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
         ));
     }
 

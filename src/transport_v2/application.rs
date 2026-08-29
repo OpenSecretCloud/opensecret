@@ -22,8 +22,8 @@ use crate::jwt::{
 };
 use crate::kv::StoreError;
 use crate::web::login_routes::{
-    authenticate_login, register_and_authenticate, verify_email_data, AuthResponse, Credentials,
-    RefreshResponse, RegisterCredentials,
+    authenticate_login, logout_data, register_and_authenticate, verify_email_data, AuthResponse,
+    Credentials, LogoutRequest, RefreshResponse, RegisterCredentials,
 };
 use crate::web::protected_routes::{
     confirm_account_deletion_data, create_api_key_data, decrypt_data_value, delete_all_kv_values,
@@ -77,6 +77,9 @@ pub(crate) enum UserOperation {
     },
     VerifyEmail {
         code: uuid::Uuid,
+    },
+    Logout {
+        body: SensitiveBytes,
     },
     Protected {
         authority: BoundUserAuthority,
@@ -170,6 +173,14 @@ impl UserOperation {
                 ..
             }
         )
+    }
+
+    const fn session_effect_on_success(&self) -> SessionEffect {
+        match self {
+            Self::Logout { .. } => SessionEffect::Close,
+            Self::Protected { operation, .. } => operation.session_effect_on_success(),
+            _ => SessionEffect::Retain,
+        }
     }
 }
 
@@ -320,6 +331,7 @@ pub(crate) fn prepare_user_operation(
         DeleteApiKey,
         RequestAccountDeletion,
         ConfirmAccountDeletion,
+        Logout,
     }
 
     let kv_key = match decode_canonical_kv_item_path(request.method, &request.path) {
@@ -370,6 +382,7 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Post, "/protected/delete-account/confirm") => {
             Some(Route::ConfirmAccountDeletion)
         }
+        (LogicalMethod::Post, "/logout") => Some(Route::Logout),
         (LogicalMethod::Get, _) if kv_key.is_some() => Some(Route::GetKv),
         (LogicalMethod::Put, _) if kv_key.is_some() => Some(Route::PutKv),
         (LogicalMethod::Delete, _) if kv_key.is_some() => Some(Route::DeleteKv),
@@ -557,6 +570,29 @@ pub(crate) fn prepare_user_operation(
             OperationPreparation::Ready(UserOperation::Protected {
                 authority,
                 operation,
+            })
+        }
+        Route::Logout => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            if let Err(rejection) = bound_user_authority(authority) {
+                return rejection;
+            }
+            OperationPreparation::Ready(UserOperation::Logout {
+                body: Zeroizing::new(
+                    request
+                        .body_base64
+                        .expect("validated logout body presence")
+                        .into_bytes(),
+                ),
             })
         }
         Route::PutKv => {
@@ -759,6 +795,7 @@ pub(crate) async fn execute_user_operation(
     authentication: Option<AuthenticationReservation>,
     monotonic_now: Instant,
 ) -> ApplicationOutcome {
+    let session_effect_on_success = operation.session_effect_on_success();
     match operation {
         UserOperation::Login { body } => {
             let parsed =
@@ -834,12 +871,23 @@ pub(crate) async fn execute_user_operation(
             };
             ApplicationOutcome::success(response, SessionEffect::Retain)
         }
+        UserOperation::Logout { body } => {
+            debug_assert!(authentication.is_none());
+            let request = match parse_json_body::<LogoutRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            let response = match LogicalUnaryResponse::json(StatusCode::OK, &logout_data(request)) {
+                Ok(response) => response,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            ApplicationOutcome::success(response, session_effect_on_success)
+        }
         UserOperation::Protected {
             authority,
             operation,
         } => {
             debug_assert!(authentication.is_none());
-            let session_effect = operation.session_effect_on_success();
             let user = match app_state.verify_bound_user(
                 authority.user_id,
                 authority.project_id,
@@ -869,7 +917,7 @@ pub(crate) async fn execute_user_operation(
                     return ApplicationOutcome::error(error);
                 }
             };
-            ApplicationOutcome::success(response, session_effect)
+            ApplicationOutcome::success(response, session_effect_on_success)
         }
     }
 }
@@ -1469,6 +1517,116 @@ mod tests {
 
         assert!(matches!(
             prepare_user_operation(request(), AuthorityState::Anonymous),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::UNAUTHORIZED
+        ));
+
+        let mut with_query = request();
+        with_query.request.query = Some("transplanted=true".to_owned());
+        assert!(matches!(
+            prepare_user_operation(with_query, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_extra_header = request();
+        with_extra_header.request.headers.push(HeaderField {
+            name: "accept".to_owned(),
+            value_base64: EncodedBytes::from_bytes(b"application/json".to_vec()),
+        });
+        assert!(matches!(
+            prepare_user_operation(with_extra_header, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut without_body = request();
+        without_body.request.body_base64 = None;
+        assert!(matches!(
+            prepare_user_operation(without_body, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_empty_body = request();
+        with_empty_body.request.body_base64 = Some(EncodedBytes::from_bytes(Vec::new()));
+        assert!(matches!(
+            prepare_user_operation(with_empty_body, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_credential = request();
+        with_credential.credential = Some(Credential::Resumption {
+            value_base64: EncodedBytes::from_bytes(b"transplanted".to_vec()),
+        });
+        assert!(matches!(
+            prepare_user_operation(with_credential, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut streaming = request();
+        streaming.response_mode = ResponseMode::Stream;
+        assert!(matches!(
+            prepare_user_operation(streaming, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+    }
+
+    #[test]
+    fn logout_is_exact_bound_and_terminal_only_on_success() {
+        let request = || {
+            envelope(
+                LogicalMethod::Post,
+                "/logout",
+                json_header(),
+                Some(br#"{"refresh_token":"resumption-token"}"#),
+                None,
+            )
+        };
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(request(), bound_user_authority())
+        else {
+            panic!("exact user logout must be admitted");
+        };
+        assert!(matches!(&operation, UserOperation::Logout { .. }));
+        assert_eq!(operation.session_effect_on_success(), SessionEffect::Close);
+        let parsed = parse_json_body::<LogoutRequest>(Zeroizing::new(
+            br#"{"refresh_token":"resumption-token","push_device_id":"123e4567-e89b-12d3-a456-426614174000"}"#
+                .to_vec(),
+        ))
+        .expect("the released Rust SDK logout extension must remain accepted");
+        assert_eq!(
+            logout_data(parsed),
+            serde_json::json!({ "message": "Logged out successfully" })
+        );
+
+        assert!(matches!(
+            prepare_user_operation(request(), AuthorityState::Anonymous),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::UNAUTHORIZED
+        ));
+        assert!(matches!(
+            prepare_user_operation(
+                request(),
+                AuthorityState::Bound(BoundAuthority::platform(
+                    uuid::Uuid::from_bytes([0x42; 16]),
+                    Instant::now() + std::time::Duration::from_secs(60),
+                )),
+            ),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::UNAUTHORIZED
+        ));
+        assert!(matches!(
+            prepare_user_operation(
+                request(),
+                AuthorityState::Bound(BoundAuthority::api_key(
+                    17,
+                    uuid::Uuid::from_bytes([0x43; 16]),
+                )),
+            ),
             OperationPreparation::Rejected(response)
                 if response.status == StatusCode::UNAUTHORIZED
         ));

@@ -26,6 +26,7 @@ use std::sync::Arc;
 use tokio::spawn;
 use tracing::{error, info};
 use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Deserialize, Clone)]
 pub struct PasswordResetRequestPayload {
@@ -129,8 +130,8 @@ pub struct RefreshResponse {
     pub(crate) refresh_token: String,
 }
 
-#[derive(Deserialize, Clone)]
-pub struct LogoutRequest {
+#[derive(Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
+pub(crate) struct LogoutRequest {
     refresh_token: String,
 }
 
@@ -260,12 +261,15 @@ pub async fn logout(
     Extension(logout_request): Extension<LogoutRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    let response = logout_data(logout_request);
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) fn logout_data(mut logout_request: LogoutRequest) -> serde_json::Value {
     info!("Logout request received");
     // TODO actually delete the refresh token
-    drop(logout_request.refresh_token);
-    let response = json!({ "message": "Logged out successfully" });
-    let result = encrypt_response(&data, &session_id, &response).await;
-    result
+    logout_request.refresh_token.zeroize();
+    json!({ "message": "Logged out successfully" })
 }
 
 pub async fn register(

@@ -716,6 +716,14 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
    explicitly close the now-invalid bound session only after that commit.
    Invalid codes, secrets, requests, expiry, and database failures return their
    existing encrypted errors without closing an otherwise valid session.
+   Project user logout as an exact bound-user JSON operation with the existing
+   refresh-token request and success body, then close the admitted session only
+   after the response is prepared. This remains session-local logout: matching
+   transport-v1 behavior, the submitted resumption credential is not revoked
+   server-side. The v2 SDK must treat the request as terminal, never
+   transparently retry or resume the logout attempt, and use generation-safe
+   local cleanup after the final response attempt. Exact cleanup behavior for
+   an ambiguous outcome is fixed in the SDK cutover PR.
 12. **Stored user unary operations**: project conversations, conversation
    projects, instructions, response control, and web-provider unary routes in
    ownership-preserving families before the client cutover.

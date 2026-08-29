@@ -5,7 +5,9 @@ use crate::{
         org_memberships::{NewOrgMembership, OrgRole},
         platform_users::PlatformUser,
     },
-    web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+    web::encryption_middleware::{
+        decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
+    },
     ApiError, AppState, DBError,
 };
 use axum::{
@@ -55,7 +57,7 @@ async fn create_invite(
     Extension(platform_user): Extension<PlatformUser>,
     Path(org_id): Path<Uuid>,
     Extension(create_request): Extension<CreateInviteRequest>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<InviteResponse>>, ApiError> {
     debug!("Creating invite");
 
@@ -133,7 +135,7 @@ async fn list_invites(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path(org_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<Vec<InviteResponse>>>, ApiError> {
     debug!("Listing organization invites");
 
@@ -187,7 +189,7 @@ async fn get_invite(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, invite_code)): Path<(Uuid, Uuid)>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<DetailedInviteResponse>>, ApiError> {
     debug!("Getting invite by code");
 
@@ -247,7 +249,7 @@ async fn delete_invite(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, invite_code)): Path<(Uuid, Uuid)>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     debug!("Deleting invite");
 
@@ -299,7 +301,7 @@ async fn accept_invite(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path(code): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     debug!("Accepting invite");
 

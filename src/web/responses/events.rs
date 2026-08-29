@@ -1,10 +1,9 @@
 //! SSE event handling utilities
 
-use crate::AppState;
+use crate::{web::encryption_middleware::TransportSession, AppState};
 use axum::response::sse::Event;
 use serde::Serialize;
 use tracing::{error, trace};
-use uuid::Uuid;
 
 use super::constants::{
     ERROR_DATA_ENCRYPTION_FAILED, ERROR_DATA_SERIALIZATION_FAILED, EVENT_RESPONSE_CANCELLED,
@@ -32,16 +31,20 @@ use super::handlers::{
 /// - Sequence number management
 pub struct SseEventEmitter<'a> {
     state: &'a AppState,
-    session_id: Uuid,
+    transport_session: TransportSession,
     sequence_number: i32,
 }
 
 impl<'a> SseEventEmitter<'a> {
     /// Create a new SSE event emitter
-    pub fn new(state: &'a AppState, session_id: Uuid, initial_sequence: i32) -> Self {
+    pub fn new(
+        state: &'a AppState,
+        transport_session: TransportSession,
+        initial_sequence: i32,
+    ) -> Self {
         Self {
             state,
-            session_id,
+            transport_session,
             sequence_number: initial_sequence,
         }
     }
@@ -63,7 +66,7 @@ impl<'a> SseEventEmitter<'a> {
     pub async fn emit<T: Serialize>(&mut self, event_type: &str, data: &T) -> Event {
         match serde_json::to_value(data) {
             Ok(json) => {
-                match encrypt_event(self.state, &self.session_id, event_type, &json).await {
+                match encrypt_event(self.state, &self.transport_session, event_type, &json).await {
                     Ok(event) => {
                         self.sequence_number += 1;
                         trace!(
@@ -97,7 +100,7 @@ impl<'a> SseEventEmitter<'a> {
     pub async fn emit_without_sequence<T: Serialize>(&self, event_type: &str, data: &T) -> Event {
         match serde_json::to_value(data) {
             Ok(json) => {
-                match encrypt_event(self.state, &self.session_id, event_type, &json).await {
+                match encrypt_event(self.state, &self.transport_session, event_type, &json).await {
                     Ok(event) => event,
                     Err(e) => {
                         error!("Failed to encrypt {} event: {:?}", event_type, e);

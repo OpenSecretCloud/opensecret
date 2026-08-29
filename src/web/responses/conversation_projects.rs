@@ -7,7 +7,9 @@ use crate::{
     models::users::User,
     tokens::count_tokens,
     web::{
-        encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+        encryption_middleware::{
+            decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
+        },
         responses::{
             constants::{
                 DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT,
@@ -157,7 +159,7 @@ fn build_project_response(
 
 async fn create_conversation_project(
     State(state): State<Arc<AppState>>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<CreateConversationProjectRequest>,
@@ -184,7 +186,7 @@ async fn create_conversation_project(
 async fn list_conversation_projects(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListConversationProjectsParams>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationProjectListResponse>>, ApiError> {
@@ -241,7 +243,7 @@ async fn list_conversation_projects(
 async fn get_conversation_project(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<ConversationProjectResponse>>, ApiError> {
@@ -263,7 +265,7 @@ async fn get_conversation_project(
 async fn update_conversation_project(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<UpdateConversationProjectRequest>,
@@ -321,7 +323,7 @@ async fn update_conversation_project(
 async fn delete_conversation_project(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
 ) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
     debug!(

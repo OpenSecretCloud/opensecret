@@ -8,7 +8,9 @@ use crate::{
     models::users::User,
     tokens::count_tokens,
     web::{
-        encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+        encryption_middleware::{
+            decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
+        },
         responses::{
             constants::{
                 DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT,
@@ -247,7 +249,7 @@ impl InstructionResponseBuilder {
 /// POST /v1/instructions - Create a new user instruction
 async fn create_instruction(
     State(state): State<Arc<AppState>>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<CreateInstructionRequest>,
@@ -318,7 +320,7 @@ async fn create_instruction(
 async fn get_instruction(
     State(state): State<Arc<AppState>>,
     Path(instruction_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<InstructionResponse>>, ApiError> {
@@ -342,7 +344,7 @@ async fn get_instruction(
 async fn update_instruction(
     State(state): State<Arc<AppState>>,
     Path(instruction_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<UpdateInstructionRequest>,
@@ -418,7 +420,7 @@ async fn update_instruction(
 async fn delete_instruction(
     State(state): State<Arc<AppState>>,
     Path(instruction_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
@@ -448,7 +450,7 @@ async fn delete_instruction(
 async fn list_instructions(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListInstructionsParams>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<InstructionListResponse>>, ApiError> {
@@ -522,7 +524,7 @@ async fn list_instructions(
 async fn set_default_instruction(
     State(state): State<Arc<AppState>>,
     Path(instruction_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
 ) -> Result<Json<EncryptedResponse<InstructionResponse>>, ApiError> {

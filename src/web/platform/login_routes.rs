@@ -5,7 +5,9 @@ use crate::{
         org_memberships::OrgRole, platform_email_verification::NewPlatformEmailVerification,
         platform_users::NewPlatformUser,
     },
-    web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+    web::encryption_middleware::{
+        decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
+    },
     ApiError, AppState, Error,
 };
 use axum::{
@@ -193,7 +195,7 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
 pub async fn login_platform_user(
     State(data): State<Arc<AppState>>,
     Extension(login_request): Extension<PlatformLoginRequest>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<PlatformAuthResponse>>, ApiError> {
     // Validate request
     if let Err(errors) = login_request.validate() {
@@ -245,7 +247,7 @@ async fn login_internal_platform(
 pub async fn register_platform_user(
     State(data): State<Arc<AppState>>,
     Extension(register_request): Extension<PlatformRegisterRequest>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<PlatformAuthResponse>>, ApiError> {
     // Validate request
     if let Err(errors) = register_request.validate() {
@@ -350,7 +352,7 @@ pub async fn register_platform_user(
 pub async fn refresh_platform_token(
     State(data): State<Arc<AppState>>,
     Extension(refresh_request): Extension<PlatformRefreshRequest>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<PlatformRefreshResponse>>, ApiError> {
     // Validate request
     if let Err(errors) = refresh_request.validate() {
@@ -383,7 +385,7 @@ pub async fn refresh_platform_token(
 pub async fn verify_platform_email(
     State(data): State<Arc<AppState>>,
     Path(code): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     // Retrieve the verification record using the code
     let verification = match data.db.get_platform_email_verification_by_code(code) {
@@ -433,7 +435,7 @@ pub async fn verify_platform_email(
 pub async fn logout_platform_user(
     State(data): State<Arc<AppState>>,
     Extension(logout_request): Extension<PlatformLogoutRequest>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     info!("Platform logout request received");
 
@@ -447,7 +449,7 @@ pub async fn logout_platform_user(
 pub async fn platform_password_reset_request(
     State(data): State<Arc<AppState>>,
     Extension(payload): Extension<PlatformPasswordResetRequestPayload>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     // Validate request
     if let Err(errors) = payload.validate() {
@@ -499,7 +501,7 @@ pub async fn platform_password_reset_request(
 pub async fn platform_password_reset_confirm(
     State(data): State<Arc<AppState>>,
     Extension(payload): Extension<PlatformPasswordResetConfirmPayload>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     // Validate request
     if let Err(errors) = payload.validate() {

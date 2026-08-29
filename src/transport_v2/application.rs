@@ -27,11 +27,12 @@ use crate::web::login_routes::{
 };
 use crate::web::protected_routes::{
     create_api_key_data, decrypt_data_value, delete_all_kv_values, delete_api_key_by_name,
-    delete_kv_value, encrypt_data_value, list_bounded_api_keys_data, private_key_bytes_data,
-    private_key_data, protected_user_data, public_key_data, put_kv_value,
-    request_new_verification_code_data, sign_message_data, third_party_token_data,
-    CreateApiKeyRequest, DecryptDataRequest, DerivationPathQuery, EncryptDataRequest, KvValue,
-    PublicKeyQuery, SignMessageRequest, ThirdPartyTokenRequest,
+    delete_kv_value, encrypt_data_value, initiate_account_deletion_data,
+    list_bounded_api_keys_data, private_key_bytes_data, private_key_data, protected_user_data,
+    public_key_data, put_kv_value, request_new_verification_code_data, sign_message_data,
+    third_party_token_data, CreateApiKeyRequest, DecryptDataRequest, DerivationPathQuery,
+    EncryptDataRequest, InitiateAccountDeletionRequest, KvValue, PublicKeyQuery,
+    SignMessageRequest, ThirdPartyTokenRequest,
 };
 use crate::{ApiError, AppState, VerifiedUserAuthentication};
 
@@ -125,6 +126,9 @@ pub(crate) enum ProtectedUserOperation {
     ListApiKeys,
     DeleteApiKey {
         name: Zeroizing<String>,
+    },
+    RequestAccountDeletion {
+        body: SensitiveBytes,
     },
 }
 
@@ -287,6 +291,7 @@ pub(crate) fn prepare_user_operation(
         CreateApiKey,
         ListApiKeys,
         DeleteApiKey,
+        RequestAccountDeletion,
     }
 
     let kv_key = match decode_canonical_kv_item_path(request.method, &request.path) {
@@ -331,6 +336,9 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Delete, "/protected/kv") => Some(Route::DeleteAllKv),
         (LogicalMethod::Post, "/protected/api-keys") => Some(Route::CreateApiKey),
         (LogicalMethod::Get, "/protected/api-keys") => Some(Route::ListApiKeys),
+        (LogicalMethod::Post, "/protected/delete-account/request") => {
+            Some(Route::RequestAccountDeletion)
+        }
         (LogicalMethod::Get, _) if kv_key.is_some() => Some(Route::GetKv),
         (LogicalMethod::Put, _) if kv_key.is_some() => Some(Route::PutKv),
         (LogicalMethod::Delete, _) if kv_key.is_some() => Some(Route::DeleteKv),
@@ -478,7 +486,8 @@ pub(crate) fn prepare_user_operation(
         Route::SignMessage
         | Route::IssueThirdPartyToken
         | Route::EncryptData
-        | Route::DecryptData => {
+        | Route::DecryptData
+        | Route::RequestAccountDeletion => {
             if credential.is_some()
                 || request.query.is_some()
                 || !has_exact_json_content_type(&request.headers)
@@ -505,6 +514,9 @@ pub(crate) fn prepare_user_operation(
                 }
                 Route::EncryptData => ProtectedUserOperation::EncryptData { body },
                 Route::DecryptData => ProtectedUserOperation::DecryptData { body },
+                Route::RequestAccountDeletion => {
+                    ProtectedUserOperation::RequestAccountDeletion { body }
+                }
                 _ => unreachable!("fixed protected POST classifier is exhaustive"),
             };
             OperationPreparation::Ready(UserOperation::Protected {
@@ -955,6 +967,11 @@ async fn execute_protected_user_operation(
             delete_api_key_by_name(app_state, user, &name)?;
             Ok(response)
         }
+        ProtectedUserOperation::RequestAccountDeletion { body } => {
+            let request = parse_json_body::<InitiateAccountDeletionRequest>(body)?;
+            let value = initiate_account_deletion_data(app_state, user, request).await?;
+            LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
     }
 }
 
@@ -1299,6 +1316,68 @@ mod tests {
         with_body.request.body_base64 = Some(EncodedBytes::from_bytes(b"{}".to_vec()));
         assert!(matches!(
             prepare_user_operation(with_body, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_credential = request();
+        with_credential.credential = Some(Credential::Resumption {
+            value_base64: EncodedBytes::from_bytes(b"transplanted".to_vec()),
+        });
+        assert!(matches!(
+            prepare_user_operation(with_credential, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+    }
+
+    #[test]
+    fn account_deletion_request_requires_a_bound_user_and_exact_json_request() {
+        let request = || {
+            envelope(
+                LogicalMethod::Post,
+                "/protected/delete-account/request",
+                json_header(),
+                Some(br#"{"hashed_secret":"client-hash"}"#),
+                None,
+            )
+        };
+        assert!(matches!(
+            prepare_user_operation(request(), bound_user_authority()),
+            OperationPreparation::Ready(UserOperation::Protected {
+                operation: ProtectedUserOperation::RequestAccountDeletion { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            prepare_user_operation(request(), AuthorityState::Anonymous),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::UNAUTHORIZED
+        ));
+
+        let mut with_query = request();
+        with_query.request.query = Some("transplanted=true".to_owned());
+        assert!(matches!(
+            prepare_user_operation(with_query, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut with_extra_header = request();
+        with_extra_header.request.headers.push(HeaderField {
+            name: "accept".to_owned(),
+            value_base64: EncodedBytes::from_bytes(b"application/json".to_vec()),
+        });
+        assert!(matches!(
+            prepare_user_operation(with_extra_header, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let mut without_body = request();
+        without_body.request.body_base64 = None;
+        assert!(matches!(
+            prepare_user_operation(without_body, bound_user_authority()),
             OperationPreparation::Rejected(response)
                 if response.status == StatusCode::BAD_REQUEST
         ));

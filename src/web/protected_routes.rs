@@ -90,7 +90,7 @@ pub struct ChangePasswordRequest {
     pub new_password: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct InitiateAccountDeletionRequest {
     pub hashed_secret: String,
 }
@@ -1315,26 +1315,29 @@ pub async fn initiate_account_deletion(
     Extension(delete_request): Extension<InitiateAccountDeletionRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    let response = initiate_account_deletion_data(&data, &user, delete_request).await?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn initiate_account_deletion_data(
+    data: &AppState,
+    user: &User,
+    mut delete_request: InitiateAccountDeletionRequest,
+) -> Result<serde_json::Value, ApiError> {
     info!("User {} is initiating account deletion request", user.uuid);
 
     // Create the account deletion request
+    let hashed_secret = std::mem::take(&mut delete_request.hashed_secret);
     match data
-        .create_account_deletion_request(
-            user.uuid,
-            delete_request.hashed_secret.clone(),
-            user.project_id,
-        )
+        .create_account_deletion_request(user.uuid, hashed_secret, user.project_id)
         .await
     {
-        Ok(_) => {
+        Ok(()) => {
             // Success - we return a generic message regardless of whether the
             // request was actually created and email sent
-            let response = json!({
+            Ok(json!({
                 "message": "We have sent a confirmation code to your email."
-            });
-
-            let result = encrypt_response(&data, &session_id, &response).await;
-            result
+            }))
         }
         Err(e) => {
             error!("Error in initiating account deletion: {:?}", e);

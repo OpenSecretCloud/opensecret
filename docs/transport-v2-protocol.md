@@ -705,7 +705,10 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
    that accepts either an anonymous or already-bound session without changing
    its authority. Require one lowercase hyphenated UUID path spelling, reject
    all logical metadata, and preserve the existing invalid/expired 400 plus
-   success/already-verified 200 outcomes. Password/account deletion must
+   success/already-verified 200 outcomes. Project account-deletion request as
+   an exact bound-user JSON mutation, preserving the generic success response,
+   independent fresh attempts, and background email behavior while claiming
+   replay state before request creation. Account-deletion confirmation must
    explicitly close the now-invalid bound session.
 12. **Stored user unary operations**: project conversations, conversation
    projects, instructions, response control, and web-provider unary routes in

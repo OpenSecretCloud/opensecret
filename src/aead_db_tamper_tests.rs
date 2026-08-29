@@ -14,9 +14,10 @@ use crate::{
             ResponsesError,
         },
         schema::{
-            assistant_messages, conversation_projects, conversation_summaries, conversations,
-            org_projects, password_reset_requests, reasoning_items, responses, tool_calls,
-            tool_outputs, user_messages, user_oauth_connections, user_seed_wrappings,
+            account_deletion_requests, assistant_messages, conversation_projects,
+            conversation_summaries, conversations, org_projects, password_reset_requests,
+            reasoning_items, responses, tool_calls, tool_outputs, user_messages,
+            user_oauth_connections, user_seed_wrappings,
         },
         user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError},
         user_kv::{NewUserKV, UserKV},
@@ -743,6 +744,79 @@ async fn db_email_verification_preserves_success_idempotency_and_expiry_contract
         Err(crate::ApiError::BadRequest)
     ));
 
+    let _ = app_state.db.delete_user(&user);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_account_deletion_request_preserves_generic_response_and_distinct_attempts() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let user = app_state
+        .db
+        .create_user(NewUser::new(None, None, project.id))
+        .expect("guest deletion-request test user should insert");
+
+    for hashed_secret in ["first-client-hash", "second-client-hash"] {
+        let value = crate::web::protected_routes::initiate_account_deletion_data(
+            &app_state,
+            &user,
+            crate::web::protected_routes::InitiateAccountDeletionRequest {
+                hashed_secret: hashed_secret.to_owned(),
+            },
+        )
+        .await
+        .expect("account deletion request should preserve its generic success response");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "message": "We have sent a confirmation code to your email."
+            })
+        );
+    }
+
+    let conn = &mut app_state
+        .db
+        .get_pool()
+        .get()
+        .expect("test database connection should be available");
+    let stored = account_deletion_requests::table
+        .filter(account_deletion_requests::user_id.eq(user.uuid))
+        .order(account_deletion_requests::id.asc())
+        .select((
+            account_deletion_requests::project_id,
+            account_deletion_requests::hashed_secret,
+            account_deletion_requests::encrypted_code,
+            account_deletion_requests::expiration_time,
+            account_deletion_requests::is_deleted,
+        ))
+        .load::<(i32, String, Vec<u8>, chrono::DateTime<Utc>, bool)>(conn)
+        .expect("account deletion requests should remain readable");
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored[0].0, project.id);
+    assert_eq!(stored[0].1, "first-client-hash");
+    assert!(!stored[0].4);
+    assert_eq!(stored[1].0, project.id);
+    assert_eq!(stored[1].1, "second-client-hash");
+    assert!(!stored[1].4);
+    assert_ne!(stored[0].2, stored[1].2);
+    let now = Utc::now();
+    for (_, _, _, expiration_time, _) in &stored {
+        let remaining = expiration_time.signed_duration_since(now);
+        assert!(remaining > chrono::Duration::hours(23));
+        assert!(remaining <= chrono::Duration::hours(24));
+    }
+
+    diesel::delete(
+        account_deletion_requests::table.filter(account_deletion_requests::user_id.eq(user.uuid)),
+    )
+    .execute(conn)
+    .expect("test account deletion requests should delete");
     let _ = app_state.db.delete_user(&user);
 }
 

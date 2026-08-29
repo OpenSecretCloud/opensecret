@@ -22,6 +22,7 @@ use crate::jwt::{
     issue_transport_v2_user_tokens, validate_transport_v2_user_resumption, AuthContext,
 };
 use crate::kv::StoreError;
+use crate::models::responses::{ConversationProjectFilter, NewConversation, ResponseStatus};
 use crate::tokens::count_tokens;
 use crate::web::login_routes::{
     authenticate_login, logout_data, register_and_authenticate, verify_email_data, AuthResponse,
@@ -38,10 +39,18 @@ use crate::web::protected_routes::{
     InitiateAccountDeletionRequest, KvValue, PublicKeyQuery, SignMessageRequest,
     ThirdPartyTokenRequest,
 };
+use crate::web::responses::conversions::ReasoningContentItem;
+use crate::web::responses::handlers::{
+    ContentPart, InputTokenDetails, OutputItem, OutputTokenDetails, ResponseUsage,
+    ResponsesRetrieveResponse,
+};
+use crate::web::responses::types::ConversationContent;
 use crate::web::responses::{
     constants::{
-        DEFAULT_PAGINATION_LIMIT, MAX_PAGINATION_LIMIT, OBJECT_TYPE_CONVERSATION_PROJECT,
-        OBJECT_TYPE_LIST,
+        DEFAULT_PAGINATION_LIMIT, DEFAULT_TOOL_FUNCTION_NAME, MAX_PAGINATION_LIMIT,
+        OBJECT_TYPE_CONVERSATION, OBJECT_TYPE_CONVERSATION_DELETED,
+        OBJECT_TYPE_CONVERSATION_PROJECT, OBJECT_TYPE_LIST, OBJECT_TYPE_LIST_DELETED,
+        OBJECT_TYPE_RESPONSE, ROLE_ASSISTANT, ROLE_USER, STATUS_CANCELLED, STATUS_COMPLETED,
     },
     conversation_projects::{
         create_conversation_project_with_name_data, delete_conversation_project_by_uuid_data,
@@ -49,26 +58,37 @@ use crate::web::responses::{
         ConversationProjectResponse, CreateConversationProjectRequest,
         ListConversationProjectsParams, UpdateConversationProjectRequest,
     },
+    conversations::{
+        validate_metadata, BatchDeleteConversationsRequest, BatchDeleteConversationsResponse,
+        BatchDeleteItemResult, BatchUpdateConversationProjectRequest,
+        BatchUpdateConversationProjectResponse, ConversationItemListResponse,
+        ConversationListResponse, ConversationResponse, CreateConversationRequest,
+        ListConversationsParams, ListItemsParams, UpdateConversationRequest,
+        MAX_CONVERSATION_BATCH_SIZE,
+    },
     instructions::{
         create_instruction_with_content_data, validate_instruction_content,
         CreateInstructionRequest, InstructionListResponse, InstructionResponse,
         ListInstructionsParams, UpdateInstructionRequest,
     },
-    DeletedObjectResponse, NullableField,
+    ConversationItem, DeletedObjectResponse, MessageContent, NullableField,
 };
 use crate::{ApiError, AppState, VerifiedUserAuthentication};
 
 use super::envelope::{
-    decode_canonical_api_key_name_path, decode_canonical_conversation_project_path,
-    decode_canonical_instruction_path, decode_canonical_kv_item_path,
-    decode_canonical_verify_email_path, Credential, EncodedBytes, EnvelopeLimits, HeaderField,
-    InstructionItemPath, LogicalMethod, RequestEnvelope, RequestId, ResponseMode,
+    decode_canonical_api_key_name_path, decode_canonical_conversation_path,
+    decode_canonical_conversation_project_path, decode_canonical_instruction_path,
+    decode_canonical_kv_item_path, decode_canonical_response_path,
+    decode_canonical_verify_email_path, ConversationItemPath, Credential, EncodedBytes,
+    EnvelopeLimits, HeaderField, InstructionItemPath, LogicalMethod, RequestEnvelope, RequestId,
+    ResponseItemPath, ResponseMode,
 };
 use super::session::{
     AuthenticationReservation, AuthenticationStartError, AuthorityState, BoundAuthority,
     BoundPrincipal,
 };
 use super::session_cache::V2SessionLease;
+use super::stored_conversations::{self, ProjectAssignmentUpdate, StoredConversationError};
 use super::stored_resources::{self, StoredResourceError};
 
 const JSON_CONTENT_TYPE: &[u8] = b"application/json";
@@ -80,8 +100,16 @@ const MAX_ENCRYPTION_PLAINTEXT_BYTES: usize =
     (MAX_ENCRYPTED_DATA_BASE64_BYTES / 4) * 3 - AES_GCM_NONCE_AND_TAG_BYTES;
 const MAX_V2_KV_LIST_ROWS: usize = 65_536;
 const MAX_V2_API_KEY_LIST_ROWS: usize = 65_536;
+const MAX_CONVERSATION_JSON_DEPTH: usize = 64;
+const MAX_CONVERSATION_JSON_STRUCTURAL_TOKENS: usize = 131_072;
 
 type SensitiveBytes = Zeroizing<Vec<u8>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonShapeError {
+    TooLarge,
+    Malformed,
+}
 
 pub(crate) enum OperationPreparation {
     Unsupported,
@@ -193,6 +221,46 @@ pub(crate) enum ProtectedUserOperation {
     SetDefaultInstruction {
         instruction_id: uuid::Uuid,
     },
+    CreateConversation {
+        body: SensitiveBytes,
+    },
+    ListConversations {
+        query: Option<String>,
+    },
+    GetConversation {
+        conversation_id: uuid::Uuid,
+    },
+    UpdateConversation {
+        conversation_id: uuid::Uuid,
+        body: SensitiveBytes,
+    },
+    DeleteConversation {
+        conversation_id: uuid::Uuid,
+    },
+    DeleteAllConversations,
+    BatchDeleteConversations {
+        body: SensitiveBytes,
+    },
+    BatchUpdateConversationProject {
+        body: SensitiveBytes,
+    },
+    ListConversationItems {
+        conversation_id: uuid::Uuid,
+        query: Option<String>,
+    },
+    GetConversationItem {
+        conversation_id: uuid::Uuid,
+        item_id: uuid::Uuid,
+    },
+    GetStoredResponse {
+        response_id: uuid::Uuid,
+    },
+    CancelStoredResponse {
+        response_id: uuid::Uuid,
+    },
+    DeleteStoredResponse {
+        response_id: uuid::Uuid,
+    },
     RequestAccountDeletion {
         body: SensitiveBytes,
     },
@@ -239,7 +307,14 @@ impl UserOperation {
                     | ProtectedUserOperation::ListInstructions { .. }
                     | ProtectedUserOperation::GetInstruction { .. }
                     | ProtectedUserOperation::UpdateInstruction { .. }
-                    | ProtectedUserOperation::SetDefaultInstruction { .. },
+                    | ProtectedUserOperation::SetDefaultInstruction { .. }
+                    | ProtectedUserOperation::ListConversations { .. }
+                    | ProtectedUserOperation::GetConversation { .. }
+                    | ProtectedUserOperation::UpdateConversation { .. }
+                    | ProtectedUserOperation::ListConversationItems { .. }
+                    | ProtectedUserOperation::GetConversationItem { .. }
+                    | ProtectedUserOperation::GetStoredResponse { .. }
+                    | ProtectedUserOperation::CancelStoredResponse { .. },
                 ..
             }
         )
@@ -280,6 +355,28 @@ struct InstructionResponsePreflight<'a> {
     is_default: bool,
     created_at: i64,
     updated_at: i64,
+}
+
+#[derive(Serialize)]
+struct ConversationResponsePreflight<'a> {
+    id: uuid::Uuid,
+    object: &'static str,
+    metadata: Option<&'a serde_json::Value>,
+    project_id: Option<uuid::Uuid>,
+    pinned: bool,
+    created_at: i64,
+    last_activity_at: i64,
+}
+
+#[derive(Serialize)]
+struct CancelledResponsePreflight<'a> {
+    id: uuid::Uuid,
+    object: &'static str,
+    created_at: i64,
+    status: &'static str,
+    model: &'a str,
+    usage: Option<serde_json::Value>,
+    output: &'static [serde_json::Value],
 }
 
 fn preflight_conversation_project_creation_response(name: &str) -> Result<(), ApiError> {
@@ -355,6 +452,57 @@ fn preflight_instruction_response_with_limit(
     };
     let response =
         LogicalUnaryResponse::json_with_limit(StatusCode::OK, &candidate, logical_body_bytes)?;
+    drop(response);
+    Ok(())
+}
+
+fn preflight_conversation_response(
+    metadata: Option<&serde_json::Value>,
+    project_id: Option<uuid::Uuid>,
+    pinned: bool,
+) -> Result<(), ApiError> {
+    let candidate = ConversationResponsePreflight {
+        id: uuid::Uuid::nil(),
+        object: OBJECT_TYPE_CONVERSATION,
+        metadata,
+        project_id,
+        pinned,
+        created_at: i64::MIN,
+        last_activity_at: i64::MIN,
+    };
+    let response = LogicalUnaryResponse::json(StatusCode::OK, &candidate)?;
+    drop(response);
+    Ok(())
+}
+
+fn preflight_batch_delete_conversations_response() -> Result<(), ApiError> {
+    let candidate = BatchDeleteConversationsResponse {
+        object: OBJECT_TYPE_LIST,
+        data: (0..MAX_CONVERSATION_BATCH_SIZE)
+            .map(|_| BatchDeleteItemResult {
+                id: uuid::Uuid::nil(),
+                object: OBJECT_TYPE_CONVERSATION_DELETED,
+                deleted: false,
+                error: Some("delete_failed"),
+            })
+            .collect(),
+    };
+    let response = LogicalUnaryResponse::json(StatusCode::OK, &candidate)?;
+    drop(response);
+    Ok(())
+}
+
+fn preflight_cancelled_response(model: &str) -> Result<(), ApiError> {
+    let candidate = CancelledResponsePreflight {
+        id: uuid::Uuid::nil(),
+        object: OBJECT_TYPE_RESPONSE,
+        created_at: i64::MIN,
+        status: STATUS_CANCELLED,
+        model,
+        usage: None,
+        output: &[],
+    };
+    let response = LogicalUnaryResponse::json(StatusCode::OK, &candidate)?;
     drop(response);
     Ok(())
 }
@@ -509,6 +657,19 @@ pub(crate) fn prepare_user_operation(
         UpdateInstruction,
         DeleteInstruction,
         SetDefaultInstruction,
+        CreateConversation,
+        ListConversations,
+        GetConversation,
+        UpdateConversation,
+        DeleteConversation,
+        DeleteAllConversations,
+        BatchDeleteConversations,
+        BatchUpdateConversationProject,
+        ListConversationItems,
+        GetConversationItem,
+        GetStoredResponse,
+        CancelStoredResponse,
+        DeleteStoredResponse,
         RequestAccountDeletion,
         ConfirmAccountDeletion,
         Logout,
@@ -552,6 +713,21 @@ pub(crate) fn prepare_user_operation(
             return rejected_bad_request();
         }
     };
+    let conversation_path = match decode_canonical_conversation_path(request.method, &request.path)
+    {
+        Ok(path) => path,
+        Err(_) => {
+            request.path.zeroize();
+            return rejected_bad_request();
+        }
+    };
+    let response_path = match decode_canonical_response_path(request.method, &request.path) {
+        Ok(path) => path,
+        Err(_) => {
+            request.path.zeroize();
+            return rejected_bad_request();
+        }
+    };
     let route = match (request.method, request.path.as_str()) {
         (LogicalMethod::Post, "/login") => Some(Route::Login),
         (LogicalMethod::Post, "/register") => Some(Route::Register),
@@ -578,6 +754,15 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Get, "/v1/conversation-projects") => Some(Route::ListConversationProjects),
         (LogicalMethod::Post, "/v1/instructions") => Some(Route::CreateInstruction),
         (LogicalMethod::Get, "/v1/instructions") => Some(Route::ListInstructions),
+        (LogicalMethod::Post, "/v1/conversations") => Some(Route::CreateConversation),
+        (LogicalMethod::Get, "/v1/conversations") => Some(Route::ListConversations),
+        (LogicalMethod::Delete, "/v1/conversations") => Some(Route::DeleteAllConversations),
+        (LogicalMethod::Post, "/v1/conversations/batch-delete") => {
+            Some(Route::BatchDeleteConversations)
+        }
+        (LogicalMethod::Post, "/v1/conversations/batch-update-project") => {
+            Some(Route::BatchUpdateConversationProject)
+        }
         (LogicalMethod::Post, "/protected/delete-account/request") => {
             Some(Route::RequestAccountDeletion)
         }
@@ -619,6 +804,49 @@ pub(crate) fn prepare_user_operation(
         {
             Some(Route::SetDefaultInstruction)
         }
+        (LogicalMethod::Get, _)
+            if matches!(
+                conversation_path,
+                Some(ConversationItemPath::Conversation(_))
+            ) =>
+        {
+            Some(Route::GetConversation)
+        }
+        (LogicalMethod::Post, _)
+            if matches!(
+                conversation_path,
+                Some(ConversationItemPath::Conversation(_))
+            ) =>
+        {
+            Some(Route::UpdateConversation)
+        }
+        (LogicalMethod::Delete, _)
+            if matches!(
+                conversation_path,
+                Some(ConversationItemPath::Conversation(_))
+            ) =>
+        {
+            Some(Route::DeleteConversation)
+        }
+        (LogicalMethod::Get, _)
+            if matches!(conversation_path, Some(ConversationItemPath::Items(_))) =>
+        {
+            Some(Route::ListConversationItems)
+        }
+        (LogicalMethod::Get, _)
+            if matches!(conversation_path, Some(ConversationItemPath::Item { .. })) =>
+        {
+            Some(Route::GetConversationItem)
+        }
+        (LogicalMethod::Get, _) if matches!(response_path, Some(ResponseItemPath::Item(_))) => {
+            Some(Route::GetStoredResponse)
+        }
+        (LogicalMethod::Delete, _) if matches!(response_path, Some(ResponseItemPath::Item(_))) => {
+            Some(Route::DeleteStoredResponse)
+        }
+        (LogicalMethod::Post, _) if matches!(response_path, Some(ResponseItemPath::Cancel(_))) => {
+            Some(Route::CancelStoredResponse)
+        }
         _ => None,
     };
     if kv_key.is_some()
@@ -626,6 +854,8 @@ pub(crate) fn prepare_user_operation(
         || verification_code.is_some()
         || conversation_project_id.is_some()
         || instruction_path.is_some()
+        || conversation_path.is_some()
+        || response_path.is_some()
     {
         request.path.zeroize();
     }
@@ -1193,6 +1423,171 @@ pub(crate) fn prepare_user_operation(
                             .into_bytes(),
                     ),
                 },
+            })
+        }
+        Route::CreateConversation
+        | Route::BatchDeleteConversations
+        | Route::BatchUpdateConversationProject => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            let body = Zeroizing::new(
+                request
+                    .body_base64
+                    .expect("validated conversation mutation body")
+                    .into_bytes(),
+            );
+            let operation = match route {
+                Route::CreateConversation => ProtectedUserOperation::CreateConversation { body },
+                Route::BatchDeleteConversations => {
+                    ProtectedUserOperation::BatchDeleteConversations { body }
+                }
+                Route::BatchUpdateConversationProject => {
+                    ProtectedUserOperation::BatchUpdateConversationProject { body }
+                }
+                _ => unreachable!("conversation collection mutation group is exhaustive"),
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation,
+            })
+        }
+        Route::UpdateConversation => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            let Some(ConversationItemPath::Conversation(conversation_id)) = conversation_path
+            else {
+                unreachable!("classified conversation update must use a conversation path")
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::UpdateConversation {
+                    conversation_id,
+                    body: Zeroizing::new(
+                        request
+                            .body_base64
+                            .expect("validated conversation update body")
+                            .into_bytes(),
+                    ),
+                },
+            })
+        }
+        Route::ListConversations | Route::ListConversationItems => {
+            if credential.is_some() || !request.headers.is_empty() || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            let operation = if matches!(route, Route::ListConversations) {
+                ProtectedUserOperation::ListConversations {
+                    query: request.query,
+                }
+            } else {
+                let Some(ConversationItemPath::Items(conversation_id)) = conversation_path else {
+                    unreachable!("classified conversation-item list must use an items path")
+                };
+                ProtectedUserOperation::ListConversationItems {
+                    conversation_id,
+                    query: request.query,
+                }
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation,
+            })
+        }
+        Route::GetConversation
+        | Route::DeleteConversation
+        | Route::DeleteAllConversations
+        | Route::GetConversationItem
+        | Route::GetStoredResponse
+        | Route::CancelStoredResponse
+        | Route::DeleteStoredResponse => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return rejection,
+            };
+            let operation = match route {
+                Route::GetConversation | Route::DeleteConversation => {
+                    let Some(ConversationItemPath::Conversation(conversation_id)) =
+                        conversation_path
+                    else {
+                        unreachable!("classified conversation item must use a conversation path")
+                    };
+                    if matches!(route, Route::GetConversation) {
+                        ProtectedUserOperation::GetConversation { conversation_id }
+                    } else {
+                        ProtectedUserOperation::DeleteConversation { conversation_id }
+                    }
+                }
+                Route::DeleteAllConversations => ProtectedUserOperation::DeleteAllConversations,
+                Route::GetConversationItem => {
+                    let Some(ConversationItemPath::Item {
+                        conversation_id,
+                        item_id,
+                    }) = conversation_path
+                    else {
+                        unreachable!("classified conversation item must use an item path")
+                    };
+                    ProtectedUserOperation::GetConversationItem {
+                        conversation_id,
+                        item_id,
+                    }
+                }
+                Route::GetStoredResponse | Route::DeleteStoredResponse => {
+                    let Some(ResponseItemPath::Item(response_id)) = response_path else {
+                        unreachable!("classified stored response must use an item path")
+                    };
+                    if matches!(route, Route::GetStoredResponse) {
+                        ProtectedUserOperation::GetStoredResponse { response_id }
+                    } else {
+                        ProtectedUserOperation::DeleteStoredResponse { response_id }
+                    }
+                }
+                Route::CancelStoredResponse => {
+                    let Some(ResponseItemPath::Cancel(response_id)) = response_path else {
+                        unreachable!("classified response cancellation must use a cancel path")
+                    };
+                    ProtectedUserOperation::CancelStoredResponse { response_id }
+                }
+                _ => unreachable!("bodyless conversation/response group is exhaustive"),
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation,
             })
         }
     }
@@ -2015,6 +2410,460 @@ async fn execute_protected_user_operation(
             };
             LogicalUnaryResponse::json(StatusCode::OK, &value)
         }
+        ProtectedUserOperation::CreateConversation { body } => {
+            let request = parse_conversation_json_body::<CreateConversationRequest>(body)?;
+            if request
+                .items
+                .as_ref()
+                .is_some_and(|items| !items.is_empty())
+            {
+                return Err(ApiError::BadRequest);
+            }
+
+            let mut metadata = request.metadata.unwrap_or_else(|| serde_json::json!({}));
+            validate_metadata(&metadata)?;
+            if metadata.get("title").is_none() {
+                metadata["title"] = serde_json::json!("New Conversation");
+            }
+            let project_id = match request.project_id {
+                Some(project_uuid) => Some(
+                    stored_conversations::resolve_project_id(
+                        app_state.db.get_pool(),
+                        user.uuid,
+                        project_uuid,
+                    )
+                    .map_err(map_stored_conversation_error)?,
+                ),
+                None => None,
+            };
+            let pinned = request.pinned.unwrap_or(false);
+            preflight_conversation_response(Some(&metadata), request.project_id, pinned)?;
+
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+            let metadata_enc = Some(encrypt_json_value(&user_key, &metadata).await?);
+            let conversation_uuid = uuid::Uuid::new_v4();
+            let mut conversation = app_state
+                .db
+                .create_conversation(NewConversation {
+                    uuid: conversation_uuid,
+                    user_id: user.uuid,
+                    project_id,
+                    is_pinned: pinned,
+                    metadata_enc,
+                })
+                .map_err(crate::web::responses::error_mapping::map_generic_db_error)?;
+            let mut value = ConversationResponse {
+                id: conversation.uuid,
+                object: OBJECT_TYPE_CONVERSATION,
+                metadata: Some(metadata),
+                project_id: request.project_id,
+                pinned: conversation.is_pinned,
+                created_at: conversation.created_at.timestamp(),
+                last_activity_at: conversation.last_activity_at.timestamp(),
+            };
+            if let Some(ciphertext) = conversation.metadata_enc.as_mut() {
+                ciphertext.zeroize();
+            }
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value);
+            zeroize_conversation_response(&mut value);
+            response
+        }
+        ProtectedUserOperation::ListConversations { query } => {
+            let params = parse_logical_query::<ListConversationsParams>(query)?;
+            params.validate()?;
+            let limit = if params.limit <= 0 {
+                DEFAULT_PAGINATION_LIMIT
+            } else {
+                params.limit.min(MAX_PAGINATION_LIMIT)
+            };
+            let project_filter = if params.unassigned_project == Some(true) {
+                ConversationProjectFilter::Unassigned
+            } else if let Some(project_uuid) = params.project_id {
+                ConversationProjectFilter::Assigned(
+                    stored_conversations::resolve_project_id(
+                        app_state.db.get_pool(),
+                        user.uuid,
+                        project_uuid,
+                    )
+                    .map_err(map_stored_conversation_error)?,
+                )
+            } else {
+                ConversationProjectFilter::Any
+            };
+            let (stored, has_more) = stored_conversations::list_conversations(
+                app_state.db.get_pool(),
+                user.uuid,
+                limit,
+                params.after,
+                &params.order,
+                project_filter,
+                params.pinned,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_stored_conversation_error)?;
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+            let first_id = stored.first().map(|value| value.conversation.uuid);
+            let last_id = stored.last().map(|value| value.conversation.uuid);
+            let mut data = Vec::with_capacity(stored.len());
+            for value in &stored {
+                let metadata = decrypt_optional_json(
+                    &user_key,
+                    value.conversation.metadata_enc.as_ref(),
+                    "conversation metadata",
+                )?;
+                data.push(stored_conversation_response(value, metadata));
+            }
+            let mut value = ConversationListResponse {
+                object: OBJECT_TYPE_LIST,
+                data,
+                has_more,
+                first_id,
+                last_id,
+            };
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value);
+            value
+                .data
+                .iter_mut()
+                .for_each(zeroize_conversation_response);
+            response
+        }
+        ProtectedUserOperation::GetConversation { conversation_id } => {
+            let stored = stored_conversations::get_conversation(
+                app_state.db.get_pool(),
+                user.uuid,
+                conversation_id,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_stored_conversation_error)?;
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+            let metadata = decrypt_optional_json(
+                &user_key,
+                stored.conversation.metadata_enc.as_ref(),
+                "conversation metadata",
+            )?;
+            let mut value = stored_conversation_response(&stored, metadata);
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value);
+            zeroize_conversation_response(&mut value);
+            response
+        }
+        ProtectedUserOperation::UpdateConversation {
+            conversation_id,
+            body,
+        } => {
+            let mut request = parse_conversation_json_body::<UpdateConversationRequest>(body)?;
+            if request.metadata.is_none()
+                && request.project_id.is_missing()
+                && request.pinned.is_none()
+            {
+                return Err(ApiError::BadRequest);
+            }
+            let stored = stored_conversations::get_conversation(
+                app_state.db.get_pool(),
+                user.uuid,
+                conversation_id,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_stored_conversation_error)?;
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+
+            let supplied_metadata = request.metadata.is_some();
+            let final_metadata = match request.metadata.take() {
+                Some(metadata) => {
+                    validate_metadata(&metadata)?;
+                    Some(metadata)
+                }
+                None => decrypt_optional_json(
+                    &user_key,
+                    stored.conversation.metadata_enc.as_ref(),
+                    "conversation metadata",
+                )?,
+            };
+            let (project_update, final_project_uuid) = match request.project_id {
+                NullableField::Missing => (ProjectAssignmentUpdate::Unchanged, stored.project_uuid),
+                NullableField::Null => (ProjectAssignmentUpdate::Set(None), None),
+                NullableField::Value(project_uuid) => {
+                    let project_id = stored_conversations::resolve_project_id(
+                        app_state.db.get_pool(),
+                        user.uuid,
+                        project_uuid,
+                    )
+                    .map_err(map_stored_conversation_error)?;
+                    (
+                        ProjectAssignmentUpdate::Set(Some(project_id)),
+                        Some(project_uuid),
+                    )
+                }
+            };
+            let pinned = request.pinned.unwrap_or(stored.conversation.is_pinned);
+            preflight_conversation_response(final_metadata.as_ref(), final_project_uuid, pinned)?;
+            let metadata_enc = if supplied_metadata {
+                Some(
+                    encrypt_json_value(
+                        &user_key,
+                        final_metadata
+                            .as_ref()
+                            .expect("supplied metadata must remain available"),
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let metadata = stored_conversations::update_conversation(
+                app_state.db.get_pool(),
+                user.uuid,
+                conversation_id,
+                metadata_enc,
+                project_update,
+                request.pinned,
+            )
+            .map_err(map_stored_conversation_error)?;
+            let mut value = ConversationResponse {
+                id: metadata.uuid,
+                object: OBJECT_TYPE_CONVERSATION,
+                metadata: final_metadata,
+                project_id: metadata.project_uuid,
+                pinned: metadata.is_pinned,
+                created_at: metadata.created_at.timestamp(),
+                last_activity_at: metadata.last_activity_at.timestamp(),
+            };
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value);
+            zeroize_conversation_response(&mut value);
+            response
+        }
+        ProtectedUserOperation::DeleteConversation { conversation_id } => {
+            let value = DeletedObjectResponse::conversation(conversation_id);
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value)?;
+            stored_conversations::delete_conversation(
+                app_state.db.get_pool(),
+                user.uuid,
+                conversation_id,
+            )
+            .map_err(map_stored_conversation_error)?;
+            Ok(response)
+        }
+        ProtectedUserOperation::DeleteAllConversations => {
+            let value = serde_json::json!({
+                "object": OBJECT_TYPE_LIST_DELETED,
+                "deleted": true
+            });
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value)?;
+            stored_conversations::delete_all_conversations(app_state.db.get_pool(), user.uuid)
+                .map_err(map_stored_conversation_error)?;
+            Ok(response)
+        }
+        ProtectedUserOperation::BatchDeleteConversations { body } => {
+            let request = parse_json_body::<BatchDeleteConversationsRequest>(body)?;
+            if request.ids.is_empty() || request.ids.len() > MAX_CONVERSATION_BATCH_SIZE {
+                return Err(ApiError::BadRequest);
+            }
+            preflight_batch_delete_conversations_response()?;
+            let mut data = Vec::with_capacity(request.ids.len());
+            for conversation_id in request.ids {
+                let lookup = stored_conversations::lookup_conversation_id(
+                    app_state.db.get_pool(),
+                    user.uuid,
+                    conversation_id,
+                );
+                let Ok(internal_id) = lookup else {
+                    data.push(BatchDeleteItemResult {
+                        id: conversation_id,
+                        object: OBJECT_TYPE_CONVERSATION_DELETED,
+                        deleted: false,
+                        error: Some("not_found"),
+                    });
+                    continue;
+                };
+                data.push(match stored_conversations::delete_conversation_by_internal_id(
+                    app_state.db.get_pool(),
+                    user.uuid,
+                    internal_id,
+                ) {
+                    Ok(()) => BatchDeleteItemResult {
+                        id: conversation_id,
+                        object: OBJECT_TYPE_CONVERSATION_DELETED,
+                        deleted: true,
+                        error: None,
+                    },
+                    Err(error) => {
+                        tracing::error!(?error, %conversation_id, "Failed to batch-delete conversation");
+                        BatchDeleteItemResult {
+                            id: conversation_id,
+                            object: OBJECT_TYPE_CONVERSATION_DELETED,
+                            deleted: false,
+                            error: Some("delete_failed"),
+                        }
+                    }
+                });
+            }
+            LogicalUnaryResponse::json(
+                StatusCode::OK,
+                &BatchDeleteConversationsResponse {
+                    object: OBJECT_TYPE_LIST,
+                    data,
+                },
+            )
+        }
+        ProtectedUserOperation::BatchUpdateConversationProject { body } => {
+            let request = parse_json_body::<BatchUpdateConversationProjectRequest>(body)?;
+            if request.ids.is_empty() || request.ids.len() > MAX_CONVERSATION_BATCH_SIZE {
+                return Err(ApiError::BadRequest);
+            }
+            let target_project_id = match request.project_id {
+                NullableField::Missing => return Err(ApiError::BadRequest),
+                NullableField::Null => None,
+                NullableField::Value(project_uuid) => Some(
+                    stored_conversations::resolve_project_id(
+                        app_state.db.get_pool(),
+                        user.uuid,
+                        project_uuid,
+                    )
+                    .map_err(map_stored_conversation_error)?,
+                ),
+            };
+            let value = BatchUpdateConversationProjectResponse { success: true };
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value)?;
+            stored_conversations::batch_update_conversation_project(
+                app_state.db.get_pool(),
+                user.uuid,
+                &request.ids,
+                target_project_id,
+            )
+            .map_err(map_stored_conversation_error)?;
+            Ok(response)
+        }
+        ProtectedUserOperation::ListConversationItems {
+            conversation_id,
+            query,
+        } => {
+            let params = parse_logical_query::<ListItemsParams>(query)?;
+            let limit = if params.limit <= 0 {
+                DEFAULT_PAGINATION_LIMIT
+            } else {
+                params.limit.min(MAX_PAGINATION_LIMIT)
+            };
+            let (stored, has_more) = stored_conversations::list_conversation_items(
+                app_state.db.get_pool(),
+                user.uuid,
+                conversation_id,
+                limit,
+                params.after,
+                &params.order,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_stored_conversation_error)?;
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+            let data = stored
+                .into_iter()
+                .map(|item| stored_item_to_conversation_item(item, &user_key))
+                .collect::<Result<Vec<_>, _>>()?;
+            let first_id = data.first().map(conversation_item_id);
+            let last_id = data.last().map(conversation_item_id);
+            let mut value = ConversationItemListResponse {
+                object: OBJECT_TYPE_LIST,
+                data,
+                has_more,
+                first_id,
+                last_id,
+            };
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value);
+            value.data.iter_mut().for_each(zeroize_conversation_item);
+            response
+        }
+        ProtectedUserOperation::GetConversationItem {
+            conversation_id,
+            item_id,
+        } => {
+            let stored = stored_conversations::get_conversation_item(
+                app_state.db.get_pool(),
+                user.uuid,
+                conversation_id,
+                item_id,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_stored_conversation_error)?;
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+            let mut value = stored_item_to_conversation_item(stored, &user_key)?;
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value);
+            zeroize_conversation_item(&mut value);
+            response
+        }
+        ProtectedUserOperation::GetStoredResponse { response_id } => {
+            let stored = stored_conversations::get_stored_response(
+                app_state.db.get_pool(),
+                user.uuid,
+                response_id,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_stored_conversation_error)?;
+            let user_key = app_state
+                .get_user_key(user, auth_context, None, None)
+                .await
+                .map_err(|_| crate::web::responses::error_mapping::map_key_retrieval_error())?;
+            let mut value = stored_response_to_wire(stored, &user_key)?;
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value);
+            zeroize_stored_response(&mut value);
+            response
+        }
+        ProtectedUserOperation::CancelStoredResponse { response_id } => {
+            let metadata = stored_conversations::get_cancelable_response_metadata(
+                app_state.db.get_pool(),
+                user.uuid,
+                response_id,
+                EnvelopeLimits::default().logical_body_bytes,
+            )
+            .map_err(map_stored_conversation_error)?;
+            preflight_cancelled_response(&metadata.model)?;
+            let mut value = ResponsesRetrieveResponse {
+                id: metadata.uuid,
+                object: OBJECT_TYPE_RESPONSE,
+                created_at: metadata.created_at.timestamp(),
+                status: STATUS_CANCELLED.to_owned(),
+                model: metadata.model,
+                usage: None,
+                output: Vec::new(),
+            };
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value)?;
+            zeroize_stored_response(&mut value);
+            let transitioned = stored_conversations::transition_stored_response_to_cancelled(
+                app_state.db.get_pool(),
+                user.uuid,
+                response_id,
+            )
+            .map_err(map_stored_conversation_error)?;
+            debug_assert_eq!(transitioned, response_id);
+            let _ = app_state.cancellation_broadcast.send(response_id);
+            Ok(response)
+        }
+        ProtectedUserOperation::DeleteStoredResponse { response_id } => {
+            let value = DeletedObjectResponse::response(response_id);
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value)?;
+            stored_conversations::delete_stored_response(
+                app_state.db.get_pool(),
+                user.uuid,
+                response_id,
+            )
+            .map_err(map_stored_conversation_error)?;
+            Ok(response)
+        }
         ProtectedUserOperation::RequestAccountDeletion { body } => {
             let request = parse_json_body::<InitiateAccountDeletionRequest>(body)?;
             let value = initiate_account_deletion_data(app_state, user, request).await?;
@@ -2065,6 +2914,418 @@ fn map_instruction_storage_error(error: StoredResourceError) -> ApiError {
             ApiError::InternalServerError
         }
     }
+}
+
+fn map_stored_conversation_error(error: StoredConversationError) -> ApiError {
+    match error {
+        StoredConversationError::ConversationNotFound
+        | StoredConversationError::ConversationProjectNotFound
+        | StoredConversationError::ConversationItemNotFound
+        | StoredConversationError::ResponseNotFound => ApiError::NotFound,
+        StoredConversationError::Validation => ApiError::BadRequest,
+        StoredConversationError::OutputTooLarge => ApiError::PayloadTooLarge,
+        error => {
+            tracing::error!(?error, "Failed to access bounded conversation state");
+            ApiError::InternalServerError
+        }
+    }
+}
+
+fn decrypt_optional_json(
+    user_key: &secp256k1::SecretKey,
+    ciphertext: Option<&Vec<u8>>,
+    description: &'static str,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let Some(ciphertext) = ciphertext else {
+        return Ok(None);
+    };
+    let plaintext = Zeroizing::new(decrypt_with_key(user_key, ciphertext).map_err(|_| {
+        tracing::error!(description, "Failed to decrypt bounded stored JSON");
+        ApiError::InternalServerError
+    })?);
+    match validate_json_shape(&plaintext) {
+        Ok(()) => {}
+        Err(JsonShapeError::TooLarge) => return Err(ApiError::PayloadTooLarge),
+        Err(JsonShapeError::Malformed) => {
+            tracing::error!(description, "Malformed bounded stored JSON");
+            return Err(ApiError::InternalServerError);
+        }
+    }
+    serde_json::from_slice(&plaintext).map(Some).map_err(|_| {
+        tracing::error!(description, "Failed to parse bounded stored JSON");
+        ApiError::InternalServerError
+    })
+}
+
+async fn encrypt_json_value(
+    user_key: &secp256k1::SecretKey,
+    value: &serde_json::Value,
+) -> Result<Vec<u8>, ApiError> {
+    let plaintext = Zeroizing::new(serde_json::to_vec(value).map_err(|_| {
+        tracing::error!("Failed to serialize conversation metadata");
+        ApiError::InternalServerError
+    })?);
+    Ok(encrypt_with_key(user_key, &plaintext).await)
+}
+
+fn stored_conversation_response(
+    stored: &stored_conversations::StoredConversation,
+    metadata: Option<serde_json::Value>,
+) -> ConversationResponse {
+    ConversationResponse {
+        id: stored.conversation.uuid,
+        object: OBJECT_TYPE_CONVERSATION,
+        metadata,
+        project_id: stored.project_uuid,
+        pinned: stored.conversation.is_pinned,
+        created_at: stored.conversation.created_at.timestamp(),
+        last_activity_at: stored.conversation.last_activity_at.timestamp(),
+    }
+}
+
+fn zeroize_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(value) => value.zeroize(),
+        serde_json::Value::Array(values) => values.iter_mut().for_each(zeroize_json_value),
+        serde_json::Value::Object(values) => {
+            for (mut key, mut value) in std::mem::take(values) {
+                key.zeroize();
+                zeroize_json_value(&mut value);
+            }
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn zeroize_conversation_response(value: &mut ConversationResponse) {
+    if let Some(metadata) = value.metadata.as_mut() {
+        zeroize_json_value(metadata);
+    }
+}
+
+fn zeroize_conversation_item(item: &mut ConversationItem) {
+    match item {
+        ConversationItem::Message {
+            status,
+            role,
+            content,
+            ..
+        } => {
+            if let Some(status) = status.as_mut() {
+                status.zeroize();
+            }
+            role.zeroize();
+            for part in content {
+                match part {
+                    ConversationContent::Text { text }
+                    | ConversationContent::InputText { text }
+                    | ConversationContent::OutputText { text } => text.zeroize(),
+                    ConversationContent::InputImage { image_url } => image_url.zeroize(),
+                    ConversationContent::InputFile { filename } => filename.zeroize(),
+                }
+            }
+        }
+        ConversationItem::FunctionToolCall {
+            name,
+            arguments,
+            status,
+            ..
+        } => {
+            name.zeroize();
+            arguments.zeroize();
+            if let Some(status) = status.as_mut() {
+                status.zeroize();
+            }
+        }
+        ConversationItem::FunctionToolCallOutput { output, status, .. } => {
+            output.zeroize();
+            if let Some(status) = status.as_mut() {
+                status.zeroize();
+            }
+        }
+        ConversationItem::Reasoning {
+            content, status, ..
+        } => {
+            for ReasoningContentItem::Text { text } in content {
+                text.zeroize();
+            }
+            if let Some(status) = status.as_mut() {
+                status.zeroize();
+            }
+        }
+    }
+}
+
+fn zeroize_stored_response(value: &mut ResponsesRetrieveResponse) {
+    value.status.zeroize();
+    value.model.zeroize();
+    for item in &mut value.output {
+        item.output_type.zeroize();
+        item.id.zeroize();
+        item.status.zeroize();
+        if let Some(role) = item.role.as_mut() {
+            role.zeroize();
+        }
+        if let Some(content) = item.content.as_mut() {
+            for part in content {
+                part.part_type.zeroize();
+                part.text.zeroize();
+            }
+        }
+        for value in [
+            &mut item.call_id,
+            &mut item.name,
+            &mut item.arguments,
+            &mut item.output,
+        ] {
+            if let Some(value) = value.as_mut() {
+                value.zeroize();
+            }
+        }
+    }
+}
+
+fn conversation_item_id(item: &ConversationItem) -> uuid::Uuid {
+    match item {
+        ConversationItem::Message { id, .. }
+        | ConversationItem::FunctionToolCall { id, .. }
+        | ConversationItem::FunctionToolCallOutput { id, .. }
+        | ConversationItem::Reasoning { id, .. } => *id,
+    }
+}
+
+fn stored_item_to_conversation_item(
+    mut item: stored_conversations::StoredConversationItem,
+    user_key: &secp256k1::SecretKey,
+) -> Result<ConversationItem, ApiError> {
+    let mut content = decrypt_optional_string(
+        user_key,
+        item.content_enc.as_ref(),
+        "conversation item content",
+    )?
+    .unwrap_or_else(|| Zeroizing::new(String::new()));
+    let id = item.uuid;
+    let created_at = Some(item.created_at.timestamp());
+    let status = item.status.take();
+
+    match item.message_type.as_str() {
+        "user" => {
+            let message_content =
+                serde_json::from_str::<MessageContent>(&content).map_err(|_| {
+                    tracing::error!("Failed to parse bounded user-message content");
+                    ApiError::InternalServerError
+                })?;
+            Ok(ConversationItem::Message {
+                id,
+                status,
+                role: ROLE_USER.to_owned(),
+                content: Vec::<ConversationContent>::from(message_content),
+                created_at,
+            })
+        }
+        "assistant" => {
+            let content = if content.is_empty() {
+                Vec::new()
+            } else {
+                vec![ConversationContent::OutputText {
+                    text: std::mem::take(&mut *content),
+                }]
+            };
+            Ok(ConversationItem::Message {
+                id,
+                status,
+                role: ROLE_ASSISTANT.to_owned(),
+                content,
+                created_at,
+            })
+        }
+        "tool_call" => Ok(ConversationItem::FunctionToolCall {
+            id,
+            call_id: item.tool_call_id.ok_or_else(|| {
+                tracing::error!("Stored tool call is missing its call ID");
+                ApiError::InternalServerError
+            })?,
+            name: item
+                .tool_name
+                .take()
+                .unwrap_or_else(|| DEFAULT_TOOL_FUNCTION_NAME.to_owned()),
+            arguments: std::mem::take(&mut *content),
+            status,
+            created_at,
+        }),
+        "tool_output" => Ok(ConversationItem::FunctionToolCallOutput {
+            id,
+            call_id: item.tool_call_id.ok_or_else(|| {
+                tracing::error!("Stored tool output is missing its call ID");
+                ApiError::InternalServerError
+            })?,
+            output: std::mem::take(&mut *content),
+            status,
+            created_at,
+        }),
+        "reasoning" => {
+            let content = if content.is_empty() {
+                Vec::new()
+            } else {
+                vec![ReasoningContentItem::Text {
+                    text: std::mem::take(&mut *content),
+                }]
+            };
+            Ok(ConversationItem::Reasoning {
+                id,
+                content,
+                status,
+                created_at,
+            })
+        }
+        unknown => {
+            tracing::error!(
+                message_type = unknown,
+                "Unknown bounded conversation-item type"
+            );
+            Err(ApiError::InternalServerError)
+        }
+    }
+}
+
+fn response_status_string(status: ResponseStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn stored_response_to_wire(
+    stored: stored_conversations::StoredResponse,
+    user_key: &secp256k1::SecretKey,
+) -> Result<ResponsesRetrieveResponse, ApiError> {
+    let completed = stored.response.status == ResponseStatus::Completed;
+    let mut input_tokens = 0i32;
+    let mut output_tokens = 0i32;
+    let mut reasoning_tokens = 0i32;
+    let mut output = Vec::new();
+
+    for mut item in stored.items {
+        let tokens = item.token_count.unwrap_or_default();
+        if completed {
+            match item.message_type.as_str() {
+                "user" | "tool_call" | "tool_output" => {
+                    input_tokens = input_tokens.saturating_add(tokens);
+                }
+                "assistant" => {
+                    output_tokens = output_tokens.saturating_add(tokens);
+                }
+                "reasoning" => {
+                    output_tokens = output_tokens.saturating_add(tokens);
+                    reasoning_tokens = reasoning_tokens.saturating_add(tokens);
+                }
+                _ => {}
+            }
+        }
+
+        let status = item
+            .status
+            .take()
+            .unwrap_or_else(|| STATUS_COMPLETED.to_owned());
+        match item.message_type.as_str() {
+            "user" => {}
+            "assistant" => {
+                let content = decrypt_optional_string(
+                    user_key,
+                    item.content_enc.as_ref(),
+                    "assistant message content",
+                )?
+                .map_or_else(Vec::new, |mut text| {
+                    vec![ContentPart {
+                        part_type: "output_text".to_owned(),
+                        annotations: Vec::new(),
+                        logprobs: Vec::new(),
+                        text: std::mem::take(&mut *text),
+                    }]
+                });
+                output.push(OutputItem {
+                    id: item.uuid.to_string(),
+                    output_type: "message".to_owned(),
+                    status,
+                    role: Some(ROLE_ASSISTANT.to_owned()),
+                    content: Some(content),
+                    call_id: None,
+                    name: None,
+                    arguments: None,
+                    output: None,
+                });
+            }
+            "tool_call" => {
+                let arguments = decrypt_optional_string(
+                    user_key,
+                    item.content_enc.as_ref(),
+                    "tool call arguments",
+                )?
+                .map(|mut value| std::mem::take(&mut *value));
+                output.push(OutputItem {
+                    id: item.uuid.to_string(),
+                    output_type: "tool_call".to_owned(),
+                    status,
+                    role: None,
+                    content: None,
+                    call_id: Some(item.tool_call_id.unwrap_or(item.uuid).to_string()),
+                    name: Some(
+                        item.tool_name
+                            .take()
+                            .unwrap_or_else(|| DEFAULT_TOOL_FUNCTION_NAME.to_owned()),
+                    ),
+                    arguments,
+                    output: None,
+                });
+            }
+            "tool_output" => {
+                let tool_output =
+                    decrypt_optional_string(user_key, item.content_enc.as_ref(), "tool output")?
+                        .map(|mut value| std::mem::take(&mut *value));
+                output.push(OutputItem {
+                    id: item.uuid.to_string(),
+                    output_type: "tool_output".to_owned(),
+                    status,
+                    role: None,
+                    content: None,
+                    call_id: item.tool_call_id.map(|id| id.to_string()),
+                    name: None,
+                    arguments: None,
+                    output: tool_output,
+                });
+            }
+            "reasoning" => output.push(OutputItem {
+                id: item.uuid.to_string(),
+                output_type: "reasoning".to_owned(),
+                status,
+                role: None,
+                content: Some(Vec::new()),
+                call_id: None,
+                name: None,
+                arguments: None,
+                output: None,
+            }),
+            _ => {}
+        }
+    }
+
+    let usage = completed.then(|| ResponseUsage {
+        input_tokens,
+        input_tokens_details: InputTokenDetails { cached_tokens: 0 },
+        output_tokens,
+        output_tokens_details: OutputTokenDetails { reasoning_tokens },
+        total_tokens: input_tokens.saturating_add(output_tokens),
+    });
+
+    Ok(ResponsesRetrieveResponse {
+        id: stored.response.uuid,
+        object: OBJECT_TYPE_RESPONSE,
+        created_at: stored.response.created_at.timestamp(),
+        status: response_status_string(stored.response.status),
+        model: stored.response.model,
+        usage,
+        output,
+    })
 }
 
 fn decrypt_instruction_content(
@@ -2118,6 +3379,78 @@ fn decrypt_optional_string(
 
 fn parse_json_body<T: DeserializeOwned>(body: SensitiveBytes) -> Result<T, ApiError> {
     serde_json::from_slice::<T>(&body).map_err(|_| ApiError::BadRequest)
+}
+
+/// Bounds JSON container amplification before serde allocates an object tree.
+///
+/// Strings are skipped without allocation, so structural punctuation inside a
+/// metadata value cannot inflate the count. Full syntax validation remains the
+/// responsibility of serde immediately after this preflight.
+fn validate_json_shape(bytes: &[u8]) -> Result<(), JsonShapeError> {
+    let mut depth = 0usize;
+    let mut structural_tokens = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for byte in bytes {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match *byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth = depth.checked_add(1).ok_or(JsonShapeError::TooLarge)?;
+                structural_tokens = structural_tokens
+                    .checked_add(1)
+                    .ok_or(JsonShapeError::TooLarge)?;
+                if depth > MAX_CONVERSATION_JSON_DEPTH
+                    || structural_tokens > MAX_CONVERSATION_JSON_STRUCTURAL_TOKENS
+                {
+                    return Err(JsonShapeError::TooLarge);
+                }
+            }
+            b'}' | b']' => {
+                depth = depth.checked_sub(1).ok_or(JsonShapeError::Malformed)?;
+                structural_tokens = structural_tokens
+                    .checked_add(1)
+                    .ok_or(JsonShapeError::TooLarge)?;
+                if structural_tokens > MAX_CONVERSATION_JSON_STRUCTURAL_TOKENS {
+                    return Err(JsonShapeError::TooLarge);
+                }
+            }
+            b',' | b':' => {
+                structural_tokens = structural_tokens
+                    .checked_add(1)
+                    .ok_or(JsonShapeError::TooLarge)?;
+                if structural_tokens > MAX_CONVERSATION_JSON_STRUCTURAL_TOKENS {
+                    return Err(JsonShapeError::TooLarge);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if in_string || depth != 0 {
+        Err(JsonShapeError::Malformed)
+    } else {
+        Ok(())
+    }
+}
+
+fn parse_conversation_json_body<T: DeserializeOwned>(body: SensitiveBytes) -> Result<T, ApiError> {
+    match validate_json_shape(&body) {
+        Ok(()) => parse_json_body(body),
+        Err(JsonShapeError::TooLarge) => Err(ApiError::PayloadTooLarge),
+        Err(JsonShapeError::Malformed) => Err(ApiError::BadRequest),
+    }
 }
 
 fn parse_logical_query<T: DeserializeOwned>(query: Option<String>) -> Result<T, ApiError> {
@@ -3321,6 +4654,242 @@ mod tests {
     }
 
     #[test]
+    fn conversation_item_and_stored_response_families_are_exact_and_classified_by_storage_risk() {
+        let conversation = "123e4567-e89b-12d3-a456-426614174000";
+        let item = "223e4567-e89b-12d3-a456-426614174000";
+        let response = "323e4567-e89b-12d3-a456-426614174000";
+        let conversation_path = format!("/v1/conversations/{conversation}");
+        let items_path = format!("{conversation_path}/items");
+        let response_path = format!("/v1/responses/{response}");
+
+        let cases = [
+            (
+                envelope(
+                    LogicalMethod::Post,
+                    "/v1/conversations",
+                    json_header(),
+                    Some(br#"{}"#),
+                    None,
+                ),
+                "create_conversation",
+                false,
+            ),
+            (
+                {
+                    let mut request = envelope(
+                        LogicalMethod::Get,
+                        "/v1/conversations",
+                        Vec::new(),
+                        None,
+                        None,
+                    );
+                    request.request.query = Some("limit=10&order=desc".to_owned());
+                    request
+                },
+                "list_conversations",
+                true,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Get,
+                    &conversation_path,
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                "get_conversation",
+                true,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Post,
+                    &conversation_path,
+                    json_header(),
+                    Some(br#"{"pinned":true}"#),
+                    None,
+                ),
+                "update_conversation",
+                true,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Delete,
+                    &conversation_path,
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                "delete_conversation",
+                false,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Delete,
+                    "/v1/conversations",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                "delete_all_conversations",
+                false,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Post,
+                    "/v1/conversations/batch-delete",
+                    json_header(),
+                    Some(br#"{"ids":["123e4567-e89b-12d3-a456-426614174000"]}"#),
+                    None,
+                ),
+                "batch_delete_conversations",
+                false,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Post,
+                    "/v1/conversations/batch-update-project",
+                    json_header(),
+                    Some(br#"{"ids":["123e4567-e89b-12d3-a456-426614174000"],"project_id":null}"#),
+                    None,
+                ),
+                "batch_update_conversation_project",
+                false,
+            ),
+            (
+                {
+                    let mut request =
+                        envelope(LogicalMethod::Get, &items_path, Vec::new(), None, None);
+                    request.request.query = Some("limit=5&include=ignored".to_owned());
+                    request
+                },
+                "list_conversation_items",
+                true,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Get,
+                    &format!("{items_path}/{item}"),
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                "get_conversation_item",
+                true,
+            ),
+            (
+                envelope(LogicalMethod::Get, &response_path, Vec::new(), None, None),
+                "get_stored_response",
+                true,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Post,
+                    &format!("{response_path}/cancel"),
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                "cancel_stored_response",
+                true,
+            ),
+            (
+                envelope(
+                    LogicalMethod::Delete,
+                    &response_path,
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                "delete_stored_response",
+                false,
+            ),
+        ];
+
+        for (request, expected, stored_output) in cases {
+            let prepared = prepare_user_operation(request, bound_user_authority());
+            let OperationPreparation::Ready(operation) = prepared else {
+                panic!("{expected} must be admitted");
+            };
+            let UserOperation::Protected {
+                operation: protected,
+                ..
+            } = &operation
+            else {
+                panic!("{expected} must be a protected user operation");
+            };
+            let actual = match protected {
+                ProtectedUserOperation::CreateConversation { .. } => "create_conversation",
+                ProtectedUserOperation::ListConversations { .. } => "list_conversations",
+                ProtectedUserOperation::GetConversation { .. } => "get_conversation",
+                ProtectedUserOperation::UpdateConversation { .. } => "update_conversation",
+                ProtectedUserOperation::DeleteConversation { .. } => "delete_conversation",
+                ProtectedUserOperation::DeleteAllConversations => "delete_all_conversations",
+                ProtectedUserOperation::BatchDeleteConversations { .. } => {
+                    "batch_delete_conversations"
+                }
+                ProtectedUserOperation::BatchUpdateConversationProject { .. } => {
+                    "batch_update_conversation_project"
+                }
+                ProtectedUserOperation::ListConversationItems { .. } => "list_conversation_items",
+                ProtectedUserOperation::GetConversationItem { .. } => "get_conversation_item",
+                ProtectedUserOperation::GetStoredResponse { .. } => "get_stored_response",
+                ProtectedUserOperation::CancelStoredResponse { .. } => "cancel_stored_response",
+                ProtectedUserOperation::DeleteStoredResponse { .. } => "delete_stored_response",
+                _ => panic!("unexpected operation for {expected}"),
+            };
+            assert_eq!(actual, expected);
+            assert_eq!(
+                operation.requires_stored_output_reservation(),
+                stored_output
+            );
+        }
+
+        for request in [
+            envelope(
+                LogicalMethod::Get,
+                &conversation_path,
+                Vec::new(),
+                None,
+                None,
+            ),
+            envelope(LogicalMethod::Get, &response_path, Vec::new(), None, None),
+        ] {
+            assert!(matches!(
+                prepare_user_operation(request, AuthorityState::Anonymous),
+                OperationPreparation::Rejected(response)
+                    if response.status == StatusCode::UNAUTHORIZED
+            ));
+        }
+
+        let mut transplanted_body = envelope(
+            LogicalMethod::Delete,
+            &conversation_path,
+            Vec::new(),
+            None,
+            None,
+        );
+        transplanted_body.request.body_base64 = Some(EncodedBytes::from_bytes(b"{}".to_vec()));
+        assert!(matches!(
+            prepare_user_operation(transplanted_body, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+
+        let disabled_item_post = envelope(
+            LogicalMethod::Post,
+            &items_path,
+            json_header(),
+            Some(br#"{"items":[]}"#),
+            None,
+        );
+        assert!(matches!(
+            prepare_user_operation(disabled_item_post, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::BAD_REQUEST
+        ));
+    }
+
+    #[test]
     fn conversation_project_creation_preflight_matches_wire_shape_and_bounds_before_insert() {
         let name = "quoted \\\" project ☃";
         let candidate = ConversationProjectCreationResponsePreflight {
@@ -3381,6 +4950,254 @@ mod tests {
             preflight_instruction_response_with_limit(name, prompt, true, 8),
             Err(ApiError::PayloadTooLarge)
         ));
+    }
+
+    fn stored_item_fixture(
+        message_type: &str,
+        uuid: uuid::Uuid,
+        content_enc: Option<Vec<u8>>,
+        token_count: i32,
+    ) -> stored_conversations::StoredConversationItem {
+        stored_conversations::StoredConversationItem {
+            message_type: message_type.to_owned(),
+            id: 1,
+            type_rank: 1,
+            uuid,
+            content_enc,
+            status: Some(STATUS_COMPLETED.to_owned()),
+            created_at: Utc::now(),
+            model: None,
+            token_count: Some(token_count),
+            tool_call_id: None,
+            finish_reason: None,
+            tool_name: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_conversation_items_preserve_each_existing_wire_variant() {
+        let user_key = secp256k1::SecretKey::from_slice(&[0x51; 32]).unwrap();
+        let user_id = uuid::Uuid::from_bytes([0x52; 16]);
+        let assistant_id = uuid::Uuid::from_bytes([0x53; 16]);
+        let tool_call_id = uuid::Uuid::from_bytes([0x54; 16]);
+        let tool_output_id = uuid::Uuid::from_bytes([0x55; 16]);
+        let reasoning_id = uuid::Uuid::from_bytes([0x56; 16]);
+
+        let user_plaintext =
+            Zeroizing::new(serde_json::to_vec(&MessageContent::Text("hello".to_owned())).unwrap());
+        let user = stored_item_fixture(
+            "user",
+            user_id,
+            Some(encrypt_with_key(&user_key, &user_plaintext).await),
+            1,
+        );
+        let user_timestamp = user.created_at.timestamp();
+
+        let assistant = stored_item_fixture(
+            "assistant",
+            assistant_id,
+            Some(encrypt_with_key(&user_key, b"answer").await),
+            2,
+        );
+        let assistant_timestamp = assistant.created_at.timestamp();
+
+        let mut tool_call = stored_item_fixture(
+            "tool_call",
+            tool_call_id,
+            Some(encrypt_with_key(&user_key, br#"{"city":"Oslo"}"#).await),
+            3,
+        );
+        tool_call.tool_call_id = Some(tool_call_id);
+        tool_call.tool_name = Some("weather".to_owned());
+        let tool_call_timestamp = tool_call.created_at.timestamp();
+
+        let mut tool_output = stored_item_fixture(
+            "tool_output",
+            tool_output_id,
+            Some(encrypt_with_key(&user_key, b"sunny").await),
+            4,
+        );
+        tool_output.tool_call_id = Some(tool_call_id);
+        let tool_output_timestamp = tool_output.created_at.timestamp();
+
+        let reasoning = stored_item_fixture(
+            "reasoning",
+            reasoning_id,
+            Some(encrypt_with_key(&user_key, b"private thought").await),
+            5,
+        );
+        let reasoning_timestamp = reasoning.created_at.timestamp();
+
+        let actual = [user, assistant, tool_call, tool_output, reasoning]
+            .into_iter()
+            .map(|item| {
+                serde_json::to_value(stored_item_to_conversation_item(item, &user_key).unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                serde_json::json!({
+                    "type": "message", "id": user_id, "status": "completed", "role": "user",
+                    "content": [{"type":"input_text","text":"hello"}],
+                    "created_at": user_timestamp
+                }),
+                serde_json::json!({
+                    "type": "message", "id": assistant_id, "status": "completed", "role": "assistant",
+                    "content": [{"type":"output_text","text":"answer"}],
+                    "created_at": assistant_timestamp
+                }),
+                serde_json::json!({
+                    "type": "function_call", "id": tool_call_id, "call_id": tool_call_id,
+                    "name": "weather", "arguments": "{\"city\":\"Oslo\"}",
+                    "status": "completed", "created_at": tool_call_timestamp
+                }),
+                serde_json::json!({
+                    "type": "function_call_output", "id": tool_output_id, "call_id": tool_call_id,
+                    "output": "sunny", "status": "completed", "created_at": tool_output_timestamp
+                }),
+                serde_json::json!({
+                    "type": "reasoning", "id": reasoning_id,
+                    "content": [{"type":"text","text":"private thought"}],
+                    "status": "completed", "created_at": reasoning_timestamp
+                }),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_stored_response_preserves_output_filtering_and_usage_math() {
+        let user_key = secp256k1::SecretKey::from_slice(&[0x61; 32]).unwrap();
+        let response_id = uuid::Uuid::from_bytes([0x62; 16]);
+        let user_item_id = uuid::Uuid::from_bytes([0x64; 16]);
+        let assistant_id = uuid::Uuid::from_bytes([0x65; 16]);
+        let empty_assistant_id = uuid::Uuid::from_bytes([0x69; 16]);
+        let call_id = uuid::Uuid::from_bytes([0x66; 16]);
+        let output_id = uuid::Uuid::from_bytes([0x67; 16]);
+        let reasoning_id = uuid::Uuid::from_bytes([0x68; 16]);
+
+        let user = stored_item_fixture("user", user_item_id, None, 3);
+        let assistant = stored_item_fixture(
+            "assistant",
+            assistant_id,
+            Some(encrypt_with_key(&user_key, b"answer").await),
+            5,
+        );
+        let empty_assistant = stored_item_fixture("assistant", empty_assistant_id, None, 0);
+        let mut tool_call = stored_item_fixture(
+            "tool_call",
+            call_id,
+            Some(encrypt_with_key(&user_key, b"{}").await),
+            2,
+        );
+        tool_call.tool_call_id = Some(call_id);
+        tool_call.tool_name = Some("lookup".to_owned());
+        let mut tool_output = stored_item_fixture(
+            "tool_output",
+            output_id,
+            Some(encrypt_with_key(&user_key, b"ok").await),
+            4,
+        );
+        tool_output.tool_call_id = Some(call_id);
+        let reasoning = stored_item_fixture("reasoning", reasoning_id, None, 7);
+        let created_at = Utc::now();
+        let stored = stored_conversations::StoredResponse {
+            response: stored_conversations::StoredResponseMetadata {
+                id: 1,
+                uuid: response_id,
+                conversation_id: 2,
+                status: ResponseStatus::Completed,
+                model: "test-model".to_owned(),
+                created_at,
+            },
+            items: vec![
+                user,
+                assistant,
+                empty_assistant,
+                tool_call,
+                tool_output,
+                reasoning,
+            ],
+        };
+
+        let actual =
+            serde_json::to_value(stored_response_to_wire(stored, &user_key).unwrap()).unwrap();
+        assert_eq!(actual["id"], serde_json::json!(response_id));
+        assert_eq!(actual["status"], "completed");
+        assert_eq!(actual["model"], "test-model");
+        assert_eq!(actual["usage"]["input_tokens"], 9);
+        assert_eq!(actual["usage"]["output_tokens"], 12);
+        assert_eq!(
+            actual["usage"]["output_tokens_details"]["reasoning_tokens"],
+            7
+        );
+        assert_eq!(actual["usage"]["total_tokens"], 21);
+        assert_eq!(
+            actual["output"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "message",
+                "message",
+                "tool_call",
+                "tool_output",
+                "reasoning"
+            ]
+        );
+        assert_eq!(actual["output"][1]["content"], serde_json::json!([]));
+        assert_eq!(actual["output"][4]["content"], serde_json::json!([]));
+        assert!(actual["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["id"] != serde_json::json!(user_item_id)));
+    }
+
+    #[test]
+    fn conversation_json_shape_is_bounded_before_value_allocation() {
+        assert_eq!(
+            validate_json_shape(
+                br#"{"metadata":{"title":"{[,:","escaped":"quote: \" ok"},"future":true}"#
+            ),
+            Ok(())
+        );
+
+        let too_deep = format!(
+            "{}0{}",
+            "[".repeat(MAX_CONVERSATION_JSON_DEPTH + 1),
+            "]".repeat(MAX_CONVERSATION_JSON_DEPTH + 1)
+        );
+        assert_eq!(
+            validate_json_shape(too_deep.as_bytes()),
+            Err(JsonShapeError::TooLarge)
+        );
+
+        let mut too_wide = String::from("[");
+        for index in 0..=MAX_CONVERSATION_JSON_STRUCTURAL_TOKENS {
+            if index != 0 {
+                too_wide.push(',');
+            }
+            too_wide.push('0');
+        }
+        too_wide.push(']');
+        assert_eq!(
+            validate_json_shape(too_wide.as_bytes()),
+            Err(JsonShapeError::TooLarge)
+        );
+        assert_eq!(
+            validate_json_shape(br#"{"metadata":"unterminated}"#),
+            Err(JsonShapeError::Malformed)
+        );
+
+        let parsed = parse_conversation_json_body::<UpdateConversationRequest>(Zeroizing::new(
+            br#"{"pinned":true,"future":{"shape":"ignored"}}"#.to_vec(),
+        ))
+        .expect("unknown fields must remain accepted after structural preflight");
+        assert_eq!(parsed.pinned, Some(true));
     }
 
     #[test]

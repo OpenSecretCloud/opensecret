@@ -374,12 +374,30 @@ const KV_ITEM_PATH_PREFIX: &str = "/protected/kv/";
 const API_KEY_ITEM_PATH_PREFIX: &str = "/protected/api-keys/";
 const VERIFY_EMAIL_PATH_PREFIX: &str = "/verify-email/";
 const CONVERSATION_PROJECT_ITEM_PATH_PREFIX: &str = "/v1/conversation-projects/";
+const CONVERSATION_ITEM_PATH_PREFIX: &str = "/v1/conversations/";
 const INSTRUCTION_ITEM_PATH_PREFIX: &str = "/v1/instructions/";
+const RESPONSE_ITEM_PATH_PREFIX: &str = "/v1/responses/";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InstructionItemPath {
     Item(Uuid),
     SetDefault(Uuid),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConversationItemPath {
+    Conversation(Uuid),
+    Items(Uuid),
+    Item {
+        conversation_id: Uuid,
+        item_id: Uuid,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResponseItemPath {
+    Item(Uuid),
+    Cancel(Uuid),
 }
 
 fn validate_logical_path(
@@ -400,7 +418,13 @@ fn validate_logical_path(
     if decode_canonical_conversation_project_path(method, path)?.is_some() {
         return Ok(());
     }
+    if decode_canonical_conversation_path(method, path)?.is_some() {
+        return Ok(());
+    }
     if decode_canonical_instruction_path(method, path)?.is_some() {
+        return Ok(());
+    }
+    if decode_canonical_response_path(method, path)?.is_some() {
         return Ok(());
     }
     validate_path(path, limits)
@@ -553,6 +577,103 @@ pub(crate) fn decode_canonical_instruction_path(
     } else {
         InstructionItemPath::Item(instruction_id)
     }))
+}
+
+/// Decodes canonical conversation, item-collection, and individual-item paths.
+///
+/// Fixed collection actions are excluded before UUID parsing. Item suffixes are
+/// recognized before the ordinary conversation form so an admitted operation
+/// has one unambiguous lowercase-hyphenated spelling.
+pub(crate) fn decode_canonical_conversation_path(
+    method: LogicalMethod,
+    path: &str,
+) -> Result<Option<ConversationItemPath>, EnvelopeError> {
+    let Some(suffix) = path.strip_prefix(CONVERSATION_ITEM_PATH_PREFIX) else {
+        return Ok(None);
+    };
+    if matches!(suffix, "batch-delete" | "batch-update-project") {
+        return Ok(None);
+    }
+
+    if method == LogicalMethod::Get {
+        if let Some((conversation, item)) = suffix.split_once("/items/") {
+            if item.contains('/') {
+                return Err(EnvelopeError::InvalidPath(
+                    "conversation item path has extra segments",
+                ));
+            }
+            return Ok(Some(ConversationItemPath::Item {
+                conversation_id: decode_canonical_uuid_segment(
+                    conversation,
+                    "conversation ID must use lowercase hyphenated UUID spelling",
+                )?,
+                item_id: decode_canonical_uuid_segment(
+                    item,
+                    "conversation item ID must use lowercase hyphenated UUID spelling",
+                )?,
+            }));
+        }
+        if let Some(conversation) = suffix.strip_suffix("/items") {
+            return Ok(Some(ConversationItemPath::Items(
+                decode_canonical_uuid_segment(
+                    conversation,
+                    "conversation ID must use lowercase hyphenated UUID spelling",
+                )?,
+            )));
+        }
+    }
+
+    if !matches!(
+        method,
+        LogicalMethod::Get | LogicalMethod::Post | LogicalMethod::Delete
+    ) {
+        return Ok(None);
+    }
+    Ok(Some(ConversationItemPath::Conversation(
+        decode_canonical_uuid_segment(
+            suffix,
+            "conversation ID must use lowercase hyphenated UUID spelling",
+        )?,
+    )))
+}
+
+/// Decodes canonical stored-response item and cancellation paths.
+pub(crate) fn decode_canonical_response_path(
+    method: LogicalMethod,
+    path: &str,
+) -> Result<Option<ResponseItemPath>, EnvelopeError> {
+    let Some(suffix) = path.strip_prefix(RESPONSE_ITEM_PATH_PREFIX) else {
+        return Ok(None);
+    };
+    if let Some(response) = suffix.strip_suffix("/cancel") {
+        if method != LogicalMethod::Post {
+            return Ok(None);
+        }
+        return Ok(Some(ResponseItemPath::Cancel(
+            decode_canonical_uuid_segment(
+                response,
+                "response ID must use lowercase hyphenated UUID spelling",
+            )?,
+        )));
+    }
+    if !matches!(method, LogicalMethod::Get | LogicalMethod::Delete) {
+        return Ok(None);
+    }
+    Ok(Some(ResponseItemPath::Item(decode_canonical_uuid_segment(
+        suffix,
+        "response ID must use lowercase hyphenated UUID spelling",
+    )?)))
+}
+
+fn decode_canonical_uuid_segment(
+    segment: &str,
+    error: &'static str,
+) -> Result<Uuid, EnvelopeError> {
+    let id = Uuid::parse_str(segment).map_err(|_| EnvelopeError::InvalidPath(error))?;
+    if id.hyphenated().to_string() != segment {
+        return Err(EnvelopeError::InvalidPath(error));
+    }
+    Ok(id)
 }
 
 fn decode_canonical_opaque_segment(segment: &str) -> Result<Zeroizing<String>, EnvelopeError> {
@@ -1461,6 +1582,115 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn conversation_and_item_paths_are_canonical_and_distinct() {
+        let conversation = "123e4567-e89b-12d3-a456-426614174000";
+        let item = "223e4567-e89b-12d3-a456-426614174000";
+        let conversation_id = Uuid::parse_str(conversation).unwrap();
+        let item_id = Uuid::parse_str(item).unwrap();
+        let conversation_path = format!("{CONVERSATION_ITEM_PATH_PREFIX}{conversation}");
+
+        for method in [
+            LogicalMethod::Get,
+            LogicalMethod::Post,
+            LogicalMethod::Delete,
+        ] {
+            assert_eq!(
+                decode_canonical_conversation_path(method, &conversation_path).unwrap(),
+                Some(ConversationItemPath::Conversation(conversation_id))
+            );
+        }
+
+        let items_path = format!("{conversation_path}/items");
+        assert_eq!(
+            decode_canonical_conversation_path(LogicalMethod::Get, &items_path).unwrap(),
+            Some(ConversationItemPath::Items(conversation_id))
+        );
+        let item_path = format!("{items_path}/{item}");
+        assert_eq!(
+            decode_canonical_conversation_path(LogicalMethod::Get, &item_path).unwrap(),
+            Some(ConversationItemPath::Item {
+                conversation_id,
+                item_id,
+            })
+        );
+        validate_logical_path(LogicalMethod::Get, &item_path, &EnvelopeLimits::default()).unwrap();
+
+        for action in ["batch-delete", "batch-update-project"] {
+            assert!(decode_canonical_conversation_path(
+                LogicalMethod::Post,
+                &format!("{CONVERSATION_ITEM_PATH_PREFIX}{action}"),
+            )
+            .unwrap()
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn conversation_paths_reject_uuid_aliases_and_suffix_ambiguity() {
+        for invalid in [
+            "/v1/conversations/",
+            "/v1/conversations/123E4567-E89B-12D3-A456-426614174000",
+            "/v1/conversations/123e4567e89b12d3a456426614174000",
+            "/v1/conversations/{123e4567-e89b-12d3-a456-426614174000}",
+            "/v1/conversations/123e4567-e89b-12d3-a456-426614174000/extra",
+            "/v1/conversations/123e4567-e89b-12d3-a456-426614174000/items/",
+            "/v1/conversations/123e4567-e89b-12d3-a456-426614174000/items/not-a-uuid",
+            "/v1/conversations/123e4567-e89b-12d3-a456-426614174000/items/223e4567-e89b-12d3-a456-426614174000/extra",
+        ] {
+            assert!(
+                validate_logical_path(LogicalMethod::Get, invalid, &EnvelopeLimits::default())
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_response_item_and_cancel_paths_are_canonical() {
+        let encoded = "123e4567-e89b-12d3-a456-426614174000";
+        let id = Uuid::parse_str(encoded).unwrap();
+        let item = format!("{RESPONSE_ITEM_PATH_PREFIX}{encoded}");
+        assert_eq!(
+            decode_canonical_response_path(LogicalMethod::Get, &item).unwrap(),
+            Some(ResponseItemPath::Item(id))
+        );
+        assert_eq!(
+            decode_canonical_response_path(LogicalMethod::Delete, &item).unwrap(),
+            Some(ResponseItemPath::Item(id))
+        );
+        let cancel = format!("{item}/cancel");
+        assert_eq!(
+            decode_canonical_response_path(LogicalMethod::Post, &cancel).unwrap(),
+            Some(ResponseItemPath::Cancel(id))
+        );
+        validate_logical_path(LogicalMethod::Post, &cancel, &EnvelopeLimits::default()).unwrap();
+    }
+
+    #[test]
+    fn stored_response_paths_reject_uuid_aliases_and_suffix_ambiguity() {
+        for invalid in [
+            "/v1/responses/",
+            "/v1/responses/123E4567-E89B-12D3-A456-426614174000",
+            "/v1/responses/123e4567e89b12d3a456426614174000",
+            "/v1/responses/{123e4567-e89b-12d3-a456-426614174000}",
+            "/v1/responses/123e4567-e89b-12d3-a456-426614174000/extra",
+            "/v1/responses/123e4567-e89b-12d3-a456-426614174000/cancel/extra",
+        ] {
+            assert!(
+                validate_logical_path(LogicalMethod::Get, invalid, &EnvelopeLimits::default())
+                    .is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(validate_logical_path(
+            LogicalMethod::Post,
+            "/v1/responses/not-a-uuid/cancel",
+            &EnvelopeLimits::default(),
+        )
+        .is_err());
     }
 
     #[test]

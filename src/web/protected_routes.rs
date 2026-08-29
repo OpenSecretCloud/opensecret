@@ -35,6 +35,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use validator::Validate;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -100,7 +101,7 @@ pub struct ConfirmAccountDeletionRequest {
     pub plaintext_secret: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct PrivateKeyResponse {
     /// Root mnemonic or derived mnemonic if BIP-85 path is specified
     mnemonic: String,
@@ -108,7 +109,7 @@ pub struct PrivateKeyResponse {
 
 /// Response struct for the private key bytes endpoint.
 /// Contains the private key encoded as a hexadecimal string.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct PrivateKeyBytesResponse {
     /// The private key as a 64-character hexadecimal string (32 bytes).
     /// This is the standard secp256k1 private key format.
@@ -349,7 +350,7 @@ pub struct ThirdPartyTokenRequest {
     pub audience: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct ThirdPartyTokenResponse {
     pub token: String,
 }
@@ -857,11 +858,21 @@ pub async fn get_private_key(
     Extension(session_id): Extension<TransportSession>,
     Query(query): Query<DerivationPathQuery>,
 ) -> Result<Json<EncryptedResponse<PrivateKeyResponse>>, ApiError> {
+    let response = private_key_data(&data, &user, &auth_context, query)?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) fn private_key_data(
+    data: &AppState,
+    user: &User,
+    auth_context: &AuthContext,
+    query: DerivationPathQuery,
+) -> Result<PrivateKeyResponse, ApiError> {
     // Validate paths if present
     query.validate()?;
 
     let plaintext_seed = data
-        .decrypt_seed_for_auth_context(&user, &auth_context)
+        .decrypt_seed_for_auth_context(user, auth_context)
         .map_err(|e| {
             error!("Failed to decrypt authenticated seed wrap: {:?}", e);
             ApiError::Unauthorized
@@ -884,14 +895,14 @@ pub async fn get_private_key(
             mnemonic: child_mnemonic.to_string(),
         };
 
-        encrypt_response(&data, &session_id, &response).await
+        Ok(response)
     } else {
         // Return root mnemonic
         let response = PrivateKeyResponse {
             mnemonic: root_mnemonic.to_string(),
         };
 
-        encrypt_response(&data, &session_id, &response).await
+        Ok(response)
     }
 }
 
@@ -902,14 +913,24 @@ pub async fn get_private_key_bytes(
     Extension(session_id): Extension<TransportSession>,
     Query(query): Query<DerivationPathQuery>,
 ) -> Result<Json<EncryptedResponse<PrivateKeyBytesResponse>>, ApiError> {
+    let response = private_key_bytes_data(&data, &user, &auth_context, query).await?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn private_key_bytes_data(
+    data: &AppState,
+    user: &User,
+    auth_context: &AuthContext,
+    query: DerivationPathQuery,
+) -> Result<PrivateKeyBytesResponse, ApiError> {
     // Validate derivation path if present
     query.validate()?;
 
     // Use the method that supports both BIP-85 and BIP-32 derivation
     let secret_key = data
         .get_user_key(
-            &user,
-            &auth_context,
+            user,
+            auth_context,
             query.key_options.private_key_derivation_path.as_deref(),
             query.key_options.seed_phrase_derivation_path.as_deref(),
         )
@@ -934,7 +955,7 @@ pub async fn get_private_key_bytes(
         private_key: secret_key.display_secret().to_string(),
     };
 
-    encrypt_response(&data, &session_id, &response).await
+    Ok(response)
 }
 
 pub async fn sign_message(
@@ -944,6 +965,16 @@ pub async fn sign_message(
     Extension(sign_request): Extension<SignMessageRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<SignMessageResponseJson>>, ApiError> {
+    let response = sign_message_data(&data, &user, &auth_context, sign_request).await?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn sign_message_data(
+    data: &AppState,
+    user: &User,
+    auth_context: &AuthContext,
+    mut sign_request: SignMessageRequest,
+) -> Result<SignMessageResponseJson, ApiError> {
     // Validate key_options
     let validation_query = DerivationPathQuery {
         key_options: sign_request.key_options.clone(),
@@ -960,17 +991,20 @@ pub async fn sign_message(
         .seed_phrase_derivation_path
         .as_deref();
 
-    let message_bytes = general_purpose::STANDARD
-        .decode(&sign_request.message_base64)
-        .map_err(|e| {
-            error!("Failed to decode base64 message: {:?}", e);
-            ApiError::BadRequest
-        })?;
+    let message_base64 = Zeroizing::new(std::mem::take(&mut sign_request.message_base64));
+    let message_bytes = Zeroizing::new(
+        general_purpose::STANDARD
+            .decode(message_base64.as_bytes())
+            .map_err(|e| {
+                error!("Failed to decode base64 message: {:?}", e);
+                ApiError::BadRequest
+            })?,
+    );
 
     let response = data
         .sign_message(
-            &user,
-            &auth_context,
+            user,
+            auth_context,
             &message_bytes,
             sign_request.algorithm,
             derivation_path,
@@ -987,7 +1021,7 @@ pub async fn sign_message(
         message_hash: hex::encode(response.message_hash),
     };
 
-    encrypt_response(&data, &session_id, &json_response).await
+    Ok(json_response)
 }
 
 pub async fn get_public_key(
@@ -997,6 +1031,16 @@ pub async fn get_public_key(
     Extension(session_id): Extension<TransportSession>,
     Query(query): Query<PublicKeyQuery>,
 ) -> Result<Json<EncryptedResponse<PublicKeyResponseJson>>, ApiError> {
+    let response = public_key_data(&data, &user, &auth_context, query).await?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn public_key_data(
+    data: &AppState,
+    user: &User,
+    auth_context: &AuthContext,
+    query: PublicKeyQuery,
+) -> Result<PublicKeyResponseJson, ApiError> {
     // Validate the key_options
     let validation_query = DerivationPathQuery {
         key_options: query.key_options.clone(),
@@ -1009,8 +1053,8 @@ pub async fn get_public_key(
 
     let user_secret_key = data
         .get_user_key(
-            &user,
-            &auth_context,
+            user,
+            auth_context,
             derivation_path,
             seed_phrase_derivation_path,
         )
@@ -1039,7 +1083,7 @@ pub async fn get_public_key(
         public_key: public_key_str,
         algorithm: query.algorithm,
     };
-    encrypt_response(&data, &session_id, &response).await
+    Ok(response)
 }
 
 pub async fn generate_third_party_token(
@@ -1048,6 +1092,15 @@ pub async fn generate_third_party_token(
     Extension(request): Extension<ThirdPartyTokenRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<ThirdPartyTokenResponse>>, ApiError> {
+    let response = third_party_token_data(&data, &user, request)?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) fn third_party_token_data(
+    data: &AppState,
+    user: &User,
+    request: ThirdPartyTokenRequest,
+) -> Result<ThirdPartyTokenResponse, ApiError> {
     // Validate the audience
     if let Some(audience) = request.audience.as_ref() {
         if audience.is_empty() || (audience.contains(':') && url::Url::parse(audience).is_err()) {
@@ -1059,12 +1112,12 @@ pub async fn generate_third_party_token(
     let project = data.db.get_org_project_by_id(user.project_id)?;
 
     let token = match NewToken::new(
-        &user,
+        user,
         TokenType::ThirdParty {
             aud: request.audience,
             azp: project.client_id.to_string(),
         },
-        &data,
+        data,
     ) {
         Ok(token) => token,
         Err(e) => {
@@ -1074,7 +1127,7 @@ pub async fn generate_third_party_token(
     };
 
     let response = ThirdPartyTokenResponse { token: token.token };
-    encrypt_response(&data, &session_id, &response).await
+    Ok(response)
 }
 
 pub async fn encrypt_data(
@@ -1399,6 +1452,15 @@ mod tests {
     use super::*;
     use crate::encrypt::{decrypt_with_key, encrypt_with_key};
     use secp256k1::SecretKey;
+
+    #[test]
+    fn sensitive_response_types_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+        assert_zeroize_on_drop::<PrivateKeyResponse>();
+        assert_zeroize_on_drop::<PrivateKeyBytesResponse>();
+        assert_zeroize_on_drop::<ThirdPartyTokenResponse>();
+    }
 
     #[test]
     fn test_derivation_path_validation() {

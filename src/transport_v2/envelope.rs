@@ -2,6 +2,7 @@ use std::fmt;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const MIB: usize = 1024 * 1024;
 const KIB: usize = 1024;
@@ -182,7 +183,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 }
 
 /// Exact bytes represented on the wire as padded standard base64.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Zeroize, ZeroizeOnDrop)]
 pub(crate) struct EncodedBytes(Vec<u8>);
 
 impl EncodedBytes {
@@ -194,8 +195,8 @@ impl EncodedBytes {
         &self.0
     }
 
-    pub(crate) fn into_bytes(self) -> Vec<u8> {
-        self.0
+    pub(crate) fn into_bytes(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0)
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -726,6 +727,13 @@ mod tests {
     use super::*;
 
     const REQUEST_ID: &str = "00112233445566778899aabbccddeeff";
+
+    #[test]
+    fn decoded_byte_fields_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+
+        assert_zeroize_on_drop::<EncodedBytes>();
+    }
 
     fn request_json(body: &str) -> String {
         format!(

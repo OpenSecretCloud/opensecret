@@ -52,10 +52,13 @@ async fn purge_expired_secret_state(app_state: &AppState, now: Instant) {
         }
     }
 
-    if pending_count != 0 || session_count != 0 {
+    let transport_v2_secret_count = app_state.transport_v2_state.cleanup_expired_at(now).await;
+
+    if pending_count != 0 || session_count != 0 || transport_v2_secret_count != 0 {
         tracing::debug!(
             pending_attestations = pending_count,
             encryption_sessions = session_count,
+            transport_v2_secret_entries = transport_v2_secret_count,
             "Purged expired secret state"
         );
     }

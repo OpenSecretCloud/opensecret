@@ -785,6 +785,7 @@ pub struct AppState {
     resend_api_key: Option<String>,
     ephemeral_keys: Arc<RwLock<BoundedTtlCache<PendingAttestationKey, EphemeralSecret>>>,
     session_states: Arc<tokio::sync::Mutex<LeaseAwareTtlCache<Uuid, SessionState>>>,
+    transport_v2_state: Arc<transport_v2::TransportV2State>,
     oauth_manager: Arc<OAuthManager>,
     sqs_publisher: Option<Arc<SqsEventPublisher>>,
     billing_client: Option<BillingClient>,
@@ -1128,6 +1129,7 @@ impl AppStateBuilder {
                     .expect("encryption session capacity must be non-zero"),
                 ENCRYPTION_SESSION_IDLE_TTL,
             ))),
+            transport_v2_state: Arc::new(transport_v2::TransportV2State::new()),
             oauth_manager,
             sqs_publisher,
             billing_client,
@@ -3900,6 +3902,7 @@ async fn main() -> Result<(), Error> {
             instructions_routes(app_state.clone())
                 .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
         )
+        .merge(transport_v2::router(app_state.clone()))
         .merge(attestation_routes::router(app_state.clone()))
         .merge(oauth_routes(app_state.clone()))
         .merge(platform_login_routes(app_state.clone()))

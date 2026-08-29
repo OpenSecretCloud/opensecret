@@ -1,6 +1,6 @@
 # OpenSecret Transport Protocol v2
 
-Status: pre-implementation protocol contract
+Status: protocol contract under additive stacked implementation
 
 Transport v2 carries a complete logical OpenSecret request inside one
 attested, encrypted request record. It binds authentication to that encrypted
@@ -62,6 +62,11 @@ The rollout unit is the SDK release, not a runtime feature flag. Deploy all
 additive server support before publishing clients that require v2. Rolling a
 client back means installing the previous SDK/application release; it does not
 mean negotiating down on a live connection.
+
+Server support may be merged in independently reviewable layers before any v2
+client is published. In particular, the isolated gateway may exist while its
+logical-operation allowlist is empty; such requests receive an authenticated
+encrypted logical `404` and cannot reach application handlers.
 
 The term **transport v2** is intentionally distinct from the existing
 `USER_TOKEN_FORMAT_V2`, which describes first-party JWT claims rather than the
@@ -549,8 +554,18 @@ The separate v2 cache budget is 256 MiB. Capacity accounting reserves 512
 bytes per live session, 64 bytes per replay identifier, and 192 bytes per
 pending attestation entry: approximately 172 MiB at the independent hard
 limits, leaving headroom for allocator and cache metadata. Replay sets allocate
-lazily. The dormant core defines and tests these limits but does not allocate a
-cache until the v2 gateway is wired.
+lazily. The dormant-core stack layer defines and tests these limits without
+allocating a cache; the gateway layer allocates the separate pending-attestation
+and live-session caches when `AppState` is built.
+
+The gateway also applies a separate 256 MiB aggregate admission budget to
+in-flight v2 request buffers. It reserves a conservative four times the outer
+content length in 64 KiB units before reading the body and holds that permit
+through decoding, decryption, parsing, and response encryption. A missing
+content length reserves the maximum request allowance. The actual body remains
+independently capped at 50 MiB. Reserving the full working set up front permits
+normal small-request concurrency without allowing several maximum-size base64
+and plaintext buffer pipelines to grow concurrently.
 
 The 28 MiB logical-body limit is deliberate. A body is base64-encoded inside
 the JSON envelope, then the envelope is encrypted and base64-encoded again for
@@ -563,7 +578,7 @@ payload validation remains owned by the existing application operation.
 
 ## 13. Required compatibility and security tests
 
-Before registering public v2 routes, backend, TypeScript, and Rust tests share
+Before a v2 client is published, backend, TypeScript, and Rust tests share
 golden vectors for:
 
 - handshake HKDF and encrypted key payload;
@@ -609,16 +624,18 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
 3. **Dormant v2 core**: codecs, key schedule, directional AEAD, separate session
    state/cache, absolute expiry, replay registry, budgets, and vectors; no
    public routes.
-4. **V2 gateway and binding**: attestation/key exchange/request endpoints,
-   anonymous authentication transitions, v2-only resumption, and API-key
-   binding.
-5. **Application projection and streaming**: existing operation families over
+4. **Isolated v2 gateway**: separate attestation/key-exchange/request endpoints,
+   bounded session allocation, strict outer parsing, exact-session decryption,
+   and encrypted unsupported-operation responses; no application dispatch.
+5. **Session binding**: atomic anonymous authentication transitions, v2-only
+   resumption, and immutable user, platform, and API-key authority.
+6. **Application projection and streaming**: existing operation families over
    v2, live authorization checks, unary responses, and ordered streaming.
-6. **Additive SDK v2 internals**: TypeScript and Rust codecs/session managers
+7. **Additive SDK v2 internals**: TypeScript and Rust codecs/session managers
    behind private seams, still not selected by public calls.
-7. **Atomic SDK cutover**: v2-only network behavior, no downgrade, one-time
+8. **Atomic SDK cutover**: v2-only network behavior, no downgrade, one-time
    fresh login, and Maple/proxy integration.
-8. **SDK major/version packaging**: package metadata, locks, integration pin,
+9. **SDK major/version packaging**: package metadata, locks, integration pin,
    compatibility matrix, and release rehearsal. Publication/deployment remain
    separate authorized actions.
 

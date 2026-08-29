@@ -238,21 +238,35 @@ impl LogicalUnaryResponse {
 
 pub(crate) struct ApplicationOutcome {
     pub(crate) response: LogicalUnaryResponse,
-    pub(crate) bound_session: bool,
+    pub(crate) session_effect: SessionEffect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionEffect {
+    Retain,
+    NewlyBound,
+    Close,
 }
 
 impl ApplicationOutcome {
-    fn success(response: LogicalUnaryResponse, bound_session: bool) -> Self {
+    fn success(response: LogicalUnaryResponse, session_effect: SessionEffect) -> Self {
         Self {
             response,
-            bound_session,
+            session_effect,
         }
     }
 
     fn error(error: ApiError) -> Self {
         Self {
             response: LogicalUnaryResponse::api_error(&error),
-            bound_session: false,
+            session_effect: SessionEffect::Retain,
+        }
+    }
+
+    fn closing_error(error: ApiError) -> Self {
+        Self {
+            response: LogicalUnaryResponse::api_error(&error),
+            session_effect: SessionEffect::Close,
         }
     }
 }
@@ -797,7 +811,7 @@ pub(crate) async fn execute_user_operation(
                 Ok(response) => response,
                 Err(error) => return ApplicationOutcome::error(error),
             };
-            ApplicationOutcome::success(response, false)
+            ApplicationOutcome::success(response, SessionEffect::Retain)
         }
         UserOperation::Protected {
             authority,
@@ -812,7 +826,7 @@ pub(crate) async fn execute_user_operation(
                 Ok(user) => user,
                 Err(error) => {
                     if matches!(error, ApiError::Unauthorized | ApiError::InvalidJwt) {
-                        lease.state().close();
+                        return ApplicationOutcome::closing_error(error);
                     }
                     return ApplicationOutcome::error(error);
                 }
@@ -828,12 +842,12 @@ pub(crate) async fn execute_user_operation(
                 Ok(response) => response,
                 Err(error) => {
                     if matches!(error, ApiError::Unauthorized | ApiError::InvalidJwt) {
-                        lease.state().close();
+                        return ApplicationOutcome::closing_error(error);
                     }
                     return ApplicationOutcome::error(error);
                 }
             };
-            ApplicationOutcome::success(response, false)
+            ApplicationOutcome::success(response, SessionEffect::Retain)
         }
     }
 }
@@ -1082,7 +1096,7 @@ fn finish_user_binding(
         return ApplicationOutcome::error(ApiError::InternalServerError);
     }
 
-    ApplicationOutcome::success(response, true)
+    ApplicationOutcome::success(response, SessionEffect::NewlyBound)
 }
 
 fn monotonic_authentication_expiry(

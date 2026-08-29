@@ -26,6 +26,7 @@ use zeroize::Zeroize;
 
 use crate::encrypt::CustomRng;
 use crate::web::attestation_routes;
+use crate::web::encryption_middleware::hold_resource_through_response_body;
 use crate::{AppState, AsyncRngWrapper};
 
 use super::application::{
@@ -587,7 +588,7 @@ async fn key_exchange(
 async fn encrypted_request(
     State(app_state): State<Arc<AppState>>,
     request: Request<Body>,
-) -> Result<Json<EncryptedOuterResponse>, GatewayError> {
+) -> Result<Response, GatewayError> {
     let session_id = parse_request_session_id(request.uri(), request.headers())?;
     validate_json_content_type(request.headers())?;
     let working_set_permit = app_state
@@ -612,8 +613,15 @@ async fn encrypted_request(
         )
         .await?;
     drop(encrypted);
-    drop(working_set_permit);
-    Ok(Json(response))
+    Ok(encrypted_outer_http_response(response, working_set_permit))
+}
+
+fn encrypted_outer_http_response(
+    response: EncryptedOuterResponse,
+    working_set_permit: OwnedSemaphorePermit,
+) -> Response {
+    let response = Json(response).into_response();
+    hold_resource_through_response_body(response, working_set_permit)
 }
 
 #[derive(Deserialize)]
@@ -1292,6 +1300,29 @@ mod tests {
         assert!(Arc::clone(&state.request_working_set)
             .try_acquire_many_owned(maximum_units)
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn encrypted_outer_response_holds_working_set_through_body_lifetime() {
+        let working_set = Arc::new(Semaphore::new(1));
+        let response_value = || EncryptedOuterResponse {
+            encrypted: EncodedBytes::from_bytes(vec![1, 2, 3]),
+        };
+
+        let permit = Arc::clone(&working_set).try_acquire_owned().unwrap();
+        let response = encrypted_outer_http_response(response_value(), permit);
+        assert_eq!(working_set.available_permits(), 0);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], br#"{"encrypted":"AQID"}"#);
+        assert_eq!(working_set.available_permits(), 1);
+
+        let permit = Arc::clone(&working_set).try_acquire_owned().unwrap();
+        let response = encrypted_outer_http_response(response_value(), permit);
+        assert_eq!(working_set.available_permits(), 0);
+        drop(response);
+        assert_eq!(working_set.available_permits(), 1);
     }
 
     #[test]

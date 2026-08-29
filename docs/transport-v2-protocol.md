@@ -547,7 +547,11 @@ At minimum v2 bounds:
 
 The initial outer ceiling may retain the current 50 MiB limit. Base64 expansion
 and simultaneous outer/decoded/decrypted buffers must be included in memory
-accounting rather than described as only wire overhead.
+accounting rather than described as only wire overhead. The request working-set
+reservation remains held while the final encrypted response is JSON/base64
+serialized and until its HTTP body is consumed or dropped. Operations whose
+maximum output is not correlated with their request size require an additional
+route-specific output reservation before dispatch.
 
 The initial v2-core limits are:
 

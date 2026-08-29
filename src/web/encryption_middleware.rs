@@ -173,7 +173,10 @@ where
     Ok(hold_resource_through_response_body(response, session_lease))
 }
 
-fn hold_resource_through_response_body<T>(mut response: Response, resource: T) -> Response
+pub(crate) fn hold_resource_through_response_body<T>(
+    mut response: Response,
+    resource: T,
+) -> Response
 where
     T: Send + Unpin + 'static,
 {

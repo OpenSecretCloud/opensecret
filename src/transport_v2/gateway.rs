@@ -1674,9 +1674,7 @@ mod tests {
     }
 
     fn random_test_nonce() -> [u8; 12] {
-        let mut nonce = [0_u8; 12];
-        rand_core::OsRng.fill_bytes(&mut nonce);
-        nonce
+        rand::Rng::gen(&mut rand_core::OsRng)
     }
 
     async fn process_native_handoff_test_redemption(

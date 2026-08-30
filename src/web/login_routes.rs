@@ -444,6 +444,14 @@ pub async fn password_reset_request(
     Extension(payload): Extension<PasswordResetRequestPayload>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    let response = password_reset_request_data(&data, payload).await?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn password_reset_request_data(
+    data: &Arc<AppState>,
+    payload: PasswordResetRequestPayload,
+) -> Result<serde_json::Value, ApiError> {
     // Get project by client_id
     let project = data
         .db
@@ -459,7 +467,7 @@ pub async fn password_reset_request(
                 let response = json!({
                     "message": "If an account with that email exists, we have sent a password reset link."
                 });
-                return encrypt_response(&data, &session_id, &response).await;
+                return Ok(response);
             }
         }
         Err(DBError::UserNotFound) => {
@@ -467,7 +475,7 @@ pub async fn password_reset_request(
             let response = json!({
                 "message": "If an account with that email exists, we have sent a password reset link."
             });
-            return encrypt_response(&data, &session_id, &response).await;
+            return Ok(response);
         }
         Err(e) => {
             error!("Error in password reset request: {:?}", e);
@@ -487,8 +495,7 @@ pub async fn password_reset_request(
     let response = json!({
         "message": "If an account with that email exists, we have sent a password reset link."
     });
-    let result = encrypt_response(&data, &session_id, &response).await;
-    result
+    Ok(response)
 }
 
 pub async fn password_reset_confirm(
@@ -496,6 +503,14 @@ pub async fn password_reset_confirm(
     Extension(payload): Extension<PasswordResetConfirmPayload>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    let response = password_reset_confirm_data(&data, payload).await?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn password_reset_confirm_data(
+    data: &Arc<AppState>,
+    payload: PasswordResetConfirmPayload,
+) -> Result<serde_json::Value, ApiError> {
     // Get project by client_id
     let project = data
         .db
@@ -539,6 +554,5 @@ pub async fn password_reset_confirm(
     let response = json!({
         "message": "Password reset successful. You can now log in with your new password."
     });
-    let result = encrypt_response(&data, &session_id, &response).await;
-    result
+    Ok(response)
 }

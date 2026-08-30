@@ -1,7 +1,7 @@
 pub mod common;
 mod invite_routes;
-mod login_routes;
-mod me_routes;
+pub(crate) mod login_routes;
+pub(crate) mod me_routes;
 mod membership_routes;
 pub mod org_routes;
 mod project_routes;

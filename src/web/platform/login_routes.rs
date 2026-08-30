@@ -2,8 +2,9 @@ use crate::{
     email::send_platform_verification_email,
     jwt::{NewToken, TokenType, PLATFORM_REFRESH},
     models::{
-        org_memberships::OrgRole, platform_email_verification::NewPlatformEmailVerification,
-        platform_users::NewPlatformUser,
+        org_memberships::OrgRole,
+        platform_email_verification::NewPlatformEmailVerification,
+        platform_users::{NewPlatformUser, PlatformUser},
     },
     web::encryption_middleware::{
         decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
@@ -203,36 +204,22 @@ pub async fn login_platform_user(
         return Err(ApiError::BadRequest);
     }
 
-    let auth_response = login_internal_platform(data.clone(), login_request).await?;
+    let platform_user = authenticate_platform_login(data.clone(), login_request).await?;
+    let auth_response = v1_platform_auth_response(&data, platform_user)?;
     let result = encrypt_response(&data, &session_id, &auth_response).await;
     result
 }
 
-async fn login_internal_platform(
+pub(crate) async fn authenticate_platform_login(
     data: Arc<AppState>,
     login_request: PlatformLoginRequest,
-) -> Result<PlatformAuthResponse, ApiError> {
+) -> Result<PlatformUser, ApiError> {
     // Authenticate the platform user
     match data
         .authenticate_platform_user(&login_request.email, login_request.password)
         .await
     {
-        Ok(Some(platform_user)) => {
-            // Generate tokens
-            let access_token =
-                NewToken::new_for_platform_user(&platform_user, TokenType::Access, &data)?;
-            let refresh_token =
-                NewToken::new_for_platform_user(&platform_user, TokenType::Refresh, &data)?;
-
-            let auth_response = PlatformAuthResponse {
-                id: platform_user.uuid,
-                email: platform_user.email,
-                name: platform_user.name,
-                access_token: access_token.token,
-                refresh_token: refresh_token.token,
-            };
-            Ok(auth_response)
-        }
+        Ok(Some(platform_user)) => Ok(platform_user),
         Ok(None) => {
             error!("Invalid login attempt for platform user");
             Err(ApiError::InvalidUsernameOrPassword)
@@ -242,6 +229,22 @@ async fn login_internal_platform(
             Err(ApiError::InternalServerError)
         }
     }
+}
+
+fn v1_platform_auth_response(
+    data: &AppState,
+    platform_user: PlatformUser,
+) -> Result<PlatformAuthResponse, ApiError> {
+    let access_token = NewToken::new_for_platform_user(&platform_user, TokenType::Access, data)?;
+    let refresh_token = NewToken::new_for_platform_user(&platform_user, TokenType::Refresh, data)?;
+
+    Ok(PlatformAuthResponse {
+        id: platform_user.uuid,
+        email: platform_user.email,
+        name: platform_user.name,
+        access_token: access_token.token,
+        refresh_token: refresh_token.token,
+    })
 }
 
 pub async fn register_platform_user(
@@ -255,6 +258,17 @@ pub async fn register_platform_user(
         return Err(ApiError::BadRequest);
     }
 
+    let platform_user = register_platform_user_data(data.clone(), register_request).await?;
+    let response = v1_platform_auth_response(&data, platform_user)?;
+
+    let result = encrypt_response(&data, &session_id, &response).await;
+    result
+}
+
+pub(crate) async fn register_platform_user_data(
+    data: Arc<AppState>,
+    register_request: PlatformRegisterRequest,
+) -> Result<PlatformUser, ApiError> {
     // Check if user already exists
     if data
         .db
@@ -333,20 +347,7 @@ pub async fn register_platform_user(
         }
     });
 
-    // Generate tokens
-    let access_token = NewToken::new_for_platform_user(&platform_user, TokenType::Access, &data)?;
-    let refresh_token = NewToken::new_for_platform_user(&platform_user, TokenType::Refresh, &data)?;
-
-    let response = PlatformAuthResponse {
-        id: platform_user.uuid,
-        email: platform_user.email,
-        name: platform_user.name,
-        access_token: access_token.token,
-        refresh_token: refresh_token.token,
-    };
-
-    let result = encrypt_response(&data, &session_id, &response).await;
-    result
+    Ok(platform_user)
 }
 
 pub async fn refresh_platform_token(
@@ -387,6 +388,14 @@ pub async fn verify_platform_email(
     Path(code): Path<Uuid>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    let response = verify_platform_email_data(&data, code)?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) fn verify_platform_email_data(
+    data: &AppState,
+    code: Uuid,
+) -> Result<serde_json::Value, ApiError> {
     // Retrieve the verification record using the code
     let verification = match data.db.get_platform_email_verification_by_code(code) {
         Ok(verification) => verification,
@@ -405,7 +414,7 @@ pub async fn verify_platform_email(
         let response = json!({
             "message": "Email already verified"
         });
-        return encrypt_response(&data, &session_id, &response).await;
+        return Ok(response);
     }
 
     // Check if verification is expired
@@ -428,8 +437,7 @@ pub async fn verify_platform_email(
         "message": "Email verified successfully"
     });
 
-    let result = encrypt_response(&data, &session_id, &response).await;
-    result
+    Ok(response)
 }
 
 pub async fn logout_platform_user(
@@ -439,11 +447,15 @@ pub async fn logout_platform_user(
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
     info!("Platform logout request received");
 
-    // TODO: Implement token invalidation logic here when needed
-    drop(logout_request.refresh_token);
-    let response = json!({ "message": "Logged out successfully" });
+    let response = platform_logout_data(logout_request);
     let result = encrypt_response(&data, &session_id, &response).await;
     result
+}
+
+pub(crate) fn platform_logout_data(logout_request: PlatformLogoutRequest) -> serde_json::Value {
+    // TODO: Implement token invalidation logic here when needed
+    drop(logout_request.refresh_token);
+    json!({ "message": "Logged out successfully" })
 }
 
 pub async fn platform_password_reset_request(
@@ -457,6 +469,14 @@ pub async fn platform_password_reset_request(
         return Err(ApiError::BadRequest);
     }
 
+    let response = platform_password_reset_request_data(&data, payload).await?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn platform_password_reset_request_data(
+    data: &Arc<AppState>,
+    payload: PlatformPasswordResetRequestPayload,
+) -> Result<serde_json::Value, ApiError> {
     // Check if user exists and is not an OAuth-only user
     match data.db.get_platform_user_by_email(&payload.email) {
         Ok(Some(user)) => {
@@ -466,7 +486,7 @@ pub async fn platform_password_reset_request(
                 let response = json!({
                     "message": "If an account with that email exists, we have sent a password reset link."
                 });
-                return encrypt_response(&data, &session_id, &response).await;
+                return Ok(response);
             }
         }
         Ok(None) => {
@@ -474,7 +494,7 @@ pub async fn platform_password_reset_request(
             let response = json!({
                 "message": "If an account with that email exists, we have sent a password reset link."
             });
-            return encrypt_response(&data, &session_id, &response).await;
+            return Ok(response);
         }
         Err(e) => {
             error!("Error in platform password reset request: {:?}", e);
@@ -494,8 +514,7 @@ pub async fn platform_password_reset_request(
     let response = json!({
         "message": "If an account with that email exists, we have sent a password reset link."
     });
-    let result = encrypt_response(&data, &session_id, &response).await;
-    result
+    Ok(response)
 }
 
 pub async fn platform_password_reset_confirm(
@@ -509,6 +528,14 @@ pub async fn platform_password_reset_confirm(
         return Err(ApiError::BadRequest);
     }
 
+    let response = platform_password_reset_confirm_data(&data, payload).await?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn platform_password_reset_confirm_data(
+    data: &Arc<AppState>,
+    payload: PlatformPasswordResetConfirmPayload,
+) -> Result<serde_json::Value, ApiError> {
     // Check if user exists and is not an OAuth-only user
     match data.db.get_platform_user_by_email(&payload.email) {
         Ok(Some(user)) => {
@@ -546,6 +573,5 @@ pub async fn platform_password_reset_confirm(
         "message": "Password reset successful. You can now log in with your new password."
     });
 
-    let result = encrypt_response(&data, &session_id, &response).await;
-    result
+    Ok(response)
 }

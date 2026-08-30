@@ -133,6 +133,14 @@ async fn request_platform_verification(
     Extension(platform_user): Extension<PlatformUser>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    let response = request_platform_verification_data(&data, &platform_user).await?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn request_platform_verification_data(
+    data: &Arc<AppState>,
+    platform_user: &PlatformUser,
+) -> Result<serde_json::Value, ApiError> {
     // Check if the user is already verified
     match data
         .db
@@ -141,7 +149,7 @@ async fn request_platform_verification(
         Ok(verification) => {
             if verification.is_verified {
                 let response = json!({ "error": "User is already verified" });
-                return encrypt_response(&data, &session_id, &response).await;
+                return Ok(response);
             }
             // Delete the old verification
             if let Err(e) = data.db.delete_platform_email_verification(&verification) {
@@ -193,8 +201,7 @@ async fn request_platform_verification(
         }
     });
 
-    let response = json!({ "message": "New verification code sent successfully" });
-    encrypt_response(&data, &session_id, &response).await
+    Ok(json!({ "message": "New verification code sent successfully" }))
 }
 
 pub async fn platform_change_password(
@@ -209,6 +216,15 @@ pub async fn platform_change_password(
         return Err(ApiError::BadRequest);
     }
 
+    let response = platform_change_password_data(&data, &platform_user, change_request).await?;
+    encrypt_response(&data, &session_id, &response).await
+}
+
+pub(crate) async fn platform_change_password_data(
+    data: &Arc<AppState>,
+    platform_user: &PlatformUser,
+    change_request: PlatformChangePasswordRequest,
+) -> Result<serde_json::Value, ApiError> {
     // Check if user is an OAuth-only user
     if platform_user.password_enc.is_none() {
         error!("OAuth-only platform user attempted to change password");
@@ -223,13 +239,10 @@ pub async fn platform_change_password(
         Ok(Some(authenticated_user)) if authenticated_user.uuid == platform_user.uuid => {
             // Current password is correct, proceed with password change
             match data
-                .update_platform_user_password(&platform_user, change_request.new_password)
+                .update_platform_user_password(platform_user, change_request.new_password)
                 .await
             {
-                Ok(()) => {
-                    let response = json!({ "message": "Password changed successfully" });
-                    encrypt_response(&data, &session_id, &response).await
-                }
+                Ok(()) => Ok(json!({ "message": "Password changed successfully" })),
                 Err(e) => {
                     error!("Error changing platform user password: {:?}", e);
                     Err(ApiError::InternalServerError)

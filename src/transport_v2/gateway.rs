@@ -1154,7 +1154,7 @@ mod tests {
         let client_master = SessionMaster::from_bytes(first_master);
         let client_keys = DirectionalKeys::derive(&client_master).unwrap();
         let encrypted_request = client_keys
-            .encrypt_request_record_with_nonce(&first_id, &request_plaintext, [0x12; 12])
+            .encrypt_request_record(&first_id, &request_plaintext)
             .unwrap();
 
         let response = state
@@ -1218,23 +1218,23 @@ mod tests {
     #[tokio::test]
     async fn pending_attestation_is_one_shot_and_expires_independently() {
         let state = TransportV2State::new();
-        let nonce = "v2-only-nonce";
+        let nonce = Uuid::new_v4().to_string();
         state
-            .create_pending_attestation(nonce)
+            .create_pending_attestation(&nonce)
             .await
             .expect("create pending key");
         let _secret = state
-            .take_pending_attestation(nonce)
+            .take_pending_attestation(&nonce)
             .await
             .expect("consume once");
-        assert!(state.take_pending_attestation(nonce).await.is_err());
+        assert!(state.take_pending_attestation(&nonce).await.is_err());
 
         state
-            .create_pending_attestation(nonce)
+            .create_pending_attestation(&nonce)
             .await
             .expect("create replacement key");
         let expired_at = Instant::now() + PENDING_ATTESTATION_TTL;
         assert_eq!(state.cleanup_expired_at(expired_at).await, 1);
-        assert!(state.take_pending_attestation(nonce).await.is_err());
+        assert!(state.take_pending_attestation(&nonce).await.is_err());
     }
 }

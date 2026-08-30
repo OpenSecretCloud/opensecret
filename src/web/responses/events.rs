@@ -2,6 +2,7 @@
 
 use crate::{web::encryption_middleware::TransportSession, AppState};
 use axum::response::sse::Event;
+use bytes::Bytes;
 use serde::Serialize;
 use tracing::{error, trace};
 
@@ -171,6 +172,87 @@ impl ResponseEvent {
         }
     }
 
+    /// Whether this event completes the application-level Responses stream.
+    ///
+    /// Transport v2 carries these events as ordinary plaintext SSE bytes and
+    /// emits its authenticated `End` record only after the terminal event has
+    /// been delivered. `response.error` is an application terminal, not a
+    /// transport failure.
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ResponseEvent::Completed(_) | ResponseEvent::Cancelled(_) | ResponseEvent::Error(_)
+        )
+    }
+
+    /// Match the legacy application sequence-number behavior. Cancellation
+    /// and error payloads do not carry a sequence number and historically did
+    /// not advance the v1 emitter's counter.
+    pub(crate) fn advances_sequence(&self) -> bool {
+        !matches!(self, ResponseEvent::Cancelled(_) | ResponseEvent::Error(_))
+    }
+
+    /// Assign the application-level Responses sequence number immediately
+    /// before projection. V1 does this before encryption and commits the
+    /// emitter counter only after encryption succeeds; v2 commits only after
+    /// plaintext serialization succeeds. Keeping assignment in the adapters
+    /// preserves the legacy encryption-failure behavior without coupling the
+    /// application producer to either transport.
+    pub(crate) fn set_sequence_number(&mut self, sequence_number: i32) {
+        match self {
+            ResponseEvent::Created(event) => event.sequence_number = sequence_number,
+            ResponseEvent::InProgress(event) => event.sequence_number = sequence_number,
+            ResponseEvent::OutputItemAdded(event) => event.sequence_number = sequence_number,
+            ResponseEvent::ContentPartAdded(event) => event.sequence_number = sequence_number,
+            ResponseEvent::OutputTextDelta(event) => event.sequence_number = sequence_number,
+            ResponseEvent::OutputTextDone(event) => event.sequence_number = sequence_number,
+            ResponseEvent::ReasoningTextDelta(event) => event.sequence_number = sequence_number,
+            ResponseEvent::ReasoningTextDone(event) => event.sequence_number = sequence_number,
+            ResponseEvent::ContentPartDone(event) => event.sequence_number = sequence_number,
+            ResponseEvent::OutputItemDone(event) => event.sequence_number = sequence_number,
+            ResponseEvent::Completed(event) => event.sequence_number = sequence_number,
+            ResponseEvent::ToolCallCreated(event) => event.sequence_number = sequence_number,
+            ResponseEvent::ToolOutputCreated(event) => event.sequence_number = sequence_number,
+            ResponseEvent::Cancelled(_) | ResponseEvent::Error(_) => {}
+        }
+    }
+
+    /// Serialize this application event as an ordinary OpenAI-compatible SSE
+    /// frame. The bytes are plaintext at the logical application layer; the v2
+    /// gateway authenticates and encrypts them as `StreamRecord::Chunk` data.
+    pub(crate) fn to_plaintext_sse_frame(&self) -> Result<Bytes, serde_json::Error> {
+        fn payload<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
+            serde_json::to_vec(value)
+        }
+
+        let payload = match self {
+            ResponseEvent::Created(event) => payload(event),
+            ResponseEvent::InProgress(event) => payload(event),
+            ResponseEvent::OutputItemAdded(event) => payload(event),
+            ResponseEvent::ContentPartAdded(event) => payload(event),
+            ResponseEvent::OutputTextDelta(event) => payload(event),
+            ResponseEvent::OutputTextDone(event) => payload(event),
+            ResponseEvent::ReasoningTextDelta(event) => payload(event),
+            ResponseEvent::ReasoningTextDone(event) => payload(event),
+            ResponseEvent::ContentPartDone(event) => payload(event),
+            ResponseEvent::OutputItemDone(event) => payload(event),
+            ResponseEvent::Completed(event) => payload(event),
+            ResponseEvent::Cancelled(event) => payload(event),
+            ResponseEvent::Error(event) => payload(event),
+            ResponseEvent::ToolCallCreated(event) => payload(event),
+            ResponseEvent::ToolOutputCreated(event) => payload(event),
+        }?;
+
+        let event_type = self.event_type().as_bytes();
+        let mut frame = Vec::with_capacity(event_type.len() + payload.len() + 16);
+        frame.extend_from_slice(b"event: ");
+        frame.extend_from_slice(event_type);
+        frame.extend_from_slice(b"\ndata: ");
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(b"\n\n");
+        Ok(Bytes::from(frame))
+    }
+
     /// Convert to SSE event with encryption
     ///
     /// This is a convenience method that automatically serializes and encrypts the event.
@@ -239,7 +321,7 @@ mod tests {
         use uuid::Uuid;
 
         // Test that event types map correctly
-        let created = ResponseEvent::Created(ResponseCreatedEvent {
+        let mut created = ResponseEvent::Created(ResponseCreatedEvent {
             event_type: EVENT_RESPONSE_CREATED,
             response: ResponsesCreateResponse {
                 id: Uuid::new_v4(),
@@ -282,5 +364,43 @@ mod tests {
         });
 
         assert_eq!(created.event_type(), EVENT_RESPONSE_CREATED);
+        assert!(!created.is_terminal());
+        assert!(created.advances_sequence());
+        created.set_sequence_number(7);
+
+        let frame = created
+            .to_plaintext_sse_frame()
+            .expect("created event should serialize");
+        let frame = std::str::from_utf8(&frame).expect("SSE frame should be UTF-8");
+        assert!(frame.starts_with("event: response.created\ndata: {"));
+        assert!(frame.ends_with("\n\n"));
+        let payload = frame
+            .strip_prefix("event: response.created\ndata: ")
+            .and_then(|frame| frame.strip_suffix("\n\n"))
+            .expect("canonical plaintext SSE framing");
+        let payload: serde_json::Value =
+            serde_json::from_str(payload).expect("SSE data should contain JSON");
+        assert_eq!(payload["type"], EVENT_RESPONSE_CREATED);
+        assert_eq!(payload["sequence_number"], 7);
+    }
+
+    #[test]
+    fn test_plaintext_error_event_is_an_application_terminal() {
+        let event = ResponseEvent::Error(ResponseErrorEvent {
+            event_type: EVENT_RESPONSE_ERROR,
+            error: crate::web::responses::handlers::ResponseError {
+                error_type: "stream_error".to_string(),
+                message: "Stream failed".to_string(),
+            },
+        });
+
+        assert!(event.is_terminal());
+        assert!(!event.advances_sequence());
+        assert_eq!(
+            event.to_plaintext_sse_frame().unwrap(),
+            Bytes::from_static(
+                b"event: response.error\ndata: {\"type\":\"response.error\",\"error\":{\"type\":\"stream_error\",\"message\":\"Stream failed\"}}\n\n"
+            )
+        );
     }
 }

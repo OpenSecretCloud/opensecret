@@ -15,6 +15,7 @@ mod session;
 mod session_cache;
 pub(crate) mod stored_conversations;
 pub(crate) mod stored_resources;
+pub(crate) mod streaming;
 
 pub(crate) use gateway::{router, TransportV2State};
 

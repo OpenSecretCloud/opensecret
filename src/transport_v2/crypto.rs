@@ -23,7 +23,8 @@ use super::envelope::RequestId;
 const KEY_LEN: usize = 32;
 const RECORD_NONCE_LEN: usize = 12;
 const RECORD_TAG_LEN: usize = 16;
-const MIN_RECORD_LEN: usize = RECORD_NONCE_LEN + RECORD_TAG_LEN;
+pub(crate) const RECORD_OVERHEAD_BYTES: usize = RECORD_NONCE_LEN + RECORD_TAG_LEN;
+const MIN_RECORD_LEN: usize = RECORD_OVERHEAD_BYTES;
 
 const HANDSHAKE_PAYLOAD_VERSION: u8 = 2;
 const HANDSHAKE_PAYLOAD_LEN: usize = 1 + 16 + KEY_LEN + 8;

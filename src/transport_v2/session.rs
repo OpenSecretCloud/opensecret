@@ -459,6 +459,12 @@ struct RecordBudget {
     used: AtomicUsize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamResponseCapacity {
+    Stream,
+    ExhaustionResponse,
+}
+
 impl RecordBudget {
     const fn new(limit: usize) -> Self {
         Self {
@@ -495,6 +501,31 @@ impl RecordBudget {
 
     fn try_consume(&self) -> bool {
         self.try_reserve(1)
+    }
+
+    /// Reserve a streaming response's start and terminal slots when both are
+    /// available, or atomically retain the sole remaining slot for an
+    /// authenticated exhaustion response.
+    fn try_reserve_stream_or_exhaustion(&self) -> Option<StreamResponseCapacity> {
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            let remaining = self.limit.checked_sub(current)?;
+            let (count, capacity) = match remaining {
+                0 => return None,
+                1 => (1, StreamResponseCapacity::ExhaustionResponse),
+                _ => (2, StreamResponseCapacity::Stream),
+            };
+
+            match self.used.compare_exchange_weak(
+                current,
+                current + count,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(capacity),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     fn is_full(&self) -> bool {
@@ -563,6 +594,16 @@ pub(crate) struct UnaryResponseReservation {
     reserved: bool,
 }
 
+/// Atomic admission result for a request already classified as streaming.
+///
+/// The fallback variant owns the last response-record slot and is therefore
+/// safe to use for the bound `session_exhausted` response without a second
+/// capacity race.
+pub(crate) enum StreamResponseAdmission {
+    Stream(StreamResponseReservation),
+    ExhaustionResponse(UnaryResponseReservation),
+}
+
 impl UnaryResponseReservation {
     fn belongs_to(&self, response_records: &Arc<RecordBudget>) -> bool {
         Arc::ptr_eq(&self.response_records, response_records)
@@ -597,6 +638,7 @@ enum StreamResponsePhase {
 /// cryptographic encryption fails.
 pub(crate) struct StreamResponseReservation {
     response_records: Arc<RecordBudget>,
+    request_id: RequestId,
     start_reserved: bool,
     terminal_reserved: bool,
     phase: StreamResponsePhase,
@@ -613,6 +655,44 @@ impl StreamResponseReservation {
 
     fn consume_terminal(&mut self) {
         self.terminal_reserved = false;
+    }
+
+    pub(crate) const fn request_id(&self) -> RequestId {
+        self.request_id
+    }
+
+    pub(crate) fn next_sequence(&self) -> Result<u64, SessionRecordError> {
+        match self.phase {
+            StreamResponsePhase::BeforeStart => Ok(0),
+            StreamResponsePhase::Started { next_sequence } => Ok(next_sequence),
+            StreamResponsePhase::Failed | StreamResponsePhase::Finished => {
+                Err(SessionRecordError::StreamClosed)
+            }
+        }
+    }
+
+    /// Convert an unstarted stream's atomic start+terminal reservation into
+    /// one unary reservation without releasing and reacquiring the retained
+    /// response slot. This keeps pre-Start failures authentically reportable
+    /// even under concurrent session exhaustion.
+    pub(crate) fn into_unary_before_start(
+        mut self,
+    ) -> Result<UnaryResponseReservation, SessionRecordError> {
+        if !matches!(self.phase, StreamResponsePhase::BeforeStart) {
+            return Err(SessionRecordError::StreamAlreadyStarted);
+        }
+        if !self.start_reserved || !self.terminal_reserved {
+            return Err(SessionRecordError::ResponseReservationConsumed);
+        }
+
+        self.start_reserved = false;
+        self.terminal_reserved = false;
+        self.phase = StreamResponsePhase::Finished;
+        self.response_records.release(1);
+        Ok(UnaryResponseReservation {
+            response_records: Arc::clone(&self.response_records),
+            reserved: true,
+        })
     }
 }
 
@@ -836,15 +916,45 @@ impl V2SessionState {
     /// may dispatch.
     pub(crate) fn begin_stream_response(
         &self,
+        request_id: RequestId,
     ) -> Result<StreamResponseReservation, SessionRecordError> {
         self.reserve_response_records(2)
             .map_err(|_| SessionRecordError::ResponseRecordsExhausted)?;
         Ok(StreamResponseReservation {
             response_records: Arc::clone(&self.response_records),
+            request_id,
             start_reserved: true,
             terminal_reserved: true,
             phase: StreamResponsePhase::BeforeStart,
         })
+    }
+
+    /// Atomically reserve a complete stream or the final unary response slot.
+    ///
+    /// When no response capacity remains, the caller cannot authenticate an
+    /// error and must fail at the outer transport layer.
+    pub(crate) fn begin_stream_response_or_exhaustion(
+        &self,
+        request_id: RequestId,
+    ) -> Result<StreamResponseAdmission, SessionRecordError> {
+        match self.response_records.try_reserve_stream_or_exhaustion() {
+            Some(StreamResponseCapacity::Stream) => {
+                Ok(StreamResponseAdmission::Stream(StreamResponseReservation {
+                    response_records: Arc::clone(&self.response_records),
+                    request_id,
+                    start_reserved: true,
+                    terminal_reserved: true,
+                    phase: StreamResponsePhase::BeforeStart,
+                }))
+            }
+            Some(StreamResponseCapacity::ExhaustionResponse) => Ok(
+                StreamResponseAdmission::ExhaustionResponse(UnaryResponseReservation {
+                    response_records: Arc::clone(&self.response_records),
+                    reserved: true,
+                }),
+            ),
+            None => Err(SessionRecordError::ResponseRecordsExhausted),
+        }
     }
 
     /// Consume the stream's reserved start slot. Sequence zero is fixed by this
@@ -852,7 +962,6 @@ impl V2SessionState {
     pub(crate) fn encrypt_stream_start_record(
         &self,
         reservation: &mut StreamResponseReservation,
-        request_id: &RequestId,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, SessionRecordError> {
         if !reservation.belongs_to(&self.response_records) {
@@ -874,7 +983,7 @@ impl V2SessionState {
         reservation.consume_start();
         let encrypted = self
             .keys
-            .encrypt_stream_response_record(&self.session_id, request_id, 0, plaintext)
+            .encrypt_stream_response_record(&self.session_id, &reservation.request_id, 0, plaintext)
             .map_err(SessionRecordError::Crypto);
         reservation.phase = if encrypted.is_ok() {
             StreamResponsePhase::Started { next_sequence: 1 }
@@ -889,8 +998,6 @@ impl V2SessionState {
     pub(crate) fn encrypt_stream_chunk_record(
         &self,
         reservation: &mut StreamResponseReservation,
-        request_id: &RequestId,
-        sequence: u64,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, SessionRecordError> {
         if !reservation.belongs_to(&self.response_records) {
@@ -903,7 +1010,7 @@ impl V2SessionState {
                 return Err(SessionRecordError::StreamClosed);
             }
         };
-        if sequence != next_sequence || sequence == u64::MAX {
+        if next_sequence == u64::MAX {
             return Err(SessionRecordError::InvalidStreamSequence);
         }
 
@@ -911,11 +1018,16 @@ impl V2SessionState {
             .map_err(|_| SessionRecordError::ResponseRecordsExhausted)?;
         let encrypted = self
             .keys
-            .encrypt_stream_response_record(&self.session_id, request_id, sequence, plaintext)
+            .encrypt_stream_response_record(
+                &self.session_id,
+                &reservation.request_id,
+                next_sequence,
+                plaintext,
+            )
             .map_err(SessionRecordError::Crypto);
         reservation.phase = if encrypted.is_ok() {
             StreamResponsePhase::Started {
-                next_sequence: sequence + 1,
+                next_sequence: next_sequence + 1,
             }
         } else {
             StreamResponsePhase::Failed
@@ -929,8 +1041,6 @@ impl V2SessionState {
     pub(crate) fn encrypt_stream_terminal_record(
         &self,
         reservation: &mut StreamResponseReservation,
-        request_id: &RequestId,
-        sequence: u64,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, SessionRecordError> {
         if !reservation.belongs_to(&self.response_records) {
@@ -943,16 +1053,18 @@ impl V2SessionState {
                 return Err(SessionRecordError::StreamClosed);
             }
         };
-        if sequence != next_sequence {
-            return Err(SessionRecordError::InvalidStreamSequence);
-        }
         if !reservation.terminal_reserved {
             return Err(SessionRecordError::ResponseReservationConsumed);
         }
         reservation.consume_terminal();
         reservation.phase = StreamResponsePhase::Finished;
         self.keys
-            .encrypt_stream_response_record(&self.session_id, request_id, sequence, plaintext)
+            .encrypt_stream_response_record(
+                &self.session_id,
+                &reservation.request_id,
+                next_sequence,
+                plaintext,
+            )
             .map_err(SessionRecordError::Crypto)
     }
 
@@ -1511,7 +1623,7 @@ mod tests {
             Arc::new(GlobalReplayBudget::new(4)),
         );
         assert!(matches!(
-            too_small.begin_stream_response(),
+            too_small.begin_stream_response(request_id(1)),
             Err(SessionRecordError::ResponseRecordsExhausted)
         ));
         assert_eq!(too_small.response_record_count(), 0);
@@ -1522,19 +1634,133 @@ mod tests {
             Arc::new(GlobalReplayBudget::new(4)),
         );
         let mut reservation = state
-            .begin_stream_response()
+            .begin_stream_response(request_id(1))
             .expect("atomically reserve start and terminal records");
         assert_eq!(state.response_record_count(), 2);
 
         state
-            .encrypt_stream_start_record(&mut reservation, &request_id(1), b"start")
+            .encrypt_stream_start_record(&mut reservation, b"start")
             .expect("pre-reserved start remains available");
         assert!(state.is_exhausted());
 
         state
-            .encrypt_stream_terminal_record(&mut reservation, &request_id(1), 1, b"end")
+            .encrypt_stream_terminal_record(&mut reservation, b"end")
             .expect("pre-reserved terminal remains available at the limit");
         assert_eq!(state.response_record_count(), 2);
+    }
+
+    #[test]
+    fn stream_admission_boundary_reserves_two_one_or_zero_response_slots() {
+        let now = Instant::now();
+        let no_capacity = session(
+            now + Duration::from_secs(30),
+            SessionLimits::new(4, 4, 0),
+            Arc::new(GlobalReplayBudget::new(4)),
+        );
+        assert!(matches!(
+            no_capacity.begin_stream_response_or_exhaustion(request_id(1)),
+            Err(SessionRecordError::ResponseRecordsExhausted)
+        ));
+
+        let final_slot = session(
+            now + Duration::from_secs(30),
+            SessionLimits::new(4, 4, 1),
+            Arc::new(GlobalReplayBudget::new(4)),
+        );
+        let StreamResponseAdmission::ExhaustionResponse(mut reservation) = final_slot
+            .begin_stream_response_or_exhaustion(request_id(2))
+            .expect("reserve final response slot")
+        else {
+            panic!("one remaining slot must be reserved for an exhaustion response");
+        };
+        final_slot
+            .encrypt_unary_response_record(&mut reservation, &request_id(2), b"exhausted")
+            .expect("encrypt exhaustion response with the final slot");
+        assert_eq!(final_slot.response_record_count(), 1);
+
+        let stream_capacity = session(
+            now + Duration::from_secs(30),
+            SessionLimits::new(4, 4, 2),
+            Arc::new(GlobalReplayBudget::new(4)),
+        );
+        let StreamResponseAdmission::Stream(reservation) = stream_capacity
+            .begin_stream_response_or_exhaustion(request_id(3))
+            .expect("reserve complete stream capacity")
+        else {
+            panic!("two remaining slots must be reserved for a stream");
+        };
+        assert_eq!(stream_capacity.response_record_count(), 2);
+        drop(reservation);
+        assert_eq!(stream_capacity.response_record_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_stream_admission_has_one_atomic_final_exhaustion_winner() {
+        const WORKERS: usize = 16;
+        const LIMIT: usize = 5;
+
+        let now = Instant::now();
+        let state = Arc::new(session(
+            now + Duration::from_secs(30),
+            SessionLimits::new(4, 4, LIMIT),
+            Arc::new(GlobalReplayBudget::new(4)),
+        ));
+        let start = Arc::new(Barrier::new(WORKERS));
+        let reserved = Arc::new(Barrier::new(WORKERS + 1));
+        let release = Arc::new(Barrier::new(WORKERS + 1));
+
+        let handles: Vec<_> = (0..WORKERS)
+            .map(|worker| {
+                let state = Arc::clone(&state);
+                let start = Arc::clone(&start);
+                let reserved = Arc::clone(&reserved);
+                let release = Arc::clone(&release);
+                thread::spawn(move || {
+                    start.wait();
+                    let admission =
+                        state.begin_stream_response_or_exhaustion(request_id(worker as u128 + 1));
+                    reserved.wait();
+                    release.wait();
+                    match admission {
+                        Ok(StreamResponseAdmission::Stream(_reservation)) => 2,
+                        Ok(StreamResponseAdmission::ExhaustionResponse(_reservation)) => 1,
+                        Err(SessionRecordError::ResponseRecordsExhausted) => 0,
+                        Err(error) => panic!("unexpected stream admission error: {error}"),
+                    }
+                })
+            })
+            .collect();
+
+        reserved.wait();
+        assert_eq!(state.response_record_count(), LIMIT);
+        release.wait();
+
+        let reservations: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("stream admission worker panicked"))
+            .collect();
+        assert_eq!(
+            reservations
+                .iter()
+                .filter(|reserved| **reserved == 2)
+                .count(),
+            2
+        );
+        assert_eq!(
+            reservations
+                .iter()
+                .filter(|reserved| **reserved == 1)
+                .count(),
+            1
+        );
+        assert_eq!(
+            reservations
+                .iter()
+                .filter(|reserved| **reserved == 0)
+                .count(),
+            WORKERS - 3
+        );
+        assert_eq!(state.response_record_count(), 0);
     }
 
     #[test]
@@ -1547,7 +1773,7 @@ mod tests {
         );
 
         let reservation = state
-            .begin_stream_response()
+            .begin_stream_response(request_id(1))
             .expect("reserve start and terminal response records");
         assert_eq!(state.response_record_count(), 2);
         drop(reservation);
@@ -1556,7 +1782,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_requires_matching_reservation_start_and_exact_sequence() {
+    fn stream_binds_request_and_owns_exact_sequence() {
         let now = Instant::now();
         let state = session(
             now + Duration::from_secs(30),
@@ -1569,44 +1795,88 @@ mod tests {
             Arc::new(GlobalReplayBudget::new(4)),
         );
         let mut reservation = state
-            .begin_stream_response()
+            .begin_stream_response(request_id(1))
             .expect("reserve stream response");
 
         assert!(matches!(
-            state.encrypt_stream_chunk_record(&mut reservation, &request_id(1), 1, b"chunk"),
+            state.encrypt_stream_chunk_record(&mut reservation, b"chunk"),
             Err(SessionRecordError::StreamNotStarted)
         ));
         assert!(matches!(
-            state.encrypt_stream_terminal_record(&mut reservation, &request_id(1), 1, b"end"),
+            state.encrypt_stream_terminal_record(&mut reservation, b"end"),
             Err(SessionRecordError::StreamNotStarted)
         ));
         assert!(matches!(
-            other.encrypt_stream_start_record(&mut reservation, &request_id(1), b"start"),
+            other.encrypt_stream_start_record(&mut reservation, b"start"),
             Err(SessionRecordError::ResponseReservationMismatch)
         ));
+        assert_eq!(reservation.request_id(), request_id(1));
+        assert_eq!(reservation.next_sequence().expect("start sequence"), 0);
 
         state
-            .encrypt_stream_start_record(&mut reservation, &request_id(1), b"start")
+            .encrypt_stream_start_record(&mut reservation, b"start")
             .expect("encrypt start");
-        assert!(matches!(
-            state.encrypt_stream_chunk_record(&mut reservation, &request_id(1), 2, b"out of order"),
-            Err(SessionRecordError::InvalidStreamSequence)
-        ));
+        assert_eq!(
+            reservation.next_sequence().expect("first chunk sequence"),
+            1
+        );
         state
-            .encrypt_stream_chunk_record(&mut reservation, &request_id(1), 1, b"chunk")
+            .encrypt_stream_chunk_record(&mut reservation, b"chunk")
             .expect("encrypt next chunk");
+        assert_eq!(reservation.next_sequence().expect("terminal sequence"), 2);
+        state
+            .encrypt_stream_terminal_record(&mut reservation, b"end")
+            .expect("encrypt exact next terminal");
+        assert_eq!(state.response_record_count(), 3);
+    }
+
+    #[test]
+    fn unstarted_stream_converts_to_unary_without_reacquiring_capacity() {
+        let now = Instant::now();
+        let state = session(
+            now + Duration::from_secs(30),
+            SessionLimits::new(4, 4, 2),
+            Arc::new(GlobalReplayBudget::new(4)),
+        );
+        let reservation = state
+            .begin_stream_response(request_id(7))
+            .expect("reserve stream response");
+        assert_eq!(state.response_record_count(), 2);
+
+        let mut unary = reservation
+            .into_unary_before_start()
+            .expect("retain one reserved slot for unary response");
+        assert_eq!(state.response_record_count(), 1);
+        state
+            .encrypt_unary_response_record(&mut unary, &request_id(7), b"error")
+            .expect("converted unary slot remains usable");
+        assert_eq!(state.response_record_count(), 1);
+    }
+
+    #[test]
+    fn chunk_exhaustion_preserves_the_pre_reserved_terminal() {
+        let now = Instant::now();
+        let state = session(
+            now + Duration::from_secs(30),
+            SessionLimits::new(4, 4, 3),
+            Arc::new(GlobalReplayBudget::new(4)),
+        );
+        let mut reservation = state
+            .begin_stream_response(request_id(8))
+            .expect("reserve start and terminal response records");
+        state
+            .encrypt_stream_start_record(&mut reservation, b"start")
+            .expect("encrypt start");
+        state
+            .encrypt_stream_chunk_record(&mut reservation, b"chunk")
+            .expect("encrypt final dynamic chunk slot");
         assert!(matches!(
-            state.encrypt_stream_terminal_record(
-                &mut reservation,
-                &request_id(1),
-                3,
-                b"out of order end"
-            ),
-            Err(SessionRecordError::InvalidStreamSequence)
+            state.encrypt_stream_chunk_record(&mut reservation, b"too many"),
+            Err(SessionRecordError::ResponseRecordsExhausted)
         ));
         state
-            .encrypt_stream_terminal_record(&mut reservation, &request_id(1), 2, b"end")
-            .expect("encrypt exact next terminal");
+            .encrypt_stream_terminal_record(&mut reservation, b"error")
+            .expect("reserved terminal remains usable after chunk exhaustion");
         assert_eq!(state.response_record_count(), 3);
     }
 

@@ -5,6 +5,7 @@
 //! functions, and returns plaintext logical results for the gateway to encrypt
 //! through the request's original session lease.
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,7 +15,8 @@ use axum::response::IntoResponse;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use secp256k1::SecretKey;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Error as _, IgnoredAny, MapAccess, Visitor};
+use serde::Deserializer as _;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use validator::Validate;
@@ -46,8 +48,9 @@ use crate::web::oauth_routes::{
 };
 use crate::web::openai::{
     openai_embeddings_v2_data, openai_model_catalog_data, openai_models_v2_data,
-    openai_nonstream_chat_completion_v2_data, openai_transcription_v2_data, openai_tts_v2_data,
-    EmbeddingRequest, TTSRequest, TranscriptionRequest,
+    openai_nonstream_chat_completion_v2_data, openai_stream_chat_completion_v2_data,
+    openai_transcription_v2_data, openai_tts_v2_data, EmbeddingRequest, TTSRequest,
+    TranscriptionRequest,
 };
 use crate::web::openai_auth::AuthMethod as OpenAiAuthMethod;
 use crate::web::platform::common::{
@@ -79,8 +82,8 @@ use crate::web::protected_routes::{
 };
 use crate::web::responses::conversions::ReasoningContentItem;
 use crate::web::responses::handlers::{
-    ContentPart, InputTokenDetails, OutputItem, OutputTokenDetails, ResponseUsage,
-    ResponsesRetrieveResponse,
+    responses_stream_v2_data, ContentPart, InputTokenDetails, OutputItem, OutputTokenDetails,
+    ResponseUsage, ResponsesCreateRequest, ResponsesRetrieveResponse,
 };
 use crate::web::responses::types::ConversationContent;
 use crate::web::responses::{
@@ -136,12 +139,13 @@ use super::session::{
 use super::session_cache::V2SessionLease;
 use super::stored_conversations::{self, ProjectAssignmentUpdate, StoredConversationError};
 use super::stored_resources::{self, StoredResourceError};
+use super::streaming::{LogicalStreamResponse, StreamExecutionGuard};
 
 const JSON_CONTENT_TYPE: &[u8] = b"application/json";
 const AES_GCM_NONCE_AND_TAG_BYTES: usize = 12 + 16;
 const ENCRYPTED_DATA_JSON_OVERHEAD_BYTES: usize = "{\"encrypted_data\":\"".len() + "\"}".len();
 const MAX_ENCRYPTED_DATA_BASE64_BYTES: usize =
-    ((EnvelopeLimits::DEFAULT.logical_body_bytes - ENCRYPTED_DATA_JSON_OVERHEAD_BYTES) / 4) * 4;
+    ((EnvelopeLimits::RESPONSE.logical_body_bytes - ENCRYPTED_DATA_JSON_OVERHEAD_BYTES) / 4) * 4;
 const MAX_ENCRYPTION_PLAINTEXT_BYTES: usize =
     (MAX_ENCRYPTED_DATA_BASE64_BYTES / 4) * 3 - AES_GCM_NONCE_AND_TAG_BYTES;
 const MAX_V2_KV_LIST_ROWS: usize = 65_536;
@@ -249,6 +253,11 @@ pub(crate) enum UserOperation {
     Inference {
         authority: InferenceAuthority,
         operation: InferenceOperation,
+    },
+    Responses {
+        authority: BoundUserAuthority,
+        body: SensitiveBytes,
+        headers: HeaderMap,
     },
 }
 
@@ -388,6 +397,7 @@ pub(crate) enum InferenceOperation {
     Chat {
         body: SensitiveBytes,
         headers: HeaderMap,
+        stream: bool,
     },
     TextToSpeech {
         body: SensitiveBytes,
@@ -404,6 +414,12 @@ pub(crate) enum InferenceOperation {
     WebExtract {
         body: SensitiveBytes,
     },
+}
+
+impl InferenceOperation {
+    const fn is_streaming(&self) -> bool {
+        matches!(self, Self::Chat { stream: true, .. })
+    }
 }
 
 pub(crate) enum InferenceAuthority {
@@ -594,7 +610,20 @@ impl UserOperation {
     pub(crate) const fn requires_provider_output_reservation(&self) -> bool {
         matches!(
             self,
-            Self::Inference { .. } | Self::OAuthCallback { .. } | Self::AppleNativeOAuth { .. }
+            Self::Inference { .. }
+                | Self::Responses { .. }
+                | Self::OAuthCallback { .. }
+                | Self::AppleNativeOAuth { .. }
+        )
+    }
+
+    pub(crate) const fn is_streaming(&self) -> bool {
+        matches!(
+            self,
+            Self::Inference {
+                operation: InferenceOperation::Chat { stream: true, .. },
+                ..
+            } | Self::Responses { .. }
         )
     }
 
@@ -637,6 +666,7 @@ impl UserOperation {
             Self::Protected { operation, .. } => operation.session_effect_on_success(),
             Self::PlatformControl { .. } => SessionEffect::Retain,
             Self::Inference { .. } => SessionEffect::Retain,
+            Self::Responses { .. } => SessionEffect::Retain,
             _ => SessionEffect::Retain,
         }
     }
@@ -696,7 +726,7 @@ fn preflight_conversation_project_creation_response(name: &str) -> Result<(), Ap
     preflight_conversation_project_response_with_limit(
         name,
         None,
-        EnvelopeLimits::default().logical_body_bytes,
+        EnvelopeLimits::RESPONSE.logical_body_bytes,
     )
 }
 
@@ -707,7 +737,7 @@ fn preflight_conversation_project_response(
     preflight_conversation_project_response_with_limit(
         name,
         instructions,
-        EnvelopeLimits::default().logical_body_bytes,
+        EnvelopeLimits::RESPONSE.logical_body_bytes,
     )
 }
 
@@ -743,7 +773,7 @@ fn preflight_instruction_response(
         name,
         prompt,
         is_default,
-        EnvelopeLimits::default().logical_body_bytes,
+        EnvelopeLimits::RESPONSE.logical_body_bytes,
     )
 }
 
@@ -901,8 +931,13 @@ impl LogicalUnaryResponse {
     }
 }
 
+pub(crate) enum LogicalApplicationResponse {
+    Unary(LogicalUnaryResponse),
+    Stream(LogicalStreamResponse),
+}
+
 pub(crate) struct ApplicationOutcome {
-    pub(crate) response: LogicalUnaryResponse,
+    pub(crate) response: LogicalApplicationResponse,
     pub(crate) session_effect: SessionEffect,
 }
 
@@ -916,22 +951,36 @@ pub(crate) enum SessionEffect {
 impl ApplicationOutcome {
     fn success(response: LogicalUnaryResponse, session_effect: SessionEffect) -> Self {
         Self {
-            response,
+            response: LogicalApplicationResponse::Unary(response),
+            session_effect,
+        }
+    }
+
+    fn stream(response: LogicalStreamResponse, session_effect: SessionEffect) -> Self {
+        Self {
+            response: LogicalApplicationResponse::Stream(response),
             session_effect,
         }
     }
 
     fn error(error: ApiError) -> Self {
         Self {
-            response: LogicalUnaryResponse::api_error(error),
+            response: LogicalApplicationResponse::Unary(LogicalUnaryResponse::api_error(error)),
             session_effect: SessionEffect::Retain,
         }
     }
 
     fn closing_error(error: ApiError) -> Self {
         Self {
-            response: LogicalUnaryResponse::api_error(error),
+            response: LogicalApplicationResponse::Unary(LogicalUnaryResponse::api_error(error)),
             session_effect: SessionEffect::Close,
+        }
+    }
+
+    fn error_with_effect(error: ApiError, session_effect: SessionEffect) -> Self {
+        Self {
+            response: LogicalApplicationResponse::Unary(LogicalUnaryResponse::api_error(error)),
+            session_effect,
         }
     }
 }
@@ -1024,6 +1073,7 @@ pub(crate) fn prepare_user_operation(
         Models,
         ModelCatalog,
         ChatCompletions,
+        ResponsesCreate,
         TextToSpeech,
         Transcription,
         Embeddings,
@@ -1174,6 +1224,7 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Get, "/v1/models") => Some(Route::Models),
         (LogicalMethod::Get, "/v1/models/catalog") => Some(Route::ModelCatalog),
         (LogicalMethod::Post, "/v1/chat/completions") => Some(Route::ChatCompletions),
+        (LogicalMethod::Post, "/v1/responses") => Some(Route::ResponsesCreate),
         (LogicalMethod::Post, "/v1/audio/speech") => Some(Route::TextToSpeech),
         (LogicalMethod::Post, "/v1/audio/transcriptions") => Some(Route::Transcription),
         (LogicalMethod::Post, "/v1/embeddings") => Some(Route::Embeddings),
@@ -1274,7 +1325,21 @@ pub(crate) fn prepare_user_operation(
         return OperationPreparation::Unsupported;
     };
 
-    if response_mode != ResponseMode::Unary {
+    let expected_response_mode = match route {
+        Route::ChatCompletions => {
+            let Some(body) = request.body_base64.as_ref() else {
+                return rejected_bad_request();
+            };
+            match chat_stream_requested(body.as_slice()) {
+                Ok(true) => ResponseMode::Stream,
+                Ok(false) => ResponseMode::Unary,
+                Err(()) => return rejected_bad_request(),
+            }
+        }
+        Route::ResponsesCreate => ResponseMode::Stream,
+        _ => ResponseMode::Unary,
+    };
+    if response_mode != expected_response_mode {
         return rejected_bad_request();
     }
 
@@ -1288,6 +1353,7 @@ pub(crate) fn prepare_user_operation(
                 | Route::GoogleOAuthCallback
                 | Route::AppleOAuthCallback
                 | Route::AppleNativeOAuth
+                | Route::Models
                 | Route::ModelCatalog
                 | Route::ChatCompletions
                 | Route::TextToSpeech
@@ -2562,37 +2628,28 @@ pub(crate) fn prepare_user_operation(
             })
         }
         Route::Models => {
-            if credential.is_some()
-                || cache_namespace_root_base64.is_some()
-                || request.query.is_some()
-                || !request.headers.is_empty()
-                || request.body_base64.is_some()
+            if request.body_base64.is_some()
+                || prepare_inference_headers(request.headers, false).is_err()
             {
                 return rejected_bad_request();
             }
-            match authority {
-                AuthorityState::Anonymous => {}
-                AuthorityState::Bound(bound)
-                    if matches!(
-                        bound.principal(),
-                        BoundPrincipal::User { .. } | BoundPrincipal::ApiKey { .. }
-                    ) => {}
-                AuthorityState::Bound(_) => {
-                    return OperationPreparation::Rejected(authentication_required_response());
+            let authority = if matches!(authority, AuthorityState::Anonymous)
+                && credential.is_none()
+                && cache_namespace_root_base64.is_none()
+            {
+                InferenceAuthority::Public
+            } else {
+                match prepare_inference_authority(
+                    authority,
+                    credential,
+                    cache_namespace_root_base64,
+                ) {
+                    Ok(authority) => authority,
+                    Err(rejection) => return OperationPreparation::Rejected(rejection),
                 }
-                AuthorityState::Authenticating(_) => {
-                    return OperationPreparation::Rejected(authentication_start_error(
-                        AuthenticationStartError::AuthenticationInProgress,
-                    ));
-                }
-                AuthorityState::Closing => {
-                    return OperationPreparation::Rejected(authentication_start_error(
-                        AuthenticationStartError::Closing,
-                    ));
-                }
-            }
+            };
             OperationPreparation::Ready(UserOperation::Inference {
-                authority: InferenceAuthority::Public,
+                authority,
                 operation: InferenceOperation::Models,
             })
         }
@@ -2601,13 +2658,11 @@ pub(crate) fn prepare_user_operation(
         | Route::TextToSpeech
         | Route::Transcription
         | Route::Embeddings => {
-            if request.query.is_some() {
-                return rejected_bad_request();
-            }
-
             let operation = match route {
                 Route::ModelCatalog => {
-                    if !request.headers.is_empty() || request.body_base64.is_some() {
+                    if request.body_base64.is_some()
+                        || prepare_inference_headers(request.headers, false).is_err()
+                    {
                         return rejected_bad_request();
                     }
                     InferenceOperation::ModelCatalog
@@ -2619,17 +2674,18 @@ pub(crate) fn prepare_user_operation(
                     if body.is_empty() {
                         return rejected_bad_request();
                     }
-                    let headers = match prepare_chat_provider_headers(request.headers) {
+                    let headers = match prepare_inference_headers(request.headers, true) {
                         Ok(headers) => headers,
                         Err(()) => return rejected_bad_request(),
                     };
                     InferenceOperation::Chat {
                         body: Zeroizing::new(body.into_bytes()),
                         headers,
+                        stream: response_mode == ResponseMode::Stream,
                     }
                 }
                 Route::TextToSpeech | Route::Transcription | Route::Embeddings => {
-                    if !has_exact_json_content_type(&request.headers) {
+                    if prepare_inference_headers(request.headers, true).is_err() {
                         return rejected_bad_request();
                     }
                     let Some(body) = request.body_base64.take() else {
@@ -2662,11 +2718,34 @@ pub(crate) fn prepare_user_operation(
                 operation,
             })
         }
+        Route::ResponsesCreate => {
+            if credential.is_some() || cache_namespace_root_base64.is_some() {
+                return rejected_bad_request();
+            }
+            let Some(body) = request.body_base64.take() else {
+                return rejected_bad_request();
+            };
+            if body.is_empty() {
+                return rejected_bad_request();
+            }
+            let headers = match prepare_inference_headers(request.headers, true) {
+                Ok(headers) => headers,
+                Err(()) => return rejected_bad_request(),
+            };
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
+            };
+            OperationPreparation::Ready(UserOperation::Responses {
+                authority,
+                body: Zeroizing::new(body.into_bytes()),
+                headers,
+            })
+        }
         Route::WebSearch | Route::WebExtract => {
             if credential.is_some()
                 || cache_namespace_root_base64.is_some()
-                || request.query.is_some()
-                || !has_exact_json_content_type(&request.headers)
+                || prepare_inference_headers(request.headers, true).is_err()
             {
                 return rejected_bad_request();
             }
@@ -2832,7 +2911,9 @@ pub(crate) async fn execute_user_operation(
     operation: UserOperation,
     authentication: Option<AuthenticationReservation>,
     monotonic_now: Instant,
+    stream_guard: Option<StreamExecutionGuard>,
 ) -> ApplicationOutcome {
+    debug_assert_eq!(operation.is_streaming(), stream_guard.is_some());
     let session_effect_on_success = operation.session_effect_on_success();
     match operation {
         UserOperation::Login {
@@ -3341,8 +3422,53 @@ pub(crate) async fn execute_user_operation(
                 authority,
                 authentication,
                 monotonic_now,
+                stream_guard,
             )
             .await
+        }
+        UserOperation::Responses {
+            authority,
+            body,
+            headers,
+        } => {
+            debug_assert!(authentication.is_none());
+            let Some(stream_guard) = stream_guard else {
+                return ApplicationOutcome::error(ApiError::InternalServerError);
+            };
+            let user = match app_state.verify_bound_user(
+                authority.user_id,
+                authority.project_id,
+                &authority.auth_context,
+            ) {
+                Ok(user) => user,
+                Err(error) => {
+                    if matches!(error, ApiError::Unauthorized | ApiError::InvalidJwt) {
+                        return ApplicationOutcome::closing_error(error);
+                    }
+                    return ApplicationOutcome::error(error);
+                }
+            };
+            let request = match parse_provider_json_body::<ResponsesCreateRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            match responses_stream_v2_data(
+                Arc::clone(&app_state),
+                headers,
+                user,
+                authority.auth_context,
+                request,
+                authority.cache_namespace,
+                stream_guard,
+            )
+            .await
+            {
+                Ok(stream) => ApplicationOutcome::stream(
+                    LogicalStreamResponse::sse(stream),
+                    SessionEffect::Retain,
+                ),
+                Err(error) => ApplicationOutcome::error(error),
+            }
         }
     }
 }
@@ -3768,10 +3894,12 @@ async fn execute_inference_operation(
     authority: InferenceAuthority,
     authentication: Option<AuthenticationReservation>,
     monotonic_now: Instant,
+    stream_guard: Option<StreamExecutionGuard>,
 ) -> ApplicationOutcome {
     match authority {
         InferenceAuthority::Public => {
             debug_assert!(authentication.is_none());
+            debug_assert!(stream_guard.is_none());
             if !matches!(operation, InferenceOperation::Models) {
                 return ApplicationOutcome::error(ApiError::Unauthorized);
             }
@@ -3799,15 +3927,16 @@ async fn execute_inference_operation(
                     return ApplicationOutcome::error(error);
                 }
             };
-            let response = execute_inference_for_user(
+            execute_inference_for_bound_user(
                 app_state,
                 &user,
                 OpenAiAuthMethod::Jwt,
                 &authority.cache_namespace,
                 operation,
+                stream_guard,
+                SessionEffect::Retain,
             )
-            .await;
-            ApplicationOutcome::success(response, SessionEffect::Retain)
+            .await
         }
         InferenceAuthority::ApiKey(authority) => {
             debug_assert!(authentication.is_none());
@@ -3825,15 +3954,16 @@ async fn execute_inference_operation(
                     return ApplicationOutcome::error(ApiError::InternalServerError);
                 }
             };
-            let response = execute_inference_for_user(
+            execute_inference_for_bound_user(
                 app_state,
                 &user,
                 OpenAiAuthMethod::ApiKey,
                 &authority.cache_namespace,
                 operation,
+                stream_guard,
+                SessionEffect::Retain,
             )
-            .await;
-            ApplicationOutcome::success(response, SessionEffect::Retain)
+            .await
         }
         InferenceAuthority::AuthenticateApiKey {
             credential,
@@ -3867,20 +3997,73 @@ async fn execute_inference_operation(
                 return ApplicationOutcome::error(ApiError::InternalServerError);
             }
 
-            let response = execute_inference_for_user(
+            // Once the authority commits, every application outcome must carry
+            // NewlyBound. The gateway can then close the session if this first
+            // authenticated response cannot be encrypted for the client.
+            execute_inference_for_bound_user(
                 app_state,
                 &resolved.user,
                 OpenAiAuthMethod::ApiKey,
                 &cache_namespace,
                 operation,
+                stream_guard,
+                SessionEffect::NewlyBound,
             )
-            .await;
-            // Once the authority commits, every application outcome must carry
-            // NewlyBound. The gateway can then close the session if this first
-            // authenticated response cannot be encrypted for the client.
-            ApplicationOutcome::success(response, SessionEffect::NewlyBound)
+            .await
         }
     }
+}
+
+async fn execute_inference_for_bound_user(
+    app_state: &Arc<AppState>,
+    user: &crate::User,
+    auth_method: OpenAiAuthMethod,
+    cache_namespace: &DerivedCacheNamespace,
+    operation: InferenceOperation,
+    stream_guard: Option<StreamExecutionGuard>,
+    session_effect: SessionEffect,
+) -> ApplicationOutcome {
+    if operation.is_streaming() {
+        let Some(stream_guard) = stream_guard else {
+            return ApplicationOutcome::error_with_effect(
+                ApiError::InternalServerError,
+                session_effect,
+            );
+        };
+        let InferenceOperation::Chat {
+            body,
+            headers,
+            stream: true,
+        } = operation
+        else {
+            unreachable!("only Chat Completions currently supports inference streaming")
+        };
+        let body = match parse_provider_json_body::<serde_json::Value>(body) {
+            Ok(body) => body,
+            Err(error) => return ApplicationOutcome::error_with_effect(error, session_effect),
+        };
+        return match openai_stream_chat_completion_v2_data(
+            app_state,
+            user,
+            auth_method,
+            body,
+            &headers,
+            cache_namespace,
+            stream_guard,
+        )
+        .await
+        {
+            Ok(stream) => {
+                ApplicationOutcome::stream(LogicalStreamResponse::sse(stream), session_effect)
+            }
+            Err(error) => ApplicationOutcome::error_with_effect(error, session_effect),
+        };
+    }
+
+    debug_assert!(stream_guard.is_none());
+    let response =
+        execute_inference_for_user(app_state, user, auth_method, cache_namespace, operation).await;
+    ApplicationOutcome::success(response, session_effect)
 }
 
 async fn execute_inference_for_user(
@@ -3891,12 +4074,18 @@ async fn execute_inference_for_user(
     operation: InferenceOperation,
 ) -> LogicalUnaryResponse {
     let result = match operation {
-        InferenceOperation::Models => Err(ApiError::Unauthorized),
+        InferenceOperation::Models => openai_models_v2_data(app_state)
+            .await
+            .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value)),
         InferenceOperation::ModelCatalog => {
             let value = openai_model_catalog_data(app_state, user).await;
             LogicalUnaryResponse::json(StatusCode::OK, &value)
         }
-        InferenceOperation::Chat { body, headers } => {
+        InferenceOperation::Chat {
+            body,
+            headers,
+            stream: false,
+        } => {
             let body = match parse_provider_json_body::<serde_json::Value>(body) {
                 Ok(body) => body,
                 Err(error) => return LogicalUnaryResponse::api_error(error),
@@ -3970,6 +4159,9 @@ async fn execute_inference_for_user(
                 Ok(value) => LogicalUnaryResponse::json(StatusCode::OK, &value),
                 Err(error) => logical_web_error(error),
             }
+        }
+        InferenceOperation::Chat { stream: true, .. } => {
+            unreachable!("streaming Chat Completions uses the stream dispatcher")
         }
     };
 
@@ -5606,6 +5798,48 @@ fn validate_json_shape(bytes: &[u8]) -> Result<(), JsonShapeError> {
     }
 }
 
+/// Read only the top-level Chat Completions `stream` flag while skipping all
+/// prompt/tool content without allocating a second JSON object tree.
+fn chat_stream_requested(bytes: &[u8]) -> Result<bool, ()> {
+    if validate_json_shape(bytes).is_err() {
+        return Err(());
+    }
+
+    struct StreamProbe;
+
+    impl<'de> Visitor<'de> for StreamProbe {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a Chat Completions JSON object")
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut stream = None;
+            while let Some(key) = map.next_key::<String>()? {
+                let key = Zeroizing::new(key);
+                if key.as_str() == "stream" {
+                    if stream.is_some() {
+                        return Err(M::Error::custom("duplicate stream field"));
+                    }
+                    stream = Some(map.next_value::<bool>()?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(stream.unwrap_or(false))
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let stream = deserializer.deserialize_map(StreamProbe).map_err(|_| ())?;
+    deserializer.end().map_err(|_| ())?;
+    Ok(stream)
+}
+
 fn parse_conversation_json_body<T: DeserializeOwned>(body: SensitiveBytes) -> Result<T, ApiError> {
     match validate_json_shape(&body) {
         Ok(()) => parse_json_body(body),
@@ -5909,13 +6143,16 @@ fn is_json_content_type(value: &[u8]) -> bool {
     true
 }
 
-fn prepare_chat_provider_headers(headers: Vec<HeaderField>) -> Result<HeaderMap, ()> {
+fn prepare_inference_headers(
+    headers: Vec<HeaderField>,
+    require_json_content_type: bool,
+) -> Result<HeaderMap, ()> {
     let mut prepared = HeaderMap::new();
     let mut saw_content_type = false;
 
     for header in headers {
         let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| ())?;
-        if is_forbidden_chat_provider_header(&name) {
+        if is_forbidden_inference_header(&name) {
             return Err(());
         }
         if name == header::CONTENT_TYPE {
@@ -5929,10 +6166,13 @@ fn prepare_chat_provider_headers(headers: Vec<HeaderField>) -> Result<HeaderMap,
         prepared.append(name, value);
     }
 
-    saw_content_type.then_some(prepared).ok_or(())
+    if require_json_content_type && !saw_content_type {
+        return Err(());
+    }
+    Ok(prepared)
 }
 
-fn is_forbidden_chat_provider_header(name: &HeaderName) -> bool {
+fn is_forbidden_inference_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
         "authorization"
@@ -5943,6 +6183,8 @@ fn is_forbidden_chat_provider_header(name: &HeaderName) -> bool {
             | "host"
             | "content-length"
             | "content-encoding"
+            | "content-md5"
+            | "digest"
             | "accept-encoding"
             | "connection"
             | "keep-alive"
@@ -9067,7 +9309,12 @@ mod tests {
             ),
         ];
 
-        for (request, authority, expected_kind, expects_public_authority) in cases {
+        for (mut request, authority, expected_kind, expects_public_authority) in cases {
+            request.request.query = Some("preview=1".to_owned());
+            request.request.headers.push(HeaderField {
+                name: "x-provider-beta".to_owned(),
+                value_base64: EncodedBytes::from_bytes(b"preview".to_vec()),
+            });
             let OperationPreparation::Ready(operation) = prepare_user_operation(request, authority)
             else {
                 panic!("{expected_kind} must be admitted by the exact unary matrix");
@@ -9096,8 +9343,12 @@ mod tests {
     }
 
     #[test]
-    fn exact_five_route_api_key_first_binding_matrix_requires_transition() {
+    fn exact_six_route_api_key_first_binding_matrix_requires_transition() {
         let cases = [
+            (
+                api_key_binding_envelope(LogicalMethod::Get, "/v1/models", Vec::new(), None),
+                "models",
+            ),
             (
                 api_key_binding_envelope(
                     LogicalMethod::Get,
@@ -9145,7 +9396,12 @@ mod tests {
             ),
         ];
 
-        for (request, expected_kind) in cases {
+        for (mut request, expected_kind) in cases {
+            request.request.query = Some("provider=tinfoil".to_owned());
+            request.request.headers.push(HeaderField {
+                name: "x-provider-beta".to_owned(),
+                value_base64: EncodedBytes::from_bytes(b"preview".to_vec()),
+            });
             let OperationPreparation::Ready(operation) =
                 prepare_user_operation(request, AuthorityState::Anonymous)
             else {
@@ -9173,26 +9429,67 @@ mod tests {
     }
 
     #[test]
-    fn public_models_refuses_credentials_and_cache_roots() {
-        for mut request in [
-            envelope(
-                LogicalMethod::Get,
-                "/v1/models",
-                Vec::new(),
-                None,
-                Some(api_key_credential(b"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")),
-            ),
+    fn public_models_is_anonymous_only_when_no_explicit_authority_is_supplied() {
+        let OperationPreparation::Ready(UserOperation::Inference {
+            authority: InferenceAuthority::Public,
+            operation: InferenceOperation::Models,
+        }) = prepare_user_operation(
             envelope(LogicalMethod::Get, "/v1/models", Vec::new(), None, None),
-        ] {
-            if request.credential.is_none() {
-                request.cache_namespace_root_base64 =
-                    Some(CacheNamespaceRoot::from_bytes([0xa5; 32]));
-            }
-            assert_eq!(
-                rejected_status(prepare_user_operation(request, AuthorityState::Anonymous)),
-                StatusCode::BAD_REQUEST
-            );
-        }
+            AuthorityState::Anonymous,
+        )
+        else {
+            panic!("models without credentials must remain public");
+        };
+
+        let OperationPreparation::Ready(UserOperation::Inference {
+            authority: InferenceAuthority::User(_),
+            operation: InferenceOperation::Models,
+        }) = prepare_user_operation(
+            envelope(LogicalMethod::Get, "/v1/models", Vec::new(), None, None),
+            bound_user_authority(),
+        )
+        else {
+            panic!("a user-bound session may list public models");
+        };
+
+        let OperationPreparation::Ready(UserOperation::Inference {
+            authority: InferenceAuthority::ApiKey(_),
+            operation: InferenceOperation::Models,
+        }) = prepare_user_operation(
+            envelope(LogicalMethod::Get, "/v1/models", Vec::new(), None, None),
+            bound_api_key_authority(),
+        )
+        else {
+            panic!("an API-key-bound session may list public models");
+        };
+
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                envelope(
+                    LogicalMethod::Get,
+                    "/v1/models",
+                    Vec::new(),
+                    None,
+                    Some(api_key_credential(b"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")),
+                ),
+                AuthorityState::Anonymous,
+            )),
+            StatusCode::BAD_REQUEST,
+            "an explicit first-use API key requires its cache root"
+        );
+
+        let mut root_without_credential =
+            envelope(LogicalMethod::Get, "/v1/models", Vec::new(), None, None);
+        root_without_credential.cache_namespace_root_base64 =
+            Some(CacheNamespaceRoot::from_bytes([0xa5; 32]));
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                root_without_credential,
+                AuthorityState::Anonymous,
+            )),
+            StatusCode::UNAUTHORIZED,
+            "a cache root alone cannot select an authority"
+        );
 
         assert_eq!(
             rejected_status(prepare_user_operation(
@@ -9205,7 +9502,8 @@ mod tests {
                 ),
                 bound_user_authority(),
             )),
-            StatusCode::BAD_REQUEST
+            StatusCode::CONFLICT,
+            "a bound session cannot be rebound with an API key"
         );
 
         assert_eq!(
@@ -9396,20 +9694,84 @@ mod tests {
     }
 
     #[test]
-    fn chat_classifier_rejects_non_unary_mode_missing_body_and_unsafe_headers() {
+    fn chat_classifier_requires_mode_to_match_the_top_level_stream_flag() {
         let mut streaming = envelope(
+            LogicalMethod::Post,
+            "/v1/chat/completions",
+            json_header(),
+            Some(br#"{"model":"model","messages":[],"stream":true}"#),
+            None,
+        );
+        streaming.response_mode = ResponseMode::Stream;
+        assert!(matches!(
+            prepare_user_operation(streaming, bound_user_authority()),
+            OperationPreparation::Ready(UserOperation::Inference {
+                operation: InferenceOperation::Chat { stream: true, .. },
+                ..
+            })
+        ));
+
+        let mut mismatched_stream = envelope(
             LogicalMethod::Post,
             "/v1/chat/completions",
             json_header(),
             Some(br#"{"stream":true}"#),
             None,
         );
-        streaming.response_mode = ResponseMode::Stream;
+        mismatched_stream.response_mode = ResponseMode::Unary;
         assert!(matches!(
-            prepare_user_operation(streaming, bound_user_authority()),
+            prepare_user_operation(mismatched_stream, bound_user_authority()),
             OperationPreparation::Rejected(_)
         ));
 
+        let mut mismatched_unary = envelope(
+            LogicalMethod::Post,
+            "/v1/chat/completions",
+            json_header(),
+            Some(br#"{"stream":false}"#),
+            None,
+        );
+        mismatched_unary.response_mode = ResponseMode::Stream;
+        assert!(matches!(
+            prepare_user_operation(mismatched_unary, bound_user_authority()),
+            OperationPreparation::Rejected(_)
+        ));
+
+        for invalid in [
+            br#"{"stream":"yes"}"#.as_slice(),
+            br#"{"stream":true,"stream":true}"#.as_slice(),
+            br#"[]"#.as_slice(),
+        ] {
+            let mut request = envelope(
+                LogicalMethod::Post,
+                "/v1/chat/completions",
+                json_header(),
+                Some(invalid),
+                None,
+            );
+            request.response_mode = ResponseMode::Stream;
+            assert!(matches!(
+                prepare_user_operation(request, bound_user_authority()),
+                OperationPreparation::Rejected(_)
+            ));
+        }
+
+        let mut automatic = envelope(
+            LogicalMethod::Post,
+            "/v1/chat/completions",
+            json_header(),
+            Some(br#"{"stream":true}"#),
+            None,
+        );
+        automatic.response_mode = ResponseMode::Auto;
+        assert!(matches!(
+            prepare_user_operation(automatic, bound_user_authority()),
+            OperationPreparation::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn chat_classifier_rejects_missing_body_and_unsafe_headers() {
         for body in [None, Some(&b""[..])] {
             assert!(matches!(
                 prepare_user_operation(
@@ -9435,6 +9797,8 @@ mod tests {
             "host",
             "content-length",
             "content-encoding",
+            "content-md5",
+            "digest",
             "accept-encoding",
             "connection",
             "keep-alive",
@@ -9459,17 +9823,30 @@ mod tests {
                 value_base64: EncodedBytes::from_bytes(b"opaque".to_vec()),
             });
             assert!(
-                prepare_chat_provider_headers(headers).is_err(),
+                prepare_inference_headers(headers, true).is_err(),
                 "{forbidden} must never cross the provider boundary"
             );
         }
 
         let duplicate_content_type = vec![json_header()[0].clone(), json_header()[0].clone()];
-        assert!(prepare_chat_provider_headers(duplicate_content_type).is_err());
-        assert!(prepare_chat_provider_headers(vec![HeaderField {
-            name: "invalid header name".to_owned(),
-            value_base64: EncodedBytes::from_bytes(b"opaque".to_vec()),
-        }])
+        assert!(prepare_inference_headers(duplicate_content_type, true).is_err());
+        assert!(prepare_inference_headers(
+            vec![HeaderField {
+                name: "invalid header name".to_owned(),
+                value_base64: EncodedBytes::from_bytes(b"opaque".to_vec()),
+            }],
+            true,
+        )
+        .is_err());
+        assert!(prepare_inference_headers(Vec::new(), true).is_err());
+        assert!(prepare_inference_headers(Vec::new(), false).is_ok());
+        assert!(prepare_inference_headers(
+            vec![HeaderField {
+                name: "invalid header name".to_owned(),
+                value_base64: EncodedBytes::from_bytes(b"opaque".to_vec()),
+            }],
+            false
+        )
         .is_err());
 
         let safe_headers = vec![
@@ -9483,8 +9860,8 @@ mod tests {
                 value_base64: EncodedBytes::from_bytes(b"second".to_vec()),
             },
         ];
-        let prepared =
-            prepare_chat_provider_headers(safe_headers).expect("safe opaque headers are retained");
+        let prepared = prepare_inference_headers(safe_headers, true)
+            .expect("safe opaque headers are retained");
         let values = prepared
             .get_all("x-client-hint")
             .iter()
@@ -9495,6 +9872,65 @@ mod tests {
             .get_all("x-client-hint")
             .iter()
             .all(HeaderValue::is_sensitive));
+    }
+
+    #[test]
+    fn responses_create_requires_bound_user_and_explicit_stream_mode() {
+        let request = || {
+            let mut request = envelope(
+                LogicalMethod::Post,
+                "/v1/responses",
+                json_header(),
+                Some(br#"{"model":"model","input":"hello","conversation":"123e4567-e89b-12d3-a456-426614174000","stream":false}"#),
+                None,
+            );
+            request.response_mode = ResponseMode::Stream;
+            request
+        };
+
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(request(), bound_user_authority())
+        else {
+            panic!("valid Responses create stream must be admitted");
+        };
+        assert!(matches!(&operation, UserOperation::Responses { .. }));
+        assert!(operation.is_streaming());
+
+        let mut unary = request();
+        unary.response_mode = ResponseMode::Unary;
+        assert!(matches!(
+            prepare_user_operation(unary, bound_user_authority()),
+            OperationPreparation::Rejected(_)
+        ));
+        assert!(matches!(
+            prepare_user_operation(request(), AuthorityState::Anonymous),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::UNAUTHORIZED
+        ));
+
+        let mut with_query = request();
+        with_query.request.query = Some("admin=true".to_owned());
+        with_query.request.headers.push(HeaderField {
+            name: "x-provider-beta".to_owned(),
+            value_base64: EncodedBytes::from_bytes(b"preview".to_vec()),
+        });
+        let OperationPreparation::Ready(UserOperation::Responses { headers, .. }) =
+            prepare_user_operation(with_query, bound_user_authority())
+        else {
+            panic!("Responses query and safe extension headers must preserve the raw contract");
+        };
+        assert_eq!(
+            headers.get("x-provider-beta").map(HeaderValue::as_bytes),
+            Some(&b"preview"[..])
+        );
+
+        let mut with_credential = request();
+        with_credential.credential =
+            Some(api_key_credential(b"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"));
+        assert!(matches!(
+            prepare_user_operation(with_credential, bound_user_authority()),
+            OperationPreparation::Rejected(_)
+        ));
     }
 
     #[test]

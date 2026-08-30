@@ -25,7 +25,25 @@ pub(crate) struct EnvelopeLimits {
 }
 
 impl EnvelopeLimits {
-    pub(crate) const DEFAULT: Self = Self {
+    /// Request limits preserve the released proxy's 50 MiB logical-body
+    /// contract. The larger envelope allowance accounts for the body's inner
+    /// base64 representation plus the bounded request metadata.
+    pub(crate) const REQUEST: Self = Self {
+        envelope_bytes: 67 * MIB,
+        logical_body_bytes: 50 * MIB,
+        path_bytes: 4096,
+        query_bytes: 8192,
+        header_count: 64,
+        header_name_bytes: 128,
+        header_value_bytes: 16 * KIB,
+        aggregate_header_bytes: 64 * KIB,
+        credential_bytes: 16 * KIB,
+    };
+
+    /// Response limits remain deliberately smaller. In particular, widening
+    /// request admission must not silently increase database/provider output
+    /// retained inside the enclave or returned to a client.
+    pub(crate) const RESPONSE: Self = Self {
         envelope_bytes: 50 * MIB,
         logical_body_bytes: 28 * MIB,
         path_bytes: 4096,
@@ -36,11 +54,15 @@ impl EnvelopeLimits {
         aggregate_header_bytes: 64 * KIB,
         credential_bytes: 16 * KIB,
     };
+
+    /// Compatibility alias for response-side/application-output call sites.
+    /// Request parsing must opt into `REQUEST` explicitly.
+    pub(crate) const DEFAULT: Self = Self::RESPONSE;
 }
 
 impl Default for EnvelopeLimits {
     fn default() -> Self {
-        Self::DEFAULT
+        Self::RESPONSE
     }
 }
 
@@ -1006,6 +1028,9 @@ pub(crate) enum StreamRecord {
     },
 }
 
+pub(crate) const MAX_STREAM_CHUNK_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_STREAM_ERROR_BYTES: usize = 16 * 1024;
+
 impl StreamRecord {
     pub(crate) fn from_json_slice(
         input: &[u8],
@@ -1028,7 +1053,9 @@ impl StreamRecord {
                 if *sequence != 0 {
                     return Err(EnvelopeError::InvalidStreamSequence);
                 }
-                validate_status(*status)?;
+                if !(200..=299).contains(status) {
+                    return Err(EnvelopeError::InvalidStatus);
+                }
                 validate_headers(headers, limits)
             }
             Self::Chunk {
@@ -1037,7 +1064,7 @@ impl StreamRecord {
                 ..
             } => {
                 validate_non_initial_sequence(*sequence)?;
-                check_limit(body_base64.len(), limits.logical_body_bytes, "logical body")
+                check_limit(body_base64.len(), MAX_STREAM_CHUNK_BYTES, "stream chunk")
             }
             Self::End { sequence, .. } => validate_non_initial_sequence(*sequence),
             Self::Error {
@@ -1047,8 +1074,10 @@ impl StreamRecord {
                 ..
             } => {
                 validate_non_initial_sequence(*sequence)?;
-                validate_status(*status)?;
-                check_limit(body_base64.len(), limits.logical_body_bytes, "logical body")
+                if !(400..=599).contains(status) {
+                    return Err(EnvelopeError::InvalidStatus);
+                }
+                check_limit(body_base64.len(), MAX_STREAM_ERROR_BYTES, "stream error")
             }
         }
     }
@@ -2254,7 +2283,7 @@ mod tests {
                 r#"{{"version":2,"request_id":"{REQUEST_ID}","sequence":2,"kind":"error","status":500,"body_base64":"YQ=="}}"#
             ),
         ];
-        for record in records {
+        for record in &records {
             assert!(StreamRecord::from_json_slice(record.as_bytes(), &limits).is_ok());
         }
 
@@ -2271,6 +2300,20 @@ mod tests {
             r#"{{"version":2,"request_id":"{REQUEST_ID}","sequence":1,"kind":"start","status":200,"headers":[]}}"#
         );
         assert!(StreamRecord::from_json_slice(non_initial_start.as_bytes(), &limits).is_err());
+        assert!(StreamRecord::from_json_slice(
+            records[0]
+                .replace("\"status\":200", "\"status\":400")
+                .as_bytes(),
+            &limits
+        )
+        .is_err());
+        assert!(StreamRecord::from_json_slice(
+            records[3]
+                .replace("\"status\":500", "\"status\":200")
+                .as_bytes(),
+            &limits
+        )
+        .is_err());
         for kind_and_fields in [
             r#""kind":"chunk","body_base64":"YQ==""#,
             r#""kind":"end""#,
@@ -2281,17 +2324,100 @@ mod tests {
             );
             assert!(StreamRecord::from_json_slice(invalid.as_bytes(), &limits).is_err());
         }
+
+        let at_chunk_limit = StreamRecord::Chunk {
+            version: Version2,
+            request_id: RequestId::from_bytes([0x11; 16]),
+            sequence: 1,
+            body_base64: EncodedBytes::from_bytes(vec![0; MAX_STREAM_CHUNK_BYTES]),
+        };
+        assert!(at_chunk_limit.validate(&limits).is_ok());
+        let oversized_chunk = StreamRecord::Chunk {
+            version: Version2,
+            request_id: RequestId::from_bytes([0x11; 16]),
+            sequence: 1,
+            body_base64: EncodedBytes::from_bytes(vec![0; MAX_STREAM_CHUNK_BYTES + 1]),
+        };
+        assert!(oversized_chunk.validate(&limits).is_err());
+
+        let at_error_limit = StreamRecord::Error {
+            version: Version2,
+            request_id: RequestId::from_bytes([0x11; 16]),
+            sequence: 1,
+            status: 500,
+            body_base64: EncodedBytes::from_bytes(vec![0; MAX_STREAM_ERROR_BYTES]),
+        };
+        assert!(at_error_limit.validate(&limits).is_ok());
     }
 
     #[test]
     fn default_limits_match_the_protocol_contract() {
-        assert_eq!(EnvelopeLimits::DEFAULT.envelope_bytes, 50 * 1024 * 1024);
-        assert_eq!(EnvelopeLimits::DEFAULT.logical_body_bytes, 28 * 1024 * 1024);
-        assert_eq!(EnvelopeLimits::DEFAULT.path_bytes, 4096);
-        assert_eq!(EnvelopeLimits::DEFAULT.query_bytes, 8192);
-        assert_eq!(EnvelopeLimits::DEFAULT.header_count, 64);
-        assert_eq!(EnvelopeLimits::DEFAULT.header_name_bytes, 128);
-        assert_eq!(EnvelopeLimits::DEFAULT.header_value_bytes, 16 * 1024);
-        assert_eq!(EnvelopeLimits::DEFAULT.aggregate_header_bytes, 64 * 1024);
+        assert_eq!(EnvelopeLimits::REQUEST.envelope_bytes, 67 * 1024 * 1024);
+        assert_eq!(EnvelopeLimits::REQUEST.logical_body_bytes, 50 * 1024 * 1024);
+        assert_eq!(EnvelopeLimits::RESPONSE.envelope_bytes, 50 * 1024 * 1024);
+        assert_eq!(
+            EnvelopeLimits::RESPONSE.logical_body_bytes,
+            28 * 1024 * 1024
+        );
+        assert_eq!(EnvelopeLimits::RESPONSE.path_bytes, 4096);
+        assert_eq!(EnvelopeLimits::RESPONSE.query_bytes, 8192);
+        assert_eq!(EnvelopeLimits::RESPONSE.header_count, 64);
+        assert_eq!(EnvelopeLimits::RESPONSE.header_name_bytes, 128);
+        assert_eq!(EnvelopeLimits::RESPONSE.header_value_bytes, 16 * 1024);
+        assert_eq!(EnvelopeLimits::RESPONSE.aggregate_header_bytes, 64 * 1024);
+    }
+
+    #[test]
+    fn maximum_structural_request_shape_fits_the_request_envelope_limit() {
+        let limits = EnvelopeLimits::REQUEST;
+        let mut headers = Vec::with_capacity(limits.header_count);
+        for _ in 0..60 {
+            headers.push(HeaderField {
+                name: "x".to_owned(),
+                value_base64: EncodedBytes::from_bytes(vec![b'a'; 1]),
+            });
+        }
+        for _ in 0..3 {
+            headers.push(HeaderField {
+                name: "x".to_owned(),
+                value_base64: EncodedBytes::from_bytes(vec![b'a'; 16_381]),
+            });
+        }
+        headers.push(HeaderField {
+            name: "x".to_owned(),
+            value_base64: EncodedBytes::from_bytes(vec![b'a'; 16_269]),
+        });
+
+        let path_prefix = "/protected/kv/";
+        let envelope = RequestEnvelope {
+            version: Version2,
+            request_id: RequestId::from_bytes([0xff; 16]),
+            response_mode: ResponseMode::Stream,
+            credential: Some(Credential::Resumption {
+                value_base64: EncodedBytes::from_bytes(vec![0_u8; limits.credential_bytes]),
+            }),
+            cache_namespace_root_base64: Some(CacheNamespaceRoot::from_bytes([0xff; 32])),
+            request: LogicalRequest {
+                method: LogicalMethod::Delete,
+                path: format!(
+                    "{path_prefix}{}",
+                    "A".repeat(limits.path_bytes - path_prefix.len())
+                ),
+                query: Some("q".repeat(limits.query_bytes)),
+                headers,
+                body_base64: Some(EncodedBytes::from_bytes(Vec::new())),
+            },
+        };
+        envelope.validate(&limits).unwrap();
+
+        let empty_body_json = serde_json::to_vec(&envelope).unwrap();
+        let maximum_body_base64_bytes = limits.logical_body_bytes.div_ceil(3) * 4;
+        let projected_maximum_envelope_bytes = empty_body_json
+            .len()
+            .checked_add(maximum_body_base64_bytes)
+            .unwrap();
+
+        assert_eq!(projected_maximum_envelope_bytes, 70_028_948);
+        assert!(projected_maximum_envelope_bytes <= limits.envelope_bytes);
     }
 }

@@ -10,6 +10,9 @@ use crate::provider_client::{
 use crate::provider_routing::{ProviderName, ProviderRoutingError};
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
+use crate::transport_v2::streaming::{
+    LogicalByteStream, LogicalStreamFailure, LogicalStreamItem, StreamExecutionGuard,
+};
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
 use crate::web::encryption_middleware::{
     decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
@@ -51,6 +54,10 @@ const TTS_PROVIDER_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_TTS_INPUT_CHARS: usize = 100_000;
 const MAX_BOUNDED_PROVIDER_RESPONSE_BYTES: usize = 256 * 1024;
 const V2_MAX_PROVIDER_RESPONSE_BYTES: usize = 28 * 1024 * 1024;
+const V2_MAX_PROVIDER_STREAM_FRAME_BYTES: usize = 1024 * 1024;
+const V2_MAX_PROVIDER_STREAM_BYTES: usize = 64 * 1024 * 1024;
+const V2_MAX_LOGICAL_CHAT_STREAM_BYTES: usize = V2_MAX_PROVIDER_STREAM_BYTES;
+const V2_STREAM_CHANNEL_CAPACITY: usize = 1;
 // TTS wraps provider bytes in padded base64 plus a small JSON object. Keep the
 // raw response below three quarters of the logical v2 response ceiling so the
 // transport's bounded serializer always has room for that expansion.
@@ -106,6 +113,51 @@ impl ProviderResponseBodyPolicy {
 enum ProviderRetryPolicy {
     LegacyV1,
     NoAmbiguousRetry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderStreamPolicy {
+    max_frame_bytes: Option<usize>,
+    max_total_bytes: Option<usize>,
+    max_json_structural_tokens: Option<usize>,
+    channel_capacity: usize,
+    require_event_stream_content_type: bool,
+    require_provider_done: bool,
+    retry: ProviderRetryPolicy,
+}
+
+impl ProviderStreamPolicy {
+    const LEGACY_V1: Self = Self {
+        max_frame_bytes: None,
+        max_total_bytes: None,
+        max_json_structural_tokens: None,
+        channel_capacity: 100,
+        require_event_stream_content_type: false,
+        require_provider_done: false,
+        retry: ProviderRetryPolicy::LegacyV1,
+    };
+
+    const V2: Self = Self {
+        max_frame_bytes: Some(V2_MAX_PROVIDER_STREAM_FRAME_BYTES),
+        max_total_bytes: Some(V2_MAX_PROVIDER_STREAM_BYTES),
+        max_json_structural_tokens: Some(V2_MAX_PROVIDER_JSON_STRUCTURAL_TOKENS),
+        channel_capacity: V2_STREAM_CHANNEL_CAPACITY,
+        require_event_stream_content_type: true,
+        require_provider_done: true,
+        retry: ProviderRetryPolicy::NoAmbiguousRetry,
+    };
+
+    const fn frame_body_policy(self) -> ProviderResponseBodyPolicy {
+        match (self.max_frame_bytes, self.max_json_structural_tokens) {
+            (Some(limit_bytes), max_json_structural_tokens) => {
+                ProviderResponseBodyPolicy::Bounded {
+                    limit_bytes,
+                    max_json_structural_tokens,
+                }
+            }
+            (None, _) => ProviderResponseBodyPolicy::Unbounded,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -971,6 +1023,8 @@ async fn proxy_openai(
         &headers,
         CompletionCachePolicy::LegacyV1,
         ProviderResponseBodyPolicy::Unbounded,
+        ProviderStreamPolicy::LEGACY_V1,
+        None,
     )
     .await?;
 
@@ -986,6 +1040,8 @@ async fn openai_chat_completion_data(
     headers: &HeaderMap,
     cache_policy: CompletionCachePolicy<'_>,
     response_body_policy: ProviderResponseBodyPolicy,
+    stream_policy: ProviderStreamPolicy,
+    stream_guard: Option<StreamExecutionGuard>,
 ) -> Result<CompletionStream, ApiError> {
     let billing_access = state
         .chat_billing_access(user.uuid, auth_method == AuthMethod::ApiKey)
@@ -1044,6 +1100,8 @@ async fn openai_chat_completion_data(
         None,
         cache_policy,
         response_body_policy,
+        stream_policy,
+        stream_guard,
     )
     .await
 }
@@ -1070,6 +1128,8 @@ pub(crate) async fn openai_nonstream_chat_completion_v2_data(
         headers,
         CompletionCachePolicy::BoundV2(cache_namespace),
         UnaryProviderPolicy::V2.response_body,
+        ProviderStreamPolicy::V2,
+        None,
     )
     .await?;
 
@@ -1088,11 +1148,143 @@ pub(crate) async fn openai_nonstream_chat_completion_v2_data(
     }
 }
 
+/// Execute streaming Chat Completions for transport v2 and return the
+/// caller-visible plaintext SSE byte stream. Transport-v2 record framing,
+/// sequencing, and encryption are owned exclusively by the v2 gateway.
+pub(crate) async fn openai_stream_chat_completion_v2_data(
+    state: &Arc<AppState>,
+    user: &User,
+    auth_method: AuthMethod,
+    body: Value,
+    headers: &HeaderMap,
+    cache_namespace: &DerivedCacheNamespace,
+    stream_guard: StreamExecutionGuard,
+) -> Result<LogicalByteStream, ApiError> {
+    ensure_stream_chat_completion(&body)?;
+
+    let completion = openai_chat_completion_data(
+        state,
+        user,
+        auth_method,
+        body,
+        headers,
+        CompletionCachePolicy::BoundV2(cache_namespace),
+        UnaryProviderPolicy::V2.response_body,
+        ProviderStreamPolicy::V2,
+        Some(stream_guard.clone()),
+    )
+    .await?;
+
+    if !completion.metadata.is_streaming {
+        error!("Streaming Chat Completions unexpectedly produced a unary response");
+        return Err(ApiError::InternalServerError);
+    }
+
+    Ok(build_v2_chat_logical_stream(
+        completion,
+        Some(stream_guard),
+        V2_MAX_LOGICAL_CHAT_STREAM_BYTES,
+    ))
+}
+
+fn build_v2_chat_logical_stream(
+    completion: CompletionStream,
+    stream_guard: Option<StreamExecutionGuard>,
+    max_logical_bytes: usize,
+) -> LogicalByteStream {
+    let mut receiver = completion.stream;
+    let stream = async_stream::stream! {
+        // The returned logical stream and the detached provider reader each
+        // retain a guard. Client disconnect therefore cannot release the
+        // promoted output permit while provider data is still retained.
+        let _stream_guard = stream_guard;
+        let mut emitted_bytes = 0_usize;
+
+        while let Some(chunk) = receiver.recv().await {
+            match chunk {
+                CompletionChunk::StreamChunk(json) => {
+                    let json = match serde_json::to_vec(&json) {
+                        Ok(json) => json,
+                        Err(error) => {
+                            error!("Failed to serialize a v2 Chat Completions chunk: {error:?}");
+                            yield LogicalStreamItem::Failure(LogicalStreamFailure::internal());
+                            return;
+                        }
+                    };
+                    let Some(event_len) = b"data: ".len()
+                        .checked_add(json.len())
+                        .and_then(|len| len.checked_add(b"\n\n".len()))
+                    else {
+                        yield LogicalStreamItem::Failure(LogicalStreamFailure::internal());
+                        return;
+                    };
+                    if event_len > max_logical_bytes.saturating_sub(emitted_bytes) {
+                        error!(
+                            limit_bytes = max_logical_bytes,
+                            "V2 Chat Completions logical stream exceeded its byte limit"
+                        );
+                        yield LogicalStreamItem::Failure(LogicalStreamFailure::internal());
+                        return;
+                    }
+
+                    let mut event = Vec::with_capacity(event_len);
+                    event.extend_from_slice(b"data: ");
+                    event.extend_from_slice(&json);
+                    event.extend_from_slice(b"\n\n");
+                    emitted_bytes += event.len();
+                    yield LogicalStreamItem::Bytes(bytes::Bytes::from(event));
+                }
+                CompletionChunk::Usage(_) => {
+                    trace!("V2 Chat Completions consumed internal usage notification");
+                }
+                CompletionChunk::Done => {
+                    const DONE: &[u8] = b"data: [DONE]\n\n";
+                    if DONE.len() > max_logical_bytes.saturating_sub(emitted_bytes) {
+                        error!(
+                            limit_bytes = max_logical_bytes,
+                            "V2 Chat Completions logical stream had no room for its terminal event"
+                        );
+                        yield LogicalStreamItem::Failure(LogicalStreamFailure::internal());
+                        return;
+                    }
+                    yield LogicalStreamItem::Bytes(bytes::Bytes::from_static(DONE));
+                    yield LogicalStreamItem::Complete;
+                    return;
+                }
+                CompletionChunk::Error(error_message) => {
+                    error!("V2 Chat Completions provider stream failed: {error_message}");
+                    yield LogicalStreamItem::Failure(LogicalStreamFailure::internal());
+                    return;
+                }
+                CompletionChunk::FullResponse(_) => {
+                    error!("V2 streaming Chat Completions received an unexpected full response");
+                    yield LogicalStreamItem::Failure(LogicalStreamFailure::internal());
+                    return;
+                }
+            }
+        }
+
+        error!("V2 Chat Completions channel closed without a terminal provider event");
+        yield LogicalStreamItem::Failure(LogicalStreamFailure::internal());
+    };
+    Box::pin(stream)
+}
+
 fn ensure_nonstream_chat_completion(body: &Value) -> Result<(), ApiError> {
     match body.get("stream") {
         None | Some(Value::Bool(false)) => Ok(()),
         Some(_) => {
             error!("Chat Completions stream must be absent or Boolean false for unary v2");
+            Err(ApiError::BadRequest)
+        }
+    }
+}
+
+fn ensure_stream_chat_completion(body: &Value) -> Result<(), ApiError> {
+    match body.get("stream") {
+        Some(Value::Bool(true)) => Ok(()),
+        _ => {
+            error!("Chat Completions stream must be literal Boolean true for streaming v2");
             Err(ApiError::BadRequest)
         }
     }
@@ -1193,6 +1385,39 @@ pub async fn get_chat_completion_response(
         None,
         CompletionCachePolicy::LegacyV1,
         ProviderResponseBodyPolicy::Unbounded,
+        ProviderStreamPolicy::LEGACY_V1,
+        None,
+    )
+    .await
+}
+
+/// Transport-v2 completion entry point for Responses-style consumers. The
+/// caller supplies the cache namespace bound to the authenticated v2 session
+/// and a clone of the promoted provider-output guard. Streaming provider work
+/// retains that guard until its detached reader exits.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn get_chat_completion_response_v2(
+    state: &Arc<AppState>,
+    user: &User,
+    body: Value,
+    headers: &HeaderMap,
+    billing_context: BillingContext,
+    model_plan: ModelPlan,
+    cache_namespace: &DerivedCacheNamespace,
+    stream_guard: StreamExecutionGuard,
+) -> Result<CompletionStream, ApiError> {
+    get_chat_completion_response_with_expected_route(
+        state,
+        user,
+        body,
+        headers,
+        billing_context,
+        model_plan,
+        None,
+        CompletionCachePolicy::BoundV2(cache_namespace),
+        UnaryProviderPolicy::V2.response_body,
+        ProviderStreamPolicy::V2,
+        Some(stream_guard),
     )
     .await
 }
@@ -1226,6 +1451,45 @@ pub(crate) async fn get_chat_completion_response_for_expected_route(
         }),
         CompletionCachePolicy::LegacyV1,
         ProviderResponseBodyPolicy::Unbounded,
+        ProviderStreamPolicy::LEGACY_V1,
+        None,
+    )
+    .await
+}
+
+/// V2 variant of the server-selected completion entry point. It preserves the
+/// existing Continuum cache-salt isolation while applying the bound session
+/// namespace and strict v2 provider stream policy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn get_chat_completion_response_for_expected_route_v2(
+    state: &Arc<AppState>,
+    user: &User,
+    body: Value,
+    headers: &HeaderMap,
+    billing_context: BillingContext,
+    model_plan: ModelPlan,
+    route: ServerSelectedCompletionRoute<'_>,
+    cache_namespace: &DerivedCacheNamespace,
+    stream_guard: StreamExecutionGuard,
+) -> Result<CompletionStream, ApiError> {
+    let continuum_cache_salt = (route.provider_name == ProviderName::Continuum.as_str())
+        .then(|| format!("server-selected-{}", Uuid::new_v4().simple()));
+    get_chat_completion_response_with_expected_route(
+        state,
+        user,
+        body,
+        headers,
+        billing_context,
+        model_plan,
+        Some(ExpectedCompletionRoute {
+            provider_name: route.provider_name,
+            provider_model_id: route.provider_model_id,
+            continuum_cache_salt,
+        }),
+        CompletionCachePolicy::BoundV2(cache_namespace),
+        UnaryProviderPolicy::V2.response_body,
+        ProviderStreamPolicy::V2,
+        Some(stream_guard),
     )
     .await
 }
@@ -1253,10 +1517,27 @@ async fn get_chat_completion_response_with_expected_route(
     expected_route: Option<ExpectedCompletionRoute<'_>>,
     cache_policy: CompletionCachePolicy<'_>,
     response_body_policy: ProviderResponseBodyPolicy,
+    stream_policy: ProviderStreamPolicy,
+    stream_guard: Option<StreamExecutionGuard>,
 ) -> Result<CompletionStream, ApiError> {
     if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
         return Err(ApiError::BadRequest);
+    }
+
+    let policy_matches_cache_boundary = matches!(
+        (&cache_policy, stream_policy.retry),
+        (
+            CompletionCachePolicy::LegacyV1,
+            ProviderRetryPolicy::LegacyV1
+        ) | (
+            CompletionCachePolicy::BoundV2(_),
+            ProviderRetryPolicy::NoAmbiguousRetry
+        )
+    );
+    if !policy_matches_cache_boundary {
+        error!("Completion cache and provider retry policies crossed transport boundaries");
+        return Err(ApiError::InternalServerError);
     }
 
     let mut modified_body = body
@@ -1438,6 +1719,17 @@ async fn get_chat_completion_response_with_expected_route(
         successful_provider
     );
 
+    if is_streaming
+        && stream_policy.require_event_stream_content_type
+        && !is_event_stream_content_type(res.content_type())
+    {
+        error!(
+            provider = %successful_provider,
+            "V2 streaming completion provider returned a non-SSE content type"
+        );
+        return Err(ApiError::ServiceUnavailable);
+    }
+
     // NOW: Process the response internally and handle billing
     if !is_streaming {
         // NON-STREAMING: Simple case
@@ -1507,7 +1799,7 @@ async fn get_chat_completion_response_with_expected_route(
 
     // STREAMING: Complex case - spawn internal processor
     debug!("Processing streaming response with internal billing");
-    let (tx_consumer, rx_consumer) = mpsc::channel(100);
+    let (tx_consumer, rx_consumer) = mpsc::channel(stream_policy.channel_capacity);
 
     // Spawn INTERNAL task that handles billing
     let state_clone = state.clone();
@@ -1517,9 +1809,11 @@ async fn get_chat_completion_response_with_expected_route(
     let response_model_id = selected_route.response_model_id.clone();
 
     tokio::spawn(async move {
+        let _stream_guard = stream_guard;
         let mut body_stream = res.bytes_stream();
         let mut buffer = Vec::new();
         let mut usage_accumulator = StreamUsageAccumulator::default();
+        let mut total_provider_bytes = 0_usize;
 
         loop {
             match timeout(
@@ -1531,44 +1825,59 @@ async fn get_chat_completion_response_with_expected_route(
                 Ok(Some(chunk_result)) => {
                     match chunk_result {
                         Ok(bytes) => {
-                            buffer.extend_from_slice(bytes.as_ref());
-
-                            // Parse SSE frames
-                            while let Some(frame) = extract_sse_frame(&mut buffer) {
-                                if frame == b"[DONE]" {
-                                    finalize_stream_usage(
-                                        &mut usage_accumulator,
-                                        StreamUsageFinalization::ProviderDone,
-                                        &state_clone,
-                                        &user_clone,
-                                        &billing_ctx,
-                                        &provider,
-                                        &tx_consumer,
-                                    )
+                            if charge_provider_stream_bytes(
+                                &mut total_provider_bytes,
+                                bytes.len(),
+                                stream_policy,
+                            )
+                            .is_err()
+                            {
+                                error!(
+                                    provider = %provider,
+                                    limit_bytes = stream_policy.max_total_bytes.unwrap_or_default(),
+                                    "V2 completion provider stream exceeded its aggregate byte limit"
+                                );
+                                finalize_stream_usage(
+                                    &mut usage_accumulator,
+                                    StreamUsageFinalization::InvalidData,
+                                    &state_clone,
+                                    &user_clone,
+                                    &billing_ctx,
+                                    &provider,
+                                    &tx_consumer,
+                                )
+                                .await;
+                                let _ = tx_consumer
+                                    .send(CompletionChunk::Error(
+                                        "Provider stream exceeded its byte limit".to_string(),
+                                    ))
                                     .await;
-                                    let _ = tx_consumer.send(CompletionChunk::Done).await;
-                                    return;
-                                }
+                                return;
+                            }
+                            let mut chunk_offset = 0_usize;
+                            let mut appended_legacy_chunk = false;
+                            loop {
+                                match stream_policy.max_frame_bytes {
+                                    Some(limit_bytes) => {
+                                        if chunk_offset == bytes.len() {
+                                            break;
+                                        }
 
-                                match serde_json::from_slice::<Value>(&frame) {
-                                    Ok(mut json) => {
-                                        // vLLM can report cumulative usage on every delta, while
-                                        // providers may add cache details after finish_reason.
-                                        // Accumulate observations and publish only when the stream
-                                        // lifecycle confirms completion.
-                                        usage_accumulator.observe(&json);
-
-                                        canonicalize_response_model(&mut json, &response_model_id);
-
-                                        // Send full JSON chunk to consumer (preserves all metadata)
-                                        if tx_consumer
-                                            .send(CompletionChunk::StreamChunk(json))
-                                            .await
-                                            .is_err()
-                                        {
+                                        // Never copy an arbitrarily large provider network chunk
+                                        // into the unfinished-frame buffer. Four extra bytes are
+                                        // sufficient to recognize the longest SSE delimiter.
+                                        let max_buffer_bytes = limit_bytes.saturating_add(4);
+                                        let append_capacity =
+                                            max_buffer_bytes.saturating_sub(buffer.len());
+                                        if append_capacity == 0 {
+                                            error!(
+                                                provider = %provider,
+                                                limit_bytes = limit_bytes,
+                                                "V2 completion provider SSE frame buffer exceeded its byte limit"
+                                            );
                                             finalize_stream_usage(
                                                 &mut usage_accumulator,
-                                                StreamUsageFinalization::ConsumerDropped,
+                                                StreamUsageFinalization::InvalidData,
                                                 &state_clone,
                                                 &user_clone,
                                                 &billing_ctx,
@@ -1576,11 +1885,96 @@ async fn get_chat_completion_response_with_expected_route(
                                                 &tx_consumer,
                                             )
                                             .await;
+                                            let _ = tx_consumer
+                                                .send(CompletionChunk::Error(
+                                                    "Provider SSE frame exceeded its byte limit"
+                                                        .to_string(),
+                                                ))
+                                                .await;
                                             return;
                                         }
+                                        let append_len = append_capacity
+                                            .min(bytes.len().saturating_sub(chunk_offset));
+                                        let append_end = chunk_offset + append_len;
+                                        buffer.extend_from_slice(&bytes[chunk_offset..append_end]);
+                                        chunk_offset = append_end;
                                     }
-                                    Err(e) => {
-                                        error!("Received non-JSON data event. Error: {:?}", e);
+                                    None => {
+                                        if appended_legacy_chunk {
+                                            break;
+                                        }
+                                        // Preserve v1's byte-for-byte buffering behavior.
+                                        buffer.extend_from_slice(bytes.as_ref());
+                                        appended_legacy_chunk = true;
+                                    }
+                                }
+
+                                // Parse every complete frame before copying more provider bytes
+                                // into the bounded unfinished-frame buffer.
+                                loop {
+                                    let frame = match stream_policy.max_frame_bytes {
+                                        Some(limit_bytes) => {
+                                            match extract_bounded_sse_frame(
+                                                &mut buffer,
+                                                limit_bytes,
+                                            ) {
+                                                Ok(frame) => frame,
+                                                Err(BoundedSseFrameError::TooLarge) => {
+                                                    error!(
+                                                        provider = %provider,
+                                                        limit_bytes = limit_bytes,
+                                                        "V2 completion provider SSE frame exceeded its byte limit"
+                                                    );
+                                                    finalize_stream_usage(
+                                                        &mut usage_accumulator,
+                                                        StreamUsageFinalization::InvalidData,
+                                                        &state_clone,
+                                                        &user_clone,
+                                                        &billing_ctx,
+                                                        &provider,
+                                                        &tx_consumer,
+                                                    )
+                                                    .await;
+                                                    let _ = tx_consumer
+                                                    .send(CompletionChunk::Error(
+                                                        "Provider SSE frame exceeded its byte limit"
+                                                            .to_string(),
+                                                    ))
+                                                    .await;
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        None => extract_sse_frame(&mut buffer),
+                                    };
+                                    let Some(frame) = frame else {
+                                        break;
+                                    };
+                                    if frame == b"[DONE]" {
+                                        finalize_stream_usage(
+                                            &mut usage_accumulator,
+                                            StreamUsageFinalization::ProviderDone,
+                                            &state_clone,
+                                            &user_clone,
+                                            &billing_ctx,
+                                            &provider,
+                                            &tx_consumer,
+                                        )
+                                        .await;
+                                        let _ = tx_consumer.send(CompletionChunk::Done).await;
+                                        return;
+                                    }
+
+                                    if preflight_provider_json(
+                                        &frame,
+                                        stream_policy.frame_body_policy(),
+                                    )
+                                    .is_err()
+                                    {
+                                        error!(
+                                            provider = %provider,
+                                            "V2 completion provider SSE data failed structural JSON preflight"
+                                        );
                                         finalize_stream_usage(
                                             &mut usage_accumulator,
                                             StreamUsageFinalization::InvalidData,
@@ -1593,10 +1987,63 @@ async fn get_chat_completion_response_with_expected_route(
                                         .await;
                                         let _ = tx_consumer
                                             .send(CompletionChunk::Error(
-                                                "Invalid JSON".to_string(),
+                                                "Invalid provider stream data".to_string(),
                                             ))
                                             .await;
                                         return;
+                                    }
+
+                                    match serde_json::from_slice::<Value>(&frame) {
+                                        Ok(mut json) => {
+                                            // vLLM can report cumulative usage on every delta, while
+                                            // providers may add cache details after finish_reason.
+                                            // Accumulate observations and publish only when the stream
+                                            // lifecycle confirms completion.
+                                            usage_accumulator.observe(&json);
+
+                                            canonicalize_response_model(
+                                                &mut json,
+                                                &response_model_id,
+                                            );
+
+                                            // Send full JSON chunk to consumer (preserves all metadata)
+                                            if tx_consumer
+                                                .send(CompletionChunk::StreamChunk(json))
+                                                .await
+                                                .is_err()
+                                            {
+                                                finalize_stream_usage(
+                                                    &mut usage_accumulator,
+                                                    StreamUsageFinalization::ConsumerDropped,
+                                                    &state_clone,
+                                                    &user_clone,
+                                                    &billing_ctx,
+                                                    &provider,
+                                                    &tx_consumer,
+                                                )
+                                                .await;
+                                                return;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Received non-JSON data event. Error: {:?}", e);
+                                            finalize_stream_usage(
+                                                &mut usage_accumulator,
+                                                StreamUsageFinalization::InvalidData,
+                                                &state_clone,
+                                                &user_clone,
+                                                &billing_ctx,
+                                                &provider,
+                                                &tx_consumer,
+                                            )
+                                            .await;
+                                            let _ = tx_consumer
+                                                .send(CompletionChunk::Error(
+                                                    "Invalid JSON".to_string(),
+                                                ))
+                                                .await;
+                                            return;
+                                        }
                                     }
                                 }
                             }
@@ -1632,7 +2079,8 @@ async fn get_chat_completion_response_with_expected_route(
                         &tx_consumer,
                     )
                     .await;
-                    let _ = tx_consumer.send(CompletionChunk::Done).await;
+                    let terminal = provider_stream_eof_terminal(stream_policy);
+                    let _ = tx_consumer.send(terminal).await;
                     return;
                 }
                 Err(_) => {
@@ -1837,6 +2285,97 @@ fn canonicalize_response_model(json: &mut Value, response_model_id: &str) {
     if let Some(model_value) = json.get_mut("model") {
         if model_value.as_str().is_some() {
             *model_value = json!(response_model_id);
+        }
+    }
+}
+
+fn is_event_stream_content_type(content_type: Option<&str>) -> bool {
+    content_type
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+fn charge_provider_stream_bytes(
+    total_bytes: &mut usize,
+    chunk_bytes: usize,
+    policy: ProviderStreamPolicy,
+) -> Result<(), ()> {
+    let Some(limit_bytes) = policy.max_total_bytes else {
+        return Ok(());
+    };
+    let next_total = total_bytes.checked_add(chunk_bytes).ok_or(())?;
+    if next_total > limit_bytes {
+        return Err(());
+    }
+    *total_bytes = next_total;
+    Ok(())
+}
+
+fn provider_stream_eof_terminal(policy: ProviderStreamPolicy) -> CompletionChunk {
+    if policy.require_provider_done {
+        CompletionChunk::Error("Provider stream ended before its terminal event".to_string())
+    } else {
+        CompletionChunk::Done
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedSseFrameError {
+    TooLarge,
+}
+
+/// V2-only bounded variant of [`extract_sse_frame`]. The legacy helper remains
+/// unchanged so transport-v1 keeps its existing provider framing behavior.
+fn extract_bounded_sse_frame(
+    buffer: &mut Vec<u8>,
+    max_frame_bytes: usize,
+) -> Result<Option<Vec<u8>>, BoundedSseFrameError> {
+    loop {
+        let Some((frame_end, delimiter_len)) = find_sse_frame_boundary(buffer) else {
+            // A provider may split the blank-line delimiter across network
+            // chunks. Exclude only a suffix that can still become `\n\n` or
+            // `\r\n\r\n`; the unfinished frame payload itself remains capped.
+            let possible_delimiter_prefix = if buffer.ends_with(b"\r\n\r") {
+                3
+            } else if buffer.ends_with(b"\r\n") {
+                2
+            } else if buffer.ends_with(b"\n") || buffer.ends_with(b"\r") {
+                1
+            } else {
+                0
+            };
+            return if buffer.len().saturating_sub(possible_delimiter_prefix) > max_frame_bytes {
+                Err(BoundedSseFrameError::TooLarge)
+            } else {
+                Ok(None)
+            };
+        };
+        if frame_end > max_frame_bytes {
+            return Err(BoundedSseFrameError::TooLarge);
+        }
+
+        let frame = buffer[..frame_end].to_vec();
+        buffer.drain(..frame_end + delimiter_len);
+
+        if frame.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+
+        let mut data = Vec::new();
+        for line in frame.split(|byte| *byte == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let Some(value) = line.strip_prefix(b"data:") else {
+                continue;
+            };
+            let value = value.strip_prefix(b" ").unwrap_or(value);
+            if !data.is_empty() {
+                data.push(b'\n');
+            }
+            data.extend_from_slice(value);
+        }
+
+        if !data.is_empty() {
+            return Ok(Some(data));
         }
     }
 }
@@ -3336,6 +3875,34 @@ mod tests {
     }
 
     #[test]
+    fn stream_provider_policies_keep_v1_legacy_and_v2_strictly_bounded() {
+        assert_eq!(
+            ProviderStreamPolicy::LEGACY_V1,
+            ProviderStreamPolicy {
+                max_frame_bytes: None,
+                max_total_bytes: None,
+                max_json_structural_tokens: None,
+                channel_capacity: 100,
+                require_event_stream_content_type: false,
+                require_provider_done: false,
+                retry: ProviderRetryPolicy::LegacyV1,
+            }
+        );
+        assert_eq!(
+            ProviderStreamPolicy::V2,
+            ProviderStreamPolicy {
+                max_frame_bytes: Some(1024 * 1024),
+                max_total_bytes: Some(64 * 1024 * 1024),
+                max_json_structural_tokens: Some(V2_MAX_PROVIDER_JSON_STRUCTURAL_TOKENS),
+                channel_capacity: 1,
+                require_event_stream_content_type: true,
+                require_provider_done: true,
+                retry: ProviderRetryPolicy::NoAmbiguousRetry,
+            }
+        );
+    }
+
+    #[test]
     fn v2_unary_chat_helper_accepts_only_absent_or_boolean_false_stream() {
         assert!(ensure_nonstream_chat_completion(&json!({"stream": false})).is_ok());
         assert!(ensure_nonstream_chat_completion(&json!({})).is_ok());
@@ -3349,6 +3916,192 @@ mod tests {
         ] {
             assert!(ensure_nonstream_chat_completion(&rejected).is_err());
         }
+    }
+
+    #[test]
+    fn v2_stream_chat_helper_accepts_only_boolean_true_stream() {
+        assert!(ensure_stream_chat_completion(&json!({"stream": true})).is_ok());
+        for rejected in [
+            json!({}),
+            json!({"stream": false}),
+            json!({"stream": null}),
+            json!({"stream": "true"}),
+            json!({"stream": 1}),
+            json!({"stream": {}}),
+            json!({"stream": []}),
+        ] {
+            assert!(ensure_stream_chat_completion(&rejected).is_err());
+        }
+    }
+
+    #[test]
+    fn v2_provider_stream_requires_an_sse_content_type() {
+        assert!(is_event_stream_content_type(Some("text/event-stream")));
+        assert!(is_event_stream_content_type(Some(
+            "TEXT/EVENT-STREAM; charset=utf-8"
+        )));
+        assert!(!is_event_stream_content_type(Some("application/json")));
+        assert!(!is_event_stream_content_type(Some("text/event-streaming")));
+        assert!(!is_event_stream_content_type(None));
+    }
+
+    #[test]
+    fn v2_provider_stream_aggregate_limit_is_exact_and_overflow_safe() {
+        let policy = ProviderStreamPolicy {
+            max_total_bytes: Some(5),
+            ..ProviderStreamPolicy::V2
+        };
+        let mut total = 0;
+        assert!(charge_provider_stream_bytes(&mut total, 3, policy).is_ok());
+        assert!(charge_provider_stream_bytes(&mut total, 2, policy).is_ok());
+        assert_eq!(total, 5);
+        assert!(charge_provider_stream_bytes(&mut total, 1, policy).is_err());
+        assert_eq!(total, 5);
+
+        let mut overflow = usize::MAX;
+        assert!(charge_provider_stream_bytes(&mut overflow, 1, policy).is_err());
+    }
+
+    #[test]
+    fn v2_provider_stream_requires_done_while_v1_preserves_clean_eof() {
+        assert!(matches!(
+            provider_stream_eof_terminal(ProviderStreamPolicy::V2),
+            CompletionChunk::Error(_)
+        ));
+        assert!(matches!(
+            provider_stream_eof_terminal(ProviderStreamPolicy::LEGACY_V1),
+            CompletionChunk::Done
+        ));
+    }
+
+    #[test]
+    fn bounded_sse_decoder_limits_each_frame_not_the_network_chunk() {
+        let mut buffer = b"data: one\n\ndata: two\n\n".to_vec();
+        assert_eq!(
+            extract_bounded_sse_frame(&mut buffer, b"data: one".len()),
+            Ok(Some(b"one".to_vec()))
+        );
+        assert_eq!(
+            extract_bounded_sse_frame(&mut buffer, b"data: two".len()),
+            Ok(Some(b"two".to_vec()))
+        );
+        assert!(buffer.is_empty());
+
+        let mut exact = b"data: exact\r\n\r\n".to_vec();
+        assert_eq!(
+            extract_bounded_sse_frame(&mut exact, b"data: exact".len()),
+            Ok(Some(b"exact".to_vec()))
+        );
+
+        let mut split_delimiter = b"data: exact\r\n\r".to_vec();
+        assert_eq!(
+            extract_bounded_sse_frame(&mut split_delimiter, b"data: exact".len()),
+            Ok(None)
+        );
+        split_delimiter.push(b'\n');
+        assert_eq!(
+            extract_bounded_sse_frame(&mut split_delimiter, b"data: exact".len()),
+            Ok(Some(b"exact".to_vec()))
+        );
+
+        let mut oversized = b"data: oversized\n\n".to_vec();
+        assert_eq!(
+            extract_bounded_sse_frame(&mut oversized, b"data: oversized".len() - 1),
+            Err(BoundedSseFrameError::TooLarge)
+        );
+
+        let mut unfinished = b"data: unfinished".to_vec();
+        let unfinished_limit = unfinished.len() - 1;
+        assert_eq!(
+            extract_bounded_sse_frame(&mut unfinished, unfinished_limit),
+            Err(BoundedSseFrameError::TooLarge)
+        );
+    }
+
+    fn completion_stream_for_test(chunks: Vec<CompletionChunk>) -> CompletionStream {
+        let (sender, receiver) = mpsc::channel(chunks.len().max(1));
+        for chunk in chunks {
+            sender.try_send(chunk).unwrap();
+        }
+        drop(sender);
+        CompletionStream {
+            stream: receiver,
+            metadata: CompletionMetadata {
+                provider_name: "test-provider".to_string(),
+                model_name: "test-model".to_string(),
+                is_streaming: true,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_chat_adapter_emits_plaintext_sse_done_and_complete() {
+        let completion = completion_stream_for_test(vec![
+            CompletionChunk::StreamChunk(json!({"id": "chunk-1"})),
+            CompletionChunk::Usage(CompletionUsage {
+                prompt_tokens: 2,
+                completion_tokens: 1,
+                cached_prompt_tokens: None,
+            }),
+            CompletionChunk::Done,
+        ]);
+        let mut stream = build_v2_chat_logical_stream(completion, None, 1024);
+
+        match stream.next().await.unwrap() {
+            LogicalStreamItem::Bytes(bytes) => {
+                assert_eq!(
+                    bytes,
+                    bytes::Bytes::from_static(b"data: {\"id\":\"chunk-1\"}\n\n")
+                );
+            }
+            _ => panic!("first logical item must be plaintext SSE bytes"),
+        }
+        match stream.next().await.unwrap() {
+            LogicalStreamItem::Bytes(bytes) => {
+                assert_eq!(bytes, bytes::Bytes::from_static(b"data: [DONE]\n\n"));
+            }
+            _ => panic!("second logical item must be the Chat done event"),
+        }
+        assert!(matches!(
+            stream.next().await,
+            Some(LogicalStreamItem::Complete)
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn v2_chat_adapter_sanitizes_errors_and_rejects_unterminated_channels() {
+        for completion in [
+            completion_stream_for_test(vec![CompletionChunk::Error(
+                "provider-secret-error-body".to_string(),
+            )]),
+            completion_stream_for_test(Vec::new()),
+        ] {
+            let mut stream = build_v2_chat_logical_stream(completion, None, 1024);
+            let Some(LogicalStreamItem::Failure(failure)) = stream.next().await else {
+                panic!("failed or unterminated provider stream must yield Failure")
+            };
+            assert_eq!(
+                failure.status,
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+            assert!(!String::from_utf8_lossy(&failure.body).contains("provider-secret"));
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_chat_adapter_enforces_aggregate_logical_byte_limit() {
+        let completion = completion_stream_for_test(vec![
+            CompletionChunk::StreamChunk(json!({"delta": "too-large"})),
+            CompletionChunk::Done,
+        ]);
+        let mut stream = build_v2_chat_logical_stream(completion, None, 4);
+        assert!(matches!(
+            stream.next().await,
+            Some(LogicalStreamItem::Failure(_))
+        ));
+        assert!(stream.next().await.is_none());
     }
 
     #[test]

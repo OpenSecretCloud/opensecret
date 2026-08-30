@@ -14,15 +14,20 @@ use crate::{
         NewToolCall, NewToolOutput, NewUserMessage, ResponseStatus, ResponsesError,
     },
     models::users::User,
+    provider_cache::DerivedCacheNamespace,
     tokens::count_tokens,
+    transport_v2::streaming::{
+        LogicalByteStream, LogicalStreamFailure, LogicalStreamItem, StreamExecutionGuard,
+    },
     web::{
         encryption_middleware::{
             decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
         },
         openai::{
             ensure_completion_model_access, get_chat_completion_response,
-            get_chat_completion_response_for_expected_route, BillingContext, CompletionChunk,
-            ServerSelectedCompletionRoute,
+            get_chat_completion_response_for_expected_route,
+            get_chat_completion_response_for_expected_route_v2, get_chat_completion_response_v2,
+            BillingContext, CompletionChunk, ServerSelectedCompletionRoute,
         },
         openai_auth::AuthMethod,
         responses::{
@@ -33,8 +38,8 @@ use crate::{
             image_describer::{
                 describe_image_with_fallback, ImageDescriptionAttemptError,
                 ImageDescriptionAttemptExecutor, ImageDescriptionCandidate, ImageDescriptionError,
-                ImageDescriptionFailureClass, ImageDescriptionInput,
-                RetryNonTerminalImageDescriptionFallbackPolicy,
+                ImageDescriptionFailureClass, ImageDescriptionFallbackPolicy,
+                ImageDescriptionInput, RetryNonTerminalImageDescriptionFallbackPolicy,
             },
             prompt_token_budget, storage_task, tools, ContentPartBuilder, DeletedObjectResponse,
             MessageContent, MessageContentConverter, MessageContentPart, OutputItemBuilder,
@@ -56,13 +61,14 @@ use axum::{
 };
 use base64::Engine;
 use chrono::Utc;
-use futures::Stream;
+use futures::{future, Future, Stream, StreamExt};
 use secp256k1::SecretKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -71,8 +77,73 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 const RESPONSES_SSE_KEEPALIVE_INTERVAL_SECS: u64 = 1;
+const V2_CLIENT_CHANNEL_BUFFER: usize = 32;
+const V2_MAX_LOGICAL_RESPONSES_STREAM_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WEB_SEARCH_TOOL_TURNS_FREE: usize = 5;
 const MAX_WEB_SEARCH_TOOL_TURNS_PAID: usize = 30;
+
+#[derive(Clone)]
+enum ResponsesExecutionPolicy {
+    LegacyV1,
+    BoundV2 {
+        cache_namespace: DerivedCacheNamespace,
+        stream_guard: StreamExecutionGuard,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClientDelivery {
+    LegacyBestEffort,
+    Awaited,
+}
+
+impl ResponsesExecutionPolicy {
+    fn client_delivery(&self) -> ClientDelivery {
+        match self {
+            Self::LegacyV1 => ClientDelivery::LegacyBestEffort,
+            Self::BoundV2 { .. } => ClientDelivery::Awaited,
+        }
+    }
+
+    fn client_channel_buffer(&self) -> usize {
+        match self {
+            Self::LegacyV1 => CLIENT_CHANNEL_BUFFER,
+            Self::BoundV2 { .. } => V2_CLIENT_CHANNEL_BUFFER,
+        }
+    }
+
+    fn stream_guard(&self) -> Option<StreamExecutionGuard> {
+        match self {
+            Self::LegacyV1 => None,
+            Self::BoundV2 { stream_guard, .. } => Some(stream_guard.clone()),
+        }
+    }
+
+    fn sanitized_application_error(&self, error: &ApiError) -> String {
+        match self {
+            Self::LegacyV1 => format!("Streaming failed: {error:?}"),
+            Self::BoundV2 { .. } => "Streaming failed".to_string(),
+        }
+    }
+
+    fn is_v2(&self) -> bool {
+        matches!(self, Self::BoundV2 { .. })
+    }
+}
+
+fn should_try_next_image_description_candidate(
+    v2_transport: bool,
+    failure: &ImageDescriptionAttemptError,
+) -> bool {
+    if !v2_transport {
+        return RetryNonTerminalImageDescriptionFallbackPolicy.should_try_next(failure);
+    }
+
+    !matches!(
+        failure.class,
+        ImageDescriptionFailureClass::Terminal | ImageDescriptionFailureClass::AmbiguousAfterSend
+    )
+}
 
 // Default functions for serde
 fn default_store() -> bool {
@@ -401,22 +472,28 @@ mod tests {
         finalize_first_model_tool_call, has_streamed_tool_call_entries, image_attachments,
         image_description_access, image_description_api_error, maple_kagi_web_search_prompt,
         model_turn_request_without_user_payload, resolve_responses_model,
-        resolve_responses_sampling, wait_for_response_cancellation, web_search_is_selected,
-        web_search_tool_turn_limit, web_search_tool_turn_limit_error,
-        web_search_tool_turn_limit_reached, ClientResponseState, ConversationParam,
-        ImageAttachment, ImageDescriptionFailureClass, ImageDescriptionInput,
-        ImageDescriptionToolPair, InputMessage, MessageContent, MessageContentPart, MessageInput,
-        ResponsesCreateRequest, StorageMessage, StreamedToolCall, MAX_WEB_SEARCH_TOOL_TURNS_FREE,
-        MAX_WEB_SEARCH_TOOL_TURNS_PAID, READ_IMAGE_TOOL_NAME,
+        resolve_responses_sampling, responses_v2_logical_stream, send_client_message,
+        should_try_next_image_description_candidate, wait_for_response_cancellation,
+        web_search_is_selected, web_search_tool_turn_limit, web_search_tool_turn_limit_error,
+        web_search_tool_turn_limit_reached, ClientDelivery, ClientResponseState, ConversationParam,
+        ImageAttachment, ImageDescriptionAttemptError, ImageDescriptionFailureClass,
+        ImageDescriptionInput, ImageDescriptionToolPair, InputMessage, MessageContent,
+        MessageContentPart, MessageInput, ResponseEventProjector, ResponsesCreateRequest,
+        ResponsesEventStream, ResponsesStreamView, StorageMessage, StreamedToolCall,
+        MAX_WEB_SEARCH_TOOL_TURNS_FREE, MAX_WEB_SEARCH_TOOL_TURNS_PAID, READ_IMAGE_TOOL_NAME,
     };
     use crate::web::responses::tools;
     use crate::{
         billing::{BillingClient, ChatBillingAccess},
         model_config::{ModelAliasTargets, ModelPlan},
+        models::responses::{Response, ResponseStatus},
+        transport_v2::streaming::LogicalStreamItem,
+        web::responses::{constants::*, ResponseEvent},
         ApiError,
     };
     use axum::{routing::get, Json, Router};
     use chrono::{TimeZone, Utc};
+    use futures::StreamExt;
     use serde_json::json;
     use tokio::{
         net::TcpListener,
@@ -691,6 +768,55 @@ mod tests {
     }
 
     #[test]
+    fn v2_image_description_fallback_stops_after_ambiguous_send() {
+        let ambiguous = ImageDescriptionAttemptError::new(
+            ImageDescriptionFailureClass::AmbiguousAfterSend,
+            "provider outcome is unknown",
+        );
+        let pre_acceptance = ImageDescriptionAttemptError::new(
+            ImageDescriptionFailureClass::PreAcceptance,
+            "request was not written",
+        );
+        let invalid_response = ImageDescriptionAttemptError::new(
+            ImageDescriptionFailureClass::InvalidResponse,
+            "provider returned an unusable response",
+        );
+        let retryable_response = ImageDescriptionAttemptError::new(
+            ImageDescriptionFailureClass::RetryableResponse,
+            "provider explicitly rejected the attempt as retryable",
+        );
+        let terminal = ImageDescriptionAttemptError::new(
+            ImageDescriptionFailureClass::Terminal,
+            "request is not authorized",
+        );
+
+        assert!(should_try_next_image_description_candidate(
+            false, &ambiguous
+        ));
+        assert!(!should_try_next_image_description_candidate(
+            true, &ambiguous
+        ));
+        assert!(should_try_next_image_description_candidate(
+            true,
+            &pre_acceptance
+        ));
+        assert!(should_try_next_image_description_candidate(
+            true,
+            &invalid_response
+        ));
+        assert!(should_try_next_image_description_candidate(
+            true,
+            &retryable_response
+        ));
+        assert!(!should_try_next_image_description_candidate(
+            false, &terminal
+        ));
+        assert!(!should_try_next_image_description_candidate(
+            true, &terminal
+        ));
+    }
+
+    #[test]
     fn test_apply_responses_model_defaults_enables_gemma_thinking() {
         let mut chat_request = json!({
             "model": "gemma4-31b",
@@ -787,6 +913,169 @@ mod tests {
             metadata: None,
             stream: true,
         }
+    }
+
+    fn responses_stream_view() -> ResponsesStreamView {
+        let now = Utc
+            .with_ymd_and_hms(2026, 8, 30, 12, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        ResponsesStreamView {
+            response: Response {
+                id: 1,
+                uuid: Uuid::from_u128(10),
+                user_id: Uuid::from_u128(11),
+                conversation_id: 12,
+                status: ResponseStatus::InProgress,
+                model: "test-model".to_string(),
+                temperature: Some(1.0),
+                top_p: Some(1.0),
+                max_output_tokens: None,
+                tool_choice: None,
+                parallel_tool_calls: false,
+                store: true,
+                metadata_enc: None,
+                created_at: now,
+                completed_at: None,
+                updated_at: now,
+            },
+            decrypted_metadata: Some(json!({"source": "test"})),
+            total_prompt_tokens: 7,
+        }
+    }
+
+    #[test]
+    fn response_event_projector_preserves_message_order_usage_and_single_terminal() {
+        let mut projector = ResponseEventProjector::new(responses_stream_view());
+        assert_eq!(
+            projector
+                .initial_events()
+                .iter()
+                .map(ResponseEvent::event_type)
+                .collect::<Vec<_>>(),
+            vec![EVENT_RESPONSE_CREATED, EVENT_RESPONSE_IN_PROGRESS]
+        );
+
+        let item_id = Uuid::from_u128(20);
+        let mut event_types = Vec::new();
+        for message in [
+            StorageMessage::MessageStarted { item_id },
+            StorageMessage::ContentDelta {
+                item_id,
+                delta: "hello".to_string(),
+            },
+            StorageMessage::Usage {
+                prompt_tokens: 3,
+                completion_tokens: 2,
+            },
+            StorageMessage::MessageDone {
+                item_id,
+                finish_reason: "stop".to_string(),
+            },
+        ] {
+            event_types.extend(
+                projector
+                    .project(message)
+                    .iter()
+                    .map(ResponseEvent::event_type),
+            );
+        }
+        assert_eq!(
+            event_types,
+            vec![
+                EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
+                EVENT_RESPONSE_CONTENT_PART_ADDED,
+                EVENT_RESPONSE_OUTPUT_TEXT_DELTA,
+                EVENT_RESPONSE_OUTPUT_TEXT_DONE,
+                EVENT_RESPONSE_CONTENT_PART_DONE,
+                EVENT_RESPONSE_OUTPUT_ITEM_DONE,
+            ]
+        );
+
+        let completed = projector.project(StorageMessage::ResponseDone {
+            finish_reason: "stop".to_string(),
+        });
+        assert_eq!(completed.len(), 1);
+        let ResponseEvent::Completed(completed) = &completed[0] else {
+            panic!("expected response.completed");
+        };
+        let usage = completed
+            .response
+            .usage
+            .as_ref()
+            .expect("completed response should contain usage");
+        assert_eq!(usage.input_tokens, 3);
+        assert_eq!(usage.output_tokens, 2);
+        assert_eq!(usage.total_tokens, 5);
+        assert!(projector.is_terminal());
+        assert!(projector
+            .project(StorageMessage::ContentDelta {
+                item_id,
+                delta: "ignored".to_string(),
+            })
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn awaited_v2_client_delivery_applies_backpressure_without_dropping() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(StorageMessage::Cancelled).await.unwrap();
+
+        let sender = tokio::spawn(async move {
+            send_client_message(
+                &tx,
+                StorageMessage::Error("second".to_string()),
+                ClientDelivery::Awaited,
+            )
+            .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!sender.is_finished(), "bounded send should await capacity");
+        assert!(matches!(rx.recv().await, Some(StorageMessage::Cancelled)));
+        sender.await.unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some(StorageMessage::Error(message)) if message == "second"
+        ));
+    }
+
+    #[tokio::test]
+    async fn v2_projection_emits_plaintext_events_then_exact_complete() {
+        let mut projector = ResponseEventProjector::new(responses_stream_view());
+        let mut events = projector.initial_events().into_iter().collect::<Vec<_>>();
+        events.extend(projector.project(StorageMessage::Error("Stream failed".to_string())));
+        let response_events: ResponsesEventStream = Box::pin(futures::stream::iter(events));
+        let mut logical = responses_v2_logical_stream(response_events, None);
+
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            let Some(LogicalStreamItem::Bytes(frame)) = logical.next().await else {
+                panic!("expected plaintext SSE bytes");
+            };
+            frames.push(String::from_utf8(frame.to_vec()).unwrap());
+        }
+        assert!(frames[0].starts_with("event: response.created\ndata: "));
+        assert!(frames[0].contains("\"sequence_number\":0"));
+        assert!(frames[1].starts_with("event: response.in_progress\ndata: "));
+        assert!(frames[1].contains("\"sequence_number\":1"));
+        assert!(frames[2].starts_with("event: response.error\ndata: "));
+        assert!(!frames.iter().any(|frame| frame.contains("[DONE]")));
+        assert!(matches!(
+            logical.next().await,
+            Some(LogicalStreamItem::Complete)
+        ));
+        assert!(logical.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn v2_projection_converts_missing_application_terminal_to_failure() {
+        let response_events: ResponsesEventStream = Box::pin(futures::stream::empty());
+        let mut logical = responses_v2_logical_stream(response_events, None);
+        assert!(matches!(
+            logical.next().await,
+            Some(LogicalStreamItem::Failure(_))
+        ));
+        assert!(logical.next().await.is_none());
     }
 
     #[test]
@@ -2350,6 +2639,7 @@ struct ResponsesImageDescriptionExecutor<'a> {
     state: &'a Arc<AppState>,
     user: &'a User,
     _access: PaidImageDescriptionAccess,
+    execution_policy: &'a ResponsesExecutionPolicy,
 }
 
 fn image_description_api_error(error: ApiError) -> ImageDescriptionAttemptError {
@@ -2381,19 +2671,41 @@ impl ImageDescriptionAttemptExecutor for ResponsesImageDescriptionExecutor<'_> {
         let headers = HeaderMap::new();
         let billing_context =
             BillingContext::new(AuthMethod::Jwt, candidate.public_model_id.to_string());
-        let mut completion = get_chat_completion_response_for_expected_route(
-            self.state,
-            self.user,
-            request,
-            &headers,
-            billing_context,
-            ModelPlan::Paid,
-            ServerSelectedCompletionRoute {
-                provider_name: candidate.provider.as_str(),
-                provider_model_id: candidate.provider_model_id,
-            },
-        )
-        .await
+        let route = ServerSelectedCompletionRoute {
+            provider_name: candidate.provider.as_str(),
+            provider_model_id: candidate.provider_model_id,
+        };
+        let mut completion = match self.execution_policy {
+            ResponsesExecutionPolicy::LegacyV1 => {
+                get_chat_completion_response_for_expected_route(
+                    self.state,
+                    self.user,
+                    request,
+                    &headers,
+                    billing_context,
+                    ModelPlan::Paid,
+                    route,
+                )
+                .await
+            }
+            ResponsesExecutionPolicy::BoundV2 {
+                cache_namespace,
+                stream_guard,
+            } => {
+                get_chat_completion_response_for_expected_route_v2(
+                    self.state,
+                    self.user,
+                    request,
+                    &headers,
+                    billing_context,
+                    ModelPlan::Paid,
+                    route,
+                    cache_namespace,
+                    stream_guard.clone(),
+                )
+                .await
+            }
+        }
         .map_err(image_description_api_error)?;
 
         if completion.metadata.provider_name != candidate.provider.as_str()
@@ -2435,13 +2747,18 @@ async fn describe_images(
     user: &User,
     access: PaidImageDescriptionAccess,
     images: &[ImageAttachment],
+    execution_policy: &ResponsesExecutionPolicy,
 ) -> Result<Vec<ImageDescriptionToolPair>, ApiError> {
     let executor = ResponsesImageDescriptionExecutor {
         state,
         user,
         _access: access,
+        execution_policy,
     };
-    let fallback_policy = RetryNonTerminalImageDescriptionFallbackPolicy;
+    let v2_transport = execution_policy.is_v2();
+    let fallback_policy = move |failure: &ImageDescriptionAttemptError| {
+        should_try_next_image_description_candidate(v2_transport, failure)
+    };
 
     let outcomes =
         futures::future::join_all(images.iter().enumerate().map(|(image_index, image)| {
@@ -2555,8 +2872,13 @@ async fn spawn_title_generation_task(
     user: User,
     user_key: SecretKey,
     user_content: String,
+    execution_policy: ResponsesExecutionPolicy,
 ) {
     tokio::spawn(async move {
+        // V2 title generation is detached from the network carrier, so retain
+        // the promoted execution permit until this provider call and its
+        // retained output are fully released.
+        let _stream_guard = execution_policy.stream_guard();
         debug!(
             "Starting background title generation for conversation {}",
             conversation_uuid
@@ -2589,18 +2911,37 @@ async fn spawn_title_generation_task(
             crate::web::openai_auth::AuthMethod::Jwt,
             "llama3-3-70b".to_string(),
         );
-
         debug!("Title generation: about to call get_chat_completion_response");
-        match get_chat_completion_response(
-            &state,
-            &user,
-            title_request,
-            &headers,
-            billing_context,
-            ModelPlan::Free,
-        )
-        .await
-        {
+        let completion = match &execution_policy {
+            ResponsesExecutionPolicy::LegacyV1 => {
+                get_chat_completion_response(
+                    &state,
+                    &user,
+                    title_request,
+                    &headers,
+                    billing_context,
+                    ModelPlan::Free,
+                )
+                .await
+            }
+            ResponsesExecutionPolicy::BoundV2 {
+                cache_namespace,
+                stream_guard,
+            } => {
+                get_chat_completion_response_v2(
+                    &state,
+                    &user,
+                    title_request,
+                    &headers,
+                    billing_context,
+                    ModelPlan::Free,
+                    cache_namespace,
+                    stream_guard.clone(),
+                )
+                .await
+            }
+        };
+        match completion {
             Ok(mut completion) => {
                 debug!("Title generation: received completion stream from API");
                 // Get the FullResponse chunk (title generation is non-streaming)
@@ -3088,6 +3429,7 @@ async fn execute_tool_call_and_wait(
     tool_call: ModelToolCall,
     tx_client: &mpsc::Sender<StorageMessage>,
     tx_storage: &mpsc::Sender<StorageMessage>,
+    client_delivery: ClientDelivery,
     rx_tool_ack: &mut mpsc::Receiver<Result<(), String>>,
     kagi_allowed_urls: &mut HashSet<String>,
     tool_turn_count: usize,
@@ -3120,12 +3462,7 @@ async fn execute_tool_call_and_wait(
             .await;
         return Err(ApiError::InternalServerError);
     }
-    if tx_client.try_send(tool_call_msg).is_err() {
-        warn!(
-            "Client channel full or closed, skipping tool_call {} for response {}",
-            tool_call_id, persisted.response.uuid
-        );
-    }
+    send_client_message(tx_client, tool_call_msg, client_delivery).await;
     debug!(
         "Tool loop: enqueued tool_call {} ({}) for response {} in {} ms",
         tool_call_id,
@@ -3196,12 +3533,7 @@ async fn execute_tool_call_and_wait(
             .await;
         return Err(ApiError::InternalServerError);
     }
-    if tx_client.try_send(tool_output_msg).is_err() {
-        warn!(
-            "Client channel full or closed, skipping tool_output {} for tool_call {} on response {}",
-            tool_output_id, tool_call_id, persisted.response.uuid
-        );
-    }
+    send_client_message(tx_client, tool_output_msg, client_delivery).await;
     debug!(
         "Tool loop: enqueued tool_output {} for tool_call {} on response {} in {} ms",
         tool_output_id,
@@ -3242,18 +3574,36 @@ async fn execute_tool_call_and_wait(
     }
 }
 
+async fn send_client_message(
+    tx_client: &mpsc::Sender<StorageMessage>,
+    msg: StorageMessage,
+    delivery: ClientDelivery,
+) {
+    match delivery {
+        ClientDelivery::LegacyBestEffort => {
+            if tx_client.try_send(msg).is_err() {
+                warn!("Client channel full or closed");
+            }
+        }
+        ClientDelivery::Awaited => {
+            if tx_client.send(msg).await.is_err() {
+                trace!("V2 Responses projector detached; continuing durable execution");
+            }
+        }
+    }
+}
+
 async fn send_storage_message(
     tx_storage: &mpsc::Sender<StorageMessage>,
     tx_client: &mpsc::Sender<StorageMessage>,
     msg: StorageMessage,
+    client_delivery: ClientDelivery,
 ) -> Result<(), ApiError> {
     if tx_storage.send(msg.clone()).await.is_err() {
         error!("Storage channel closed unexpectedly");
         return Err(ApiError::InternalServerError);
     }
-    if tx_client.try_send(msg).is_err() {
-        warn!("Client channel full or closed");
-    }
+    send_client_message(tx_client, msg, client_delivery).await;
     Ok(())
 }
 
@@ -3287,6 +3637,7 @@ async fn close_reasoning_if_active(
     state: &mut ReasoningState,
     tx_storage: &mpsc::Sender<StorageMessage>,
     tx_client: &mpsc::Sender<StorageMessage>,
+    client_delivery: ClientDelivery,
 ) -> Result<(), ApiError> {
     if let Some(reasoning_id) = state.active_id() {
         debug!(
@@ -3299,6 +3650,7 @@ async fn close_reasoning_if_active(
             StorageMessage::ReasoningDone {
                 item_id: reasoning_id,
             },
+            client_delivery,
         )
         .await?;
         *state = ReasoningState::Done;
@@ -3311,6 +3663,7 @@ async fn ensure_message_started(
     next_message_id: &mut Option<Uuid>,
     tx_storage: &mpsc::Sender<StorageMessage>,
     tx_client: &mpsc::Sender<StorageMessage>,
+    client_delivery: ClientDelivery,
 ) -> Result<Uuid, ApiError> {
     if let Some(id) = *current_message_id {
         return Ok(id);
@@ -3320,6 +3673,7 @@ async fn ensure_message_started(
         tx_storage,
         tx_client,
         StorageMessage::MessageStarted { item_id: id },
+        client_delivery,
     )
     .await?;
     *current_message_id = Some(id);
@@ -3332,6 +3686,7 @@ async fn stream_one_assistant_turn(
     user: &User,
     body: &ResponsesCreateRequest,
     model_plan: ModelPlan,
+    execution_policy: &ResponsesExecutionPolicy,
     headers: &HeaderMap,
     prompt_messages: &[Value],
     tools_enabled: bool,
@@ -3343,6 +3698,7 @@ async fn stream_one_assistant_turn(
     tool_turn_count: usize,
     prompt_token_estimate: usize,
 ) -> Result<AssistantTurnOutcome, ApiError> {
+    let client_delivery = execution_policy.client_delivery();
     let mut chat_request = build_model_turn_request(body, prompt_messages, tools_enabled);
 
     let chat_request_bytes = serde_json::to_vec(&chat_request)
@@ -3367,15 +3723,35 @@ async fn stream_one_assistant_turn(
         body.model.clone(),
     );
 
-    let mut completion = get_chat_completion_response(
-        state,
-        user,
-        chat_request.take(),
-        headers,
-        billing_context,
-        model_plan,
-    )
-    .await?;
+    let mut completion = match execution_policy {
+        ResponsesExecutionPolicy::LegacyV1 => {
+            get_chat_completion_response(
+                state,
+                user,
+                chat_request.take(),
+                headers,
+                billing_context,
+                model_plan,
+            )
+            .await
+        }
+        ResponsesExecutionPolicy::BoundV2 {
+            cache_namespace,
+            stream_guard,
+        } => {
+            get_chat_completion_response_v2(
+                state,
+                user,
+                chat_request.take(),
+                headers,
+                billing_context,
+                model_plan,
+                cache_namespace,
+                stream_guard.clone(),
+            )
+            .await
+        }
+    }?;
 
     debug!(
         "Received completion from provider: {} (model: {})",
@@ -3424,6 +3800,7 @@ async fn stream_one_assistant_turn(
                                     StorageMessage::ReasoningStarted {
                                         item_id: reasoning_id,
                                     },
+                                    client_delivery,
                                 )
                                 .await?;
                                 send_storage_message(
@@ -3433,6 +3810,7 @@ async fn stream_one_assistant_turn(
                                         item_id: reasoning_id,
                                         delta: reasoning_delta.to_string(),
                                     },
+                                    client_delivery,
                                 )
                                 .await?;
                                 reasoning = ReasoningState::Active(reasoning_id);
@@ -3445,6 +3823,7 @@ async fn stream_one_assistant_turn(
                                         item_id: *reasoning_id,
                                         delta: reasoning_delta.to_string(),
                                     },
+                                    client_delivery,
                                 )
                                 .await?;
                             }
@@ -3481,10 +3860,17 @@ async fn stream_one_assistant_turn(
                                     item_id: message_id,
                                     finish_reason: "tool_calls".to_string(),
                                 },
+                                client_delivery,
                             )
                             .await?;
                         }
-                        close_reasoning_if_active(&mut reasoning, tx_storage, tx_client).await?;
+                        close_reasoning_if_active(
+                            &mut reasoning,
+                            tx_storage,
+                            tx_client,
+                            client_delivery,
+                        )
+                        .await?;
 
                         saw_tool_calls = true;
                         append_streamed_tool_calls(&mut streamed_tool_calls, tool_call_delta);
@@ -3504,14 +3890,20 @@ async fn stream_one_assistant_turn(
                                 content.len()
                             );
                         } else {
-                            close_reasoning_if_active(&mut reasoning, tx_storage, tx_client)
-                                .await?;
+                            close_reasoning_if_active(
+                                &mut reasoning,
+                                tx_storage,
+                                tx_client,
+                                client_delivery,
+                            )
+                            .await?;
 
                             let message_id = ensure_message_started(
                                 &mut current_message_id,
                                 next_message_id,
                                 tx_storage,
                                 tx_client,
+                                client_delivery,
                             )
                             .await?;
 
@@ -3522,6 +3914,7 @@ async fn stream_one_assistant_turn(
                                     item_id: message_id,
                                     delta: content.to_string(),
                                 },
+                                client_delivery,
                             )
                             .await?;
                         }
@@ -3536,11 +3929,26 @@ async fn stream_one_assistant_turn(
                         prompt_tokens: usage.prompt_tokens,
                         completion_tokens: usage.completion_tokens,
                     },
+                    client_delivery,
                 )
                 .await?;
             }
             crate::web::openai::CompletionChunk::Done => {
-                close_reasoning_if_active(&mut reasoning, tx_storage, tx_client).await?;
+                if execution_policy.is_v2()
+                    && response_is_durably_cancelled(state, response_uuid, user.uuid)
+                {
+                    send_storage_message(
+                        tx_storage,
+                        tx_client,
+                        StorageMessage::Cancelled,
+                        client_delivery,
+                    )
+                    .await?;
+                    return Ok(AssistantTurnOutcome::Final);
+                }
+
+                close_reasoning_if_active(&mut reasoning, tx_storage, tx_client, client_delivery)
+                    .await?;
 
                 if assistant_turn_finished_with_tool_call(
                     saw_tool_calls,
@@ -3570,6 +3978,7 @@ async fn stream_one_assistant_turn(
                     next_message_id,
                     tx_storage,
                     tx_client,
+                    client_delivery,
                 )
                 .await?;
 
@@ -3588,6 +3997,7 @@ async fn stream_one_assistant_turn(
                         item_id: message_id,
                         finish_reason: final_finish_reason.clone(),
                     },
+                    client_delivery,
                 )
                 .await?;
 
@@ -3597,6 +4007,7 @@ async fn stream_one_assistant_turn(
                     StorageMessage::ResponseDone {
                         finish_reason: final_finish_reason,
                     },
+                    client_delivery,
                 )
                 .await?;
                 return Ok(AssistantTurnOutcome::Final);
@@ -3627,6 +4038,7 @@ async fn setup_completion_processor(
     user: &User,
     body: &ResponsesCreateRequest,
     model_plan: ModelPlan,
+    execution_policy: &ResponsesExecutionPolicy,
     context: &BuiltContext,
     user_key: &SecretKey,
     assistant_message_id: Uuid,
@@ -3650,6 +4062,7 @@ async fn setup_completion_processor(
                 user,
                 body,
                 model_plan,
+                execution_policy,
                 headers,
                 &prompt_messages,
                 tools_enabled,
@@ -3676,6 +4089,7 @@ async fn setup_completion_processor(
                         tool_call,
                         &tx_client,
                         &tx_storage,
+                        execution_policy.client_delivery(),
                         &mut rx_tool_ack,
                         &mut kagi_allowed_urls,
                         tool_turn_count,
@@ -3704,9 +4118,9 @@ async fn setup_completion_processor(
     .await;
 
     if let Err(e) = loop_result {
-        let msg = StorageMessage::Error(format!("Streaming failed: {:?}", e));
+        let msg = StorageMessage::Error(execution_policy.sanitized_application_error(&e));
         let _ = tx_storage.send(msg.clone()).await;
-        let _ = tx_client.try_send(msg);
+        send_client_message(&tx_client, msg, execution_policy.client_delivery()).await;
         return Err(e);
     }
 
@@ -3715,22 +4129,58 @@ async fn setup_completion_processor(
 
 async fn wait_for_response_cancellation(
     response_uuid: Uuid,
-    mut cancel_rx: broadcast::Receiver<Uuid>,
+    cancel_rx: broadcast::Receiver<Uuid>,
     tx_storage: mpsc::Sender<StorageMessage>,
     tx_client: mpsc::Sender<StorageMessage>,
 ) {
+    wait_for_response_cancellation_signal(response_uuid, cancel_rx, None).await;
+    forward_response_cancellation(response_uuid, &tx_storage, &tx_client).await;
+}
+
+fn response_is_durably_cancelled(state: &AppState, response_uuid: Uuid, user_uuid: Uuid) -> bool {
+    match state
+        .db
+        .get_response_by_uuid_and_user(response_uuid, user_uuid)
+    {
+        Ok(response) => response.status == ResponseStatus::Cancelled,
+        Err(error) => {
+            warn!(
+                "Failed to recheck cancellation state for response {}: {:?}",
+                response_uuid, error
+            );
+            false
+        }
+    }
+}
+
+async fn forward_response_cancellation(
+    response_uuid: Uuid,
+    tx_storage: &mpsc::Sender<StorageMessage>,
+    tx_client: &mpsc::Sender<StorageMessage>,
+) {
+    debug!(
+        "Orchestrator: Received cancellation during phases 5-6 for response {}",
+        response_uuid
+    );
+    let _ = tx_storage.send(StorageMessage::Cancelled).await;
+    let _ = tx_client.send(StorageMessage::Cancelled).await;
+    trace!("Orchestrator: Cancellation handled, exiting");
+}
+
+async fn wait_for_response_cancellation_signal(
+    response_uuid: Uuid,
+    mut cancel_rx: broadcast::Receiver<Uuid>,
+    durable_recheck: Option<(Arc<AppState>, Uuid)>,
+) {
+    if let Some((state, user_uuid)) = durable_recheck.as_ref() {
+        if response_is_durably_cancelled(state, response_uuid, *user_uuid) {
+            return;
+        }
+    }
+
     loop {
         match cancel_rx.recv().await {
             Ok(cancelled_id) if cancelled_id == response_uuid => {
-                debug!(
-                    "Orchestrator: Received cancellation during phases 5-6 for response {}",
-                    response_uuid
-                );
-
-                let _ = tx_storage.send(StorageMessage::Cancelled).await;
-                let _ = tx_client.send(StorageMessage::Cancelled).await;
-
-                trace!("Orchestrator: Cancellation handled, exiting");
                 return;
             }
             Ok(cancelled_id) => {
@@ -3745,6 +4195,11 @@ async fn wait_for_response_cancellation(
                     "Orchestrator: cancellation listener for response {} lagged by {} message(s)",
                     response_uuid, skipped
                 );
+                if let Some((state, user_uuid)) = durable_recheck.as_ref() {
+                    if response_is_durably_cancelled(state, response_uuid, *user_uuid) {
+                        return;
+                    }
+                }
             }
             Err(broadcast::error::RecvError::Closed) => {
                 warn!(
@@ -3757,16 +4212,60 @@ async fn wait_for_response_cancellation(
     }
 }
 
-async fn create_response_stream(
-    State(state): State<Arc<AppState>>,
+#[derive(Clone)]
+struct ResponsesStreamView {
+    response: crate::models::responses::Response,
+    decrypted_metadata: Option<Value>,
+    total_prompt_tokens: usize,
+}
+
+struct PreparedResponsesJob {
+    state: Arc<AppState>,
     headers: HeaderMap,
-    Extension(session_id): Extension<TransportSession>,
-    Extension(user): Extension<User>,
-    Extension(auth_context): Extension<AuthContext>,
-    Extension(mut body): Extension<ResponsesCreateRequest>,
-) -> Result<Response, ApiError> {
-    trace!("=== ENTERING create_response_stream ===");
+    user: User,
+    model_plan: ModelPlan,
+    execution_policy: ResponsesExecutionPolicy,
+    model_turn_body: ResponsesCreateRequest,
+    context: BuiltContext,
+    persisted: PersistedData,
+    assistant_message_id: Uuid,
+    user_key: SecretKey,
+    first_response_item_created_at: chrono::DateTime<chrono::Utc>,
+    image_descriptions: Arc<Vec<ImageDescriptionToolPair>>,
+    cancellation_rx: Option<broadcast::Receiver<Uuid>>,
+}
+
+struct StartedResponsesJob {
+    rx_client: mpsc::Receiver<StorageMessage>,
+    // Transport v1 historically retained its original sender clones inside
+    // the SSE generator. Preserve that abnormal-path lifecycle exactly: if a
+    // legacy producer exits without enqueueing a terminal event, the carrier
+    // continues keepalives rather than observing channel EOF. V2 deliberately
+    // omits these guards so missing finality becomes an authenticated Error.
+    _legacy_sender_guards: Option<(mpsc::Sender<StorageMessage>, mpsc::Sender<StorageMessage>)>,
+}
+
+type ResponsesEventStream = Pin<Box<dyn Stream<Item = ResponseEvent> + Send + 'static>>;
+type StartResponsesJobFuture = Pin<Box<dyn Future<Output = StartedResponsesJob> + Send + 'static>>;
+
+async fn prepare_responses_job(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    user: User,
+    auth_context: AuthContext,
+    mut body: ResponsesCreateRequest,
+    execution_policy: ResponsesExecutionPolicy,
+) -> Result<(ResponsesStreamView, PreparedResponsesJob), ApiError> {
+    trace!("=== PREPARING RESPONSES JOB ===");
     trace!("User: {}", user.uuid);
+
+    // V2 subscribes before the response row can become cancellable. The
+    // receiver is retained through persistence and handed to the detached job,
+    // closing the legacy subscribe-after-persist race without changing v1.
+    let cancellation_rx = execution_policy
+        .is_v2()
+        .then(|| state.cancellation_broadcast.subscribe());
+
     let requested_model = body.model.clone();
     let billing_access = state.chat_billing_access(user.uuid, false).await;
     let model_plan =
@@ -3822,12 +4321,9 @@ async fn create_response_stream(
         body.store
     );
 
-    // Phase 1: Validate and normalize input
     let prepared = validate_and_normalize_input(&state, &user, &auth_context, &body).await?;
     let image_access = image_description_access(&prepared.image_attachments, billing_access)?;
 
-    // Phase 2a: Validate conversation ownership, base context, and quota before
-    // making any user-billed descriptor calls.
     let base_context = build_context_and_check_billing(
         &state,
         &user,
@@ -3839,15 +4335,20 @@ async fn create_response_stream(
     )
     .await?;
 
-    // Phase 2b: Describe all current-turn images before any database write or
-    // SSE response. A complete cascade failure therefore leaves no partial chat.
     let image_descriptions = match image_access {
-        Some(access) => describe_images(&state, &user, access, &prepared.image_attachments).await?,
+        Some(access) => {
+            describe_images(
+                &state,
+                &user,
+                access,
+                &prepared.image_attachments,
+                &execution_policy,
+            )
+            .await?
+        }
         None => Vec::new(),
     };
 
-    // Rebuild with enough reserved room for the persisted descriptions so
-    // historical context can be truncated instead of rejecting a valid turn.
     let context = if image_descriptions.is_empty() {
         base_context
     } else {
@@ -3863,7 +4364,6 @@ async fn create_response_stream(
         .await?
     };
 
-    // Phase 3: Persist request data
     let persisted = persist_request_data(
         &state,
         &user,
@@ -3874,13 +4374,12 @@ async fn create_response_stream(
     )
     .await?;
 
-    // Check if first message and spawn title generation task
     let (user_count, assistant_count) =
         context
             .prompt_messages
             .iter()
             .fold((0, 0), |(users, assistants), msg| {
-                match msg.get("role").and_then(|r| r.as_str()) {
+                match msg.get("role").and_then(|role| role.as_str()) {
                     Some(ROLE_USER) => (users + 1, assistants),
                     Some(ROLE_ASSISTANT) if msg.get("tool_calls").is_none() => {
                         (users, assistants + 1)
@@ -3899,197 +4398,268 @@ async fn create_response_stream(
             user.clone(),
             prepared.user_key,
             user_content,
+            execution_policy.clone(),
         )
         .await;
     }
 
-    // Capture variables needed inside the stream
-    let response_for_stream = persisted.response.clone();
-    let decrypted_metadata = persisted.decrypted_metadata.clone();
-    let assistant_message_id = prepared.assistant_message_id;
-    let total_prompt_tokens = context.total_prompt_tokens;
-    let response_id = persisted.response.id;
-    let response_uuid = persisted.response.uuid;
-    // Persist all generated response items on a single monotonic timestamp sequence that
-    // begins immediately after the user message so retrieval order matches stream order.
     let first_response_item_created_at = persisted
         .last_item_created_at
         .checked_add_signed(chrono::Duration::microseconds(1))
         .ok_or(ApiError::InternalServerError)?;
-    let conversation_id = context.conversation.id;
-    let user_id = user.uuid;
-    let user_key = prepared.user_key;
-    let conversation_for_stream = context.conversation.clone();
-    let prompt_messages = context.prompt_messages.clone();
-    let web_search_enabled = context.web_search_enabled;
-    let image_descriptions_for_stream = Arc::new(image_descriptions);
-    let model_turn_body = model_turn_request_without_user_payload(&body);
+    let stream_view = ResponsesStreamView {
+        response: persisted.response.clone(),
+        decrypted_metadata: persisted.decrypted_metadata.clone(),
+        total_prompt_tokens: context.total_prompt_tokens,
+    };
+    let job = PreparedResponsesJob {
+        state,
+        headers,
+        user,
+        model_plan,
+        execution_policy,
+        model_turn_body: model_turn_request_without_user_payload(&body),
+        context,
+        persisted,
+        assistant_message_id: prepared.assistant_message_id,
+        user_key: prepared.user_key,
+        first_response_item_created_at,
+        image_descriptions: Arc::new(image_descriptions),
+        cancellation_rx,
+    };
 
-    // Phases 4-6 now happen INSIDE the stream to start sending events ASAP
-    trace!("Creating SSE event stream for client");
-    let event_stream = async_stream::stream! {
-        trace!("=== STARTING SSE STREAM ===");
+    Ok((stream_view, job))
+}
 
-        // Initialize the SSE event emitter
-        let mut emitter = SseEventEmitter::new(&state, session_id, 0);
+impl PreparedResponsesJob {
+    async fn start(self) -> StartedResponsesJob {
+        let PreparedResponsesJob {
+            state,
+            headers,
+            user,
+            model_plan,
+            execution_policy,
+            model_turn_body,
+            context,
+            persisted,
+            assistant_message_id,
+            user_key,
+            first_response_item_created_at,
+            image_descriptions,
+            cancellation_rx,
+        } = self;
 
-        // Send initial response.created event IMMEDIATELY (before any processing)
-        trace!("Building response.created event");
-        let created_response = ResponseBuilder::from_response(&response_for_stream)
-            .status(STATUS_IN_PROGRESS)
-            .metadata(decrypted_metadata.clone())
-            .build();
-
-        let created_event = ResponseCreatedEvent {
-            event_type: EVENT_RESPONSE_CREATED,
-            response: created_response.clone(),
-            sequence_number: emitter.sequence_number(),
-        };
-
-        yield Ok(ResponseEvent::Created(created_event).to_sse_event(&mut emitter).await);
-
-        // Event 2: response.in_progress
-        let in_progress_event = ResponseInProgressEvent {
-            event_type: EVENT_RESPONSE_IN_PROGRESS,
-            response: created_response,
-            sequence_number: emitter.sequence_number(),
-        };
-
-        yield Ok(ResponseEvent::InProgress(in_progress_event).to_sse_event(&mut emitter).await);
-
-        // Phase 4: Create dual streams and spawn storage task
-        trace!("Phase 4: Creating dual streams and spawning storage task");
+        let client_delivery = execution_policy.client_delivery();
         let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
-        let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
+        let (tx_client, rx_client) =
+            mpsc::channel::<StorageMessage>(execution_policy.client_channel_buffer());
 
-        // These pairs are already durable. Queue them only for client emission,
-        // before the orchestrator can enqueue any assistant output.
-        for pair in image_descriptions_for_stream.iter() {
+        // These pairs are already durable. Queue them before the orchestrator
+        // can enqueue assistant output so both transports preserve ordering.
+        for pair in image_descriptions.iter() {
             for message in pair.client_messages() {
-                let _ = tx_client.send(message).await;
+                send_client_message(&tx_client, message, client_delivery).await;
             }
         }
 
-        // Create channel for tool persistence acknowledgments (supports multiple tool loops)
         let (tx_tool_ack, rx_tool_ack) = mpsc::channel::<Result<(), String>>(8);
+        let response_id = persisted.response.id;
+        let response_uuid = persisted.response.uuid;
+        let conversation_id = context.conversation.id;
+        let user_id = user.uuid;
 
-        let _storage_handle = {
-            let db = state.db.clone();
+        let storage_guard = execution_policy.stream_guard();
+        let db = state.db.clone();
+        let storage_user_key = user_key;
+        tokio::spawn(async move {
+            let _stream_guard = storage_guard;
+            storage_task(
+                rx_storage,
+                Some(tx_tool_ack),
+                db,
+                response_id,
+                response_uuid,
+                first_response_item_created_at,
+                conversation_id,
+                user_id,
+                storage_user_key,
+            )
+            .await;
+        });
 
-            tokio::spawn(async move {
-                storage_task(
-                    rx_storage,
-                    Some(tx_tool_ack),
-                    db,
-                    response_id,
-                    response_uuid,
-                    first_response_item_created_at,
-                    conversation_id,
-                    user_id,
-                    user_key,
-                )
-                .await;
-            })
-        };
-
-        // Spawn orchestrator task for phases 5-6 (runs in background, sends events to tx_client)
-        trace!("Spawning background orchestrator for phases 5-6");
         let orchestrator_tx_client = tx_client.clone();
         let orchestrator_tx_storage = tx_storage.clone();
         let orchestrator_state = state.clone();
         let orchestrator_user = user.clone();
-        let orchestrator_body = model_turn_body.clone();
-        let orchestrator_headers = headers.clone();
-        let orchestrator_response = response_for_stream.clone();
-        let orchestrator_metadata = decrypted_metadata.clone();
-        let orchestrator_last_item_created_at = persisted.last_item_created_at;
-        let orchestrator_conversation = conversation_for_stream.clone();
-        let orchestrator_prompt_messages = prompt_messages.clone();
+        let orchestrator_execution_policy = execution_policy.clone();
+        let orchestrator_guard = execution_policy.stream_guard();
+        let mut cancellation_rx = cancellation_rx;
 
         tokio::spawn(async move {
+            let _stream_guard = orchestrator_guard;
             trace!("Orchestrator: Starting phases 5-6 in background");
 
-            // Subscribe to cancellation broadcast. The endpoint lives on a separate
-            // request task, so each stream listens for its own response UUID.
-            let cancel_rx = orchestrator_state.cancellation_broadcast.subscribe();
-            let cancellation_listener = wait_for_response_cancellation(
-                response_uuid,
-                cancel_rx,
-                orchestrator_tx_storage.clone(),
-                orchestrator_tx_client.clone(),
-            );
-
-            // Run phases 5-6 with cancellation support
-            tokio::select! {
-                _ = async {
-                    // Phase 5-6: Run the normal assistant/tool loop
-                    trace!("Orchestrator: Setting up assistant/tool loop");
-
-                    let context_for_completion = BuiltContext {
-                        conversation: orchestrator_conversation,
-                        prompt_messages: orchestrator_prompt_messages,
-                        total_prompt_tokens,
-                        web_search_enabled,
-                    };
-
-                    let persisted_for_completion = PersistedData {
-                        response: orchestrator_response.clone(),
-                        decrypted_metadata: orchestrator_metadata.clone(),
-                        last_item_created_at: orchestrator_last_item_created_at,
-                    };
-
-                    match setup_completion_processor(
-                        &orchestrator_state,
-                        &orchestrator_user,
-                        &orchestrator_body,
-                        model_plan,
-                        &context_for_completion,
-                        &user_key,
-                        assistant_message_id,
-                        &persisted_for_completion,
-                        &orchestrator_headers,
-                        orchestrator_tx_client.clone(),
-                        orchestrator_tx_storage.clone(),
-                        rx_tool_ack,
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            trace!("Orchestrator: Assistant/tool loop completed");
-                        }
-                        Err(e) => {
-                            error!("Orchestrator: Assistant/tool loop failed: {:?}", e);
-                        }
+            let completion = async {
+                trace!("Orchestrator: Setting up assistant/tool loop");
+                match setup_completion_processor(
+                    &orchestrator_state,
+                    &orchestrator_user,
+                    &model_turn_body,
+                    model_plan,
+                    &orchestrator_execution_policy,
+                    &context,
+                    &user_key,
+                    assistant_message_id,
+                    &persisted,
+                    &headers,
+                    orchestrator_tx_client.clone(),
+                    orchestrator_tx_storage.clone(),
+                    rx_tool_ack,
+                )
+                .await
+                {
+                    Ok(_) => trace!("Orchestrator: Assistant/tool loop completed"),
+                    Err(error) => {
+                        error!("Orchestrator: Assistant/tool loop failed: {:?}", error)
                     }
-                } => {
-                    trace!("Orchestrator: Phases 5-6 completed normally");
                 }
+            };
+            tokio::pin!(completion);
 
-                _ = cancellation_listener => {}
+            if orchestrator_execution_policy.is_v2() {
+                let cancel_rx = cancellation_rx
+                    .take()
+                    .expect("v2 Responses job must pre-subscribe to cancellation");
+                let cancellation_listener = wait_for_response_cancellation_signal(
+                    response_uuid,
+                    cancel_rx,
+                    Some((orchestrator_state.clone(), orchestrator_user.uuid)),
+                );
+                tokio::pin!(cancellation_listener);
+
+                // V2 prioritizes a cancellation that is already ready so the
+                // provider consumer is dropped before awaited terminal
+                // delivery. This is intentionally not applied to v1.
+                let cancelled = tokio::select! {
+                    biased;
+                    _ = &mut cancellation_listener => true,
+                    _ = &mut completion => {
+                        trace!("Orchestrator: Phases 5-6 completed normally");
+                        false
+                    }
+                };
+
+                if cancelled {
+                    // Selecting cancellation first drops the
+                    // assistant/provider consumer immediately. Only then may
+                    // bounded client delivery await space for the application
+                    // terminal.
+                    forward_response_cancellation(
+                        response_uuid,
+                        &orchestrator_tx_storage,
+                        &orchestrator_tx_client,
+                    )
+                    .await;
+                }
+            } else {
+                // Preserve v1's historical unbiased race semantics, including
+                // subscribing only after the orchestrator has started and
+                // keeping cancellation pending while either legacy channel is
+                // backpressured.
+                let cancel_rx = orchestrator_state.cancellation_broadcast.subscribe();
+                let cancellation = wait_for_response_cancellation(
+                    response_uuid,
+                    cancel_rx,
+                    orchestrator_tx_storage.clone(),
+                    orchestrator_tx_client.clone(),
+                );
+                tokio::pin!(cancellation);
+                tokio::select! {
+                    _ = &mut completion => {
+                        trace!("Orchestrator: Phases 5-6 completed normally");
+                    }
+                    _ = &mut cancellation => {}
+                }
             }
         });
 
-        // NOW immediately start the event loop - it will receive events from orchestrator as they happen
-        trace!("Starting event loop to receive messages from background tasks");
-        let mut client_state = ClientResponseState::default();
-        let mut total_prompt_tokens_used = 0i32;
-        let mut total_completion_tokens = 0i32;
-        while let Some(msg) = rx_client.recv().await {
-            trace!("Client stream received message from upstream processor");
-            match msg {
-                StorageMessage::MessageStarted { item_id } => {
-                    let output_index = client_state.push_message(item_id);
-                    let output_item_added_event = ResponseOutputItemAddedEvent {
+        let legacy_sender_guards = if execution_policy.is_v2() {
+            // Once the detached v2 orchestrator exits, the receiver closes if
+            // no application terminal was delivered and the gateway can emit
+            // an authenticated transport Error.
+            None
+        } else {
+            Some((tx_client, tx_storage))
+        };
+
+        StartedResponsesJob {
+            rx_client,
+            _legacy_sender_guards: legacy_sender_guards,
+        }
+    }
+}
+
+struct ResponseEventProjector {
+    view: ResponsesStreamView,
+    client_state: ClientResponseState,
+    total_prompt_tokens_used: i32,
+    total_completion_tokens: i32,
+    terminal: bool,
+}
+
+impl ResponseEventProjector {
+    fn new(view: ResponsesStreamView) -> Self {
+        Self {
+            view,
+            client_state: ClientResponseState::default(),
+            total_prompt_tokens_used: 0,
+            total_completion_tokens: 0,
+            terminal: false,
+        }
+    }
+
+    fn initial_events(&self) -> [ResponseEvent; 2] {
+        let created_response = ResponseBuilder::from_response(&self.view.response)
+            .status(STATUS_IN_PROGRESS)
+            .metadata(self.view.decrypted_metadata.clone())
+            .build();
+        [
+            ResponseEvent::Created(ResponseCreatedEvent {
+                event_type: EVENT_RESPONSE_CREATED,
+                response: created_response.clone(),
+                sequence_number: 0,
+            }),
+            ResponseEvent::InProgress(ResponseInProgressEvent {
+                event_type: EVENT_RESPONSE_IN_PROGRESS,
+                response: created_response,
+                sequence_number: 0,
+            }),
+        ]
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
+    fn project(&mut self, msg: StorageMessage) -> Vec<ResponseEvent> {
+        if self.terminal {
+            warn!("Ignoring Responses message received after the application terminal");
+            return Vec::new();
+        }
+
+        match msg {
+            StorageMessage::MessageStarted { item_id } => {
+                let output_index = self.client_state.push_message(item_id);
+                vec![
+                    ResponseEvent::OutputItemAdded(ResponseOutputItemAddedEvent {
                         event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         output_index,
                         item: OutputItemBuilder::new_message(item_id).build(),
-                    };
-                    yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
-
-                    let content_part_added_event = ResponseContentPartAddedEvent {
+                    }),
+                    ResponseEvent::ContentPartAdded(ResponseContentPartAddedEvent {
                         event_type: EVENT_RESPONSE_CONTENT_PART_ADDED,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         item_id: item_id.to_string(),
                         output_index,
                         content_index: 0,
@@ -4099,71 +4669,75 @@ async fn create_response_stream(
                             logprobs: vec![],
                             text: String::new(),
                         },
-                    };
-                    yield Ok(ResponseEvent::ContentPartAdded(content_part_added_event).to_sse_event(&mut emitter).await);
-                }
-                StorageMessage::ContentDelta { item_id, delta } => {
-                    let Some(output_index) = client_state.append_message_delta(item_id, &delta) else {
-                        warn!("Received content delta for unknown message item {}", item_id);
-                        continue;
-                    };
-
-                    let delta_event = ResponseOutputTextDeltaEvent {
+                    }),
+                ]
+            }
+            StorageMessage::ContentDelta { item_id, delta } => {
+                let Some(output_index) = self.client_state.append_message_delta(item_id, &delta)
+                else {
+                    warn!(
+                        "Received content delta for unknown message item {}",
+                        item_id
+                    );
+                    return Vec::new();
+                };
+                vec![ResponseEvent::OutputTextDelta(
+                    ResponseOutputTextDeltaEvent {
                         event_type: EVENT_RESPONSE_OUTPUT_TEXT_DELTA,
                         delta,
                         item_id: item_id.to_string(),
                         output_index,
                         content_index: 0,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         logprobs: vec![],
-                    };
-
-                    yield Ok(ResponseEvent::OutputTextDelta(delta_event).to_sse_event(&mut emitter).await);
-                }
-                StorageMessage::MessageDone { item_id, .. } => {
-                    let Some(output_index) = client_state.message_output_index(item_id) else {
-                        warn!("Received message done for unknown item {}", item_id);
-                        continue;
-                    };
-                    let text = client_state.message_text(item_id).unwrap_or("").to_string();
-
-                    let output_text_done_event = ResponseOutputTextDoneEvent {
+                    },
+                )]
+            }
+            StorageMessage::MessageDone { item_id, .. } => {
+                let Some(output_index) = self.client_state.message_output_index(item_id) else {
+                    warn!("Received message done for unknown item {}", item_id);
+                    return Vec::new();
+                };
+                let text = self
+                    .client_state
+                    .message_text(item_id)
+                    .unwrap_or("")
+                    .to_string();
+                vec![
+                    ResponseEvent::OutputTextDone(ResponseOutputTextDoneEvent {
                         event_type: EVENT_RESPONSE_OUTPUT_TEXT_DONE,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         item_id: item_id.to_string(),
                         output_index,
                         content_index: 0,
                         text: text.clone(),
                         logprobs: vec![],
-                    };
-                    yield Ok(ResponseEvent::OutputTextDone(output_text_done_event).to_sse_event(&mut emitter).await);
-
-                    let content_part_done_event = ResponseContentPartDoneEvent {
+                    }),
+                    ResponseEvent::ContentPartDone(ResponseContentPartDoneEvent {
                         event_type: EVENT_RESPONSE_CONTENT_PART_DONE,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         item_id: item_id.to_string(),
                         output_index,
                         content_index: 0,
                         part: ContentPartBuilder::new_output_text(text.clone()).build(),
-                    };
-                    yield Ok(ResponseEvent::ContentPartDone(content_part_done_event).to_sse_event(&mut emitter).await);
-
-                    let output_item_done_event = ResponseOutputItemDoneEvent {
+                    }),
+                    ResponseEvent::OutputItemDone(ResponseOutputItemDoneEvent {
                         event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         output_index,
                         item: OutputItemBuilder::new_message(item_id)
                             .status(STATUS_COMPLETED)
                             .content(vec![ContentPartBuilder::new_output_text(text).build()])
                             .build(),
-                    };
-                    yield Ok(ResponseEvent::OutputItemDone(output_item_done_event).to_sse_event(&mut emitter).await);
-                }
-                StorageMessage::ReasoningStarted { item_id } => {
-                    let output_index = client_state.push_reasoning(item_id);
-                    let reasoning_item_added = ResponseOutputItemAddedEvent {
+                    }),
+                ]
+            }
+            StorageMessage::ReasoningStarted { item_id } => {
+                let output_index = self.client_state.push_reasoning(item_id);
+                vec![ResponseEvent::OutputItemAdded(
+                    ResponseOutputItemAddedEvent {
                         event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         output_index,
                         item: OutputItem {
                             id: item_id.to_string(),
@@ -4176,50 +4750,48 @@ async fn create_response_stream(
                             arguments: None,
                             output: None,
                         },
-                    };
-                    yield Ok(ResponseEvent::OutputItemAdded(reasoning_item_added).to_sse_event(&mut emitter).await);
-                }
-                StorageMessage::ReasoningDelta { item_id, delta } => {
-                    let Some(output_index) = client_state.append_reasoning_delta(item_id, &delta) else {
-                        warn!("Received reasoning delta for unknown item {}", item_id);
-                        continue;
-                    };
-
-                    let delta_event = ResponseReasoningTextDeltaEvent {
+                    },
+                )]
+            }
+            StorageMessage::ReasoningDelta { item_id, delta } => {
+                let Some(output_index) = self.client_state.append_reasoning_delta(item_id, &delta)
+                else {
+                    warn!("Received reasoning delta for unknown item {}", item_id);
+                    return Vec::new();
+                };
+                vec![ResponseEvent::ReasoningTextDelta(
+                    ResponseReasoningTextDeltaEvent {
                         event_type: EVENT_RESPONSE_REASONING_TEXT_DELTA,
                         delta,
                         item_id: item_id.to_string(),
                         output_index,
                         content_index: 0,
-                        sequence_number: emitter.sequence_number(),
-                    };
-
-                    yield Ok(ResponseEvent::ReasoningTextDelta(delta_event).to_sse_event(&mut emitter).await);
-                }
-                StorageMessage::ReasoningDone { item_id } => {
-                    debug!(
-                        "Client stream received reasoning_done {} for response {}",
-                        item_id, response_uuid
-                    );
-                    let Some(output_index) = client_state.reasoning_output_index(item_id) else {
-                        warn!("Received reasoning done for unknown item {}", item_id);
-                        continue;
-                    };
-                    let text = client_state.reasoning_text(item_id).unwrap_or("").to_string();
-
-                    let reasoning_done_event = ResponseReasoningTextDoneEvent {
+                        sequence_number: 0,
+                    },
+                )]
+            }
+            StorageMessage::ReasoningDone { item_id } => {
+                let Some(output_index) = self.client_state.reasoning_output_index(item_id) else {
+                    warn!("Received reasoning done for unknown item {}", item_id);
+                    return Vec::new();
+                };
+                let text = self
+                    .client_state
+                    .reasoning_text(item_id)
+                    .unwrap_or("")
+                    .to_string();
+                vec![
+                    ResponseEvent::ReasoningTextDone(ResponseReasoningTextDoneEvent {
                         event_type: EVENT_RESPONSE_REASONING_TEXT_DONE,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         item_id: item_id.to_string(),
                         output_index,
                         content_index: 0,
                         text,
-                    };
-                    yield Ok(ResponseEvent::ReasoningTextDone(reasoning_done_event).to_sse_event(&mut emitter).await);
-
-                    let reasoning_item_done = ResponseOutputItemDoneEvent {
+                    }),
+                    ResponseEvent::OutputItemDone(ResponseOutputItemDoneEvent {
                         event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         output_index,
                         item: OutputItem {
                             id: item_id.to_string(),
@@ -4232,83 +4804,78 @@ async fn create_response_stream(
                             arguments: None,
                             output: None,
                         },
-                    };
-                    yield Ok(ResponseEvent::OutputItemDone(reasoning_item_done).to_sse_event(&mut emitter).await);
-                }
-                StorageMessage::ResponseDone { finish_reason: _finish_reason } => {
-                    let usage = build_usage(
-                        if total_prompt_tokens_used > 0 {
-                            total_prompt_tokens_used
-                        } else {
-                            total_prompt_tokens as i32
-                        },
-                        total_completion_tokens,
-                    );
-
-                    let done_response = ResponseBuilder::from_response(&response_for_stream)
-                        .status(STATUS_COMPLETED)
-                        .output(client_state.build_output_items())
-                        .usage(usage)
-                        .metadata(decrypted_metadata.clone())
-                        .build();
-
-                    let completed_event = ResponseCompletedEvent {
-                        event_type: EVENT_RESPONSE_COMPLETED,
-                        response: done_response,
-                        sequence_number: emitter.sequence_number(),
-                    };
-
-                    yield Ok(ResponseEvent::Completed(completed_event).to_sse_event(&mut emitter).await);
-                    break;
-                }
-                StorageMessage::Usage { prompt_tokens, completion_tokens } => {
-                    trace!("Client stream received usage data");
-                    total_prompt_tokens_used += prompt_tokens;
-                    total_completion_tokens += completion_tokens;
-                }
-                StorageMessage::Cancelled => {
-                    debug!("Client stream received cancellation signal");
-                    // Send response.cancelled event
-                    let cancelled_event = ResponseCancelledEvent {
-                        id: Uuid::new_v4().to_string(),
-                        event_type: EVENT_RESPONSE_CANCELLED,
-                        created_at: Utc::now().timestamp(),
-                        data: ResponseCancelledData {
-                            id: response_uuid,
-                        },
-                    };
-
-                    yield Ok(ResponseEvent::Cancelled(cancelled_event).to_sse_event(&mut emitter).await);
-                    break;
-                }
-                StorageMessage::Error(error_msg) => {
-                    error!("Client stream received error: {}", error_msg);
-                    // Send error event to client
-                    let error_event = ResponseErrorEvent {
-                        event_type: EVENT_RESPONSE_ERROR,
-                        error: ResponseError {
-                            error_type: "stream_error".to_string(),
-                            message: error_msg,
-                        },
-                    };
-
-                    yield Ok(ResponseEvent::Error(error_event).to_sse_event(&mut emitter).await);
-                    break;
-                }
-                StorageMessage::ToolCall { tool_call_id, name, arguments } => {
-                    debug!(
-                        "Client stream received tool_call {} ({}) for response {}",
-                        tool_call_id, name, response_uuid
-                    );
-                    let tool_name = name.clone();
-                    let arguments_json =
-                        serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
-                    let output_index =
-                        client_state.push_tool_call(tool_call_id, tool_name.clone(), arguments.clone());
-
-                    let output_item_added_event = ResponseOutputItemAddedEvent {
+                    }),
+                ]
+            }
+            StorageMessage::ResponseDone { .. } => {
+                let usage = build_usage(
+                    if self.total_prompt_tokens_used > 0 {
+                        self.total_prompt_tokens_used
+                    } else {
+                        self.view.total_prompt_tokens as i32
+                    },
+                    self.total_completion_tokens,
+                );
+                let done_response = ResponseBuilder::from_response(&self.view.response)
+                    .status(STATUS_COMPLETED)
+                    .output(self.client_state.build_output_items())
+                    .usage(usage)
+                    .metadata(self.view.decrypted_metadata.clone())
+                    .build();
+                self.terminal = true;
+                vec![ResponseEvent::Completed(ResponseCompletedEvent {
+                    event_type: EVENT_RESPONSE_COMPLETED,
+                    response: done_response,
+                    sequence_number: 0,
+                })]
+            }
+            StorageMessage::Usage {
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                self.total_prompt_tokens_used += prompt_tokens;
+                self.total_completion_tokens += completion_tokens;
+                Vec::new()
+            }
+            StorageMessage::Cancelled => {
+                self.terminal = true;
+                vec![ResponseEvent::Cancelled(ResponseCancelledEvent {
+                    id: Uuid::new_v4().to_string(),
+                    event_type: EVENT_RESPONSE_CANCELLED,
+                    created_at: Utc::now().timestamp(),
+                    data: ResponseCancelledData {
+                        id: self.view.response.uuid,
+                    },
+                })]
+            }
+            StorageMessage::Error(error_msg) => {
+                error!("Client stream received error: {}", error_msg);
+                self.terminal = true;
+                vec![ResponseEvent::Error(ResponseErrorEvent {
+                    event_type: EVENT_RESPONSE_ERROR,
+                    error: ResponseError {
+                        error_type: "stream_error".to_string(),
+                        message: error_msg,
+                    },
+                })]
+            }
+            StorageMessage::ToolCall {
+                tool_call_id,
+                name,
+                arguments,
+            } => {
+                let tool_name = name.clone();
+                let arguments_json =
+                    serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
+                let output_index = self.client_state.push_tool_call(
+                    tool_call_id,
+                    tool_name.clone(),
+                    arguments.clone(),
+                );
+                vec![
+                    ResponseEvent::OutputItemAdded(ResponseOutputItemAddedEvent {
                         event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         output_index,
                         item: OutputItem {
                             id: tool_call_id.to_string(),
@@ -4321,25 +4888,18 @@ async fn create_response_stream(
                             arguments: Some(arguments_json.clone()),
                             output: None,
                         },
-                    };
-
-                    yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
-
-                    // Send tool_call.created event
-                    let tool_call_event = ToolCallCreatedEvent {
+                    }),
+                    ResponseEvent::ToolCallCreated(ToolCallCreatedEvent {
                         event_type: EVENT_TOOL_CALL_CREATED,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         output_index,
                         tool_call_id,
                         name,
                         arguments,
-                    };
-
-                    yield Ok(ResponseEvent::ToolCallCreated(tool_call_event).to_sse_event(&mut emitter).await);
-
-                    let output_item_done_event = ResponseOutputItemDoneEvent {
+                    }),
+                    ResponseEvent::OutputItemDone(ResponseOutputItemDoneEvent {
                         event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         output_index,
                         item: OutputItem {
                             id: tool_call_id.to_string(),
@@ -4352,23 +4912,23 @@ async fn create_response_stream(
                             arguments: Some(arguments_json),
                             output: None,
                         },
-                    };
-
-                    yield Ok(ResponseEvent::OutputItemDone(output_item_done_event).to_sse_event(&mut emitter).await);
-                }
-                StorageMessage::ToolOutput { tool_output_id, tool_call_id, output } => {
-                    debug!(
-                        "Client stream received tool_output {} for tool_call {} on response {}",
-                        tool_output_id, tool_call_id, response_uuid
-                    );
-                    let output_index = client_state.push_tool_output(
-                        tool_output_id,
-                        tool_call_id,
-                        output.clone(),
-                    );
-                    let output_item_added_event = ResponseOutputItemAddedEvent {
+                    }),
+                ]
+            }
+            StorageMessage::ToolOutput {
+                tool_output_id,
+                tool_call_id,
+                output,
+            } => {
+                let output_index = self.client_state.push_tool_output(
+                    tool_output_id,
+                    tool_call_id,
+                    output.clone(),
+                );
+                vec![
+                    ResponseEvent::OutputItemAdded(ResponseOutputItemAddedEvent {
                         event_type: EVENT_RESPONSE_OUTPUT_ITEM_ADDED,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         output_index,
                         item: OutputItem {
                             id: tool_output_id.to_string(),
@@ -4381,25 +4941,18 @@ async fn create_response_stream(
                             arguments: None,
                             output: Some(output.clone()),
                         },
-                    };
-
-                    yield Ok(ResponseEvent::OutputItemAdded(output_item_added_event).to_sse_event(&mut emitter).await);
-
-                    // Send tool_output.created event
-                    let tool_output_event = ToolOutputCreatedEvent {
+                    }),
+                    ResponseEvent::ToolOutputCreated(ToolOutputCreatedEvent {
                         event_type: EVENT_TOOL_OUTPUT_CREATED,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         output_index,
                         tool_output_id,
                         tool_call_id,
                         output: output.clone(),
-                    };
-
-                    yield Ok(ResponseEvent::ToolOutputCreated(tool_output_event).to_sse_event(&mut emitter).await);
-
-                    let output_item_done_event = ResponseOutputItemDoneEvent {
+                    }),
+                    ResponseEvent::OutputItemDone(ResponseOutputItemDoneEvent {
                         event_type: EVENT_RESPONSE_OUTPUT_ITEM_DONE,
-                        sequence_number: emitter.sequence_number(),
+                        sequence_number: 0,
                         output_index,
                         item: OutputItem {
                             id: tool_output_id.to_string(),
@@ -4412,21 +4965,167 @@ async fn create_response_stream(
                             arguments: None,
                             output: Some(output),
                         },
-                    };
+                    }),
+                ]
+            }
+        }
+    }
+}
 
-                    yield Ok(ResponseEvent::OutputItemDone(output_item_done_event).to_sse_event(&mut emitter).await);
+fn responses_event_stream(
+    view: ResponsesStreamView,
+    start_job: StartResponsesJobFuture,
+) -> ResponsesEventStream {
+    let stream = async_stream::stream! {
+        let mut projector = ResponseEventProjector::new(view);
+        for event in projector.initial_events() {
+            yield event;
+        }
+
+        let StartedResponsesJob {
+            mut rx_client,
+            _legacy_sender_guards,
+        } = start_job.await;
+        while let Some(message) = rx_client.recv().await {
+            for event in projector.project(message) {
+                let terminal = event.is_terminal();
+                yield event;
+                if terminal {
+                    return;
                 }
             }
         }
 
-        // Client stream is done, but storage and upstream tasks continue independently
-        trace!("Client SSE stream ending");
+        if !projector.is_terminal() {
+            warn!("Responses event source closed without an application terminal");
+        }
+    };
+    Box::pin(stream)
+}
+
+async fn create_response_stream(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Extension(session_id): Extension<TransportSession>,
+    Extension(user): Extension<User>,
+    Extension(auth_context): Extension<AuthContext>,
+    Extension(body): Extension<ResponsesCreateRequest>,
+) -> Result<Response, ApiError> {
+    let (view, job) = prepare_responses_job(
+        state.clone(),
+        headers,
+        user,
+        auth_context,
+        body,
+        ResponsesExecutionPolicy::LegacyV1,
+    )
+    .await?;
+
+    // Preserve the v1 lifecycle: the detached job is not polled until after
+    // response.created and response.in_progress have been projected.
+    let response_events = responses_event_stream(view, Box::pin(async move { job.start().await }));
+    let event_stream = async_stream::stream! {
+        let mut emitter = SseEventEmitter::new(&state, session_id, 0);
+        let mut response_events = response_events;
+        while let Some(mut event) = response_events.next().await {
+            event.set_sequence_number(emitter.sequence_number());
+            yield Ok::<Event, Infallible>(event.to_sse_event(&mut emitter).await);
+        }
     };
 
-    trace!("Returning SSE stream");
     Ok(responses_sse_response(event_stream))
 }
 
+/// Prepare and start a Responses job for authenticated transport v2.
+///
+/// Pre-start validation and persistence failures are returned to the v2
+/// application layer as ordinary authenticated unary errors. Once returned,
+/// the logical stream contains plaintext OpenAI SSE bytes and an explicit
+/// authenticated terminal signal.
+pub(crate) async fn responses_stream_v2_data(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    user: User,
+    auth_context: AuthContext,
+    body: ResponsesCreateRequest,
+    cache_namespace: DerivedCacheNamespace,
+    stream_guard: StreamExecutionGuard,
+) -> Result<LogicalByteStream, ApiError> {
+    let projection_guard = stream_guard.clone();
+    let execution_policy = ResponsesExecutionPolicy::BoundV2 {
+        cache_namespace,
+        stream_guard,
+    };
+    let (view, job) =
+        prepare_responses_job(state, headers, user, auth_context, body, execution_policy).await?;
+
+    // Start storage/orchestration before the first application event is polled.
+    // Their own guard clones keep provider capacity admitted if the carrier is
+    // dropped before or immediately after response.created.
+    let started = job.start().await;
+    let response_events = responses_event_stream(view, Box::pin(future::ready(started)));
+
+    Ok(responses_v2_logical_stream(
+        response_events,
+        Some(projection_guard),
+    ))
+}
+
+fn responses_v2_logical_stream(
+    mut response_events: ResponsesEventStream,
+    stream_guard: Option<StreamExecutionGuard>,
+) -> LogicalByteStream {
+    let stream = async_stream::stream! {
+        let _stream_guard = stream_guard;
+        let mut sequence_number = 0_i32;
+        let mut emitted_bytes = 0_usize;
+
+        while let Some(mut event) = response_events.next().await {
+            event.set_sequence_number(sequence_number);
+            let terminal = event.is_terminal();
+            let advances_sequence = event.advances_sequence();
+            let frame = match event.to_plaintext_sse_frame() {
+                Ok(frame) => frame,
+                Err(error) => {
+                    error!("Failed to serialize a v2 Responses event: {error:?}");
+                    yield LogicalStreamItem::Failure(LogicalStreamFailure::internal());
+                    return;
+                }
+            };
+            if frame.len()
+                > V2_MAX_LOGICAL_RESPONSES_STREAM_BYTES.saturating_sub(emitted_bytes)
+            {
+                error!(
+                    limit_bytes = V2_MAX_LOGICAL_RESPONSES_STREAM_BYTES,
+                    "V2 Responses logical stream exceeded its byte limit"
+                );
+                yield LogicalStreamItem::Failure(LogicalStreamFailure::internal());
+                return;
+            }
+            emitted_bytes += frame.len();
+
+            yield LogicalStreamItem::Bytes(frame);
+            if terminal {
+                yield LogicalStreamItem::Complete;
+                return;
+            }
+
+            if advances_sequence {
+                let Some(next_sequence) = sequence_number.checked_add(1) else {
+                    error!("V2 Responses application sequence exhausted");
+                    yield LogicalStreamItem::Failure(LogicalStreamFailure::internal());
+                    return;
+                };
+                sequence_number = next_sequence;
+            }
+        }
+
+        error!("V2 Responses event source closed without an application terminal");
+        yield LogicalStreamItem::Failure(LogicalStreamFailure::internal());
+    };
+
+    Box::pin(stream)
+}
 fn responses_sse_response<S>(event_stream: S) -> Response
 where
     S: Stream<Item = Result<Event, Infallible>> + Send + 'static,

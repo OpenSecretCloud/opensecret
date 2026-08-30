@@ -8,6 +8,7 @@
 
 use std::collections::hash_map::RandomState;
 use std::future::Future;
+use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -18,6 +19,8 @@ use axum::http::{header, HeaderMap, Request, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
@@ -31,26 +34,33 @@ use crate::{AppState, AsyncRngWrapper};
 
 use super::application::{
     begin_authentication_transition, execute_user_operation, prepare_user_operation,
-    LogicalUnaryResponse, OperationPreparation, SessionEffect,
+    LogicalApplicationResponse, LogicalUnaryResponse, OperationPreparation, SessionEffect,
 };
 use super::crypto::{
     encrypt_key_exchange_record, CryptoError, DirectionalKeys, HandshakePayload, SessionMaster,
+    RECORD_OVERHEAD_BYTES,
 };
 use super::envelope::{
-    EncodedBytes, EnvelopeLimits, RequestEnvelope, UnaryResponseEnvelope, Version2,
+    EncodedBytes, EnvelopeLimits, RequestEnvelope, StreamRecord, UnaryResponseEnvelope, Version2,
+    MAX_STREAM_CHUNK_BYTES, MAX_STREAM_ERROR_BYTES,
 };
 use super::session::{
-    GlobalReplayBudget, ReplayClaim, SessionRecordError, UnaryResponseReservation, V2SessionState,
+    GlobalReplayBudget, ReplayClaim, SessionRecordError, StreamResponseAdmission,
+    StreamResponseReservation, UnaryResponseReservation, V2SessionState,
     DEFAULT_ABSOLUTE_SESSION_LIFETIME, DEFAULT_GLOBAL_REPLAY_IDS,
 };
 use super::session_cache::{V2SessionCache, V2SessionInsertError, V2SessionLease};
+use super::streaming::{
+    LogicalStreamFailure, LogicalStreamItem, LogicalStreamResponse, StreamExecutionGuard,
+};
 use super::{MAX_LIVE_SESSIONS, MAX_PENDING_ATTESTATIONS};
 
 const MAX_ATTESTATION_NONCE_BYTES: usize = 512;
 const PENDING_ATTESTATION_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_KEY_EXCHANGE_BODY_BYTES: usize = 4 * 1024;
-const MAX_OUTER_REQUEST_BODY_BYTES: usize = 50 * 1024 * 1024;
-const REQUEST_WORKING_SET_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const MAX_OUTER_REQUEST_BODY_BYTES: usize =
+    EnvelopeLimits::REQUEST.envelope_bytes + RECORD_OVERHEAD_BYTES;
+const REQUEST_WORKING_SET_BUDGET_BYTES: usize = 320 * 1024 * 1024;
 const REQUEST_WORKING_SET_UNIT_BYTES: usize = 64 * 1024;
 const REQUEST_WORKING_SET_MULTIPLIER: usize = 4;
 const REQUEST_WORKING_SET_UNITS: usize =
@@ -401,9 +411,9 @@ impl TransportV2State {
         app_state: Arc<AppState>,
         session_id: Uuid,
         encrypted: &[u8],
-        working_set_permit: &mut OwnedSemaphorePermit,
+        mut working_set_permit: OwnedSemaphorePermit,
         now: Instant,
-    ) -> Result<EncryptedOuterResponse, GatewayError> {
+    ) -> Result<Response, GatewayError> {
         let (lease, envelope) = self
             .decrypt_request_envelope(session_id, encrypted, now)
             .await?;
@@ -411,7 +421,7 @@ impl TransportV2State {
 
         let operation = match prepare_user_operation(envelope, lease.state().authority()) {
             OperationPreparation::Unsupported => {
-                return encrypt_new_logical_response(
+                let response = encrypt_new_logical_response(
                     &lease,
                     request_id,
                     LogicalUnaryResponse::protocol_error(
@@ -419,31 +429,58 @@ impl TransportV2State {
                         "not_found",
                         "Not found",
                     ),
-                );
+                )?;
+                return Ok(encrypted_outer_http_response(response, working_set_permit));
             }
             OperationPreparation::Rejected(response) => {
-                return encrypt_new_logical_response(&lease, request_id, response);
+                let response = encrypt_new_logical_response(&lease, request_id, response)?;
+                return Ok(encrypted_outer_http_response(response, working_set_permit));
             }
             OperationPreparation::Ready(operation) => operation,
         };
 
-        self.process_ready_operation(
-            &lease,
-            request_id,
-            operation,
-            working_set_permit,
-            now,
-            move |dispatch_lease, operation, authentication, admitted_at| {
-                execute_user_operation(
-                    app_state,
-                    dispatch_lease,
+        if operation.is_streaming() {
+            return self
+                .process_ready_stream_operation(
+                    &lease,
+                    request_id,
                     operation,
-                    authentication,
-                    admitted_at,
+                    working_set_permit,
+                    now,
+                    move |dispatch_lease, operation, authentication, admitted_at, stream_guard| {
+                        execute_user_operation(
+                            app_state,
+                            dispatch_lease,
+                            operation,
+                            authentication,
+                            admitted_at,
+                            Some(stream_guard),
+                        )
+                    },
                 )
-            },
-        )
-        .await
+                .await;
+        }
+
+        let response = self
+            .process_ready_operation(
+                &lease,
+                request_id,
+                operation,
+                &mut working_set_permit,
+                now,
+                move |dispatch_lease, operation, authentication, admitted_at| {
+                    execute_user_operation(
+                        app_state,
+                        dispatch_lease,
+                        operation,
+                        authentication,
+                        admitted_at,
+                        None,
+                    )
+                },
+            )
+            .await?;
+        Ok(encrypted_outer_http_response(response, working_set_permit))
     }
 
     async fn process_ready_operation<Dispatch, DispatchFuture>(
@@ -560,14 +597,173 @@ impl TransportV2State {
             // usable while Closing so this admitted response can still finish.
             lease.state().close();
         }
-        let encrypted =
-            encrypt_reserved_logical_response(lease, request_id, reservation, outcome.response);
+        let LogicalApplicationResponse::Unary(response) = outcome.response else {
+            lease.state().close();
+            return Err(GatewayError::Internal);
+        };
+        let encrypted = encrypt_reserved_logical_response(lease, request_id, reservation, response);
         if encrypted.is_err() && session_effect == SessionEffect::NewlyBound {
             // Never leave a newly authenticated session reachable when its
             // only binding response could not be authenticated to the client.
             lease.state().close();
         }
         encrypted
+    }
+
+    async fn process_ready_stream_operation<Dispatch, DispatchFuture>(
+        &self,
+        lease: &V2SessionLease,
+        request_id: super::envelope::RequestId,
+        operation: super::application::UserOperation,
+        mut working_set_permit: OwnedSemaphorePermit,
+        now: Instant,
+        dispatch: Dispatch,
+    ) -> Result<Response, GatewayError>
+    where
+        Dispatch: FnOnce(
+            V2SessionLease,
+            super::application::UserOperation,
+            Option<super::session::AuthenticationReservation>,
+            Instant,
+            StreamExecutionGuard,
+        ) -> DispatchFuture,
+        DispatchFuture: Future<Output = super::application::ApplicationOutcome>,
+    {
+        let reservation = match lease
+            .state()
+            .begin_stream_response_or_exhaustion(request_id)
+        {
+            Ok(StreamResponseAdmission::Stream(reservation)) => reservation,
+            Ok(StreamResponseAdmission::ExhaustionResponse(unary)) => {
+                let response = encrypt_reserved_logical_response(
+                    lease,
+                    request_id,
+                    unary,
+                    LogicalUnaryResponse::protocol_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "session_exhausted",
+                        "Session response capacity is exhausted",
+                    ),
+                )?;
+                return Ok(encrypted_outer_http_response(response, working_set_permit));
+            }
+            Err(error) => return Err(GatewayError::from_session_record(error)),
+        };
+
+        if self
+            .promote_provider_output_working_set(&mut working_set_permit)
+            .is_err()
+        {
+            return encrypt_pre_start_unary_http_response(
+                lease,
+                request_id,
+                reservation,
+                LogicalUnaryResponse::protocol_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "provider_output_unavailable",
+                    "Provider response capacity is unavailable",
+                ),
+                working_set_permit,
+            );
+        }
+
+        match lease.state().claim_request_id(request_id) {
+            ReplayClaim::Claimed => {}
+            ReplayClaim::Duplicate => {
+                return encrypt_pre_start_unary_http_response(
+                    lease,
+                    request_id,
+                    reservation,
+                    LogicalUnaryResponse::protocol_error(
+                        StatusCode::CONFLICT,
+                        "replay_detected",
+                        "Request identifier has already been used",
+                    ),
+                    working_set_permit,
+                );
+            }
+            ReplayClaim::Exhausted => {
+                return encrypt_pre_start_unary_http_response(
+                    lease,
+                    request_id,
+                    reservation,
+                    LogicalUnaryResponse::protocol_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "session_exhausted",
+                        "Session request capacity is exhausted",
+                    ),
+                    working_set_permit,
+                );
+            }
+        }
+
+        let authentication = match begin_authentication_transition(&operation, lease, request_id) {
+            Ok(authentication) => authentication,
+            Err(response) => {
+                return encrypt_pre_start_unary_http_response(
+                    lease,
+                    request_id,
+                    reservation,
+                    response,
+                    working_set_permit,
+                );
+            }
+        };
+
+        if !self.mark_admitted(lease).await {
+            lease.state().close();
+            return encrypt_pre_start_unary_http_response(
+                lease,
+                request_id,
+                reservation,
+                LogicalUnaryResponse::protocol_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "session_unavailable",
+                    "Session is unavailable",
+                ),
+                working_set_permit,
+            );
+        }
+
+        let stream_guard = StreamExecutionGuard::new(working_set_permit);
+        let outcome = dispatch(
+            lease.clone(),
+            operation,
+            authentication,
+            now,
+            stream_guard.clone(),
+        )
+        .await;
+        let session_effect = outcome.session_effect;
+        if session_effect == SessionEffect::Close {
+            lease.state().close();
+        }
+
+        match outcome.response {
+            LogicalApplicationResponse::Unary(response) => {
+                let unary = reservation
+                    .into_unary_before_start()
+                    .map_err(GatewayError::from_session_record)?;
+                let encrypted =
+                    encrypt_reserved_logical_response(lease, request_id, unary, response);
+                if encrypted.is_err() && session_effect == SessionEffect::NewlyBound {
+                    lease.state().close();
+                }
+                Ok(encrypted_outer_http_response(encrypted?, stream_guard))
+            }
+            LogicalApplicationResponse::Stream(response) => {
+                let response = encrypted_stream_http_response(
+                    lease.clone(),
+                    reservation,
+                    response,
+                    stream_guard,
+                );
+                if response.is_err() && session_effect == SessionEffect::NewlyBound {
+                    lease.state().close();
+                }
+                response
+            }
+        }
     }
 
     async fn decrypt_request_envelope(
@@ -581,7 +777,7 @@ impl TransportV2State {
             .state()
             .decrypt_request_record(encrypted)
             .map_err(GatewayError::from_session_record)?;
-        let parsed = RequestEnvelope::from_json_slice(&plaintext, &EnvelopeLimits::default());
+        let parsed = RequestEnvelope::from_json_slice(&plaintext, &EnvelopeLimits::REQUEST);
         plaintext.zeroize();
         let envelope = parsed.map_err(|_| GatewayError::InvalidRequest)?;
         Ok((lease, envelope))
@@ -671,8 +867,8 @@ async fn encrypted_request(
     request: Request<Body>,
 ) -> Result<Response, GatewayError> {
     let session_id = parse_request_session_id(request.uri(), request.headers())?;
-    validate_json_content_type(request.headers())?;
-    let mut working_set_permit = app_state
+    validate_octet_stream_content_type(request.headers())?;
+    let working_set_permit = app_state
         .transport_v2_state
         .reserve_request_working_set(request.headers())?;
 
@@ -680,30 +876,268 @@ async fn encrypted_request(
     // oversized outer request therefore cannot pin secret-bearing session
     // state or prevent cache eviction.
     let body = read_bounded_body(request.into_body(), MAX_OUTER_REQUEST_BODY_BYTES).await?;
-    let outer = parse_encrypted_outer_request(&body, MAX_OUTER_REQUEST_BODY_BYTES)?;
-    drop(body);
-    let encrypted = outer.encrypted.into_bytes();
+    validate_encrypted_outer_request(&body)?;
 
     let response = app_state
         .transport_v2_state
         .process_encrypted_request(
             Arc::clone(&app_state),
             session_id,
-            &encrypted,
-            &mut working_set_permit,
+            &body,
+            working_set_permit,
             Instant::now(),
         )
         .await?;
-    drop(encrypted);
-    Ok(encrypted_outer_http_response(response, working_set_permit))
+    drop(body);
+    Ok(response)
 }
 
-fn encrypted_outer_http_response(
+fn encrypted_outer_http_response<T>(
     response: EncryptedOuterResponse,
-    working_set_permit: OwnedSemaphorePermit,
-) -> Response {
-    let response = Json(response).into_response();
-    hold_resource_through_response_body(response, working_set_permit)
+    working_set_resource: T,
+) -> Response
+where
+    T: Send + Unpin + 'static,
+{
+    let response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CACHE_CONTROL, "no-store, no-transform")
+        .body(Body::from(response.encrypted))
+        .expect("static v2 unary response metadata must be valid");
+    hold_resource_through_response_body(response, working_set_resource)
+}
+
+fn encrypt_pre_start_unary_http_response<T>(
+    lease: &V2SessionLease,
+    request_id: super::envelope::RequestId,
+    reservation: StreamResponseReservation,
+    response: LogicalUnaryResponse,
+    working_set_resource: T,
+) -> Result<Response, GatewayError>
+where
+    T: Send + Unpin + 'static,
+{
+    let unary = reservation
+        .into_unary_before_start()
+        .map_err(GatewayError::from_session_record)?;
+    let encrypted = encrypt_reserved_logical_response(lease, request_id, unary, response)?;
+    Ok(encrypted_outer_http_response(
+        encrypted,
+        working_set_resource,
+    ))
+}
+
+fn encrypted_stream_http_response(
+    lease: V2SessionLease,
+    mut reservation: StreamResponseReservation,
+    response: LogicalStreamResponse,
+    stream_guard: StreamExecutionGuard,
+) -> Result<Response, GatewayError> {
+    let start = encrypt_stream_start(&lease, &mut reservation, response.status, response.headers)?;
+    let start_frame = encrypted_outer_sse_frame(start);
+    let mut application_stream = response.stream;
+
+    let encrypted_stream = async_stream::stream! {
+        // Keeping these resources inside the body guarantees that an unpolled
+        // response retains both the exact session lease and its promoted
+        // working-set admission until the response itself is dropped.
+        let _stream_guard = stream_guard;
+        let _lease_guard = &lease;
+        yield Ok::<bytes::Bytes, io::Error>(start_frame);
+
+        let mut terminal_emitted = false;
+        'application: while let Some(item) = application_stream.next().await {
+            match item {
+                LogicalStreamItem::Bytes(bytes) => {
+                    for chunk in bytes.chunks(MAX_STREAM_CHUNK_BYTES) {
+                        if chunk.is_empty() {
+                            continue;
+                        }
+                        match encrypt_stream_chunk(&lease, &mut reservation, chunk) {
+                            Ok(encrypted) => {
+                                yield Ok(encrypted_outer_sse_frame(encrypted));
+                            }
+                            Err(GatewayError::Unavailable) => {
+                                let failure = LogicalStreamFailure::protocol(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    "session_exhausted",
+                                    "Session response capacity is exhausted",
+                                );
+                                match encrypt_stream_error(&lease, &mut reservation, failure) {
+                                    Ok(encrypted) => {
+                                        yield Ok(encrypted_outer_sse_frame(encrypted));
+                                    }
+                                    Err(_) => {
+                                        yield Err(stream_transport_io_error());
+                                    }
+                                }
+                                terminal_emitted = true;
+                                break 'application;
+                            }
+                            Err(_) => {
+                                yield Err(stream_transport_io_error());
+                                terminal_emitted = true;
+                                break 'application;
+                            }
+                        }
+                    }
+                }
+                LogicalStreamItem::Complete => {
+                    match encrypt_stream_end(&lease, &mut reservation) {
+                        Ok(encrypted) => yield Ok(encrypted_outer_sse_frame(encrypted)),
+                        Err(_) => yield Err(stream_transport_io_error()),
+                    }
+                    terminal_emitted = true;
+                    break;
+                }
+                LogicalStreamItem::Failure(failure) => {
+                    match encrypt_stream_error(&lease, &mut reservation, failure) {
+                        Ok(encrypted) => yield Ok(encrypted_outer_sse_frame(encrypted)),
+                        Err(_) => yield Err(stream_transport_io_error()),
+                    }
+                    terminal_emitted = true;
+                    break;
+                }
+            }
+        }
+
+        if !terminal_emitted {
+            match encrypt_stream_error(
+                &lease,
+                &mut reservation,
+                LogicalStreamFailure::internal(),
+            ) {
+                Ok(encrypted) => yield Ok(encrypted_outer_sse_frame(encrypted)),
+                Err(_) => yield Err(stream_transport_io_error()),
+            }
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(encrypted_stream))
+        .map_err(|_| GatewayError::Internal)
+}
+
+fn encrypt_stream_start(
+    lease: &V2SessionLease,
+    reservation: &mut StreamResponseReservation,
+    status: StatusCode,
+    headers: Vec<super::envelope::HeaderField>,
+) -> Result<Vec<u8>, GatewayError> {
+    let record = StreamRecord::Start {
+        version: Version2,
+        request_id: reservation.request_id(),
+        sequence: 0,
+        status: status.as_u16(),
+        headers,
+    };
+    let mut plaintext = serialize_stream_record(record)?;
+    let encrypted = lease
+        .state()
+        .encrypt_stream_start_record(reservation, &plaintext)
+        .map_err(GatewayError::from_session_record);
+    plaintext.zeroize();
+    encrypted
+}
+
+fn encrypt_stream_chunk(
+    lease: &V2SessionLease,
+    reservation: &mut StreamResponseReservation,
+    body: &[u8],
+) -> Result<Vec<u8>, GatewayError> {
+    let sequence = reservation
+        .next_sequence()
+        .map_err(GatewayError::from_session_record)?;
+    let record = StreamRecord::Chunk {
+        version: Version2,
+        request_id: reservation.request_id(),
+        sequence,
+        body_base64: EncodedBytes::from_bytes(body.to_vec()),
+    };
+    let mut plaintext = serialize_stream_record(record)?;
+    let encrypted = lease
+        .state()
+        .encrypt_stream_chunk_record(reservation, &plaintext)
+        .map_err(GatewayError::from_session_record);
+    plaintext.zeroize();
+    encrypted
+}
+
+fn encrypt_stream_end(
+    lease: &V2SessionLease,
+    reservation: &mut StreamResponseReservation,
+) -> Result<Vec<u8>, GatewayError> {
+    let sequence = reservation
+        .next_sequence()
+        .map_err(GatewayError::from_session_record)?;
+    let record = StreamRecord::End {
+        version: Version2,
+        request_id: reservation.request_id(),
+        sequence,
+    };
+    let mut plaintext = serialize_stream_record(record)?;
+    let encrypted = lease
+        .state()
+        .encrypt_stream_terminal_record(reservation, &plaintext)
+        .map_err(GatewayError::from_session_record);
+    plaintext.zeroize();
+    encrypted
+}
+
+fn encrypt_stream_error(
+    lease: &V2SessionLease,
+    reservation: &mut StreamResponseReservation,
+    mut failure: LogicalStreamFailure,
+) -> Result<Vec<u8>, GatewayError> {
+    if !failure.status.is_client_error() && !failure.status.is_server_error() {
+        failure = LogicalStreamFailure::internal();
+    }
+    if failure.body.len() > MAX_STREAM_ERROR_BYTES {
+        failure = LogicalStreamFailure::internal();
+    }
+    let sequence = reservation
+        .next_sequence()
+        .map_err(GatewayError::from_session_record)?;
+    let record = StreamRecord::Error {
+        version: Version2,
+        request_id: reservation.request_id(),
+        sequence,
+        status: failure.status.as_u16(),
+        body_base64: EncodedBytes::from_bytes(std::mem::take(&mut *failure.body)),
+    };
+    let mut plaintext = serialize_stream_record(record)?;
+    let encrypted = lease
+        .state()
+        .encrypt_stream_terminal_record(reservation, &plaintext)
+        .map_err(GatewayError::from_session_record);
+    plaintext.zeroize();
+    encrypted
+}
+
+fn serialize_stream_record(record: StreamRecord) -> Result<Vec<u8>, GatewayError> {
+    record
+        .validate(&EnvelopeLimits::default())
+        .map_err(|_| GatewayError::Internal)?;
+    serde_json::to_vec(&record).map_err(|_| GatewayError::Internal)
+}
+
+fn encrypted_outer_sse_frame(mut encrypted: Vec<u8>) -> bytes::Bytes {
+    let encoded = STANDARD.encode(&encrypted);
+    encrypted.zeroize();
+    let mut frame = Vec::with_capacity("data: ".len() + encoded.len() + 2);
+    frame.extend_from_slice(b"data: ");
+    frame.extend_from_slice(encoded.as_bytes());
+    frame.extend_from_slice(b"\n\n");
+    bytes::Bytes::from(frame)
+}
+
+fn stream_transport_io_error() -> io::Error {
+    io::Error::other("encrypted stream terminated")
 }
 
 #[derive(Deserialize)]
@@ -772,15 +1206,9 @@ fn prepare_key_exchange(
     Ok(PreparedKeyExchange { session, response })
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EncryptedOuterRequest {
-    encrypted: EncodedBytes,
-}
-
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 struct EncryptedOuterResponse {
-    encrypted: EncodedBytes,
+    encrypted: Vec<u8>,
 }
 
 fn encrypt_new_logical_response(
@@ -830,9 +1258,7 @@ fn encrypt_reserved_logical_response(
     plaintext.zeroize();
     let encrypted = result?;
 
-    Ok(EncryptedOuterResponse {
-        encrypted: EncodedBytes::from_bytes(encrypted),
-    })
+    Ok(EncryptedOuterResponse { encrypted })
 }
 
 fn zeroize_response_body(response: &mut UnaryResponseEnvelope) {
@@ -852,14 +1278,18 @@ fn parse_key_exchange_request(
     serde_json::from_slice(body).map_err(|_| GatewayError::InvalidRequest)
 }
 
-fn parse_encrypted_outer_request(
-    body: &[u8],
-    limit: usize,
-) -> Result<EncryptedOuterRequest, GatewayError> {
-    if body.len() > limit {
+fn validate_encrypted_outer_request(body: &[u8]) -> Result<(), GatewayError> {
+    validate_encrypted_outer_request_len(body.len())
+}
+
+fn validate_encrypted_outer_request_len(body_len: usize) -> Result<(), GatewayError> {
+    if body_len > MAX_OUTER_REQUEST_BODY_BYTES {
         return Err(GatewayError::PayloadTooLarge);
     }
-    serde_json::from_slice(body).map_err(|_| GatewayError::InvalidRequest)
+    if body_len < RECORD_OVERHEAD_BYTES {
+        return Err(GatewayError::InvalidRequest);
+    }
+    Ok(())
 }
 
 fn parse_client_public_key(encoded: &EncodedBytes) -> Result<PublicKey, GatewayError> {
@@ -946,6 +1376,20 @@ fn validate_json_content_type(headers: &HeaderMap) -> Result<(), GatewayError> {
         saw_charset = true;
     }
     Ok(())
+}
+
+fn validate_octet_stream_content_type(headers: &HeaderMap) -> Result<(), GatewayError> {
+    let mut values = headers.get_all(header::CONTENT_TYPE).iter();
+    let value = values.next().ok_or(GatewayError::InvalidRequest)?;
+    if values.next().is_some() {
+        return Err(GatewayError::InvalidRequest);
+    }
+    let value = value.to_str().map_err(|_| GatewayError::InvalidRequest)?;
+    if value.eq_ignore_ascii_case("application/octet-stream") {
+        Ok(())
+    } else {
+        Err(GatewayError::InvalidRequest)
+    }
 }
 
 fn request_working_set_units(headers: &HeaderMap) -> Result<u32, GatewayError> {
@@ -1065,7 +1509,7 @@ mod tests {
     use crate::transport_v2::envelope::{
         HeaderField, LogicalMethod, LogicalRequest, RequestId, ResponseMode,
     };
-    use crate::transport_v2::session::{AuthorityState, BoundAuthority};
+    use crate::transport_v2::session::{AuthorityState, BoundAuthority, SessionLimits};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_session(
@@ -1074,13 +1518,30 @@ mod tests {
         expires_at: Instant,
         global_budget: Arc<GlobalReplayBudget>,
     ) -> Arc<V2SessionState> {
+        test_session_with_limits(
+            session_id,
+            master_bytes,
+            expires_at,
+            global_budget,
+            SessionLimits::default(),
+        )
+    }
+
+    fn test_session_with_limits(
+        session_id: Uuid,
+        master_bytes: [u8; 32],
+        expires_at: Instant,
+        global_budget: Arc<GlobalReplayBudget>,
+        limits: SessionLimits,
+    ) -> Arc<V2SessionState> {
         let master = SessionMaster::from_bytes(master_bytes);
         let keys = DirectionalKeys::derive(&master).expect("derive test keys");
-        Arc::new(V2SessionState::new(
+        Arc::new(V2SessionState::new_with_limits(
             session_id,
             keys,
             expires_at,
             global_budget,
+            limits,
         ))
     }
 
@@ -1140,13 +1601,58 @@ mod tests {
         }
     }
 
+    fn stream_chat_envelope(request_id: RequestId) -> RequestEnvelope {
+        RequestEnvelope {
+            version: Version2,
+            request_id,
+            response_mode: ResponseMode::Stream,
+            credential: None,
+            cache_namespace_root_base64: None,
+            request: LogicalRequest {
+                method: LogicalMethod::Post,
+                path: "/v1/chat/completions".to_owned(),
+                query: None,
+                headers: vec![HeaderField {
+                    name: "content-type".to_owned(),
+                    value_base64: EncodedBytes::from_bytes(b"application/json".to_vec()),
+                }],
+                body_base64: Some(EncodedBytes::from_bytes(
+                    br#"{"model":"model","messages":[],"stream":true}"#.to_vec(),
+                )),
+            },
+        }
+    }
+
+    fn bind_test_user(session: &Arc<V2SessionState>, now: Instant, user_byte: u8) {
+        let user_id = Uuid::from_bytes([user_byte; 16]);
+        session
+            .begin_authentication(RequestId::from_bytes([user_byte.wrapping_add(1); 16]))
+            .expect("reserve test authentication")
+            .commit_at(
+                BoundAuthority::user(
+                    user_id,
+                    7,
+                    &AuthContext::new(AuthMethod::Password, 7, [user_byte.wrapping_add(2); 32]),
+                    now + Duration::from_secs(30),
+                    crate::provider_cache::derive_tinfoil_cache_namespace(
+                        &crate::provider_cache::CacheNamespaceRoot::from_bytes(
+                            [user_byte.wrapping_add(3); 32],
+                        ),
+                        user_id,
+                    ),
+                ),
+                now,
+            )
+            .expect("bind test user");
+    }
+
     fn successful_test_outcome() -> super::super::application::ApplicationOutcome {
         super::super::application::ApplicationOutcome {
-            response: LogicalUnaryResponse {
+            response: LogicalApplicationResponse::Unary(LogicalUnaryResponse {
                 status: StatusCode::OK,
                 headers: Vec::new(),
                 body: Some(zeroize::Zeroizing::new(br#"{"ok":true}"#.to_vec())),
-            },
+            }),
             session_effect: SessionEffect::Retain,
         }
     }
@@ -1163,6 +1669,180 @@ mod tests {
         UnaryResponseEnvelope::from_json_slice(&plaintext, &EnvelopeLimits::default())
             .expect("parse authenticated unary response")
             .status
+    }
+
+    async fn unary_http_response_status(
+        keys: &DirectionalKeys,
+        session_id: &Uuid,
+        request_id: &RequestId,
+        response: Response,
+    ) -> u16 {
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        let body = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read encrypted unary carrier");
+        let plaintext = keys
+            .decrypt_unary_response_record(session_id, request_id, &body)
+            .expect("decrypt authenticated unary response");
+        UnaryResponseEnvelope::from_json_slice(&plaintext, &EnvelopeLimits::default())
+            .expect("parse authenticated unary response")
+            .status
+    }
+
+    fn decrypt_outer_stream_records(
+        keys: &DirectionalKeys,
+        session_id: &Uuid,
+        request_id: &RequestId,
+        carrier: &[u8],
+    ) -> Vec<StreamRecord> {
+        let carrier = std::str::from_utf8(carrier).expect("outer SSE is UTF-8");
+        carrier
+            .split("\n\n")
+            .filter(|frame| !frame.is_empty())
+            .enumerate()
+            .map(|(sequence, frame)| {
+                let encoded = frame
+                    .strip_prefix("data: ")
+                    .expect("one canonical outer data field");
+                let encrypted = STANDARD.decode(encoded).expect("canonical outer base64");
+                let plaintext = keys
+                    .decrypt_stream_response_record(
+                        session_id,
+                        request_id,
+                        sequence as u64,
+                        &encrypted,
+                    )
+                    .expect("decrypt authenticated stream record");
+                StreamRecord::from_json_slice(&plaintext, &EnvelopeLimits::default())
+                    .expect("parse authenticated stream record")
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stream_gateway_splits_bytes_and_emits_explicit_end() {
+        let state = TransportV2State::new();
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        let request_id = RequestId::from_bytes([0x72; 16]);
+        let master_bytes = [0x73; 32];
+        state
+            .insert_session(test_session(
+                session_id,
+                master_bytes,
+                now + Duration::from_secs(60),
+                Arc::clone(&state.global_replay_budget),
+            ))
+            .await
+            .unwrap();
+        let lease = state.acquire_session(&session_id, now).await.unwrap();
+        let reservation = lease
+            .state()
+            .begin_stream_response(request_id)
+            .expect("reserve start and terminal");
+        let permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        let guard = StreamExecutionGuard::new(permit);
+        let application_bytes = bytes::Bytes::from(vec![0x41; MAX_STREAM_CHUNK_BYTES + 1]);
+        let logical = LogicalStreamResponse::sse(Box::pin(futures::stream::iter([
+            LogicalStreamItem::Bytes(application_bytes),
+            LogicalStreamItem::Complete,
+        ])));
+
+        let response = encrypted_stream_http_response(lease, reservation, logical, guard)
+            .expect("build authenticated stream response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        let carrier = to_bytes(response.into_body(), 512 * 1024)
+            .await
+            .expect("read encrypted carrier");
+
+        let master = SessionMaster::from_bytes(master_bytes);
+        let keys = DirectionalKeys::derive(&master).unwrap();
+        let records = decrypt_outer_stream_records(&keys, &session_id, &request_id, &carrier);
+        assert_eq!(records.len(), 4);
+        assert!(matches!(
+            &records[0],
+            StreamRecord::Start {
+                sequence: 0,
+                status: 200,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &records[1],
+            StreamRecord::Chunk {
+                sequence: 1,
+                body_base64,
+                ..
+            } if body_base64.len() == MAX_STREAM_CHUNK_BYTES
+        ));
+        assert!(matches!(
+            &records[2],
+            StreamRecord::Chunk {
+                sequence: 2,
+                body_base64,
+                ..
+            } if body_base64.len() == 1
+        ));
+        assert!(matches!(&records[3], StreamRecord::End { sequence: 3, .. }));
+    }
+
+    #[tokio::test]
+    async fn stream_gateway_turns_unexpected_source_eof_into_authenticated_error() {
+        let state = TransportV2State::new();
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        let request_id = RequestId::from_bytes([0x74; 16]);
+        let master_bytes = [0x75; 32];
+        state
+            .insert_session(test_session(
+                session_id,
+                master_bytes,
+                now + Duration::from_secs(60),
+                Arc::clone(&state.global_replay_budget),
+            ))
+            .await
+            .unwrap();
+        let lease = state.acquire_session(&session_id, now).await.unwrap();
+        let reservation = lease
+            .state()
+            .begin_stream_response(request_id)
+            .expect("reserve start and terminal");
+        let guard = StreamExecutionGuard::new(
+            Arc::clone(&state.request_working_set)
+                .try_acquire_owned()
+                .unwrap(),
+        );
+        let logical = LogicalStreamResponse::sse(Box::pin(futures::stream::empty()));
+
+        let response = encrypted_stream_http_response(lease, reservation, logical, guard)
+            .expect("build authenticated stream response");
+        let carrier = to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read encrypted carrier");
+        let master = SessionMaster::from_bytes(master_bytes);
+        let keys = DirectionalKeys::derive(&master).unwrap();
+        let records = decrypt_outer_stream_records(&keys, &session_id, &request_id, &carrier);
+        assert!(matches!(
+            records.as_slice(),
+            [
+                StreamRecord::Start { sequence: 0, .. },
+                StreamRecord::Error {
+                    sequence: 1,
+                    status: 500,
+                    ..
+                }
+            ]
+        ));
     }
 
     #[test]
@@ -1316,7 +1996,7 @@ mod tests {
 
         let session_id = Uuid::new_v4();
         let request = format!(
-            "POST /v2/request HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nx-session-id: {session_id}\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n0\r\n\r\n"
+            "POST /v2/request HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/octet-stream\r\nx-session-id: {session_id}\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n0\r\n\r\n"
         );
         let mut stream = tokio::net::TcpStream::connect(address)
             .await
@@ -1341,7 +2021,7 @@ mod tests {
     }
 
     #[test]
-    fn post_content_type_requires_one_unambiguous_json_value() {
+    fn key_exchange_content_type_requires_one_unambiguous_json_value() {
         let mut headers = HeaderMap::new();
         assert!(validate_json_content_type(&headers).is_err());
 
@@ -1370,13 +2050,53 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_request_content_type_is_exact_octet_stream() {
+        let mut headers = HeaderMap::new();
+        assert!(validate_octet_stream_content_type(&headers).is_err());
+
+        headers.insert(
+            header::CONTENT_TYPE,
+            "application/octet-stream".parse().unwrap(),
+        );
+        assert!(validate_octet_stream_content_type(&headers).is_ok());
+        headers.insert(
+            header::CONTENT_TYPE,
+            "Application/Octet-Stream".parse().unwrap(),
+        );
+        assert!(validate_octet_stream_content_type(&headers).is_ok());
+
+        for invalid in [
+            "application/json",
+            "application/octet-stream; charset=binary",
+            "application/octet-stream; profile=v2",
+            " application/octet-stream",
+        ] {
+            headers.insert(header::CONTENT_TYPE, invalid.parse().unwrap());
+            assert!(
+                validate_octet_stream_content_type(&headers).is_err(),
+                "{invalid}"
+            );
+        }
+
+        headers.insert(
+            header::CONTENT_TYPE,
+            "application/octet-stream".parse().unwrap(),
+        );
+        headers.append(
+            header::CONTENT_TYPE,
+            "application/octet-stream".parse().unwrap(),
+        );
+        assert!(validate_octet_stream_content_type(&headers).is_err());
+    }
+
+    #[test]
     fn request_working_set_accounting_is_bounded_and_conservative() {
         let mut headers = HeaderMap::new();
         assert_eq!(
             request_working_set_units(&headers).unwrap(),
             u32::try_from(
-                MAX_OUTER_REQUEST_BODY_BYTES * REQUEST_WORKING_SET_MULTIPLIER
-                    / REQUEST_WORKING_SET_UNIT_BYTES
+                (MAX_OUTER_REQUEST_BODY_BYTES * REQUEST_WORKING_SET_MULTIPLIER)
+                    .div_ceil(REQUEST_WORKING_SET_UNIT_BYTES)
             )
             .unwrap()
         );
@@ -1393,8 +2113,8 @@ mod tests {
             MAX_OUTER_REQUEST_BODY_BYTES.to_string().parse().unwrap(),
         );
         let maximum_units = request_working_set_units(&headers).unwrap();
-        assert!(usize::try_from(maximum_units).unwrap() > REQUEST_WORKING_SET_UNITS / 2);
-        assert!(usize::try_from(maximum_units).unwrap() <= REQUEST_WORKING_SET_UNITS);
+        assert_eq!(maximum_units, 4_289);
+        assert_eq!(REQUEST_WORKING_SET_UNITS, 5_120);
 
         headers.insert(
             header::CONTENT_LENGTH,
@@ -1472,16 +2192,23 @@ mod tests {
     async fn encrypted_outer_response_holds_working_set_through_body_lifetime() {
         let working_set = Arc::new(Semaphore::new(1));
         let response_value = || EncryptedOuterResponse {
-            encrypted: EncodedBytes::from_bytes(vec![1, 2, 3]),
+            encrypted: vec![1, 2, 3],
         };
 
         let permit = Arc::clone(&working_set).try_acquire_owned().unwrap();
         let response = encrypted_outer_http_response(response_value(), permit);
         assert_eq!(working_set.available_permits(), 0);
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/octet-stream"
+        );
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store, no-transform"
+        );
         let body = to_bytes(response.into_body(), 1024).await.unwrap();
-        assert_eq!(&body[..], br#"{"encrypted":"AQID"}"#);
+        assert_eq!(&body[..], &[1, 2, 3]);
         assert_eq!(working_set.available_permits(), 1);
 
         let permit = Arc::clone(&working_set).try_acquire_owned().unwrap();
@@ -1492,21 +2219,15 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_outer_json_is_strict_canonical_and_bounded() {
-        let valid = br#"{"encrypted":"YQ=="}"#;
-        assert_eq!(
-            parse_encrypted_outer_request(valid, valid.len())
-                .unwrap()
-                .encrypted
-                .as_slice(),
-            b"a"
-        );
-        assert!(
-            parse_encrypted_outer_request(br#"{"encrypted":"YQ==","extra":true}"#, 64).is_err()
-        );
-        assert!(parse_encrypted_outer_request(br#"{"encrypted":"YQ"}"#, 64).is_err());
+    fn encrypted_outer_record_is_raw_exact_and_bounded() {
+        assert!(validate_encrypted_outer_request_len(RECORD_OVERHEAD_BYTES).is_ok());
+        assert!(validate_encrypted_outer_request_len(MAX_OUTER_REQUEST_BODY_BYTES).is_ok());
         assert!(matches!(
-            parse_encrypted_outer_request(valid, valid.len() - 1),
+            validate_encrypted_outer_request_len(RECORD_OVERHEAD_BYTES - 1),
+            Err(GatewayError::InvalidRequest)
+        ));
+        assert!(matches!(
+            validate_encrypted_outer_request_len(MAX_OUTER_REQUEST_BODY_BYTES + 1),
             Err(GatewayError::PayloadTooLarge)
         ));
     }
@@ -1695,6 +2416,282 @@ mod tests {
             lease.state().authority(),
             AuthorityState::Anonymous
         ));
+    }
+
+    #[tokio::test]
+    async fn duplicate_stream_request_id_returns_authenticated_unary_conflict_without_dispatch() {
+        let state = TransportV2State::new();
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        let master_bytes = [0x57; 32];
+        let session = test_session(
+            session_id,
+            master_bytes,
+            now + Duration::from_secs(60),
+            Arc::clone(&state.global_replay_budget),
+        );
+        bind_test_user(&session, now, 0x58);
+        state.insert_session(session).await.unwrap();
+
+        let request_id = RequestId::from_bytes([0x59; 16]);
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let keys = DirectionalKeys::derive(&SessionMaster::from_bytes(master_bytes)).unwrap();
+
+        let lease = state.acquire_session(&session_id, now).await.unwrap();
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(stream_chat_envelope(request_id), lease.state().authority())
+        else {
+            panic!("bound streaming Chat operation must be ready");
+        };
+        let first_dispatches = Arc::clone(&dispatches);
+        let first_permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        let first = state
+            .process_ready_stream_operation(
+                &lease,
+                request_id,
+                operation,
+                first_permit,
+                now,
+                move |_lease, _operation, authentication, _, _guard| async move {
+                    assert!(authentication.is_none());
+                    first_dispatches.fetch_add(1, Ordering::SeqCst);
+                    super::super::application::ApplicationOutcome {
+                        response: LogicalApplicationResponse::Stream(LogicalStreamResponse::sse(
+                            Box::pin(futures::stream::iter([LogicalStreamItem::Complete])),
+                        )),
+                        session_effect: SessionEffect::Retain,
+                    }
+                },
+            )
+            .await
+            .expect("first stream request succeeds");
+        let carrier = to_bytes(first.into_body(), 64 * 1024)
+            .await
+            .expect("read first encrypted stream");
+        let records = decrypt_outer_stream_records(&keys, &session_id, &request_id, &carrier);
+        assert!(matches!(
+            records.as_slice(),
+            [
+                StreamRecord::Start { sequence: 0, .. },
+                StreamRecord::End { sequence: 1, .. }
+            ]
+        ));
+
+        let duplicate_lease = state.acquire_session(&session_id, now).await.unwrap();
+        let OperationPreparation::Ready(duplicate_operation) = prepare_user_operation(
+            stream_chat_envelope(request_id),
+            duplicate_lease.state().authority(),
+        ) else {
+            panic!("duplicate streaming Chat operation must still classify");
+        };
+        let duplicate_dispatches = Arc::clone(&dispatches);
+        let duplicate_permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        let duplicate = state
+            .process_ready_stream_operation(
+                &duplicate_lease,
+                request_id,
+                duplicate_operation,
+                duplicate_permit,
+                now,
+                move |_lease, _operation, _authentication, _, _guard| async move {
+                    duplicate_dispatches.fetch_add(1, Ordering::SeqCst);
+                    successful_test_outcome()
+                },
+            )
+            .await
+            .expect("duplicate receives an authenticated response");
+
+        assert_eq!(
+            unary_http_response_status(&keys, &session_id, &request_id, duplicate).await,
+            409
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        assert_eq!(duplicate_lease.state().replay_id_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_gateway_uses_final_response_slot_for_authenticated_exhaustion() {
+        let state = TransportV2State::new();
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        let master_bytes = [0x91; 32];
+        let session = test_session_with_limits(
+            session_id,
+            master_bytes,
+            now + Duration::from_secs(60),
+            Arc::clone(&state.global_replay_budget),
+            SessionLimits::new(4, 4, 2),
+        );
+        bind_test_user(&session, now, 0x92);
+        let mut spent = session
+            .begin_unary_response()
+            .expect("reserve prior response slot");
+        session
+            .encrypt_unary_response_record(
+                &mut spent,
+                &RequestId::from_bytes([0x93; 16]),
+                b"prior response",
+            )
+            .expect("consume prior response slot");
+        state.insert_session(session).await.unwrap();
+
+        let request_id = RequestId::from_bytes([0x94; 16]);
+        let lease = state.acquire_session(&session_id, now).await.unwrap();
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(stream_chat_envelope(request_id), lease.state().authority())
+        else {
+            panic!("bound streaming Chat operation must be ready");
+        };
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let counted_dispatches = Arc::clone(&dispatches);
+        let permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        let response = state
+            .process_ready_stream_operation(
+                &lease,
+                request_id,
+                operation,
+                permit,
+                now,
+                move |_lease, _operation, _authentication, _, _guard| async move {
+                    counted_dispatches.fetch_add(1, Ordering::SeqCst);
+                    successful_test_outcome()
+                },
+            )
+            .await
+            .expect("final response slot authenticates exhaustion");
+
+        let keys = DirectionalKeys::derive(&SessionMaster::from_bytes(master_bytes)).unwrap();
+        assert_eq!(
+            unary_http_response_status(&keys, &session_id, &request_id, response).await,
+            503
+        );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(lease.state().replay_id_count(), 0);
+        assert_eq!(lease.state().response_record_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn stream_gateway_fails_outer_transport_when_no_response_slot_remains() {
+        let state = TransportV2State::new();
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        let master_bytes = [0x95; 32];
+        let session = test_session_with_limits(
+            session_id,
+            master_bytes,
+            now + Duration::from_secs(60),
+            Arc::clone(&state.global_replay_budget),
+            SessionLimits::new(4, 4, 1),
+        );
+        bind_test_user(&session, now, 0x96);
+        state.insert_session(session).await.unwrap();
+
+        let request_id = RequestId::from_bytes([0x97; 16]);
+        let lease = state.acquire_session(&session_id, now).await.unwrap();
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(stream_chat_envelope(request_id), lease.state().authority())
+        else {
+            panic!("bound streaming Chat operation must be ready");
+        };
+        let mut spent = lease
+            .state()
+            .begin_unary_response()
+            .expect("reserve final response slot");
+        lease
+            .state()
+            .encrypt_unary_response_record(
+                &mut spent,
+                &RequestId::from_bytes([0x98; 16]),
+                b"prior response",
+            )
+            .expect("consume final response slot");
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let counted_dispatches = Arc::clone(&dispatches);
+        let permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        let response = state
+            .process_ready_stream_operation(
+                &lease,
+                request_id,
+                operation,
+                permit,
+                now,
+                move |_lease, _operation, _authentication, _, _guard| async move {
+                    counted_dispatches.fetch_add(1, Ordering::SeqCst);
+                    successful_test_outcome()
+                },
+            )
+            .await;
+
+        assert!(matches!(response, Err(GatewayError::Unavailable)));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        assert_eq!(lease.state().replay_id_count(), 0);
+        assert_eq!(lease.state().response_record_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn pre_start_stream_failure_converts_reserved_capacity_to_exact_bound_unary_response() {
+        let state = TransportV2State::new();
+        let now = Instant::now();
+        let session_id = Uuid::new_v4();
+        let master_bytes = [0x5a; 32];
+        let session = test_session(
+            session_id,
+            master_bytes,
+            now + Duration::from_secs(60),
+            Arc::clone(&state.global_replay_budget),
+        );
+        bind_test_user(&session, now, 0x5b);
+        state.insert_session(session).await.unwrap();
+
+        let request_id = RequestId::from_bytes([0x5c; 16]);
+        let lease = state.acquire_session(&session_id, now).await.unwrap();
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(stream_chat_envelope(request_id), lease.state().authority())
+        else {
+            panic!("bound streaming Chat operation must be ready");
+        };
+        let permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .unwrap();
+        let response = state
+            .process_ready_stream_operation(
+                &lease,
+                request_id,
+                operation,
+                permit,
+                now,
+                |_lease, _operation, authentication, _, _guard| async move {
+                    assert!(authentication.is_none());
+                    super::super::application::ApplicationOutcome {
+                        response: LogicalApplicationResponse::Unary(
+                            LogicalUnaryResponse::protocol_error(
+                                StatusCode::BAD_REQUEST,
+                                "setup_failed",
+                                "Stream setup failed",
+                            ),
+                        ),
+                        session_effect: SessionEffect::Retain,
+                    }
+                },
+            )
+            .await
+            .expect("pre-Start failure remains authentically reportable");
+
+        let keys = DirectionalKeys::derive(&SessionMaster::from_bytes(master_bytes)).unwrap();
+        assert_eq!(
+            unary_http_response_status(&keys, &session_id, &request_id, response).await,
+            400
+        );
+        assert_eq!(lease.state().replay_id_count(), 1);
+        assert_eq!(lease.state().response_record_count(), 1);
     }
 
     #[tokio::test]
@@ -1913,14 +2910,14 @@ mod tests {
                 |_lease, _operation, authentication, _| async move {
                     assert!(authentication.is_none());
                     super::super::application::ApplicationOutcome {
-                        response: LogicalUnaryResponse {
+                        response: LogicalApplicationResponse::Unary(LogicalUnaryResponse {
                             status: StatusCode::OK,
                             headers: vec![HeaderField {
                                 name: "invalid header name".to_owned(),
                                 value_base64: EncodedBytes::from_bytes(b"x".to_vec()),
                             }],
                             body: None,
-                        },
+                        }),
                         session_effect: SessionEffect::Close,
                     }
                 },
@@ -2061,14 +3058,14 @@ mod tests {
                         )
                         .unwrap();
                     super::super::application::ApplicationOutcome {
-                        response: LogicalUnaryResponse {
+                        response: LogicalApplicationResponse::Unary(LogicalUnaryResponse {
                             status: StatusCode::OK,
                             headers: vec![HeaderField {
                                 name: "invalid header name".to_owned(),
                                 value_base64: EncodedBytes::from_bytes(b"x".to_vec()),
                             }],
                             body: None,
-                        },
+                        }),
                         session_effect: SessionEffect::NewlyBound,
                     }
                 },

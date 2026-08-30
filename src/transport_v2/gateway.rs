@@ -1519,7 +1519,6 @@ mod tests {
         AuthorityState, BoundAuthority, BoundPrincipal, SessionLimits,
     };
     use crate::ApiError;
-    use rand_core::RngCore;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_session(
@@ -1667,16 +1666,9 @@ mod tests {
         session_id: Uuid,
         master_bytes: [u8; 32],
         request_id: RequestId,
-        request_nonce: [u8; 12],
         grant: &'a str,
         native_attempt_id: Uuid,
         now: Instant,
-    }
-
-    fn random_test_nonce() -> [u8; 12] {
-        let mut nonce = [0_u8; 12];
-        rand_core::OsRng.fill_bytes(&mut nonce);
-        nonce
     }
 
     async fn process_native_handoff_test_redemption(
@@ -1688,7 +1680,6 @@ mod tests {
             session_id,
             master_bytes,
             request_id,
-            request_nonce,
             grant,
             native_attempt_id,
             now,
@@ -1702,7 +1693,7 @@ mod tests {
         let client_keys = DirectionalKeys::derive(&SessionMaster::from_bytes(master_bytes))
             .expect("derive native handoff client keys");
         let encrypted = client_keys
-            .encrypt_request_record_with_nonce(&session_id, &plaintext, request_nonce)
+            .encrypt_request_record(&session_id, &plaintext)
             .expect("encrypt native handoff request");
         let (lease, envelope) = state
             .decrypt_request_envelope(session_id, &encrypted, now)
@@ -2533,7 +2524,6 @@ mod tests {
                 session_id: other_session_id,
                 master_bytes: other_master,
                 request_id: wrong_session_request_id,
-                request_nonce: random_test_nonce(),
                 grant: &issued.grant,
                 native_attempt_id,
                 now,
@@ -2564,7 +2554,6 @@ mod tests {
                 session_id: target_session_id,
                 master_bytes: target_master,
                 request_id: wrong_attempt_request_id,
-                request_nonce: random_test_nonce(),
                 grant: &issued.grant,
                 native_attempt_id: Uuid::from_bytes([0xce; 16]),
                 now,
@@ -2595,7 +2584,6 @@ mod tests {
                 session_id: target_session_id,
                 master_bytes: target_master,
                 request_id: success_request_id,
-                request_nonce: random_test_nonce(),
                 grant: &issued.grant,
                 native_attempt_id,
                 now,
@@ -2646,11 +2634,7 @@ mod tests {
         ))
         .unwrap();
         let second_encrypted = target_client_keys
-            .encrypt_request_record_with_nonce(
-                &target_session_id,
-                &second_plaintext,
-                random_test_nonce(),
-            )
+            .encrypt_request_record(&target_session_id, &second_plaintext)
             .unwrap();
         let (second_lease, second_envelope) = state
             .decrypt_request_envelope(target_session_id, &second_encrypted, now)

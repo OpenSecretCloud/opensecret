@@ -2,7 +2,10 @@ use crate::{
     db::{setup_db, DBError},
     encrypt::{encrypt_key_deterministic, encrypt_with_key},
     generate_reset_hash,
-    jwt::{issue_transport_v2_user_tokens, validate_transport_v2_user_resumption},
+    jwt::{
+        issue_transport_v2_platform_tokens, issue_transport_v2_user_tokens,
+        validate_transport_v2_platform_resumption, validate_transport_v2_user_resumption,
+    },
     login_routes::RegisterCredentials,
     models::{
         account_deletion::NewAccountDeletionRequest,
@@ -10,6 +13,7 @@ use crate::{
         oauth::NewUserOAuthConnection,
         org_projects::OrgProject,
         password_reset::NewPasswordResetRequest,
+        platform_users::NewPlatformUser,
         responses::{
             NewAssistantMessage, NewConversation, NewConversationProject, NewReasoningItem,
             NewResponse, NewToolCall, NewToolOutput, NewUserInstruction, NewUserMessage,
@@ -18,8 +22,8 @@ use crate::{
         schema::{
             account_deletion_requests, assistant_messages, conversation_projects,
             conversation_summaries, conversations, org_projects, password_reset_requests,
-            reasoning_items, responses, tool_calls, tool_outputs, user_instructions, user_messages,
-            user_oauth_connections, user_seed_wrappings,
+            platform_users, reasoning_items, responses, tool_calls, tool_outputs,
+            user_instructions, user_messages, user_oauth_connections, user_seed_wrappings,
         },
         user_api_keys::{NewUserApiKey, UserApiKey, UserApiKeyError},
         user_kv::{NewUserKV, UserKV},
@@ -41,6 +45,39 @@ use uuid::Uuid;
 
 fn test_credential(label: &str) -> &'static str {
     Box::leak(format!("aead-test-credential-{label}").into_boxed_str())
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_platform_v2_resumption_revalidates_live_platform_user() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let marker = Uuid::new_v4();
+    let platform_user = app_state
+        .db
+        .create_platform_user(NewPlatformUser::new(
+            format!("transport-v2-platform-{marker}@example.com"),
+            Some(vec![0x41; 32]),
+        ))
+        .expect("platform user should be created");
+    let issued = issue_transport_v2_platform_tokens(&platform_user, &app_state)
+        .expect("platform v2 credentials should issue");
+    let resumed = validate_transport_v2_platform_resumption(&issued.resumption_token, &app_state)
+        .expect("live platform principal should resume");
+    assert_eq!(resumed.uuid, platform_user.uuid);
+
+    let mut connection = app_state.db.get_pool().get().expect("database connection");
+    diesel::delete(platform_users::table.filter(platform_users::id.eq(platform_user.id)))
+        .execute(&mut connection)
+        .expect("platform test user should be deleted");
+    assert!(
+        validate_transport_v2_platform_resumption(&issued.resumption_token, &app_state).is_err(),
+        "deleted platform principals must not resume"
+    );
 }
 
 #[tokio::test]

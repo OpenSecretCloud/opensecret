@@ -15,12 +15,15 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use validator::Validate;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::bounded_json::BoundedJsonBuffer;
+use crate::db::DBError;
 use crate::encrypt::{decrypt_with_key, encrypt_with_key};
 use crate::jwt::{
-    issue_transport_v2_user_tokens, validate_transport_v2_user_resumption, AuthContext,
+    issue_transport_v2_platform_tokens, issue_transport_v2_user_tokens,
+    validate_transport_v2_platform_resumption, validate_transport_v2_user_resumption, AuthContext,
 };
 use crate::kv::StoreError;
 use crate::models::responses::{ConversationProjectFilter, NewConversation, ResponseStatus};
@@ -29,8 +32,9 @@ use crate::provider_cache::{
 };
 use crate::tokens::count_tokens;
 use crate::web::login_routes::{
-    authenticate_login, logout_data, register_and_authenticate, verify_email_data, AuthResponse,
-    Credentials, LogoutRequest, RefreshResponse, RegisterCredentials,
+    authenticate_login, logout_data, password_reset_confirm_data, password_reset_request_data,
+    register_and_authenticate, verify_email_data, AuthResponse, Credentials, LogoutRequest,
+    PasswordResetConfirmPayload, PasswordResetRequestPayload, RefreshResponse, RegisterCredentials,
 };
 use crate::web::oauth_routes::{
     apple_native_authenticate, initiate_oauth_data, oauth_callback_authenticate,
@@ -42,6 +46,17 @@ use crate::web::openai::{
     EmbeddingRequest, TTSRequest, TranscriptionRequest,
 };
 use crate::web::openai_auth::AuthMethod as OpenAiAuthMethod;
+use crate::web::platform::login_routes::{
+    authenticate_platform_login, platform_logout_data, platform_password_reset_confirm_data,
+    platform_password_reset_request_data, register_platform_user_data, verify_platform_email_data,
+    PlatformAuthResponse, PlatformLoginRequest, PlatformLogoutRequest,
+    PlatformPasswordResetConfirmPayload, PlatformPasswordResetRequestPayload,
+    PlatformRefreshResponse, PlatformRegisterRequest,
+};
+use crate::web::platform::me_routes::{
+    platform_change_password_data, request_platform_verification_data,
+    PlatformChangePasswordRequest,
+};
 use crate::web::protected_routes::{
     confirm_account_deletion_data, create_api_key_data, decrypt_data_value, delete_all_kv_values,
     delete_api_key_by_name, delete_kv_value, encrypt_data_value, initiate_account_deletion_data,
@@ -98,10 +113,10 @@ use crate::{
 use super::envelope::{
     decode_canonical_api_key_name_path, decode_canonical_conversation_path,
     decode_canonical_conversation_project_path, decode_canonical_instruction_path,
-    decode_canonical_kv_item_path, decode_canonical_response_path,
-    decode_canonical_verify_email_path, ConversationItemPath, Credential, EncodedBytes,
-    EnvelopeLimits, HeaderField, InstructionItemPath, LogicalMethod, RequestEnvelope, RequestId,
-    ResponseItemPath, ResponseMode,
+    decode_canonical_kv_item_path, decode_canonical_platform_verify_email_path,
+    decode_canonical_response_path, decode_canonical_verify_email_path, ConversationItemPath,
+    Credential, EncodedBytes, EnvelopeLimits, HeaderField, InstructionItemPath, LogicalMethod,
+    RequestEnvelope, RequestId, ResponseItemPath, ResponseMode,
 };
 use super::session::{
     AuthenticationReservation, AuthenticationStartError, AuthorityState, BoundAuthority,
@@ -167,8 +182,43 @@ pub(crate) enum UserOperation {
         body: SensitiveBytes,
         cache_namespace_root: CacheNamespaceRoot,
     },
+    UserPasswordResetRequest {
+        body: SensitiveBytes,
+    },
+    UserPasswordResetConfirm {
+        body: SensitiveBytes,
+    },
     VerifyEmail {
         code: uuid::Uuid,
+    },
+    PlatformLogin {
+        body: SensitiveBytes,
+    },
+    PlatformRegister {
+        body: SensitiveBytes,
+    },
+    PlatformResume {
+        credential: SensitiveBytes,
+    },
+    PlatformVerifyEmail {
+        code: uuid::Uuid,
+    },
+    PlatformPasswordResetRequest {
+        body: SensitiveBytes,
+    },
+    PlatformPasswordResetConfirm {
+        body: SensitiveBytes,
+    },
+    PlatformLogout {
+        authority: BoundPlatformAuthority,
+        body: SensitiveBytes,
+    },
+    PlatformRequestVerification {
+        authority: BoundPlatformAuthority,
+    },
+    PlatformChangePassword {
+        authority: BoundPlatformAuthority,
+        body: SensitiveBytes,
     },
     Logout {
         body: SensitiveBytes,
@@ -389,6 +439,11 @@ pub(crate) struct BoundUserAuthority {
     cache_namespace: DerivedCacheNamespace,
 }
 
+#[derive(Clone)]
+pub(crate) struct BoundPlatformAuthority {
+    platform_user_id: uuid::Uuid,
+}
+
 impl UserOperation {
     pub(crate) const fn requires_authentication_transition(&self) -> bool {
         matches!(
@@ -398,6 +453,9 @@ impl UserOperation {
                 | Self::Resume { .. }
                 | Self::OAuthCallback { .. }
                 | Self::AppleNativeOAuth { .. }
+                | Self::PlatformLogin { .. }
+                | Self::PlatformRegister { .. }
+                | Self::PlatformResume { .. }
                 | Self::Inference {
                     authority: InferenceAuthority::AuthenticateApiKey { .. },
                     ..
@@ -440,7 +498,10 @@ impl UserOperation {
 
     const fn session_effect_on_success(&self) -> SessionEffect {
         match self {
-            Self::Logout { .. } | Self::ChangePassword { .. } => SessionEffect::Close,
+            Self::Logout { .. }
+            | Self::ChangePassword { .. }
+            | Self::PlatformLogout { .. }
+            | Self::PlatformChangePassword { .. } => SessionEffect::Close,
             Self::Protected { operation, .. } => operation.session_effect_on_success(),
             Self::Inference { .. } => SessionEffect::Retain,
             _ => SessionEffect::Retain,
@@ -766,7 +827,18 @@ pub(crate) fn prepare_user_operation(
         AppleOAuthInitiate,
         AppleOAuthCallback,
         AppleNativeOAuth,
+        UserPasswordResetRequest,
+        UserPasswordResetConfirm,
         VerifyEmail,
+        PlatformLogin,
+        PlatformRegister,
+        PlatformResume,
+        PlatformVerifyEmail,
+        PlatformPasswordResetRequest,
+        PlatformPasswordResetConfirm,
+        PlatformLogout,
+        PlatformRequestVerification,
+        PlatformChangePassword,
         GetUser,
         RequestVerification,
         GetPrivateKey,
@@ -844,6 +916,14 @@ pub(crate) fn prepare_user_operation(
             return rejected_bad_request();
         }
     };
+    let platform_verification_code =
+        match decode_canonical_platform_verify_email_path(request.method, &request.path) {
+            Ok(code) => code,
+            Err(_) => {
+                request.path.zeroize();
+                return rejected_bad_request();
+            }
+        };
     let conversation_project_id =
         match decode_canonical_conversation_project_path(request.method, &request.path) {
             Ok(project_id) => project_id,
@@ -885,7 +965,26 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Post, "/auth/apple") => Some(Route::AppleOAuthInitiate),
         (LogicalMethod::Post, "/auth/apple/callback") => Some(Route::AppleOAuthCallback),
         (LogicalMethod::Post, "/auth/apple/native") => Some(Route::AppleNativeOAuth),
+        (LogicalMethod::Post, "/password-reset/request") => Some(Route::UserPasswordResetRequest),
+        (LogicalMethod::Post, "/password-reset/confirm") => Some(Route::UserPasswordResetConfirm),
         (LogicalMethod::Get, _) if verification_code.is_some() => Some(Route::VerifyEmail),
+        (LogicalMethod::Post, "/platform/login") => Some(Route::PlatformLogin),
+        (LogicalMethod::Post, "/platform/register") => Some(Route::PlatformRegister),
+        (LogicalMethod::Post, "/platform/refresh") => Some(Route::PlatformResume),
+        (LogicalMethod::Get, _) if platform_verification_code.is_some() => {
+            Some(Route::PlatformVerifyEmail)
+        }
+        (LogicalMethod::Post, "/platform/password-reset/request") => {
+            Some(Route::PlatformPasswordResetRequest)
+        }
+        (LogicalMethod::Post, "/platform/password-reset/confirm") => {
+            Some(Route::PlatformPasswordResetConfirm)
+        }
+        (LogicalMethod::Post, "/platform/logout") => Some(Route::PlatformLogout),
+        (LogicalMethod::Post, "/platform/request_verification") => {
+            Some(Route::PlatformRequestVerification)
+        }
+        (LogicalMethod::Post, "/platform/change-password") => Some(Route::PlatformChangePassword),
         (LogicalMethod::Get, "/protected/user") => Some(Route::GetUser),
         (LogicalMethod::Post, "/protected/request_verification") => {
             Some(Route::RequestVerification)
@@ -1013,6 +1112,7 @@ pub(crate) fn prepare_user_operation(
     if kv_key.is_some()
         || api_key_name.is_some()
         || verification_code.is_some()
+        || platform_verification_code.is_some()
         || conversation_project_id.is_some()
         || instruction_path.is_some()
         || conversation_path.is_some()
@@ -1233,6 +1333,183 @@ pub(crate) fn prepare_user_operation(
                 _ => unreachable!("OAuth callback route group is exhaustive"),
             }
         }
+        Route::UserPasswordResetRequest | Route::UserPasswordResetConfirm => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            if !matches!(authority, AuthorityState::Anonymous) {
+                return OperationPreparation::Rejected(authentication_required_response());
+            }
+            let body = Zeroizing::new(
+                request
+                    .body_base64
+                    .expect("validated password-reset body")
+                    .into_bytes(),
+            );
+            if matches!(route, Route::UserPasswordResetRequest) {
+                OperationPreparation::Ready(UserOperation::UserPasswordResetRequest { body })
+            } else {
+                OperationPreparation::Ready(UserOperation::UserPasswordResetConfirm { body })
+            }
+        }
+        Route::PlatformLogin | Route::PlatformRegister => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            if !matches!(authority, AuthorityState::Anonymous) {
+                return OperationPreparation::Rejected(authentication_start_error(
+                    AuthenticationStartError::AlreadyBound,
+                ));
+            }
+            let body = Zeroizing::new(
+                request
+                    .body_base64
+                    .expect("validated platform authentication body")
+                    .into_bytes(),
+            );
+            if matches!(route, Route::PlatformLogin) {
+                OperationPreparation::Ready(UserOperation::PlatformLogin { body })
+            } else {
+                OperationPreparation::Ready(UserOperation::PlatformRegister { body })
+            }
+        }
+        Route::PlatformResume => {
+            if request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            if !matches!(authority, AuthorityState::Anonymous) {
+                return OperationPreparation::Rejected(authentication_start_error(
+                    AuthenticationStartError::AlreadyBound,
+                ));
+            }
+            let Some(Credential::Resumption { value_base64 }) = credential else {
+                return rejected_bad_request();
+            };
+            if value_base64.is_empty() {
+                return rejected_bad_request();
+            }
+            OperationPreparation::Ready(UserOperation::PlatformResume {
+                credential: Zeroizing::new(value_base64.into_bytes()),
+            })
+        }
+        Route::PlatformVerifyEmail => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            match authority {
+                AuthorityState::Anonymous => {}
+                AuthorityState::Bound(bound)
+                    if matches!(bound.principal(), BoundPrincipal::Platform { .. }) => {}
+                AuthorityState::Bound(_) => {
+                    return OperationPreparation::Rejected(authentication_required_response());
+                }
+                AuthorityState::Authenticating(_) => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::AuthenticationInProgress,
+                    ));
+                }
+                AuthorityState::Closing => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::Closing,
+                    ));
+                }
+            }
+            OperationPreparation::Ready(UserOperation::PlatformVerifyEmail {
+                code: platform_verification_code
+                    .expect("classified platform verification route must have a code"),
+            })
+        }
+        Route::PlatformPasswordResetRequest | Route::PlatformPasswordResetConfirm => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            if !matches!(authority, AuthorityState::Anonymous) {
+                return OperationPreparation::Rejected(authentication_required_response());
+            }
+            let body = Zeroizing::new(
+                request
+                    .body_base64
+                    .expect("validated platform password-reset body")
+                    .into_bytes(),
+            );
+            if matches!(route, Route::PlatformPasswordResetRequest) {
+                OperationPreparation::Ready(UserOperation::PlatformPasswordResetRequest { body })
+            } else {
+                OperationPreparation::Ready(UserOperation::PlatformPasswordResetConfirm { body })
+            }
+        }
+        Route::PlatformLogout | Route::PlatformChangePassword => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_platform_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
+            };
+            let body = Zeroizing::new(
+                request
+                    .body_base64
+                    .expect("validated platform account body")
+                    .into_bytes(),
+            );
+            if matches!(route, Route::PlatformLogout) {
+                OperationPreparation::Ready(UserOperation::PlatformLogout { authority, body })
+            } else {
+                OperationPreparation::Ready(UserOperation::PlatformChangePassword {
+                    authority,
+                    body,
+                })
+            }
+        }
+        Route::PlatformRequestVerification => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !request.headers.is_empty()
+                || request.body_base64.is_some()
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_platform_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
+            };
+            OperationPreparation::Ready(UserOperation::PlatformRequestVerification { authority })
+        }
         Route::VerifyEmail => {
             if credential.is_some()
                 || request.query.is_some()
@@ -1242,7 +1519,12 @@ pub(crate) fn prepare_user_operation(
                 return rejected_bad_request();
             }
             match authority {
-                AuthorityState::Anonymous | AuthorityState::Bound(_) => {}
+                AuthorityState::Anonymous => {}
+                AuthorityState::Bound(bound)
+                    if matches!(bound.principal(), BoundPrincipal::User { .. }) => {}
+                AuthorityState::Bound(_) => {
+                    return OperationPreparation::Rejected(authentication_required_response());
+                }
                 AuthorityState::Authenticating(_) => {
                     return OperationPreparation::Rejected(authentication_start_error(
                         AuthenticationStartError::AuthenticationInProgress,
@@ -1911,7 +2193,15 @@ pub(crate) fn prepare_user_operation(
                 return rejected_bad_request();
             }
             match authority {
-                AuthorityState::Anonymous | AuthorityState::Bound(_) => {}
+                AuthorityState::Anonymous => {}
+                AuthorityState::Bound(bound)
+                    if matches!(
+                        bound.principal(),
+                        BoundPrincipal::User { .. } | BoundPrincipal::ApiKey { .. }
+                    ) => {}
+                AuthorityState::Bound(_) => {
+                    return OperationPreparation::Rejected(authentication_required_response());
+                }
                 AuthorityState::Authenticating(_) => {
                     return OperationPreparation::Rejected(authentication_start_error(
                         AuthenticationStartError::AuthenticationInProgress,
@@ -2049,6 +2339,20 @@ fn bound_user_authority(
         project_id: *project_id,
         auth_context: auth_context.clone(),
         cache_namespace: cache_namespace.clone(),
+    })
+}
+
+fn bound_platform_authority(
+    authority: AuthorityState,
+) -> Result<BoundPlatformAuthority, LogicalUnaryResponse> {
+    let AuthorityState::Bound(bound) = authority else {
+        return Err(authentication_required_response());
+    };
+    let BoundPrincipal::Platform { platform_user_id } = bound.principal() else {
+        return Err(authentication_required_response());
+    };
+    Ok(BoundPlatformAuthority {
+        platform_user_id: *platform_user_id,
     })
 }
 
@@ -2306,6 +2610,203 @@ pub(crate) async fn execute_user_operation(
                 UserAuthResponseKind::Login,
                 cache_namespace_root,
             )
+        }
+        UserOperation::UserPasswordResetRequest { body } => {
+            debug_assert!(authentication.is_none());
+            let request = match parse_json_body::<PasswordResetRequestPayload>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            let response = match password_reset_request_data(&app_state, request)
+                .await
+                .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+            {
+                Ok(response) => response,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            ApplicationOutcome::success(response, SessionEffect::Retain)
+        }
+        UserOperation::UserPasswordResetConfirm { body } => {
+            debug_assert!(authentication.is_none());
+            let request = match parse_json_body::<PasswordResetConfirmPayload>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            let response = match password_reset_confirm_data(&app_state, request)
+                .await
+                .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+            {
+                Ok(response) => response,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            ApplicationOutcome::success(response, SessionEffect::Retain)
+        }
+        UserOperation::PlatformLogin { body } => {
+            let request = match parse_json_body::<PlatformLoginRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if request.validate().is_err() {
+                return ApplicationOutcome::error(ApiError::BadRequest);
+            }
+            let platform_user =
+                match authenticate_platform_login(Arc::clone(&app_state), request).await {
+                    Ok(platform_user) => platform_user,
+                    Err(error) => return ApplicationOutcome::error(error),
+                };
+            finish_platform_binding(
+                &app_state,
+                &lease,
+                platform_user,
+                authentication.expect("platform login requires authentication reservation"),
+                monotonic_now,
+                PlatformAuthResponseKind::Login,
+            )
+        }
+        UserOperation::PlatformRegister { body } => {
+            let request = match parse_json_body::<PlatformRegisterRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if request.validate().is_err() {
+                return ApplicationOutcome::error(ApiError::BadRequest);
+            }
+            let platform_user =
+                match register_platform_user_data(Arc::clone(&app_state), request).await {
+                    Ok(platform_user) => platform_user,
+                    Err(error) => return ApplicationOutcome::error(error),
+                };
+            finish_platform_binding(
+                &app_state,
+                &lease,
+                platform_user,
+                authentication.expect("platform registration requires authentication reservation"),
+                monotonic_now,
+                PlatformAuthResponseKind::Login,
+            )
+        }
+        UserOperation::PlatformResume { mut credential } => {
+            let bytes = std::mem::take(&mut *credential);
+            let credential = match String::from_utf8(bytes) {
+                Ok(credential) => Zeroizing::new(credential),
+                Err(error) => {
+                    let mut bytes = error.into_bytes();
+                    bytes.zeroize();
+                    return ApplicationOutcome::error(ApiError::InvalidJwt);
+                }
+            };
+            let platform_user =
+                match validate_transport_v2_platform_resumption(&credential, &app_state) {
+                    Ok(platform_user) => platform_user,
+                    Err(error) => return ApplicationOutcome::error(error),
+                };
+            finish_platform_binding(
+                &app_state,
+                &lease,
+                platform_user,
+                authentication.expect("platform resumption requires authentication reservation"),
+                monotonic_now,
+                PlatformAuthResponseKind::Refresh,
+            )
+        }
+        UserOperation::PlatformVerifyEmail { code } => {
+            debug_assert!(authentication.is_none());
+            let response = match verify_platform_email_data(&app_state, code)
+                .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+            {
+                Ok(response) => response,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            ApplicationOutcome::success(response, SessionEffect::Retain)
+        }
+        UserOperation::PlatformPasswordResetRequest { body } => {
+            debug_assert!(authentication.is_none());
+            let request = match parse_json_body::<PlatformPasswordResetRequestPayload>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if request.validate().is_err() {
+                return ApplicationOutcome::error(ApiError::BadRequest);
+            }
+            let response = match platform_password_reset_request_data(&app_state, request)
+                .await
+                .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+            {
+                Ok(response) => response,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            ApplicationOutcome::success(response, SessionEffect::Retain)
+        }
+        UserOperation::PlatformPasswordResetConfirm { body } => {
+            debug_assert!(authentication.is_none());
+            let request = match parse_json_body::<PlatformPasswordResetConfirmPayload>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if request.validate().is_err() {
+                return ApplicationOutcome::error(ApiError::BadRequest);
+            }
+            let response = match platform_password_reset_confirm_data(&app_state, request)
+                .await
+                .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+            {
+                Ok(response) => response,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            ApplicationOutcome::success(response, SessionEffect::Retain)
+        }
+        UserOperation::PlatformLogout { authority, body } => {
+            debug_assert!(authentication.is_none());
+            if let Err(outcome) = revalidate_bound_platform_user(&app_state, &authority) {
+                return outcome;
+            }
+            let request = match parse_json_body::<PlatformLogoutRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            let response =
+                match LogicalUnaryResponse::json(StatusCode::OK, &platform_logout_data(request)) {
+                    Ok(response) => response,
+                    Err(error) => return ApplicationOutcome::error(error),
+                };
+            ApplicationOutcome::success(response, session_effect_on_success)
+        }
+        UserOperation::PlatformRequestVerification { authority } => {
+            debug_assert!(authentication.is_none());
+            let platform_user = match revalidate_bound_platform_user(&app_state, &authority) {
+                Ok(platform_user) => platform_user,
+                Err(outcome) => return outcome,
+            };
+            let response = match request_platform_verification_data(&app_state, &platform_user)
+                .await
+                .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+            {
+                Ok(response) => response,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            ApplicationOutcome::success(response, SessionEffect::Retain)
+        }
+        UserOperation::PlatformChangePassword { authority, body } => {
+            debug_assert!(authentication.is_none());
+            let platform_user = match revalidate_bound_platform_user(&app_state, &authority) {
+                Ok(platform_user) => platform_user,
+                Err(outcome) => return outcome,
+            };
+            let request = match parse_json_body::<PlatformChangePasswordRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if request.validate().is_err() {
+                return ApplicationOutcome::error(ApiError::BadRequest);
+            }
+            let response = match platform_change_password_data(&app_state, &platform_user, request)
+                .await
+                .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+            {
+                Ok(response) => response,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            ApplicationOutcome::success(response, session_effect_on_success)
         }
         UserOperation::VerifyEmail { code } => {
             debug_assert!(authentication.is_none());
@@ -2720,6 +3221,27 @@ fn bound_user_error_outcome(
     } else {
         ApplicationOutcome::error(error)
     }
+}
+
+fn revalidate_bound_platform_user(
+    app_state: &AppState,
+    authority: &BoundPlatformAuthority,
+) -> Result<crate::models::platform_users::PlatformUser, ApplicationOutcome> {
+    app_state
+        .db
+        .get_platform_user_by_uuid(authority.platform_user_id)
+        .map_err(|error| match error {
+            DBError::PlatformUserNotFound => {
+                ApplicationOutcome::closing_error(ApiError::Unauthorized)
+            }
+            _ => {
+                tracing::error!(
+                    platform_user_id = %authority.platform_user_id,
+                    "Failed to revalidate bound platform user: {error:?}"
+                );
+                ApplicationOutcome::error(ApiError::InternalServerError)
+            }
+        })
 }
 
 async fn execute_protected_user_operation(
@@ -4367,6 +4889,78 @@ enum UserAuthResponseKind {
     Refresh,
 }
 
+enum PlatformAuthResponseKind {
+    Login,
+    Refresh,
+}
+
+fn finish_platform_binding(
+    app_state: &AppState,
+    lease: &V2SessionLease,
+    platform_user: crate::models::platform_users::PlatformUser,
+    authentication: AuthenticationReservation,
+    monotonic_now: Instant,
+    response_kind: PlatformAuthResponseKind,
+) -> ApplicationOutcome {
+    let issued = match issue_transport_v2_platform_tokens(&platform_user, app_state) {
+        Ok(issued) => issued,
+        Err(error) => return ApplicationOutcome::error(error),
+    };
+    let authentication_expires_at = match monotonic_authentication_expiry(
+        issued.access_expires_at,
+        monotonic_now,
+        lease.state().absolute_expires_at(),
+    ) {
+        Ok(expiry) => expiry,
+        Err(error) => return ApplicationOutcome::error(error),
+    };
+
+    let mut access_token = issued.access_token;
+    let mut resumption_token = issued.resumption_token;
+    let response = match response_kind {
+        PlatformAuthResponseKind::Login => {
+            let mut value = PlatformAuthResponse {
+                id: platform_user.uuid,
+                email: platform_user.email.clone(),
+                name: platform_user.name.clone(),
+                access_token: access_token.clone(),
+                refresh_token: resumption_token.clone(),
+            };
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value);
+            value.access_token.zeroize();
+            value.refresh_token.zeroize();
+            response
+        }
+        PlatformAuthResponseKind::Refresh => {
+            let mut value = PlatformRefreshResponse {
+                access_token: access_token.clone(),
+                refresh_token: resumption_token.clone(),
+            };
+            let response = LogicalUnaryResponse::json(StatusCode::OK, &value);
+            value.access_token.zeroize();
+            value.refresh_token.zeroize();
+            response
+        }
+    };
+    access_token.zeroize();
+    resumption_token.zeroize();
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => return ApplicationOutcome::error(error),
+    };
+
+    if authentication
+        .commit_at(
+            BoundAuthority::platform(platform_user.uuid, authentication_expires_at),
+            monotonic_now,
+        )
+        .is_err()
+    {
+        return ApplicationOutcome::error(ApiError::InternalServerError);
+    }
+    ApplicationOutcome::success(response, SessionEffect::NewlyBound)
+}
+
 fn finish_user_binding(
     app_state: &AppState,
     lease: &V2SessionLease,
@@ -4713,6 +5307,235 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn exact_password_reset_and_platform_lifecycle_contracts_are_admitted() {
+        for (path, expected_request) in [
+            ("/password-reset/request", true),
+            ("/password-reset/confirm", false),
+        ] {
+            let prepared = prepare_user_operation(
+                envelope(LogicalMethod::Post, path, json_header(), Some(b"{}"), None),
+                AuthorityState::Anonymous,
+            );
+            assert!(matches!(
+                (expected_request, prepared),
+                (
+                    true,
+                    OperationPreparation::Ready(UserOperation::UserPasswordResetRequest { .. })
+                ) | (
+                    false,
+                    OperationPreparation::Ready(UserOperation::UserPasswordResetConfirm { .. })
+                )
+            ));
+        }
+
+        for (path, expected_login) in [("/platform/login", true), ("/platform/register", false)] {
+            let prepared = prepare_user_operation(
+                envelope(LogicalMethod::Post, path, json_header(), Some(b"{}"), None),
+                AuthorityState::Anonymous,
+            );
+            assert!(matches!(
+                (expected_login, prepared),
+                (
+                    true,
+                    OperationPreparation::Ready(UserOperation::PlatformLogin { .. })
+                ) | (
+                    false,
+                    OperationPreparation::Ready(UserOperation::PlatformRegister { .. })
+                )
+            ));
+        }
+
+        let mut resume = envelope(
+            LogicalMethod::Post,
+            "/platform/refresh",
+            Vec::new(),
+            None,
+            Some(Credential::Resumption {
+                value_base64: EncodedBytes::from_bytes(b"platform-resumption".to_vec()),
+            }),
+        );
+        resume.cache_namespace_root_base64 = None;
+        assert!(matches!(
+            prepare_user_operation(resume, AuthorityState::Anonymous),
+            OperationPreparation::Ready(UserOperation::PlatformResume { .. })
+        ));
+
+        let verification_path = "/platform/verify-email/123e4567-e89b-12d3-a456-426614174000";
+        for authority in [AuthorityState::Anonymous, bound_platform_authority()] {
+            assert!(matches!(
+                prepare_user_operation(
+                    envelope(
+                        LogicalMethod::Get,
+                        verification_path,
+                        Vec::new(),
+                        None,
+                        None,
+                    ),
+                    authority,
+                ),
+                OperationPreparation::Ready(UserOperation::PlatformVerifyEmail { .. })
+            ));
+        }
+
+        for (path, expected_request) in [
+            ("/platform/password-reset/request", true),
+            ("/platform/password-reset/confirm", false),
+        ] {
+            let prepared = prepare_user_operation(
+                envelope(LogicalMethod::Post, path, json_header(), Some(b"{}"), None),
+                AuthorityState::Anonymous,
+            );
+            assert!(matches!(
+                (expected_request, prepared),
+                (
+                    true,
+                    OperationPreparation::Ready(UserOperation::PlatformPasswordResetRequest { .. })
+                ) | (
+                    false,
+                    OperationPreparation::Ready(UserOperation::PlatformPasswordResetConfirm { .. })
+                )
+            ));
+        }
+
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Post,
+                    "/platform/logout",
+                    json_header(),
+                    Some(b"{}"),
+                    None,
+                ),
+                bound_platform_authority(),
+            ),
+            OperationPreparation::Ready(UserOperation::PlatformLogout { .. })
+        ));
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Post,
+                    "/platform/request_verification",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                bound_platform_authority(),
+            ),
+            OperationPreparation::Ready(UserOperation::PlatformRequestVerification { .. })
+        ));
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Post,
+                    "/platform/change-password",
+                    json_header(),
+                    Some(b"{}"),
+                    None,
+                ),
+                bound_platform_authority(),
+            ),
+            OperationPreparation::Ready(UserOperation::PlatformChangePassword { .. })
+        ));
+    }
+
+    #[test]
+    fn platform_lifecycle_rejects_wrong_authority_and_transplanted_metadata() {
+        for path in [
+            "/platform/logout",
+            "/platform/request_verification",
+            "/platform/change-password",
+        ] {
+            let bodyful = path != "/platform/request_verification";
+            let request = envelope(
+                LogicalMethod::Post,
+                path,
+                if bodyful { json_header() } else { Vec::new() },
+                bodyful.then_some(b"{}".as_slice()),
+                None,
+            );
+            for authority in [AuthorityState::Anonymous, bound_user_authority()] {
+                assert!(matches!(
+                    prepare_user_operation(request.clone(), authority),
+                    OperationPreparation::Rejected(response)
+                        if response.status == StatusCode::UNAUTHORIZED
+                ));
+            }
+
+            let mut transplanted = request;
+            transplanted.request.query = Some("admin=true".to_owned());
+            assert!(matches!(
+                prepare_user_operation(transplanted, bound_platform_authority()),
+                OperationPreparation::Rejected(response)
+                    if response.status == StatusCode::BAD_REQUEST
+            ));
+        }
+
+        let platform_login = envelope(
+            LogicalMethod::Post,
+            "/platform/login",
+            json_header(),
+            Some(b"{}"),
+            None,
+        );
+        assert!(matches!(
+            prepare_user_operation(platform_login, bound_platform_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::CONFLICT
+        ));
+
+        let platform_verification = envelope(
+            LogicalMethod::Get,
+            "/platform/verify-email/123e4567-e89b-12d3-a456-426614174000",
+            Vec::new(),
+            None,
+            None,
+        );
+        assert!(matches!(
+            prepare_user_operation(platform_verification, bound_user_authority()),
+            OperationPreparation::Rejected(response)
+                if response.status == StatusCode::UNAUTHORIZED
+        ));
+    }
+
+    #[test]
+    fn platform_authentication_and_terminal_session_effects_are_classified() {
+        for operation in [
+            UserOperation::PlatformLogin {
+                body: Zeroizing::new(Vec::new()),
+            },
+            UserOperation::PlatformRegister {
+                body: Zeroizing::new(Vec::new()),
+            },
+            UserOperation::PlatformResume {
+                credential: Zeroizing::new(Vec::new()),
+            },
+        ] {
+            assert!(operation.requires_authentication_transition());
+            assert_eq!(operation.session_effect_on_success(), SessionEffect::Retain);
+        }
+
+        let authority = BoundPlatformAuthority {
+            platform_user_id: uuid::Uuid::nil(),
+        };
+        assert_eq!(
+            UserOperation::PlatformLogout {
+                authority: authority.clone(),
+                body: Zeroizing::new(Vec::new()),
+            }
+            .session_effect_on_success(),
+            SessionEffect::Close
+        );
+        assert_eq!(
+            UserOperation::PlatformChangePassword {
+                authority,
+                body: Zeroizing::new(Vec::new()),
+            }
+            .session_effect_on_success(),
+            SessionEffect::Close
+        );
     }
 
     #[test]
@@ -5119,6 +5942,13 @@ mod tests {
                 OperationPreparation::Ready(UserOperation::VerifyEmail { code })
                     if code == uuid::Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").unwrap()
             ));
+        }
+
+        for authority in [bound_api_key_authority(), bound_platform_authority()] {
+            assert_eq!(
+                rejected_status(prepare_user_operation(request(), authority)),
+                StatusCode::UNAUTHORIZED
+            );
         }
 
         assert!(matches!(
@@ -7355,6 +8185,14 @@ mod tests {
                 bound_user_authority(),
             )),
             StatusCode::BAD_REQUEST
+        );
+
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                envelope(LogicalMethod::Get, "/v1/models", Vec::new(), None, None),
+                bound_platform_authority(),
+            )),
+            StatusCode::UNAUTHORIZED
         );
     }
 

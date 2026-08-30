@@ -567,6 +567,55 @@ error bodies never enter enclave logs. These are v2-only admission rules;
 transport v1 retains its existing limits, concurrency, retry behavior, error
 logging, and provider-cache derivation.
 
+### 8.7 Password recovery and platform authentication lifecycle
+
+Transport v2 completes the anonymous password-recovery paths needed by a
+v2-only SDK and establishes a distinct platform authority before projecting
+the larger organization control plane:
+
+| Logical operation | Authority before request | Generic credential | Success effect |
+| --- | --- | --- | --- |
+| `POST /password-reset/request` | anonymous | none | retain anonymous |
+| `POST /password-reset/confirm` | anonymous | none | retain anonymous |
+| `POST /platform/login` | anonymous | none | bind platform user |
+| `POST /platform/register` | anonymous | none | bind platform user |
+| `POST /platform/refresh` | anonymous | platform resumption | bind platform user |
+| `GET /platform/verify-email/{code}` | anonymous or same-kind platform binding | none | retain authority |
+| `POST /platform/password-reset/request` | anonymous | none | retain anonymous |
+| `POST /platform/password-reset/confirm` | anonymous | none | retain anonymous |
+| `POST /platform/logout` | bound platform user | none | close exact session |
+| `POST /platform/request_verification` | bound platform user | none | retain binding |
+| `POST /platform/change-password` | bound platform user | none | close exact session |
+
+Except for refresh, bodyful operations retain their existing logical JSON
+shapes. Platform refresh carries no logical body or header: its v2-only
+resumption secret is the envelope credential. Every platform transition
+requires `cache_namespace_root_base64: null`; a platform session never obtains
+a provider-cache namespace.
+
+Platform access-descriptor and resumption tokens use distinct platform
+audiences and `pk = platform`. Legacy platform JWTs, user-v2 credentials,
+access descriptors, wrong-signature tokens, and wrong-purpose tokens cannot
+resume a platform session. Successful login, registration, or resumption
+constructs the complete logical response before atomically committing
+`Bound(Platform { platform_user_id })`; the gateway then encrypts that response
+through the same held session lease. The binding's authentication deadline is
+the access-descriptor expiry capped by the session's absolute expiry.
+
+Every bound platform account operation reloads the exact platform user. A
+deleted platform user produces an authenticated unauthorized response and
+closes the session; transient database failure retains the otherwise valid
+session. Logout intentionally preserves current behavior: it closes this
+transport session but does not globally revoke resumption credentials. A
+successful password change also closes this session. Global credential epochs
+and all-device logout remain separate application-authentication work, not an
+implicit transport promise.
+
+The following stack layer projects `/platform/me` and the complete
+organization, project, membership, invite, secret, and settings control plane.
+Those operations require live role checks and v2-only bounded database output;
+they are deliberately separated from principal establishment.
+
 ## 9. First-party and third-party tokens
 
 Transport v2 removes first-party JWTs from steady-state OpenSecret request
@@ -589,6 +638,11 @@ first-party audiences. Resumption validates the expected v2 audience, token
 kind, principal kind and identity, project/authentication context where
 applicable, issue/expiry times, and active credential state; an audience match
 alone is never sufficient.
+
+User and platform credentials occupy separate v2 domains. Platform credentials
+carry no user project or seed-wrap authentication context; platform resumption
+instead revalidates that exact platform-user row before binding. Neither kind
+can be parsed as or substituted for the other.
 
 These credentials remain bearer secrets if stolen from the client. Transport
 v2 protects them from the parent/network threat; it does not claim to protect a
@@ -779,7 +833,7 @@ encryption, bodyless, and SSE behavior. Client cutover proves:
 
 ## 14. Planned pull-request stack
 
-The implementation is intentionally consolidated into at most fourteen
+The implementation is intentionally consolidated into at most fifteen
 capability PRs. Each PR targets the branch immediately below it:
 
 1. **Protocol and v1-neutral seam**: freeze the contract and introduce shared
@@ -806,13 +860,17 @@ capability PRs. Each PR targets the branch immediately below it:
    revalidation, and client-random Tinfoil cache namespaces.
 10. **Session-bound user OAuth**: bind OAuth continuation to its originating
     v2 session without exposing credentials outside ciphertext.
-11. **Platform v2 end to end**: platform authentication and authorization with
-    live organization checks.
-12. **Authenticated streaming**: ordered, request-bound records and an
+11. **Platform authentication and account lifecycle**: distinct platform-v2
+    credentials, immutable platform-session binding, password recovery, email
+    verification, logout, and password change.
+12. **Platform resource control**: bounded `/platform/me` and complete
+    organization, project, membership, invite, secret, and settings projection
+    with live role checks.
+13. **Authenticated streaming**: ordered, request-bound records and an
     authenticated terminal event while preserving caller-visible streaming.
-13. **Dormant TypeScript and Rust SDK engines**: shared vectors and private v2
+14. **Dormant TypeScript and Rust SDK engines**: shared vectors and private v2
     session/transport implementations that public calls do not yet select.
-14. **Atomic v2 cutover and packaging**: switch new SDK majors to v2-only,
+15. **Atomic v2 cutover and packaging**: switch new SDK majors to v2-only,
     update Maple and maple-proxy dependencies, and run compatibility/release
     rehearsal. Publication and deployment remain separately authorized.
 

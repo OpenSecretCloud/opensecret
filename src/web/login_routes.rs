@@ -169,7 +169,7 @@ pub(crate) async fn authenticate_login(
             match data.db.get_user_by_email(email.clone(), project.id) {
                 Ok(user) => user,
                 Err(DBError::UserNotFound) => {
-                    error!("User not found by email: {email}");
+                    error!("User not found for email login");
                     return Err(ApiError::InvalidUsernameOrPassword);
                 }
                 Err(e) => {

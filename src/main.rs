@@ -1697,7 +1697,7 @@ impl AppState {
 
         let encrypted_pw = encrypt_with_key(&secret_key, password_hash.as_bytes()).await;
 
-        tracing::debug!("registering new user: {:?}", creds.email);
+        tracing::debug!("registering new password-backed user");
 
         // Generate private key for new user
         let user_seed_words = generate_twelve_word_seed(self.aws_credential_manager.clone())
@@ -1713,7 +1713,7 @@ impl AppState {
             user_seed_words.as_bytes(),
         )?;
 
-        tracing::info!("registered new user: {:?} {:?}", user.email, user.uuid);
+        tracing::info!(user_uuid = %user.uuid, "registered new user");
 
         Ok(user)
     }
@@ -2200,7 +2200,7 @@ impl AppState {
             Err(DBError::UserNotFound) => {
                 // User doesn't exist, but we don't want to reveal this information
                 // So we'll just log it and return as if everything was successful
-                debug!("Password reset requested for non-existent email: {}", email);
+                debug!("Password reset requested for a non-existent email address");
             }
             Err(e) => {
                 // For other errors, we should still log them but not expose them to the user
@@ -2374,10 +2374,7 @@ impl AppState {
             Ok(None) => {
                 // User doesn't exist, but we don't want to reveal this information
                 // So we'll just log it and return as if everything was successful
-                debug!(
-                    "Password reset requested for non-existent platform email: {}",
-                    email
-                );
+                debug!("Platform password reset requested for a non-existent email address");
             }
             Err(e) => {
                 // For other errors, we should still log them but not expose them to the user
@@ -2735,7 +2732,7 @@ impl AppState {
         let platform_user = match self.db.get_platform_user_by_email(email)? {
             Some(user) => user,
             None => {
-                warn!("Could not find platform user by email: {email}");
+                warn!("Could not find platform user for email login");
                 return Ok(None);
             }
         };

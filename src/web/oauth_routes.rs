@@ -1635,6 +1635,10 @@ mod tests {
         );
 
         let _ = app_state.db.delete_user(&user);
+        drop(app_state);
+        // Let the test-only database pool finish retiring its libpq worker
+        // before this one-test runtime tears down linked GSS thread state.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     #[tokio::test]
@@ -1711,6 +1715,9 @@ mod tests {
             .expect("new OAuth auth context should unwrap the committed seed wrap");
 
         let _ = app_state.db.delete_user(&authenticated_user.user);
+        drop(app_state);
+        // See the same-email OAuth database test above.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     async fn build_local_test_app_state(database_url: String) -> AppState {

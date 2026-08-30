@@ -1519,6 +1519,7 @@ mod tests {
         AuthorityState, BoundAuthority, BoundPrincipal, SessionLimits,
     };
     use crate::ApiError;
+    use rand_core::RngCore;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_session(
@@ -1670,6 +1671,12 @@ mod tests {
         grant: &'a str,
         native_attempt_id: Uuid,
         now: Instant,
+    }
+
+    fn random_test_nonce() -> [u8; 12] {
+        let mut nonce = [0_u8; 12];
+        rand_core::OsRng.fill_bytes(&mut nonce);
+        nonce
     }
 
     async fn process_native_handoff_test_redemption(
@@ -2526,7 +2533,7 @@ mod tests {
                 session_id: other_session_id,
                 master_bytes: other_master,
                 request_id: wrong_session_request_id,
-                request_nonce: [0xcb; 12],
+                request_nonce: random_test_nonce(),
                 grant: &issued.grant,
                 native_attempt_id,
                 now,
@@ -2557,7 +2564,7 @@ mod tests {
                 session_id: target_session_id,
                 master_bytes: target_master,
                 request_id: wrong_attempt_request_id,
-                request_nonce: [0xcd; 12],
+                request_nonce: random_test_nonce(),
                 grant: &issued.grant,
                 native_attempt_id: Uuid::from_bytes([0xce; 16]),
                 now,
@@ -2588,7 +2595,7 @@ mod tests {
                 session_id: target_session_id,
                 master_bytes: target_master,
                 request_id: success_request_id,
-                request_nonce: [0xd0; 12],
+                request_nonce: random_test_nonce(),
                 grant: &issued.grant,
                 native_attempt_id,
                 now,
@@ -2639,7 +2646,11 @@ mod tests {
         ))
         .unwrap();
         let second_encrypted = target_client_keys
-            .encrypt_request_record_with_nonce(&target_session_id, &second_plaintext, [0xd2; 12])
+            .encrypt_request_record_with_nonce(
+                &target_session_id,
+                &second_plaintext,
+                random_test_nonce(),
+            )
             .unwrap();
         let (second_lease, second_envelope) = state
             .decrypt_request_envelope(target_session_id, &second_encrypted, now)

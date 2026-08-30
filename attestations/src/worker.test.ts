@@ -26,9 +26,9 @@ describe("TUF path contract", () => {
       "/tuf/metadata/1.root.json",
       "/tuf/metadata/12.snapshot.json",
       "/tuf/metadata/999.targets.json",
-      `/tuf/targets/policy/${SHA256}.builders.json`,
       `/tuf/targets/sigstore/${SHA256}.trusted_root.json`,
       `/tuf/targets/channels/${SHA256}.prod.json`,
+      `/tuf/targets/releases/1.2.3/prod/${SHA256}.manifest.json`,
       `/tuf/targets/releases/1.2.3/prod/${SHA256}.manifest.sigstore.json`,
     ]) {
       expect(classifyAssetPath(pathname)).toEqual({
@@ -51,11 +51,11 @@ describe("TUF path contract", () => {
       "/tuf/metadata/0.root.json",
       "/tuf/metadata/01.root.json",
       "/tuf/metadata/1.delegated.json",
-      "/tuf/targets/builders.json",
-      `/tuf/targets/${"A".repeat(64)}.builders.json`,
-      `/tuf/targets/policy//${SHA256}.builders.json`,
-      `/tuf/targets/.hidden/${SHA256}.builders.json`,
-      `/tuf/targets/policy/${SHA256}.builders.txt`,
+      "/tuf/targets/manifest.json",
+      `/tuf/targets/${"A".repeat(64)}.manifest.json`,
+      `/tuf/targets/releases//${SHA256}.manifest.json`,
+      `/tuf/targets/.hidden/${SHA256}.manifest.json`,
+      `/tuf/targets/releases/${SHA256}.manifest.txt`,
     ]) {
       expect(classifyAssetPath(pathname)).toBeNull();
     }
@@ -124,7 +124,7 @@ describe("attestations Worker", () => {
       "https://attestations.trymaple.ai/tuf/metadata/timestamp.json?cache=bust",
       "https://attestations.trymaple.ai/tuf/metadata/timestamp.json?",
       "https://attestations.trymaple.ai/tuf/metadata/root.json",
-      "https://attestations.trymaple.ai/tuf/targets/builders.json",
+      "https://attestations.trymaple.ai/tuf/targets/manifest.json",
     ]) {
       const response = await handleRequest(new Request(url), env);
       expect(response.status).toBe(404);

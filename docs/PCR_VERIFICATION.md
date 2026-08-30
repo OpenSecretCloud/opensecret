@@ -1,12 +1,14 @@
 # Nitro EIF Attestation Trust
 
-OpenSecret now separates two questions that the old signed-PCR JSON path mixed
+OpenSecret now separates three questions that the old signed-PCR JSON path mixed
 together:
 
-1. **Did an authorized builder produce and publicly attest these exact release
-   bytes and PCR measurements?** Sigstore answers this.
-2. **Which of those valid releases may a client trust now?** TUF metadata served
-   from `https://attestations.trymaple.ai` answers this.
+1. **Was this exact release manifest signed with valid, transparency-recorded
+   Sigstore evidence?** Sigstore answers this.
+2. **May this candidate enter the release channel?** Protected promotion checks
+   the release against repository-local builder configuration.
+3. **Which promoted releases may a client trust now?** TUF metadata served from
+   `https://attestations.trymaple.ai` answers this.
 
 AWS Nitro attestation then answers the live question: **is the enclave I am
 connecting to currently presenting the PCR tuple and session key that I
@@ -31,7 +33,7 @@ flowchart LR
 
     bundle --> promotion["Protected manual promotion"]
     manifest --> promotion
-    builderPolicy["TUF-authenticated builder policy"] --> promotion
+    builderConfig["Protected repo-side builder config"] --> promotion
     trustedRoot["TUF-authenticated Sigstore trusted root"] --> promotion
     promotion --> tuf["New signed TUF targets/snapshot/timestamp"]
     tuf --> worker["Atomic Cloudflare Worker deployment"]
@@ -48,11 +50,12 @@ flowchart LR
 The append-only Rekor log makes a signing event durable and auditable. It does
 not declare that release current. TUF supplies versioned, expiring, signed
 authorization and rollback protection. Cloudflare is only the byte transport:
-all clients authenticate the repository bytes through TUF. Rust also performs
-local cryptographic verification of each portable Sigstore bundle. Browser
-TypeScript authenticates the exact manifest, bundle, policy, and trusted-root
-bytes through TUF; the protected promotion is the component that
-cryptographically verifies Sigstore for that browser path.
+all clients authenticate the repository bytes through TUF. Rust and browser
+TypeScript also perform local cryptographic verification of each portable
+Sigstore bundle against the exact TUF-authenticated trusted-root bytes. Signer
+identity remains visible for audit, but clients do not use a builder identity
+allowlist: TUF authorization of the exact manifest and bundle is the client
+release decision.
 
 ## Before and after
 
@@ -61,10 +64,10 @@ cryptographically verifies Sigstore for that browser path.
 | Published statement | A long-lived P-384 key signed PCR0 only | A keyless Sigstore signature covers a canonical manifest containing source revision, locked Nix build data, EIF digest, and PCR0/PCR1/PCR2 |
 | Discovery | Client fetched mutable JSON from `raw.githubusercontent.com` | Client starts at `attestations.trymaple.ai/tuf` and follows authenticated TUF metadata |
 | Current release | Every valid history entry remained accepted | A monotonic prod/dev channel authorizes at most two active releases |
-| Builder identity | Implied by repository history and the custom signing key | Exact Fulcio issuer, workflow identity, repository, trigger, and workflow name live in a TUF-authenticated builder policy |
+| Builder identity | Implied by repository history and the custom signing key | Protected promotion checks exact Fulcio/workflow claims against repository-local configuration; clients authorize exact TUF targets, not a builder name |
 | Root of trust | Custom PCR public key shipped by old clients | Standard TUF root metadata is pinned by new clients |
 | PCR decision | PCR0-only legacy approval | Same-release, same-environment PCR0/PCR1/PCR2 tuple |
-| Runtime network | GitHub was in the dependency path | GitHub, Fulcio, and Rekor are not contacted during connection. Rust verifies portable evidence locally; browser TypeScript consumes the exact TUF-authenticated evidence already verified by protected promotion |
+| Runtime network | GitHub was in the dependency path | GitHub, Fulcio, and Rekor are not contacted during connection. Both SDKs verify the portable evidence locally from TUF-authenticated bytes |
 | Rollout | Updating history immediately enlarged trust | Candidate creation and activation are separate protected actions |
 
 Sigstore does not store values “inside Rekor” as a mutable database lookup.
@@ -114,9 +117,11 @@ The canonical manifest schema is repository-neutral:
 ```
 
 The current source URI happens to be GitHub because that is where the build runs
-today. It is data, not a fixed schema assumption. Moving the repository or
-builder later requires publishing a newly authenticated builder-policy entry,
-not changing the client protocol.
+today. It is data, not a fixed schema assumption. `builderId` is a bounded
+promotion-config selector and audit field; it is not client authorization.
+Moving the repository or builder later requires updating protected promotion
+tooling/configuration and publishing new release targets, not changing the SDK,
+TUF root, or channel schema.
 
 ## TUF repository contract
 
@@ -134,7 +139,6 @@ repository uses standard top-level TUF roles and consistent snapshots:
   <sha256>.name                       # hash-prefixed immutable targets
   channels/<sha256>.prod.json
   channels/<sha256>.dev.json
-  policy/<sha256>.builders.json
   sigstore/<sha256>.trusted_root.json
   releases/<version>/<env>/<sha256>.manifest.json
   releases/<version>/<env>/<sha256>.manifest.sigstore.json
@@ -156,10 +160,6 @@ A channel target is deliberately small:
   "schema": "https://attestations.trymaple.ai/schemas/channel/v1",
   "environment": "prod",
   "sequence": 12,
-  "builderPolicyTarget": {
-    "path": "policy/builders.json",
-    "sha256": "..."
-  },
   "sigstoreTrustedRootTarget": {
     "path": "sigstore/trusted_root.json",
     "sha256": "..."
@@ -197,14 +197,10 @@ sequenceDiagram
     SDK->>TUF: Verify hashes, signatures, versions, expiry
     SDK->>Site: GET environment channel
     SDK->>TUF: Verify target length + SHA-256
-    SDK->>Site: GET builder policy, trusted root, active manifests + bundles
+    SDK->>Site: GET trusted root, active manifests + bundles
     SDK->>TUF: Verify every target
-    alt Rust / native client
-        SDK->>Sigstore: Verify exact manifest bytes and builder identity offline
-    else Browser TypeScript
-        SDK->>SDK: Validate exact TUF-authenticated evidence bytes and schema
-        Note over SDK: Sigstore crypto was enforced by protected promotion
-    end
+    SDK->>Sigstore: Verify exact manifest bytes, signature, certificate chain, and log evidence offline
+    Note over SDK: TUF authorizes exact evidence; signer identity is audit-only in clients
     SDK->>Enclave: Send fresh nonce
     Enclave-->>SDK: AWS-signed document + key + PCR0/1/2
     SDK->>SDK: Require exact tuple from one active release
@@ -228,12 +224,12 @@ The current v1 bootstrap accepts at most 32 sequential rotations (root versions
 a longer history until that bridge design exists.
 
 Both clients reject redirects, expired metadata, rollback, freeze, unknown
-schemas, wrong environment, incomplete tuples, unexpected builder IDs, and any
-target whose length or digest differs. Rust additionally rejects any local
-Sigstore signature, certificate identity, issuer, transparency proof, or
-trusted-root failure. Browser TypeScript does not claim to implement that
-cryptography: it relies on the separately protected promotion to admit only a
-Cosign-verified bundle, while TUF prevents substituting different bytes later.
+schemas, wrong environment, incomplete tuples, malformed build metadata, and
+any target whose length or digest differs. They also reject local Sigstore
+signature, certificate-chain, transparency-proof, checkpoint, timestamp, or
+trusted-root failures. Neither client rejects an otherwise authorized release
+because its observed signer identity differs from an SDK-embedded builder
+allowlist; no such allowlist exists.
 
 ## Key model
 
@@ -268,18 +264,23 @@ violation.
 Production bootstrap fails closed until an operator generates keys and initial
 metadata. A safe outline is:
 
+This client contract is being finalized before first publication. Re-bootstrap
+any unpublished draft state that contains `policy/builders.json`; never rewrite
+already published TUF history to remove a target.
+
 1. Generate root and online Ed25519 keys into an operator-controlled directory,
    never the repository.
 2. Download and independently inspect the current official Sigstore trusted
    root.
-3. Run the local `bootstrap` command with the offline root key, online
-   key, reviewed `attestations/bootstrap/builders.json`, and trusted
-   root.
-4. Create the protected `attestations-state` branch containing only
+3. Run the local `bootstrap` command with the offline root key, online key, and
+   trusted root.
+4. Review `attestations/promotion/builders.json`, which is protected promotion
+   input and is never published as a TUF target.
+5. Create the protected `attestations-state` branch containing only
    public TUF state. Private keys must not appear there.
-5. Put only the online PEM key and scoped Cloudflare credentials in the
+6. Put only the online PEM key and scoped Cloudflare credentials in the
    protected GitHub Environment.
-6. Configure required reviewers, deployment branch restrictions, tag
+7. Configure required reviewers, deployment branch restrictions, tag
    protection, and master protection before the first release.
 
 Example local commands, using paths outside the checkout:
@@ -296,7 +297,6 @@ python scripts/manage_tuf_repository.py bootstrap \
   --output /secure/rendered/tuf \
   --root-key /secure/offline-root.pem \
   --online-key /secure/online.pem \
-  --builder-policy attestations/bootstrap/builders.json \
   --sigstore-trusted-root /secure/sigstore-trusted_root.json
 ```
 
@@ -324,10 +324,12 @@ Candidate publication does **not** update TUF or client trust.
 Dispatch `Promote Nitro Attestation` from protected master. Select
 environment, version, and `rollout` or `finalize`. It:
 
-1. verifies existing TUF state before reading policy;
+1. verifies existing TUF state before reading promotion configuration;
 2. downloads the inactive candidate;
 3. verifies its portable bundle with the TUF-authenticated Sigstore trusted root
-   and exact TUF-authenticated builder policy;
+   and exact repository-local builder configuration from protected master, then
+   rejects evidence outside the narrow bundle/trusted-root profile implemented
+   by both SDKs before signing any TUF metadata;
 4. proves the live repository is either byte-identical to state or an exact
    authenticated historical subset, rejecting rollback and same-version forks;
 5. signs new targets, snapshot, and timestamp metadata with the online key;
@@ -406,20 +408,25 @@ never read or fall back to the legacy JSON. Once old versions no longer need
 support, the bridge and GitHub raw-file dependency can be removed without
 changing the TUF/Sigstore protocol.
 
-The initial publisher deliberately has no policy/trusted-root update command.
-Activating either update requires a separately reviewed transition operation
-that verifies the old authenticated policy before signing the replacement.
-Inactive logical release targets are pruned automatically; their
+Builder configuration is ordinary protected promotion tooling: changing it can
+admit a different builder to a future promotion, but it does not change old
+client code or publish a client policy. The initial publisher deliberately has
+no Sigstore trusted-root update command; replacing that TUF target requires a
+separately reviewed transition operation. Inactive logical release targets are
+pruned automatically; their
 consistent-snapshot hash-prefixed bytes and historical metadata remain
 append-only.
 
 ## Security boundaries
 
 - Sigstore proves attributable, transparency-recorded provenance; it does not
-  prove code safety or current approval. Rust re-verifies this locally.
-  Browser TypeScript relies on the protected promotion for Sigstore
-  cryptographic verification and authenticates the promoted evidence through
-  TUF.
+  prove code safety or current approval. Both SDKs re-verify it locally, while
+  TUF authorizes the exact evidence without consulting a client builder
+  allowlist.
+- Promotion's Cosign check is the cryptographic and builder-authorization gate.
+  The publisher's additional strict schema check is a compatibility gate: it
+  prevents activating cryptographically valid evidence that either SDK cannot
+  parse or verify.
 - TUF authorizes current releases and resists rollback/freeze; it does not prove
   the enclave is running.
 - AWS Nitro attestation proves a fresh document and binds its key/PCRs; it does
@@ -428,6 +435,8 @@ append-only.
   itself independent reproduction.
 - Cloudflare availability and TLS are operational defenses. TUF authentication
   remains the byte-integrity defense for every client; local Sigstore
-  verification adds another independent provenance check in Rust.
-- A GitHub or builder migration is a builder-policy and source-URI update
-  authorized through TUF, not a client rewrite.
+  verification adds a separate cryptographic provenance check in both SDKs. It
+  is not an independent release authority in this initial model because Maple's
+  TUF authority also authenticates the Sigstore trusted-root target.
+- A GitHub or builder migration updates protected promotion configuration and
+  the next manifest's source/audit fields, not client code or the TUF root.

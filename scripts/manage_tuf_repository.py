@@ -8,6 +8,8 @@ one threshold-1 Ed25519 key shared by targets, snapshot, and timestamp.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -63,6 +65,12 @@ MAX_BUILDER_POLICY_BYTES = 128 * 1024
 MAX_SIGSTORE_ROOT_BYTES = 512 * 1024
 MAX_MANIFEST_BYTES = 128 * 1024
 MAX_BUNDLE_BYTES = 2 * 1024 * 1024
+MAX_CERTIFICATE_BYTES = 64 * 1024
+MAX_PUBLIC_KEY_BYTES = 16 * 1024
+MAX_SIGNATURE_BYTES = 16 * 1024
+MAX_RFC3161_TIMESTAMP_BYTES = 256 * 1024
+MAX_REKOR_BODY_BYTES = 1024 * 1024
+MAX_CHECKPOINT_CHARS = 64 * 1024
 MAX_TARGETS = 256
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 WORKFLOW_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}/[A-Za-z0-9_.-]{1,128}$")
@@ -228,6 +236,14 @@ def validate_root_client_subset(
             or any(keyid not in root.keys for keyid in role.keyids)
         ):
             raise RepositoryError(f"{context} has an invalid {role_name} role")
+        role_material = [
+            normalized_public_key_material(root.keys[keyid])
+            for keyid in role.keyids
+        ]
+        if len(set(role_material)) != len(role_material):
+            raise RepositoryError(
+                f"{context} reuses key material within the {role_name} role"
+            )
 
     root_material = {
         normalized_public_key_material(root.keys[keyid])
@@ -264,7 +280,7 @@ def role_public_key_material(root: Root, role_name: str) -> set[bytes]:
 
 
 def target_size_limit(logical: str) -> int:
-    if logical == "policy/builders.json" or logical.startswith("channels/"):
+    if logical.startswith("channels/"):
         return MAX_CHANNEL_BYTES
     if logical == "sigstore/trusted_root.json":
         return MAX_SIGSTORE_ROOT_BYTES
@@ -478,12 +494,31 @@ def validate_source_path(path: Any) -> None:
 
 
 def validate_https_url(value: Any, context: str) -> urllib.parse.SplitResult:
-    if not isinstance(value, str) or not value or value.strip() != value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 2048
+        or value.strip() != value
+    ):
         raise RepositoryError(f"{context} must be an exact HTTPS URL")
-    parsed = urllib.parse.urlsplit(value)
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        raise RepositoryError(f"{context} must be an exact HTTPS URL") from error
     if (
         parsed.scheme != "https"
         or not parsed.netloc
+        or hostname is None
+        or "%" in parsed.netloc
+        or not re.fullmatch(
+            r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?[.])*"
+            r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?[.]?",
+            hostname,
+        )
+        or len(hostname) > 253
+        or (port is not None and not 0 <= port <= 65535)
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -491,6 +526,81 @@ def validate_https_url(value: Any, context: str) -> urllib.parse.SplitResult:
     ):
         raise RepositoryError(f"{context} must be an exact HTTPS URL")
     return parsed
+
+
+def require_exact_object(
+    value: Any, required: set[str], optional: set[str], context: str
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or not required <= set(value) or set(value) - (
+        required | optional
+    ):
+        raise RepositoryError(f"{context} has invalid fields")
+    return value
+
+
+def validate_base64(
+    value: Any, maximum: int, context: str, exact: int | None = None
+) -> bytes:
+    if not isinstance(value, str) or not value:
+        raise RepositoryError(f"{context} must be non-empty canonical base64")
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise RepositoryError(f"{context} is not valid base64") from error
+    if not decoded or len(decoded) > maximum:
+        raise RepositoryError(f"{context} exceeds its decoded byte limit")
+    if exact is not None and len(decoded) != exact:
+        raise RepositoryError(f"{context} must decode to exactly {exact} bytes")
+    if base64.b64encode(decoded).decode("ascii") != value:
+        raise RepositoryError(f"{context} is not canonically encoded base64")
+    return decoded
+
+
+def validate_decimal_integer(value: Any, context: str, positive: bool = False) -> int:
+    if (
+        not isinstance(value, str)
+        or not re.fullmatch(r"0|[1-9][0-9]{0,15}", value)
+        or int(value) > MAX_SAFE_INTEGER
+        or (positive and value == "0")
+    ):
+        qualifier = "positive " if positive else ""
+        raise RepositoryError(
+            f"{context} must be a browser-safe {qualifier}decimal integer string"
+        )
+    return int(value)
+
+
+def validate_datetime(value: Any, context: str) -> datetime:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 64
+        or not re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+            r"(?:[.][0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})",
+            value,
+        )
+    ):
+        raise RepositoryError(f"{context} must be a bounded RFC3339 timestamp")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise RepositoryError(f"{context} is not an RFC3339 timestamp") from error
+    if parsed.tzinfo is None:
+        raise RepositoryError(f"{context} must include a timezone offset")
+    return parsed
+
+
+def javascript_milliseconds(value: datetime) -> int:
+    """Return the millisecond precision used by JavaScript Date.parse()."""
+
+    utc_value = value.astimezone(timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = utc_value - epoch
+    return (
+        (delta.days * 24 * 60 * 60 + delta.seconds) * 1000
+        + delta.microseconds // 1000
+    )
 
 
 def require_size(data: bytes, maximum: int, context: str) -> None:
@@ -516,6 +626,8 @@ def authenticated_target(
 
 
 def validate_builder_policy(data: bytes) -> dict[str, Any]:
+    """Validate repo-side promotion input, never a client-facing TUF target."""
+
     require_size(data, MAX_BUILDER_POLICY_BYTES, "builder policy")
     policy = strict_json_bytes(data, "builder policy")
     if not isinstance(policy, dict) or set(policy) != {"schema", "builders"}:
@@ -578,12 +690,116 @@ def validate_builder_policy(data: bytes) -> dict[str, Any]:
     return policy
 
 
-def validate_sigstore_root(data: bytes) -> None:
+def validate_valid_for(value: Any, context: str) -> None:
+    valid_for = require_exact_object(value, {"start"}, {"end"}, context)
+    start = validate_datetime(valid_for["start"], f"{context}.start")
+    if "end" in valid_for:
+        end = validate_datetime(valid_for["end"], f"{context}.end")
+        if javascript_milliseconds(end) <= javascript_milliseconds(start):
+            raise RepositoryError(f"{context}.end must be after its start")
+
+
+def validate_certificate(value: Any, context: str) -> None:
+    certificate = require_exact_object(value, {"rawBytes"}, set(), context)
+    validate_base64(
+        certificate["rawBytes"], MAX_CERTIFICATE_BYTES, f"{context}.rawBytes"
+    )
+
+
+def validate_subject(value: Any, context: str) -> None:
+    subject = require_exact_object(
+        value, {"organization", "commonName"}, set(), context
+    )
+    for name in ("organization", "commonName"):
+        field = subject[name]
+        if not isinstance(field, str) or not field or len(field) > 512:
+            raise RepositoryError(f"{context}.{name} must be a bounded string")
+
+
+def validate_certificate_chain(value: Any, context: str) -> None:
+    chain = require_exact_object(value, {"certificates"}, set(), context)
+    certificates = chain["certificates"]
+    if not isinstance(certificates, list) or not 1 <= len(certificates) <= 8:
+        raise RepositoryError(f"{context}.certificates must contain between 1 and 8 entries")
+    for index, certificate in enumerate(certificates):
+        validate_certificate(certificate, f"{context}.certificates[{index}]")
+
+
+def validate_log(value: Any, context: str) -> str:
+    log = require_exact_object(
+        value,
+        {"baseUrl", "hashAlgorithm", "publicKey", "logId"},
+        set(),
+        context,
+    )
+    validate_https_url(log["baseUrl"], f"{context}.baseUrl")
+    if log["hashAlgorithm"] != "SHA2_256":
+        raise RepositoryError(f"{context}.hashAlgorithm must be SHA2_256")
+    public_key = require_exact_object(
+        log["publicKey"], {"rawBytes", "keyDetails", "validFor"}, set(), f"{context}.publicKey"
+    )
+    validate_base64(
+        public_key["rawBytes"], MAX_PUBLIC_KEY_BYTES, f"{context}.publicKey.rawBytes"
+    )
+    if (
+        not isinstance(public_key["keyDetails"], str)
+        or not public_key["keyDetails"]
+        or len(public_key["keyDetails"]) > 128
+    ):
+        raise RepositoryError(f"{context}.publicKey.keyDetails must be a bounded string")
+    validate_valid_for(public_key["validFor"], f"{context}.publicKey.validFor")
+    log_id = require_exact_object(log["logId"], {"keyId"}, set(), f"{context}.logId")
+    validate_base64(log_id["keyId"], 32, f"{context}.logId.keyId", exact=32)
+    return log_id["keyId"]
+
+
+def validate_authority(value: Any, context: str) -> None:
+    authority = require_exact_object(
+        value, {"subject", "uri", "certChain", "validFor"}, set(), context
+    )
+    validate_subject(authority["subject"], f"{context}.subject")
+    validate_https_url(authority["uri"], f"{context}.uri")
+    validate_certificate_chain(authority["certChain"], f"{context}.certChain")
+    validate_valid_for(authority["validFor"], f"{context}.validFor")
+
+
+def validate_sigstore_root(data: bytes) -> dict[str, Any]:
     require_size(data, MAX_SIGSTORE_ROOT_BYTES, "Sigstore trusted root")
     root = strict_json_bytes(data, "Sigstore trusted root")
     expected = "application/vnd.dev.sigstore.trustedroot+json;version=0.1"
-    if not isinstance(root, dict) or root.get("mediaType") != expected:
+    root = require_exact_object(
+        root,
+        {
+            "mediaType",
+            "tlogs",
+            "certificateAuthorities",
+            "ctlogs",
+            "timestampAuthorities",
+        },
+        set(),
+        "Sigstore trusted root",
+    )
+    if root["mediaType"] != expected:
         raise RepositoryError("Sigstore trusted root has an unsupported mediaType")
+    for name in ("tlogs", "certificateAuthorities", "ctlogs", "timestampAuthorities"):
+        entries = root[name]
+        if not isinstance(entries, list) or not 1 <= len(entries) <= 16:
+            raise RepositoryError(
+                f"Sigstore trusted root {name} must contain between 1 and 16 entries"
+            )
+    for index, log in enumerate(root["tlogs"]):
+        validate_log(log, f"Sigstore trusted root.tlogs[{index}]")
+    for index, authority in enumerate(root["certificateAuthorities"]):
+        validate_authority(
+            authority, f"Sigstore trusted root.certificateAuthorities[{index}]"
+        )
+    for index, log in enumerate(root["ctlogs"]):
+        validate_log(log, f"Sigstore trusted root.ctlogs[{index}]")
+    for index, authority in enumerate(root["timestampAuthorities"]):
+        validate_authority(
+            authority, f"Sigstore trusted root.timestampAuthorities[{index}]"
+        )
+    return root
 
 
 def validate_manifest(data: bytes, environment: str, version: str) -> dict[str, Any]:
@@ -696,12 +912,210 @@ def validate_manifest(data: bytes, environment: str, version: str) -> dict[str, 
     return manifest
 
 
-def validate_bundle(data: bytes) -> None:
+def validate_inclusion_proof(value: Any, context: str) -> int:
+    proof = require_exact_object(
+        value,
+        {"logIndex", "rootHash", "treeSize", "hashes", "checkpoint"},
+        set(),
+        context,
+    )
+    log_index = validate_decimal_integer(proof["logIndex"], f"{context}.logIndex")
+    tree_size = validate_decimal_integer(
+        proof["treeSize"], f"{context}.treeSize", positive=True
+    )
+    if log_index >= tree_size:
+        raise RepositoryError(f"{context}.logIndex must be smaller than treeSize")
+    validate_base64(proof["rootHash"], 32, f"{context}.rootHash", exact=32)
+    hashes = proof["hashes"]
+    if not isinstance(hashes, list) or len(hashes) > 64:
+        raise RepositoryError(f"{context}.hashes must contain at most 64 entries")
+    for index, digest in enumerate(hashes):
+        validate_base64(digest, 32, f"{context}.hashes[{index}]", exact=32)
+    checkpoint = require_exact_object(
+        proof["checkpoint"], {"envelope"}, set(), f"{context}.checkpoint"
+    )
+    envelope = checkpoint["envelope"]
+    if (
+        not isinstance(envelope, str)
+        or not envelope
+        or len(envelope) > MAX_CHECKPOINT_CHARS
+    ):
+        raise RepositoryError(
+            f"{context}.checkpoint.envelope must contain a bounded signed checkpoint"
+        )
+    return log_index
+
+
+def validate_timestamp_verification_data(value: Any, context: str) -> None:
+    timestamp_data = require_exact_object(
+        value, {"rfc3161Timestamps"}, set(), context
+    )
+    timestamps = timestamp_data["rfc3161Timestamps"]
+    if not isinstance(timestamps, list) or len(timestamps) != 1:
+        raise RepositoryError(
+            f"{context}.rfc3161Timestamps must contain exactly one entry"
+        )
+    for index, timestamp in enumerate(timestamps):
+        timestamp = require_exact_object(
+            timestamp, {"signedTimestamp"}, set(), f"{context}.rfc3161Timestamps[{index}]"
+        )
+        validate_base64(
+            timestamp["signedTimestamp"],
+            MAX_RFC3161_TIMESTAMP_BYTES,
+            f"{context}.rfc3161Timestamps[{index}].signedTimestamp",
+        )
+
+
+def validate_bundle(data: bytes, trusted_root: dict[str, Any]) -> dict[str, Any]:
     require_size(data, MAX_BUNDLE_BYTES, "Sigstore bundle")
     bundle = strict_json_bytes(data, "Sigstore bundle")
     expected = "application/vnd.dev.sigstore.bundle.v0.3+json"
-    if not isinstance(bundle, dict) or bundle.get("mediaType") != expected:
+    bundle = require_exact_object(
+        bundle,
+        {"mediaType", "verificationMaterial", "messageSignature"},
+        set(),
+        "Sigstore bundle",
+    )
+    if bundle["mediaType"] != expected:
         raise RepositoryError("unsupported Sigstore bundle mediaType")
+    message = require_exact_object(
+        bundle["messageSignature"],
+        {"messageDigest", "signature"},
+        set(),
+        "Sigstore bundle.messageSignature",
+    )
+    digest = require_exact_object(
+        message["messageDigest"],
+        {"algorithm", "digest"},
+        set(),
+        "Sigstore bundle.messageSignature.messageDigest",
+    )
+    if digest["algorithm"] != "SHA2_256":
+        raise RepositoryError("Sigstore message digest algorithm must be SHA2_256")
+    validate_base64(
+        digest["digest"],
+        32,
+        "Sigstore bundle.messageSignature.messageDigest.digest",
+        exact=32,
+    )
+    validate_base64(
+        message["signature"],
+        MAX_SIGNATURE_BYTES,
+        "Sigstore bundle.messageSignature.signature",
+    )
+
+    material = require_exact_object(
+        bundle["verificationMaterial"],
+        {"certificate", "tlogEntries", "timestampVerificationData"},
+        set(),
+        "Sigstore bundle.verificationMaterial",
+    )
+    validate_certificate(
+        material["certificate"], "Sigstore bundle.verificationMaterial.certificate"
+    )
+    validate_timestamp_verification_data(
+        material["timestampVerificationData"],
+        "Sigstore bundle.verificationMaterial.timestampVerificationData",
+    )
+    entries = material["tlogEntries"]
+    if not isinstance(entries, list) or len(entries) != 1:
+        raise RepositoryError(
+            "Sigstore bundle must contain exactly one transparency-log entry"
+        )
+    entry = require_exact_object(
+        entries[0],
+        {
+            "logIndex",
+            "logId",
+            "kindVersion",
+            "inclusionProof",
+            "canonicalizedBody",
+        },
+        {"integratedTime", "inclusionPromise"},
+        "Sigstore bundle transparency-log entry",
+    )
+    log_index = validate_decimal_integer(
+        entry["logIndex"], "Sigstore bundle transparency-log entry.logIndex"
+    )
+    log_id = require_exact_object(
+        entry["logId"],
+        {"keyId"},
+        set(),
+        "Sigstore bundle transparency-log entry.logId",
+    )
+    validate_base64(
+        log_id["keyId"],
+        32,
+        "Sigstore bundle transparency-log entry.logId.keyId",
+        exact=32,
+    )
+    kind_version = require_exact_object(
+        entry["kindVersion"],
+        {"kind", "version"},
+        set(),
+        "Sigstore bundle transparency-log entry.kindVersion",
+    )
+    if kind_version["kind"] != "hashedrekord" or kind_version["version"] not in {
+        "0.0.1",
+        "0.0.2",
+    }:
+        raise RepositoryError(
+            "Sigstore transparency-log entry must be hashedrekord v0.0.1 or v0.0.2"
+        )
+
+    inclusion_promise = entry.get("inclusionPromise")
+    if "inclusionPromise" in entry:
+        inclusion_promise = require_exact_object(
+            inclusion_promise,
+            {"signedEntryTimestamp"},
+            set(),
+            "Sigstore bundle transparency-log entry.inclusionPromise",
+        )
+        validate_base64(
+            inclusion_promise["signedEntryTimestamp"],
+            MAX_SIGNATURE_BYTES,
+            "Sigstore bundle transparency-log entry.inclusionPromise.signedEntryTimestamp",
+        )
+    if kind_version["version"] == "0.0.1":
+        validate_decimal_integer(
+            entry.get("integratedTime"),
+            "Sigstore Rekor v1 integratedTime",
+            positive=True,
+        )
+        if inclusion_promise is None:
+            raise RepositoryError("Sigstore Rekor v1 entry requires an inclusion promise")
+    elif "integratedTime" in entry:
+        integrated_time = entry["integratedTime"]
+        if integrated_time is not None and integrated_time != "0" and not (
+            type(integrated_time) is int and integrated_time == 0
+        ):
+            raise RepositoryError(
+                "Sigstore Rekor v2 integratedTime must be absent, null, string zero, or numeric zero"
+            )
+
+    proof_log_index = validate_inclusion_proof(
+        entry["inclusionProof"],
+        "Sigstore bundle transparency-log entry.inclusionProof",
+    )
+    if proof_log_index != log_index:
+        raise RepositoryError(
+            "Sigstore transparency-log entry and inclusion proof logIndex must match"
+        )
+    validate_base64(
+        entry["canonicalizedBody"],
+        MAX_REKOR_BODY_BYTES,
+        "Sigstore bundle transparency-log entry.canonicalizedBody",
+    )
+    matching_logs = [
+        log
+        for log in trusted_root["tlogs"]
+        if log["logId"]["keyId"] == log_id["keyId"]
+    ]
+    if len(matching_logs) != 1:
+        raise RepositoryError(
+            "Sigstore bundle must identify exactly one trusted-root transparency log"
+        )
+    return bundle
 
 
 def validate_channel(channel: Any, environment: str) -> dict[str, Any]:
@@ -710,7 +1124,6 @@ def validate_channel(channel: Any, environment: str) -> dict[str, Any]:
         or set(channel)
         != {
             "active",
-            "builderPolicyTarget",
             "environment",
             "schema",
             "sequence",
@@ -722,19 +1135,16 @@ def validate_channel(channel: Any, environment: str) -> dict[str, Any]:
         or channel["sequence"] < 1
     ):
         raise RepositoryError("current channel target is invalid")
-    for name in ("builderPolicyTarget", "sigstoreTrustedRootTarget"):
-        reference = channel[name]
-        if (
-            not isinstance(reference, dict)
-            or set(reference) != {"path", "sha256"}
-            or not isinstance(reference["path"], str)
-            or not isinstance(reference["sha256"], str)
-            or not SHA256_RE.fullmatch(reference["sha256"])
-        ):
-            raise RepositoryError(f"current channel {name} is invalid")
-        validate_target_path(reference["path"])
-    if channel["builderPolicyTarget"]["path"] != "policy/builders.json":
-        raise RepositoryError("current channel builder policy path is invalid")
+    reference = channel["sigstoreTrustedRootTarget"]
+    if (
+        not isinstance(reference, dict)
+        or set(reference) != {"path", "sha256"}
+        or not isinstance(reference["path"], str)
+        or not isinstance(reference["sha256"], str)
+        or not SHA256_RE.fullmatch(reference["sha256"])
+    ):
+        raise RepositoryError("current channel sigstoreTrustedRootTarget is invalid")
+    validate_target_path(reference["path"])
     if channel["sigstoreTrustedRootTarget"]["path"] != "sigstore/trusted_root.json":
         raise RepositoryError("current channel Sigstore trusted-root path is invalid")
     active = channel["active"]
@@ -906,6 +1316,10 @@ def validate_repository(repository: Path) -> None:
     validate_safe_tree(repository)
     root = load_root_chain(repository)
     targets, snapshot, current_timestamp = load_current(repository, root.signed)
+    if "policy/builders.json" in targets.signed.targets:
+        raise RepositoryError(
+            "builder configuration must remain promotion-local, not a TUF target"
+        )
     actual_targets = {
         path.relative_to(repository / "targets").as_posix()
         for path in (repository / "targets").rglob("*")
@@ -1117,7 +1531,6 @@ def bootstrap(
     output: Path,
     root_key: Path,
     online_key: Path,
-    builder_policy: Path,
     sigstore_root: Path,
 ) -> None:
     if repository.exists() and any(repository.iterdir()):
@@ -1132,9 +1545,7 @@ def bootstrap(
         raise RepositoryError(
             "offline root and online signing key material must differ"
         )
-    policy = require_file(builder_policy, "builder policy")
     trusted_root = require_file(sigstore_root, "Sigstore trusted root")
-    validate_builder_policy(policy)
     validate_sigstore_root(trusted_root)
 
     root = Root(
@@ -1148,14 +1559,13 @@ def bootstrap(
     root_metadata = Metadata(root)
     root_metadata.sign(root_signer)
     atomic_write(repository / "metadata" / "1.root.json", root_metadata.to_bytes())
-    atomic_write(repository / "targets/policy/builders.json", policy)
     atomic_write(repository / "targets/sigstore/trusted_root.json", trusted_root)
 
     descriptors = {
         logical: TargetFile.from_data(
             logical, (repository / "targets" / logical).read_bytes(), ["sha256"]
         )
-        for logical in ("policy/builders.json", "sigstore/trusted_root.json")
+        for logical in ("sigstore/trusted_root.json",)
     }
     targets = Metadata(
         Targets(
@@ -1196,6 +1606,7 @@ def promote(
     repository: Path,
     output: Path,
     online_key: Path,
+    builder_policy: Path,
     environment: str,
     version: str,
     phase: str,
@@ -1214,19 +1625,18 @@ def promote(
     require_online_key(root.signed, signer)
     old_targets, old_snapshot, old_timestamp = load_current(repository, root.signed)
 
-    policy_path = "policy/builders.json"
     trusted_root_path = "sigstore/trusted_root.json"
-    policy_bytes = authenticated_target(repository, old_targets.signed, policy_path)
     trusted_root_bytes = authenticated_target(
         repository, old_targets.signed, trusted_root_path
     )
+    policy_bytes = require_file(builder_policy, "promotion builder policy")
     policy = validate_builder_policy(policy_bytes)
-    validate_sigstore_root(trusted_root_bytes)
+    trusted_root = validate_sigstore_root(trusted_root_bytes)
 
     manifest_bytes = require_file(manifest_path, "release manifest")
     bundle_bytes = require_file(bundle_path, "Sigstore bundle")
     manifest = validate_manifest(manifest_bytes, environment, version)
-    validate_bundle(bundle_bytes)
+    validate_bundle(bundle_bytes, trusted_root)
     if manifest["build"]["builderId"] not in policy["builders"]:
         raise RepositoryError("manifest builderId is not authorized by builder policy")
     builder = policy["builders"][manifest["build"]["builderId"]]
@@ -1264,13 +1674,12 @@ def promote(
             f"{environment} channel",
         )
         channel = validate_channel(channel, environment)
-        if channel["builderPolicyTarget"] != target_ref(
-            policy_path, policy_bytes
-        ) or channel["sigstoreTrustedRootTarget"] != target_ref(
+        if channel["sigstoreTrustedRootTarget"] != target_ref(
             trusted_root_path, trusted_root_bytes
         ):
             raise RepositoryError(
-                "current channel policy references do not match authenticated targets"
+                "current channel Sigstore trusted-root reference does not match "
+                "the authenticated target"
             )
         previous_active = channel["active"]
         sequence = channel["sequence"] + 1
@@ -1328,7 +1737,6 @@ def promote(
 
     channel = {
         "active": active,
-        "builderPolicyTarget": target_ref(policy_path, policy_bytes),
         "environment": environment,
         "schema": CHANNEL_SCHEMA,
         "sequence": sequence,
@@ -1351,13 +1759,10 @@ def revoke(repository: Path, output: Path, online_key: Path, environment: str) -
     require_online_key(root.signed, signer)
     old_targets, old_snapshot, old_timestamp = load_current(repository, root.signed)
 
-    policy_path = "policy/builders.json"
     trusted_root_path = "sigstore/trusted_root.json"
-    policy_bytes = authenticated_target(repository, old_targets.signed, policy_path)
     trusted_root_bytes = authenticated_target(
         repository, old_targets.signed, trusted_root_path
     )
-    validate_builder_policy(policy_bytes)
     validate_sigstore_root(trusted_root_bytes)
 
     channel_path = f"channels/{environment}.json"
@@ -1376,19 +1781,17 @@ def revoke(repository: Path, output: Path, online_key: Path, environment: str) -
             ),
             environment,
         )
-        if previous["builderPolicyTarget"] != target_ref(
-            policy_path, policy_bytes
-        ) or previous["sigstoreTrustedRootTarget"] != target_ref(
+        if previous["sigstoreTrustedRootTarget"] != target_ref(
             trusted_root_path, trusted_root_bytes
         ):
             raise RepositoryError(
-                "current channel policy references do not match authenticated targets"
+                "current channel Sigstore trusted-root reference does not match "
+                "the authenticated target"
             )
         sequence = previous["sequence"] + 1
 
     channel = {
         "active": [],
-        "builderPolicyTarget": target_ref(policy_path, policy_bytes),
         "environment": environment,
         "schema": CHANNEL_SCHEMA,
         "sequence": sequence,
@@ -1504,8 +1907,7 @@ def verify_live_state(
             current_root.signed.version == 1
             and current_targets.signed.version == current_snapshot.signed.version
             and current_snapshot.signed.version == current_timestamp.signed.version
-            and set(current_targets.signed.targets)
-            == {"policy/builders.json", "sigstore/trusted_root.json"}
+            and set(current_targets.signed.targets) == {"sigstore/trusted_root.json"}
         )
         if allow_unpublished and unactivated:
             return
@@ -1582,6 +1984,11 @@ def verify_live_state(
         )
 
     snapshot_version = live_timestamp.signed.snapshot_meta.version
+    if snapshot_version > current_snapshot.signed.version:
+        raise RepositoryError(
+            f"live snapshot version {snapshot_version} is ahead of checked-out state "
+            f"{current_snapshot.signed.version}"
+        )
     snapshot_relative = f"metadata/{snapshot_version}.snapshot.json"
     try:
         live_snapshot_bytes = fetch(snapshot_relative)
@@ -1608,10 +2015,32 @@ def verify_live_state(
             "live snapshot is not an exact historical subset of checked-out state"
         )
 
+    for version in range(1, snapshot_version):
+        historical_relative = f"metadata/{version}.snapshot.json"
+        try:
+            historical_live_bytes = fetch(historical_relative)
+        except LiveFileNotFound:
+            raise RepositoryError(
+                f"live repository is missing historical {historical_relative}"
+            ) from None
+        historical_state_bytes = require_file(
+            repository / "metadata" / f"{version}.snapshot.json",
+            "historical snapshot",
+        )
+        if historical_live_bytes != historical_state_bytes:
+            raise RepositoryError(
+                f"live historical snapshot version {version} forks checked-out history"
+            )
+
     targets_descriptor = live_snapshot.signed.meta.get("targets.json")
     if targets_descriptor is None:
         raise RepositoryError("live snapshot does not reference targets metadata")
     targets_version = targets_descriptor.version
+    if targets_version > current_targets.signed.version:
+        raise RepositoryError(
+            f"live targets version {targets_version} is ahead of checked-out state "
+            f"{current_targets.signed.version}"
+        )
     targets_relative = f"metadata/{targets_version}.targets.json"
     try:
         live_targets_bytes = fetch(targets_relative)
@@ -1637,16 +2066,48 @@ def verify_live_state(
             "live targets are not an exact historical subset of checked-out state"
         )
 
+    historical_archived_targets: dict[str, tuple[str, TargetFile]] = {}
+    for version in range(1, targets_version + 1):
+        historical_state_path = (
+            repository / "metadata" / f"{version}.targets.json"
+        )
+        historical_state_bytes = require_file(
+            historical_state_path, "historical targets"
+        )
+        if version == targets_version:
+            historical_live_bytes = live_targets_bytes
+            historical_targets = live_targets
+        else:
+            historical_relative = f"metadata/{version}.targets.json"
+            try:
+                historical_live_bytes = fetch(historical_relative)
+            except LiveFileNotFound:
+                raise RepositoryError(
+                    f"live repository is missing historical {historical_relative}"
+                ) from None
+            historical_targets = load_metadata(historical_state_path, Targets)
+        if historical_live_bytes != historical_state_bytes:
+            raise RepositoryError(
+                f"live historical targets version {version} forks checked-out history"
+            )
+        for logical, descriptor in historical_targets.signed.targets.items():
+            validate_target_path(logical)
+            digest = descriptor.hashes.get("sha256")
+            if digest is None:
+                raise RepositoryError(
+                    f"live target lacks required SHA-256 hash: {logical}"
+                )
+            logical_path = Path(logical)
+            published_relative = (
+                logical_path.parent / f"{digest}.{logical_path.name}"
+            ).as_posix()
+            historical_archived_targets[published_relative] = (logical, descriptor)
+
     archive = repository / "published-targets"
-    for logical, descriptor in live_targets.signed.targets.items():
-        validate_target_path(logical)
-        logical_path = Path(logical)
-        digest = descriptor.hashes.get("sha256")
-        if digest is None:
-            raise RepositoryError(f"live target lacks required SHA-256 hash: {logical}")
-        published_relative = (
-            logical_path.parent / f"{digest}.{logical_path.name}"
-        ).as_posix()
+    for published_relative, (logical, descriptor) in sorted(
+        historical_archived_targets.items()
+    ):
+        digest = descriptor.hashes["sha256"]
         live_relative = f"targets/{published_relative}"
         try:
             live_bytes = fetch(live_relative)
@@ -1684,7 +2145,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "output",
         "root-key",
         "online-key",
-        "builder-policy",
         "sigstore-trusted-root",
     ):
         init.add_argument(f"--{name}", required=True, type=Path)
@@ -1692,6 +2152,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     promotion.add_argument("--repository", required=True, type=Path)
     promotion.add_argument("--output", required=True, type=Path)
     promotion.add_argument("--online-key", required=True, type=Path)
+    promotion.add_argument("--builder-policy", required=True, type=Path)
     promotion.add_argument("--environment", required=True, choices=sorted(ENVIRONMENTS))
     promotion.add_argument("--version", required=True)
     promotion.add_argument("--phase", required=True, choices=("rollout", "finalize"))
@@ -1727,7 +2188,6 @@ def run(argv: list[str]) -> None:
             args.output,
             args.root_key,
             args.online_key,
-            args.builder_policy,
             args.sigstore_trusted_root,
         )
     elif args.command == "promote":
@@ -1735,6 +2195,7 @@ def run(argv: list[str]) -> None:
             args.repository,
             args.output,
             args.online_key,
+            args.builder_policy,
             args.environment,
             args.version,
             args.phase,

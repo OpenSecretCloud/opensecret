@@ -217,6 +217,8 @@ def build_manifest(
             "size": eif_size,
         },
         "build": {
+            # Promotion uses this as a repo-local configuration selector. It is
+            # signed audit data, not a client-side builder authorization rule.
             "builderId": builder_id,
             "derivation": f".#eif-{environment}",
             "flakeLockSha256": sha256_file(flake_lock),

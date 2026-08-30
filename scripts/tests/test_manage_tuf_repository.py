@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import shutil
@@ -16,6 +17,90 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import manage_tuf_repository as tuf_repo
+
+
+def fixture_base64(value: bytes) -> str:
+    return base64.b64encode(value).decode("ascii")
+
+
+def fixture_valid_for() -> dict[str, str]:
+    return {"start": "2024-01-01T00:00:00Z"}
+
+
+def fixture_certificate(value: bytes = b"fixture certificate") -> dict[str, str]:
+    return {"rawBytes": fixture_base64(value)}
+
+
+def fixture_log(log_id: bytes, name: str) -> dict:
+    return {
+        "baseUrl": f"https://{name}.example.test",
+        "hashAlgorithm": "SHA2_256",
+        "publicKey": {
+            "rawBytes": fixture_base64(f"{name} public key".encode()),
+            "keyDetails": "PKIX_ECDSA_P256_SHA_256",
+            "validFor": fixture_valid_for(),
+        },
+        "logId": {"keyId": fixture_base64(log_id)},
+    }
+
+
+def fixture_authority(name: str) -> dict:
+    return {
+        "subject": {"organization": "Maple Test", "commonName": name},
+        "uri": f"https://{name}.example.test",
+        "certChain": {"certificates": [fixture_certificate(name.encode())]},
+        "validFor": fixture_valid_for(),
+    }
+
+
+def fixture_trusted_root() -> dict:
+    return {
+        "mediaType": "application/vnd.dev.sigstore.trustedroot+json;version=0.1",
+        "tlogs": [fixture_log(b"L" * 32, "rekor")],
+        "certificateAuthorities": [fixture_authority("fulcio")],
+        "ctlogs": [fixture_log(b"C" * 32, "ctlog")],
+        "timestampAuthorities": [fixture_authority("tsa")],
+    }
+
+
+def fixture_bundle(version: str = "0.0.2") -> dict:
+    entry = {
+        "logIndex": "0",
+        "logId": {"keyId": fixture_base64(b"L" * 32)},
+        "kindVersion": {"kind": "hashedrekord", "version": version},
+        "inclusionProof": {
+            "logIndex": "0",
+            "rootHash": fixture_base64(b"R" * 32),
+            "treeSize": "1",
+            "hashes": [],
+            "checkpoint": {"envelope": "fixture checkpoint\nfixture signature"},
+        },
+        "canonicalizedBody": fixture_base64(b'{"kind":"hashedrekord"}'),
+    }
+    if version == "0.0.1":
+        entry["integratedTime"] = "1"
+        entry["inclusionPromise"] = {
+            "signedEntryTimestamp": fixture_base64(b"fixture SET")
+        }
+    return {
+        "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+        "verificationMaterial": {
+            "certificate": fixture_certificate(),
+            "tlogEntries": [entry],
+            "timestampVerificationData": {
+                "rfc3161Timestamps": [
+                    {"signedTimestamp": fixture_base64(b"fixture RFC3161 timestamp")}
+                ]
+            },
+        },
+        "messageSignature": {
+            "messageDigest": {
+                "algorithm": "SHA2_256",
+                "digest": fixture_base64(b"D" * 32),
+            },
+            "signature": fixture_base64(b"fixture signature"),
+        },
+    }
 
 
 class LocalRepositoryFetcher(FetcherInterface):
@@ -65,22 +150,12 @@ class TufRepositoryTests(unittest.TestCase):
             )
         )
         self.trusted_root = self.root / "trusted_root.json"
-        self.trusted_root.write_bytes(
-            tuf_repo.canonical_json(
-                {
-                    "mediaType": "application/vnd.dev.sigstore.trustedroot+json;version=0.1",
-                    "certificateAuthorities": [],
-                    "tlogs": [],
-                    "ctlogs": [],
-                }
-            )
-        )
+        self.trusted_root.write_bytes(tuf_repo.canonical_json(fixture_trusted_root()))
         tuf_repo.bootstrap(
             self.repository,
             self.public,
             self.root_key,
             self.online_key,
-            self.policy,
             self.trusted_root,
         )
 
@@ -92,6 +167,7 @@ class TufRepositoryTests(unittest.TestCase):
         version: str,
         environment: str = "prod",
         pcrs: dict[str, str] | None = None,
+        bundle_version: str = "0.0.2",
     ) -> tuple[Path, Path]:
         if pcrs is None:
             pcrs = {
@@ -136,15 +212,7 @@ class TufRepositoryTests(unittest.TestCase):
             )
         )
         bundle = self.root / f"{version}-{environment}.sigstore.json"
-        bundle.write_bytes(
-            tuf_repo.canonical_json(
-                {
-                    "mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
-                    "verificationMaterial": {},
-                    "messageSignature": {},
-                }
-            )
-        )
+        bundle.write_bytes(tuf_repo.canonical_json(fixture_bundle(bundle_version)))
         return manifest, bundle
 
     def promote(
@@ -159,6 +227,7 @@ class TufRepositoryTests(unittest.TestCase):
             self.repository,
             self.public,
             self.online_key,
+            self.policy,
             environment,
             version,
             phase,
@@ -236,8 +305,12 @@ class TufRepositoryTests(unittest.TestCase):
         self,
     ) -> None:
         root = tuf_repo.load_root_chain(self.repository)
+        targets, _, _ = tuf_repo.load_current(self.repository, root.signed)
         online = tuf_repo.load_signer(self.online_key)
         self.assertTrue(root.signed.consistent_snapshot)
+        self.assertEqual(
+            set(targets.signed.targets), {"sigstore/trusted_root.json"}
+        )
         self.assertNotIn(online.public_key.keyid, root.signed.roles["root"].keyids)
         for role in tuf_repo.ONLINE_ROLES:
             self.assertEqual(root.signed.roles[role].threshold, 1)
@@ -256,9 +329,189 @@ class TufRepositoryTests(unittest.TestCase):
                 self.root / "same-key-public",
                 self.root_key,
                 self.root_key,
-                self.policy,
                 self.trusted_root,
             )
+
+    def test_checked_in_builder_configuration_is_valid_promotion_input(
+        self,
+    ) -> None:
+        config_path = SCRIPT_DIR.parent / "attestations/promotion/builders.json"
+        config = tuf_repo.validate_builder_policy(config_path.read_bytes())
+        self.assertIn("opensecret-nitro-eif-github-actions", config["builders"])
+
+    def test_sigstore_structural_profile_accepts_v1_and_v2_portable_bundles(
+        self,
+    ) -> None:
+        trusted_root = tuf_repo.validate_sigstore_root(self.trusted_root.read_bytes())
+        tuf_repo.validate_bundle(
+            tuf_repo.canonical_json(fixture_bundle("0.0.1")), trusted_root
+        )
+        for integrated_time in (None, "0", 0):
+            with self.subTest(v2_integrated_time=integrated_time):
+                bundle = fixture_bundle("0.0.2")
+                bundle["verificationMaterial"]["tlogEntries"][0][
+                    "integratedTime"
+                ] = integrated_time
+                tuf_repo.validate_bundle(tuf_repo.canonical_json(bundle), trusted_root)
+        tuf_repo.validate_bundle(
+            tuf_repo.canonical_json(fixture_bundle("0.0.2")), trusted_root
+        )
+
+    def test_sigstore_structural_profile_rejects_unsupported_signature_shapes(
+        self,
+    ) -> None:
+        trusted_root = tuf_repo.validate_sigstore_root(self.trusted_root.read_bytes())
+        mutations = {
+            "wrong digest algorithm": lambda bundle: bundle["messageSignature"][
+                "messageDigest"
+            ].__setitem__("algorithm", "SHA2_512"),
+            "short digest": lambda bundle: bundle["messageSignature"][
+                "messageDigest"
+            ].__setitem__("digest", fixture_base64(b"short")),
+            "noncanonical signature base64": lambda bundle: bundle[
+                "messageSignature"
+            ].__setitem__("signature", "Zg"),
+            "legacy certificate chain": lambda bundle: bundle[
+                "verificationMaterial"
+            ].__setitem__(
+                "x509CertificateChain", {"certificates": [fixture_certificate()]}
+            ),
+            "multiple tlog entries": lambda bundle: bundle["verificationMaterial"][
+                "tlogEntries"
+            ].append(bundle["verificationMaterial"]["tlogEntries"][0].copy()),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                bundle = fixture_bundle()
+                mutate(bundle)
+                with self.assertRaises(tuf_repo.RepositoryError):
+                    tuf_repo.validate_bundle(tuf_repo.canonical_json(bundle), trusted_root)
+
+    def test_sigstore_structural_profile_rejects_invalid_log_time_and_proof(
+        self,
+    ) -> None:
+        trusted_root = tuf_repo.validate_sigstore_root(self.trusted_root.read_bytes())
+
+        def entry(bundle: dict) -> dict:
+            return bundle["verificationMaterial"]["tlogEntries"][0]
+
+        mutations = {
+            "wrong kind": lambda bundle: entry(bundle)["kindVersion"].__setitem__(
+                "kind", "intoto"
+            ),
+            "unsupported version": lambda bundle: entry(bundle)[
+                "kindVersion"
+            ].__setitem__("version", "0.0.3"),
+            "unsafe log index": lambda bundle: entry(bundle).__setitem__(
+                "logIndex", str(tuf_repo.MAX_SAFE_INTEGER + 1)
+            ),
+            "zero tree": lambda bundle: entry(bundle)["inclusionProof"].__setitem__(
+                "treeSize", "0"
+            ),
+            "index outside tree": lambda bundle: entry(bundle)[
+                "inclusionProof"
+            ].__setitem__("logIndex", "1"),
+            "empty checkpoint": lambda bundle: entry(bundle)["inclusionProof"][
+                "checkpoint"
+            ].__setitem__("envelope", ""),
+            "nonzero v2 time": lambda bundle: entry(bundle).__setitem__(
+                "integratedTime", "1"
+            ),
+            "missing RFC3161": lambda bundle: bundle["verificationMaterial"][
+                "timestampVerificationData"
+            ].__setitem__("rfc3161Timestamps", []),
+            "duplicate RFC3161": lambda bundle: bundle["verificationMaterial"][
+                "timestampVerificationData"
+            ]["rfc3161Timestamps"].append(
+                {"signedTimestamp": fixture_base64(b"second RFC3161 timestamp")}
+            ),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name):
+                bundle = fixture_bundle()
+                mutate(bundle)
+                with self.assertRaises(tuf_repo.RepositoryError):
+                    tuf_repo.validate_bundle(tuf_repo.canonical_json(bundle), trusted_root)
+
+        v1_missing_set = fixture_bundle("0.0.1")
+        entry(v1_missing_set).pop("inclusionPromise")
+        with self.assertRaisesRegex(tuf_repo.RepositoryError, "inclusion promise"):
+            tuf_repo.validate_bundle(
+                tuf_repo.canonical_json(v1_missing_set), trusted_root
+            )
+        v1_zero_time = fixture_bundle("0.0.1")
+        entry(v1_zero_time)["integratedTime"] = "0"
+        with self.assertRaisesRegex(tuf_repo.RepositoryError, "positive"):
+            tuf_repo.validate_bundle(tuf_repo.canonical_json(v1_zero_time), trusted_root)
+        v1_missing_timestamp = fixture_bundle("0.0.1")
+        v1_missing_timestamp["verificationMaterial"]["timestampVerificationData"][
+            "rfc3161Timestamps"
+        ] = []
+        with self.assertRaisesRegex(tuf_repo.RepositoryError, "exactly one"):
+            tuf_repo.validate_bundle(
+                tuf_repo.canonical_json(v1_missing_timestamp), trusted_root
+            )
+
+    def test_sigstore_structural_profile_requires_usable_matching_trusted_root(
+        self,
+    ) -> None:
+        for name in (
+            "tlogs",
+            "certificateAuthorities",
+            "ctlogs",
+            "timestampAuthorities",
+        ):
+            with self.subTest(empty_root_role=name):
+                root = fixture_trusted_root()
+                root[name] = []
+                with self.assertRaises(tuf_repo.RepositoryError):
+                    tuf_repo.validate_sigstore_root(tuf_repo.canonical_json(root))
+
+        trusted_root = fixture_trusted_root()
+        trusted_root["tlogs"][0]["hashAlgorithm"] = "SHA2_512"
+        with self.assertRaisesRegex(tuf_repo.RepositoryError, "SHA2_256"):
+            tuf_repo.validate_sigstore_root(tuf_repo.canonical_json(trusted_root))
+
+        trusted_root = fixture_trusted_root()
+        trusted_root["tlogs"][0]["publicKey"]["validFor"][
+            "start"
+        ] = "2024-01-01 00:00:00+00:00"
+        with self.assertRaisesRegex(tuf_repo.RepositoryError, "RFC3339"):
+            tuf_repo.validate_sigstore_root(tuf_repo.canonical_json(trusted_root))
+
+        for invalid_url in (
+            "https://example.com:99999",
+            "https://exa%mple.com",
+        ):
+            with self.subTest(invalid_url=invalid_url):
+                trusted_root = fixture_trusted_root()
+                trusted_root["tlogs"][0]["baseUrl"] = invalid_url
+                with self.assertRaisesRegex(tuf_repo.RepositoryError, "HTTPS URL"):
+                    tuf_repo.validate_sigstore_root(
+                        tuf_repo.canonical_json(trusted_root)
+                    )
+
+        trusted_root = fixture_trusted_root()
+        trusted_root["tlogs"][0]["publicKey"]["validFor"] = {
+            "start": "2024-01-01T00:00:00.000000Z",
+            "end": "2024-01-01T00:00:00.000999Z",
+        }
+        with self.assertRaisesRegex(tuf_repo.RepositoryError, "after its start"):
+            tuf_repo.validate_sigstore_root(tuf_repo.canonical_json(trusted_root))
+
+        trusted_root = fixture_trusted_root()
+        trusted_root["tlogs"][0]["logId"]["keyId"] = fixture_base64(b"X" * 32)
+        parsed_root = tuf_repo.validate_sigstore_root(
+            tuf_repo.canonical_json(trusted_root)
+        )
+        with self.assertRaisesRegex(tuf_repo.RepositoryError, "exactly one"):
+            tuf_repo.validate_bundle(
+                tuf_repo.canonical_json(fixture_bundle()), parsed_root
+            )
+
+    def test_sigstore_timestamp_limit_does_not_widen_tuf_metadata_limit(self) -> None:
+        self.assertEqual(tuf_repo.MAX_TIMESTAMP_BYTES, 32 * 1024)
+        self.assertEqual(tuf_repo.MAX_RFC3161_TIMESTAMP_BYTES, 256 * 1024)
 
     def test_parsed_root_chain_rejects_root_material_under_online_alias_key_ids(
         self,
@@ -287,6 +540,32 @@ class TufRepositoryTests(unittest.TestCase):
                         tuf_repo.load_root_chain(self.repository)
                 finally:
                     root_v2_path.unlink()
+
+    def test_root_roles_reject_threshold_aliases_of_the_same_key_material(
+        self,
+    ) -> None:
+        root_v1_path = self.repository / "metadata/1.root.json"
+        for role_name in ("root", *tuf_repo.ONLINE_ROLES):
+            with self.subTest(role=role_name):
+                root_v2 = tuf_repo.Metadata.from_bytes(root_v1_path.read_bytes())
+                root_v2.signed.version = 2
+                original_keyid = root_v2.signed.roles[role_name].keyids[0]
+                alias_keyid = f"alias-{role_name}"
+                self.assertNotIn(alias_keyid, root_v2.signed.keys)
+                root_v2.signed.keys[alias_keyid] = root_v2.signed.keys[original_keyid]
+                root_v2.signed.roles[role_name].keyids = [
+                    original_keyid,
+                    alias_keyid,
+                ]
+                root_v2.signed.roles[role_name].threshold = 2
+
+                with self.assertRaisesRegex(
+                    tuf_repo.RepositoryError,
+                    f"reuses key material within the {role_name} role",
+                ):
+                    tuf_repo.validate_root_client_subset(
+                        root_v2, root_v2.to_bytes(), f"root v2 {role_name}"
+                    )
 
     def test_root_chain_allows_fresh_root_and_shared_online_key_rotation(self) -> None:
         old_root = tuf_repo.load_signer(self.root_key)
@@ -363,7 +642,7 @@ class TufRepositoryTests(unittest.TestCase):
         ):
             tuf_repo.load_root_chain(self.repository)
 
-    def test_workflow_shaped_python_cli_verify_and_refresh(self) -> None:
+    def test_workflow_shaped_python_cli_verify_refresh_and_promote(self) -> None:
         script = SCRIPT_DIR / "manage_tuf_repository.py"
         subprocess.run(
             [
@@ -372,6 +651,33 @@ class TufRepositoryTests(unittest.TestCase):
                 "verify",
                 "--repository",
                 str(self.repository),
+            ],
+            check=True,
+        )
+        manifest, bundle = self.release_files("0.1.0")
+        subprocess.run(
+            [
+                sys.executable,
+                str(script),
+                "promote",
+                "--repository",
+                str(self.repository),
+                "--output",
+                str(self.public),
+                "--online-key",
+                str(self.online_key),
+                "--builder-policy",
+                str(self.policy),
+                "--environment",
+                "prod",
+                "--version",
+                "0.1.0",
+                "--phase",
+                "rollout",
+                "--manifest",
+                str(manifest),
+                "--bundle",
+                str(bundle),
             ],
             check=True,
         )
@@ -469,19 +775,84 @@ class TufRepositoryTests(unittest.TestCase):
         snapshot_name = f"{timestamp.signed.snapshot_meta.version}.snapshot.json"
         self.assertTrue((self.public / "metadata" / snapshot_name).is_file())
 
-    def test_tampering_with_authenticated_policy_fails_closed(self) -> None:
+    def test_invalid_promotion_local_builder_policy_fails_closed(self) -> None:
         self.policy.write_text("{}\n", encoding="utf-8")
-        (self.repository / "targets/policy/builders.json").write_text(
+        manifest, bundle = self.release_files("3.0.0")
+        with self.assertRaisesRegex(tuf_repo.RepositoryError, "builder policy"):
+            tuf_repo.promote(
+                self.repository,
+                self.public,
+                self.online_key,
+                self.policy,
+                "prod",
+                "3.0.0",
+                "rollout",
+                manifest,
+                bundle,
+            )
+
+    def test_promotion_rejects_sigstore_evidence_outside_client_profile(
+        self,
+    ) -> None:
+        manifest, bundle = self.release_files("3.0.1")
+        value = json.loads(bundle.read_text(encoding="utf-8"))
+        value["messageSignature"]["messageDigest"]["algorithm"] = "SHA2_512"
+        bundle.write_bytes(tuf_repo.canonical_json(value))
+        with self.assertRaisesRegex(tuf_repo.RepositoryError, "SHA2_256"):
+            tuf_repo.promote(
+                self.repository,
+                self.public,
+                self.online_key,
+                self.policy,
+                "prod",
+                "3.0.1",
+                "rollout",
+                manifest,
+                bundle,
+            )
+
+    def test_tampering_with_tuf_authenticated_sigstore_root_fails_closed(
+        self,
+    ) -> None:
+        (self.repository / "targets/sigstore/trusted_root.json").write_text(
             "{}\n", encoding="utf-8"
         )
-        manifest, bundle = self.release_files("3.0.0")
+        manifest, bundle = self.release_files("3.0.2")
         with self.assertRaisesRegex(tuf_repo.RepositoryError, "does not match signed"):
             tuf_repo.promote(
                 self.repository,
                 self.public,
                 self.online_key,
+                self.policy,
                 "prod",
-                "3.0.0",
+                "3.0.2",
+                "rollout",
+                manifest,
+                bundle,
+            )
+
+    def test_builder_policy_is_promotion_local_and_absent_from_tuf_contract(
+        self,
+    ) -> None:
+        self.promote("3.0.3")
+        root = tuf_repo.load_root_chain(self.repository)
+        targets, _, _ = tuf_repo.load_current(self.repository, root.signed)
+        self.assertNotIn("policy/builders.json", targets.signed.targets)
+        self.assertNotIn("builderPolicyTarget", self.current_channel())
+
+    def test_manifest_builder_id_must_be_allowed_by_promotion_policy(self) -> None:
+        manifest, bundle = self.release_files("3.0.4")
+        value = json.loads(manifest.read_text(encoding="utf-8"))
+        value["build"]["builderId"] = "unconfigured-builder"
+        manifest.write_bytes(tuf_repo.canonical_json(value))
+        with self.assertRaisesRegex(tuf_repo.RepositoryError, "not authorized"):
+            tuf_repo.promote(
+                self.repository,
+                self.public,
+                self.online_key,
+                self.policy,
+                "prod",
+                "3.0.4",
                 "rollout",
                 manifest,
                 bundle,
@@ -602,6 +973,83 @@ class TufRepositoryTests(unittest.TestCase):
                 fetcher=missing_target,
             )
 
+    def test_live_preflight_rejects_rewritten_historical_metadata(self) -> None:
+        self.promote("5.1.3")
+
+        historical_targets_path = self.repository / "metadata/1.targets.json"
+        historical_targets = tuf_repo.load_metadata(
+            historical_targets_path, tuf_repo.Targets
+        )
+        historical_targets.signed.expires += timedelta(minutes=1)
+        historical_targets.signatures.clear()
+        historical_targets.sign(tuf_repo.load_signer(self.online_key))
+        historical_targets_bytes = historical_targets.to_bytes()
+        historical_targets_path.write_bytes(historical_targets_bytes)
+
+        historical_snapshot_path = self.repository / "metadata/1.snapshot.json"
+        historical_snapshot = tuf_repo.load_metadata(
+            historical_snapshot_path, tuf_repo.Snapshot
+        )
+        historical_snapshot.signed.meta["targets.json"] = tuf_repo.MetaFile.from_data(
+            1, historical_targets_bytes, ["sha256"]
+        )
+        historical_snapshot.signatures.clear()
+        historical_snapshot.sign(tuf_repo.load_signer(self.online_key))
+        historical_snapshot_bytes = historical_snapshot.to_bytes()
+        historical_snapshot_path.write_bytes(historical_snapshot_bytes)
+
+        historical_timestamp_path = (
+            self.repository / "timestamp-history/1.timestamp.json"
+        )
+        historical_timestamp = tuf_repo.load_metadata(
+            historical_timestamp_path, tuf_repo.Timestamp
+        )
+        historical_timestamp.signed.snapshot_meta = tuf_repo.MetaFile.from_data(
+            1, historical_snapshot_bytes, ["sha256"]
+        )
+        historical_timestamp.signatures.clear()
+        historical_timestamp.sign(tuf_repo.load_signer(self.online_key))
+        historical_timestamp_path.write_bytes(historical_timestamp.to_bytes())
+
+        # This is a fully valid alternate history signed by an authorized key.
+        # The live byte comparison, not local signature validation, must reject it.
+        tuf_repo.validate_repository(self.repository)
+
+        with self.assertRaisesRegex(
+            tuf_repo.RepositoryError, "historical snapshot version 1 forks"
+        ):
+            tuf_repo.verify_live_state(
+                self.repository,
+                "https://unused.example/tuf",
+                fetcher=self.file_fetcher(self.public),
+            )
+
+    def test_live_preflight_requires_retired_historical_target_bytes(self) -> None:
+        self.promote("5.1.4")
+        retired_manifest = (
+            self.repository / "targets/releases/5.1.4/prod/manifest.json"
+        ).read_bytes()
+        retired_manifest_digest = tuf_repo.sha256_bytes(retired_manifest)
+        self.promote("5.1.5")
+        self.promote("5.1.5", phase="finalize")
+
+        forked_public = self.root / "forked-public-archive"
+        shutil.copytree(self.public, forked_public)
+        (
+            forked_public
+            / "targets/releases/5.1.4/prod"
+            / f"{retired_manifest_digest}.manifest.json"
+        ).unlink()
+
+        with self.assertRaisesRegex(
+            tuf_repo.RepositoryError, "references missing.*5[.]1[.]4"
+        ):
+            tuf_repo.verify_live_state(
+                self.repository,
+                "https://unused.example/tuf",
+                fetcher=self.file_fetcher(forked_public),
+            )
+
     def test_live_high_water_allows_equal_or_historical_subset_and_rejects_ahead(
         self,
     ) -> None:
@@ -691,6 +1139,7 @@ class TufRepositoryTests(unittest.TestCase):
                 self.repository,
                 self.public,
                 self.online_key,
+                self.policy,
                 "prod",
                 "5.5.0",
                 "rollout",
@@ -707,6 +1156,7 @@ class TufRepositoryTests(unittest.TestCase):
                 self.repository,
                 self.public,
                 wrong,
+                self.policy,
                 "prod",
                 "4.0.0",
                 "rollout",
@@ -720,6 +1170,7 @@ class TufRepositoryTests(unittest.TestCase):
                 self.repository,
                 self.public,
                 self.online_key,
+                self.policy,
                 "prod",
                 "4.0.0",
                 "rollout",
@@ -734,6 +1185,7 @@ class TufRepositoryTests(unittest.TestCase):
                 self.repository,
                 self.public,
                 self.online_key,
+                self.policy,
                 "prod",
                 long_version,
                 "rollout",

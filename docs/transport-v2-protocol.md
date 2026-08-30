@@ -616,6 +616,62 @@ organization, project, membership, invite, secret, and settings control plane.
 Those operations require live role checks and v2-only bounded database output;
 they are deliberately separated from principal establishment.
 
+### 8.8 Platform resource control
+
+Every platform resource request requires the immutable platform authority on
+the admitting v2 session. The logical request carries no credential, cache
+namespace, or query. GET and DELETE operations, plus invite acceptance, carry
+no logical headers or body. POST, PATCH, and PUT resource operations carry one
+nonempty JSON body and exactly one logical JSON content-type header. The
+gateway claims the request ID before any read or mutation and encrypts the
+logical result through the same held session lease.
+
+Transport v2 projects the complete currently implemented control plane:
+
+| Resource | Read authority | Mutation authority |
+| --- | --- | --- |
+| `/platform/me` and `/platform/orgs` | current platform user; organization lists contain only memberships | any platform user may create an organization and becomes Owner; only Owner deletes it |
+| organization projects | any organization member | Owner or Admin creates, updates, and deletes |
+| project secret metadata | any organization member; values are never returned or loaded by a metadata read | Owner or Admin upserts and deletes |
+| project email and OAuth settings | any organization member | Owner or Admin updates |
+| organization memberships | any organization member | Owner changes roles or removes members; the final Owner cannot be demoted or removed |
+| organization invites | Owner or Admin lists and deletes; the exact recipient may read its invite | Owner or Admin creates non-Owner invites; only Owner creates an Owner invite |
+| `/platform/accept_invite/{code}` | exact bound recipient | unused, unexpired invite is consumed atomically with membership creation |
+
+Every operation rechecks that the platform-user row still exists. Organization
+roles are never cached in session state: reads recheck live membership, and a
+write checks authority in the same transaction as its mutation. Project paths
+also prove that the selected project belongs to the selected organization.
+Membership changes serialize the actor, target, and final-Owner invariant.
+Invite acceptance locks and revalidates the invite before consuming it.
+
+V2 closes two demonstrated invitation elevation paths without changing the
+transport-v1 contract. An Admin cannot issue an Owner invite. Accepting an
+Owner invite additionally requires a currently verified platform email, so an
+account registered under a visible pending recipient address cannot claim
+ownership before proving mailbox control. During v1 coexistence, an authorized
+legacy Admin can still use the unchanged v1 invitation behavior; global closure
+therefore requires eventual v1 platform-control retirement or a separately
+approved v1 security correction.
+
+Database-controlled platform output uses a v2-only bounded storage projection.
+Reads measure length and count in a repeatable-read snapshot before loading
+variable strings or JSON, use narrow columns, and fail with encrypted 413
+rather than truncating. Collections have a 65,536-row sentinel and must also
+fit the 28 MiB logical-response ceiling. Secret listing and deletion never load
+the encrypted secret value. Operations whose logical success depends on stored
+variable data obtain the larger stored-output working-set reservation before
+the replay claim and database dispatch.
+
+Response status and JSON shape otherwise remain the current application
+contract: every success is 200, delete operations retain their message object,
+secret creation remains an upsert, absent email settings remain 404, absent
+OAuth settings return the disabled default, and the SDK-only push-settings
+stubs are not treated as backend routes. V2 also applies the already-declared
+project-update and invite-request validators that their v1 handlers omit; this
+prevents a v2 write from creating stored values outside the bounded v2 read
+contract while leaving the v1 handlers unchanged.
+
 ## 9. First-party and third-party tokens
 
 Transport v2 removes first-party JWTs from steady-state OpenSecret request

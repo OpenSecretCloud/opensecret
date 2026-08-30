@@ -10,6 +10,7 @@ mod application;
 mod crypto;
 mod envelope;
 mod gateway;
+pub(crate) mod platform_resources;
 mod session;
 mod session_cache;
 pub(crate) mod stored_conversations;

@@ -11,7 +11,9 @@ use std::time::Instant;
 use axum::extract::Query;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::IntoResponse;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
+use secp256k1::SecretKey;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -20,12 +22,14 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::bounded_json::BoundedJsonBuffer;
 use crate::db::DBError;
+use crate::email::send_platform_invite_email;
 use crate::encrypt::{decrypt_with_key, encrypt_with_key};
 use crate::jwt::{
     issue_transport_v2_platform_tokens, issue_transport_v2_user_tokens,
     validate_transport_v2_platform_resumption, validate_transport_v2_user_resumption, AuthContext,
 };
 use crate::kv::StoreError;
+use crate::models::project_settings::{EmailSettings, OAuthSettings};
 use crate::models::responses::{ConversationProjectFilter, NewConversation, ResponseStatus};
 use crate::provider_cache::{
     derive_tinfoil_cache_namespace, CacheNamespaceRoot, DerivedCacheNamespace,
@@ -46,6 +50,11 @@ use crate::web::openai::{
     EmbeddingRequest, TTSRequest, TranscriptionRequest,
 };
 use crate::web::openai_auth::AuthMethod as OpenAiAuthMethod;
+use crate::web::platform::common::{
+    CreateInviteRequest, CreateOrgRequest, CreateProjectRequest, CreateSecretRequest,
+    UpdateEmailSettingsRequest, UpdateMembershipRequest, UpdateOAuthSettingsRequest,
+    UpdateProjectRequest,
+};
 use crate::web::platform::login_routes::{
     authenticate_platform_login, platform_logout_data, platform_password_reset_confirm_data,
     platform_password_reset_request_data, register_platform_user_data, verify_platform_email_data,
@@ -113,11 +122,13 @@ use crate::{
 use super::envelope::{
     decode_canonical_api_key_name_path, decode_canonical_conversation_path,
     decode_canonical_conversation_project_path, decode_canonical_instruction_path,
-    decode_canonical_kv_item_path, decode_canonical_platform_verify_email_path,
-    decode_canonical_response_path, decode_canonical_verify_email_path, ConversationItemPath,
-    Credential, EncodedBytes, EnvelopeLimits, HeaderField, InstructionItemPath, LogicalMethod,
+    decode_canonical_kv_item_path, decode_canonical_platform_resource_path,
+    decode_canonical_platform_verify_email_path, decode_canonical_response_path,
+    decode_canonical_verify_email_path, ConversationItemPath, Credential, EncodedBytes,
+    EnvelopeLimits, HeaderField, InstructionItemPath, LogicalMethod, PlatformResourcePath,
     RequestEnvelope, RequestId, ResponseItemPath, ResponseMode,
 };
+use super::platform_resources::{self, PlatformResourceError, PlatformResourceKind};
 use super::session::{
     AuthenticationReservation, AuthenticationStartError, AuthorityState, BoundAuthority,
     BoundPrincipal,
@@ -220,6 +231,10 @@ pub(crate) enum UserOperation {
         authority: BoundPlatformAuthority,
         body: SensitiveBytes,
     },
+    PlatformControl {
+        authority: BoundPlatformAuthority,
+        operation: PlatformControlOperation,
+    },
     Logout {
         body: SensitiveBytes,
     },
@@ -235,6 +250,119 @@ pub(crate) enum UserOperation {
         authority: InferenceAuthority,
         operation: InferenceOperation,
     },
+}
+
+pub(crate) enum PlatformControlOperation {
+    GetMe,
+    CreateOrganization {
+        body: SensitiveBytes,
+    },
+    ListOrganizations,
+    DeleteOrganization {
+        org_id: uuid::Uuid,
+    },
+    CreateProject {
+        org_id: uuid::Uuid,
+        body: SensitiveBytes,
+    },
+    ListProjects {
+        org_id: uuid::Uuid,
+    },
+    GetProject {
+        org_id: uuid::Uuid,
+        project_id: uuid::Uuid,
+    },
+    UpdateProject {
+        org_id: uuid::Uuid,
+        project_id: uuid::Uuid,
+        body: SensitiveBytes,
+    },
+    DeleteProject {
+        org_id: uuid::Uuid,
+        project_id: uuid::Uuid,
+    },
+    CreateSecret {
+        org_id: uuid::Uuid,
+        project_id: uuid::Uuid,
+        body: SensitiveBytes,
+    },
+    ListSecrets {
+        org_id: uuid::Uuid,
+        project_id: uuid::Uuid,
+    },
+    DeleteSecret {
+        org_id: uuid::Uuid,
+        project_id: uuid::Uuid,
+        key_name: Zeroizing<String>,
+    },
+    GetEmailSettings {
+        org_id: uuid::Uuid,
+        project_id: uuid::Uuid,
+    },
+    UpdateEmailSettings {
+        org_id: uuid::Uuid,
+        project_id: uuid::Uuid,
+        body: SensitiveBytes,
+    },
+    GetOAuthSettings {
+        org_id: uuid::Uuid,
+        project_id: uuid::Uuid,
+    },
+    UpdateOAuthSettings {
+        org_id: uuid::Uuid,
+        project_id: uuid::Uuid,
+        body: SensitiveBytes,
+    },
+    ListMemberships {
+        org_id: uuid::Uuid,
+    },
+    UpdateMembership {
+        org_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+        body: SensitiveBytes,
+    },
+    DeleteMembership {
+        org_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+    },
+    CreateInvite {
+        org_id: uuid::Uuid,
+        body: SensitiveBytes,
+    },
+    ListInvites {
+        org_id: uuid::Uuid,
+    },
+    GetInvite {
+        org_id: uuid::Uuid,
+        invite_code: uuid::Uuid,
+    },
+    DeleteInvite {
+        org_id: uuid::Uuid,
+        invite_code: uuid::Uuid,
+    },
+    AcceptInvite {
+        invite_code: uuid::Uuid,
+    },
+}
+
+impl PlatformControlOperation {
+    const fn requires_stored_output_reservation(&self) -> bool {
+        matches!(
+            self,
+            Self::GetMe
+                | Self::ListOrganizations
+                | Self::ListProjects { .. }
+                | Self::GetProject { .. }
+                | Self::UpdateProject { .. }
+                | Self::ListSecrets { .. }
+                | Self::GetEmailSettings { .. }
+                | Self::GetOAuthSettings { .. }
+                | Self::ListMemberships { .. }
+                | Self::UpdateMembership { .. }
+                | Self::ListInvites { .. }
+                | Self::GetInvite { .. }
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -493,6 +621,10 @@ impl UserOperation {
                     | ProtectedUserOperation::CancelStoredResponse { .. },
                 ..
             }
+        ) || matches!(
+            self,
+            Self::PlatformControl { operation, .. }
+                if operation.requires_stored_output_reservation()
         )
     }
 
@@ -503,6 +635,7 @@ impl UserOperation {
             | Self::PlatformLogout { .. }
             | Self::PlatformChangePassword { .. } => SessionEffect::Close,
             Self::Protected { operation, .. } => operation.session_effect_on_success(),
+            Self::PlatformControl { .. } => SessionEffect::Retain,
             Self::Inference { .. } => SessionEffect::Retain,
             _ => SessionEffect::Retain,
         }
@@ -839,6 +972,10 @@ pub(crate) fn prepare_user_operation(
         PlatformLogout,
         PlatformRequestVerification,
         PlatformChangePassword,
+        PlatformMe,
+        CreatePlatformOrganization,
+        ListPlatformOrganizations,
+        PlatformResource,
         GetUser,
         RequestVerification,
         GetPrivateKey,
@@ -924,6 +1061,14 @@ pub(crate) fn prepare_user_operation(
                 return rejected_bad_request();
             }
         };
+    let platform_resource_path =
+        match decode_canonical_platform_resource_path(request.method, &request.path) {
+            Ok(path) => path,
+            Err(_) => {
+                request.path.zeroize();
+                return rejected_bad_request();
+            }
+        };
     let conversation_project_id =
         match decode_canonical_conversation_project_path(request.method, &request.path) {
             Ok(project_id) => project_id,
@@ -985,6 +1130,9 @@ pub(crate) fn prepare_user_operation(
             Some(Route::PlatformRequestVerification)
         }
         (LogicalMethod::Post, "/platform/change-password") => Some(Route::PlatformChangePassword),
+        (LogicalMethod::Get, "/platform/me") => Some(Route::PlatformMe),
+        (LogicalMethod::Post, "/platform/orgs") => Some(Route::CreatePlatformOrganization),
+        (LogicalMethod::Get, "/platform/orgs") => Some(Route::ListPlatformOrganizations),
         (LogicalMethod::Get, "/protected/user") => Some(Route::GetUser),
         (LogicalMethod::Post, "/protected/request_verification") => {
             Some(Route::RequestVerification)
@@ -1107,12 +1255,14 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Post, _) if matches!(response_path, Some(ResponseItemPath::Cancel(_))) => {
             Some(Route::CancelStoredResponse)
         }
+        (_, _) if platform_resource_path.is_some() => Some(Route::PlatformResource),
         _ => None,
     };
     if kv_key.is_some()
         || api_key_name.is_some()
         || verification_code.is_some()
         || platform_verification_code.is_some()
+        || platform_resource_path.is_some()
         || conversation_project_id.is_some()
         || instruction_path.is_some()
         || conversation_path.is_some()
@@ -1509,6 +1659,234 @@ pub(crate) fn prepare_user_operation(
                 Err(rejection) => return OperationPreparation::Rejected(rejection),
             };
             OperationPreparation::Ready(UserOperation::PlatformRequestVerification { authority })
+        }
+        Route::PlatformMe
+        | Route::CreatePlatformOrganization
+        | Route::ListPlatformOrganizations
+        | Route::PlatformResource => {
+            if credential.is_some() || request.query.is_some() {
+                return rejected_bad_request();
+            }
+
+            let requires_body = matches!(route, Route::CreatePlatformOrganization)
+                || matches!(
+                    (&platform_resource_path, request.method),
+                    (
+                        Some(
+                            PlatformResourcePath::Projects(_)
+                                | PlatformResourcePath::Secrets { .. }
+                                | PlatformResourcePath::Invites(_)
+                        ),
+                        LogicalMethod::Post
+                    ) | (
+                        Some(
+                            PlatformResourcePath::Project { .. }
+                                | PlatformResourcePath::Membership { .. }
+                        ),
+                        LogicalMethod::Patch
+                    ) | (
+                        Some(
+                            PlatformResourcePath::EmailSettings { .. }
+                                | PlatformResourcePath::OAuthSettings { .. }
+                        ),
+                        LogicalMethod::Put
+                    )
+                );
+
+            let body = if requires_body {
+                if !has_exact_json_content_type(&request.headers)
+                    || request
+                        .body_base64
+                        .as_ref()
+                        .is_none_or(EncodedBytes::is_empty)
+                {
+                    return rejected_bad_request();
+                }
+                Some(Zeroizing::new(
+                    request
+                        .body_base64
+                        .take()
+                        .expect("validated platform resource body")
+                        .into_bytes(),
+                ))
+            } else {
+                if !request.headers.is_empty() || request.body_base64.is_some() {
+                    return rejected_bad_request();
+                }
+                None
+            };
+
+            let authority = match bound_platform_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
+            };
+            let operation = match (route, platform_resource_path, request.method) {
+                (Route::PlatformMe, None, LogicalMethod::Get) => PlatformControlOperation::GetMe,
+                (Route::CreatePlatformOrganization, None, LogicalMethod::Post) => {
+                    PlatformControlOperation::CreateOrganization {
+                        body: body.expect("organization creation requires a body"),
+                    }
+                }
+                (Route::ListPlatformOrganizations, None, LogicalMethod::Get) => {
+                    PlatformControlOperation::ListOrganizations
+                }
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Organization(org_id)),
+                    LogicalMethod::Delete,
+                ) => PlatformControlOperation::DeleteOrganization { org_id },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Projects(org_id)),
+                    LogicalMethod::Post,
+                ) => PlatformControlOperation::CreateProject {
+                    org_id,
+                    body: body.expect("project creation requires a body"),
+                },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Projects(org_id)),
+                    LogicalMethod::Get,
+                ) => PlatformControlOperation::ListProjects { org_id },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Project { org_id, project_id }),
+                    LogicalMethod::Get,
+                ) => PlatformControlOperation::GetProject { org_id, project_id },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Project { org_id, project_id }),
+                    LogicalMethod::Patch,
+                ) => PlatformControlOperation::UpdateProject {
+                    org_id,
+                    project_id,
+                    body: body.expect("project update requires a body"),
+                },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Project { org_id, project_id }),
+                    LogicalMethod::Delete,
+                ) => PlatformControlOperation::DeleteProject { org_id, project_id },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Secrets { org_id, project_id }),
+                    LogicalMethod::Post,
+                ) => PlatformControlOperation::CreateSecret {
+                    org_id,
+                    project_id,
+                    body: body.expect("secret creation requires a body"),
+                },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Secrets { org_id, project_id }),
+                    LogicalMethod::Get,
+                ) => PlatformControlOperation::ListSecrets { org_id, project_id },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Secret {
+                        org_id,
+                        project_id,
+                        key_name,
+                    }),
+                    LogicalMethod::Delete,
+                ) => PlatformControlOperation::DeleteSecret {
+                    org_id,
+                    project_id,
+                    key_name,
+                },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::EmailSettings { org_id, project_id }),
+                    LogicalMethod::Get,
+                ) => PlatformControlOperation::GetEmailSettings { org_id, project_id },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::EmailSettings { org_id, project_id }),
+                    LogicalMethod::Put,
+                ) => PlatformControlOperation::UpdateEmailSettings {
+                    org_id,
+                    project_id,
+                    body: body.expect("email settings update requires a body"),
+                },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::OAuthSettings { org_id, project_id }),
+                    LogicalMethod::Get,
+                ) => PlatformControlOperation::GetOAuthSettings { org_id, project_id },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::OAuthSettings { org_id, project_id }),
+                    LogicalMethod::Put,
+                ) => PlatformControlOperation::UpdateOAuthSettings {
+                    org_id,
+                    project_id,
+                    body: body.expect("OAuth settings update requires a body"),
+                },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Memberships(org_id)),
+                    LogicalMethod::Get,
+                ) => PlatformControlOperation::ListMemberships { org_id },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Membership { org_id, user_id }),
+                    LogicalMethod::Patch,
+                ) => PlatformControlOperation::UpdateMembership {
+                    org_id,
+                    user_id,
+                    body: body.expect("membership update requires a body"),
+                },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Membership { org_id, user_id }),
+                    LogicalMethod::Delete,
+                ) => PlatformControlOperation::DeleteMembership { org_id, user_id },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Invites(org_id)),
+                    LogicalMethod::Post,
+                ) => PlatformControlOperation::CreateInvite {
+                    org_id,
+                    body: body.expect("invite creation requires a body"),
+                },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Invites(org_id)),
+                    LogicalMethod::Get,
+                ) => PlatformControlOperation::ListInvites { org_id },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Invite {
+                        org_id,
+                        invite_code,
+                    }),
+                    LogicalMethod::Get,
+                ) => PlatformControlOperation::GetInvite {
+                    org_id,
+                    invite_code,
+                },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::Invite {
+                        org_id,
+                        invite_code,
+                    }),
+                    LogicalMethod::Delete,
+                ) => PlatformControlOperation::DeleteInvite {
+                    org_id,
+                    invite_code,
+                },
+                (
+                    Route::PlatformResource,
+                    Some(PlatformResourcePath::AcceptInvite(invite_code)),
+                    LogicalMethod::Post,
+                ) => PlatformControlOperation::AcceptInvite { invite_code },
+                _ => return rejected_bad_request(),
+            };
+            OperationPreparation::Ready(UserOperation::PlatformControl {
+                authority,
+                operation,
+            })
         }
         Route::VerifyEmail => {
             if credential.is_some()
@@ -2808,6 +3186,10 @@ pub(crate) async fn execute_user_operation(
             };
             ApplicationOutcome::success(response, session_effect_on_success)
         }
+        UserOperation::PlatformControl {
+            authority,
+            operation,
+        } => execute_platform_control_operation(&app_state, authority, operation).await,
         UserOperation::VerifyEmail { code } => {
             debug_assert!(authentication.is_none());
             let response = match verify_email_data(&app_state, code)
@@ -2961,6 +3343,421 @@ pub(crate) async fn execute_user_operation(
                 monotonic_now,
             )
             .await
+        }
+    }
+}
+
+async fn execute_platform_control_operation(
+    app_state: &AppState,
+    authority: BoundPlatformAuthority,
+    operation: PlatformControlOperation,
+) -> ApplicationOutcome {
+    macro_rules! resource_value {
+        ($future:expr) => {
+            match $future.await {
+                Ok(value) => value,
+                Err(error) => return platform_resource_error_outcome(error),
+            }
+        };
+    }
+
+    macro_rules! json_response {
+        ($value:expr) => {
+            match LogicalUnaryResponse::json(StatusCode::OK, &$value) {
+                Ok(response) => response,
+                Err(error) => return ApplicationOutcome::error(error),
+            }
+        };
+    }
+
+    let pool = app_state.db.get_pool();
+    let actor_id = authority.platform_user_id;
+    let logical_body_limit = EnvelopeLimits::DEFAULT.logical_body_bytes;
+    let response = match operation {
+        PlatformControlOperation::GetMe => {
+            let value = resource_value!(platform_resources::get_me(
+                pool,
+                actor_id,
+                logical_body_limit
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::CreateOrganization { body } => {
+            let request = match parse_json_body::<CreateOrgRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if request.validate().is_err() {
+                return ApplicationOutcome::error(ApiError::BadRequest);
+            }
+            let value =
+                resource_value!(platform_resources::create_org(pool, actor_id, request.name));
+            json_response!(value)
+        }
+        PlatformControlOperation::ListOrganizations => {
+            let value = resource_value!(platform_resources::list_orgs(
+                pool,
+                actor_id,
+                logical_body_limit
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::DeleteOrganization { org_id } => {
+            resource_value!(platform_resources::delete_org(pool, actor_id, org_id));
+            json_response!(serde_json::json!({
+                "message": "Organization deleted successfully"
+            }))
+        }
+        PlatformControlOperation::CreateProject { org_id, body } => {
+            let request = match parse_json_body::<CreateProjectRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if request.validate().is_err() {
+                return ApplicationOutcome::error(ApiError::BadRequest);
+            }
+            let value = resource_value!(platform_resources::create_project(
+                pool,
+                actor_id,
+                org_id,
+                request.name,
+                request.description,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::ListProjects { org_id } => {
+            let value = resource_value!(platform_resources::list_projects(
+                pool,
+                actor_id,
+                org_id,
+                logical_body_limit,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::GetProject { org_id, project_id } => {
+            let value = resource_value!(platform_resources::get_project(
+                pool,
+                actor_id,
+                org_id,
+                project_id,
+                logical_body_limit,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::UpdateProject {
+            org_id,
+            project_id,
+            body,
+        } => {
+            let request = match parse_json_body::<UpdateProjectRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if request.validate().is_err() {
+                return ApplicationOutcome::error(ApiError::BadRequest);
+            }
+            let value = resource_value!(platform_resources::update_project(
+                pool,
+                actor_id,
+                org_id,
+                project_id,
+                request.name,
+                request.description,
+                request.status,
+                logical_body_limit,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::DeleteProject { org_id, project_id } => {
+            resource_value!(platform_resources::delete_project(
+                pool, actor_id, org_id, project_id
+            ));
+            json_response!(serde_json::json!({
+                "message": "Project deleted successfully"
+            }))
+        }
+        PlatformControlOperation::CreateSecret {
+            org_id,
+            project_id,
+            body,
+        } => {
+            let mut request = match parse_json_body::<CreateSecretRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if request.validate().is_err() {
+                request.secret.zeroize();
+                return ApplicationOutcome::error(ApiError::BadRequest);
+            }
+            let encoded_secret = Zeroizing::new(std::mem::take(&mut request.secret));
+            let secret_bytes = match STANDARD.decode(encoded_secret.as_bytes()) {
+                Ok(secret) => Zeroizing::new(secret),
+                Err(_) => return ApplicationOutcome::error(ApiError::BadRequest),
+            };
+            let enclave_key = match SecretKey::from_slice(&app_state.enclave_key) {
+                Ok(key) => key,
+                Err(_) => return ApplicationOutcome::error(ApiError::InternalServerError),
+            };
+            let encrypted_secret =
+                Zeroizing::new(encrypt_with_key(&enclave_key, &secret_bytes).await);
+            let value = resource_value!(platform_resources::create_secret(
+                pool,
+                actor_id,
+                org_id,
+                project_id,
+                request.key_name,
+                &encrypted_secret,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::ListSecrets { org_id, project_id } => {
+            let value = resource_value!(platform_resources::list_secrets(
+                pool,
+                actor_id,
+                org_id,
+                project_id,
+                logical_body_limit,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::DeleteSecret {
+            org_id,
+            project_id,
+            key_name,
+        } => {
+            resource_value!(platform_resources::delete_secret(
+                pool, actor_id, org_id, project_id, &key_name,
+            ));
+            json_response!(serde_json::json!({
+                "message": "Secret deleted successfully"
+            }))
+        }
+        PlatformControlOperation::GetEmailSettings { org_id, project_id } => {
+            let value = resource_value!(platform_resources::get_email_settings(
+                pool,
+                actor_id,
+                org_id,
+                project_id,
+                logical_body_limit,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::UpdateEmailSettings {
+            org_id,
+            project_id,
+            body,
+        } => {
+            let request = match parse_json_body::<UpdateEmailSettingsRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if request.validate().is_err() {
+                return ApplicationOutcome::error(ApiError::BadRequest);
+            }
+            let settings = EmailSettings {
+                provider: request.provider,
+                send_from: request.send_from,
+                email_verification_url: request.email_verification_url,
+            };
+            let value = resource_value!(platform_resources::update_email_settings(
+                pool, actor_id, org_id, project_id, settings,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::GetOAuthSettings { org_id, project_id } => {
+            let value = resource_value!(platform_resources::get_oauth_settings(
+                pool,
+                actor_id,
+                org_id,
+                project_id,
+                logical_body_limit,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::UpdateOAuthSettings {
+            org_id,
+            project_id,
+            body,
+        } => {
+            let request = match parse_json_body::<UpdateOAuthSettingsRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if request.validate().is_err()
+                || (request.google_oauth_enabled && request.google_oauth_settings.is_none())
+                || (request.github_oauth_enabled && request.github_oauth_settings.is_none())
+                || (request.apple_oauth_enabled && request.apple_oauth_settings.is_none())
+            {
+                return ApplicationOutcome::error(ApiError::BadRequest);
+            }
+            let settings = OAuthSettings {
+                google_oauth_enabled: request.google_oauth_enabled,
+                github_oauth_enabled: request.github_oauth_enabled,
+                apple_oauth_enabled: request.apple_oauth_enabled,
+                google_oauth_settings: request.google_oauth_settings,
+                github_oauth_settings: request.github_oauth_settings,
+                apple_oauth_settings: request.apple_oauth_settings,
+            };
+            let value = resource_value!(platform_resources::update_oauth_settings(
+                pool, actor_id, org_id, project_id, settings,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::ListMemberships { org_id } => {
+            let value = resource_value!(platform_resources::list_memberships(
+                pool,
+                actor_id,
+                org_id,
+                logical_body_limit,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::UpdateMembership {
+            org_id,
+            user_id,
+            body,
+        } => {
+            let request = match parse_json_body::<UpdateMembershipRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            let value = resource_value!(platform_resources::update_membership(
+                pool,
+                actor_id,
+                org_id,
+                user_id,
+                request.role,
+                logical_body_limit,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::DeleteMembership { org_id, user_id } => {
+            resource_value!(platform_resources::delete_membership(
+                pool, actor_id, org_id, user_id,
+            ));
+            json_response!(serde_json::json!({
+                "message": "Membership deleted successfully"
+            }))
+        }
+        PlatformControlOperation::CreateInvite { org_id, body } => {
+            let request = match parse_json_body::<CreateInviteRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if request.validate().is_err() {
+                return ApplicationOutcome::error(ApiError::BadRequest);
+            }
+            let created = match platform_resources::create_invite(
+                pool,
+                actor_id,
+                org_id,
+                request.email,
+                request.role,
+                logical_body_limit,
+            )
+            .await
+            {
+                Ok(created) => created,
+                Err(PlatformResourceError::NotFound(PlatformResourceKind::Organization)) => {
+                    return ApplicationOutcome::error(ApiError::BadRequest);
+                }
+                Err(error) => return platform_resource_error_outcome(error),
+            };
+            let response = json_response!(created.response);
+            let dispatch = created.dispatch;
+            let app_mode = app_state.app_mode.clone();
+            let resend_api_key = app_state.resend_api_key.clone();
+            tokio::spawn(async move {
+                if send_platform_invite_email(
+                    app_mode,
+                    resend_api_key,
+                    dispatch.email,
+                    dispatch.organization_name,
+                    dispatch.invite_code,
+                    dispatch.organization_id,
+                )
+                .await
+                .is_err()
+                {
+                    tracing::error!("Failed to send platform invitation email");
+                }
+            });
+            response
+        }
+        PlatformControlOperation::ListInvites { org_id } => {
+            let value = resource_value!(platform_resources::list_invites(
+                pool,
+                actor_id,
+                org_id,
+                logical_body_limit,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::GetInvite {
+            org_id,
+            invite_code,
+        } => {
+            let value = resource_value!(platform_resources::get_invite(
+                pool,
+                actor_id,
+                org_id,
+                invite_code,
+                logical_body_limit,
+            ));
+            json_response!(value)
+        }
+        PlatformControlOperation::DeleteInvite {
+            org_id,
+            invite_code,
+        } => {
+            resource_value!(platform_resources::delete_invite(
+                pool,
+                actor_id,
+                org_id,
+                invite_code,
+            ));
+            json_response!(serde_json::json!({
+                "message": "Invite deleted successfully"
+            }))
+        }
+        PlatformControlOperation::AcceptInvite { invite_code } => {
+            resource_value!(platform_resources::accept_invite(
+                pool,
+                actor_id,
+                invite_code,
+                logical_body_limit,
+            ));
+            json_response!(serde_json::json!({
+                "message": "Invite accepted successfully"
+            }))
+        }
+    };
+
+    ApplicationOutcome::success(response, SessionEffect::Retain)
+}
+
+fn platform_resource_error_outcome(error: PlatformResourceError) -> ApplicationOutcome {
+    match error {
+        PlatformResourceError::NotFound(PlatformResourceKind::Actor) => {
+            ApplicationOutcome::closing_error(ApiError::Unauthorized)
+        }
+        PlatformResourceError::NotFound(_) => ApplicationOutcome::error(ApiError::NotFound),
+        PlatformResourceError::Unauthorized | PlatformResourceError::VerifiedEmailRequired => {
+            ApplicationOutcome::error(ApiError::Unauthorized)
+        }
+        PlatformResourceError::Validation
+        | PlatformResourceError::Conflict
+        | PlatformResourceError::LastOwner
+        | PlatformResourceError::InviteAlreadyUsed
+        | PlatformResourceError::InviteExpired => ApplicationOutcome::error(ApiError::BadRequest),
+        PlatformResourceError::OutputTooLarge => {
+            ApplicationOutcome::error(ApiError::PayloadTooLarge)
+        }
+        PlatformResourceError::InconsistentSnapshot
+        | PlatformResourceError::Connection
+        | PlatformResourceError::Database(_) => {
+            tracing::error!("Failed to execute bounded platform resource operation");
+            ApplicationOutcome::error(ApiError::InternalServerError)
         }
     }
 }
@@ -7730,6 +8527,230 @@ mod tests {
             uuid::Uuid::from_bytes([0xa4; 16]),
             Instant::now() + std::time::Duration::from_secs(60),
         ))
+    }
+
+    #[test]
+    fn complete_platform_control_matrix_is_exactly_session_bound() {
+        let org = "123e4567-e89b-12d3-a456-426614174000";
+        let project = "223e4567-e89b-12d3-a456-426614174000";
+        let user = "323e4567-e89b-12d3-a456-426614174000";
+        let invite = "423e4567-e89b-12d3-a456-426614174000";
+        let cases = [
+            (LogicalMethod::Get, "/platform/me".to_owned(), false, true),
+            (
+                LogicalMethod::Post,
+                "/platform/orgs".to_owned(),
+                true,
+                false,
+            ),
+            (LogicalMethod::Get, "/platform/orgs".to_owned(), false, true),
+            (
+                LogicalMethod::Delete,
+                format!("/platform/orgs/{org}"),
+                false,
+                false,
+            ),
+            (
+                LogicalMethod::Post,
+                format!("/platform/orgs/{org}/projects"),
+                true,
+                false,
+            ),
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{org}/projects"),
+                false,
+                true,
+            ),
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{org}/projects/{project}"),
+                false,
+                true,
+            ),
+            (
+                LogicalMethod::Patch,
+                format!("/platform/orgs/{org}/projects/{project}"),
+                true,
+                true,
+            ),
+            (
+                LogicalMethod::Delete,
+                format!("/platform/orgs/{org}/projects/{project}"),
+                false,
+                false,
+            ),
+            (
+                LogicalMethod::Post,
+                format!("/platform/orgs/{org}/projects/{project}/secrets"),
+                true,
+                false,
+            ),
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{org}/projects/{project}/secrets"),
+                false,
+                true,
+            ),
+            (
+                LogicalMethod::Delete,
+                format!("/platform/orgs/{org}/projects/{project}/secrets/API_KEY"),
+                false,
+                false,
+            ),
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{org}/projects/{project}/settings/email"),
+                false,
+                true,
+            ),
+            (
+                LogicalMethod::Put,
+                format!("/platform/orgs/{org}/projects/{project}/settings/email"),
+                true,
+                false,
+            ),
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{org}/projects/{project}/settings/oauth"),
+                false,
+                true,
+            ),
+            (
+                LogicalMethod::Put,
+                format!("/platform/orgs/{org}/projects/{project}/settings/oauth"),
+                true,
+                false,
+            ),
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{org}/memberships"),
+                false,
+                true,
+            ),
+            (
+                LogicalMethod::Patch,
+                format!("/platform/orgs/{org}/memberships/{user}"),
+                true,
+                true,
+            ),
+            (
+                LogicalMethod::Delete,
+                format!("/platform/orgs/{org}/memberships/{user}"),
+                false,
+                false,
+            ),
+            (
+                LogicalMethod::Post,
+                format!("/platform/orgs/{org}/invites"),
+                true,
+                false,
+            ),
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{org}/invites"),
+                false,
+                true,
+            ),
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{org}/invites/{invite}"),
+                false,
+                true,
+            ),
+            (
+                LogicalMethod::Delete,
+                format!("/platform/orgs/{org}/invites/{invite}"),
+                false,
+                false,
+            ),
+            (
+                LogicalMethod::Post,
+                format!("/platform/accept_invite/{invite}"),
+                false,
+                false,
+            ),
+        ];
+
+        assert_eq!(cases.len(), 24);
+        for (method, path, has_body, requires_stored_output) in cases {
+            let preparation = prepare_user_operation(
+                envelope(
+                    method,
+                    &path,
+                    has_body.then(json_header).unwrap_or_default(),
+                    has_body.then_some(b"{}".as_slice()),
+                    None,
+                ),
+                bound_platform_authority(),
+            );
+            let OperationPreparation::Ready(operation) = preparation else {
+                panic!("platform control route was not admitted: {method:?} {path}");
+            };
+            assert!(matches!(&operation, UserOperation::PlatformControl { .. }));
+            assert_eq!(
+                operation.requires_stored_output_reservation(),
+                requires_stored_output,
+                "{method:?} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn platform_control_rejects_authority_and_request_transplants() {
+        let exact = || envelope(LogicalMethod::Get, "/platform/me", Vec::new(), None, None);
+        for authority in [
+            AuthorityState::Anonymous,
+            bound_user_authority(),
+            bound_api_key_authority(),
+        ] {
+            assert_eq!(
+                rejected_status(prepare_user_operation(exact(), authority)),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+
+        let mut with_query = exact();
+        with_query.request.query = Some("transplanted=true".to_owned());
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                with_query,
+                bound_platform_authority()
+            )),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut with_body = exact();
+        with_body.request.body_base64 = Some(EncodedBytes::from_bytes(b"{}".to_vec()));
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                with_body,
+                bound_platform_authority()
+            )),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut with_header = exact();
+        with_header.request.headers = json_header();
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                with_header,
+                bound_platform_authority()
+            )),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut with_credential = exact();
+        with_credential.credential = Some(Credential::Resumption {
+            value_base64: EncodedBytes::from_bytes(b"transplanted".to_vec()),
+        });
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                with_credential,
+                bound_platform_authority()
+            )),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     fn inference_kind(operation: &InferenceOperation) -> &'static str {

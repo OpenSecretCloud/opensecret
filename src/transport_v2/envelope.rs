@@ -378,6 +378,8 @@ const KV_ITEM_PATH_PREFIX: &str = "/protected/kv/";
 const API_KEY_ITEM_PATH_PREFIX: &str = "/protected/api-keys/";
 const VERIFY_EMAIL_PATH_PREFIX: &str = "/verify-email/";
 const PLATFORM_VERIFY_EMAIL_PATH_PREFIX: &str = "/platform/verify-email/";
+const PLATFORM_ORG_PATH_PREFIX: &str = "/platform/orgs/";
+const PLATFORM_ACCEPT_INVITE_PATH_PREFIX: &str = "/platform/accept_invite/";
 const CONVERSATION_PROJECT_ITEM_PATH_PREFIX: &str = "/v1/conversation-projects/";
 const CONVERSATION_ITEM_PATH_PREFIX: &str = "/v1/conversations/";
 const INSTRUCTION_ITEM_PATH_PREFIX: &str = "/v1/instructions/";
@@ -405,6 +407,44 @@ pub(crate) enum ResponseItemPath {
     Cancel(Uuid),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PlatformResourcePath {
+    Organization(Uuid),
+    Projects(Uuid),
+    Project {
+        org_id: Uuid,
+        project_id: Uuid,
+    },
+    Secrets {
+        org_id: Uuid,
+        project_id: Uuid,
+    },
+    Secret {
+        org_id: Uuid,
+        project_id: Uuid,
+        key_name: Zeroizing<String>,
+    },
+    EmailSettings {
+        org_id: Uuid,
+        project_id: Uuid,
+    },
+    OAuthSettings {
+        org_id: Uuid,
+        project_id: Uuid,
+    },
+    Memberships(Uuid),
+    Membership {
+        org_id: Uuid,
+        user_id: Uuid,
+    },
+    Invites(Uuid),
+    Invite {
+        org_id: Uuid,
+        invite_code: Uuid,
+    },
+    AcceptInvite(Uuid),
+}
+
 fn validate_logical_path(
     method: LogicalMethod,
     path: &str,
@@ -421,6 +461,9 @@ fn validate_logical_path(
         return Ok(());
     }
     if decode_canonical_platform_verify_email_path(method, path)?.is_some() {
+        return Ok(());
+    }
+    if decode_canonical_platform_resource_path(method, path)?.is_some() {
         return Ok(());
     }
     if decode_canonical_conversation_project_path(method, path)?.is_some() {
@@ -538,6 +581,140 @@ pub(crate) fn decode_canonical_platform_verify_email_path(
         ));
     }
     Ok(Some(code))
+}
+
+/// Decodes the dynamic platform control-plane paths admitted by transport v2.
+///
+/// UUIDs have one lowercase-hyphenated spelling. Project-secret names use the
+/// released `[A-Za-z0-9_]+` route contract directly; unlike general opaque
+/// paths, an underscore is literal because existing TypeScript clients place
+/// it in the URL without percent encoding.
+pub(crate) fn decode_canonical_platform_resource_path(
+    method: LogicalMethod,
+    path: &str,
+) -> Result<Option<PlatformResourcePath>, EnvelopeError> {
+    if let Some(code) = path.strip_prefix(PLATFORM_ACCEPT_INVITE_PATH_PREFIX) {
+        if method != LogicalMethod::Post {
+            return Ok(None);
+        }
+        return decode_canonical_uuid_segment(
+            code,
+            "platform invite code must use lowercase hyphenated UUID spelling",
+        )
+        .map(PlatformResourcePath::AcceptInvite)
+        .map(Some);
+    }
+
+    let Some(suffix) = path.strip_prefix(PLATFORM_ORG_PATH_PREFIX) else {
+        return Ok(None);
+    };
+    let mut segments = suffix.split('/');
+    let org = segments.next().unwrap_or_default();
+    let org_id = decode_canonical_uuid_segment(
+        org,
+        "platform organization ID must use lowercase hyphenated UUID spelling",
+    )?;
+    let remainder = segments.collect::<Vec<_>>();
+
+    let decoded = match remainder.as_slice() {
+        [] if method == LogicalMethod::Delete => PlatformResourcePath::Organization(org_id),
+        ["projects"] if matches!(method, LogicalMethod::Get | LogicalMethod::Post) => {
+            PlatformResourcePath::Projects(org_id)
+        }
+        ["projects", project]
+            if matches!(
+                method,
+                LogicalMethod::Get | LogicalMethod::Patch | LogicalMethod::Delete
+            ) =>
+        {
+            PlatformResourcePath::Project {
+                org_id,
+                project_id: decode_canonical_uuid_segment(
+                    project,
+                    "platform project ID must use lowercase hyphenated UUID spelling",
+                )?,
+            }
+        }
+        ["projects", project, "secrets"]
+            if matches!(method, LogicalMethod::Get | LogicalMethod::Post) =>
+        {
+            PlatformResourcePath::Secrets {
+                org_id,
+                project_id: decode_canonical_uuid_segment(
+                    project,
+                    "platform project ID must use lowercase hyphenated UUID spelling",
+                )?,
+            }
+        }
+        ["projects", project, "secrets", key_name] if method == LogicalMethod::Delete => {
+            if key_name.is_empty()
+                || key_name.len() > 50
+                || !key_name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            {
+                return Err(EnvelopeError::InvalidPath(
+                    "platform secret name violates the route contract",
+                ));
+            }
+            PlatformResourcePath::Secret {
+                org_id,
+                project_id: decode_canonical_uuid_segment(
+                    project,
+                    "platform project ID must use lowercase hyphenated UUID spelling",
+                )?,
+                key_name: Zeroizing::new((*key_name).to_owned()),
+            }
+        }
+        ["projects", project, "settings", "email"]
+            if matches!(method, LogicalMethod::Get | LogicalMethod::Put) =>
+        {
+            PlatformResourcePath::EmailSettings {
+                org_id,
+                project_id: decode_canonical_uuid_segment(
+                    project,
+                    "platform project ID must use lowercase hyphenated UUID spelling",
+                )?,
+            }
+        }
+        ["projects", project, "settings", "oauth"]
+            if matches!(method, LogicalMethod::Get | LogicalMethod::Put) =>
+        {
+            PlatformResourcePath::OAuthSettings {
+                org_id,
+                project_id: decode_canonical_uuid_segment(
+                    project,
+                    "platform project ID must use lowercase hyphenated UUID spelling",
+                )?,
+            }
+        }
+        ["memberships"] if method == LogicalMethod::Get => {
+            PlatformResourcePath::Memberships(org_id)
+        }
+        ["memberships", user] if matches!(method, LogicalMethod::Patch | LogicalMethod::Delete) => {
+            PlatformResourcePath::Membership {
+                org_id,
+                user_id: decode_canonical_uuid_segment(
+                    user,
+                    "platform membership user ID must use lowercase hyphenated UUID spelling",
+                )?,
+            }
+        }
+        ["invites"] if matches!(method, LogicalMethod::Get | LogicalMethod::Post) => {
+            PlatformResourcePath::Invites(org_id)
+        }
+        ["invites", invite] if matches!(method, LogicalMethod::Get | LogicalMethod::Delete) => {
+            PlatformResourcePath::Invite {
+                org_id,
+                invite_code: decode_canonical_uuid_segment(
+                    invite,
+                    "platform invite code must use lowercase hyphenated UUID spelling",
+                )?,
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(decoded))
 }
 
 /// Decodes the canonical UUID segment used by one conversation-project item.
@@ -1581,6 +1758,157 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn platform_resource_paths_have_one_canonical_route_spelling() {
+        let org = Uuid::parse_str("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let project = Uuid::parse_str("223e4567-e89b-12d3-a456-426614174000").unwrap();
+        let user = Uuid::parse_str("323e4567-e89b-12d3-a456-426614174000").unwrap();
+        let invite = Uuid::parse_str("423e4567-e89b-12d3-a456-426614174000").unwrap();
+
+        for (method, path, expected) in [
+            (
+                LogicalMethod::Delete,
+                format!("/platform/orgs/{org}"),
+                PlatformResourcePath::Organization(org),
+            ),
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{org}/projects"),
+                PlatformResourcePath::Projects(org),
+            ),
+            (
+                LogicalMethod::Patch,
+                format!("/platform/orgs/{org}/projects/{project}"),
+                PlatformResourcePath::Project {
+                    org_id: org,
+                    project_id: project,
+                },
+            ),
+            (
+                LogicalMethod::Post,
+                format!("/platform/orgs/{org}/projects/{project}/secrets"),
+                PlatformResourcePath::Secrets {
+                    org_id: org,
+                    project_id: project,
+                },
+            ),
+            (
+                LogicalMethod::Delete,
+                format!("/platform/orgs/{org}/projects/{project}/secrets/API_KEY_2"),
+                PlatformResourcePath::Secret {
+                    org_id: org,
+                    project_id: project,
+                    key_name: Zeroizing::new("API_KEY_2".to_owned()),
+                },
+            ),
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{org}/projects/{project}/settings/email"),
+                PlatformResourcePath::EmailSettings {
+                    org_id: org,
+                    project_id: project,
+                },
+            ),
+            (
+                LogicalMethod::Put,
+                format!("/platform/orgs/{org}/projects/{project}/settings/oauth"),
+                PlatformResourcePath::OAuthSettings {
+                    org_id: org,
+                    project_id: project,
+                },
+            ),
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{org}/memberships"),
+                PlatformResourcePath::Memberships(org),
+            ),
+            (
+                LogicalMethod::Delete,
+                format!("/platform/orgs/{org}/memberships/{user}"),
+                PlatformResourcePath::Membership {
+                    org_id: org,
+                    user_id: user,
+                },
+            ),
+            (
+                LogicalMethod::Post,
+                format!("/platform/orgs/{org}/invites"),
+                PlatformResourcePath::Invites(org),
+            ),
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{org}/invites/{invite}"),
+                PlatformResourcePath::Invite {
+                    org_id: org,
+                    invite_code: invite,
+                },
+            ),
+            (
+                LogicalMethod::Post,
+                format!("/platform/accept_invite/{invite}"),
+                PlatformResourcePath::AcceptInvite(invite),
+            ),
+        ] {
+            assert_eq!(
+                decode_canonical_platform_resource_path(method, &path).unwrap(),
+                Some(expected),
+                "{method:?} {path}"
+            );
+            validate_logical_path(method, &path, &EnvelopeLimits::default()).unwrap();
+        }
+    }
+
+    #[test]
+    fn platform_resource_paths_reject_aliases_and_route_transplants() {
+        let canonical_org = "123e4567-e89b-12d3-a456-426614174000";
+        let canonical_project = "223e4567-e89b-12d3-a456-426614174000";
+        for (method, invalid) in [
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{}/projects", canonical_org.to_uppercase()),
+            ),
+            (
+                LogicalMethod::Get,
+                format!("/platform/orgs/{canonical_org}/projects/{canonical_project}/"),
+            ),
+            (
+                LogicalMethod::Delete,
+                format!("/platform/orgs/{canonical_org}/projects/{canonical_project}/secrets/a-b"),
+            ),
+            (
+                LogicalMethod::Delete,
+                format!(
+                    "/platform/orgs/{canonical_org}/projects/{canonical_project}/secrets/a%5Fb"
+                ),
+            ),
+            (
+                LogicalMethod::Post,
+                "/platform/accept_invite/423E4567-E89B-12D3-A456-426614174000".to_owned(),
+            ),
+        ] {
+            assert!(
+                !matches!(
+                    decode_canonical_platform_resource_path(method, &invalid),
+                    Ok(Some(_))
+                ),
+                "{method:?} {invalid}"
+            );
+        }
+
+        assert!(decode_canonical_platform_resource_path(
+            LogicalMethod::Post,
+            &format!("/platform/orgs/{canonical_org}/memberships")
+        )
+        .unwrap()
+        .is_none());
+        assert!(decode_canonical_platform_resource_path(
+            LogicalMethod::Get,
+            "/platform/accept_invite/423e4567-e89b-12d3-a456-426614174000"
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]

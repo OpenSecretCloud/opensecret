@@ -90,8 +90,8 @@ cleanup() {
   rm -rf -- "$workdir"
 
   if [ "$status" -eq 0 ] && [ "$tests_passed" -eq 1 ]; then
-    printf 'Disposable-DB evidence: %s AEAD/database tests and %s OAuth database tests passed; no tests skipped; temporary cluster removed.\n' \
-      "$aead_count" "$oauth_count"
+    printf 'Disposable-DB evidence: %s AEAD/database tests, %s OAuth database tests, and %s platform-resource database tests passed; no tests skipped; temporary cluster removed.\n' \
+      "$aead_count" "$oauth_count" "$platform_resource_count"
   fi
   exit "$status"
 }
@@ -177,6 +177,13 @@ oauth_count="$(awk '/^web::oauth_routes::tests::db_.*: test$/ { count++ }
   END { print count + 0 }' "$workdir/oauth-tests.list")"
 test "$oauth_count" -gt 0
 
+cargo test --locked --all-features \
+  transport_v2::platform_resources::tests::database_ \
+  -- --ignored --list | tee "$workdir/platform-resource-tests.list"
+platform_resource_count="$(awk '/^transport_v2::platform_resources::tests::database_.*: test$/ { count++ }
+  END { print count + 0 }' "$workdir/platform-resource-tests.list")"
+test "$platform_resource_count" -gt 0
+
 cargo test --locked --all-features aead_db_tamper_tests \
   -- --ignored --test-threads=1 --nocapture 2>&1 | tee "$workdir/aead-tests.log"
 if grep -qi 'skipping:' "$workdir/aead-tests.log"; then
@@ -194,6 +201,17 @@ if grep -qi 'skipping:' "$workdir/oauth-tests.log"; then
 fi
 grep -Eq "test result: ok\\. ${oauth_count} passed; 0 failed; 0 ignored;" \
   "$workdir/oauth-tests.log"
+
+cargo test --locked --all-features \
+  transport_v2::platform_resources::tests::database_ \
+  -- --ignored --test-threads=1 --nocapture 2>&1 |
+  tee "$workdir/platform-resource-tests.log"
+if grep -qi 'skipping:' "$workdir/platform-resource-tests.log"; then
+  printf 'Platform-resource database test output contained a skip marker\n' >&2
+  exit 1
+fi
+grep -Eq "test result: ok\\. ${platform_resource_count} passed; 0 failed; 0 ignored;" \
+  "$workdir/platform-resource-tests.log"
 
 assert_database_identity
 assert_migration_count

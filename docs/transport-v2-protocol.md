@@ -571,7 +571,97 @@ new anonymous session and restarts OAuth. It cannot replay the old callback on
 the replacement session. Transport-v1 state storage, callbacks, token issuance,
 and encrypted-body routes retain their existing behavior during migration.
 
-### 8.6 Unary inference projection
+### 8.6 Browser-to-native user handoff
+
+Transport v2 exposes two unary operations for moving an already-authenticated
+browser identity onto a separately attested native session without putting a
+portable resumption credential or provider cache secret in a deep link:
+
+| Logical operation | Authority before request | Cache namespace root | Success effect |
+| --- | --- | --- | --- |
+| `POST /auth/native-handoff/grant` | bound user | null | retain browser session |
+| `POST /auth/native-handoff/redeem` | exact anonymous native session | required | bind verified user |
+
+The native client first establishes and retains an anonymous v2 session. It
+generates a fresh cryptographically random, canonical non-nil UUID attempt
+identifier and gives the browser the canonical native session UUID and attempt
+UUID. A bound browser user submits those two values in the exact JSON body of
+the grant operation. Platform and API-key sessions cannot create user handoff
+grants. The encrypted success body is:
+
+```json
+{
+  "grant": "<compact signed grant>",
+  "expires_at": 1730000000
+}
+```
+
+`expires_at` is a non-negative integer Unix timestamp in seconds. The grant is
+an ES256K compact JWT of no more than 4,096 bytes with exactly three non-empty,
+unpadded base64url segments. It has the transport-v2 issuer, version and user
+principal plus the dedicated
+`urn:opensecret:internal:transport-v2:user:native-handoff` audience and
+`native_handoff` token kind. It carries the verified user/project/AuthContext,
+the exact target session UUID in `sid`, and a domain-separated SHA-256
+commitment to the native attempt UUID in `jti`. The raw attempt never appears
+in the readable signed grant.
+`iat`, `nbf`, and `exp` are mandatory; `iat` equals `nbf`, the nominal and
+maximum lifetime is five minutes, and validation allows no more than 30 seconds
+of clock skew.
+
+The return deep link carries `grant` plus the public target session UUID for
+local stale-callback correlation; it never carries the raw attempt. The native
+client rejects a mismatched public session before consuming its pending state,
+keeps its attempt UUID locally, and sends `{grant, native_attempt_id}` inside
+the redemption request encrypted under the original anonymous session. The
+enclave requires the signed `sid` to equal that request lease's exact session
+UUID and the signed
+`jti` to equal the domain-separated commitment recomputed from the locally
+retained attempt UUID in the encrypted body. It also revalidates the user,
+project, active seed wrap, and complete AuthContext. The native client supplies
+its own cache namespace root; the browser's namespace, access descriptor, and
+resumption credential are never transferred.
+
+The attempt UUID is a PKCE-like anti-injection secret, not public routing
+metadata. It must be generated with a cryptographically secure source, retained
+only by the native client, and delivered to trusted browser code without putting
+it in an HTTP query, request header, referrer, cookie, log, or other
+host-visible channel. A URL fragment can hide it from the HTTP forwarding path,
+but does not protect against malicious same-origin JavaScript. If an attacker
+learns both the target session and raw attempt before redemption, it can use its
+own bound user session to mint a competing valid grant and cause account/session
+injection. A return-channel observer learns only the attempt commitment and
+cannot mint a replacement grant without the raw verifier. Clients must still
+treat attempt confidentiality, trusted browser execution, and an explicit
+native confirmation of the resulting account as part of this handoff's
+security boundary.
+
+Redemption takes the ordinary atomic authentication reservation on the target
+session and reuses the normal user-binding path to issue fresh descriptors,
+derive the native cache namespace, and commit the verified authority. No grant
+row or global `jti` registry is needed: the exact target session's
+`Anonymous -> Authenticating -> Bound` transition is the one-success ledger.
+The request replay registry independently rejects the same request ID. A
+pre-commit failure returns the session to anonymous and the same grant may be
+retried before expiry; after a successful commit, any further redemption fails
+because the session cannot be rebound.
+
+The grant is signed, not encrypted. Anyone who obtains the deep link can read
+its claims, although possession alone cannot redeem it without the exact target
+session request key. Clients, redirect handlers, intermediaries, and enclave
+code must not log or persist the grant. If a successful response is lost, the
+outcome is uncertain and the now-bound target cannot redeem again; the client
+abandons it and starts a fresh attested handoff rather than retargeting or
+downgrading the grant.
+
+The signing key is shared by approved enclaves in one environment, so the
+browser and native sessions do not need to live on the same enclave. Each
+request still has to reach the enclave process that owns its own in-memory v2
+session. Wrong-origin routing, restart, expiry, or eviction fails closed and
+requires a fresh attestation and handoff; a grant is never rebound to a
+replacement session.
+
+### 8.7 Unary inference projection
 
 The initial unary-inference layer admits exactly these logical operations:
 
@@ -610,7 +700,7 @@ error bodies never enter enclave logs. These are v2-only admission rules;
 transport v1 retains its existing limits, concurrency, retry behavior, error
 logging, and provider-cache derivation.
 
-### 8.7 Password recovery and platform authentication lifecycle
+### 8.8 Password recovery and platform authentication lifecycle
 
 Transport v2 completes the anonymous password-recovery paths needed by a
 v2-only SDK and establishes a distinct platform authority before projecting
@@ -659,7 +749,7 @@ organization, project, membership, invite, secret, and settings control plane.
 Those operations require live role checks and v2-only bounded database output;
 they are deliberately separated from principal establishment.
 
-### 8.8 Platform resource control
+### 8.9 Platform resource control
 
 Every platform resource request requires the immutable platform authority on
 the admitting v2 session. The logical request carries no credential, cache
@@ -1034,6 +1124,14 @@ The backend additionally proves:
 - replay/session exhaustion fails closed;
 - authentication transitions are atomic and cancellation safe;
 - bound principals cannot switch kind or identity;
+- native handoff grants reject wrong signatures, issuer, audience, token kind,
+  principal kind, timestamps, compact-JWT shape, target session, attempt UUID,
+  project, AuthContext, and live seed-wrap state;
+- only a bound user can mint a handoff grant, only the exact anonymous native
+  session can redeem it, and concurrent redemptions have one binding winner;
+- native handoff responses contain a Unix-seconds expiry, use the target
+  session's response key and fresh cache root, and deep links contain neither
+  resumption credentials nor provider cache roots;
 - API-key deletion remains effective for an already-bound session;
 - Chat and Responses select only their exact explicit response modes and reject
   `auto` or a mode/body mismatch;

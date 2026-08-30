@@ -1504,12 +1504,21 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::jwt::{AuthContext, AuthMethod};
+    use crate::jwt::{
+        issue_transport_v2_native_handoff_grant_for_test,
+        validate_transport_v2_native_handoff_grant_claims_for_test, AuthContext, AuthMethod,
+        JwtKeys,
+    };
+    use crate::provider_cache::{derive_tinfoil_cache_namespace, CacheNamespaceRoot};
+    use crate::transport_v2::application::{ApplicationOutcome, UserOperation};
     use crate::transport_v2::crypto::{decrypt_key_exchange_record, SessionMaster};
     use crate::transport_v2::envelope::{
         HeaderField, LogicalMethod, LogicalRequest, RequestId, ResponseMode,
     };
-    use crate::transport_v2::session::{AuthorityState, BoundAuthority, SessionLimits};
+    use crate::transport_v2::session::{
+        AuthorityState, BoundAuthority, BoundPrincipal, SessionLimits,
+    };
+    use crate::ApiError;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_session(
@@ -1621,6 +1630,156 @@ mod tests {
                 )),
             },
         }
+    }
+
+    fn native_handoff_redeem_envelope(
+        request_id: RequestId,
+        grant: &str,
+        native_attempt_id: Uuid,
+    ) -> RequestEnvelope {
+        RequestEnvelope {
+            version: Version2,
+            request_id,
+            response_mode: ResponseMode::Unary,
+            credential: None,
+            cache_namespace_root_base64: Some(CacheNamespaceRoot::from_bytes([0xc1; 32])),
+            request: LogicalRequest {
+                method: LogicalMethod::Post,
+                path: "/auth/native-handoff/redeem".to_owned(),
+                query: None,
+                headers: vec![HeaderField {
+                    name: "content-type".to_owned(),
+                    value_base64: EncodedBytes::from_bytes(b"application/json".to_vec()),
+                }],
+                body_base64: Some(EncodedBytes::from_bytes(
+                    serde_json::to_vec(&serde_json::json!({
+                        "grant": grant,
+                        "native_attempt_id": native_attempt_id,
+                    }))
+                    .expect("serialize native handoff redemption"),
+                )),
+            },
+        }
+    }
+
+    struct NativeHandoffTestRedemption<'a> {
+        session_id: Uuid,
+        master_bytes: [u8; 32],
+        request_id: RequestId,
+        request_nonce: [u8; 12],
+        grant: &'a str,
+        native_attempt_id: Uuid,
+        now: Instant,
+    }
+
+    async fn process_native_handoff_test_redemption(
+        state: &TransportV2State,
+        jwt_keys: &JwtKeys,
+        redemption: NativeHandoffTestRedemption<'_>,
+    ) -> (V2SessionLease, EncryptedOuterResponse) {
+        let NativeHandoffTestRedemption {
+            session_id,
+            master_bytes,
+            request_id,
+            request_nonce,
+            grant,
+            native_attempt_id,
+            now,
+        } = redemption;
+        let plaintext = serde_json::to_vec(&native_handoff_redeem_envelope(
+            request_id,
+            grant,
+            native_attempt_id,
+        ))
+        .expect("serialize native handoff envelope");
+        let client_keys = DirectionalKeys::derive(&SessionMaster::from_bytes(master_bytes))
+            .expect("derive native handoff client keys");
+        let encrypted = client_keys
+            .encrypt_request_record_with_nonce(&session_id, &plaintext, request_nonce)
+            .expect("encrypt native handoff request");
+        let (lease, envelope) = state
+            .decrypt_request_envelope(session_id, &encrypted, now)
+            .await
+            .expect("decrypt native handoff request");
+        let OperationPreparation::Ready(operation) =
+            prepare_user_operation(envelope, lease.state().authority())
+        else {
+            panic!("anonymous native handoff redemption must be ready");
+        };
+        let mut working_set_permit = Arc::clone(&state.request_working_set)
+            .try_acquire_owned()
+            .expect("acquire native handoff working set");
+        let response = state
+            .process_ready_operation(
+                &lease,
+                request_id,
+                operation,
+                &mut working_set_permit,
+                now,
+                |_dispatch_lease, operation, authentication, admitted_at| async move {
+                    let UserOperation::RedeemNativeHandoff {
+                        body,
+                        cache_namespace_root,
+                    } = operation
+                    else {
+                        panic!("prepared operation must remain native handoff redemption");
+                    };
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&body).expect("parse prepared native handoff body");
+                    let request_grant = request["grant"]
+                        .as_str()
+                        .expect("prepared native handoff grant");
+                    let request_attempt = request["native_attempt_id"]
+                        .as_str()
+                        .and_then(|value| Uuid::parse_str(value).ok())
+                        .expect("prepared native handoff attempt");
+                    let verified = validate_transport_v2_native_handoff_grant_claims_for_test(
+                        request_grant,
+                        session_id,
+                        request_attempt,
+                        jwt_keys,
+                    );
+                    let (user_id, auth_context) = match verified {
+                        Ok(verified) => verified,
+                        Err(_) => {
+                            drop(authentication);
+                            return ApplicationOutcome {
+                                response: LogicalApplicationResponse::Unary(
+                                    LogicalUnaryResponse::api_error(ApiError::InvalidJwt),
+                                ),
+                                session_effect: SessionEffect::Retain,
+                            };
+                        }
+                    };
+
+                    authentication
+                        .expect("native handoff must reserve authentication")
+                        .commit_at(
+                            BoundAuthority::user(
+                                user_id,
+                                auth_context.project_id,
+                                &auth_context,
+                                admitted_at + Duration::from_secs(30),
+                                derive_tinfoil_cache_namespace(&cache_namespace_root, user_id),
+                            ),
+                            admitted_at,
+                        )
+                        .expect("commit native handoff binding");
+                    ApplicationOutcome {
+                        response: LogicalApplicationResponse::Unary(
+                            LogicalUnaryResponse::json(
+                                StatusCode::OK,
+                                &serde_json::json!({ "id": user_id }),
+                            )
+                            .expect("serialize native handoff success"),
+                        ),
+                        session_effect: SessionEffect::NewlyBound,
+                    }
+                },
+            )
+            .await
+            .expect("encrypt native handoff response");
+        (lease, response)
     }
 
     fn bind_test_user(session: &Arc<V2SessionState>, now: Instant, user_byte: u8) {
@@ -2321,6 +2480,192 @@ mod tests {
         // admission promotion.
         let first_lease = state.acquire_session(&first_id, now).await.unwrap();
         assert_eq!(first_lease.state().replay_id_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn native_handoff_grant_binds_only_its_exact_session_and_attempt() {
+        let state = TransportV2State::new();
+        let now = Instant::now();
+        let target_session_id = Uuid::from_bytes([0xc2; 16]);
+        let other_session_id = Uuid::from_bytes([0xc3; 16]);
+        let target_master = [0xc4; 32];
+        let other_master = [0xc5; 32];
+        for (session_id, master) in [
+            (target_session_id, target_master),
+            (other_session_id, other_master),
+        ] {
+            state
+                .insert_session(test_session(
+                    session_id,
+                    master,
+                    now + Duration::from_secs(60),
+                    Arc::clone(&state.global_replay_budget),
+                ))
+                .await
+                .expect("insert native handoff test session");
+        }
+
+        let jwt_keys = JwtKeys::new(vec![0xc6; 32]).expect("native handoff signing key");
+        let user_id = Uuid::from_bytes([0xc7; 16]);
+        let auth_context = AuthContext::new(AuthMethod::OAuth, 7, [0xc8; 32]);
+        let native_attempt_id = Uuid::from_bytes([0xc9; 16]);
+        let issued = issue_transport_v2_native_handoff_grant_for_test(
+            user_id,
+            &auth_context,
+            target_session_id,
+            native_attempt_id,
+            &jwt_keys,
+        )
+        .expect("issue native handoff grant");
+
+        let wrong_session_request_id = RequestId::from_bytes([0xca; 16]);
+        let (wrong_session_lease, wrong_session_response) = process_native_handoff_test_redemption(
+            &state,
+            &jwt_keys,
+            NativeHandoffTestRedemption {
+                session_id: other_session_id,
+                master_bytes: other_master,
+                request_id: wrong_session_request_id,
+                request_nonce: [0xcb; 12],
+                grant: &issued.grant,
+                native_attempt_id,
+                now,
+            },
+        )
+        .await;
+        let other_client_keys =
+            DirectionalKeys::derive(&SessionMaster::from_bytes(other_master)).unwrap();
+        assert_eq!(
+            response_status(
+                &other_client_keys,
+                &other_session_id,
+                &wrong_session_request_id,
+                &wrong_session_response,
+            ),
+            StatusCode::UNAUTHORIZED.as_u16()
+        );
+        assert!(matches!(
+            wrong_session_lease.state().authority(),
+            AuthorityState::Anonymous
+        ));
+
+        let wrong_attempt_request_id = RequestId::from_bytes([0xcc; 16]);
+        let (wrong_attempt_lease, wrong_attempt_response) = process_native_handoff_test_redemption(
+            &state,
+            &jwt_keys,
+            NativeHandoffTestRedemption {
+                session_id: target_session_id,
+                master_bytes: target_master,
+                request_id: wrong_attempt_request_id,
+                request_nonce: [0xcd; 12],
+                grant: &issued.grant,
+                native_attempt_id: Uuid::from_bytes([0xce; 16]),
+                now,
+            },
+        )
+        .await;
+        let target_client_keys =
+            DirectionalKeys::derive(&SessionMaster::from_bytes(target_master)).unwrap();
+        assert_eq!(
+            response_status(
+                &target_client_keys,
+                &target_session_id,
+                &wrong_attempt_request_id,
+                &wrong_attempt_response,
+            ),
+            StatusCode::UNAUTHORIZED.as_u16()
+        );
+        assert!(matches!(
+            wrong_attempt_lease.state().authority(),
+            AuthorityState::Anonymous
+        ));
+
+        let success_request_id = RequestId::from_bytes([0xcf; 16]);
+        let (target_lease, success_response) = process_native_handoff_test_redemption(
+            &state,
+            &jwt_keys,
+            NativeHandoffTestRedemption {
+                session_id: target_session_id,
+                master_bytes: target_master,
+                request_id: success_request_id,
+                request_nonce: [0xd0; 12],
+                grant: &issued.grant,
+                native_attempt_id,
+                now,
+            },
+        )
+        .await;
+        assert_eq!(
+            response_status(
+                &target_client_keys,
+                &target_session_id,
+                &success_request_id,
+                &success_response,
+            ),
+            StatusCode::OK.as_u16()
+        );
+        assert!(other_client_keys
+            .decrypt_unary_response_record(
+                &target_session_id,
+                &success_request_id,
+                success_response.encrypted.as_slice(),
+            )
+            .is_err());
+
+        let expected_cache_namespace =
+            derive_tinfoil_cache_namespace(&CacheNamespaceRoot::from_bytes([0xc1; 32]), user_id);
+        let AuthorityState::Bound(bound) = target_lease.state().authority() else {
+            panic!("exact native handoff redemption must bind the target session");
+        };
+        let BoundPrincipal::User {
+            user_id: bound_user_id,
+            project_id: bound_project_id,
+            auth_context: bound_auth_context,
+            cache_namespace: bound_cache_namespace,
+        } = bound.principal()
+        else {
+            panic!("native handoff must bind a user principal");
+        };
+        assert_eq!(*bound_user_id, user_id);
+        assert_eq!(*bound_project_id, auth_context.project_id);
+        assert_eq!(bound_auth_context, &auth_context);
+        assert_eq!(bound_cache_namespace, &expected_cache_namespace);
+
+        let second_request_id = RequestId::from_bytes([0xd1; 16]);
+        let second_plaintext = serde_json::to_vec(&native_handoff_redeem_envelope(
+            second_request_id,
+            &issued.grant,
+            native_attempt_id,
+        ))
+        .unwrap();
+        let second_encrypted = target_client_keys
+            .encrypt_request_record_with_nonce(&target_session_id, &second_plaintext, [0xd2; 12])
+            .unwrap();
+        let (second_lease, second_envelope) = state
+            .decrypt_request_envelope(target_session_id, &second_encrypted, now)
+            .await
+            .unwrap();
+        let OperationPreparation::Rejected(second_rejection) =
+            prepare_user_operation(second_envelope, second_lease.state().authority())
+        else {
+            panic!("a bound target session must reject a second native handoff redemption");
+        };
+        let second_response =
+            encrypt_new_logical_response(&second_lease, second_request_id, second_rejection)
+                .unwrap();
+        assert_eq!(
+            response_status(
+                &target_client_keys,
+                &target_session_id,
+                &second_request_id,
+                &second_response,
+            ),
+            StatusCode::CONFLICT.as_u16()
+        );
+        assert!(matches!(
+            second_lease.state().authority(),
+            AuthorityState::Bound(_)
+        ));
     }
 
     #[tokio::test]

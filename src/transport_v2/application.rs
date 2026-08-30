@@ -20,15 +20,17 @@ use serde::Deserializer as _;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use validator::Validate;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::bounded_json::BoundedJsonBuffer;
 use crate::db::DBError;
 use crate::email::send_platform_invite_email;
 use crate::encrypt::{decrypt_with_key, encrypt_with_key};
 use crate::jwt::{
-    issue_transport_v2_platform_tokens, issue_transport_v2_user_tokens,
+    issue_transport_v2_native_handoff_grant, issue_transport_v2_platform_tokens,
+    issue_transport_v2_user_tokens, validate_transport_v2_native_handoff_grant,
     validate_transport_v2_platform_resumption, validate_transport_v2_user_resumption, AuthContext,
+    TRANSPORT_V2_NATIVE_HANDOFF_GRANT_MAX_BYTES,
 };
 use crate::kv::StoreError;
 use crate::models::project_settings::{EmailSettings, OAuthSettings};
@@ -159,6 +161,26 @@ const MAX_APPLE_OPTIONAL_FIELD_BYTES: usize = 4 * 1024;
 
 type SensitiveBytes = Zeroizing<Vec<u8>>;
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeHandoffGrantRequest {
+    native_session_id: String,
+    native_attempt_id: String,
+}
+
+#[derive(serde::Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(deny_unknown_fields)]
+struct NativeHandoffRedeemRequest {
+    grant: String,
+    native_attempt_id: String,
+}
+
+#[derive(Serialize)]
+struct NativeHandoffGrantResponse<'a> {
+    grant: &'a str,
+    expires_at: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum JsonShapeError {
     TooLarge,
@@ -194,6 +216,10 @@ pub(crate) enum UserOperation {
         cache_namespace_root: CacheNamespaceRoot,
     },
     AppleNativeOAuth {
+        body: SensitiveBytes,
+        cache_namespace_root: CacheNamespaceRoot,
+    },
+    RedeemNativeHandoff {
         body: SensitiveBytes,
         cache_namespace_root: CacheNamespaceRoot,
     },
@@ -442,6 +468,9 @@ pub(crate) struct BoundApiKeyAuthority {
 pub(crate) enum ProtectedUserOperation {
     GetUser,
     RequestVerification,
+    CreateNativeHandoffGrant {
+        body: SensitiveBytes,
+    },
     GetPrivateKey {
         query: Option<String>,
     },
@@ -597,6 +626,7 @@ impl UserOperation {
                 | Self::Resume { .. }
                 | Self::OAuthCallback { .. }
                 | Self::AppleNativeOAuth { .. }
+                | Self::RedeemNativeHandoff { .. }
                 | Self::PlatformLogin { .. }
                 | Self::PlatformRegister { .. }
                 | Self::PlatformResume { .. }
@@ -1009,6 +1039,8 @@ pub(crate) fn prepare_user_operation(
         AppleOAuthInitiate,
         AppleOAuthCallback,
         AppleNativeOAuth,
+        CreateNativeHandoffGrant,
+        RedeemNativeHandoff,
         UserPasswordResetRequest,
         UserPasswordResetConfirm,
         VerifyEmail,
@@ -1160,6 +1192,10 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Post, "/auth/apple") => Some(Route::AppleOAuthInitiate),
         (LogicalMethod::Post, "/auth/apple/callback") => Some(Route::AppleOAuthCallback),
         (LogicalMethod::Post, "/auth/apple/native") => Some(Route::AppleNativeOAuth),
+        (LogicalMethod::Post, "/auth/native-handoff/grant") => {
+            Some(Route::CreateNativeHandoffGrant)
+        }
+        (LogicalMethod::Post, "/auth/native-handoff/redeem") => Some(Route::RedeemNativeHandoff),
         (LogicalMethod::Post, "/password-reset/request") => Some(Route::UserPasswordResetRequest),
         (LogicalMethod::Post, "/password-reset/confirm") => Some(Route::UserPasswordResetConfirm),
         (LogicalMethod::Get, _) if verification_code.is_some() => Some(Route::VerifyEmail),
@@ -1353,6 +1389,7 @@ pub(crate) fn prepare_user_operation(
                 | Route::GoogleOAuthCallback
                 | Route::AppleOAuthCallback
                 | Route::AppleNativeOAuth
+                | Route::RedeemNativeHandoff
                 | Route::Models
                 | Route::ModelCatalog
                 | Route::ChatCompletions
@@ -1548,6 +1585,75 @@ pub(crate) fn prepare_user_operation(
                 }
                 _ => unreachable!("OAuth callback route group is exhaustive"),
             }
+        }
+        Route::CreateNativeHandoffGrant => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            let authority = match bound_user_authority(authority) {
+                Ok(authority) => authority,
+                Err(rejection) => return OperationPreparation::Rejected(rejection),
+            };
+            OperationPreparation::Ready(UserOperation::Protected {
+                authority,
+                operation: ProtectedUserOperation::CreateNativeHandoffGrant {
+                    body: Zeroizing::new(
+                        request
+                            .body_base64
+                            .expect("validated native handoff grant body")
+                            .into_bytes(),
+                    ),
+                },
+            })
+        }
+        Route::RedeemNativeHandoff => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            match authority {
+                AuthorityState::Anonymous => {}
+                AuthorityState::Bound(_) => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::AlreadyBound,
+                    ));
+                }
+                AuthorityState::Authenticating(_) => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::AuthenticationInProgress,
+                    ));
+                }
+                AuthorityState::Closing => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::Closing,
+                    ));
+                }
+            }
+            let Some(cache_namespace_root) = cache_namespace_root_base64 else {
+                return rejected_bad_request();
+            };
+            OperationPreparation::Ready(UserOperation::RedeemNativeHandoff {
+                body: Zeroizing::new(
+                    request
+                        .body_base64
+                        .expect("validated native handoff redemption body")
+                        .into_bytes(),
+                ),
+                cache_namespace_root,
+            })
         }
         Route::UserPasswordResetRequest | Route::UserPasswordResetConfirm => {
             if credential.is_some()
@@ -3070,6 +3176,38 @@ pub(crate) async fn execute_user_operation(
                 cache_namespace_root,
             )
         }
+        UserOperation::RedeemNativeHandoff {
+            body,
+            cache_namespace_root,
+        } => {
+            let request = match parse_json_body::<NativeHandoffRedeemRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            let native_attempt_id = match validate_native_handoff_redeem_request(&request) {
+                Ok(native_attempt_id) => native_attempt_id,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            let verified = match validate_transport_v2_native_handoff_grant(
+                &request.grant,
+                lease.state().session_id(),
+                native_attempt_id,
+                &app_state,
+            ) {
+                Ok(verified) => verified,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            finish_user_binding(
+                &app_state,
+                &lease,
+                verified,
+                authentication
+                    .expect("native handoff redemption requires authentication reservation"),
+                monotonic_now,
+                UserAuthResponseKind::Login,
+                cache_namespace_root,
+            )
+        }
         UserOperation::UserPasswordResetRequest { body } => {
             debug_assert!(authentication.is_none());
             let request = match parse_json_body::<PasswordResetRequestPayload>(body) {
@@ -4247,6 +4385,29 @@ async fn execute_protected_user_operation(
         ProtectedUserOperation::RequestVerification => {
             let value = request_new_verification_code_data(app_state, user).await?;
             LogicalUnaryResponse::json(StatusCode::OK, &value)
+        }
+        ProtectedUserOperation::CreateNativeHandoffGrant { body } => {
+            let request = parse_json_body::<NativeHandoffGrantRequest>(body)?;
+            let (native_session_id, native_attempt_id) =
+                validate_native_handoff_grant_request(&request)?;
+            let mut issued = issue_transport_v2_native_handoff_grant(
+                user,
+                auth_context,
+                native_session_id,
+                native_attempt_id,
+                app_state,
+            )?;
+            let expires_at = u64::try_from(issued.expires_at.timestamp())
+                .map_err(|_| ApiError::InternalServerError)?;
+            let response = LogicalUnaryResponse::json(
+                StatusCode::OK,
+                &NativeHandoffGrantResponse {
+                    grant: &issued.grant,
+                    expires_at,
+                },
+            );
+            issued.grant.zeroize();
+            response
         }
         ProtectedUserOperation::GetPrivateKey { query } => {
             let query = parse_logical_query::<DerivationPathQuery>(query)?;
@@ -5884,6 +6045,35 @@ fn validate_apple_native_request(request: &AppleNativeSignInRequest) -> Result<(
         return Err(ApiError::PayloadTooLarge);
     }
     Ok(())
+}
+
+fn parse_canonical_non_nil_request_uuid(value: &str) -> Result<uuid::Uuid, ApiError> {
+    let parsed = uuid::Uuid::parse_str(value).map_err(|_| ApiError::BadRequest)?;
+    if parsed.is_nil() || parsed.to_string() != value {
+        return Err(ApiError::BadRequest);
+    }
+    Ok(parsed)
+}
+
+fn validate_native_handoff_grant_request(
+    request: &NativeHandoffGrantRequest,
+) -> Result<(uuid::Uuid, uuid::Uuid), ApiError> {
+    Ok((
+        parse_canonical_non_nil_request_uuid(&request.native_session_id)?,
+        parse_canonical_non_nil_request_uuid(&request.native_attempt_id)?,
+    ))
+}
+
+fn validate_native_handoff_redeem_request(
+    request: &NativeHandoffRedeemRequest,
+) -> Result<uuid::Uuid, ApiError> {
+    if request.grant.len() > TRANSPORT_V2_NATIVE_HANDOFF_GRANT_MAX_BYTES {
+        return Err(ApiError::PayloadTooLarge);
+    }
+    if request.grant.is_empty() {
+        return Err(ApiError::BadRequest);
+    }
+    parse_canonical_non_nil_request_uuid(&request.native_attempt_id)
 }
 
 fn parse_logical_query<T: DeserializeOwned>(query: Option<String>) -> Result<T, ApiError> {
@@ -9022,6 +9212,189 @@ mod tests {
             request.cache_namespace_root_base64 = Some(CacheNamespaceRoot::from_bytes([0xa5; 32]));
         }
         request
+    }
+
+    fn native_handoff_envelope(path: &str, body: &[u8], with_cache_root: bool) -> RequestEnvelope {
+        let mut request = envelope(LogicalMethod::Post, path, json_header(), Some(body), None);
+        if with_cache_root {
+            request.cache_namespace_root_base64 = Some(CacheNamespaceRoot::from_bytes([0xb5; 32]));
+        }
+        request
+    }
+
+    #[test]
+    fn native_handoff_routes_have_exact_authority_and_transition_contracts() {
+        let grant_body = br#"{
+            "native_session_id":"123e4567-e89b-42d3-a456-426614174000",
+            "native_attempt_id":"223e4567-e89b-42d3-a456-426614174000"
+        }"#;
+        let OperationPreparation::Ready(grant_operation) = prepare_user_operation(
+            native_handoff_envelope("/auth/native-handoff/grant", grant_body, false),
+            bound_user_authority(),
+        ) else {
+            panic!("bound user must be able to create a native handoff grant");
+        };
+        assert!(matches!(
+            &grant_operation,
+            UserOperation::Protected {
+                operation: ProtectedUserOperation::CreateNativeHandoffGrant { .. },
+                ..
+            }
+        ));
+        assert!(!grant_operation.requires_authentication_transition());
+        assert_eq!(
+            grant_operation.session_effect_on_success(),
+            SessionEffect::Retain
+        );
+        let grant_response = serde_json::to_value(NativeHandoffGrantResponse {
+            grant: "header.payload.signature",
+            expires_at: 1_730_000_000,
+        })
+        .expect("native handoff response must serialize");
+        assert_eq!(grant_response["expires_at"].as_u64(), Some(1_730_000_000));
+
+        let redeem_body = br#"{
+            "grant":"a.b.c",
+            "native_attempt_id":"223e4567-e89b-42d3-a456-426614174000"
+        }"#;
+        let OperationPreparation::Ready(redeem_operation) = prepare_user_operation(
+            native_handoff_envelope("/auth/native-handoff/redeem", redeem_body, true),
+            AuthorityState::Anonymous,
+        ) else {
+            panic!("exact anonymous native handoff redemption must be admitted");
+        };
+        assert!(matches!(
+            &redeem_operation,
+            UserOperation::RedeemNativeHandoff { .. }
+        ));
+        assert!(redeem_operation.requires_authentication_transition());
+        assert!(!redeem_operation.requires_provider_output_reservation());
+
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                native_handoff_envelope("/auth/native-handoff/grant", grant_body, false),
+                AuthorityState::Anonymous,
+            )),
+            StatusCode::UNAUTHORIZED
+        );
+        for authority in [bound_platform_authority(), bound_api_key_authority()] {
+            assert_eq!(
+                rejected_status(prepare_user_operation(
+                    native_handoff_envelope("/auth/native-handoff/grant", grant_body, false),
+                    authority,
+                )),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                native_handoff_envelope("/auth/native-handoff/redeem", redeem_body, true),
+                bound_user_authority(),
+            )),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn native_handoff_routes_reject_transplants_and_noncanonical_bodies() {
+        let grant_body = br#"{
+            "native_session_id":"123e4567-e89b-42d3-a456-426614174000",
+            "native_attempt_id":"223e4567-e89b-42d3-a456-426614174000"
+        }"#;
+        let redeem_body = br#"{
+            "grant":"a.b.c",
+            "native_attempt_id":"223e4567-e89b-42d3-a456-426614174000"
+        }"#;
+
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                native_handoff_envelope("/auth/native-handoff/grant", grant_body, true),
+                bound_user_authority(),
+            )),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                native_handoff_envelope("/auth/native-handoff/redeem", redeem_body, false),
+                AuthorityState::Anonymous,
+            )),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut with_query =
+            native_handoff_envelope("/auth/native-handoff/redeem", redeem_body, true);
+        with_query.request.query = Some("target=elsewhere".to_owned());
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                with_query,
+                AuthorityState::Anonymous
+            )),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut with_credential =
+            native_handoff_envelope("/auth/native-handoff/redeem", redeem_body, true);
+        with_credential.credential = Some(Credential::Resumption {
+            value_base64: EncodedBytes::from_bytes(b"copied".to_vec()),
+        });
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                with_credential,
+                AuthorityState::Anonymous
+            )),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut streaming =
+            native_handoff_envelope("/auth/native-handoff/redeem", redeem_body, true);
+        streaming.response_mode = ResponseMode::Stream;
+        assert_eq!(
+            rejected_status(prepare_user_operation(streaming, AuthorityState::Anonymous)),
+            StatusCode::BAD_REQUEST
+        );
+
+        for invalid in [
+            br#"{"native_session_id":"123e4567-e89b-42d3-a456-426614174000","native_attempt_id":"223e4567-e89b-42d3-a456-426614174000","extra":true}"#.as_slice(),
+            br#"{"native_session_id":"00000000-0000-0000-0000-000000000000","native_attempt_id":"223e4567-e89b-42d3-a456-426614174000"}"#.as_slice(),
+            br#"{"native_session_id":"123E4567-E89B-42D3-A456-426614174000","native_attempt_id":"223e4567-e89b-42d3-a456-426614174000"}"#.as_slice(),
+        ] {
+            let parsed = parse_json_body::<NativeHandoffGrantRequest>(Zeroizing::new(
+                invalid.to_vec(),
+            ))
+            .and_then(|request| validate_native_handoff_grant_request(&request).map(|_| ()));
+            assert!(matches!(parsed, Err(ApiError::BadRequest)));
+        }
+
+        let oversized = NativeHandoffRedeemRequest {
+            grant: "a".repeat(TRANSPORT_V2_NATIVE_HANDOFF_GRANT_MAX_BYTES + 1),
+            native_attempt_id: "223e4567-e89b-42d3-a456-426614174000".to_owned(),
+        };
+        assert!(matches!(
+            validate_native_handoff_redeem_request(&oversized),
+            Err(ApiError::PayloadTooLarge)
+        ));
+        let empty = NativeHandoffRedeemRequest {
+            grant: String::new(),
+            native_attempt_id: "223e4567-e89b-42d3-a456-426614174000".to_owned(),
+        };
+        assert!(matches!(
+            validate_native_handoff_redeem_request(&empty),
+            Err(ApiError::BadRequest)
+        ));
+
+        assert!(matches!(
+            prepare_user_operation(
+                envelope(
+                    LogicalMethod::Get,
+                    "/auth/native-handoff/grant",
+                    Vec::new(),
+                    None,
+                    None,
+                ),
+                bound_user_authority(),
+            ),
+            OperationPreparation::Unsupported
+        ));
     }
 
     #[test]

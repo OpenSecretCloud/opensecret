@@ -15,7 +15,7 @@ use chrono::{DateTime, Duration, Utc};
 use jwt_compact::{alg::Es256k, prelude::*, AlgorithmExt};
 use secp256k1::{All, PublicKey, Secp256k1, SecretKey};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::db::DBError;
@@ -37,12 +37,19 @@ pub(crate) const TRANSPORT_V2_USER_ACCESS_AUDIENCE: &str =
     "urn:opensecret:internal:transport-v2:user:access-descriptor";
 pub(crate) const TRANSPORT_V2_USER_RESUMPTION_AUDIENCE: &str =
     "urn:opensecret:internal:transport-v2:user:resumption";
+pub(crate) const TRANSPORT_V2_USER_NATIVE_HANDOFF_AUDIENCE: &str =
+    "urn:opensecret:internal:transport-v2:user:native-handoff";
+pub(crate) const TRANSPORT_V2_NATIVE_HANDOFF_GRANT_MAX_BYTES: usize = 4_096;
 pub(crate) const TRANSPORT_V2_PLATFORM_ACCESS_AUDIENCE: &str =
     "urn:opensecret:internal:transport-v2:platform:access-descriptor";
 pub(crate) const TRANSPORT_V2_PLATFORM_RESUMPTION_AUDIENCE: &str =
     "urn:opensecret:internal:transport-v2:platform:resumption";
 const TRANSPORT_V2_TOKEN_ISSUER: &str = "urn:opensecret:transport-v2";
 const TRANSPORT_V2_TOKEN_VERSION: u8 = 2;
+const TRANSPORT_V2_NATIVE_HANDOFF_TTL: Duration = Duration::minutes(5);
+const TRANSPORT_V2_NATIVE_HANDOFF_CLOCK_LEEWAY: Duration = Duration::seconds(30);
+const TRANSPORT_V2_NATIVE_HANDOFF_ATTEMPT_DOMAIN: &[u8] =
+    b"opensecret:transport-v2:native-handoff:attempt:v1\0";
 
 pub const USER_TOKEN_FORMAT_V2: u8 = 2;
 
@@ -188,6 +195,7 @@ impl AuthContext {
 enum TransportV2TokenKind {
     AccessDescriptor,
     Resumption,
+    NativeHandoff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +233,28 @@ struct TransportV2PlatformClaims {
     pk: TransportV2PrincipalKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TransportV2NativeHandoffClaims {
+    sub: String,
+    iss: String,
+    aud: String,
+    tv: u8,
+    tk: TransportV2TokenKind,
+    pk: TransportV2PrincipalKind,
+    #[serde(rename = "tf")]
+    token_format: u8,
+    #[serde(rename = "am")]
+    auth_method: String,
+    #[serde(rename = "pid")]
+    project_id: i32,
+    #[serde(rename = "ab")]
+    auth_binding: String,
+    #[serde(rename = "sid")]
+    target_session_id: String,
+    #[serde(rename = "jti")]
+    native_attempt_commitment: String,
+}
+
 pub(crate) struct IssuedTransportV2UserTokens {
     pub(crate) access_token: String,
     pub(crate) resumption_token: String,
@@ -237,16 +267,22 @@ pub(crate) struct IssuedTransportV2PlatformTokens {
     pub(crate) access_expires_at: DateTime<Utc>,
 }
 
+pub(crate) struct IssuedTransportV2NativeHandoffGrant {
+    pub(crate) grant: String,
+    pub(crate) expires_at: DateTime<Utc>,
+}
+
 impl TokenType {
     pub fn validate_third_party_audience(aud: &str) -> Result<(), ApiError> {
         // Validate third party audience can't use our internal audience types
-        const RESERVED_AUDIENCES: [&str; 8] = [
+        const RESERVED_AUDIENCES: [&str; 9] = [
             USER_ACCESS,
             USER_REFRESH,
             PLATFORM_ACCESS,
             PLATFORM_REFRESH,
             TRANSPORT_V2_USER_ACCESS_AUDIENCE,
             TRANSPORT_V2_USER_RESUMPTION_AUDIENCE,
+            TRANSPORT_V2_USER_NATIVE_HANDOFF_AUDIENCE,
             TRANSPORT_V2_PLATFORM_ACCESS_AUDIENCE,
             TRANSPORT_V2_PLATFORM_RESUMPTION_AUDIENCE,
         ];
@@ -704,6 +740,95 @@ fn issue_transport_v2_user_token(
     Ok((token, expiration))
 }
 
+pub(crate) fn issue_transport_v2_native_handoff_grant(
+    user: &User,
+    auth_context: &AuthContext,
+    target_session_id: Uuid,
+    native_attempt_id: Uuid,
+    app_state: &AppState,
+) -> Result<IssuedTransportV2NativeHandoffGrant, ApiError> {
+    if user.project_id != auth_context.project_id {
+        return Err(ApiError::BadRequest);
+    }
+
+    issue_transport_v2_native_handoff_grant_with_keys(
+        user.get_id(),
+        auth_context,
+        target_session_id,
+        native_attempt_id,
+        &app_state.config.jwt_keys,
+    )
+}
+
+fn issue_transport_v2_native_handoff_grant_with_keys(
+    user_id: Uuid,
+    auth_context: &AuthContext,
+    target_session_id: Uuid,
+    native_attempt_id: Uuid,
+    jwt_keys: &JwtKeys,
+) -> Result<IssuedTransportV2NativeHandoffGrant, ApiError> {
+    if target_session_id.is_nil() || native_attempt_id.is_nil() {
+        return Err(ApiError::BadRequest);
+    }
+
+    let custom_claims = TransportV2NativeHandoffClaims {
+        sub: user_id.to_string(),
+        iss: TRANSPORT_V2_TOKEN_ISSUER.to_owned(),
+        aud: TRANSPORT_V2_USER_NATIVE_HANDOFF_AUDIENCE.to_owned(),
+        tv: TRANSPORT_V2_TOKEN_VERSION,
+        tk: TransportV2TokenKind::NativeHandoff,
+        pk: TransportV2PrincipalKind::User,
+        token_format: auth_context.token_format,
+        auth_method: auth_context.method.as_str().to_owned(),
+        project_id: auth_context.project_id,
+        auth_binding: URL_SAFE_NO_PAD.encode(auth_context.auth_binding),
+        target_session_id: target_session_id.to_string(),
+        native_attempt_commitment: native_handoff_attempt_commitment(native_attempt_id),
+    };
+
+    let issued_at = Utc::now();
+    let expiration = issued_at + TRANSPORT_V2_NATIVE_HANDOFF_TTL;
+    let mut claims = Claims::new(custom_claims);
+    claims.issued_at = Some(issued_at);
+    claims.not_before = Some(issued_at);
+    claims.expiration = Some(expiration);
+
+    let header = Header::empty().with_token_type("JWT");
+    let es256k = Es256k::<Sha256>::new(jwt_keys.secp.clone());
+    let grant = es256k
+        .token(&header, &claims, &jwt_keys.signing_key)
+        .map_err(|error| {
+            tracing::error!("Error creating transport-v2 native handoff grant: {error:?}");
+            ApiError::InternalServerError
+        })?;
+    if !is_canonical_compact_jwt(&grant) {
+        tracing::error!("Issued transport-v2 native handoff grant exceeded its wire contract");
+        return Err(ApiError::InternalServerError);
+    }
+
+    Ok(IssuedTransportV2NativeHandoffGrant {
+        grant,
+        expires_at: expiration,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn issue_transport_v2_native_handoff_grant_for_test(
+    user_id: Uuid,
+    auth_context: &AuthContext,
+    target_session_id: Uuid,
+    native_attempt_id: Uuid,
+    jwt_keys: &JwtKeys,
+) -> Result<IssuedTransportV2NativeHandoffGrant, ApiError> {
+    issue_transport_v2_native_handoff_grant_with_keys(
+        user_id,
+        auth_context,
+        target_session_id,
+        native_attempt_id,
+        jwt_keys,
+    )
+}
+
 pub(crate) fn issue_transport_v2_platform_tokens(
     platform_user: &PlatformUser,
     app_state: &AppState,
@@ -773,6 +898,37 @@ pub(crate) fn validate_transport_v2_user_resumption(
         validate_transport_v2_user_resumption_claims(original_token, &data.config.jwt_keys)?;
     let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::InvalidJwt)?;
     let auth_context = transport_v2_auth_context(&claims)?;
+    let user = match data.verify_bound_user(user_id, claims.project_id, &auth_context) {
+        Ok(user) => user,
+        Err(ApiError::InternalServerError) => return Err(ApiError::InternalServerError),
+        Err(_) => return Err(ApiError::InvalidJwt),
+    };
+
+    Ok(VerifiedUserAuthentication { user, auth_context })
+}
+
+pub(crate) fn validate_transport_v2_native_handoff_grant(
+    original_token: &str,
+    expected_session_id: Uuid,
+    expected_attempt_id: Uuid,
+    data: &AppState,
+) -> Result<VerifiedUserAuthentication, ApiError> {
+    if expected_session_id.is_nil() || expected_attempt_id.is_nil() {
+        return Err(ApiError::InvalidJwt);
+    }
+    let claims = validate_transport_v2_native_handoff_grant_claims(
+        original_token,
+        &data.config.jwt_keys,
+        expected_session_id,
+        expected_attempt_id,
+    )?;
+    let user_id = parse_canonical_non_nil_uuid(&claims.sub)?;
+    let auth_context = transport_v2_auth_context_from_parts(
+        claims.token_format,
+        &claims.auth_method,
+        claims.project_id,
+        &claims.auth_binding,
+    )?;
     let user = match data.verify_bound_user(user_id, claims.project_id, &auth_context) {
         Ok(user) => user,
         Err(ApiError::InternalServerError) => return Err(ApiError::InternalServerError),
@@ -877,6 +1033,143 @@ fn validate_transport_v2_user_resumption_claims(
     Ok(claims.custom.clone())
 }
 
+fn validate_transport_v2_native_handoff_grant_claims(
+    original_token: &str,
+    jwt_keys: &JwtKeys,
+    expected_session_id: Uuid,
+    expected_attempt_id: Uuid,
+) -> Result<TransportV2NativeHandoffClaims, ApiError> {
+    if !is_canonical_compact_jwt(original_token) {
+        return Err(ApiError::InvalidJwt);
+    }
+    let parsed_token = UntrustedToken::new(original_token).map_err(|error| {
+        tracing::debug!("Failed to parse transport-v2 native handoff grant: {error:?}");
+        ApiError::InvalidJwt
+    })?;
+    let es256k = Es256k::<Sha256>::new(jwt_keys.secp.clone());
+    let public_key = jwt_keys.public_key();
+    let token: Token<TransportV2NativeHandoffClaims> = es256k
+        .validator(&public_key)
+        .validate(&parsed_token)
+        .map_err(|error| {
+            tracing::debug!(
+                "Transport-v2 native handoff grant signature validation failed: {error:?}"
+            );
+            ApiError::InvalidJwt
+        })?;
+    let claims = token.claims();
+
+    if claims.custom.iss != TRANSPORT_V2_TOKEN_ISSUER
+        || claims.custom.aud != TRANSPORT_V2_USER_NATIVE_HANDOFF_AUDIENCE
+        || claims.custom.tv != TRANSPORT_V2_TOKEN_VERSION
+        || claims.custom.tk != TransportV2TokenKind::NativeHandoff
+        || claims.custom.pk != TransportV2PrincipalKind::User
+    {
+        return Err(ApiError::InvalidJwt);
+    }
+
+    validate_transport_v2_native_handoff_times(claims)?;
+    let target_session_id = parse_canonical_non_nil_uuid(&claims.custom.target_session_id)?;
+    if target_session_id != expected_session_id
+        || claims.custom.native_attempt_commitment
+            != native_handoff_attempt_commitment(expected_attempt_id)
+    {
+        return Err(ApiError::InvalidJwt);
+    }
+
+    Ok(claims.custom.clone())
+}
+
+#[cfg(test)]
+pub(crate) fn validate_transport_v2_native_handoff_grant_claims_for_test(
+    original_token: &str,
+    expected_session_id: Uuid,
+    expected_attempt_id: Uuid,
+    jwt_keys: &JwtKeys,
+) -> Result<(Uuid, AuthContext), ApiError> {
+    let claims = validate_transport_v2_native_handoff_grant_claims(
+        original_token,
+        jwt_keys,
+        expected_session_id,
+        expected_attempt_id,
+    )?;
+    let user_id = parse_canonical_non_nil_uuid(&claims.sub)?;
+    let auth_context = transport_v2_auth_context_from_parts(
+        claims.token_format,
+        &claims.auth_method,
+        claims.project_id,
+        &claims.auth_binding,
+    )?;
+    Ok((user_id, auth_context))
+}
+
+fn validate_transport_v2_native_handoff_times<T>(claims: &Claims<T>) -> Result<(), ApiError> {
+    let time_options = TimeOptions::from_leeway(TRANSPORT_V2_NATIVE_HANDOFF_CLOCK_LEEWAY);
+    claims
+        .validate_expiration(&time_options)
+        .and_then(|claims| claims.validate_maturity(&time_options))
+        .map_err(|error| {
+            tracing::debug!("Transport-v2 native handoff time validation failed: {error:?}");
+            ApiError::InvalidJwt
+        })?;
+
+    let issued_at = claims.issued_at.ok_or(ApiError::InvalidJwt)?;
+    let not_before = claims.not_before.ok_or(ApiError::InvalidJwt)?;
+    let expiration = claims.expiration.ok_or(ApiError::InvalidJwt)?;
+    let latest_acceptable_issuance = Utc::now()
+        .checked_add_signed(TRANSPORT_V2_NATIVE_HANDOFF_CLOCK_LEEWAY)
+        .ok_or(ApiError::InvalidJwt)?;
+    if issued_at != not_before
+        || issued_at > latest_acceptable_issuance
+        || expiration <= issued_at
+        || expiration.signed_duration_since(issued_at) > TRANSPORT_V2_NATIVE_HANDOFF_TTL
+    {
+        return Err(ApiError::InvalidJwt);
+    }
+    Ok(())
+}
+
+fn parse_canonical_non_nil_uuid(value: &str) -> Result<Uuid, ApiError> {
+    let parsed = Uuid::parse_str(value).map_err(|_| ApiError::InvalidJwt)?;
+    if parsed.is_nil() || parsed.to_string() != value {
+        return Err(ApiError::InvalidJwt);
+    }
+    Ok(parsed)
+}
+
+fn native_handoff_attempt_commitment(native_attempt_id: Uuid) -> String {
+    let mut digest = Sha256::new();
+    digest.update(TRANSPORT_V2_NATIVE_HANDOFF_ATTEMPT_DOMAIN);
+    digest.update(native_attempt_id.as_bytes());
+    URL_SAFE_NO_PAD.encode(digest.finalize())
+}
+
+fn is_canonical_compact_jwt(value: &str) -> bool {
+    if value.is_empty() || value.len() > TRANSPORT_V2_NATIVE_HANDOFF_GRANT_MAX_BYTES {
+        return false;
+    }
+    let mut segments = value.split('.');
+    let canonical_segment = |segment: &str| {
+        if segment.is_empty()
+            || !segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return false;
+        }
+        URL_SAFE_NO_PAD
+            .decode(segment)
+            .is_ok_and(|decoded| URL_SAFE_NO_PAD.encode(decoded) == segment)
+    };
+    matches!(
+        (segments.next(), segments.next(), segments.next(), segments.next()),
+        (Some(header), Some(payload), Some(signature), None)
+            if canonical_segment(header)
+                && canonical_segment(payload)
+                && canonical_segment(signature)
+    )
+}
+
 fn validate_transport_v2_token_times<T>(
     claims: &Claims<T>,
     principal_label: &'static str,
@@ -908,12 +1201,26 @@ fn validate_transport_v2_token_times<T>(
 }
 
 fn transport_v2_auth_context(claims: &TransportV2UserClaims) -> Result<AuthContext, ApiError> {
-    if claims.token_format != USER_TOKEN_FORMAT_V2 {
+    transport_v2_auth_context_from_parts(
+        claims.token_format,
+        &claims.auth_method,
+        claims.project_id,
+        &claims.auth_binding,
+    )
+}
+
+fn transport_v2_auth_context_from_parts(
+    token_format: u8,
+    auth_method: &str,
+    project_id: i32,
+    auth_binding: &str,
+) -> Result<AuthContext, ApiError> {
+    if token_format != USER_TOKEN_FORMAT_V2 {
         return Err(ApiError::InvalidJwt);
     }
-    let method = AuthMethod::from_str(&claims.auth_method)?;
+    let method = AuthMethod::from_str(auth_method)?;
     let auth_binding_bytes = URL_SAFE_NO_PAD
-        .decode(&claims.auth_binding)
+        .decode(auth_binding)
         .map_err(|_| ApiError::InvalidJwt)?;
     let auth_binding: [u8; 32] = auth_binding_bytes
         .try_into()
@@ -921,7 +1228,7 @@ fn transport_v2_auth_context(claims: &TransportV2UserClaims) -> Result<AuthConte
     Ok(AuthContext {
         token_format: USER_TOKEN_FORMAT_V2,
         method,
-        project_id: claims.project_id,
+        project_id,
         auth_binding,
     })
 }
@@ -1302,6 +1609,26 @@ mod tests {
             Some(now - Duration::minutes(2)),
             Some(now + Duration::minutes(5)),
         )
+    }
+
+    fn transport_v2_native_handoff_test_claims(
+        target_session_id: Uuid,
+        native_attempt_id: Uuid,
+    ) -> TransportV2NativeHandoffClaims {
+        TransportV2NativeHandoffClaims {
+            sub: Uuid::from_bytes([0x41; 16]).to_string(),
+            iss: TRANSPORT_V2_TOKEN_ISSUER.to_owned(),
+            aud: TRANSPORT_V2_USER_NATIVE_HANDOFF_AUDIENCE.to_owned(),
+            tv: TRANSPORT_V2_TOKEN_VERSION,
+            tk: TransportV2TokenKind::NativeHandoff,
+            pk: TransportV2PrincipalKind::User,
+            token_format: USER_TOKEN_FORMAT_V2,
+            auth_method: AuthMethod::OAuth.as_str().to_owned(),
+            project_id: 7,
+            auth_binding: URL_SAFE_NO_PAD.encode([0x42; 32]),
+            target_session_id: target_session_id.to_string(),
+            native_attempt_commitment: native_handoff_attempt_commitment(native_attempt_id),
+        }
     }
 
     #[test]
@@ -1818,5 +2145,186 @@ mod tests {
             transport_v2_auth_context(&wrong_method),
             Err(ApiError::InvalidJwt)
         ));
+    }
+
+    #[test]
+    fn transport_v2_native_handoff_grant_is_exactly_session_and_attempt_bound() {
+        let keys = test_keys(12);
+        let target_session_id = Uuid::from_bytes([0x51; 16]);
+        let native_attempt_id = Uuid::from_bytes([0x52; 16]);
+        let now = Utc::now();
+        let token = signed_transport_v2_test_token(
+            &keys,
+            transport_v2_native_handoff_test_claims(target_session_id, native_attempt_id),
+            Some(now),
+            Some(now),
+            Some(now + TRANSPORT_V2_NATIVE_HANDOFF_TTL),
+        );
+
+        let claims = validate_transport_v2_native_handoff_grant_claims(
+            &token,
+            &keys,
+            target_session_id,
+            native_attempt_id,
+        )
+        .expect("valid grant should pass its exact domain and binding checks");
+        let auth_context = transport_v2_auth_context_from_parts(
+            claims.token_format,
+            &claims.auth_method,
+            claims.project_id,
+            &claims.auth_binding,
+        )
+        .expect("valid grant should carry a complete auth context");
+        assert_eq!(auth_context.method, AuthMethod::OAuth);
+        assert!(is_canonical_compact_jwt(&token));
+        assert!(token.len() <= TRANSPORT_V2_NATIVE_HANDOFF_GRANT_MAX_BYTES);
+        let encoded_payload = token
+            .split('.')
+            .nth(1)
+            .expect("compact JWT must have a payload");
+        let payload = URL_SAFE_NO_PAD
+            .decode(encoded_payload)
+            .expect("signed test payload must be canonical base64url");
+        assert!(!String::from_utf8_lossy(&payload).contains(&native_attempt_id.to_string()));
+
+        for (session_id, attempt_id) in [
+            (Uuid::from_bytes([0x53; 16]), native_attempt_id),
+            (target_session_id, Uuid::from_bytes([0x54; 16])),
+        ] {
+            assert!(matches!(
+                validate_transport_v2_native_handoff_grant_claims(
+                    &token, &keys, session_id, attempt_id,
+                ),
+                Err(ApiError::InvalidJwt)
+            ));
+        }
+
+        assert!(matches!(
+            validate_transport_v2_native_handoff_grant_claims(
+                &token,
+                &test_keys(13),
+                target_session_id,
+                native_attempt_id,
+            ),
+            Err(ApiError::InvalidJwt)
+        ));
+        assert!(matches!(
+            TokenType::validate_third_party_audience(TRANSPORT_V2_USER_NATIVE_HANDOFF_AUDIENCE),
+            Err(ApiError::BadRequest)
+        ));
+    }
+
+    #[test]
+    fn transport_v2_native_handoff_rejects_wrong_domain_time_and_wire_shape() {
+        let keys = test_keys(14);
+        let target_session_id = Uuid::from_bytes([0xab; 16]);
+        let native_attempt_id = Uuid::from_bytes([0xcd; 16]);
+        let now = Utc::now();
+        let sign = |claims: TransportV2NativeHandoffClaims,
+                    issued_at: Option<DateTime<Utc>>,
+                    not_before: Option<DateTime<Utc>>,
+                    expiration: Option<DateTime<Utc>>| {
+            signed_transport_v2_test_token(&keys, claims, issued_at, not_before, expiration)
+        };
+        let validate = |token: &str| {
+            validate_transport_v2_native_handoff_grant_claims(
+                token,
+                &keys,
+                target_session_id,
+                native_attempt_id,
+            )
+        };
+        let valid_claims =
+            || transport_v2_native_handoff_test_claims(target_session_id, native_attempt_id);
+
+        let mut wrong_issuer = valid_claims();
+        wrong_issuer.iss = "urn:attacker".to_owned();
+        let mut wrong_audience = valid_claims();
+        wrong_audience.aud = TRANSPORT_V2_USER_RESUMPTION_AUDIENCE.to_owned();
+        let mut wrong_version = valid_claims();
+        wrong_version.tv += 1;
+        let mut wrong_kind = valid_claims();
+        wrong_kind.tk = TransportV2TokenKind::Resumption;
+        let mut wrong_principal = valid_claims();
+        wrong_principal.pk = TransportV2PrincipalKind::Platform;
+        let mut noncanonical_session = valid_claims();
+        noncanonical_session.target_session_id =
+            noncanonical_session.target_session_id.to_uppercase();
+        let mut malformed_attempt_commitment = valid_claims();
+        malformed_attempt_commitment.native_attempt_commitment = Uuid::nil().to_string();
+
+        for claims in [
+            wrong_issuer,
+            wrong_audience,
+            wrong_version,
+            wrong_kind,
+            wrong_principal,
+            noncanonical_session,
+            malformed_attempt_commitment,
+        ] {
+            let token = sign(
+                claims,
+                Some(now),
+                Some(now),
+                Some(now + TRANSPORT_V2_NATIVE_HANDOFF_TTL),
+            );
+            assert!(matches!(validate(&token), Err(ApiError::InvalidJwt)));
+        }
+
+        let invalid_times = [
+            (None, Some(now), Some(now + Duration::minutes(1))),
+            (Some(now), None, Some(now + Duration::minutes(1))),
+            (Some(now), Some(now), None),
+            (
+                Some(now - Duration::minutes(2)),
+                Some(now - Duration::minutes(2)),
+                Some(now - Duration::minutes(1)),
+            ),
+            (
+                Some(now + Duration::minutes(1)),
+                Some(now + Duration::minutes(1)),
+                Some(now + Duration::minutes(2)),
+            ),
+            (
+                Some(now),
+                Some(now),
+                Some(now + TRANSPORT_V2_NATIVE_HANDOFF_TTL + Duration::seconds(1)),
+            ),
+            (
+                Some(now),
+                Some(now + Duration::seconds(1)),
+                Some(now + Duration::minutes(1)),
+            ),
+        ];
+        for (issued_at, not_before, expiration) in invalid_times {
+            let token = sign(valid_claims(), issued_at, not_before, expiration);
+            assert!(matches!(validate(&token), Err(ApiError::InvalidJwt)));
+        }
+
+        let access_descriptor = signed_transport_v2_test_token(
+            &keys,
+            transport_v2_test_claims(
+                TransportV2TokenKind::AccessDescriptor,
+                TRANSPORT_V2_USER_ACCESS_AUDIENCE,
+            ),
+            Some(now),
+            Some(now),
+            Some(now + Duration::minutes(1)),
+        );
+        assert!(matches!(
+            validate(&access_descriptor),
+            Err(ApiError::InvalidJwt)
+        ));
+
+        for malformed in [
+            "not-a-jwt".to_owned(),
+            "a.b.c".to_owned(),
+            "a.b.c.d".to_owned(),
+            "a.b.c=".to_owned(),
+            "a".repeat(TRANSPORT_V2_NATIVE_HANDOFF_GRANT_MAX_BYTES + 1),
+        ] {
+            assert!(!is_canonical_compact_jwt(&malformed));
+            assert!(matches!(validate(&malformed), Err(ApiError::InvalidJwt)));
+        }
     }
 }

@@ -1282,11 +1282,7 @@ mod tests {
 
         let valid_record = state
             .keys()
-            .encrypt_request_record_with_nonce(
-                &state.session_id(),
-                b"authenticated request",
-                [0x44; 12],
-            )
+            .encrypt_request_record(&state.session_id(), b"authenticated request")
             .expect("encrypt test request");
         assert!(state.decrypt_request_record(&[0u8; 28]).is_err());
         assert_eq!(state.request_record_count(), 0);

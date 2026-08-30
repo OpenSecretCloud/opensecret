@@ -229,6 +229,16 @@ impl DirectionalKeys {
     }
 
     #[cfg(test)]
+    pub(crate) fn encrypt_request_record(
+        &self,
+        session_id: &Uuid,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        self.request
+            .encrypt(plaintext, &request_record_aad(session_id))
+    }
+
+    #[cfg(test)]
     pub(crate) fn encrypt_request_record_with_nonce(
         &self,
         session_id: &Uuid,
@@ -450,9 +460,7 @@ mod tests {
         let session_id = Uuid::parse_str("00112233-4455-6677-8899-aabbccddeeff").unwrap();
         let other_session = Uuid::parse_str("10112233-4455-6677-8899-aabbccddeeff").unwrap();
         let plaintext = br#"{"version":2}"#;
-        let record = keys
-            .encrypt_request_record_with_nonce(&session_id, plaintext, [7; RECORD_NONCE_LEN])
-            .unwrap();
+        let record = keys.encrypt_request_record(&session_id, plaintext).unwrap();
 
         assert_eq!(
             keys.decrypt_request_record(&session_id, &record).unwrap(),
@@ -465,16 +473,13 @@ mod tests {
     }
 
     #[test]
-    fn key_exchange_uses_fixed_nonce_record_shape_and_aad() {
+    fn key_exchange_uses_nonce_record_shape_and_aad() {
         let shared_secret = [0x11; KEY_LEN];
         let session_id = Uuid::nil();
         let master = SessionMaster::from_bytes([0x22; KEY_LEN]);
         let payload = HandshakePayload::new(&session_id, &master, 1234);
-        let nonce = [0x33; RECORD_NONCE_LEN];
 
-        let record =
-            encrypt_key_exchange_record_with_nonce(&shared_secret, &payload, nonce).unwrap();
-        assert_eq!(&record[..RECORD_NONCE_LEN], &nonce);
+        let record = encrypt_key_exchange_record(&shared_secret, &payload).unwrap();
         assert_eq!(record.len(), RECORD_NONCE_LEN + 57 + RECORD_TAG_LEN);
         assert_eq!(
             decrypt_key_exchange_record(&shared_secret, &record).unwrap(),
@@ -495,11 +500,7 @@ mod tests {
         let payload = HandshakePayload::new(&Uuid::nil(), &master, 1234);
 
         assert_eq!(
-            encrypt_key_exchange_record_with_nonce(
-                &[0; KEY_LEN],
-                &payload,
-                [0x33; RECORD_NONCE_LEN]
-            ),
+            encrypt_key_exchange_record(&[0; KEY_LEN], &payload),
             Err(CryptoError::NonContributorySharedSecret)
         );
     }

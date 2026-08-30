@@ -44,7 +44,20 @@ struct OAuthStateStoreInner {
 #[derive(Debug)]
 struct StoredOAuthState {
     state: OAuthState,
+    binding: OAuthStateBinding,
     expires_at: Instant,
+}
+
+/// Server-only continuation binding for an OAuth authorization round trip.
+///
+/// V1 keeps its existing bearer-independent state semantics. V2 additionally
+/// binds the one-time state to the attested transport session that initiated
+/// the redirect, so copied callback parameters cannot authenticate a different
+/// session and a v1 callback cannot downgrade a v2 continuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OAuthStateBinding {
+    LegacyV1,
+    TransportV2(Uuid),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -70,13 +83,46 @@ impl OAuthStateStore {
         csrf_token: &str,
         state: OAuthState,
     ) -> Result<(), OAuthStateCapacityError> {
-        self.store_at(csrf_token, state, Instant::now()).await
+        self.store_with_binding(
+            csrf_token,
+            state,
+            OAuthStateBinding::LegacyV1,
+            Instant::now(),
+        )
+        .await
     }
 
+    async fn store_for_session(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        session_id: Uuid,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.store_with_binding(
+            csrf_token,
+            state,
+            OAuthStateBinding::TransportV2(session_id),
+            Instant::now(),
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn store_at(
         &self,
         csrf_token: &str,
         state: OAuthState,
+        now: Instant,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.store_with_binding(csrf_token, state, OAuthStateBinding::LegacyV1, now)
+            .await
+    }
+
+    async fn store_with_binding(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        binding: OAuthStateBinding,
         now: Instant,
     ) -> Result<(), OAuthStateCapacityError> {
         let mut inner = self.inner.lock().await;
@@ -92,6 +138,7 @@ impl OAuthStateStore {
             csrf_token.to_string(),
             StoredOAuthState {
                 state,
+                binding,
                 expires_at: now
                     .checked_add(self.ttl)
                     .expect("OAuth state TTL must fit in Instant"),
@@ -101,10 +148,31 @@ impl OAuthStateStore {
     }
 
     async fn consume(&self, state: &OAuthState) -> bool {
-        self.consume_at(state, Instant::now()).await
+        self.consume_with_binding(state, OAuthStateBinding::LegacyV1, Instant::now())
+            .await
     }
 
+    async fn consume_for_session(&self, state: &OAuthState, session_id: Uuid) -> bool {
+        self.consume_with_binding(
+            state,
+            OAuthStateBinding::TransportV2(session_id),
+            Instant::now(),
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn consume_at(&self, state: &OAuthState, now: Instant) -> bool {
+        self.consume_with_binding(state, OAuthStateBinding::LegacyV1, now)
+            .await
+    }
+
+    async fn consume_with_binding(
+        &self,
+        state: &OAuthState,
+        binding: OAuthStateBinding,
+        now: Instant,
+    ) -> bool {
         let mut inner = self.inner.lock().await;
         inner
             .entries
@@ -113,7 +181,9 @@ impl OAuthStateStore {
         let matches = inner
             .entries
             .get(&state.csrf_token)
-            .is_some_and(|stored_state| stored_state.state == *state);
+            .is_some_and(|stored_state| {
+                stored_state.state == *state && stored_state.binding == binding
+            });
         if matches {
             inner.entries.remove(&state.csrf_token);
         }
@@ -198,6 +268,27 @@ impl GithubProvider {
 
     pub async fn consume_state(&self, state: &OAuthState) -> bool {
         self.state_store.consume(state).await
+    }
+
+    pub(crate) async fn store_state_for_session(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        session_id: Uuid,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.state_store
+            .store_for_session(csrf_token, state, session_id)
+            .await
+    }
+
+    pub(crate) async fn consume_state_for_session(
+        &self,
+        state: &OAuthState,
+        session_id: Uuid,
+    ) -> bool {
+        self.state_store
+            .consume_for_session(state, session_id)
+            .await
     }
 
     async fn ensure_provider_exists(
@@ -303,6 +394,27 @@ impl GoogleProvider {
 
     pub async fn consume_state(&self, state: &OAuthState) -> bool {
         self.state_store.consume(state).await
+    }
+
+    pub(crate) async fn store_state_for_session(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        session_id: Uuid,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.state_store
+            .store_for_session(csrf_token, state, session_id)
+            .await
+    }
+
+    pub(crate) async fn consume_state_for_session(
+        &self,
+        state: &OAuthState,
+        session_id: Uuid,
+    ) -> bool {
+        self.state_store
+            .consume_for_session(state, session_id)
+            .await
     }
 
     async fn ensure_provider_exists(
@@ -415,6 +527,27 @@ impl AppleProvider {
         self.state_store.consume(state).await
     }
 
+    pub(crate) async fn store_state_for_session(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        session_id: Uuid,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.state_store
+            .store_for_session(csrf_token, state, session_id)
+            .await
+    }
+
+    pub(crate) async fn consume_state_for_session(
+        &self,
+        state: &OAuthState,
+        session_id: Uuid,
+    ) -> bool {
+        self.state_store
+            .consume_for_session(state, session_id)
+            .await
+    }
+
     async fn ensure_provider_exists(
         &self,
         db: Arc<dyn DBConnection + Send + Sync>,
@@ -468,6 +601,13 @@ pub trait OAuthProvider: Send + Sync + 'static {
         state: OAuthState,
     ) -> Result<(), OAuthStateCapacityError>;
     async fn consume_state(&self, state: &OAuthState) -> bool;
+    async fn store_state_for_session(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        session_id: Uuid,
+    ) -> Result<(), OAuthStateCapacityError>;
+    async fn consume_state_for_session(&self, state: &OAuthState, session_id: Uuid) -> bool;
     async fn build_client(
         &self,
         client_id: String,
@@ -518,6 +658,20 @@ impl OAuthProvider for GithubProvider {
         self.consume_state(state).await
     }
 
+    async fn store_state_for_session(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        session_id: Uuid,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.store_state_for_session(csrf_token, state, session_id)
+            .await
+    }
+
+    async fn consume_state_for_session(&self, state: &OAuthState, session_id: Uuid) -> bool {
+        self.consume_state_for_session(state, session_id).await
+    }
+
     async fn build_client(
         &self,
         client_id: String,
@@ -551,6 +705,20 @@ impl OAuthProvider for GoogleProvider {
         self.consume_state(state).await
     }
 
+    async fn store_state_for_session(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        session_id: Uuid,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.store_state_for_session(csrf_token, state, session_id)
+            .await
+    }
+
+    async fn consume_state_for_session(&self, state: &OAuthState, session_id: Uuid) -> bool {
+        self.consume_state_for_session(state, session_id).await
+    }
+
     async fn build_client(
         &self,
         client_id: String,
@@ -582,6 +750,20 @@ impl OAuthProvider for AppleProvider {
 
     async fn consume_state(&self, state: &OAuthState) -> bool {
         self.consume_state(state).await
+    }
+
+    async fn store_state_for_session(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        session_id: Uuid,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.store_state_for_session(csrf_token, state, session_id)
+            .await
+    }
+
+    async fn consume_state_for_session(&self, state: &OAuthState, session_id: Uuid) -> bool {
+        self.consume_state_for_session(state, session_id).await
     }
 
     async fn build_client(
@@ -714,6 +896,61 @@ mod tests {
 
         assert!(!store.consume_at(&mismatched, now).await);
         assert!(store.consume_at(&valid, now).await);
+    }
+
+    #[tokio::test]
+    async fn oauth_state_protocol_and_v2_session_binding_are_non_consuming_on_mismatch() {
+        let store = OAuthStateStore::with_limits(Duration::from_secs(60), 2);
+        let now = Instant::now();
+        let v2_state = state("v2-state", 1);
+        let initiating_session = Uuid::from_u128(10);
+        let other_session = Uuid::from_u128(11);
+
+        store
+            .store_with_binding(
+                &v2_state.csrf_token,
+                v2_state.clone(),
+                OAuthStateBinding::TransportV2(initiating_session),
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert!(!store.consume_at(&v2_state, now).await);
+        assert!(
+            !store
+                .consume_with_binding(
+                    &v2_state,
+                    OAuthStateBinding::TransportV2(other_session),
+                    now,
+                )
+                .await
+        );
+        assert!(
+            store
+                .consume_with_binding(
+                    &v2_state,
+                    OAuthStateBinding::TransportV2(initiating_session),
+                    now,
+                )
+                .await
+        );
+
+        let v1_state = state("v1-state", 2);
+        store
+            .store_at(&v1_state.csrf_token, v1_state.clone(), now)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .consume_with_binding(
+                    &v1_state,
+                    OAuthStateBinding::TransportV2(initiating_session),
+                    now,
+                )
+                .await
+        );
+        assert!(store.consume_at(&v1_state, now).await);
     }
 
     #[tokio::test]

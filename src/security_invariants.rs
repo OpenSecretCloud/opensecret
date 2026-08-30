@@ -681,8 +681,10 @@ fn oauth_login_uses_verified_project_scoped_subject_and_pre_token_unwrap() {
     let shared_oauth_body =
         extract_function_body(&contents, "async fn find_or_create_user_from_oauth");
     let authenticated_body = extract_function_body(&contents, "fn authenticated_oauth_user");
-    let apple_native_body =
+    let apple_native_handler =
         extract_function_body(&contents, "pub async fn handle_apple_native_signin");
+    let apple_native_body =
+        extract_function_body(&contents, "pub(crate) async fn apple_native_authenticate");
 
     for required_pattern in [
         "get_project_user_oauth_connection_by_provider_subject(",
@@ -713,14 +715,28 @@ fn oauth_login_uses_verified_project_scoped_subject_and_pre_token_unwrap() {
         "apple_provider.id",
         "&verified_user_id",
         "project.id",
-        "update_provider_connection(&app_state, &connection, &access_token)",
-        "authenticated_oauth_user(&app_state, user, \"apple\", &verified_user_id)",
+        "update_provider_connection(app_state, &connection, &access_token)",
+        "authenticated_oauth_user(app_state, user, \"apple\", &verified_user_id)",
     ] {
         assert!(
             apple_native_body.contains(required_pattern),
             "Apple native OAuth flow must contain `{required_pattern}`"
         );
     }
+
+    let authenticate = apple_native_handler
+        .find("apple_native_authenticate(")
+        .expect("Apple native v1 handler must authenticate before issuing tokens");
+    let issue_tokens = apple_native_handler
+        .find("oauth_callback_response(")
+        .expect("Apple native v1 handler must issue legacy tokens");
+    let encrypt = apple_native_handler
+        .find("encrypt_response(")
+        .expect("Apple native v1 handler must encrypt its token response");
+    assert!(
+        authenticate < issue_tokens && issue_tokens < encrypt,
+        "Apple native v1 handler must authenticate, issue legacy tokens, and then encrypt"
+    );
 }
 
 #[test]

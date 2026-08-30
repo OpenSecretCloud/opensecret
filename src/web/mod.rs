@@ -3,7 +3,7 @@ pub mod audio_utils;
 pub mod encryption_middleware;
 mod health_routes;
 pub mod login_routes;
-mod oauth_routes;
+pub(crate) mod oauth_routes;
 pub(crate) mod openai;
 pub mod openai_auth;
 pub mod platform;

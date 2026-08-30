@@ -15,12 +15,12 @@ use crate::GoogleProvider;
 use crate::{decrypt_with_key, private_key::generate_twelve_word_seed};
 use crate::{encrypt, DBError};
 use crate::{
-    jwt::{AuthContext, NewToken, TokenType},
+    jwt::{NewToken, TokenType},
     models::{
         project_settings::OAuthProviderSettings,
         users::{NewUser, User},
     },
-    ApiError, AppState,
+    ApiError, AppState, VerifiedUserAuthentication,
 };
 use axum::{
     extract::{Extension, State},
@@ -128,11 +128,6 @@ pub struct OAuthCallbackResponse {
     email: String,
     access_token: String,
     refresh_token: String,
-}
-
-struct AuthenticatedOAuthUser {
-    user: User,
-    auth_context: AuthContext,
 }
 
 #[derive(Deserialize, Clone)]
@@ -426,6 +421,16 @@ pub async fn initiate_oauth(
     Extension(session_id): Extension<TransportSession>,
     provider_name: &str,
 ) -> Result<Json<EncryptedResponse<OAuthOAuthCallbackResponse>>, ApiError> {
+    let response = initiate_oauth_data(&app_state, auth_request, provider_name, None).await?;
+    encrypt_response(&app_state, &session_id, &response).await
+}
+
+pub(crate) async fn initiate_oauth_data(
+    app_state: &Arc<AppState>,
+    auth_request: OAuthAuthRequest,
+    provider_name: &str,
+    v2_session_id: Option<Uuid>,
+) -> Result<OAuthOAuthCallbackResponse, ApiError> {
     // Get project
     let project = app_state
         .db
@@ -433,7 +438,7 @@ pub async fn initiate_oauth(
         .map_err(|_| ApiError::BadRequest)?;
 
     // Get OAuth client for this project
-    let oauth_client = get_project_oauth_client(&app_state, project.id, provider_name).await?;
+    let oauth_client = get_project_oauth_client(app_state, project.id, provider_name).await?;
 
     // Get the OAuth provider
     let oauth_provider = app_state
@@ -454,10 +459,19 @@ pub async fn initiate_oauth(
     };
 
     // Store the complete state in the provider
-    oauth_provider
-        .store_state(csrf_token.secret(), state.clone())
-        .await
-        .map_err(|_| ApiError::TooManyRequests)?;
+    match v2_session_id {
+        Some(session_id) => {
+            oauth_provider
+                .store_state_for_session(csrf_token.secret(), state.clone(), session_id)
+                .await
+        }
+        None => {
+            oauth_provider
+                .store_state(csrf_token.secret(), state.clone())
+                .await
+        }
+    }
+    .map_err(|_| ApiError::TooManyRequests)?;
 
     let state_json = serde_json::to_string(&state).map_err(|_| ApiError::InternalServerError)?;
     let state_base64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(state_json);
@@ -465,11 +479,10 @@ pub async fn initiate_oauth(
     // Replace the CSRF token in the URL with our encoded state
     let auth_url = initial_url.replace(csrf_token.secret(), &state_base64);
 
-    let response = OAuthOAuthCallbackResponse {
+    Ok(OAuthOAuthCallbackResponse {
         auth_url,
         state: state_base64,
-    };
-    encrypt_response(&app_state, &session_id, &response).await
+    })
 }
 
 pub async fn oauth_callback(
@@ -484,6 +497,18 @@ pub async fn oauth_callback(
     );
     debug!("Received state: {}", callback_request.state);
 
+    let authenticated_user =
+        oauth_callback_authenticate(&app_state, callback_request, provider_name, None).await?;
+    let auth_response = oauth_callback_response(&app_state, &authenticated_user)?;
+    encrypt_response(&app_state, &session_id, &auth_response).await
+}
+
+pub(crate) async fn oauth_callback_authenticate(
+    app_state: &Arc<AppState>,
+    callback_request: OAuthCallbackRequest,
+    provider_name: &str,
+    v2_session_id: Option<Uuid>,
+) -> Result<VerifiedUserAuthentication, ApiError> {
     // Decode and parse the state
     let state_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&callback_request.state)
@@ -509,7 +534,14 @@ pub async fn oauth_callback(
 
     // Validate and atomically consume the complete state so a successful match is one-time.
     // A mismatched state is left in the store for the legitimate callback.
-    let is_valid = oauth_provider.consume_state(&state).await;
+    let is_valid = match v2_session_id {
+        Some(session_id) => {
+            oauth_provider
+                .consume_state_for_session(&state, session_id)
+                .await
+        }
+        None => oauth_provider.consume_state(&state).await,
+    };
 
     if !is_valid {
         error!("Invalid state in {} callback", provider_name);
@@ -530,7 +562,7 @@ pub async fn oauth_callback(
         })?;
 
     // Get OAuth client for this project
-    let oauth_client = get_project_oauth_client(&app_state, project.id, provider_name).await?;
+    let oauth_client = get_project_oauth_client(app_state, project.id, provider_name).await?;
 
     // Exchange the code for an access token
     debug!(
@@ -785,7 +817,7 @@ pub async fn oauth_callback(
             };
 
             find_or_create_user_from_oauth(
-                &app_state,
+                app_state,
                 github_user.email.clone(),
                 github_user.id.to_string(),
                 "github",
@@ -814,7 +846,7 @@ pub async fn oauth_callback(
             };
 
             find_or_create_user_from_oauth(
-                &app_state,
+                app_state,
                 Some(google_user.email.clone()),
                 google_user.sub.clone(),
                 "google",
@@ -869,7 +901,7 @@ pub async fn oauth_callback(
             })?;
 
             // Verify the token just like we do for native sign-in
-            let apple_user = match fetch_apple_user(&app_state, &id_token, &client_id).await {
+            let apple_user = match fetch_apple_user(app_state, &id_token, &client_id).await {
                 Ok(user) => {
                     debug!("Successfully verified Apple ID token");
                     user
@@ -888,7 +920,7 @@ pub async fn oauth_callback(
                 .unwrap_or_else(|| "".to_string());
 
             find_or_create_user_from_oauth(
-                &app_state,
+                app_state,
                 apple_user.email.clone(),
                 sub,
                 "apple",
@@ -904,8 +936,7 @@ pub async fn oauth_callback(
         }
     };
 
-    let auth_response = oauth_callback_response(&app_state, &authenticated_user)?;
-    encrypt_response(&app_state, &session_id, &auth_response).await
+    Ok(authenticated_user)
 }
 
 async fn fetch_github_user(
@@ -1104,7 +1135,7 @@ fn authenticated_oauth_user(
     user: User,
     provider_name: &str,
     provider_user_id: &str,
-) -> Result<AuthenticatedOAuthUser, ApiError> {
+) -> Result<VerifiedUserAuthentication, ApiError> {
     let auth_context = app_state
         .oauth_auth_context_for_user(&user, provider_name, provider_user_id)
         .map_err(|e| {
@@ -1119,12 +1150,12 @@ fn authenticated_oauth_user(
             ApiError::Unauthorized
         })?;
 
-    Ok(AuthenticatedOAuthUser { user, auth_context })
+    Ok(VerifiedUserAuthentication { user, auth_context })
 }
 
 fn oauth_callback_response(
     app_state: &AppState,
-    authenticated_user: &AuthenticatedOAuthUser,
+    authenticated_user: &VerifiedUserAuthentication,
 ) -> Result<OAuthCallbackResponse, ApiError> {
     let access_token = NewToken::new_with_auth_context(
         &authenticated_user.user,
@@ -1167,7 +1198,7 @@ async fn find_or_create_user_from_oauth(
     access_token: String,
     user_name: Option<String>,
     project_id: i32,
-) -> Result<AuthenticatedOAuthUser, ApiError> {
+) -> Result<VerifiedUserAuthentication, ApiError> {
     let provider = app_state
         .db
         .get_oauth_provider_by_name(provider_name)
@@ -1285,6 +1316,15 @@ pub async fn handle_apple_native_signin(
 ) -> Result<Json<EncryptedResponse<OAuthCallbackResponse>>, ApiError> {
     debug!("Handling Apple native sign-in");
 
+    let authenticated_user = apple_native_authenticate(&app_state, request).await?;
+    let auth_response = oauth_callback_response(&app_state, &authenticated_user)?;
+    encrypt_response(&app_state, &session_id, &auth_response).await
+}
+
+pub(crate) async fn apple_native_authenticate(
+    app_state: &Arc<AppState>,
+    request: AppleNativeSignInRequest,
+) -> Result<VerifiedUserAuthentication, ApiError> {
     // Get project
     let project = app_state
         .db
@@ -1379,14 +1419,13 @@ pub async fn handle_apple_native_signin(
             return Err(ApiError::Unauthorized);
         }
 
-        update_provider_connection(&app_state, &connection, &access_token).await?;
+        update_provider_connection(app_state, &connection, &access_token).await?;
 
         let authenticated_user =
-            authenticated_oauth_user(&app_state, user, "apple", &verified_user_id)?;
-        let auth_response = oauth_callback_response(&app_state, &authenticated_user)?;
+            authenticated_oauth_user(app_state, user, "apple", &verified_user_id)?;
 
         debug!("Apple sign-in successful for existing user");
-        return encrypt_response(&app_state, &session_id, &auth_response).await;
+        return Ok(authenticated_user);
     }
 
     // If we get here, user doesn't exist - need to create new user
@@ -1441,7 +1480,7 @@ pub async fn handle_apple_native_signin(
 
     // Create the new user
     let authenticated_user = find_or_create_user_from_oauth(
-        &app_state,
+        app_state,
         Some(email),
         verified_user_id,
         "apple",
@@ -1451,10 +1490,8 @@ pub async fn handle_apple_native_signin(
     )
     .await?;
 
-    let auth_response = oauth_callback_response(&app_state, &authenticated_user)?;
-
     debug!("Apple native sign-in successful for new user");
-    encrypt_response(&app_state, &session_id, &auth_response).await
+    Ok(authenticated_user)
 }
 
 async fn update_provider_connection(

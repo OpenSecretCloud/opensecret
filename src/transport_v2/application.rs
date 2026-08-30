@@ -32,6 +32,10 @@ use crate::web::login_routes::{
     authenticate_login, logout_data, register_and_authenticate, verify_email_data, AuthResponse,
     Credentials, LogoutRequest, RefreshResponse, RegisterCredentials,
 };
+use crate::web::oauth_routes::{
+    apple_native_authenticate, initiate_oauth_data, oauth_callback_authenticate,
+    AppleNativeSignInRequest, OAuthAuthRequest, OAuthCallbackRequest,
+};
 use crate::web::openai::{
     openai_embeddings_v2_data, openai_model_catalog_data, openai_models_v2_data,
     openai_nonstream_chat_completion_v2_data, openai_transcription_v2_data, openai_tts_v2_data,
@@ -118,6 +122,10 @@ const MAX_V2_KV_LIST_ROWS: usize = 65_536;
 const MAX_V2_API_KEY_LIST_ROWS: usize = 65_536;
 const MAX_CONVERSATION_JSON_DEPTH: usize = 64;
 const MAX_CONVERSATION_JSON_STRUCTURAL_TOKENS: usize = 131_072;
+const MAX_OAUTH_STATE_BYTES: usize = 4 * 1024;
+const MAX_OAUTH_CODE_BYTES: usize = 16 * 1024;
+const MAX_APPLE_IDENTITY_TOKEN_BYTES: usize = 64 * 1024;
+const MAX_APPLE_OPTIONAL_FIELD_BYTES: usize = 4 * 1024;
 
 type SensitiveBytes = Zeroizing<Vec<u8>>;
 
@@ -146,6 +154,19 @@ pub(crate) enum UserOperation {
         credential: SensitiveBytes,
         cache_namespace_root: CacheNamespaceRoot,
     },
+    OAuthInitiate {
+        provider: OAuthProviderName,
+        body: SensitiveBytes,
+    },
+    OAuthCallback {
+        provider: OAuthProviderName,
+        body: SensitiveBytes,
+        cache_namespace_root: CacheNamespaceRoot,
+    },
+    AppleNativeOAuth {
+        body: SensitiveBytes,
+        cache_namespace_root: CacheNamespaceRoot,
+    },
     VerifyEmail {
         code: uuid::Uuid,
     },
@@ -164,6 +185,23 @@ pub(crate) enum UserOperation {
         authority: InferenceAuthority,
         operation: InferenceOperation,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OAuthProviderName {
+    Github,
+    Google,
+    Apple,
+}
+
+impl OAuthProviderName {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Github => "github",
+            Self::Google => "google",
+            Self::Apple => "apple",
+        }
+    }
 }
 
 pub(crate) enum InferenceOperation {
@@ -358,6 +396,8 @@ impl UserOperation {
             Self::Login { .. }
                 | Self::Register { .. }
                 | Self::Resume { .. }
+                | Self::OAuthCallback { .. }
+                | Self::AppleNativeOAuth { .. }
                 | Self::Inference {
                     authority: InferenceAuthority::AuthenticateApiKey { .. },
                     ..
@@ -366,7 +406,10 @@ impl UserOperation {
     }
 
     pub(crate) const fn requires_provider_output_reservation(&self) -> bool {
-        matches!(self, Self::Inference { .. })
+        matches!(
+            self,
+            Self::Inference { .. } | Self::OAuthCallback { .. } | Self::AppleNativeOAuth { .. }
+        )
     }
 
     pub(crate) const fn requires_stored_output_reservation(&self) -> bool {
@@ -716,6 +759,13 @@ pub(crate) fn prepare_user_operation(
         Login,
         Register,
         Resume,
+        GithubOAuthInitiate,
+        GithubOAuthCallback,
+        GoogleOAuthInitiate,
+        GoogleOAuthCallback,
+        AppleOAuthInitiate,
+        AppleOAuthCallback,
+        AppleNativeOAuth,
         VerifyEmail,
         GetUser,
         RequestVerification,
@@ -828,6 +878,13 @@ pub(crate) fn prepare_user_operation(
         (LogicalMethod::Post, "/login") => Some(Route::Login),
         (LogicalMethod::Post, "/register") => Some(Route::Register),
         (LogicalMethod::Post, "/refresh") => Some(Route::Resume),
+        (LogicalMethod::Post, "/auth/github") => Some(Route::GithubOAuthInitiate),
+        (LogicalMethod::Post, "/auth/github/callback") => Some(Route::GithubOAuthCallback),
+        (LogicalMethod::Post, "/auth/google") => Some(Route::GoogleOAuthInitiate),
+        (LogicalMethod::Post, "/auth/google/callback") => Some(Route::GoogleOAuthCallback),
+        (LogicalMethod::Post, "/auth/apple") => Some(Route::AppleOAuthInitiate),
+        (LogicalMethod::Post, "/auth/apple/callback") => Some(Route::AppleOAuthCallback),
+        (LogicalMethod::Post, "/auth/apple/native") => Some(Route::AppleNativeOAuth),
         (LogicalMethod::Get, _) if verification_code.is_some() => Some(Route::VerifyEmail),
         (LogicalMethod::Get, "/protected/user") => Some(Route::GetUser),
         (LogicalMethod::Post, "/protected/request_verification") => {
@@ -977,6 +1034,10 @@ pub(crate) fn prepare_user_operation(
             Route::Login
                 | Route::Register
                 | Route::Resume
+                | Route::GithubOAuthCallback
+                | Route::GoogleOAuthCallback
+                | Route::AppleOAuthCallback
+                | Route::AppleNativeOAuth
                 | Route::ModelCatalog
                 | Route::ChatCompletions
                 | Route::TextToSpeech
@@ -1054,6 +1115,123 @@ pub(crate) fn prepare_user_operation(
                 credential: Zeroizing::new(value_base64.into_bytes()),
                 cache_namespace_root,
             })
+        }
+        Route::GithubOAuthInitiate | Route::GoogleOAuthInitiate | Route::AppleOAuthInitiate => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            match authority {
+                AuthorityState::Anonymous => {}
+                AuthorityState::Bound(_) => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::AlreadyBound,
+                    ));
+                }
+                AuthorityState::Authenticating(_) => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::AuthenticationInProgress,
+                    ));
+                }
+                AuthorityState::Closing => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::Closing,
+                    ));
+                }
+            }
+            let provider = match route {
+                Route::GithubOAuthInitiate => OAuthProviderName::Github,
+                Route::GoogleOAuthInitiate => OAuthProviderName::Google,
+                Route::AppleOAuthInitiate => OAuthProviderName::Apple,
+                _ => unreachable!("OAuth initiation route group is exhaustive"),
+            };
+            OperationPreparation::Ready(UserOperation::OAuthInitiate {
+                provider,
+                body: Zeroizing::new(
+                    request
+                        .body_base64
+                        .expect("validated OAuth initiation body")
+                        .into_bytes(),
+                ),
+            })
+        }
+        Route::GithubOAuthCallback
+        | Route::GoogleOAuthCallback
+        | Route::AppleOAuthCallback
+        | Route::AppleNativeOAuth => {
+            if credential.is_some()
+                || request.query.is_some()
+                || !has_exact_json_content_type(&request.headers)
+                || request
+                    .body_base64
+                    .as_ref()
+                    .is_none_or(EncodedBytes::is_empty)
+            {
+                return rejected_bad_request();
+            }
+            match authority {
+                AuthorityState::Anonymous => {}
+                AuthorityState::Bound(_) => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::AlreadyBound,
+                    ));
+                }
+                AuthorityState::Authenticating(_) => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::AuthenticationInProgress,
+                    ));
+                }
+                AuthorityState::Closing => {
+                    return OperationPreparation::Rejected(authentication_start_error(
+                        AuthenticationStartError::Closing,
+                    ));
+                }
+            }
+            let Some(cache_namespace_root) = cache_namespace_root_base64 else {
+                return rejected_bad_request();
+            };
+            let body = Zeroizing::new(
+                request
+                    .body_base64
+                    .expect("validated OAuth callback body")
+                    .into_bytes(),
+            );
+            match route {
+                Route::GithubOAuthCallback => {
+                    OperationPreparation::Ready(UserOperation::OAuthCallback {
+                        provider: OAuthProviderName::Github,
+                        body,
+                        cache_namespace_root,
+                    })
+                }
+                Route::GoogleOAuthCallback => {
+                    OperationPreparation::Ready(UserOperation::OAuthCallback {
+                        provider: OAuthProviderName::Google,
+                        body,
+                        cache_namespace_root,
+                    })
+                }
+                Route::AppleOAuthCallback => {
+                    OperationPreparation::Ready(UserOperation::OAuthCallback {
+                        provider: OAuthProviderName::Apple,
+                        body,
+                        cache_namespace_root,
+                    })
+                }
+                Route::AppleNativeOAuth => {
+                    OperationPreparation::Ready(UserOperation::AppleNativeOAuth {
+                        body,
+                        cache_namespace_root,
+                    })
+                }
+                _ => unreachable!("OAuth callback route group is exhaustive"),
+            }
         }
         Route::VerifyEmail => {
             if credential.is_some()
@@ -2048,6 +2226,84 @@ pub(crate) async fn execute_user_operation(
                 authentication.expect("resumption requires authentication reservation"),
                 monotonic_now,
                 UserAuthResponseKind::Refresh,
+                cache_namespace_root,
+            )
+        }
+        UserOperation::OAuthInitiate { provider, body } => {
+            debug_assert!(authentication.is_none());
+            let request = match parse_provider_json_body::<OAuthAuthRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            let response = match initiate_oauth_data(
+                &app_state,
+                request,
+                provider.as_str(),
+                Some(lease.state().session_id()),
+            )
+            .await
+            .and_then(|value| LogicalUnaryResponse::json(StatusCode::OK, &value))
+            {
+                Ok(response) => response,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            ApplicationOutcome::success(response, SessionEffect::Retain)
+        }
+        UserOperation::OAuthCallback {
+            provider,
+            body,
+            cache_namespace_root,
+        } => {
+            let request = match parse_provider_json_body::<OAuthCallbackRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if let Err(error) = validate_oauth_callback_request(&request) {
+                return ApplicationOutcome::error(error);
+            }
+            let verified = match oauth_callback_authenticate(
+                &app_state,
+                request,
+                provider.as_str(),
+                Some(lease.state().session_id()),
+            )
+            .await
+            {
+                Ok(verified) => verified,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            finish_user_binding(
+                &app_state,
+                &lease,
+                verified,
+                authentication.expect("OAuth callback requires authentication reservation"),
+                monotonic_now,
+                UserAuthResponseKind::Login,
+                cache_namespace_root,
+            )
+        }
+        UserOperation::AppleNativeOAuth {
+            body,
+            cache_namespace_root,
+        } => {
+            let request = match parse_provider_json_body::<AppleNativeSignInRequest>(body) {
+                Ok(request) => request,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            if let Err(error) = validate_apple_native_request(&request) {
+                return ApplicationOutcome::error(error);
+            }
+            let verified = match apple_native_authenticate(&app_state, request).await {
+                Ok(verified) => verified,
+                Err(error) => return ApplicationOutcome::error(error),
+            };
+            finish_user_binding(
+                &app_state,
+                &lease,
+                verified,
+                authentication.expect("Apple native OAuth requires authentication reservation"),
+                monotonic_now,
+                UserAuthResponseKind::Login,
                 cache_namespace_root,
             )
         }
@@ -4045,6 +4301,36 @@ fn parse_provider_json_body<T: DeserializeOwned>(body: SensitiveBytes) -> Result
         Err(JsonShapeError::TooLarge) => Err(ApiError::PayloadTooLarge),
         Err(JsonShapeError::Malformed) => Err(ApiError::BadRequest),
     }
+}
+
+fn validate_oauth_callback_request(request: &OAuthCallbackRequest) -> Result<(), ApiError> {
+    if request.code.is_empty() || request.state.is_empty() {
+        return Err(ApiError::BadRequest);
+    }
+    if request.code.len() > MAX_OAUTH_CODE_BYTES || request.state.len() > MAX_OAUTH_STATE_BYTES {
+        return Err(ApiError::PayloadTooLarge);
+    }
+    Ok(())
+}
+
+fn validate_apple_native_request(request: &AppleNativeSignInRequest) -> Result<(), ApiError> {
+    let oversized_optional_field = [
+        request.user_identifier.as_deref(),
+        request.email.as_deref(),
+        request.given_name.as_deref(),
+        request.family_name.as_deref(),
+        request.nonce.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|value| value.len() > MAX_APPLE_OPTIONAL_FIELD_BYTES);
+    if request.identity_token.is_empty() {
+        return Err(ApiError::BadRequest);
+    }
+    if request.identity_token.len() > MAX_APPLE_IDENTITY_TOKEN_BYTES || oversized_optional_field {
+        return Err(ApiError::PayloadTooLarge);
+    }
+    Ok(())
 }
 
 fn parse_logical_query<T: DeserializeOwned>(query: Option<String>) -> Result<T, ApiError> {
@@ -6635,6 +6921,204 @@ mod tests {
             OperationPreparation::Unsupported => panic!("expected a classified rejection"),
             OperationPreparation::Ready(_) => panic!("expected the request to be rejected"),
         }
+    }
+
+    fn oauth_envelope(path: &str, body: &[u8], with_cache_root: bool) -> RequestEnvelope {
+        let mut request = envelope(LogicalMethod::Post, path, json_header(), Some(body), None);
+        if with_cache_root {
+            request.cache_namespace_root_base64 = Some(CacheNamespaceRoot::from_bytes([0xa5; 32]));
+        }
+        request
+    }
+
+    #[test]
+    fn exact_seven_route_oauth_matrix_is_session_bound_at_callback() {
+        let initiate_body =
+            br#"{"client_id":"00000000-0000-0000-0000-000000000000","invite_code":"ignored"}"#;
+        for (path, expected_provider) in [
+            ("/auth/github", OAuthProviderName::Github),
+            ("/auth/google", OAuthProviderName::Google),
+            ("/auth/apple", OAuthProviderName::Apple),
+        ] {
+            let OperationPreparation::Ready(operation) = prepare_user_operation(
+                oauth_envelope(path, initiate_body, false),
+                AuthorityState::Anonymous,
+            ) else {
+                panic!("OAuth initiation route {path} must be admitted");
+            };
+            assert!(matches!(
+                &operation,
+                UserOperation::OAuthInitiate { provider, .. }
+                    if *provider == expected_provider
+            ));
+            assert!(!operation.requires_authentication_transition());
+            assert!(!operation.requires_provider_output_reservation());
+        }
+
+        let callback_body = br#"{"code":"code","state":"state"}"#;
+        for (path, expected_provider) in [
+            ("/auth/github/callback", OAuthProviderName::Github),
+            ("/auth/google/callback", OAuthProviderName::Google),
+            ("/auth/apple/callback", OAuthProviderName::Apple),
+        ] {
+            let OperationPreparation::Ready(operation) = prepare_user_operation(
+                oauth_envelope(path, callback_body, true),
+                AuthorityState::Anonymous,
+            ) else {
+                panic!("OAuth callback route {path} must be admitted");
+            };
+            assert!(matches!(
+                &operation,
+                UserOperation::OAuthCallback { provider, .. }
+                    if *provider == expected_provider
+            ));
+            assert!(operation.requires_authentication_transition());
+            assert!(operation.requires_provider_output_reservation());
+        }
+
+        let native_body =
+            br#"{"identity_token":"token","client_id":"00000000-0000-0000-0000-000000000000"}"#;
+        let OperationPreparation::Ready(operation) = prepare_user_operation(
+            oauth_envelope("/auth/apple/native", native_body, true),
+            AuthorityState::Anonymous,
+        ) else {
+            panic!("Apple native OAuth route must be admitted");
+        };
+        assert!(matches!(&operation, UserOperation::AppleNativeOAuth { .. }));
+        assert!(operation.requires_authentication_transition());
+        assert!(operation.requires_provider_output_reservation());
+
+        assert!(serde_json::from_slice::<OAuthAuthRequest>(initiate_body).is_ok());
+    }
+
+    #[test]
+    fn oauth_projection_rejects_transplants_and_noncanonical_shapes() {
+        let callback_body = br#"{"code":"code","state":"state"}"#;
+        let initiation_body = br#"{"client_id":"00000000-0000-0000-0000-000000000000"}"#;
+
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                oauth_envelope("/auth/github/callback", callback_body, false),
+                AuthorityState::Anonymous,
+            )),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                oauth_envelope("/auth/github", initiation_body, true),
+                AuthorityState::Anonymous,
+            )),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                oauth_envelope("/auth/github", initiation_body, false),
+                bound_user_authority(),
+            )),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                oauth_envelope("/auth/github/callback", callback_body, true),
+                bound_user_authority(),
+            )),
+            StatusCode::CONFLICT
+        );
+
+        let mut with_query = oauth_envelope("/auth/google/callback", callback_body, true);
+        with_query.request.query = Some("next=elsewhere".to_owned());
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                with_query,
+                AuthorityState::Anonymous
+            )),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut with_credential = oauth_envelope("/auth/apple/native", callback_body, true);
+        with_credential.credential = Some(Credential::Resumption {
+            value_base64: EncodedBytes::from_bytes(b"copied".to_vec()),
+        });
+        assert_eq!(
+            rejected_status(prepare_user_operation(
+                with_credential,
+                AuthorityState::Anonymous
+            )),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut streaming = oauth_envelope("/auth/apple/callback", callback_body, true);
+        streaming.response_mode = ResponseMode::Stream;
+        assert_eq!(
+            rejected_status(prepare_user_operation(streaming, AuthorityState::Anonymous)),
+            StatusCode::BAD_REQUEST
+        );
+
+        let trailing_slash = oauth_envelope("/auth/github/", initiation_body, false);
+        assert!(matches!(
+            prepare_user_operation(trailing_slash, AuthorityState::Anonymous),
+            OperationPreparation::Unsupported
+        ));
+        let wrong_method = envelope(LogicalMethod::Get, "/auth/github", Vec::new(), None, None);
+        assert!(matches!(
+            prepare_user_operation(wrong_method, AuthorityState::Anonymous),
+            OperationPreparation::Unsupported
+        ));
+    }
+
+    #[test]
+    fn oauth_callback_controlled_fields_are_bounded_before_provider_work() {
+        let valid_callback = OAuthCallbackRequest {
+            code: "code".to_owned(),
+            state: "state".to_owned(),
+        };
+        assert!(validate_oauth_callback_request(&valid_callback).is_ok());
+        assert!(matches!(
+            validate_oauth_callback_request(&OAuthCallbackRequest {
+                code: String::new(),
+                state: "state".to_owned(),
+            }),
+            Err(ApiError::BadRequest)
+        ));
+        assert!(matches!(
+            validate_oauth_callback_request(&OAuthCallbackRequest {
+                code: "code".to_owned(),
+                state: "s".repeat(MAX_OAUTH_STATE_BYTES + 1),
+            }),
+            Err(ApiError::PayloadTooLarge)
+        ));
+
+        let valid_native = AppleNativeSignInRequest {
+            identity_token: "token".to_owned(),
+            user_identifier: None,
+            email: None,
+            given_name: None,
+            family_name: None,
+            client_id: uuid::Uuid::nil(),
+            nonce: None,
+        };
+        assert!(validate_apple_native_request(&valid_native).is_ok());
+        assert!(matches!(
+            validate_apple_native_request(&AppleNativeSignInRequest {
+                identity_token: String::new(),
+                ..valid_native.clone()
+            }),
+            Err(ApiError::BadRequest)
+        ));
+        assert!(matches!(
+            validate_apple_native_request(&AppleNativeSignInRequest {
+                identity_token: "t".repeat(MAX_APPLE_IDENTITY_TOKEN_BYTES + 1),
+                ..valid_native.clone()
+            }),
+            Err(ApiError::PayloadTooLarge)
+        ));
+        assert!(matches!(
+            validate_apple_native_request(&AppleNativeSignInRequest {
+                nonce: Some("n".repeat(MAX_APPLE_OPTIONAL_FIELD_BYTES + 1)),
+                ..valid_native
+            }),
+            Err(ApiError::PayloadTooLarge)
+        ));
     }
 
     #[test]

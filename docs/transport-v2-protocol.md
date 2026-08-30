@@ -487,7 +487,52 @@ client while preventing the parent/operator, which sees neither the root
 plaintext nor the enclave-held derivation result, from computing it from a
 UUID.
 
-### 8.5 Unary inference projection
+### 8.5 Session-bound user OAuth
+
+Transport v2 admits exactly seven user OAuth operations:
+
+| Logical operation | Authority before request | Cache namespace root | Success effect |
+| --- | --- | --- | --- |
+| `POST /auth/github` | anonymous | null | retain anonymous session |
+| `POST /auth/google` | anonymous | null | retain anonymous session |
+| `POST /auth/apple` | anonymous | null | retain anonymous session |
+| `POST /auth/github/callback` | anonymous | required | bind verified user |
+| `POST /auth/google/callback` | anonymous | required | bind verified user |
+| `POST /auth/apple/callback` | anonymous | required | bind verified user |
+| `POST /auth/apple/native` | anonymous | required | bind verified user |
+
+Every operation is unary, carries one non-empty JSON body, and rejects logical
+query fields, generic credentials, or additional logical headers. Initiation
+accepts the existing `{client_id}` shape; existing ignored SDK compatibility
+fields remain tolerated by the application decoder. Callback and native
+success use the same transport-v2 token issuance and immutable user-binding
+path as password login. V2 applies bounded JSON-shape and credential-field
+limits before decoding state or calling an external provider, and callback or
+native operations reserve provider-output working-set capacity before replay
+claim or dispatch.
+
+The public OAuth `state` encoding remains compatible. Its server-side entry is
+additionally tagged as either `LegacyV1` or `TransportV2(session_id)`. A v2
+callback must match both the stored state and the exact attested session that
+initiated the redirect. A v1 callback, or a callback on another v2 session,
+fails without consuming the legitimate continuation. Successful matching is
+still atomic and one-time.
+
+The gateway reserves the anonymous session's authentication transition before
+callback state consumption, provider exchange, or database work. A failed
+callback releases that reservation back to anonymous. A verified callback
+commits the user authority only after its complete logical success response has
+been constructed. The gateway then encrypts it through the same held session
+lease that authenticated the callback request; encryption failure closes the
+newly bound session through the normal gateway rule.
+
+OAuth transport keys are never moved between clients. If the initiating v2
+session is lost or expires while the browser is away, the client establishes a
+new anonymous session and restarts OAuth. It cannot replay the old callback on
+the replacement session. Transport-v1 state storage, callbacks, token issuance,
+and encrypted-body routes retain their existing behavior during migration.
+
+### 8.6 Unary inference projection
 
 The initial unary-inference layer admits exactly these logical operations:
 
@@ -757,7 +802,7 @@ capability PRs. Each PR targets the branch immediately below it:
 8. **Conversations, items, and stored response control**: bounded encrypted
    storage operations and response cancellation/deletion.
 9. **Unary providers and API-key binding**: the exact unary route table in
-   section 8.5, one-time encrypted API-key authority transition, live key-owner
+   section 8.6, one-time encrypted API-key authority transition, live key-owner
    revalidation, and client-random Tinfoil cache namespaces.
 10. **Session-bound user OAuth**: bind OAuth continuation to its originating
     v2 session without exposing credentials outside ciphertext.

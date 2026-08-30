@@ -839,6 +839,8 @@ async fn db_account_deletion_confirmation_preserves_failures_and_completed_audit
     let confirmation_code = Uuid::new_v4();
     let sibling_code = Uuid::new_v4();
     let plaintext_secret = format!("deletion-secret-{}", Uuid::new_v4());
+    let sibling_secret = format!("sibling-deletion-secret-{}", Uuid::new_v4());
+    let invalid_secret = format!("invalid-deletion-secret-{}", Uuid::new_v4());
     let enclave_key = SecretKey::from_slice(&app_state.enclave_key)
         .expect("test enclave key must be a valid secp256k1 secret");
     let selected = app_state
@@ -856,7 +858,7 @@ async fn db_account_deletion_confirmation_preserves_failures_and_completed_audit
         .create_account_deletion_request(NewAccountDeletionRequest::new(
             user.uuid,
             project.id,
-            generate_reset_hash("sibling-secret".to_owned()),
+            generate_reset_hash(sibling_secret),
             encrypt_key_deterministic(&enclave_key, sibling_code.as_bytes()),
             24,
         ))
@@ -878,7 +880,7 @@ async fn db_account_deletion_confirmation_preserves_failures_and_completed_audit
         &user,
         crate::web::protected_routes::ConfirmAccountDeletionRequest {
             confirmation_code: confirmation_code.to_string(),
-            plaintext_secret: "wrong-secret".to_owned(),
+            plaintext_secret: invalid_secret,
         },
     )
     .await;

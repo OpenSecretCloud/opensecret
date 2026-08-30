@@ -582,7 +582,7 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         true,
         false,
         50,
-        384_000,
+        256_000,
     ),
     ModelConfigEntry::new(
         DEEPSEEK_V4_FLASH_MODEL_ID,
@@ -849,7 +849,7 @@ mod tests {
         assert_eq!(model_context_window("gpt-oss-safeguard-120b"), 131_000);
         assert_eq!(model_context_window("kimi-k2-6"), 256_000);
         assert_eq!(model_context_window("gemma4-31b"), 256_000);
-        assert_eq!(model_context_window("glm-5-2"), 384_000);
+        assert_eq!(model_context_window("glm-5-2"), 256_000);
         assert_eq!(model_context_window("kimi-k3"), 256_000);
         assert_eq!(model_context_window("deepseek-v4-flash"), 800_000);
         assert_eq!(model_context_window(AUTO_QUICK_MODEL_ID), 128_000);

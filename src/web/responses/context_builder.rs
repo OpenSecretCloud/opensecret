@@ -1002,6 +1002,11 @@ fn normalize_tool_call_ids_for_kimi(messages: &mut [Value]) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_glm_5_2_prompt_budget_reserves_response_and_safety_tokens() {
+        assert_eq!(prompt_token_budget("glm-5-2"), 256_000 - 4096 - 500);
+    }
+
     // Helper to create a ChatMsg
     fn create_chat_msg(role: &'static str, content: &str, tokens: Option<usize>) -> ChatMsg {
         use crate::web::responses::MessageContent;

@@ -1426,7 +1426,7 @@ mod tests {
         let master = SessionMaster::from_bytes(master_bytes);
         let client_keys = DirectionalKeys::derive(&master).unwrap();
         let encrypted = client_keys
-            .encrypt_request_record_with_nonce(&session_id, &plaintext, [0x53; 12])
+            .encrypt_request_record(&session_id, &plaintext)
             .unwrap();
         let dispatches = Arc::new(AtomicUsize::new(0));
 
@@ -1529,7 +1529,7 @@ mod tests {
         let invalid_plaintext =
             serde_json::to_vec(&get_user_envelope(request_id, Some(Vec::new()))).unwrap();
         let invalid_encrypted = client_keys
-            .encrypt_request_record_with_nonce(&session_id, &invalid_plaintext, [0x66; 12])
+            .encrypt_request_record(&session_id, &invalid_plaintext)
             .unwrap();
         let (lease, envelope) = state
             .decrypt_request_envelope(session_id, &invalid_encrypted, now)
@@ -1549,7 +1549,7 @@ mod tests {
 
         let valid_plaintext = serde_json::to_vec(&get_user_envelope(request_id, None)).unwrap();
         let valid_encrypted = client_keys
-            .encrypt_request_record_with_nonce(&session_id, &valid_plaintext, [0x67; 12])
+            .encrypt_request_record(&session_id, &valid_plaintext)
             .unwrap();
         let (lease, envelope) = state
             .decrypt_request_envelope(session_id, &valid_encrypted, now)

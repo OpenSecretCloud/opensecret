@@ -7,9 +7,8 @@ use crate::{
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
     jwt::AuthContext,
     model_config::{
-        model_alias_requires_flag_lookup, model_config, model_reasoning_history_strategy,
-        resolve_public_model_id, ModelAliasTargets, ModelPlan, ReasoningHistoryStrategy,
-        ResponsesModelConfig, SamplingConfig,
+        model_config, model_reasoning_history_strategy, resolve_public_model_id, ModelAliasTargets,
+        ModelPlan, ReasoningHistoryStrategy, ResponsesModelConfig, SamplingConfig,
     },
     models::responses::{
         NewToolCall, NewToolOutput, NewUserMessage, ResponseStatus, ResponsesError,
@@ -417,7 +416,6 @@ mod tests {
     use axum::{routing::get, Json, Router};
     use chrono::{TimeZone, Utc};
     use serde_json::json;
-    use std::collections::HashMap;
     use tokio::{
         net::TcpListener,
         sync::{broadcast, mpsc},
@@ -957,17 +955,15 @@ mod tests {
             &[json!({"role": "user", "content": "hello"})],
             false,
         );
+        assert_eq!(auto_request["model"], crate::model_config::GLM_5_2_MODEL_ID);
         assert_eq!(
-            auto_request["chat_template_kwargs"]["preserve_thinking"],
-            true
+            auto_request["chat_template_kwargs"]["clear_thinking"],
+            false
         );
+        assert!(auto_request["chat_template_kwargs"]
+            .get("preserve_thinking")
+            .is_none());
 
-        let overrides =
-            crate::model_config::PaidModelAliasOverrides::from_flag_values(&HashMap::from([(
-                crate::os_flags::PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY.to_string(),
-                true,
-            )]));
-        let targets = ModelAliasTargets::for_plan_with_overrides(ModelPlan::Paid, overrides);
         let paid_quick =
             responses_request_for_model(targets.resolve(crate::model_config::AUTO_QUICK_MODEL_ID));
         let paid_quick_request = build_model_turn_request(
@@ -980,26 +976,6 @@ mod tests {
             crate::model_config::DEEPSEEK_V4_FLASH_MODEL_ID
         );
         assert!(paid_quick_request.get("chat_template_kwargs").is_none());
-
-        let paid_powerful = responses_request_for_model(
-            targets.resolve(crate::model_config::AUTO_POWERFUL_MODEL_ID),
-        );
-        let paid_powerful_request = build_model_turn_request(
-            &paid_powerful,
-            &[json!({"role": "user", "content": "hello"})],
-            false,
-        );
-        assert_eq!(
-            paid_powerful_request["model"],
-            crate::model_config::KIMI_K3_MODEL_ID
-        );
-        assert_eq!(
-            paid_powerful_request["chat_template_kwargs"]["preserve_thinking"],
-            true
-        );
-        assert!(paid_powerful_request["chat_template_kwargs"]
-            .get("clear_thinking")
-            .is_none());
     }
 
     #[test]
@@ -3800,11 +3776,7 @@ async fn create_response_stream(
         );
         return Err(ApiError::Unauthorized);
     }
-    let alias_targets = if model_alias_requires_flag_lookup(&requested_model) {
-        state.model_alias_targets(user.uuid, model_plan).await
-    } else {
-        ModelAliasTargets::for_plan(model_plan)
-    };
+    let alias_targets = ModelAliasTargets::for_plan(model_plan);
     let selected_model = alias_targets.resolve(&requested_model).to_string();
     let completion_provider = state.proxy_router.get_completion_proxy();
     let resolved_model = resolve_responses_model(

@@ -468,6 +468,12 @@ mod tests {
             Some(GLM_5_2_CONTINUUM_FLAG_KEY)
         );
         assert_eq!(
+            router.continuum_flag_key_for_completion_model(
+                crate::model_config::AUTO_POWERFUL_MODEL_ID
+            ),
+            Some(GLM_5_2_CONTINUUM_FLAG_KEY)
+        );
+        assert_eq!(
             router.continuum_flag_key_for_completion_model("kimi-k2-6"),
             None
         );
@@ -572,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_powerful_uses_kimi_route_table() {
+    fn test_auto_powerful_uses_glm_route_table() {
         let router = ProviderRouter::default();
         let proxy_router = proxy_router_with_both_providers();
 
@@ -584,10 +590,15 @@ mod tests {
             )
             .expect("route");
 
-        assert_eq!(selected.proxy.provider_name, "continuum");
-        assert_eq!(selected.public_model_id, "kimi-k2-6");
-        assert_eq!(selected.provider_model_id, "kimi-k2.6");
-        assert_eq!(selected.response_model_id, "kimi-k2-6");
+        assert_eq!(selected.proxy.provider_name, "tinfoil");
+        assert_eq!(selected.public_model_id, GLM_5_2_MODEL_ID);
+        assert_eq!(selected.provider_model_id, GLM_5_2_MODEL_ID);
+        assert_eq!(selected.response_model_id, GLM_5_2_MODEL_ID);
+        assert_eq!(selected.bucket, None);
+        assert_eq!(
+            selected.selection_source,
+            ProviderSelectionSource::DefaultProvider
+        );
     }
 
     #[test]

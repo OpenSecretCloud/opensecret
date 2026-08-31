@@ -11,7 +11,6 @@ use crate::encrypt::{
 };
 use crate::jwt::validate_platform_jwt;
 use crate::login_routes::RegisterCredentials;
-use crate::model_config::{ModelAliasTargets, ModelPlan, PaidModelAliasOverrides};
 use crate::models::account_deletion::{AccountDeletionError, NewAccountDeletionRequest};
 use crate::models::email_verification::{EmailVerificationError, NewEmailVerification};
 use crate::models::oauth::{NewUserOAuthConnection, OAuthError};
@@ -149,7 +148,6 @@ const BILLING_SERVER_URL_NAME: &str = "billing_server_url";
 const KAGI_API_KEY_NAME: &str = "kagi_api_key";
 const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
 const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
-const MODEL_ALIAS_FLAGS_TIMEOUT_SECS: u64 = 5;
 const PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS: u64 = 5;
 const BILLING_ACCESS_TIMEOUT_SECS: u64 = 5;
 const MAX_ATTESTATION_NONCE_BYTES: usize = 512;
@@ -1250,52 +1248,6 @@ impl AppState {
                 None
             }
         }
-    }
-
-    /// Resolve the automatic model aliases for this user's plan. The paid alias
-    /// override defaults off on missing configuration, a missing flag, service
-    /// failure, or timeout. Free plans never apply the override.
-    pub(crate) async fn model_alias_targets(
-        &self,
-        user_uuid: Uuid,
-        model_plan: ModelPlan,
-    ) -> ModelAliasTargets {
-        if !model_plan.is_paid() {
-            return ModelAliasTargets::for_plan(model_plan);
-        }
-
-        let Some(client) = &self.os_flags_client else {
-            trace!(
-                "os-flags client not configured; using default paid model aliases (user_uuid={})",
-                user_uuid
-            );
-            return ModelAliasTargets::for_plan(model_plan);
-        };
-
-        let overrides = match tokio::time::timeout(
-            Duration::from_secs(MODEL_ALIAS_FLAGS_TIMEOUT_SECS),
-            client.get_user_flags(user_uuid, Some(os_flags::PAID_MODEL_ALIAS_FLAG_KEYS)),
-        )
-        .await
-        {
-            Ok(Ok(response)) => PaidModelAliasOverrides::from_flag_values(&response.flags),
-            Ok(Err(e)) => {
-                warn!(
-                    "os-flags paid model alias check failed (user_uuid={}): {}; using default aliases",
-                    user_uuid, e
-                );
-                PaidModelAliasOverrides::default()
-            }
-            Err(_) => {
-                warn!(
-                    "os-flags paid model alias check timed out after {}s (user_uuid={}); using default aliases",
-                    MODEL_ALIAS_FLAGS_TIMEOUT_SECS, user_uuid
-                );
-                PaidModelAliasOverrides::default()
-            }
-        };
-
-        ModelAliasTargets::for_plan_with_overrides(model_plan, overrides)
     }
 
     fn password_login_identifier_for_user(user: &User) -> (PasswordLoginIdentifierKind, String) {

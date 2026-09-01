@@ -476,6 +476,7 @@
                 (baseName != ".env" && baseName != ".env.sample") &&
                 (
                   (builtins.elem "src" parts) ||
+                  (builtins.elem "testdata" parts) ||
                   (type == "regular" && (
                     baseName == "Cargo.toml" ||
                     baseName == "Cargo.lock" ||

@@ -2,9 +2,7 @@ use crate::inference::health::{
     ShadowDisposition, ShadowHealthState, ShadowObservationMode, ShadowObservationReport,
     ShadowRouteSnapshot, MIN_CAPACITY_COOLDOWN,
 };
-use crate::inference::{
-    AttemptTerminal, InferenceIntent, ModelSelectionMode, RouteIdentity, RouteKey,
-};
+use crate::inference::{AttemptTerminal, InferenceIntent, RouteIdentity, RouteKey};
 use crate::inference_planning::{
     plan_completion_route, ConfiguredProviders, ProviderPreference, RoutePlan, RoutePlanningError,
     RoutePlanningInput,
@@ -329,27 +327,16 @@ impl ProviderRouter {
 
     /// Selects the route used by a newly prepared logical request.
     ///
-    /// Stack 6 activates health filtering only for explicit GLM 5.3 requests.
-    /// Auto aliases and every other public model deliberately retain the legacy
-    /// route decision until their own rollout stack.
+    /// Health filters every configured route for the already-resolved public
+    /// model. It may select another provider for that same model, but it never
+    /// substitutes a different public model.
     pub(crate) fn select_active_completion_route(
         &self,
         proxy_router: &ProxyRouter,
         intent: &InferenceIntent,
         provider_preference: Option<ProviderPreference>,
     ) -> Result<SelectedProviderRoute, ProviderRoutingError> {
-        if intent.selection_mode == ModelSelectionMode::Explicit
-            && intent.public_model_id == GLM_5_3_MODEL_ID
-        {
-            return self.select_glm_canary_route(proxy_router, intent, provider_preference);
-        }
-
-        self.select_completion_route_with_preference(
-            proxy_router,
-            intent.account_uuid,
-            &intent.public_model_id,
-            provider_preference,
-        )
+        self.select_health_aware_route(proxy_router, intent, provider_preference)
     }
 
     pub(crate) fn shadow_completion_plan(
@@ -379,7 +366,7 @@ impl ProviderRouter {
         )
     }
 
-    fn select_glm_canary_route(
+    fn select_health_aware_route(
         &self,
         proxy_router: &ProxyRouter,
         intent: &InferenceIntent,
@@ -977,6 +964,49 @@ mod tests {
     }
 
     #[test]
+    fn router_v2_gate_is_the_only_all_model_health_activation_boundary() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+        let intent = intent(KIMI_K3_MODEL_ID, KIMI_K3_MODEL_ID);
+
+        router.observe_attempt_terminal(
+            &capacity_terminal(
+                ProviderId::Tinfoil,
+                KIMI_K3_MODEL_ID,
+                KIMI_K3_MODEL_ID,
+                429,
+                Duration::from_secs(60),
+            ),
+            ShadowObservationMode::Update,
+        );
+
+        let legacy = router
+            .select_completion_route_for_mode(
+                &proxy_router,
+                &intent,
+                None,
+                InferenceRoutingMode::Legacy,
+            )
+            .expect("legacy Kimi K3 route ignores Router v2 health");
+        let v2 = router
+            .select_completion_route_for_mode(
+                &proxy_router,
+                &intent,
+                None,
+                InferenceRoutingMode::V2,
+            )
+            .expect_err("Router v2 refuses to substitute another public model");
+
+        assert_eq!(legacy.provider, ProviderId::Tinfoil);
+        assert_eq!(legacy.public_model_id, KIMI_K3_MODEL_ID);
+        assert!(matches!(
+            v2,
+            ProviderRoutingError::CapacityUnavailable { model, .. }
+                if model == KIMI_K3_MODEL_ID
+        ));
+    }
+
+    #[test]
     fn test_golden_completion_route_matrix_by_selector_plan_and_provider_preference() {
         #[derive(Clone, Copy)]
         struct Case {
@@ -1512,7 +1542,7 @@ mod tests {
     }
 
     #[test]
-    fn active_glm_canary_consumes_continuum_account_429_without_changing_kimi_routing() {
+    fn continuum_account_429_blocks_kimi_and_keeps_glm_on_tinfoil() {
         let router = ProviderRouter::default();
         let proxy_router = proxy_router_with_both_providers();
         router.observe_attempt_terminal(
@@ -1535,19 +1565,22 @@ mod tests {
             .expect("Tinfoil GLM after Continuum account limit");
         assert_eq!(glm.provider, ProviderId::Tinfoil);
 
-        let kimi = router
+        let kimi_error = router
             .select_active_completion_route(
                 &proxy_router,
                 &intent(KIMI_K2_6_MODEL_ID, KIMI_K2_6_MODEL_ID),
                 None,
             )
-            .expect("Kimi remains on its legacy route in Stack 6");
-        assert_eq!(kimi.provider, ProviderId::Continuum);
-        assert_eq!(kimi.provider_model_id, "kimi-k2.6");
+            .expect_err("Kimi shares the open Continuum account scope");
+        assert!(matches!(
+            kimi_error,
+            ProviderRoutingError::CapacityUnavailable { model, .. }
+                if model == KIMI_K2_6_MODEL_ID
+        ));
     }
 
     #[test]
-    fn active_glm_health_filter_is_inert_for_auto_and_other_models() {
+    fn active_health_filter_applies_to_auto_without_crossing_public_models() {
         let router = ProviderRouter::default();
         let proxy_router = proxy_router_with_both_providers();
         router.observe_attempt_terminal(
@@ -1564,59 +1597,58 @@ mod tests {
         let synthetic_auto_glm = intent(AUTO_POWERFUL_MODEL_ID, GLM_5_3_MODEL_ID);
         let auto_route = router
             .select_active_completion_route(&proxy_router, &synthetic_auto_glm, None)
-            .expect("Auto stays on legacy selection until Stack 7");
-        assert_eq!(auto_route.provider, ProviderId::Continuum);
-
-        for (requested, public, expected_provider) in [
-            (GLM_5_2_MODEL_ID, GLM_5_2_MODEL_ID, ProviderId::Tinfoil),
-            (
-                GLM_5_3_FLASH_MODEL_ID,
-                GLM_5_3_FLASH_MODEL_ID,
-                ProviderId::Tinfoil,
-            ),
-            (KIMI_K3_MODEL_ID, KIMI_K3_MODEL_ID, ProviderId::Tinfoil),
-            (
-                KIMI_K2_6_MODEL_ID,
-                KIMI_K2_6_MODEL_ID,
-                ProviderId::Continuum,
-            ),
-            (QUICK_MODEL_ID, QUICK_MODEL_ID, ProviderId::Tinfoil),
-        ] {
-            let selected = router
-                .select_active_completion_route(&proxy_router, &intent(requested, public), None)
-                .expect("non-canary route");
-            assert_eq!(selected.provider, expected_provider, "{requested}");
-        }
+            .expect("Auto Powerful uses the healthy GLM provider");
+        assert_eq!(auto_route.provider, ProviderId::Tinfoil);
+        assert_eq!(auto_route.public_model_id, GLM_5_3_MODEL_ID);
+        assert_eq!(auto_route.provider_model_id, GLM_5_3_MODEL_ID);
+        assert_eq!(auto_route.response_model_id, GLM_5_3_MODEL_ID);
+        assert_eq!(auto_route.selection_source, RouteSelectionSource::Fallback);
     }
 
     #[test]
-    fn non_canary_glm_models_ignore_their_own_open_health_in_stack_6() {
-        let router = ProviderRouter::default();
+    fn active_health_filter_never_substitutes_for_single_route_explicit_models() {
         let proxy_router = proxy_router_with_both_providers();
 
-        for model in [GLM_5_2_MODEL_ID, GLM_5_3_FLASH_MODEL_ID] {
+        for (provider, public_model, provider_model) in [
+            (ProviderId::Tinfoil, GLM_5_2_MODEL_ID, GLM_5_2_MODEL_ID),
+            (
+                ProviderId::Tinfoil,
+                GLM_5_3_FLASH_MODEL_ID,
+                GLM_5_3_FLASH_MODEL_ID,
+            ),
+            (ProviderId::Tinfoil, KIMI_K3_MODEL_ID, KIMI_K3_MODEL_ID),
+            (ProviderId::Continuum, KIMI_K2_6_MODEL_ID, "kimi-k2.6"),
+            (ProviderId::Tinfoil, QUICK_MODEL_ID, QUICK_MODEL_ID),
+        ] {
+            let router = ProviderRouter::default();
             router.observe_attempt_terminal(
                 &capacity_terminal(
-                    ProviderId::Tinfoil,
-                    model,
-                    model,
+                    provider,
+                    public_model,
+                    provider_model,
                     429,
                     Duration::from_secs(60),
                 ),
                 ShadowObservationMode::Update,
             );
 
-            let selected = router
-                .select_active_completion_route(&proxy_router, &intent(model, model), None)
-                .expect("non-canary GLM route remains on legacy selection");
-            assert_eq!(selected.provider, ProviderId::Tinfoil, "{model}");
-            assert_eq!(selected.public_model_id, model, "{model}");
-            assert_eq!(selected.provider_model_id, model, "{model}");
+            let error = router
+                .select_active_completion_route(
+                    &proxy_router,
+                    &intent(public_model, public_model),
+                    None,
+                )
+                .expect_err("an explicit model cannot fall through to another public model");
+            assert!(matches!(
+                error,
+                ProviderRoutingError::CapacityUnavailable { model, .. }
+                    if model == public_model
+            ));
         }
     }
 
     #[test]
-    fn only_would_open_blocks_a_new_canary_request() {
+    fn only_would_open_blocks_a_new_request() {
         assert!(route_is_available_for_new_request(
             ShadowDisposition::Healthy
         ));

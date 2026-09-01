@@ -978,5 +978,12 @@
     "PCR2": "c9dafd8eef7d01da138acc265960e03a87dbf087e1bbcf7652b6029a7a2fa1cbf917e99f45e12dd16d26ca447de61c23",
     "timestamp": 1788222835,
     "signature": "OQ7maMcyuq4EqjxNj+Ano6o1KH5qahsesn7wUyXgvA69J4dZzu6PoTlGphl+ZWx7GkLwDXmV5mUCLiXCzNczNk43dWFu2IICZfzMSo8wXsD8rqDqmDNucC2p5Ln2ENAT"
+  },
+  {
+    "PCR0": "01bc3b66d17e3c4683b9c0b7f7a62133cfb00676c539115b1cd78ce7da7cbad79ce241c359ccebe3c310150da69d4ace",
+    "PCR1": "bbe765ee1444bd6c00361527d71c7608020019a44988026d21de882c3702303910a185cb0407cab0d679505b9e2b5f83",
+    "PCR2": "5c7ba5b67a89608e62e97ce16bfe7d96a7a7ede5dc6068c96960dc1ee66ffc7dead5e0d484e24b6b4dad529222d0f9bb",
+    "timestamp": 1788289633,
+    "signature": "kxysF5YLPCS5tLk+NDzmrWtDnids+zesIV3/DYMIWzDT2SYhM5NmOzVmaBRjynyXu+/7kzvIxIMguV5ZY/PG6gseM/cBybu3106AkSnOtZY0Tksk+dHBncOJBpFvcXPL"
   }
 ]

@@ -2121,7 +2121,7 @@ pub(crate) async fn openai_model_catalog_data(state: &Arc<AppState>, user: &User
     let model_plan = ModelPlan::from_is_paid(
         billing_access.is_some_and(crate::billing::ChatBillingAccess::is_paid),
     );
-    let alias_targets = state.model_alias_targets(user.uuid, model_plan).await;
+    let alias_targets = ModelAliasTargets::for_plan(model_plan);
     model_catalog_response(alias_targets)
 }
 

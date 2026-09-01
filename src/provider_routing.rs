@@ -1,5 +1,7 @@
-use crate::model_config::{resolve_completion_model_id, resolve_public_model_id, GLM_5_2_MODEL_ID};
-use crate::os_flags::GLM_5_2_CONTINUUM_FLAG_KEY;
+use crate::model_config::{
+    resolve_completion_model_id, resolve_public_model_id, GLM_5_2_MODEL_ID, GLM_5_3_MODEL_ID,
+};
+use crate::os_flags::GLM_5_3_TINFOIL_FLAG_KEY;
 use crate::proxy_config::{canonicalize_tinfoil_model, ProxyConfig, ProxyRouter};
 use uuid::Uuid;
 
@@ -61,14 +63,36 @@ struct ModelProviderRoute {
     provider_model_id: &'static str,
     weight: u16,
     enabled: bool,
+    requires_explicit_preference: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct ModelRoutingConfig {
     public_model_id: &'static str,
     routes: &'static [ModelProviderRoute],
-    continuum_flag_key: Option<&'static str>,
+    provider_flag: Option<ProviderRoutingFlag>,
     default_provider: Option<ProviderName>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProviderRoutingFlag {
+    key: &'static str,
+    enabled_provider: ProviderName,
+    disabled_provider: ProviderName,
+}
+
+impl ProviderRoutingFlag {
+    pub(crate) const fn key(self) -> &'static str {
+        self.key
+    }
+
+    pub(crate) const fn preference_for(self, enabled: bool) -> ProviderPreference {
+        ProviderPreference::feature_flag(if enabled {
+            self.enabled_provider
+        } else {
+            self.disabled_provider
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -124,20 +148,34 @@ const KIMI_K2_6_ROUTES: &[ModelProviderRoute] = &[ModelProviderRoute {
     provider_model_id: "kimi-k2.6",
     weight: 100,
     enabled: true,
+    requires_explicit_preference: false,
 }];
 
-const GLM_5_2_ROUTES: &[ModelProviderRoute] = &[
-    ModelProviderRoute {
-        provider: ProviderName::Tinfoil,
-        provider_model_id: GLM_5_2_MODEL_ID,
-        weight: 100,
-        enabled: true,
-    },
+const GLM_5_2_ROUTES: &[ModelProviderRoute] = &[ModelProviderRoute {
+    provider: ProviderName::Tinfoil,
+    provider_model_id: GLM_5_2_MODEL_ID,
+    weight: 100,
+    enabled: true,
+    requires_explicit_preference: false,
+}];
+
+const GLM_5_3_ROUTES: &[ModelProviderRoute] = &[
     ModelProviderRoute {
         provider: ProviderName::Continuum,
-        provider_model_id: "glm-5.2",
+        provider_model_id: "glm-5.3",
         weight: 100,
         enabled: true,
+        requires_explicit_preference: false,
+    },
+    ModelProviderRoute {
+        // Staged for Tinfoil's in-progress launch. Keep this route out of
+        // automatic fallback until the live catalog publishes the model and
+        // billing rates have been added.
+        provider: ProviderName::Tinfoil,
+        provider_model_id: GLM_5_3_MODEL_ID,
+        weight: 100,
+        enabled: true,
+        requires_explicit_preference: true,
     },
 ];
 
@@ -145,14 +183,24 @@ const MODEL_ROUTES: &[ModelRoutingConfig] = &[
     ModelRoutingConfig {
         public_model_id: "kimi-k2-6",
         routes: KIMI_K2_6_ROUTES,
-        continuum_flag_key: None,
+        provider_flag: None,
         default_provider: Some(ProviderName::Continuum),
     },
     ModelRoutingConfig {
         public_model_id: GLM_5_2_MODEL_ID,
         routes: GLM_5_2_ROUTES,
-        continuum_flag_key: Some(GLM_5_2_CONTINUUM_FLAG_KEY),
+        provider_flag: None,
         default_provider: Some(ProviderName::Tinfoil),
+    },
+    ModelRoutingConfig {
+        public_model_id: GLM_5_3_MODEL_ID,
+        routes: GLM_5_3_ROUTES,
+        provider_flag: Some(ProviderRoutingFlag {
+            key: GLM_5_3_TINFOIL_FLAG_KEY,
+            enabled_provider: ProviderName::Tinfoil,
+            disabled_provider: ProviderName::Continuum,
+        }),
+        default_provider: Some(ProviderName::Continuum),
     },
 ];
 
@@ -206,12 +254,12 @@ impl ProviderRouter {
         self.fallback_completion_route(proxy_router, requested_model)
     }
 
-    pub(crate) fn continuum_flag_key_for_completion_model(
+    pub(crate) fn provider_routing_flag_for_completion_model(
         &self,
         requested_model: &str,
-    ) -> Option<&'static str> {
+    ) -> Option<ProviderRoutingFlag> {
         let public_model_id = resolve_public_model_id(requested_model)?;
-        self.model_config(public_model_id)?.continuum_flag_key
+        self.model_config(public_model_id)?.provider_flag
     }
 
     fn select_configured_route(
@@ -225,6 +273,12 @@ impl ProviderRouter {
 
         for route in model_config.routes {
             if !route.enabled || route.weight == 0 {
+                continue;
+            }
+            if route.requires_explicit_preference
+                && provider_preference
+                    .is_none_or(|preference| preference.provider != route.provider)
+            {
                 continue;
             }
 
@@ -416,6 +470,9 @@ fn proxy_for_provider(proxy_router: &ProxyRouter, provider: ProviderName) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_config::{ModelAliasTargets, ModelPlan, PaidModelAliasOverrides};
+    use crate::os_flags::PAID_POWERFUL_GLM_5_3_ALIAS_FLAG_KEY;
+    use std::collections::HashMap;
 
     fn proxy_router_with_both_providers() -> ProxyRouter {
         ProxyRouter::new(
@@ -438,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn test_glm_defaults_to_tinfoil_without_feature_flag_preference() {
+    fn test_glm_5_2_always_uses_tinfoil() {
         let router = ProviderRouter::default();
         let proxy_router = proxy_router_with_both_providers();
 
@@ -460,31 +517,47 @@ mod tests {
     }
 
     #[test]
-    fn test_glm_routing_flag_key_does_not_apply_to_kimi_or_other_models() {
+    fn test_glm_5_2_and_alias_have_no_provider_routing_flag() {
         let router = ProviderRouter::default();
 
         assert_eq!(
-            router.continuum_flag_key_for_completion_model(GLM_5_2_MODEL_ID),
-            Some(GLM_5_2_CONTINUUM_FLAG_KEY)
-        );
-        assert_eq!(
-            router.continuum_flag_key_for_completion_model(
-                crate::model_config::AUTO_POWERFUL_MODEL_ID
-            ),
-            Some(GLM_5_2_CONTINUUM_FLAG_KEY)
-        );
-        assert_eq!(
-            router.continuum_flag_key_for_completion_model("kimi-k2-6"),
+            router.provider_routing_flag_for_completion_model(GLM_5_2_MODEL_ID),
             None
         );
         assert_eq!(
-            router.continuum_flag_key_for_completion_model("gpt-oss-120b"),
+            router.provider_routing_flag_for_completion_model(
+                crate::model_config::AUTO_POWERFUL_MODEL_ID
+            ),
+            None
+        );
+        assert_eq!(
+            router.provider_routing_flag_for_completion_model("kimi-k2-6"),
+            None
+        );
+        assert_eq!(
+            router.provider_routing_flag_for_completion_model("gpt-oss-120b"),
             None
         );
     }
 
     #[test]
-    fn test_glm_true_feature_flag_selects_continuum_model_id() {
+    fn test_glm_5_3_tinfoil_flag_maps_true_and_false_to_separate_providers() {
+        let router = ProviderRouter::default();
+        let flag = router
+            .provider_routing_flag_for_completion_model(GLM_5_3_MODEL_ID)
+            .expect("GLM 5.3 provider flag");
+
+        assert_eq!(flag.key(), GLM_5_3_TINFOIL_FLAG_KEY);
+        assert_eq!(flag.preference_for(true).provider, ProviderName::Tinfoil);
+        assert_eq!(flag.preference_for(false).provider, ProviderName::Continuum);
+        assert_eq!(
+            flag.preference_for(true).source,
+            ProviderSelectionSource::FeatureFlag
+        );
+    }
+
+    #[test]
+    fn test_glm_5_2_rejects_continuum_preference_and_stays_on_tinfoil() {
         let router = ProviderRouter::default();
         let proxy_router = proxy_router_with_both_providers();
 
@@ -497,19 +570,16 @@ mod tests {
             )
             .expect("route");
 
-        assert_eq!(selected.proxy.provider_name, "continuum");
+        assert_eq!(selected.proxy.provider_name, "tinfoil");
         assert_eq!(selected.public_model_id, GLM_5_2_MODEL_ID);
-        assert_eq!(selected.provider_model_id, "glm-5.2");
+        assert_eq!(selected.provider_model_id, GLM_5_2_MODEL_ID);
         assert_eq!(selected.response_model_id, GLM_5_2_MODEL_ID);
         assert_eq!(selected.bucket, None);
-        assert_eq!(
-            selected.selection_source,
-            ProviderSelectionSource::FeatureFlag
-        );
+        assert_eq!(selected.selection_source, ProviderSelectionSource::Fallback);
     }
 
     #[test]
-    fn test_glm_false_feature_flag_selects_tinfoil_model_id() {
+    fn test_generic_tinfoil_preference_selects_glm_5_2_route() {
         let router = ProviderRouter::default();
         let proxy_router = proxy_router_with_both_providers();
 
@@ -578,6 +648,70 @@ mod tests {
     }
 
     #[test]
+    fn test_glm_5_3_always_uses_continuum_and_canonicalizes_the_response() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+
+        let selected = router
+            .select_completion_route(&proxy_router, uuid_for_bucket(50), GLM_5_3_MODEL_ID)
+            .expect("route");
+
+        assert_eq!(selected.proxy.provider_name, "continuum");
+        assert_eq!(selected.public_model_id, GLM_5_3_MODEL_ID);
+        assert_eq!(selected.provider_model_id, "glm-5.3");
+        assert_eq!(selected.response_model_id, GLM_5_3_MODEL_ID);
+        assert_eq!(selected.bucket, None);
+        assert_eq!(
+            selected.selection_source,
+            ProviderSelectionSource::DefaultProvider
+        );
+    }
+
+    #[test]
+    fn test_glm_5_3_tinfoil_route_requires_explicit_enabled_preference() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+        let flag = router
+            .provider_routing_flag_for_completion_model(GLM_5_3_MODEL_ID)
+            .expect("GLM 5.3 provider flag");
+
+        let selected = router
+            .select_completion_route_with_preference(
+                &proxy_router,
+                uuid_for_bucket(50),
+                GLM_5_3_MODEL_ID,
+                Some(flag.preference_for(true)),
+            )
+            .expect("Tinfoil route");
+
+        assert_eq!(selected.proxy.provider_name, "tinfoil");
+        assert_eq!(selected.public_model_id, GLM_5_3_MODEL_ID);
+        assert_eq!(selected.provider_model_id, GLM_5_3_MODEL_ID);
+        assert_eq!(selected.response_model_id, GLM_5_3_MODEL_ID);
+        assert_eq!(selected.bucket, None);
+        assert_eq!(
+            selected.selection_source,
+            ProviderSelectionSource::FeatureFlag
+        );
+
+        let selected = router
+            .select_completion_route_with_preference(
+                &proxy_router,
+                uuid_for_bucket(50),
+                GLM_5_3_MODEL_ID,
+                Some(flag.preference_for(false)),
+            )
+            .expect("PrivateMode route");
+
+        assert_eq!(selected.proxy.provider_name, "continuum");
+        assert_eq!(selected.provider_model_id, "glm-5.3");
+        assert_eq!(
+            selected.selection_source,
+            ProviderSelectionSource::FeatureFlag
+        );
+    }
+
+    #[test]
     fn test_auto_powerful_uses_glm_route_table() {
         let router = ProviderRouter::default();
         let proxy_router = proxy_router_with_both_providers();
@@ -594,6 +728,35 @@ mod tests {
         assert_eq!(selected.public_model_id, GLM_5_2_MODEL_ID);
         assert_eq!(selected.provider_model_id, GLM_5_2_MODEL_ID);
         assert_eq!(selected.response_model_id, GLM_5_2_MODEL_ID);
+        assert_eq!(selected.bucket, None);
+        assert_eq!(
+            selected.selection_source,
+            ProviderSelectionSource::DefaultProvider
+        );
+    }
+
+    #[test]
+    fn test_paid_powerful_glm_5_3_override_uses_continuum_route() {
+        let router = ProviderRouter::default();
+        let proxy_router = proxy_router_with_both_providers();
+        let flags = HashMap::from([(PAID_POWERFUL_GLM_5_3_ALIAS_FLAG_KEY.to_string(), true)]);
+        let targets = ModelAliasTargets::for_plan_with_overrides(
+            ModelPlan::Paid,
+            PaidModelAliasOverrides::from_flag_values(&flags),
+        );
+
+        let selected = router
+            .select_completion_route(
+                &proxy_router,
+                uuid_for_bucket(70),
+                targets.resolve(crate::model_config::AUTO_POWERFUL_MODEL_ID),
+            )
+            .expect("route");
+
+        assert_eq!(selected.proxy.provider_name, "continuum");
+        assert_eq!(selected.public_model_id, GLM_5_3_MODEL_ID);
+        assert_eq!(selected.provider_model_id, "glm-5.3");
+        assert_eq!(selected.response_model_id, GLM_5_3_MODEL_ID);
         assert_eq!(selected.bucket, None);
         assert_eq!(
             selected.selection_source,
@@ -759,6 +922,15 @@ mod tests {
         assert_eq!(
             error,
             ProviderRoutingError::NoEligibleRoute("kimi-k2-6".to_string())
+        );
+
+        let error = router
+            .select_completion_route(&proxy_router, uuid_for_bucket(50), GLM_5_3_MODEL_ID)
+            .expect_err("no eligible GLM 5.3 route");
+
+        assert_eq!(
+            error,
+            ProviderRoutingError::NoEligibleRoute(GLM_5_3_MODEL_ID.to_string())
         );
     }
 }

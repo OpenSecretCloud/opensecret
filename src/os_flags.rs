@@ -15,7 +15,9 @@ const USER_FLAGS_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 // externally configured identifiers.
 #[allow(dead_code)]
 pub const AGENT_FEATURE_FLAG_KEY: &str = "agent";
-pub const GLM_5_2_CONTINUUM_FLAG_KEY: &str = "provider-routing.glm-5-2.continuum";
+pub const PAID_POWERFUL_GLM_5_3_ALIAS_FLAG_KEY: &str = "model-alias.paid.powerful.glm-5-3";
+pub const PAID_MODEL_ALIAS_FLAG_KEYS: &[&str] = &[PAID_POWERFUL_GLM_5_3_ALIAS_FLAG_KEY];
+pub const GLM_5_3_TINFOIL_FLAG_KEY: &str = "provider-routing.glm-5-3.tinfoil";
 
 #[derive(Debug, thiserror::Error)]
 pub enum OsFlagsError {

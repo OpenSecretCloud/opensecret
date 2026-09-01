@@ -1,5 +1,6 @@
 use crate::model_config::{
-    model_catalog_response, openai_models_response, ModelAliasTargets, ModelPlan,
+    model_alias_requires_flag_lookup, model_catalog_response, openai_models_response,
+    ModelAliasTargets, ModelPlan,
 };
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
@@ -789,7 +790,11 @@ async fn proxy_openai(
         })?
         .to_string();
 
-    let alias_targets = ModelAliasTargets::for_plan(model_plan);
+    let alias_targets = if model_alias_requires_flag_lookup(&requested_model_name) {
+        state.model_alias_targets(user.uuid, model_plan).await
+    } else {
+        ModelAliasTargets::for_plan(model_plan)
+    };
     let model_name = alias_targets.resolve(&requested_model_name).to_string();
     if requested_model_name != model_name {
         debug!(
@@ -1777,7 +1782,7 @@ async fn proxy_model_catalog(
     let model_plan = ModelPlan::from_is_paid(
         billing_access.is_some_and(crate::billing::ChatBillingAccess::is_paid),
     );
-    let alias_targets = ModelAliasTargets::for_plan(model_plan);
+    let alias_targets = state.model_alias_targets(user.uuid, model_plan).await;
     let catalog_response = model_catalog_response(alias_targets);
     encrypt_response(&state, &session_id, &catalog_response).await
 }
@@ -2651,6 +2656,11 @@ mod tests {
             Err(ApiError::ModelNotAvailableOnPlan)
         ));
         assert!(ensure_completion_model_access("glm-5-2", ModelPlan::Paid).is_ok());
+        assert!(matches!(
+            ensure_completion_model_access("glm-5-3", ModelPlan::Free),
+            Err(ApiError::ModelNotAvailableOnPlan)
+        ));
+        assert!(ensure_completion_model_access("glm-5-3", ModelPlan::Paid).is_ok());
         assert!(matches!(
             ensure_completion_model_access(
                 crate::model_config::AUTO_POWERFUL_MODEL_ID,

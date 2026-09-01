@@ -7,8 +7,9 @@ use crate::{
     encrypt::{decrypt_content, decrypt_string, encrypt_with_key},
     jwt::AuthContext,
     model_config::{
-        model_config, model_reasoning_history_strategy, resolve_public_model_id, ModelAliasTargets,
-        ModelPlan, ReasoningHistoryStrategy, ResponsesModelConfig, SamplingConfig,
+        model_alias_requires_flag_lookup, model_config, model_reasoning_history_strategy,
+        resolve_public_model_id, ModelAliasTargets, ModelPlan, ReasoningHistoryStrategy,
+        ResponsesModelConfig, SamplingConfig,
     },
     models::responses::{
         NewToolCall, NewToolOutput, NewUserMessage, ResponseStatus, ResponsesError,
@@ -890,6 +891,14 @@ mod tests {
             "glm-5-2"
         );
         assert!(matches!(
+            resolve_responses_model("glm-5-3", "continuum", ModelPlan::Free),
+            Err(ApiError::ModelNotAvailableOnPlan)
+        ));
+        assert_eq!(
+            resolve_responses_model("glm-5-3", "continuum", ModelPlan::Paid).unwrap(),
+            "glm-5-3"
+        );
+        assert!(matches!(
             resolve_responses_model("deepseek-v4-flash", "tinfoil", ModelPlan::Free),
             Err(ApiError::ModelNotAvailableOnPlan)
         ));
@@ -946,6 +955,18 @@ mod tests {
             build_model_turn_request(&glm, &[json!({"role": "user", "content": "hello"})], false);
         assert_eq!(glm_request["chat_template_kwargs"]["clear_thinking"], false);
 
+        let glm_5_3 = responses_request_for_model("glm-5-3");
+        let glm_5_3_request = build_model_turn_request(
+            &glm_5_3,
+            &[json!({"role": "user", "content": "hello"})],
+            false,
+        );
+        assert_eq!(glm_5_3_request["model"], "glm-5-3");
+        assert_eq!(
+            glm_5_3_request["chat_template_kwargs"]["clear_thinking"],
+            false
+        );
+
         let targets = ModelAliasTargets::for_plan(ModelPlan::Paid);
         let auto_powerful = responses_request_for_model(
             targets.resolve(crate::model_config::AUTO_POWERFUL_MODEL_ID),
@@ -963,6 +984,31 @@ mod tests {
         assert!(auto_request["chat_template_kwargs"]
             .get("preserve_thinking")
             .is_none());
+
+        let flags = std::collections::HashMap::from([(
+            crate::os_flags::PAID_POWERFUL_GLM_5_3_ALIAS_FLAG_KEY.to_string(),
+            true,
+        )]);
+        let flagged_targets = ModelAliasTargets::for_plan_with_overrides(
+            ModelPlan::Paid,
+            crate::model_config::PaidModelAliasOverrides::from_flag_values(&flags),
+        );
+        let flagged_powerful = responses_request_for_model(
+            flagged_targets.resolve(crate::model_config::AUTO_POWERFUL_MODEL_ID),
+        );
+        let flagged_request = build_model_turn_request(
+            &flagged_powerful,
+            &[json!({"role": "user", "content": "hello"})],
+            false,
+        );
+        assert_eq!(
+            flagged_request["model"],
+            crate::model_config::GLM_5_3_MODEL_ID
+        );
+        assert_eq!(
+            flagged_request["chat_template_kwargs"]["clear_thinking"],
+            false
+        );
 
         let paid_quick =
             responses_request_for_model(targets.resolve(crate::model_config::AUTO_QUICK_MODEL_ID));
@@ -3776,7 +3822,11 @@ async fn create_response_stream(
         );
         return Err(ApiError::Unauthorized);
     }
-    let alias_targets = ModelAliasTargets::for_plan(model_plan);
+    let alias_targets = if model_alias_requires_flag_lookup(&requested_model) {
+        state.model_alias_targets(user.uuid, model_plan).await
+    } else {
+        ModelAliasTargets::for_plan(model_plan)
+    };
     let selected_model = alias_targets.resolve(&requested_model).to_string();
     let completion_provider = state.proxy_router.get_completion_proxy();
     let resolved_model = resolve_responses_model(

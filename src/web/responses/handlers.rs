@@ -304,10 +304,18 @@ pub enum PublicResponseFailure {
 
 impl PublicResponseFailure {
     fn from_completion_error(error: &CompletionExecutionError) -> Self {
-        match error.terminal() {
-            Some(AttemptTerminal::Failed { failure, .. })
-                if failure.kind == crate::inference::AttemptFailureKind::CapacityRejected =>
-            {
+        match error {
+            CompletionExecutionError::Request(ApiError::InferenceCapacity { status, .. }) => {
+                if *status == axum::http::StatusCode::TOO_MANY_REQUESTS {
+                    Self::CapacityRateLimited
+                } else {
+                    Self::CapacityOverloaded
+                }
+            }
+            CompletionExecutionError::Attempt {
+                terminal: AttemptTerminal::Failed { failure, .. },
+                ..
+            } if failure.kind == crate::inference::AttemptFailureKind::CapacityRejected => {
                 if failure.status == Some(429) {
                     Self::CapacityRateLimited
                 } else {
@@ -969,6 +977,15 @@ mod tests {
         }
         assert_eq!(
             image_description_api_error(ApiError::ServiceUnavailable).class,
+            ImageDescriptionFailureClass::PreAcceptance
+        );
+        assert_eq!(
+            image_description_api_error(ApiError::InferenceCapacity {
+                status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                retry_after: Some(Duration::from_secs(1)),
+                client_replay_safe: false,
+            })
+            .class,
             ImageDescriptionFailureClass::PreAcceptance
         );
         assert_eq!(
@@ -1697,6 +1714,40 @@ mod tests {
         assert!(PublicResponseFailure::DeadlineExceeded
             .contract_metadata()
             .is_none());
+    }
+
+    #[test]
+    fn local_capacity_request_errors_remain_typed_after_persistence() {
+        for (status, expected) in [
+            (
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                PublicResponseFailure::CapacityRateLimited,
+            ),
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                PublicResponseFailure::CapacityOverloaded,
+            ),
+        ] {
+            let error = CompletionExecutionError::from(ApiError::InferenceCapacity {
+                status,
+                retry_after: Some(Duration::from_secs(30)),
+                client_replay_safe: false,
+            });
+
+            let actual = PublicResponseFailure::from_completion_error(&error);
+            assert_eq!(actual, expected);
+            assert_eq!(
+                actual.contract_metadata().unwrap().error_code,
+                crate::INFERENCE_CAPACITY_ERROR_CODE
+            );
+        }
+
+        assert_eq!(
+            PublicResponseFailure::from_completion_error(&CompletionExecutionError::from(
+                ApiError::InternalServerError
+            )),
+            PublicResponseFailure::Internal
+        );
     }
 
     #[test]
@@ -3385,7 +3436,9 @@ fn image_description_api_error(error: ApiError) -> ImageDescriptionAttemptError 
         ApiError::BadRequest | ApiError::Unauthorized | ApiError::ModelNotAvailableOnPlan => {
             ImageDescriptionFailureClass::Terminal
         }
-        ApiError::ServiceUnavailable => ImageDescriptionFailureClass::PreAcceptance,
+        ApiError::ServiceUnavailable | ApiError::InferenceCapacity { .. } => {
+            ImageDescriptionFailureClass::PreAcceptance
+        }
         ApiError::TooManyRequests => ImageDescriptionFailureClass::RetryableResponse,
         _ => ImageDescriptionFailureClass::AmbiguousAfterSend,
     };

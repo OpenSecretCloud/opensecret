@@ -1,10 +1,10 @@
-use crate::inference::health::ShadowObservationMode;
+use crate::inference::health::{ProbeClaimResult, ProbeLease, ShadowObservationMode};
 use crate::inference::{
     AttemptFailure, AttemptFailureKind, AttemptOutcome, AttemptStage, AttemptTerminal,
     CompletionEvidence, InferenceAttempt, InferenceExecution, InferenceIntent, InferenceSurface,
     ReplaySafety, WorkloadClass,
 };
-use crate::inference_planning::{RoutePlan, RoutePlanningError};
+use crate::inference_planning::{ProviderPreference, RoutePlan, RoutePlanningError};
 use crate::model_config::{
     model_alias_requires_flag_lookup, model_catalog_response, openai_models_response,
     ModelAliasTargets, ModelPlan,
@@ -50,7 +50,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
@@ -818,11 +818,30 @@ pub struct CompletionStream {
 #[derive(Debug, Clone)]
 pub(crate) struct PinnedCompletionRequest {
     intent: InferenceIntent,
+    /// The route selected during request preparation. It remains provisional
+    /// until the first provider turn atomically claims any half-open gates.
     route: SelectedProviderRoute,
     routing_mode: InferenceRoutingMode,
+    provider_preference: Option<ProviderPreference>,
+    finalized_route: Arc<OnceLock<SelectedProviderRoute>>,
 }
 
 impl PinnedCompletionRequest {
+    fn new(
+        intent: InferenceIntent,
+        route: SelectedProviderRoute,
+        provider_preference: Option<ProviderPreference>,
+        routing_mode: InferenceRoutingMode,
+    ) -> Self {
+        Self {
+            intent,
+            route,
+            routing_mode,
+            provider_preference,
+            finalized_route: Arc::new(OnceLock::new()),
+        }
+    }
+
     pub(crate) fn intent(&self) -> &InferenceIntent {
         &self.intent
     }
@@ -831,8 +850,20 @@ impl PinnedCompletionRequest {
         self.routing_mode
     }
 
+    pub(crate) fn public_model_id(&self) -> &str {
+        &self.selected_route().public_model_id
+    }
+
     fn begin_execution(&self) -> InferenceExecution {
         self.intent.begin_execution()
+    }
+
+    fn selected_route(&self) -> &SelectedProviderRoute {
+        self.finalized_route.get().unwrap_or(&self.route)
+    }
+
+    fn finalize_route(&self, route: SelectedProviderRoute) -> bool {
+        self.finalized_route.set(route).is_ok()
     }
 }
 
@@ -891,6 +922,7 @@ impl From<ApiError> for CompletionExecutionError {
     }
 }
 
+#[cfg(test)]
 fn failed_completion_execution(
     provider_router: &ProviderRouter,
     attempt: InferenceAttempt,
@@ -1038,51 +1070,69 @@ fn record_attempt_outcome(
             );
         }
         AttemptOutcome::Terminal(terminal) => {
-            let attempt = terminal.attempt();
             let shadow_report = provider_router.observe_attempt_terminal(terminal, shadow_mode);
-            debug!(
-                "Inference shadow health observation: request_id={}, execution_id={}, attempt_id={}, policy_version={}, mode={:?}, route_provider={}, route_model={}, signal={:?}, capacity_pool={:?}, snapshot={:?}, mutated={}",
-                attempt.request_id,
-                attempt.execution_id,
-                attempt.attempt_id,
-                shadow_report.policy_version,
-                shadow_report.mode,
-                shadow_report.route.provider.as_str(),
-                shadow_report.route.provider_model_id,
-                shadow_report.signal,
-                shadow_report.capacity_pool,
-                shadow_report.snapshot,
-                shadow_report.mutated
-            );
-            match terminal {
-                AttemptTerminal::Completed { evidence, .. } => debug!(
-                    "Inference attempt completed: request_id={}, execution_id={}, attempt_id={}, provider={}, public_model={}, provider_model={}, evidence={:?}",
-                    attempt.request_id,
-                    attempt.execution_id,
-                    attempt.attempt_id,
-                    attempt.route.provider.as_str(),
-                    attempt.route.public_model_id,
-                    attempt.route.provider_model_id,
-                    evidence
-                ),
-                AttemptTerminal::Failed { failure, .. } => warn!(
-                    "Inference attempt failed: request_id={}, execution_id={}, attempt_id={}, provider={}, public_model={}, provider_model={}, kind={:?}, stage={:?}, replay_safety={:?}, status={:?}, retry_after_ms={:?}, upstream_request_id={:?}, upstream_code={:?}",
-                    attempt.request_id,
-                    attempt.execution_id,
-                    attempt.attempt_id,
-                    attempt.route.provider.as_str(),
-                    attempt.route.public_model_id,
-                    attempt.route.provider_model_id,
-                    failure.kind,
-                    failure.stage,
-                    failure.replay_safety,
-                    failure.status,
-                    failure.retry_after.map(|duration| duration.as_millis()),
-                    failure.upstream_request_id,
-                    failure.upstream_code
-                ),
-            }
+            log_attempt_terminal(terminal, &shadow_report);
         }
+    }
+}
+
+fn record_attempt_terminal_with_probe(
+    provider_router: &ProviderRouter,
+    terminal: &AttemptTerminal,
+    shadow_mode: ShadowObservationMode,
+    probe: Option<ProbeLease>,
+) {
+    let shadow_report =
+        provider_router.observe_attempt_terminal_with_probe(terminal, shadow_mode, probe);
+    log_attempt_terminal(terminal, &shadow_report);
+}
+
+fn log_attempt_terminal(
+    terminal: &AttemptTerminal,
+    shadow_report: &crate::inference::health::ShadowObservationReport,
+) {
+    let attempt = terminal.attempt();
+    debug!(
+        "Inference shadow health observation: request_id={}, execution_id={}, attempt_id={}, policy_version={}, mode={:?}, route_provider={}, route_model={}, signal={:?}, capacity_pool={:?}, snapshot={:?}, mutated={}",
+        attempt.request_id,
+        attempt.execution_id,
+        attempt.attempt_id,
+        shadow_report.policy_version,
+        shadow_report.mode,
+        shadow_report.route.provider.as_str(),
+        shadow_report.route.provider_model_id,
+        shadow_report.signal,
+        shadow_report.capacity_pool,
+        shadow_report.snapshot,
+        shadow_report.mutated
+    );
+    match terminal {
+        AttemptTerminal::Completed { evidence, .. } => debug!(
+            "Inference attempt completed: request_id={}, execution_id={}, attempt_id={}, provider={}, public_model={}, provider_model={}, evidence={:?}",
+            attempt.request_id,
+            attempt.execution_id,
+            attempt.attempt_id,
+            attempt.route.provider.as_str(),
+            attempt.route.public_model_id,
+            attempt.route.provider_model_id,
+            evidence
+        ),
+        AttemptTerminal::Failed { failure, .. } => warn!(
+            "Inference attempt failed: request_id={}, execution_id={}, attempt_id={}, provider={}, public_model={}, provider_model={}, kind={:?}, stage={:?}, replay_safety={:?}, status={:?}, retry_after_ms={:?}, upstream_request_id={:?}, upstream_code={:?}",
+            attempt.request_id,
+            attempt.execution_id,
+            attempt.attempt_id,
+            attempt.route.provider.as_str(),
+            attempt.route.public_model_id,
+            attempt.route.provider_model_id,
+            failure.kind,
+            failure.stage,
+            failure.replay_safety,
+            failure.status,
+            failure.retry_after.map(|duration| duration.as_millis()),
+            failure.upstream_request_id,
+            failure.upstream_code
+        ),
     }
 }
 
@@ -1888,11 +1938,153 @@ pub(crate) async fn prepare_completion_request(
         route.selection_source
     );
 
-    Ok(PinnedCompletionRequest {
+    Ok(PinnedCompletionRequest::new(
         intent,
         route,
-        routing_mode: routing.mode(),
-    })
+        provider_preference,
+        routing.mode(),
+    ))
+}
+
+fn probe_api_error(retry_after: Duration) -> ApiError {
+    ApiError::InferenceCapacity {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        retry_after: Some(retry_after),
+        // The owning API surface promotes this only when its complete logical
+        // request is still known to be replay-safe.
+        client_replay_safe: false,
+    }
+}
+
+fn replan_completion_route_excluding(
+    provider_router: &ProviderRouter,
+    proxy_router: &ProxyRouter,
+    pinned: &PinnedCompletionRequest,
+    excluded_routes: &mut HashSet<crate::inference::RouteKey>,
+) -> Result<SelectedProviderRoute, ApiError> {
+    loop {
+        let route = provider_router
+            .select_active_completion_route_excluding(
+                proxy_router,
+                &pinned.intent,
+                pinned.provider_preference,
+                excluded_routes,
+            )
+            .map_err(provider_routing_api_error)?;
+
+        // Auto model selection is finalized during request preparation, before
+        // Responses builds model-specific context. A lost probe claim may move
+        // the first turn to another provider, but never to another public model.
+        if route.public_model_id == pinned.route.public_model_id {
+            return Ok(route);
+        }
+        excluded_routes.insert(route.identity().route_key());
+    }
+}
+
+#[derive(Debug)]
+struct ClaimedProviderTurn {
+    route: SelectedProviderRoute,
+    probe: Option<ProbeLease>,
+}
+
+fn claim_finalized_completion_turn(
+    provider_router: &ProviderRouter,
+    pinned: &PinnedCompletionRequest,
+    route: &SelectedProviderRoute,
+) -> Result<ClaimedProviderTurn, ApiError> {
+    let route_key = route.identity().route_key();
+    match provider_router.try_claim_probe(&route_key) {
+        ProbeClaimResult::Ready(probe) => Ok(ClaimedProviderTurn {
+            route: route.clone(),
+            probe,
+        }),
+        ProbeClaimResult::Rejected {
+            reason,
+            retry_after,
+        } => {
+            debug!(
+                "Pinned inference route unavailable before send: request_id={}, provider={}, provider_model={}, reason={:?}",
+                pinned.intent.request_id,
+                route.provider.as_str(),
+                route.provider_model_id,
+                reason
+            );
+            Err(probe_api_error(retry_after))
+        }
+    }
+}
+
+/// Atomically claims any expired health gates immediately before every provider
+/// send. Losing a first-turn claim may replan only to another provider for the
+/// already-prepared public model. Later Responses tool turns stay pinned to
+/// the finalized route and fail locally instead of switching providers.
+fn claim_completion_turn(
+    provider_router: &ProviderRouter,
+    proxy_router: &ProxyRouter,
+    pinned: &PinnedCompletionRequest,
+    allow_replan: bool,
+) -> Result<ClaimedProviderTurn, ApiError> {
+    if pinned.routing_mode() == InferenceRoutingMode::Legacy {
+        return Ok(ClaimedProviderTurn {
+            route: pinned.route.clone(),
+            probe: None,
+        });
+    }
+
+    if let Some(route) = pinned.finalized_route.get() {
+        return claim_finalized_completion_turn(provider_router, pinned, route);
+    }
+
+    let mut excluded_routes = HashSet::new();
+    let mut route = pinned.route.clone();
+    loop {
+        let route_key = route.identity().route_key();
+        let probe = match provider_router.try_claim_probe(&route_key) {
+            ProbeClaimResult::Ready(probe) => probe,
+            ProbeClaimResult::Rejected {
+                reason,
+                retry_after,
+            } => {
+                debug!(
+                    "Inference route lost half-open claim before send: request_id={}, provider={}, provider_model={}, reason={:?}",
+                    pinned.intent.request_id,
+                    route.provider.as_str(),
+                    route.provider_model_id,
+                    reason
+                );
+                let local_error = probe_api_error(retry_after);
+                if !allow_replan {
+                    return Err(local_error);
+                }
+                excluded_routes.insert(route_key);
+                route = match replan_completion_route_excluding(
+                    provider_router,
+                    proxy_router,
+                    pinned,
+                    &mut excluded_routes,
+                ) {
+                    Ok(replanned) => replanned,
+                    Err(_) => return Err(local_error),
+                };
+                continue;
+            }
+        };
+
+        if pinned.finalize_route(route.clone()) {
+            return Ok(ClaimedProviderTurn { route, probe });
+        }
+
+        // Pinned turns are serialized today. If that invariant changes, release
+        // this speculative claim and use the route already finalized by the
+        // concurrent first turn without sending a second half-open probe.
+        drop(probe);
+        let route = pinned
+            .finalized_route
+            .get()
+            .expect("failed OnceLock set means another route was finalized");
+        return claim_finalized_completion_turn(provider_router, pinned, route);
+    }
 }
 
 /// Ensures cancellation or panic cannot make an in-flight attempt disappear
@@ -1902,19 +2094,31 @@ struct AttemptObservationGuard {
     attempt: InferenceAttempt,
     provider_router: Arc<ProviderRouter>,
     stage: AttemptStage,
+    probe: Option<ProbeLease>,
     armed: bool,
 }
 
 impl AttemptObservationGuard {
+    #[cfg(test)]
     fn new(
         attempt: InferenceAttempt,
         provider_router: Arc<ProviderRouter>,
         stage: AttemptStage,
     ) -> Self {
+        Self::new_with_probe(attempt, provider_router, stage, None)
+    }
+
+    fn new_with_probe(
+        attempt: InferenceAttempt,
+        provider_router: Arc<ProviderRouter>,
+        stage: AttemptStage,
+        probe: Option<ProbeLease>,
+    ) -> Self {
         Self {
             attempt,
             provider_router,
             stage,
+            probe,
             armed: true,
         }
     }
@@ -1933,10 +2137,11 @@ impl AttemptObservationGuard {
 
     fn record_terminal(&mut self, terminal: &AttemptTerminal) {
         debug_assert_eq!(terminal.attempt(), &self.attempt);
-        record_attempt_outcome(
+        record_attempt_terminal_with_probe(
             &self.provider_router,
-            &AttemptOutcome::Terminal(terminal.clone()),
+            terminal,
             ShadowObservationMode::Update,
+            self.probe.take(),
         );
         self.disarm();
     }
@@ -1960,10 +2165,11 @@ impl Drop for AttemptObservationGuard {
         }
 
         let terminal = self.cancellation_terminal();
-        record_attempt_outcome(
+        record_attempt_terminal_with_probe(
             &self.provider_router,
-            &AttemptOutcome::Terminal(terminal),
+            &terminal,
             ShadowObservationMode::Update,
+            self.probe.take(),
         );
         warn!(
             "Inference attempt abandoned before terminal processing: request_id={}, execution_id={}, attempt_id={}, stage={:?}",
@@ -2183,20 +2389,64 @@ async fn get_chat_completion_response_with_options(
         })?
         .to_string();
 
-    if body_model_name != pinned.intent.public_model_id {
+    if body_model_name != pinned.public_model_id() {
         error!(
-            "Prepared inference model did not match execution body: request_id={}, prepared_model={}, body_model={}",
-            pinned.intent.request_id, pinned.intent.public_model_id, body_model_name
+            "Prepared inference model did not match execution body: request_id={}, preferred_model={}, prepared_model={}, body_model={}",
+            pinned.intent.request_id,
+            pinned.intent.public_model_id,
+            pinned.public_model_id(),
+            body_model_name
         );
         return Err(ApiError::InternalServerError.into());
     }
 
-    ensure_completion_model_access(&pinned.intent.public_model_id, pinned.intent.model_plan)?;
-    let selected_route = pinned.route.clone();
+    ensure_completion_model_access(pinned.public_model_id(), pinned.intent.model_plan)?;
+    if let Some(expected_route) = &options.exact_route {
+        let prepared_route = pinned.selected_route();
+        if !completion_route_matches_exact_constraint(prepared_route, expected_route) {
+            error!(
+                "Completion route did not match the server-selected constraint: request_id={}, public_model={}, expected_provider={}, expected_provider_model={}, selected_provider={}, selected_proxy_provider={}, selected_provider_model={}",
+                pinned.intent.request_id,
+                prepared_route.public_model_id,
+                expected_route.provider_name,
+                expected_route.provider_model_id,
+                prepared_route.provider.as_str(),
+                prepared_route.proxy.provider_name,
+                prepared_route.provider_model_id
+            );
+            return Err(CompletionExecutionError::Request(
+                ApiError::ServiceUnavailable,
+            ));
+        }
+    }
+
+    let ClaimedProviderTurn {
+        route: selected_route,
+        probe,
+    } = claim_completion_turn(
+        &state.provider_router,
+        &state.proxy_router,
+        pinned,
+        options.exact_route.is_none(),
+    )
+    .map_err(CompletionExecutionError::from)?;
+    if selected_route.public_model_id != body_model_name {
+        error!(
+            "Probe recovery changed the prepared public model: request_id={}, prepared_model={}, selected_model={}",
+            pinned.intent.request_id,
+            body_model_name,
+            selected_route.public_model_id
+        );
+        drop(probe);
+        return Err(CompletionExecutionError::Request(
+            ApiError::InternalServerError,
+        ));
+    }
+    ensure_completion_model_access(&selected_route.public_model_id, pinned.intent.model_plan)?;
     if let Some(expected_route) = &options.exact_route {
         if !completion_route_matches_exact_constraint(&selected_route, expected_route) {
             error!(
-                "Completion route did not match the server-selected constraint: request_id={}, public_model={}, expected_provider={}, expected_provider_model={}, selected_provider={}, selected_proxy_provider={}, selected_provider_model={}",
+                "Claimed completion route did not match the server-selected constraint: request_id={}, public_model={}, expected_provider={}, expected_provider_model={}, selected_provider={}, selected_proxy_provider={}, selected_provider_model={}",
                 pinned.intent.request_id,
                 selected_route.public_model_id,
                 expected_route.provider_name,
@@ -2205,6 +2455,7 @@ async fn get_chat_completion_response_with_options(
                 selected_route.proxy.provider_name,
                 selected_route.provider_model_id
             );
+            drop(probe);
             return Err(CompletionExecutionError::Request(
                 ApiError::ServiceUnavailable,
             ));
@@ -2252,10 +2503,16 @@ async fn get_chat_completion_response_with_options(
         ensure_stream_usage(&mut request_body);
 
         let request_body_value = Value::Object(request_body);
+        let attempt = execution.begin_attempt(route_identity.clone());
+        let mut terminal_guard = AttemptObservationGuard::new_with_probe(
+            attempt.clone(),
+            Arc::clone(&state.provider_router),
+            AttemptStage::BeforeSend,
+            probe,
+        );
         let request_body_json = match serde_json::to_string(&request_body_value) {
             Ok(json) => json,
             Err(error) => {
-                let attempt = execution.begin_attempt(route_identity.clone());
                 let failure = AttemptFailure::new(
                     AttemptFailureKind::RequestBuild,
                     AttemptStage::BeforeSend,
@@ -2265,12 +2522,12 @@ async fn get_chat_completion_response_with_options(
                     "Failed to serialize inference request: request_id={}, execution_id={}, attempt_id={}, error={:?}",
                     attempt.request_id, attempt.execution_id, attempt.attempt_id, error
                 );
-                return Err(failed_completion_execution(
-                    &state.provider_router,
-                    attempt,
-                    failure,
-                    ApiError::InternalServerError,
-                ));
+                let terminal = AttemptTerminal::Failed { attempt, failure };
+                terminal_guard.record_terminal(&terminal);
+                return Err(CompletionExecutionError::Attempt {
+                    terminal,
+                    public_error: ApiError::InternalServerError,
+                });
             }
         };
         let request_log_metadata =
@@ -2285,11 +2542,7 @@ async fn get_chat_completion_response_with_options(
             request_log_metadata
         );
 
-        let terminal_guard = AttemptObservationGuard::new(
-            execution.begin_attempt(route_identity.clone()),
-            Arc::clone(&state.provider_router),
-            AttemptStage::AwaitingResponse,
-        );
+        terminal_guard.set_stage(AttemptStage::AwaitingResponse);
         let (
             ProviderSendTrace {
                 prior_failures,
@@ -2348,14 +2601,13 @@ async fn get_chat_completion_response_with_options(
                     failure.stage,
                     request_log_metadata
                 );
-                let execution_error = failed_completion_execution(
-                    &state.provider_router,
-                    attempt,
-                    failure.clone(),
-                    public_completion_error(&err, &failure),
-                );
-                terminal_guard.disarm();
-                return Err(execution_error);
+                let public_error = public_completion_error(&err, &failure);
+                let terminal = AttemptTerminal::Failed { attempt, failure };
+                terminal_guard.record_terminal(&terminal);
+                return Err(CompletionExecutionError::Attempt {
+                    terminal,
+                    public_error,
+                });
             }
         }
     };
@@ -2421,14 +2673,15 @@ pub(crate) async fn finish_started_completion(
         {
             Ok(response_json) => response_json,
             Err(failure) => {
-                let execution_error = failed_completion_execution(
-                    &state.provider_router,
-                    attempt.clone(),
+                let terminal = AttemptTerminal::Failed {
+                    attempt: attempt.clone(),
                     failure,
-                    ApiError::InternalServerError,
-                );
-                terminal_guard.disarm();
-                return Err(execution_error);
+                };
+                terminal_guard.record_terminal(&terminal);
+                return Err(CompletionExecutionError::Attempt {
+                    terminal,
+                    public_error: ApiError::InternalServerError,
+                });
             }
         };
 
@@ -3948,8 +4201,8 @@ mod tests {
     }
 
     fn pinned_test_completion() -> PinnedCompletionRequest {
-        PinnedCompletionRequest {
-            intent: InferenceIntent::new(
+        PinnedCompletionRequest::new(
+            InferenceIntent::new(
                 Uuid::nil(),
                 crate::model_config::AUTO_POWERFUL_MODEL_ID,
                 "glm-5-2",
@@ -3957,7 +4210,7 @@ mod tests {
                 InferenceSurface::Responses,
                 WorkloadClass::Interactive,
             ),
-            route: SelectedProviderRoute {
+            SelectedProviderRoute {
                 provider: ProviderId::Tinfoil,
                 proxy: ProxyConfig {
                     base_url: "http://tinfoil.example.com".to_string(),
@@ -3970,8 +4223,9 @@ mod tests {
                 bucket: None,
                 selection_source: crate::provider_registry::RouteSelectionSource::DefaultProvider,
             },
-            routing_mode: InferenceRoutingMode::V2,
-        }
+            None,
+            InferenceRoutingMode::V2,
+        )
     }
 
     #[test]
@@ -4003,6 +4257,246 @@ mod tests {
             &pinned.route,
             &wrong_model
         ));
+    }
+
+    fn probe_test_proxy_router() -> ProxyRouter {
+        ProxyRouter::new(
+            "http://continuum.example.com".to_string(),
+            None,
+            "http://tinfoil.example.com".to_string(),
+        )
+    }
+
+    fn pinned_glm_5_3_completion(
+        provider_router: &ProviderRouter,
+        proxy_router: &ProxyRouter,
+    ) -> PinnedCompletionRequest {
+        let intent = InferenceIntent::new(
+            Uuid::nil(),
+            crate::model_config::GLM_5_3_MODEL_ID,
+            crate::model_config::GLM_5_3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+        let route = provider_router
+            .select_active_completion_route(proxy_router, &intent, None)
+            .expect("initial GLM 5.3 route");
+        assert_eq!(route.provider, ProviderId::Continuum);
+        PinnedCompletionRequest::new(intent, route, None, InferenceRoutingMode::V2)
+    }
+
+    fn open_and_claim_probe_at_boundary(
+        provider_router: &ProviderRouter,
+        intent: &InferenceIntent,
+        route: &SelectedProviderRoute,
+    ) -> ProbeLease {
+        let terminal = AttemptTerminal::Failed {
+            attempt: intent.begin_execution().begin_attempt(route.identity()),
+            failure: AttemptFailure::new(
+                AttemptFailureKind::CapacityRejected,
+                AttemptStage::AwaitingResponse,
+                ReplaySafety::ProvenPreAcceptance,
+            )
+            .with_upstream_response(429, Some(Duration::from_secs(30)), None),
+        };
+        provider_router.observe_attempt_terminal(&terminal, ShadowObservationMode::Update);
+
+        match provider_router.try_claim_probe_at(
+            &route.identity().route_key(),
+            std::time::Instant::now() + Duration::from_secs(31),
+        ) {
+            ProbeClaimResult::Ready(Some(probe)) => probe,
+            other => panic!("expected a half-open probe lease, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_router_bypasses_probe_claims_and_replanning() {
+        let provider_router = ProviderRouter::default();
+        let proxy_router = probe_test_proxy_router();
+        let intent = InferenceIntent::new(
+            Uuid::nil(),
+            crate::model_config::KIMI_K3_MODEL_ID,
+            crate::model_config::KIMI_K3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::ChatCompletions,
+            WorkloadClass::Interactive,
+        );
+        let route = provider_router
+            .select_completion_route_with_preference(
+                &proxy_router,
+                intent.account_uuid,
+                &intent.public_model_id,
+                None,
+            )
+            .expect("legacy K3 route");
+        let pinned = PinnedCompletionRequest::new(
+            intent.clone(),
+            route.clone(),
+            None,
+            InferenceRoutingMode::Legacy,
+        );
+        let winning_probe = open_and_claim_probe_at_boundary(&provider_router, &intent, &route);
+
+        let claimed = claim_completion_turn(&provider_router, &proxy_router, &pinned, true)
+            .expect("legacy routing ignores Router v2 recovery state");
+
+        assert_eq!(claimed.route.identity(), route.identity());
+        assert!(claimed.probe.is_none());
+        assert!(pinned.finalized_route.get().is_none());
+        drop(winning_probe);
+    }
+
+    #[test]
+    fn lost_auto_powerful_probe_claim_replans_within_glm_before_send() {
+        let provider_router = ProviderRouter::default();
+        let proxy_router = probe_test_proxy_router();
+        let intent = InferenceIntent::new(
+            Uuid::nil(),
+            crate::model_config::AUTO_POWERFUL_MODEL_ID,
+            crate::model_config::GLM_5_3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::ChatCompletions,
+            WorkloadClass::Interactive,
+        );
+        let route = provider_router
+            .select_active_completion_route(&proxy_router, &intent, None)
+            .expect("initial GLM route");
+        assert_eq!(route.provider, ProviderId::Continuum);
+        let pinned = PinnedCompletionRequest::new(
+            intent.clone(),
+            route.clone(),
+            None,
+            InferenceRoutingMode::V2,
+        );
+        let winning_probe = open_and_claim_probe_at_boundary(&provider_router, &intent, &route);
+
+        let claimed = claim_completion_turn(&provider_router, &proxy_router, &pinned, true)
+            .expect("loser should replan before sending");
+
+        assert_eq!(
+            claimed.route.public_model_id,
+            crate::model_config::GLM_5_3_MODEL_ID
+        );
+        assert_eq!(claimed.route.provider, ProviderId::Tinfoil);
+        assert_eq!(claimed.route.provider_model_id, "glm-5-3");
+        assert!(claimed.probe.is_none());
+        assert_eq!(pinned.selected_route().provider, ProviderId::Tinfoil);
+        drop(winning_probe);
+    }
+
+    #[test]
+    fn singleton_probe_loser_fails_before_send_without_finalizing_a_route() {
+        let provider_router = ProviderRouter::default();
+        let proxy_router = probe_test_proxy_router();
+        let intent = InferenceIntent::new(
+            Uuid::nil(),
+            crate::model_config::KIMI_K3_MODEL_ID,
+            crate::model_config::KIMI_K3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::ChatCompletions,
+            WorkloadClass::Interactive,
+        );
+        let route = provider_router
+            .select_active_completion_route(&proxy_router, &intent, None)
+            .expect("initial K3 route");
+        let pinned = PinnedCompletionRequest::new(
+            intent.clone(),
+            route.clone(),
+            None,
+            InferenceRoutingMode::V2,
+        );
+        let winning_probe = open_and_claim_probe_at_boundary(&provider_router, &intent, &route);
+
+        let error = claim_completion_turn(&provider_router, &proxy_router, &pinned, true)
+            .expect_err("a singleton route has no same-model fallback");
+
+        assert!(matches!(error, ApiError::InferenceCapacity { .. }));
+        assert!(pinned.finalized_route.get().is_none());
+        drop(winning_probe);
+    }
+
+    #[test]
+    fn exact_route_probe_loser_does_not_replan() {
+        let provider_router = ProviderRouter::default();
+        let proxy_router = probe_test_proxy_router();
+        let pinned = pinned_glm_5_3_completion(&provider_router, &proxy_router);
+        let route = pinned.route.clone();
+        let winning_probe =
+            open_and_claim_probe_at_boundary(&provider_router, pinned.intent(), &route);
+        let alternate = provider_router
+            .select_active_completion_route(&proxy_router, pinned.intent(), None)
+            .expect("same-model alternate remains eligible");
+        assert_eq!(alternate.provider, ProviderId::Tinfoil);
+
+        let error = claim_completion_turn(&provider_router, &proxy_router, &pinned, false)
+            .expect_err("an exact route must not move to another provider");
+
+        assert!(matches!(error, ApiError::InferenceCapacity { .. }));
+        assert!(pinned.finalized_route.get().is_none());
+        drop(winning_probe);
+    }
+
+    #[test]
+    fn cancelled_probe_guard_releases_ownership_without_healing() {
+        let provider_router = Arc::new(ProviderRouter::default());
+        let proxy_router = probe_test_proxy_router();
+        let intent = InferenceIntent::new(
+            Uuid::nil(),
+            crate::model_config::KIMI_K3_MODEL_ID,
+            crate::model_config::KIMI_K3_MODEL_ID,
+            ModelPlan::Paid,
+            InferenceSurface::Responses,
+            WorkloadClass::Interactive,
+        );
+        let route = provider_router
+            .select_active_completion_route(&proxy_router, &intent, None)
+            .expect("initial K3 route");
+        let probe = open_and_claim_probe_at_boundary(&provider_router, &intent, &route);
+        let attempt = intent.begin_execution().begin_attempt(route.identity());
+
+        drop(AttemptObservationGuard::new_with_probe(
+            attempt,
+            Arc::clone(&provider_router),
+            AttemptStage::AwaitingResponse,
+            Some(probe),
+        ));
+
+        let next = provider_router.try_claim_probe_at(
+            &route.identity().route_key(),
+            std::time::Instant::now() + Duration::from_secs(31),
+        );
+        assert!(matches!(next, ProbeClaimResult::Ready(Some(_))));
+    }
+
+    #[test]
+    fn later_tool_turn_stays_pinned_and_fails_while_recovery_probe_is_owned() {
+        let provider_router = ProviderRouter::default();
+        let proxy_router = probe_test_proxy_router();
+        let pinned = pinned_glm_5_3_completion(&provider_router, &proxy_router);
+        let route = pinned.route.clone();
+
+        let first = claim_completion_turn(&provider_router, &proxy_router, &pinned, true)
+            .expect("first turn finalizes the route");
+        assert_eq!(first.route.provider, ProviderId::Continuum);
+        assert!(first.probe.is_none());
+
+        let healthy_later = claim_completion_turn(&provider_router, &proxy_router, &pinned, true)
+            .expect("healthy later turn remains pinned");
+        assert_eq!(healthy_later.route.identity(), route.identity());
+        assert!(healthy_later.probe.is_none());
+
+        let _external_probe =
+            open_and_claim_probe_at_boundary(&provider_router, pinned.intent(), &route);
+        let alternate = provider_router
+            .select_active_completion_route(&proxy_router, pinned.intent(), None)
+            .expect("same-model alternate remains eligible");
+        assert_eq!(alternate.provider, ProviderId::Tinfoil);
+        let error = claim_completion_turn(&provider_router, &proxy_router, &pinned, true)
+            .expect_err("later turn must not bypass another recovery probe");
+        assert!(matches!(error, ApiError::InferenceCapacity { .. }));
+        assert_eq!(pinned.selected_route().identity(), route.identity());
     }
 
     async fn record_terminal_once(
@@ -4453,7 +4947,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn glm_tool_turns_keep_the_original_mock_provider_after_health_opens() {
+    async fn glm_tool_turns_stay_pinned_and_block_when_health_opens() {
         let tinfoil_count = Arc::new(AtomicUsize::new(0));
         let tinfoil_app = {
             let count = Arc::clone(&tinfoil_count);
@@ -4511,21 +5005,23 @@ mod tests {
             baseline,
         )
         .expect("initial GLM route");
-        let pinned = PinnedCompletionRequest {
-            intent,
-            route,
-            routing_mode: InferenceRoutingMode::V2,
-        };
+        let pinned = PinnedCompletionRequest::new(intent, route, None, InferenceRoutingMode::V2);
+        let provider_router_ref = &provider_router;
+        let proxy_router_ref = &proxy_router;
 
         let send_pinned_turn = |content: &'static str| {
             let provider_client = &provider_client;
             let pinned = &pinned;
             async move {
+                let claimed =
+                    claim_completion_turn(provider_router_ref, proxy_router_ref, pinned, true)
+                        .expect("healthy pinned turn is admitted");
+                assert!(claimed.probe.is_none());
                 let trace = try_provider(
                     provider_client,
-                    &pinned.route.proxy,
+                    &claimed.route.proxy,
                     json!({
-                        "model": pinned.route.provider_model_id,
+                        "model": claimed.route.provider_model_id,
                         "messages": [{"role": "user", "content": content}]
                     })
                     .to_string(),
@@ -4536,10 +5032,10 @@ mod tests {
                 let response = trace.result.expect("pinned mock turn succeeds");
                 let attempt = pinned
                     .begin_execution()
-                    .begin_attempt(pinned.route.identity());
+                    .begin_attempt(claimed.route.identity());
                 let response = read_non_streaming_completion_response(
                     response,
-                    &pinned.route.response_model_id,
+                    &claimed.route.response_model_id,
                     &attempt,
                     None,
                 )
@@ -4574,11 +5070,12 @@ mod tests {
             public_completion_error(&external_error, &external_failure),
         );
 
-        let second_attempt = send_pinned_turn("second tool turn").await;
-        assert_eq!(first_attempt.request_id, second_attempt.request_id);
-        assert_ne!(first_attempt.execution_id, second_attempt.execution_id);
-        assert_eq!(first_attempt.route, second_attempt.route);
-        assert_eq!(continuum_count.load(Ordering::SeqCst), 2);
+        let error = claim_completion_turn(&provider_router, &proxy_router, &pinned, true)
+            .expect_err("later tool turn must not bypass an open pinned route");
+        assert!(matches!(error, ApiError::InferenceCapacity { .. }));
+        assert_eq!(pinned.selected_route().provider, ProviderId::Continuum);
+        assert_eq!(first_attempt.route.provider, ProviderId::Continuum);
+        assert_eq!(continuum_count.load(Ordering::SeqCst), 1);
         assert_eq!(tinfoil_count.load(Ordering::SeqCst), 0);
 
         let next_intent = InferenceIntent::new(

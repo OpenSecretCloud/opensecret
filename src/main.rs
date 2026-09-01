@@ -11,6 +11,7 @@ use crate::encrypt::{
 };
 use crate::jwt::validate_platform_jwt;
 use crate::login_routes::RegisterCredentials;
+use crate::model_config::{ModelAliasTargets, ModelPlan, PaidModelAliasOverrides};
 use crate::models::account_deletion::{AccountDeletionError, NewAccountDeletionRequest};
 use crate::models::email_verification::{EmailVerificationError, NewEmailVerification};
 use crate::models::oauth::{NewUserOAuthConnection, OAuthError};
@@ -129,7 +130,7 @@ mod aead_db_tamper_tests;
 use apple_signin::AppleJwtVerifier;
 use oauth::{AppleProvider, GithubProvider, GoogleProvider, OAuthManager};
 use provider_client::{ProviderClient, ProviderRequestError};
-use provider_routing::{ProviderName, ProviderPreference, ProviderRouter};
+use provider_routing::{ProviderPreference, ProviderRouter};
 use proxy_config::ProxyRouter;
 
 const ENCLAVE_KEY_NAME: &str = "enclave_key";
@@ -148,6 +149,7 @@ const BILLING_SERVER_URL_NAME: &str = "billing_server_url";
 const KAGI_API_KEY_NAME: &str = "kagi_api_key";
 const OS_FLAGS_API_KEY_NAME: &str = "os_flags_api_key";
 const OS_FLAGS_BASE_URL_NAME: &str = "os_flags_base_url";
+const MODEL_ALIAS_FLAGS_TIMEOUT_SECS: u64 = 5;
 const PROVIDER_ROUTING_FLAGS_TIMEOUT_SECS: u64 = 5;
 const BILLING_ACCESS_TIMEOUT_SECS: u64 = 5;
 const MAX_ATTESTATION_NONCE_BYTES: usize = 512;
@@ -1158,6 +1160,52 @@ impl AppState {
         }
     }
 
+    /// Resolve automatic model aliases for this user's plan. Paid overrides
+    /// default off on missing configuration, a missing flag, service failure,
+    /// or timeout. Free plans never apply paid alias overrides.
+    pub(crate) async fn model_alias_targets(
+        &self,
+        user_uuid: Uuid,
+        model_plan: ModelPlan,
+    ) -> ModelAliasTargets {
+        if !model_plan.is_paid() {
+            return ModelAliasTargets::for_plan(model_plan);
+        }
+
+        let Some(client) = &self.os_flags_client else {
+            trace!(
+                "os-flags client not configured; using default paid model aliases (user_uuid={})",
+                user_uuid
+            );
+            return ModelAliasTargets::for_plan(model_plan);
+        };
+
+        let overrides = match tokio::time::timeout(
+            Duration::from_secs(MODEL_ALIAS_FLAGS_TIMEOUT_SECS),
+            client.get_user_flags(user_uuid, Some(os_flags::PAID_MODEL_ALIAS_FLAG_KEYS)),
+        )
+        .await
+        {
+            Ok(Ok(response)) => PaidModelAliasOverrides::from_flag_values(&response.flags),
+            Ok(Err(e)) => {
+                warn!(
+                    "os-flags paid model alias check failed (user_uuid={}): {}; using default aliases",
+                    user_uuid, e
+                );
+                PaidModelAliasOverrides::default()
+            }
+            Err(_) => {
+                warn!(
+                    "os-flags paid model alias check timed out after {}s (user_uuid={}); using default aliases",
+                    MODEL_ALIAS_FLAGS_TIMEOUT_SECS, user_uuid
+                );
+                PaidModelAliasOverrides::default()
+            }
+        };
+
+        ModelAliasTargets::for_plan_with_overrides(model_plan, overrides)
+    }
+
     /// Resolve an explicit provider preference only for models configured for
     /// flag-controlled routing. Missing configuration, flags, failures, and
     /// timeouts retain the model's default provider.
@@ -1166,9 +1214,10 @@ impl AppState {
         user_uuid: Uuid,
         requested_model: &str,
     ) -> Option<ProviderPreference> {
-        let flag_key = self
+        let provider_flag = self
             .provider_router
-            .continuum_flag_key_for_completion_model(requested_model)?;
+            .provider_routing_flag_for_completion_model(requested_model)?;
+        let flag_key = provider_flag.key();
 
         let Some(client) = &self.os_flags_client else {
             trace!(
@@ -1184,8 +1233,7 @@ impl AppState {
         )
         .await
         {
-            Ok(Ok(Some(true))) => Some(ProviderPreference::feature_flag(ProviderName::Continuum)),
-            Ok(Ok(Some(false))) => Some(ProviderPreference::feature_flag(ProviderName::Tinfoil)),
+            Ok(Ok(Some(enabled))) => Some(provider_flag.preference_for(enabled)),
             Ok(Ok(None)) => {
                 debug!(
                     "os-flags provider routing flag missing (user_uuid={}, requested_model={}, flag_key={}); using default provider routing",

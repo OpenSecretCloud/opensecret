@@ -1,8 +1,6 @@
 //! Central model-specific configuration and public model catalog.
 
-use crate::os_flags::PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelConfig {
@@ -103,21 +101,16 @@ pub(crate) struct ModelAliasTargets {
     powerful: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PaidModelAliasOverrides {
-    powerful_kimi_k3: bool,
-}
-
 pub const DEFAULT_CONTEXT_WINDOW: usize = 64_000;
 pub const DEFAULT_TEMPERATURE: f32 = 0.7;
 pub const DEFAULT_TOP_P: f32 = 1.0;
 pub const AUTO_QUICK_MODEL_ID: &str = "auto:quick";
 pub const AUTO_POWERFUL_MODEL_ID: &str = "auto:powerful";
 pub const QUICK_MODEL_ID: &str = "gpt-oss-120b";
-pub const POWERFUL_MODEL_ID: &str = "kimi-k2-6";
+pub const GLM_5_2_MODEL_ID: &str = "glm-5-2";
+pub const POWERFUL_MODEL_ID: &str = GLM_5_2_MODEL_ID;
 pub const KIMI_K3_MODEL_ID: &str = "kimi-k3";
 pub const DEEPSEEK_V4_FLASH_MODEL_ID: &str = "deepseek-v4-flash";
-pub const GLM_5_2_MODEL_ID: &str = "glm-5-2";
 
 const FREE_MODEL_ALIAS_TARGETS: ModelAliasTargets = ModelAliasTargets {
     quick: QUICK_MODEL_ID,
@@ -399,23 +392,6 @@ impl ModelAliasTargets {
         }
     }
 
-    pub(crate) const fn for_plan_with_overrides(
-        plan: ModelPlan,
-        overrides: PaidModelAliasOverrides,
-    ) -> Self {
-        match plan {
-            ModelPlan::Free => FREE_MODEL_ALIAS_TARGETS,
-            ModelPlan::Paid => Self {
-                quick: PAID_MODEL_ALIAS_TARGETS.quick,
-                powerful: if overrides.powerful_kimi_k3 {
-                    KIMI_K3_MODEL_ID
-                } else {
-                    PAID_MODEL_ALIAS_TARGETS.powerful
-                },
-            },
-        }
-    }
-
     pub(crate) fn resolve(self, model: &str) -> &str {
         match model {
             AUTO_QUICK_MODEL_ID => self.quick,
@@ -429,17 +405,6 @@ impl ModelAliasTargets {
             AUTO_QUICK_MODEL_ID => Some(self.quick),
             AUTO_POWERFUL_MODEL_ID => Some(self.powerful),
             _ => None,
-        }
-    }
-}
-
-impl PaidModelAliasOverrides {
-    pub(crate) fn from_flag_values(flags: &HashMap<String, bool>) -> Self {
-        Self {
-            powerful_kimi_k3: flags
-                .get(PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY)
-                .copied()
-                .unwrap_or(false),
         }
     }
 }
@@ -650,10 +615,6 @@ const MODEL_ALIAS_ENTRIES: &[ModelAliasEntry] = &[
 
 fn alias_target(model: &str) -> Option<&'static str> {
     ModelAliasTargets::default().target_for(model)
-}
-
-pub(crate) fn model_alias_requires_flag_lookup(model: &str) -> bool {
-    model == AUTO_POWERFUL_MODEL_ID
 }
 
 fn model_entry(model: &str) -> Option<ModelConfigEntry> {
@@ -920,6 +881,10 @@ mod tests {
             model_reasoning_history_strategy("glm-5-2"),
             Some(ReasoningHistoryStrategy::GlmClearThinking)
         );
+        assert_eq!(
+            model_reasoning_history_strategy(AUTO_POWERFUL_MODEL_ID),
+            Some(ReasoningHistoryStrategy::GlmClearThinking)
+        );
         assert_eq!(model_reasoning_history_strategy("gemma4-31b"), None);
     }
 
@@ -1001,68 +966,24 @@ mod tests {
 
     #[test]
     fn test_model_alias_targets_are_selected_by_plan() {
+        assert_eq!(POWERFUL_MODEL_ID, GLM_5_2_MODEL_ID);
+
         let free = ModelAliasTargets::for_plan(ModelPlan::Free);
         assert_eq!(free.resolve(AUTO_QUICK_MODEL_ID), QUICK_MODEL_ID);
-        assert_eq!(free.resolve(AUTO_POWERFUL_MODEL_ID), POWERFUL_MODEL_ID);
+        assert_eq!(free.resolve(AUTO_POWERFUL_MODEL_ID), GLM_5_2_MODEL_ID);
 
         let paid = ModelAliasTargets::for_plan(ModelPlan::Paid);
         assert_eq!(
             paid.resolve(AUTO_QUICK_MODEL_ID),
             DEEPSEEK_V4_FLASH_MODEL_ID
         );
-        assert_eq!(paid.resolve(AUTO_POWERFUL_MODEL_ID), POWERFUL_MODEL_ID);
-        assert_eq!(paid.resolve("glm-5-2"), "glm-5-2");
+        assert_eq!(paid.resolve(AUTO_POWERFUL_MODEL_ID), GLM_5_2_MODEL_ID);
+        assert_eq!(paid.resolve(KIMI_K3_MODEL_ID), KIMI_K3_MODEL_ID);
     }
 
     #[test]
-    fn test_paid_powerful_kimi_k3_alias_override_is_plan_gated_and_default_off() {
-        for powerful_enabled in [false, true] {
-            let flags = HashMap::from([(
-                PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY.to_string(),
-                powerful_enabled,
-            )]);
-            let overrides = PaidModelAliasOverrides::from_flag_values(&flags);
-
-            let free = ModelAliasTargets::for_plan_with_overrides(ModelPlan::Free, overrides);
-            assert_eq!(free.resolve(AUTO_QUICK_MODEL_ID), QUICK_MODEL_ID);
-            assert_eq!(free.resolve(AUTO_POWERFUL_MODEL_ID), POWERFUL_MODEL_ID);
-
-            let paid = ModelAliasTargets::for_plan_with_overrides(ModelPlan::Paid, overrides);
-            assert_eq!(
-                paid.resolve(AUTO_QUICK_MODEL_ID),
-                DEEPSEEK_V4_FLASH_MODEL_ID
-            );
-            assert_eq!(
-                paid.resolve(AUTO_POWERFUL_MODEL_ID),
-                if powerful_enabled {
-                    KIMI_K3_MODEL_ID
-                } else {
-                    POWERFUL_MODEL_ID
-                }
-            );
-        }
-
-        assert_eq!(
-            PaidModelAliasOverrides::from_flag_values(&HashMap::new()),
-            PaidModelAliasOverrides::default()
-        );
-        assert_eq!(
-            PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY,
-            "model-alias.paid.powerful.kimi-k3"
-        );
-        assert_eq!(
-            crate::os_flags::PAID_MODEL_ALIAS_FLAG_KEYS,
-            &[PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY]
-        );
-    }
-
-    #[test]
-    fn test_catalog_alias_metadata_tracks_paid_override_targets() {
-        let flags = HashMap::from([(PAID_POWERFUL_KIMI_K3_ALIAS_FLAG_KEY.to_string(), true)]);
-        let targets = ModelAliasTargets::for_plan_with_overrides(
-            ModelPlan::Paid,
-            PaidModelAliasOverrides::from_flag_values(&flags),
-        );
+    fn test_catalog_alias_metadata_tracks_paid_targets() {
+        let targets = ModelAliasTargets::for_plan(ModelPlan::Paid);
         let catalog = model_catalog_response(targets);
         let aliases = catalog["aliases"].as_array().expect("aliases");
         let quick = aliases
@@ -1077,9 +998,9 @@ mod tests {
         assert_eq!(quick["target_model"], DEEPSEEK_V4_FLASH_MODEL_ID);
         assert_eq!(quick["access"], "pro");
         assert_eq!(quick["capabilities"]["vision"], false);
-        assert_eq!(powerful["target_model"], KIMI_K3_MODEL_ID);
+        assert_eq!(powerful["target_model"], GLM_5_2_MODEL_ID);
         assert_eq!(powerful["access"], "pro");
-        assert_eq!(powerful["capabilities"]["vision"], true);
+        assert_eq!(powerful["capabilities"]["vision"], false);
     }
 
     #[test]
@@ -1152,24 +1073,6 @@ mod tests {
     }
 
     #[test]
-    fn test_only_powerful_alias_requires_flag_lookup() {
-        assert!(model_alias_requires_flag_lookup(AUTO_POWERFUL_MODEL_ID));
-        for model in [
-            AUTO_QUICK_MODEL_ID,
-            QUICK_MODEL_ID,
-            POWERFUL_MODEL_ID,
-            "kimi-k3",
-            DEEPSEEK_V4_FLASH_MODEL_ID,
-            GLM_5_2_MODEL_ID,
-        ] {
-            assert!(
-                !model_alias_requires_flag_lookup(model),
-                "direct/static model should not require flags: {model}"
-            );
-        }
-    }
-
-    #[test]
     fn test_openai_models_includes_api_only_models() {
         let response = openai_models_response();
         let data = response["data"].as_array().expect("models data");
@@ -1192,16 +1095,13 @@ mod tests {
     }
 
     #[test]
-    fn test_catalog_advertises_kimi_through_continuum() {
+    fn test_catalog_keeps_kimi_k2_6_selectable_through_continuum() {
         let catalog = model_catalog_response(ModelAliasTargets::default());
-        let kimi = catalog_model(&catalog, POWERFUL_MODEL_ID);
+        let kimi = catalog_model(&catalog, "kimi-k2-6");
 
         assert_eq!(kimi["provider"], "continuum");
         assert_eq!(kimi["provider_id"], "kimi-k2.6");
-        assert_eq!(
-            resolve_completion_model_id(POWERFUL_MODEL_ID),
-            Some(POWERFUL_MODEL_ID)
-        );
+        assert_eq!(resolve_completion_model_id("kimi-k2-6"), Some("kimi-k2-6"));
     }
 
     #[test]

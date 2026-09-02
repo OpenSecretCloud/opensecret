@@ -845,7 +845,11 @@ async fn proxy_openai(
                         Ok(event) => yield Ok::<Event, std::convert::Infallible>(event),
                         Err(e) => {
                             error!("Failed to encrypt event data: {:?}", e);
-                            yield Ok(Event::default().data("Error: Encryption failed"));
+                            // Encryption is down, so this frame cannot be
+                            // encrypted either; plaintext JSON at least
+                            // parses if the client tries.
+                            yield Ok(Event::default()
+                                .data(stream_error_payload("Encryption failed").to_string()));
                             break;
                         }
                     }
@@ -860,19 +864,48 @@ async fn proxy_openai(
                 }
                 CompletionChunk::Error(error_msg) => {
                     error!("Stream error from completion API: {}", error_msg);
-                    yield Ok(Event::default().data(format!("Error: {}", error_msg)));
+                    match encrypt_sse_event(&state, &session_id, &stream_error_payload(&error_msg)).await {
+                        Ok(event) => yield Ok(event),
+                        Err(e) => {
+                            error!("Failed to encrypt error event: {:?}", e);
+                            yield Ok(Event::default()
+                                .data(stream_error_payload(&error_msg).to_string()));
+                        }
+                    }
                     break;
                 }
                 CompletionChunk::FullResponse(_) => {
                     // Shouldn't happen in streaming mode
                     error!("Received FullResponse in streaming mode");
-                    yield Ok(Event::default().data("Error: Invalid event format"));
+                    match encrypt_sse_event(&state, &session_id, &stream_error_payload("Invalid event format")).await {
+                        Ok(event) => yield Ok(event),
+                        Err(e) => {
+                            error!("Failed to encrypt error event: {:?}", e);
+                            yield Ok(Event::default()
+                                .data(stream_error_payload("Invalid event format").to_string()));
+                        }
+                    }
                     break;
                 }
             }
         }
     };
     Ok(Sse::new(stream).into_response())
+}
+
+/// OpenAI-style error payload for in-stream failures. Streaming
+/// clients decrypt and JSON-parse every `data:` frame, so a prose
+/// frame ("Error: ...") is indistinguishable from a corrupted
+/// stream; this shape lets them surface the actual cause.
+fn stream_error_payload(message: &str) -> Value {
+    json!({
+        "error": {
+            "message": message,
+            "type": "server_error",
+            "param": null,
+            "code": null,
+        }
+    })
 }
 
 /// Internal function to get chat completion response with automatic billing
@@ -2593,6 +2626,21 @@ async fn try_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_error_payload_is_openai_shaped_json() {
+        let payload = stream_error_payload("Stream timeout");
+
+        assert_eq!(payload["error"]["message"], "Stream timeout");
+        assert_eq!(payload["error"]["type"], "server_error");
+        assert!(payload["error"]["param"].is_null());
+        assert!(payload["error"]["code"].is_null());
+        // The rendered frame must parse back as JSON; prose frames
+        // ("Error: ...") read as a corrupted stream to clients.
+        let rendered = payload.to_string();
+        assert!(serde_json::from_str::<Value>(&rendered).is_ok());
+        assert!(!rendered.starts_with("Error:"));
+    }
 
     #[tokio::test]
     async fn bounded_provider_response_body_accepts_exact_limit_across_chunks() {

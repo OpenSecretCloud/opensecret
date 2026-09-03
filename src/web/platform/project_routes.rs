@@ -6,17 +6,16 @@ use crate::{
         platform_users::PlatformUser,
         project_settings::{EmailSettings, OAuthSettings},
     },
-    web::encryption_middleware::{
-        decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
-    },
+    web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
     ApiError, AppState,
 };
 use axum::routing::put;
 use axum::{
     extract::{Path, State},
     middleware::from_fn_with_state,
+    response::Response,
     routing::{delete, get, patch, post},
-    Extension, Json, Router,
+    Extension, Router,
 };
 use base64::engine::general_purpose;
 use base64::Engine as _;
@@ -111,7 +110,7 @@ async fn create_project(
     Path(org_id): Path<Uuid>,
     Extension(create_request): Extension<CreateProjectRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<ProjectResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Creating new project");
 
     // Validate request
@@ -184,7 +183,7 @@ async fn list_projects(
     Extension(platform_user): Extension<PlatformUser>,
     Path(org_id): Path<Uuid>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<Vec<ProjectResponse>>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Listing projects");
 
     // Get org by UUID
@@ -205,7 +204,7 @@ async fn list_projects(
         ApiError::InternalServerError
     })?;
 
-    let response = projects
+    let response: Vec<ProjectResponse> = projects
         .into_iter()
         .map(|p| ProjectResponse {
             id: p.uuid,
@@ -226,7 +225,7 @@ async fn update_project(
     Path((org_id, project_id)): Path<(Uuid, Uuid)>,
     Extension(update_request): Extension<UpdateProjectRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<ProjectResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Updating project");
 
     // Get org and project by UUID
@@ -308,7 +307,7 @@ async fn get_project(
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, project_id)): Path<(Uuid, Uuid)>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<ProjectResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Getting project");
 
     // Get org and project by UUID
@@ -352,7 +351,7 @@ async fn delete_project(
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, project_id)): Path<(Uuid, Uuid)>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Deleting project");
 
     // Get org and project by UUID
@@ -401,7 +400,7 @@ async fn create_secret(
     Path((org_id, project_id)): Path<(Uuid, Uuid)>,
     Extension(create_request): Extension<CreateSecretRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<SecretResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Creating project secret");
 
     // Validate request
@@ -479,7 +478,7 @@ async fn list_secrets(
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, project_id)): Path<(Uuid, Uuid)>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<Vec<SecretResponse>>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Listing project secrets");
 
     // Get org and project by UUID
@@ -531,7 +530,7 @@ async fn delete_secret(
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, project_id, key_name)): Path<(Uuid, Uuid, String)>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Deleting project secret");
 
     // Get org and project by UUID
@@ -593,7 +592,7 @@ async fn get_email_settings(
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, project_id)): Path<(Uuid, Uuid)>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<EmailSettings>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Getting project email settings");
 
     // Get org and project by UUID
@@ -637,7 +636,7 @@ async fn update_email_settings(
     Path((org_id, project_id)): Path<(Uuid, Uuid)>,
     Extension(update_request): Extension<UpdateEmailSettingsRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<EmailSettings>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Updating project email settings");
 
     // Validate request
@@ -700,7 +699,7 @@ async fn get_oauth_settings(
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, project_id)): Path<(Uuid, Uuid)>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<OAuthSettings>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Getting project OAuth settings");
 
     // Get org and project by UUID
@@ -741,7 +740,7 @@ async fn update_oauth_settings(
     Path((org_id, project_id)): Path<(Uuid, Uuid)>,
     Extension(update_request): Extension<UpdateOAuthSettingsRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<OAuthSettings>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Updating project OAuth settings");
 
     // Validate request using validator

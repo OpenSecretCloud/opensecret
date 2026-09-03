@@ -8,9 +8,7 @@ use crate::{
     models::users::User,
     tokens::count_tokens,
     web::{
-        encryption_middleware::{
-            decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
-        },
+        encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
         responses::{
             constants::{
                 DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT,
@@ -24,8 +22,9 @@ use crate::{
 use axum::{
     extract::{Path, Query, State},
     middleware::from_fn_with_state,
+    response::Response,
     routing::{delete, get, post},
-    Extension, Json, Router,
+    Extension, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -253,7 +252,7 @@ async fn create_instruction(
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<CreateInstructionRequest>,
-) -> Result<Json<EncryptedResponse<InstructionResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Creating new instruction for user: {}", user.uuid);
 
     // Validate input
@@ -323,7 +322,7 @@ async fn get_instruction(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-) -> Result<Json<EncryptedResponse<InstructionResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!(
         "Getting instruction {} for user {}",
         instruction_id, user.uuid
@@ -348,7 +347,7 @@ async fn update_instruction(
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
     Extension(body): Extension<UpdateInstructionRequest>,
-) -> Result<Json<EncryptedResponse<InstructionResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!(
         "Updating instruction {} for user {}",
         instruction_id, user.uuid
@@ -423,7 +422,7 @@ async fn delete_instruction(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!(
         "Deleting instruction {} for user {}",
         instruction_id, user.uuid
@@ -453,7 +452,7 @@ async fn list_instructions(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-) -> Result<Json<EncryptedResponse<InstructionListResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Listing instructions for user: {}", user.uuid);
 
     let limit = if params.limit <= 0 {
@@ -527,7 +526,7 @@ async fn set_default_instruction(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-) -> Result<Json<EncryptedResponse<InstructionResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!(
         "Setting instruction {} as default for user {}",
         instruction_id, user.uuid

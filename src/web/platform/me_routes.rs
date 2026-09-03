@@ -2,16 +2,15 @@ use crate::{
     email::send_platform_verification_email,
     models::platform_email_verification::NewPlatformEmailVerification,
     models::platform_users::PlatformUser,
-    web::encryption_middleware::{
-        decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
-    },
+    web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
     ApiError, AppState,
 };
 use axum::{
     extract::State,
     middleware::from_fn_with_state,
+    response::Response,
     routing::{get, post},
-    Extension, Json, Router,
+    Extension, Router,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -65,7 +64,7 @@ async fn get_platform_user(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<MeResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Check if email is verified
     let email_verified = match data
         .db
@@ -132,7 +131,7 @@ async fn request_platform_verification(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Check if the user is already verified
     match data
         .db
@@ -202,7 +201,7 @@ pub async fn platform_change_password(
     Extension(platform_user): Extension<PlatformUser>,
     Extension(change_request): Extension<PlatformChangePasswordRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Validate request
     if let Err(errors) = change_request.validate() {
         error!("Validation error: {:?}", errors);

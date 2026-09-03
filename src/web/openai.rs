@@ -11,9 +11,7 @@ use crate::provider_routing::{ProviderName, ProviderRoutingError};
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
-use crate::web::encryption_middleware::{
-    decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
-};
+use crate::web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession};
 use crate::web::openai_auth::AuthMethod;
 use crate::web::responses::{ResponseExecution, ResponseExecutionTaskGuard};
 use crate::{ApiError, AppState};
@@ -23,7 +21,7 @@ use axum::{
     response::sse::{Event, Sse},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use base64::{engine::general_purpose, Engine as _};
 use bigdecimal::BigDecimal;
@@ -813,9 +811,16 @@ async fn proxy_openai(
     let billing_context = BillingContext::new(auth_method, requested_model_name);
 
     // Get the completion stream - billing happens automatically inside!
-    let completion =
-        get_chat_completion_response(&state, &user, body, &headers, billing_context, model_plan)
-            .await?;
+    let completion = get_chat_completion_response(
+        &state,
+        &user,
+        body,
+        &headers,
+        billing_context,
+        model_plan,
+        session_id.is_v2(),
+    )
+    .await?;
 
     debug!(
         "Received completion from provider: {} (streaming: {})",
@@ -844,7 +849,9 @@ async fn proxy_openai(
     debug!("Handling streaming response");
     let mut rx = completion.stream;
 
+    let require_explicit_terminal = session_id.is_v2();
     let stream = async_stream::stream! {
+        let mut saw_terminal = false;
         while let Some(chunk) = rx.recv().await {
             match chunk {
                 CompletionChunk::StreamChunk(json) => {
@@ -867,10 +874,12 @@ async fn proxy_openai(
                     trace!("Received usage chunk (billing already processed)");
                 }
                 CompletionChunk::Done => {
+                    saw_terminal = true;
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
                 CompletionChunk::Error(error_msg) => {
+                    saw_terminal = true;
                     error!("Stream error from completion API: {}", error_msg);
                     match encrypt_sse_event(&state, &session_id, &stream_error_payload(&error_msg)).await {
                         Ok(event) => yield Ok(event),
@@ -883,6 +892,7 @@ async fn proxy_openai(
                     break;
                 }
                 CompletionChunk::FullResponse(_) => {
+                    saw_terminal = true;
                     // Shouldn't happen in streaming mode
                     error!("Received FullResponse in streaming mode");
                     match encrypt_sse_event(&state, &session_id, &stream_error_payload("Invalid event format")).await {
@@ -894,6 +904,22 @@ async fn proxy_openai(
                         }
                     }
                     break;
+                }
+            }
+        }
+
+        if require_explicit_terminal && !saw_terminal {
+            error!("Completion stream closed without a terminal event");
+            match encrypt_sse_event(
+                &state,
+                &session_id,
+                &stream_error_payload("Completion stream ended unexpectedly"),
+            )
+            .await
+            {
+                Ok(event) => yield Ok(event),
+                Err(error) => {
+                    error!("Failed to encode terminal stream error: {:?}", error);
                 }
             }
         }
@@ -927,6 +953,7 @@ pub async fn get_chat_completion_response(
     headers: &HeaderMap,
     billing_context: BillingContext,
     model_plan: ModelPlan,
+    require_provider_done: bool,
 ) -> Result<CompletionStream, ApiError> {
     get_chat_completion_response_with_expected_route(
         state,
@@ -938,6 +965,7 @@ pub async fn get_chat_completion_response(
         None,
         None,
         None,
+        require_provider_done,
     )
     .await
 }
@@ -952,6 +980,7 @@ pub(crate) async fn get_chat_completion_response_for_execution(
     billing_context: BillingContext,
     model_plan: ModelPlan,
     response_execution: ResponseExecution,
+    require_provider_done: bool,
 ) -> Result<CompletionStream, ApiError> {
     let response_execution_guard = response_execution.begin_task().map_err(|_| {
         debug!("Response execution was cancelled before a provider turn could start");
@@ -967,6 +996,7 @@ pub(crate) async fn get_chat_completion_response_for_execution(
         None,
         Some(response_execution),
         Some(response_execution_guard),
+        require_provider_done,
     )
     .await
 }
@@ -1000,6 +1030,7 @@ pub(crate) async fn get_chat_completion_response_for_expected_route(
         }),
         None,
         None,
+        false,
     )
     .await
 }
@@ -1027,6 +1058,7 @@ async fn get_chat_completion_response_with_expected_route(
     expected_route: Option<ExpectedCompletionRoute<'_>>,
     response_execution: Option<ResponseExecution>,
     response_execution_guard: Option<ResponseExecutionTaskGuard>,
+    require_provider_done: bool,
 ) -> Result<CompletionStream, ApiError> {
     if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
@@ -1424,7 +1456,14 @@ async fn get_chat_completion_response_with_expected_route(
                         &tx_consumer,
                     )
                     .await;
-                    let _ = tx_consumer.send(CompletionChunk::Done).await;
+                    let terminal = if require_provider_done {
+                        CompletionChunk::Error(
+                            "Provider stream ended before its completion marker".to_string(),
+                        )
+                    } else {
+                        CompletionChunk::Done
+                    };
+                    let _ = tx_consumer.send(terminal).await;
                     return;
                 }
                 Err(_) => {
@@ -1791,23 +1830,21 @@ async fn encrypt_sse_event(
     json: &Value,
 ) -> Result<Event, ApiError> {
     let json_str = json.to_string();
-    let encrypted_data = transport_session
-        .encrypt_response_bytes(state, json_str.as_bytes())
+    let event_data = transport_session
+        .encode_sse_data(state, &json_str)
         .await
         .map_err(|e| {
-            error!("Failed to encrypt SSE event data: {:?}", e);
+            error!("Failed to encode SSE event data: {:?}", e);
             ApiError::InternalServerError
         })?;
-
-    let base64_encrypted = general_purpose::STANDARD.encode(&encrypted_data);
-    Ok(Event::default().data(base64_encrypted))
+    Ok(Event::default().data(event_data))
 }
 
 async fn proxy_models(
     State(state): State<Arc<AppState>>,
     axum::Extension(session_id): axum::Extension<TransportSession>,
     user: Option<axum::Extension<User>>,
-) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     let _ = user;
     let proxy_config = state.proxy_router.get_completion_proxy();
     let models_response = if proxy_config.provider_name == "tinfoil" {
@@ -1871,7 +1908,7 @@ async fn proxy_model_catalog(
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(_body): axum::Extension<()>,
-) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     let billing_access = state.chat_billing_access(user.uuid, false).await;
     let model_plan = ModelPlan::from_is_paid(
         billing_access.is_some_and(crate::billing::ChatBillingAccess::is_paid),
@@ -1986,7 +2023,7 @@ async fn proxy_transcription(
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(transcription_request): axum::Extension<TranscriptionRequest>,
-) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
         if let Some(billing_client) = &state.billing_client {
@@ -2391,7 +2428,7 @@ async fn proxy_tts(
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(tts_request): axum::Extension<TTSRequest>,
-) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     let prepared = prepare_tts_request(tts_request).map_err(|validation_error| {
         warn!(
             error = %validation_error,
@@ -2484,7 +2521,7 @@ async fn proxy_embeddings(
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(embedding_request): axum::Extension<EmbeddingRequest>,
-) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
         if let Some(billing_client) = &state.billing_client {

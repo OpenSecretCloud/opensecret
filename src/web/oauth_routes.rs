@@ -3,9 +3,7 @@ use crate::apple_signin::{generate_apple_client_secret, validate_apple_native_to
 use crate::models::oauth::NewUserOAuthConnection;
 use crate::models::oauth::UserOAuthConnection;
 use crate::oauth::{BasicClient, OAuthState};
-use crate::web::encryption_middleware::{
-    decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
-};
+use crate::web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession};
 use crate::web::login_routes::handle_new_user_registration;
 use crate::web::platform::common::{
     PROJECT_APPLE_OAUTH_SECRET, PROJECT_GITHUB_OAUTH_SECRET, PROJECT_GOOGLE_OAUTH_SECRET,
@@ -24,8 +22,9 @@ use crate::{
 };
 use axum::{
     extract::{Extension, State},
+    response::Response,
     routing::post,
-    Json, Router,
+    Router,
 };
 use base64::Engine as _;
 use oauth2::TokenResponse;
@@ -425,7 +424,7 @@ pub async fn initiate_oauth(
     Extension(auth_request): Extension<OAuthAuthRequest>,
     Extension(session_id): Extension<TransportSession>,
     provider_name: &str,
-) -> Result<Json<EncryptedResponse<OAuthOAuthCallbackResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Get project
     let project = app_state
         .db
@@ -477,7 +476,7 @@ pub async fn oauth_callback(
     Extension(callback_request): Extension<OAuthCallbackRequest>,
     Extension(session_id): Extension<TransportSession>,
     provider_name: &str,
-) -> Result<Json<EncryptedResponse<OAuthCallbackResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!(
         "Received code (redacted, len={})",
         callback_request.code.len()
@@ -1282,7 +1281,7 @@ pub async fn handle_apple_native_signin(
     State(app_state): State<Arc<AppState>>,
     Extension(request): Extension<AppleNativeSignInRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<OAuthCallbackResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Handling Apple native sign-in");
 
     // Get project

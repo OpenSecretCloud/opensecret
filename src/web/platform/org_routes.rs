@@ -1,15 +1,14 @@
 use crate::{
     models::{org_memberships::OrgRole, orgs::NewOrg, platform_users::PlatformUser},
-    web::encryption_middleware::{
-        decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
-    },
+    web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
     ApiError, AppState,
 };
 use axum::{
     extract::{Path, State},
     middleware::from_fn_with_state,
+    response::Response,
     routing::{delete, get, post},
-    Extension, Json, Router,
+    Extension, Router,
 };
 use std::sync::Arc;
 use tracing::{debug, error};
@@ -44,7 +43,7 @@ async fn create_org(
     Extension(platform_user): Extension<PlatformUser>,
     Extension(create_request): Extension<CreateOrgRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<OrgResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Creating new organization");
 
     // Validate request
@@ -75,7 +74,7 @@ async fn list_orgs(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<Vec<OrgResponse>>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Listing organizations");
 
     // Get all memberships for the user
@@ -115,7 +114,7 @@ async fn delete_org(
     Extension(platform_user): Extension<PlatformUser>,
     Path(org_id): Path<Uuid>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!("Deleting organization");
 
     // Get org by UUID instead of ID

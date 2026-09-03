@@ -30,9 +30,7 @@ use crate::{
     },
     models::users::User,
     web::{
-        encryption_middleware::{
-            decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
-        },
+        encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
         web_safety::{compact_untrusted_markdown, normalize_public_https_url, strip_image_embeds},
     },
     ApiError, AppMode, AppState,
@@ -276,7 +274,7 @@ async fn search_web(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(body): Extension<Value>,
-) -> Result<Json<EncryptedResponse<WebSearchResponse>>, WebRouteError> {
+) -> Result<Response, WebRouteError> {
     let request = serde_json::from_value::<WebSearchRequest>(body)
         .map_err(|_| WebRouteError::InvalidRequest)?;
     let options = validate_search_request(request)?;
@@ -296,7 +294,7 @@ async fn extract_web(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(body): Extension<Value>,
-) -> Result<Json<EncryptedResponse<WebExtractResponse>>, WebRouteError> {
+) -> Result<Response, WebRouteError> {
     let request = serde_json::from_value::<WebExtractRequest>(body)
         .map_err(|_| WebRouteError::InvalidRequest)?;
     let (urls, timeout) = validate_extract_request(request)?;

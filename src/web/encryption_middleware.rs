@@ -3,7 +3,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, Method, Request},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
     Json,
 };
 use base64::Engine;
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use uuid::Uuid;
 
-use crate::{ApiError, AppState};
+use crate::{transport_v2::crypto::SessionId, ApiError, AppState};
 
 const MAX_ENCRYPTED_BODY_BYTES: usize = 50 * 1024 * 1024; // 50MB
 
@@ -33,13 +33,41 @@ pub struct TransportSession {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TransportSessionKind {
-    V1 { session_id: Uuid },
+    V1 {
+        session_id: Uuid,
+    },
+    #[allow(dead_code)] // Constructed by the stacked V2 gateway.
+    V2 {
+        session_id: SessionId,
+    },
 }
 
 impl TransportSession {
     fn v1(session_id: Uuid) -> Self {
         Self {
             kind: TransportSessionKind::V1 { session_id },
+        }
+    }
+
+    /// Marks a request that has already been authenticated and decrypted by
+    /// the private Transport V2 gateway. This is an in-process capability: an
+    /// HTTP caller cannot create request extensions.
+    #[allow(dead_code)] // Constructed by the stacked V2 gateway.
+    pub(crate) fn v2(session_id: SessionId) -> Self {
+        Self {
+            kind: TransportSessionKind::V2 { session_id },
+        }
+    }
+
+    pub(crate) fn is_v2(&self) -> bool {
+        matches!(&self.kind, TransportSessionKind::V2 { .. })
+    }
+
+    #[allow(dead_code)] // Used by OAuth and native handoff in the gateway layer.
+    pub(crate) fn v2_session_id(&self) -> Option<SessionId> {
+        match &self.kind {
+            TransportSessionKind::V1 { .. } => None,
+            TransportSessionKind::V2 { session_id } => Some(*session_id),
         }
     }
 
@@ -52,6 +80,27 @@ impl TransportSession {
             TransportSessionKind::V1 { session_id } => {
                 state.encrypt_session_data(session_id, plaintext).await
             }
+            TransportSessionKind::V2 { .. } => Ok(plaintext.to_vec()),
+        }
+    }
+
+    /// Returns the exact `data:` payload expected by the logical SSE stream.
+    /// V1 keeps its per-event encryption and base64 wrapper; V2 leaves the
+    /// inner stream as ordinary UTF-8 because the gateway encrypts the entire
+    /// response carrier record-by-record.
+    pub(crate) async fn encode_sse_data(
+        &self,
+        state: &AppState,
+        plaintext: &str,
+    ) -> Result<String, ApiError> {
+        match &self.kind {
+            TransportSessionKind::V1 { .. } => {
+                let encrypted = self
+                    .encrypt_response_bytes(state, plaintext.as_bytes())
+                    .await?;
+                Ok(base64::engine::general_purpose::STANDARD.encode(encrypted))
+            }
+            TransportSessionKind::V2 { .. } => Ok(plaintext.to_string()),
         }
     }
 }
@@ -125,6 +174,26 @@ pub async fn decrypt_request<T>(
 where
     T: DeserializeOwned + Send + Sync + Clone + 'static,
 {
+    if request
+        .extensions()
+        .get::<TransportSession>()
+        .is_some_and(TransportSession::is_v2)
+    {
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>() {
+            request.extensions_mut().insert(());
+        } else {
+            let body = std::mem::replace(request.body_mut(), Body::empty());
+            let body_bytes = axum::body::to_bytes(body, MAX_ENCRYPTED_BODY_BYTES)
+                .await
+                .map_err(|_| ApiError::PayloadTooLarge)?;
+            let decoded =
+                serde_json::from_slice::<T>(&body_bytes).map_err(|_| ApiError::BadRequest)?;
+            request.extensions_mut().insert(decoded);
+        }
+
+        return Ok(next.run(request).await);
+    }
+
     let session_id = parse_session_id(&headers)?;
 
     // Skip body processing for GET, DELETE, or when T is ().
@@ -217,14 +286,24 @@ pub async fn encrypt_response<T: Serialize>(
     state: &AppState,
     transport_session: &TransportSession,
     response: &T,
-) -> Result<Json<EncryptedResponse<T>>, ApiError> {
+) -> Result<Response, ApiError> {
     let response_json = serde_json::to_vec(response).map_err(|_| ApiError::InternalServerError)?;
+
+    if transport_session.is_v2() {
+        return Ok((
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            response_json,
+        )
+            .into_response());
+    }
+
     let encrypted_response = transport_session
         .encrypt_response_bytes(state, &response_json)
         .await?;
-    Ok(Json(EncryptedResponse::new(
+    Ok(Json(EncryptedResponse::<T>::new(
         base64::engine::general_purpose::STANDARD.encode(encrypted_response),
-    )))
+    ))
+    .into_response())
 }
 
 #[cfg(test)]

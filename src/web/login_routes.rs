@@ -5,10 +5,7 @@ use crate::{
     jwt::{validate_token, AuthContext, NewToken, TokenType},
     models::email_verification::NewEmailVerification,
 };
-use crate::{
-    jwt::USER_REFRESH,
-    web::encryption_middleware::{EncryptedResponse, TransportSession},
-};
+use crate::{jwt::USER_REFRESH, web::encryption_middleware::TransportSession};
 use crate::{
     web::encryption_middleware::{decrypt_request, encrypt_response},
     Error,
@@ -17,8 +14,9 @@ use crate::{ApiError, AppState};
 use axum::{
     extract::{Path, State},
     middleware::from_fn_with_state,
+    response::Response,
     routing::{get, post},
-    Extension, Json, Router,
+    Extension, Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -138,7 +136,7 @@ pub async fn login(
     State(data): State<Arc<AppState>>,
     Extension(creds): Extension<Credentials>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<AuthResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     tracing::trace!("call login");
 
     let auth_response = login_internal(data.clone(), creds).await?;
@@ -247,7 +245,7 @@ pub async fn logout(
     State(data): State<Arc<AppState>>,
     Extension(logout_request): Extension<LogoutRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     info!("Logout request received");
     // TODO actually delete the refresh token
     drop(logout_request.refresh_token);
@@ -260,7 +258,7 @@ pub async fn register(
     State(data): State<Arc<AppState>>,
     Extension(creds): Extension<RegisterCredentials>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<AuthResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     tracing::trace!("call register");
 
     let user = match data.register_user(creds.clone()).await {
@@ -346,7 +344,7 @@ pub async fn refresh_token(
     State(data): State<Arc<AppState>>,
     Extension(refresh_request): Extension<RefreshRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<RefreshResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     info!("Refresh token request received");
 
     let claims = validate_token(&refresh_request.refresh_token, &data, USER_REFRESH)?;
@@ -380,7 +378,7 @@ pub async fn verify_email(
     State(data): State<Arc<AppState>>,
     Path(code): Path<Uuid>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     let verification = match data.db.get_email_verification_by_code(code) {
         Ok(v) => v,
         Err(DBError::EmailVerificationNotFound) => return Err(ApiError::BadRequest),
@@ -414,7 +412,7 @@ pub async fn password_reset_request(
     State(data): State<Arc<AppState>>,
     Extension(payload): Extension<PasswordResetRequestPayload>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Get project by client_id
     let project = data
         .db
@@ -466,7 +464,7 @@ pub async fn password_reset_confirm(
     State(data): State<Arc<AppState>>,
     Extension(payload): Extension<PasswordResetConfirmPayload>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Get project by client_id
     let project = data
         .db

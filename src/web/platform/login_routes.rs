@@ -5,16 +5,15 @@ use crate::{
         org_memberships::OrgRole, platform_email_verification::NewPlatformEmailVerification,
         platform_users::NewPlatformUser,
     },
-    web::encryption_middleware::{
-        decrypt_request, encrypt_response, EncryptedResponse, TransportSession,
-    },
+    web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
     ApiError, AppState, Error,
 };
 use axum::{
     extract::{Path, State},
     middleware::from_fn_with_state,
+    response::Response,
     routing::{get, post},
-    Extension, Json, Router,
+    Extension, Router,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -196,7 +195,7 @@ pub async fn login_platform_user(
     State(data): State<Arc<AppState>>,
     Extension(login_request): Extension<PlatformLoginRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<PlatformAuthResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Validate request
     if let Err(errors) = login_request.validate() {
         error!("Validation error: {:?}", errors);
@@ -248,7 +247,7 @@ pub async fn register_platform_user(
     State(data): State<Arc<AppState>>,
     Extension(register_request): Extension<PlatformRegisterRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<PlatformAuthResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Validate request
     if let Err(errors) = register_request.validate() {
         error!("Validation error: {:?}", errors);
@@ -353,7 +352,7 @@ pub async fn refresh_platform_token(
     State(data): State<Arc<AppState>>,
     Extension(refresh_request): Extension<PlatformRefreshRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<PlatformRefreshResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Validate request
     if let Err(errors) = refresh_request.validate() {
         error!("Validation error: {:?}", errors);
@@ -386,7 +385,7 @@ pub async fn verify_platform_email(
     State(data): State<Arc<AppState>>,
     Path(code): Path<Uuid>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Retrieve the verification record using the code
     let verification = match data.db.get_platform_email_verification_by_code(code) {
         Ok(verification) => verification,
@@ -436,7 +435,7 @@ pub async fn logout_platform_user(
     State(data): State<Arc<AppState>>,
     Extension(logout_request): Extension<PlatformLogoutRequest>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     info!("Platform logout request received");
 
     // TODO: Implement token invalidation logic here when needed
@@ -450,7 +449,7 @@ pub async fn platform_password_reset_request(
     State(data): State<Arc<AppState>>,
     Extension(payload): Extension<PlatformPasswordResetRequestPayload>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Validate request
     if let Err(errors) = payload.validate() {
         error!("Validation error: {:?}", errors);
@@ -502,7 +501,7 @@ pub async fn platform_password_reset_confirm(
     State(data): State<Arc<AppState>>,
     Extension(payload): Extension<PlatformPasswordResetConfirmPayload>,
     Extension(session_id): Extension<TransportSession>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Validate request
     if let Err(errors) = payload.validate() {
         error!("Validation error: {:?}", errors);

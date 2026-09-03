@@ -57,7 +57,7 @@ use axum::{
     http::{HeaderName, HeaderValue, StatusCode},
     middleware::{from_fn, from_fn_with_state, Next},
     response::{IntoResponse, Response},
-    Json,
+    Json, Router,
 };
 use base64::engine::general_purpose;
 use base64::Engine as _;
@@ -124,7 +124,7 @@ mod security_invariants;
 mod seed_wrapping;
 mod sqs;
 mod tokens;
-#[allow(dead_code)] // Transport V2 is wired by the next stacked change.
+#[allow(dead_code)] // Includes client-side vector helpers shared with the SDK implementation.
 mod transport_v2;
 mod web;
 
@@ -3514,6 +3514,48 @@ async fn retrieve_kagi_api_key(
     }
 }
 
+fn application_routes(app_state: Arc<AppState>) -> Router<()> {
+    protected_routes(app_state.clone())
+        .route_layer(from_fn_with_state(app_state.clone(), validate_jwt))
+        .merge(login_routes(app_state.clone()))
+        .merge(
+            openai_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_openai_auth)),
+        )
+        .merge(
+            openai_models_routes(app_state.clone()).route_layer(from_fn_with_state(
+                app_state.clone(),
+                validate_optional_openai_auth,
+            )),
+        )
+        .merge(
+            responses_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            web_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            conversations_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            conversation_projects_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            instructions_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(oauth_routes(app_state.clone()))
+        .merge(platform_login_routes(app_state.clone()))
+        .merge(
+            platform_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_platform_jwt)),
+        )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     dotenv::dotenv().ok();
@@ -3867,47 +3909,18 @@ async fn main() -> Result<(), Error> {
         // allow requests from any origin
         .allow_origin(Any);
 
-    let app = protected_routes(app_state.clone())
-        .route_layer(from_fn_with_state(app_state.clone(), validate_jwt))
+    let application = application_routes(app_state.clone());
+    let v2_application = application
+        .clone()
         .merge(health_routes_with_state(app_state.clone()))
-        .merge(login_routes(app_state.clone()))
-        .merge(
-            openai_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_openai_auth)),
-        )
-        .merge(
-            openai_models_routes(app_state.clone()).route_layer(from_fn_with_state(
-                app_state.clone(),
-                validate_optional_openai_auth,
-            )),
-        )
-        .merge(
-            responses_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
-        )
-        .merge(
-            web_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
-        )
-        .merge(
-            conversations_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
-        )
-        .merge(
-            conversation_projects_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
-        )
-        .merge(
-            instructions_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
-        )
+        .layer(from_fn(add_error_contract_header));
+    let transport_v2_gateway =
+        transport_v2::gateway::TransportV2Gateway::new(app_state.clone(), v2_application);
+
+    let app = application
+        .merge(health_routes_with_state(app_state.clone()))
         .merge(attestation_routes::router(app_state.clone()))
-        .merge(oauth_routes(app_state.clone()))
-        .merge(platform_login_routes(app_state.clone()))
-        .merge(
-            platform_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_platform_jwt)),
-        )
+        .merge(transport_v2_gateway.router())
         .layer(cors)
         .layer(from_fn(add_error_contract_header));
 
@@ -3921,6 +3934,9 @@ async fn main() -> Result<(), Error> {
         result = axum::serve(listener, app.into_make_service()) => Ok(result?),
         _ = secret_cache_maintenance::run(app_state) => {
             unreachable!("secret cache maintenance runs until the server stops")
+        }
+        _ = transport_v2_gateway.run_maintenance() => {
+            unreachable!("transport-v2 session maintenance runs until the server stops")
         }
     }
 }

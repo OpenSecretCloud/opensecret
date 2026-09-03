@@ -119,7 +119,7 @@ impl ResponseRecord {
     }
 
     #[cfg(test)]
-    fn decode(encoded: &[u8]) -> Result<Self, FramingError> {
+    pub(crate) fn decode(encoded: &[u8]) -> Result<Self, FramingError> {
         let (&tag, payload) = encoded.split_first().ok_or(FramingError::Truncated)?;
         match tag {
             START_TAG => {

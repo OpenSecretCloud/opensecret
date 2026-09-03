@@ -235,6 +235,15 @@ pub(crate) struct RequestEnvelope {
     body: Option<Bytes>,
 }
 
+pub(crate) struct RequestEnvelopeParts {
+    pub(crate) credential: Option<Credential>,
+    pub(crate) cache_namespace_root: Option<CacheNamespaceRoot>,
+    pub(crate) method: String,
+    pub(crate) target: String,
+    pub(crate) headers: Vec<LogicalHeader>,
+    pub(crate) body: Option<Bytes>,
+}
+
 impl fmt::Debug for RequestEnvelope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -326,6 +335,17 @@ impl RequestEnvelope {
 
     pub(crate) fn into_body(mut self) -> Option<Bytes> {
         self.body.take()
+    }
+
+    pub(crate) fn into_parts(mut self) -> RequestEnvelopeParts {
+        RequestEnvelopeParts {
+            credential: self.credential.take(),
+            cache_namespace_root: self.cache_namespace_root.take(),
+            method: std::mem::take(&mut self.method),
+            target: std::mem::take(&mut self.target),
+            headers: std::mem::take(&mut self.headers),
+            body: self.body.take(),
+        }
     }
 
     /// Encodes bounded JSON metadata followed by the raw body bytes. The raw

@@ -7,4 +7,5 @@
 pub(crate) mod crypto;
 pub(crate) mod envelope;
 pub(crate) mod framing;
+pub(crate) mod gateway;
 pub(crate) mod session;

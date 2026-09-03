@@ -113,6 +113,8 @@ mod models;
 mod oauth;
 mod os_flags;
 mod private_key;
+#[allow(dead_code)] // Used by the dormant Transport V2 core in this stack layer.
+mod provider_cache;
 mod provider_client;
 mod provider_routing;
 mod proxy_config;
@@ -122,6 +124,8 @@ mod security_invariants;
 mod seed_wrapping;
 mod sqs;
 mod tokens;
+#[allow(dead_code)] // Transport V2 is wired by the next stacked change.
+mod transport_v2;
 mod web;
 
 #[cfg(test)]

@@ -38,7 +38,8 @@ use crate::{
             },
             prompt_token_budget, storage_task, tools, ContentPartBuilder, DeletedObjectResponse,
             MessageContent, MessageContentConverter, MessageContentPart, OutputItemBuilder,
-            ResponseBuilder, ResponseEvent, ResponseExecution, SseEventEmitter, StorageTaskOutcome,
+            ResponseBuilder, ResponseEvent, ResponseExecution, ResponseExecutionRegistry,
+            SseEventEmitter, StorageTaskOutcome,
         },
     },
     ApiError, AppState,
@@ -108,6 +109,29 @@ async fn wait_for_local_response_execution_quiescence(
     tokio::time::timeout(wait_timeout, execution.wait_for_quiescence())
         .await
         .is_ok()
+}
+
+/// Resolve the process-local execution barrier without guessing what a missing
+/// entry means. For an active persisted response, absence is ambiguous: the
+/// worker may belong to another replica or to a prior server lifetime. Until a
+/// durable cross-process ownership protocol exists, cancel/delete must fail
+/// closed rather than acknowledge quiescence that this process cannot prove.
+fn response_execution_for_status(
+    registry: &ResponseExecutionRegistry,
+    response_id: Uuid,
+    user_id: Uuid,
+    status: ResponseStatus,
+) -> Result<Option<ResponseExecution>, ApiError> {
+    let execution = registry.execution_for_user(response_id, user_id);
+    if execution.is_none() && matches!(status, ResponseStatus::Queued | ResponseStatus::InProgress)
+    {
+        warn!(
+            "No process-local execution owner can prove quiescence for active response {}",
+            response_id
+        );
+        return Err(ApiError::ServiceUnavailable);
+    }
+    Ok(execution)
 }
 
 // Default functions for serde
@@ -438,7 +462,8 @@ mod tests {
         finalize_first_model_tool_call, has_streamed_tool_call_entries, image_attachments,
         image_description_access, image_description_api_error, maple_kagi_web_search_prompt,
         model_turn_request_without_user_payload, resolve_responses_model,
-        resolve_responses_sampling, response_cancellation_ack_decision, send_storage_message,
+        resolve_responses_sampling, response_cancellation_ack_decision,
+        response_execution_for_status, send_storage_message,
         wait_for_local_response_execution_quiescence, web_search_is_selected,
         web_search_tool_turn_limit, web_search_tool_turn_limit_error,
         web_search_tool_turn_limit_reached, ClientResponseState, ConversationParam,
@@ -876,6 +901,38 @@ mod tests {
                 ResponseCancellationAckDecision::LostTerminalRace
             );
         }
+    }
+
+    #[test]
+    fn active_response_from_another_process_or_prior_lifetime_fails_closed() {
+        let prior_lifetime_registry = crate::web::responses::ResponseExecutionRegistry::default();
+        let current_registry = crate::web::responses::ResponseExecutionRegistry::default();
+        let response_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let foreign_registration = prior_lifetime_registry
+            .register(response_id, user_id)
+            .expect("register foreign execution");
+
+        for status in [ResponseStatus::Queued, ResponseStatus::InProgress] {
+            assert!(matches!(
+                response_execution_for_status(&current_registry, response_id, user_id, status,),
+                Err(ApiError::ServiceUnavailable)
+            ));
+        }
+
+        // Simulate that foreign process exiting. The current process still
+        // cannot distinguish this orphan from a live owner, so recovery is
+        // intentionally fail-closed until durable ownership/fencing is added.
+        drop(foreign_registration);
+        for status in [ResponseStatus::Queued, ResponseStatus::InProgress] {
+            assert!(matches!(
+                response_execution_for_status(&current_registry, response_id, user_id, status,),
+                Err(ApiError::ServiceUnavailable)
+            ));
+        }
+        assert!(current_registry
+            .execution_for_user(response_id, user_id)
+            .is_none());
     }
 
     #[tokio::test]
@@ -5181,7 +5238,8 @@ async fn cancel_response(
             }
         })?;
 
-    let local_execution = state.response_executions.execution_for_user(id, user.uuid);
+    let local_execution =
+        response_execution_for_status(&state.response_executions, id, user.uuid, response.status)?;
 
     // A terminal-status rejection is client-visible as an already-finished
     // acknowledgement. If process-local work for that response is still
@@ -5206,15 +5264,7 @@ async fn cancel_response(
         return Err(ApiError::BadRequest);
     }
 
-    let execution = local_execution.ok_or_else(|| {
-        // A process-local registry cannot safely acknowledge a stale row
-        // from another process or a prior server lifetime.
-        warn!(
-            "No live execution owner can acknowledge cancellation for response {}",
-            id
-        );
-        ApiError::ServiceUnavailable
-    })?;
+    let execution = local_execution.ok_or(ApiError::ServiceUnavailable)?;
 
     debug!("Signalling cancellation for response {}", id);
     execution.cancel();
@@ -5313,7 +5363,10 @@ async fn delete_response(
             }
         })?;
 
-    if let Some(execution) = state.response_executions.execution_for_user(id, user.uuid) {
+    let local_execution =
+        response_execution_for_status(&state.response_executions, id, user.uuid, existing.status)?;
+
+    if let Some(execution) = local_execution {
         execution.cancel();
         if tokio::time::timeout(RESPONSE_CANCEL_ACK_TIMEOUT, execution.wait_for_quiescence())
             .await
@@ -5325,15 +5378,6 @@ async fn delete_response(
             );
             return Err(ApiError::ServiceUnavailable);
         }
-    } else if matches!(
-        existing.status,
-        ResponseStatus::Queued | ResponseStatus::InProgress
-    ) {
-        warn!(
-            "Refusing to delete active response {} without a local execution owner",
-            id
-        );
-        return Err(ApiError::ServiceUnavailable);
     }
 
     // Delete the response (cascade will handle related records)

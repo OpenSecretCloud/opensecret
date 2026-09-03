@@ -13,6 +13,7 @@ use crate::sqs::UsageEvent;
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
 use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
 use crate::web::openai_auth::AuthMethod;
+use crate::web::responses::{ResponseExecution, ResponseExecutionTaskGuard};
 use crate::{ApiError, AppState};
 use axum::http::HeaderMap;
 use axum::{
@@ -933,6 +934,37 @@ pub async fn get_chat_completion_response(
         billing_context,
         model_plan,
         None,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Responses-only completion entry point with process-local task ownership.
+/// Ordinary Chat Completions retain their existing independent lifecycle.
+pub(crate) async fn get_chat_completion_response_for_execution(
+    state: &Arc<AppState>,
+    user: &User,
+    body: Value,
+    headers: &HeaderMap,
+    billing_context: BillingContext,
+    model_plan: ModelPlan,
+    response_execution: ResponseExecution,
+) -> Result<CompletionStream, ApiError> {
+    let response_execution_guard = response_execution.begin_task().map_err(|_| {
+        debug!("Response execution was cancelled before a provider turn could start");
+        ApiError::ServiceUnavailable
+    })?;
+    get_chat_completion_response_with_expected_route(
+        state,
+        user,
+        body,
+        headers,
+        billing_context,
+        model_plan,
+        None,
+        Some(response_execution),
+        Some(response_execution_guard),
     )
     .await
 }
@@ -964,6 +996,8 @@ pub(crate) async fn get_chat_completion_response_for_expected_route(
             provider_model_id: route.provider_model_id,
             continuum_cache_salt,
         }),
+        None,
+        None,
     )
     .await
 }
@@ -989,6 +1023,8 @@ async fn get_chat_completion_response_with_expected_route(
     mut billing_context: BillingContext,
     model_plan: ModelPlan,
     expected_route: Option<ExpectedCompletionRoute<'_>>,
+    response_execution: Option<ResponseExecution>,
+    response_execution_guard: Option<ResponseExecutionTaskGuard>,
 ) -> Result<CompletionStream, ApiError> {
     if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
@@ -1248,17 +1284,40 @@ async fn get_chat_completion_response_with_expected_route(
     let response_model_id = selected_route.response_model_id.clone();
 
     tokio::spawn(async move {
+        let _response_execution_guard = response_execution_guard;
         let mut body_stream = res.bytes_stream();
         let mut buffer = Vec::new();
         let mut usage_accumulator = StreamUsageAccumulator::default();
 
         loop {
-            match timeout(
+            let next_chunk = timeout(
                 Duration::from_secs(STREAM_CHUNK_TIMEOUT_SECS),
                 body_stream.next(),
-            )
-            .await
-            {
+            );
+            tokio::pin!(next_chunk);
+            let next_chunk = if let Some(execution) = response_execution.as_ref() {
+                tokio::select! {
+                    biased;
+                    _ = execution.cancelled() => {
+                        finalize_stream_usage(
+                            &mut usage_accumulator,
+                            StreamUsageFinalization::ConsumerDropped,
+                            &state_clone,
+                            &user_clone,
+                            &billing_ctx,
+                            &provider,
+                            &tx_consumer,
+                        )
+                        .await;
+                        return;
+                    }
+                    result = &mut next_chunk => result,
+                }
+            } else {
+                next_chunk.await
+            };
+
+            match next_chunk {
                 Ok(Some(chunk_result)) => {
                     match chunk_result {
                         Ok(bytes) => {

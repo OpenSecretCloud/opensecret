@@ -1225,6 +1225,8 @@ pub struct RawThreadMessage {
     pub id: i64,
     #[diesel(sql_type = diesel::sql_types::Uuid)]
     pub uuid: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    pub response_uuid: Option<Uuid>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Bytea>)]
     pub content_enc: Option<Vec<u8>>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
@@ -1268,6 +1270,7 @@ impl RawThreadMessage {
                         'user' as message_type,
                         um.id,
                         um.uuid,
+                        r.uuid as response_uuid,
                         um.content_enc,
                         'completed'::text as status,
                         um.created_at,
@@ -1287,6 +1290,7 @@ impl RawThreadMessage {
                         'assistant' as message_type,
                         am.id,
                         am.uuid,
+                        r.uuid as response_uuid,
                         am.content_enc,
                         am.status,
                         am.created_at,
@@ -1306,6 +1310,7 @@ impl RawThreadMessage {
                         'tool_call' as message_type,
                         tc.id,
                         tc.uuid,
+                        r.uuid as response_uuid,
                         tc.arguments_enc as content_enc,
                         'completed'::text as status,
                         tc.created_at,
@@ -1315,6 +1320,7 @@ impl RawThreadMessage {
                         NULL::text as finish_reason,
                         tc.name as tool_name
                     FROM tool_calls tc
+                    LEFT JOIN responses r ON tc.response_id = r.id
                     WHERE tc.conversation_id = $1
 
                     UNION ALL
@@ -1324,6 +1330,7 @@ impl RawThreadMessage {
                         'tool_output' as message_type,
                         tto.id,
                         tto.uuid,
+                        r.uuid as response_uuid,
                         tto.output_enc as content_enc,
                         'completed'::text as status,
                         tto.created_at,
@@ -1334,6 +1341,7 @@ impl RawThreadMessage {
                         tc.name as tool_name
                     FROM tool_outputs tto
                     JOIN tool_calls tc ON tto.tool_call_fk = tc.id
+                    LEFT JOIN responses r ON tto.response_id = r.id
                     WHERE tto.conversation_id = $1
 
                     UNION ALL
@@ -1343,6 +1351,7 @@ impl RawThreadMessage {
                         'reasoning' as message_type,
                         ri.id,
                         ri.uuid,
+                        r.uuid as response_uuid,
                         ri.content_enc,
                         ri.status,
                         ri.created_at,
@@ -1352,6 +1361,7 @@ impl RawThreadMessage {
                         NULL::text as finish_reason,
                         NULL::text as tool_name
                     FROM reasoning_items ri
+                    LEFT JOIN responses r ON ri.response_id = r.id
                     WHERE ri.conversation_id = $1
                 ),
                 cursor_message AS (
@@ -1381,6 +1391,7 @@ impl RawThreadMessage {
                         'user' as message_type,
                         um.id,
                         um.uuid,
+                        r.uuid as response_uuid,
                         um.content_enc,
                         'completed'::text as status,
                         um.created_at,
@@ -1400,6 +1411,7 @@ impl RawThreadMessage {
                         'assistant' as message_type,
                         am.id,
                         am.uuid,
+                        r.uuid as response_uuid,
                         am.content_enc,
                         am.status,
                         am.created_at,
@@ -1419,6 +1431,7 @@ impl RawThreadMessage {
                         'tool_call' as message_type,
                         tc.id,
                         tc.uuid,
+                        r.uuid as response_uuid,
                         tc.arguments_enc as content_enc,
                         'completed'::text as status,
                         tc.created_at,
@@ -1428,6 +1441,7 @@ impl RawThreadMessage {
                         NULL::text as finish_reason,
                         tc.name as tool_name
                     FROM tool_calls tc
+                    LEFT JOIN responses r ON tc.response_id = r.id
                     WHERE tc.conversation_id = $1
 
                     UNION ALL
@@ -1437,6 +1451,7 @@ impl RawThreadMessage {
                         'tool_output' as message_type,
                         tto.id,
                         tto.uuid,
+                        r.uuid as response_uuid,
                         tto.output_enc as content_enc,
                         'completed'::text as status,
                         tto.created_at,
@@ -1447,6 +1462,7 @@ impl RawThreadMessage {
                         tc.name as tool_name
                     FROM tool_outputs tto
                     JOIN tool_calls tc ON tto.tool_call_fk = tc.id
+                    LEFT JOIN responses r ON tto.response_id = r.id
                     WHERE tto.conversation_id = $1
 
                     UNION ALL
@@ -1456,6 +1472,7 @@ impl RawThreadMessage {
                         'reasoning' as message_type,
                         ri.id,
                         ri.uuid,
+                        r.uuid as response_uuid,
                         ri.content_enc,
                         ri.status,
                         ri.created_at,
@@ -1465,6 +1482,7 @@ impl RawThreadMessage {
                         NULL::text as finish_reason,
                         NULL::text as tool_name
                     FROM reasoning_items ri
+                    LEFT JOIN responses r ON ri.response_id = r.id
                     WHERE ri.conversation_id = $1
                 )
                 SELECT *
@@ -1503,6 +1521,7 @@ impl RawThreadMessage {
                     'user' as message_type,
                     um.id,
                     um.uuid,
+                    r.uuid as response_uuid,
                     um.content_enc,
                     'completed'::text as status,
                     um.created_at,
@@ -1522,6 +1541,7 @@ impl RawThreadMessage {
                     'assistant' as message_type,
                     am.id,
                     am.uuid,
+                    r.uuid as response_uuid,
                     am.content_enc,
                     am.status,
                     am.created_at,
@@ -1541,6 +1561,7 @@ impl RawThreadMessage {
                     'tool_call' as message_type,
                     tc.id,
                     tc.uuid,
+                    r.uuid as response_uuid,
                     tc.arguments_enc as content_enc,
                     'completed'::text as status,
                     tc.created_at,
@@ -1550,6 +1571,7 @@ impl RawThreadMessage {
                     NULL::text as finish_reason,
                     tc.name as tool_name
                 FROM tool_calls tc
+                LEFT JOIN responses r ON tc.response_id = r.id
                 WHERE tc.response_id = $1
 
                 UNION ALL
@@ -1559,6 +1581,7 @@ impl RawThreadMessage {
                     'tool_output' as message_type,
                     tto.id,
                     tto.uuid,
+                    r.uuid as response_uuid,
                     tto.output_enc as content_enc,
                     'completed'::text as status,
                     tto.created_at,
@@ -1569,6 +1592,7 @@ impl RawThreadMessage {
                     tc.name as tool_name
                 FROM tool_outputs tto
                 JOIN tool_calls tc ON tto.tool_call_fk = tc.id
+                LEFT JOIN responses r ON tto.response_id = r.id
                 WHERE tto.response_id = $1
 
                 UNION ALL
@@ -1578,6 +1602,7 @@ impl RawThreadMessage {
                     'reasoning' as message_type,
                     ri.id,
                     ri.uuid,
+                    r.uuid as response_uuid,
                     ri.content_enc,
                     ri.status,
                     ri.created_at,
@@ -1587,6 +1612,7 @@ impl RawThreadMessage {
                     NULL::text as finish_reason,
                     NULL::text as tool_name
                 FROM reasoning_items ri
+                LEFT JOIN responses r ON ri.response_id = r.id
                 WHERE ri.response_id = $1
             )
             SELECT * FROM response_messages
@@ -1645,6 +1671,7 @@ impl RawThreadMessage {
                     'user' as message_type,
                     um.id,
                     um.uuid,
+                    r.uuid as response_uuid,
                     um.content_enc,
                     'completed'::text as status,
                     um.created_at,
@@ -1664,6 +1691,7 @@ impl RawThreadMessage {
                     'assistant' as message_type,
                     am.id,
                     am.uuid,
+                    r.uuid as response_uuid,
                     am.content_enc,
                     am.status,
                     am.created_at,
@@ -1683,6 +1711,7 @@ impl RawThreadMessage {
                     'tool_call' as message_type,
                     tc.id,
                     tc.uuid,
+                    r.uuid as response_uuid,
                     tc.arguments_enc as content_enc,
                     'completed'::text as status,
                     tc.created_at,
@@ -1692,6 +1721,7 @@ impl RawThreadMessage {
                     NULL::text as finish_reason,
                     tc.name as tool_name
                 FROM tool_calls tc
+                LEFT JOIN responses r ON tc.response_id = r.id
                 WHERE tc.conversation_id = $1
 
                 UNION ALL
@@ -1701,6 +1731,7 @@ impl RawThreadMessage {
                     'tool_output' as message_type,
                     tto.id,
                     tto.uuid,
+                    r.uuid as response_uuid,
                     tto.output_enc as content_enc,
                     'completed'::text as status,
                     tto.created_at,
@@ -1711,6 +1742,7 @@ impl RawThreadMessage {
                     tc.name as tool_name
                 FROM tool_outputs tto
                 JOIN tool_calls tc ON tto.tool_call_fk = tc.id
+                LEFT JOIN responses r ON tto.response_id = r.id
                 WHERE tto.conversation_id = $1
 
                 UNION ALL
@@ -1720,6 +1752,7 @@ impl RawThreadMessage {
                     'reasoning' as message_type,
                     ri.id,
                     ri.uuid,
+                    r.uuid as response_uuid,
                     ri.content_enc,
                     ri.status,
                     ri.created_at,
@@ -1729,6 +1762,7 @@ impl RawThreadMessage {
                     NULL::text as finish_reason,
                     NULL::text as tool_name
                 FROM reasoning_items ri
+                LEFT JOIN responses r ON ri.response_id = r.id
                 WHERE ri.conversation_id = $1
             )
             SELECT * FROM conversation_messages

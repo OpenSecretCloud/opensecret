@@ -20,6 +20,7 @@ use crate::{
         encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
         openai::{
             ensure_completion_model_access, get_chat_completion_response,
+            get_chat_completion_response_for_execution,
             get_chat_completion_response_for_expected_route, BillingContext, CompletionChunk,
             ServerSelectedCompletionRoute,
         },
@@ -37,7 +38,8 @@ use crate::{
             },
             prompt_token_budget, storage_task, tools, ContentPartBuilder, DeletedObjectResponse,
             MessageContent, MessageContentConverter, MessageContentPart, OutputItemBuilder,
-            ResponseBuilder, ResponseEvent, SseEventEmitter,
+            ResponseBuilder, ResponseEvent, ResponseExecution, ResponseExecutionRegistry,
+            SseEventEmitter, StorageTaskOutcome,
         },
     },
     ApiError, AppState,
@@ -63,15 +65,73 @@ use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 const RESPONSES_SSE_KEEPALIVE_INTERVAL_SECS: u64 = 1;
+const RESPONSE_CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(4);
+const RESPONSE_CANCEL_ACK_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const RESPONSE_STORAGE_JOIN_WARNING_AFTER: Duration = Duration::from_secs(4);
 const MAX_WEB_SEARCH_TOOL_TURNS_FREE: usize = 5;
 const MAX_WEB_SEARCH_TOOL_TURNS_PAID: usize = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponseCancellationAckDecision {
+    Wait,
+    Cancelled,
+    LostTerminalRace,
+}
+
+fn response_cancellation_ack_decision(status: ResponseStatus) -> ResponseCancellationAckDecision {
+    match status {
+        ResponseStatus::Cancelled => ResponseCancellationAckDecision::Cancelled,
+        ResponseStatus::Completed | ResponseStatus::Failed => {
+            ResponseCancellationAckDecision::LostTerminalRace
+        }
+        ResponseStatus::Queued | ResponseStatus::InProgress => {
+            ResponseCancellationAckDecision::Wait
+        }
+    }
+}
+
+async fn wait_for_local_response_execution_quiescence(
+    execution: Option<ResponseExecution>,
+    wait_timeout: Duration,
+) -> bool {
+    let Some(execution) = execution else {
+        return true;
+    };
+
+    tokio::time::timeout(wait_timeout, execution.wait_for_quiescence())
+        .await
+        .is_ok()
+}
+
+/// Resolve the process-local execution barrier without guessing what a missing
+/// entry means. For an active persisted response, absence is ambiguous: the
+/// worker may belong to another replica or to a prior server lifetime. Until a
+/// durable cross-process ownership protocol exists, cancel/delete must fail
+/// closed rather than acknowledge quiescence that this process cannot prove.
+fn response_execution_for_status(
+    registry: &ResponseExecutionRegistry,
+    response_id: Uuid,
+    user_id: Uuid,
+    status: ResponseStatus,
+) -> Result<Option<ResponseExecution>, ApiError> {
+    let execution = registry.execution_for_user(response_id, user_id);
+    if execution.is_none() && matches!(status, ResponseStatus::Queued | ResponseStatus::InProgress)
+    {
+        warn!(
+            "No process-local execution owner can prove quiescence for active response {}",
+            response_id
+        );
+        return Err(ApiError::ServiceUnavailable);
+    }
+    Ok(execution)
+}
 
 // Default functions for serde
 fn default_store() -> bool {
@@ -395,23 +455,29 @@ fn final_assistant_finish_reason(tools_enabled: bool, finish_reason: Option<Stri
 mod tests {
     use super::{
         append_streamed_tool_calls, apply_responses_model_defaults,
-        assistant_turn_finished_with_tool_call, build_internal_system_prompt_for_now,
-        build_model_turn_request, build_provider_tools, final_assistant_finish_reason,
-        finalize_first_model_tool_call, has_streamed_tool_call_entries, image_attachments,
-        image_description_access, image_description_api_error, maple_kagi_web_search_prompt,
-        model_turn_request_without_user_payload, resolve_responses_model,
-        resolve_responses_sampling, wait_for_response_cancellation, web_search_is_selected,
+        assistant_turn_finished_with_tool_call, await_storage_completion,
+        await_storage_completion_with_warning_after, build_internal_system_prompt_for_now,
+        build_model_turn_request, build_provider_tools, client_cancellation_terminal_decision,
+        final_assistant_finish_reason, finalize_first_model_tool_call,
+        has_streamed_tool_call_entries, image_attachments, image_description_access,
+        image_description_api_error, maple_kagi_web_search_prompt,
+        model_turn_request_without_user_payload, next_client_message_after_durable_completion,
+        resolve_responses_model, resolve_responses_sampling, response_cancellation_ack_decision,
+        response_execution_for_status, send_storage_message,
+        wait_for_local_response_execution_quiescence, web_search_is_selected,
         web_search_tool_turn_limit, web_search_tool_turn_limit_error,
-        web_search_tool_turn_limit_reached, ClientResponseState, ConversationParam,
-        ImageAttachment, ImageDescriptionFailureClass, ImageDescriptionInput,
-        ImageDescriptionToolPair, InputMessage, MessageContent, MessageContentPart, MessageInput,
-        ResponsesCreateRequest, StorageMessage, StreamedToolCall, MAX_WEB_SEARCH_TOOL_TURNS_FREE,
-        MAX_WEB_SEARCH_TOOL_TURNS_PAID, READ_IMAGE_TOOL_NAME,
+        web_search_tool_turn_limit_reached, ClientCancellationTerminalDecision,
+        ClientResponseState, ConversationParam, ImageAttachment, ImageDescriptionFailureClass,
+        ImageDescriptionInput, ImageDescriptionToolPair, InputMessage, MessageContent,
+        MessageContentPart, MessageInput, ResponseCancellationAckDecision, ResponsesCreateRequest,
+        StorageCompletionDecision, StorageMessage, StreamedToolCall,
+        MAX_WEB_SEARCH_TOOL_TURNS_FREE, MAX_WEB_SEARCH_TOOL_TURNS_PAID, READ_IMAGE_TOOL_NAME,
     };
-    use crate::web::responses::tools;
+    use crate::web::responses::{tools, StorageTaskOutcome};
     use crate::{
         billing::{BillingClient, ChatBillingAccess},
         model_config::{ModelAliasTargets, ModelPlan},
+        models::responses::ResponseStatus,
         ApiError,
     };
     use axum::{routing::get, Json, Router};
@@ -419,8 +485,8 @@ mod tests {
     use serde_json::json;
     use tokio::{
         net::TcpListener,
-        sync::{broadcast, mpsc},
-        time::{timeout, Duration},
+        sync::{mpsc, oneshot},
+        time::Duration,
     };
     use uuid::Uuid;
 
@@ -815,49 +881,399 @@ mod tests {
         assert!(!serialized.contains("request metadata"));
     }
 
-    #[tokio::test]
-    async fn wait_for_response_cancellation_ignores_unrelated_broadcasts() {
-        let response_uuid = Uuid::new_v4();
-        let unrelated_uuid = Uuid::new_v4();
-        let (cancel_tx, cancel_rx) = broadcast::channel(8);
-        let (storage_tx, mut storage_rx) = mpsc::channel(2);
-        let (client_tx, mut client_rx) = mpsc::channel(2);
+    #[test]
+    fn cancellation_ack_waits_only_for_nonterminal_statuses() {
+        assert_eq!(
+            response_cancellation_ack_decision(ResponseStatus::Queued),
+            ResponseCancellationAckDecision::Wait
+        );
+        assert_eq!(
+            response_cancellation_ack_decision(ResponseStatus::InProgress),
+            ResponseCancellationAckDecision::Wait
+        );
+        assert_eq!(
+            response_cancellation_ack_decision(ResponseStatus::Cancelled),
+            ResponseCancellationAckDecision::Cancelled
+        );
+        for status in [ResponseStatus::Completed, ResponseStatus::Failed] {
+            assert_eq!(
+                response_cancellation_ack_decision(status),
+                ResponseCancellationAckDecision::LostTerminalRace
+            );
+        }
+    }
 
-        let listener = tokio::spawn(wait_for_response_cancellation(
-            response_uuid,
-            cancel_rx,
-            storage_tx,
-            client_tx,
+    #[test]
+    fn active_response_from_another_process_or_prior_lifetime_fails_closed() {
+        let prior_lifetime_registry = crate::web::responses::ResponseExecutionRegistry::default();
+        let current_registry = crate::web::responses::ResponseExecutionRegistry::default();
+        let response_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let foreign_registration = prior_lifetime_registry
+            .register(response_id, user_id)
+            .expect("register foreign execution");
+
+        for status in [ResponseStatus::Queued, ResponseStatus::InProgress] {
+            assert!(matches!(
+                response_execution_for_status(&current_registry, response_id, user_id, status,),
+                Err(ApiError::ServiceUnavailable)
+            ));
+        }
+
+        // Simulate that foreign process exiting. The current process still
+        // cannot distinguish this orphan from a live owner, so recovery is
+        // intentionally fail-closed until durable ownership/fencing is added.
+        drop(foreign_registration);
+        for status in [ResponseStatus::Queued, ResponseStatus::InProgress] {
+            assert!(matches!(
+                response_execution_for_status(&current_registry, response_id, user_id, status,),
+                Err(ApiError::ServiceUnavailable)
+            ));
+        }
+        assert!(current_registry
+            .execution_for_user(response_id, user_id)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn response_completion_waits_for_storage_acknowledgement() {
+        let (release_storage, storage_released) = oneshot::channel();
+        let storage_handle = tokio::spawn(async move {
+            storage_released.await.expect("release storage worker");
+            StorageTaskOutcome::Completed
+        });
+        let mut storage_handle = Some(storage_handle);
+        let (decision_tx, mut decision_rx) = oneshot::channel();
+
+        let waiter = tokio::spawn(async move {
+            let decision = await_storage_completion(&mut storage_handle).await;
+            decision_tx.send(decision).expect("send terminal decision");
+        });
+
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            decision_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
         ));
 
-        cancel_tx.send(unrelated_uuid).unwrap();
-        assert!(
-            timeout(Duration::from_millis(25), storage_rx.recv())
-                .await
-                .is_err(),
-            "unrelated cancellation should not emit a storage cancellation"
+        release_storage.send(()).expect("release storage worker");
+        assert_eq!(
+            decision_rx.await.expect("receive terminal decision"),
+            StorageCompletionDecision::Completed
         );
-        assert!(
-            timeout(Duration::from_millis(25), client_rx.recv())
-                .await
-                .is_err(),
-            "unrelated cancellation should not emit a client cancellation"
-        );
-        assert!(
-            !listener.is_finished(),
-            "listener should continue after unrelated cancellation"
-        );
+        waiter.await.expect("join completion waiter");
+    }
 
-        cancel_tx.send(response_uuid).unwrap();
+    #[tokio::test]
+    async fn terminal_cancel_rejection_waits_for_local_execution_quiescence() {
+        let registry = crate::web::responses::ResponseExecutionRegistry::default();
+        let registration = registry
+            .register(Uuid::new_v4(), Uuid::new_v4())
+            .expect("register response execution");
+        let execution = registration.execution();
+        let child = execution.begin_task().expect("register child task");
+        drop(registration);
+
+        let mut waiter = Box::pin(wait_for_local_response_execution_quiescence(
+            Some(execution),
+            Duration::from_secs(1),
+        ));
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut waiter)
+            .await
+            .is_err());
+
+        drop(child);
+        assert!(tokio::time::timeout(Duration::from_millis(50), waiter)
+            .await
+            .expect("quiescence waiter should finish"));
+    }
+
+    #[tokio::test]
+    async fn terminal_storage_message_waits_for_saturated_client_channel() {
+        let (storage_tx, mut storage_rx) = mpsc::channel(2);
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        client_tx
+            .send(StorageMessage::ContentDelta {
+                item_id: Uuid::new_v4(),
+                delta: "queued output".to_string(),
+            })
+            .await
+            .expect("fill client channel");
+
+        let terminal_sender = tokio::spawn(async move {
+            send_storage_message(
+                &storage_tx,
+                &client_tx,
+                StorageMessage::ResponseDone {
+                    finish_reason: "stop".to_string(),
+                },
+            )
+            .await
+        });
+
         assert!(matches!(
             storage_rx.recv().await,
-            Some(StorageMessage::Cancelled)
+            Some(StorageMessage::ResponseDone { .. })
         ));
+        tokio::task::yield_now().await;
+        assert!(
+            !terminal_sender.is_finished(),
+            "terminal event must wait instead of being dropped while the client channel is full"
+        );
+
         assert!(matches!(
             client_rx.recv().await,
-            Some(StorageMessage::Cancelled)
+            Some(StorageMessage::ContentDelta { .. })
         ));
-        listener.await.unwrap();
+        terminal_sender
+            .await
+            .expect("join terminal sender")
+            .expect("send terminal message");
+        assert!(matches!(
+            client_rx.recv().await,
+            Some(StorageMessage::ResponseDone { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_completion_replays_buffered_output_when_client_terminal_send_is_interrupted() {
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+        let (client_tx, mut client_rx) = mpsc::channel(3);
+        let item_id = Uuid::new_v4();
+        client_tx
+            .send(StorageMessage::MessageStarted { item_id })
+            .await
+            .expect("queue message start");
+        client_tx
+            .send(StorageMessage::ContentDelta {
+                item_id,
+                delta: "buffered output".to_string(),
+            })
+            .await
+            .expect("queue message content");
+        client_tx
+            .send(StorageMessage::MessageDone {
+                item_id,
+                finish_reason: "stop".to_string(),
+            })
+            .await
+            .expect("fill client channel");
+
+        let terminal_sender = tokio::spawn(async move {
+            send_storage_message(
+                &storage_tx,
+                &client_tx,
+                StorageMessage::ResponseDone {
+                    finish_reason: "stop".to_string(),
+                },
+            )
+            .await
+        });
+
+        assert!(matches!(
+            storage_rx.recv().await,
+            Some(StorageMessage::ResponseDone { .. })
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            !terminal_sender.is_finished(),
+            "terminal sender must be blocked behind buffered client output"
+        );
+        terminal_sender.abort();
+        assert!(terminal_sender
+            .await
+            .expect_err("terminal sender should be cancelled")
+            .is_cancelled());
+
+        assert!(matches!(
+            next_client_message_after_durable_completion(&mut client_rx),
+            StorageMessage::MessageStarted { item_id: replayed_id } if replayed_id == item_id
+        ));
+
+        assert!(matches!(
+            next_client_message_after_durable_completion(&mut client_rx),
+            StorageMessage::ContentDelta { item_id: replayed_id, delta }
+                if replayed_id == item_id && delta == "buffered output"
+        ));
+        assert!(matches!(
+            next_client_message_after_durable_completion(&mut client_rx),
+            StorageMessage::MessageDone { item_id: replayed_id, finish_reason }
+                if replayed_id == item_id && finish_reason == "stop"
+        ));
+        assert!(matches!(
+            next_client_message_after_durable_completion(&mut client_rx),
+            StorageMessage::ResponseDone { .. }
+        ));
+    }
+
+    #[test]
+    fn durable_storage_outcome_controls_the_client_cancellation_terminal() {
+        assert_eq!(
+            client_cancellation_terminal_decision(StorageCompletionDecision::Completed),
+            ClientCancellationTerminalDecision::ReplayCompleted
+        );
+        assert_eq!(
+            client_cancellation_terminal_decision(StorageCompletionDecision::Cancelled),
+            ClientCancellationTerminalDecision::EmitCancelled
+        );
+        assert_eq!(
+            client_cancellation_terminal_decision(StorageCompletionDecision::Error),
+            ClientCancellationTerminalDecision::EmitError
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_completion_uses_an_already_queued_client_terminal_message() {
+        let (client_tx, mut client_rx) = mpsc::channel(2);
+        client_tx
+            .send(StorageMessage::Usage {
+                prompt_tokens: 3,
+                completion_tokens: 5,
+            })
+            .await
+            .expect("queue usage");
+        client_tx
+            .send(StorageMessage::ResponseDone {
+                finish_reason: "length".to_string(),
+            })
+            .await
+            .expect("queue terminal message");
+
+        assert!(matches!(
+            next_client_message_after_durable_completion(&mut client_rx),
+            StorageMessage::Usage {
+                prompt_tokens: 3,
+                completion_tokens: 5
+            }
+        ));
+        assert!(matches!(
+            next_client_message_after_durable_completion(&mut client_rx),
+            StorageMessage::ResponseDone { finish_reason } if finish_reason == "length"
+        ));
+    }
+
+    #[tokio::test]
+    async fn transcript_delta_waits_for_saturated_client_channel() {
+        let (storage_tx, mut storage_rx) = mpsc::channel(2);
+        let (client_tx, mut client_rx) = mpsc::channel(1);
+        let queued_item_id = Uuid::new_v4();
+        let retained_item_id = Uuid::new_v4();
+        client_tx
+            .send(StorageMessage::ContentDelta {
+                item_id: queued_item_id,
+                delta: "already queued".to_string(),
+            })
+            .await
+            .expect("fill client channel");
+
+        let delta_sender = tokio::spawn(async move {
+            send_storage_message(
+                &storage_tx,
+                &client_tx,
+                StorageMessage::ContentDelta {
+                    item_id: retained_item_id,
+                    delta: "must not be dropped".to_string(),
+                },
+            )
+            .await
+        });
+
+        assert!(matches!(
+            storage_rx.recv().await,
+            Some(StorageMessage::ContentDelta { item_id, .. }) if item_id == retained_item_id
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            !delta_sender.is_finished(),
+            "transcript deltas must apply backpressure instead of being dropped"
+        );
+
+        assert!(matches!(
+            client_rx.recv().await,
+            Some(StorageMessage::ContentDelta { item_id, .. }) if item_id == queued_item_id
+        ));
+        delta_sender
+            .await
+            .expect("join delta sender")
+            .expect("send retained delta");
+        assert!(matches!(
+            client_rx.recv().await,
+            Some(StorageMessage::ContentDelta { item_id, .. }) if item_id == retained_item_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn response_completion_maps_non_successful_storage_outcomes() {
+        for (outcome, expected) in [
+            (
+                StorageTaskOutcome::Cancelled,
+                StorageCompletionDecision::Cancelled,
+            ),
+            (StorageTaskOutcome::Failed, StorageCompletionDecision::Error),
+        ] {
+            let mut storage_handle = Some(tokio::spawn(async move { outcome }));
+            assert_eq!(
+                await_storage_completion(&mut storage_handle).await,
+                expected
+            );
+            assert!(storage_handle.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn response_completion_fails_closed_for_missing_or_aborted_storage_worker() {
+        let mut missing_handle = None;
+        assert_eq!(
+            await_storage_completion(&mut missing_handle).await,
+            StorageCompletionDecision::Error
+        );
+
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            StorageTaskOutcome::Completed
+        });
+        handle.abort();
+        let mut aborted_handle = Some(handle);
+        assert_eq!(
+            await_storage_completion(&mut aborted_handle).await,
+            StorageCompletionDecision::Error
+        );
+    }
+
+    #[tokio::test]
+    async fn response_completion_keeps_waiting_after_storage_join_warning() {
+        let (release_storage, storage_released) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            storage_released.await.expect("release storage worker");
+            StorageTaskOutcome::Completed
+        });
+        let abort_handle = handle.abort_handle();
+        let mut storage_handle = Some(handle);
+        let mut waiter = tokio::spawn(async move {
+            let decision = await_storage_completion_with_warning_after(
+                &mut storage_handle,
+                Duration::from_millis(20),
+            )
+            .await;
+            (decision, storage_handle.is_none())
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), &mut waiter)
+                .await
+                .is_err(),
+            "storage waiter must remain pending after the warning threshold"
+        );
+        assert!(!abort_handle.is_finished());
+
+        release_storage.send(()).expect("release storage worker");
+        let (decision, handle_consumed) = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("storage waiter should resume after release")
+            .expect("join storage waiter");
+        assert_eq!(decision, StorageCompletionDecision::Completed);
+        assert!(handle_consumed);
+        assert!(abort_handle.is_finished());
     }
 
     #[test]
@@ -2612,7 +3028,7 @@ struct PersistedData {
 /// * `user` - The user who owns the conversation
 /// * `user_key` - User's encryption key for metadata
 /// * `user_content` - The user's first message content
-async fn spawn_title_generation_task(
+fn spawn_title_generation_task(
     state: Arc<AppState>,
     conversation_id: i64,
     conversation_uuid: Uuid,
@@ -3184,9 +3600,9 @@ async fn execute_tool_call_and_wait(
             .await;
         return Err(ApiError::InternalServerError);
     }
-    if tx_client.try_send(tool_call_msg).is_err() {
+    if tx_client.send(tool_call_msg).await.is_err() {
         warn!(
-            "Client channel full or closed, skipping tool_call {} for response {}",
+            "Client channel closed before tool_call {} for response {}",
             tool_call_id, persisted.response.uuid
         );
     }
@@ -3260,9 +3676,9 @@ async fn execute_tool_call_and_wait(
             .await;
         return Err(ApiError::InternalServerError);
     }
-    if tx_client.try_send(tool_output_msg).is_err() {
+    if tx_client.send(tool_output_msg).await.is_err() {
         warn!(
-            "Client channel full or closed, skipping tool_output {} for tool_call {} on response {}",
+            "Client channel closed before tool_output {} for tool_call {} on response {}",
             tool_output_id, tool_call_id, persisted.response.uuid
         );
     }
@@ -3315,10 +3731,122 @@ async fn send_storage_message(
         error!("Storage channel closed unexpectedly");
         return Err(ApiError::InternalServerError);
     }
-    if tx_client.try_send(msg).is_err() {
-        warn!("Client channel full or closed");
+    // Every client item is part of the durable transcript projection. Apply
+    // bounded backpressure rather than dropping deltas or item-finalization
+    // events and then emitting a misleading response.completed.
+    if tx_client.send(msg).await.is_err() {
+        warn!("Client channel closed before response event");
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageCompletionDecision {
+    Completed,
+    Cancelled,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientCancellationTerminalDecision {
+    EmitCancelled,
+    ReplayCompleted,
+    EmitError,
+}
+
+fn client_cancellation_terminal_decision(
+    storage_completion: StorageCompletionDecision,
+) -> ClientCancellationTerminalDecision {
+    match storage_completion {
+        StorageCompletionDecision::Cancelled => ClientCancellationTerminalDecision::EmitCancelled,
+        StorageCompletionDecision::Completed => ClientCancellationTerminalDecision::ReplayCompleted,
+        StorageCompletionDecision::Error => ClientCancellationTerminalDecision::EmitError,
+    }
+}
+
+/// Wait for the storage worker to acknowledge the terminal response state.
+///
+/// `ResponseDone` reaches the client and storage channels independently. The
+/// client must therefore join the storage worker before treating its copy as a
+/// durable `response.completed` event. A missing, failed, or panicked worker is
+/// fail-closed so callers never observe a false completion.
+async fn await_storage_completion(
+    storage_handle: &mut Option<tokio::task::JoinHandle<StorageTaskOutcome>>,
+) -> StorageCompletionDecision {
+    await_storage_completion_with_warning_after(storage_handle, RESPONSE_STORAGE_JOIN_WARNING_AFTER)
+        .await
+}
+
+async fn await_storage_completion_with_warning_after(
+    storage_handle: &mut Option<tokio::task::JoinHandle<StorageTaskOutcome>>,
+    warning_after: Duration,
+) -> StorageCompletionDecision {
+    let Some(mut handle) = storage_handle.take() else {
+        return StorageCompletionDecision::Error;
+    };
+
+    let storage_outcome = match tokio::time::timeout(warning_after, &mut handle).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            warn!(
+                "Responses storage worker is still running after {} ms; continuing to wait for its authoritative terminal state",
+                warning_after.as_millis()
+            );
+            handle.await
+        }
+    };
+
+    match storage_outcome {
+        Ok(StorageTaskOutcome::Completed) => StorageCompletionDecision::Completed,
+        Ok(StorageTaskOutcome::Cancelled) => StorageCompletionDecision::Cancelled,
+        Ok(StorageTaskOutcome::Failed) | Err(_) => StorageCompletionDecision::Error,
+    }
+}
+
+/// Once storage has durably completed, every nonterminal client projection is
+/// already buffered or consumed because producers await each client send before
+/// enqueueing `ResponseDone` for storage. Cancellation can interrupt the
+/// redundant client-side `ResponseDone` send after storage received its copy,
+/// so synthesize only that terminal marker after the buffered projection drains.
+fn next_client_message_after_durable_completion(
+    rx_client: &mut mpsc::Receiver<StorageMessage>,
+) -> StorageMessage {
+    match rx_client.try_recv() {
+        Ok(message @ StorageMessage::ResponseDone { .. }) => message,
+        Ok(StorageMessage::Cancelled | StorageMessage::Error(_))
+        | Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+            StorageMessage::ResponseDone {
+                finish_reason: "stop".to_string(),
+            }
+        }
+        Ok(message) => message,
+    }
+}
+
+fn best_effort_fail_response_after_storage_error(
+    state: &AppState,
+    response_id: i64,
+    response_uuid: Uuid,
+) {
+    match state.db.update_response_status_if_current(
+        response_id,
+        ResponseStatus::InProgress,
+        ResponseStatus::Failed,
+        Some(Utc::now()),
+    ) {
+        Ok(true) => debug!(
+            "Marked response {} failed after storage worker error",
+            response_uuid
+        ),
+        Ok(false) => debug!(
+            "Response {} was already terminal after storage worker error",
+            response_uuid
+        ),
+        Err(e) => error!(
+            "Failed to mark response {} failed after storage worker error: {:?}",
+            response_uuid, e
+        ),
+    }
 }
 
 fn next_assistant_message_id(next_message_id: &mut Option<Uuid>) -> Uuid {
@@ -3386,6 +3914,7 @@ async fn ensure_message_started(
         StorageMessage::MessageStarted { item_id: id },
     )
     .await?;
+
     *current_message_id = Some(id);
     Ok(id)
 }
@@ -3406,6 +3935,7 @@ async fn stream_one_assistant_turn(
     conversation_uuid: Uuid,
     tool_turn_count: usize,
     prompt_token_estimate: usize,
+    response_execution: ResponseExecution,
 ) -> Result<AssistantTurnOutcome, ApiError> {
     let mut chat_request = build_model_turn_request(body, prompt_messages, tools_enabled);
 
@@ -3431,13 +3961,14 @@ async fn stream_one_assistant_turn(
         body.model.clone(),
     );
 
-    let mut completion = get_chat_completion_response(
+    let mut completion = get_chat_completion_response_for_execution(
         state,
         user,
         chat_request.take(),
         headers,
         billing_context,
         model_plan,
+        response_execution,
     )
     .await?;
 
@@ -3699,6 +4230,7 @@ async fn setup_completion_processor(
     tx_client: mpsc::Sender<StorageMessage>,
     tx_storage: mpsc::Sender<StorageMessage>,
     mut rx_tool_ack: mpsc::Receiver<Result<(), String>>,
+    response_execution: ResponseExecution,
 ) -> Result<crate::models::responses::Response, ApiError> {
     let tools_enabled = context.web_search_enabled;
     let mut prompt_messages = Arc::as_ref(&context.prompt_messages).clone();
@@ -3724,6 +4256,7 @@ async fn setup_completion_processor(
                 context.conversation.uuid,
                 tool_turn_count,
                 prompt_token_estimate,
+                response_execution.clone(),
             )
             .await?
             {
@@ -3770,55 +4303,11 @@ async fn setup_completion_processor(
     if let Err(e) = loop_result {
         let msg = StorageMessage::Error(format!("Streaming failed: {:?}", e));
         let _ = tx_storage.send(msg.clone()).await;
-        let _ = tx_client.try_send(msg);
+        let _ = tx_client.send(msg).await;
         return Err(e);
     }
 
     Ok(persisted.response.clone())
-}
-
-async fn wait_for_response_cancellation(
-    response_uuid: Uuid,
-    mut cancel_rx: broadcast::Receiver<Uuid>,
-    tx_storage: mpsc::Sender<StorageMessage>,
-    tx_client: mpsc::Sender<StorageMessage>,
-) {
-    loop {
-        match cancel_rx.recv().await {
-            Ok(cancelled_id) if cancelled_id == response_uuid => {
-                debug!(
-                    "Orchestrator: Received cancellation during phases 5-6 for response {}",
-                    response_uuid
-                );
-
-                let _ = tx_storage.send(StorageMessage::Cancelled).await;
-                let _ = tx_client.send(StorageMessage::Cancelled).await;
-
-                trace!("Orchestrator: Cancellation handled, exiting");
-                return;
-            }
-            Ok(cancelled_id) => {
-                trace!(
-                    "Orchestrator: ignoring cancellation for unrelated response {} while running response {}",
-                    cancelled_id,
-                    response_uuid
-                );
-            }
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!(
-                    "Orchestrator: cancellation listener for response {} lagged by {} message(s)",
-                    response_uuid, skipped
-                );
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                warn!(
-                    "Orchestrator: cancellation channel closed while response {} was still running",
-                    response_uuid
-                );
-                std::future::pending::<()>().await;
-            }
-        }
-    }
 }
 
 async fn create_response_stream(
@@ -3942,6 +4431,77 @@ async fn create_response_stream(
     )
     .await?;
 
+    // Derive the response-item clock before starting any detached work. If the
+    // timestamp cannot advance, fail the newly persisted response explicitly
+    // rather than leaving an in_progress row with no execution owner.
+    let Some(first_response_item_created_at) = persisted
+        .last_item_created_at
+        .checked_add_signed(chrono::Duration::microseconds(1))
+    else {
+        best_effort_fail_response_after_storage_error(
+            &state,
+            persisted.response.id,
+            persisted.response.uuid,
+        );
+        return Err(ApiError::InternalServerError);
+    };
+
+    let response_execution_registration = state
+        .response_executions
+        .register(persisted.response.uuid, user.uuid)
+        .map_err(|_| {
+            error!(
+                "Duplicate live execution registration for response {}",
+                persisted.response.uuid
+            );
+            best_effort_fail_response_after_storage_error(
+                &state,
+                persisted.response.id,
+                persisted.response.uuid,
+            );
+            ApiError::InternalServerError
+        })?;
+    let response_execution = response_execution_registration.execution();
+    // Bridge registration into lazy SSE startup. This guard is acquired before
+    // the response ID can be exposed and is released only after storage and
+    // orchestrator ownership have both been installed.
+    let response_setup_guard = response_execution.begin_task().map_err(|_| {
+        error!("Response execution closed during initial task registration");
+        best_effort_fail_response_after_storage_error(
+            &state,
+            persisted.response.id,
+            persisted.response.uuid,
+        );
+        ApiError::InternalServerError
+    })?;
+    let storage_execution_guard = response_execution.begin_task().map_err(|_| {
+        error!("Response execution closed before storage ownership was installed");
+        best_effort_fail_response_after_storage_error(
+            &state,
+            persisted.response.id,
+            persisted.response.uuid,
+        );
+        ApiError::InternalServerError
+    })?;
+    let orchestrator_execution_guard = response_execution.begin_task().map_err(|_| {
+        error!("Response execution closed before orchestrator ownership was installed");
+        best_effort_fail_response_after_storage_error(
+            &state,
+            persisted.response.id,
+            persisted.response.uuid,
+        );
+        ApiError::InternalServerError
+    })?;
+    let client_execution_guard = response_execution.begin_task().map_err(|_| {
+        error!("Response execution closed before client-stream ownership was installed");
+        best_effort_fail_response_after_storage_error(
+            &state,
+            persisted.response.id,
+            persisted.response.uuid,
+        );
+        ApiError::InternalServerError
+    })?;
+
     // Check if first message and spawn title generation task
     let (user_count, assistant_count) =
         context
@@ -3960,6 +4520,9 @@ async fn create_response_stream(
     if user_count == 1 && assistant_count == 0 {
         let user_content =
             MessageContentConverter::extract_text_for_token_counting(&prepared.message_content);
+        // Conversation title generation has its own lifecycle. It is not part
+        // of the main response execution barrier, so Stop is never delayed by
+        // this best-effort metadata task.
         spawn_title_generation_task(
             state.clone(),
             context.conversation.id,
@@ -3967,8 +4530,7 @@ async fn create_response_stream(
             user.clone(),
             prepared.user_key,
             user_content,
-        )
-        .await;
+        );
     }
 
     // Capture variables needed inside the stream
@@ -3980,10 +4542,6 @@ async fn create_response_stream(
     let response_uuid = persisted.response.uuid;
     // Persist all generated response items on a single monotonic timestamp sequence that
     // begins immediately after the user message so retrieval order matches stream order.
-    let first_response_item_created_at = persisted
-        .last_item_created_at
-        .checked_add_signed(chrono::Duration::microseconds(1))
-        .ok_or(ApiError::InternalServerError)?;
     let conversation_id = context.conversation.id;
     let user_id = user.uuid;
     let user_key = prepared.user_key;
@@ -3993,7 +4551,125 @@ async fn create_response_stream(
     let image_descriptions_for_stream = Arc::new(image_descriptions);
     let model_turn_body = model_turn_request_without_user_payload(&body);
 
-    // Phases 4-6 now happen INSIDE the stream to start sending events ASAP
+    // Install every response-owned worker eagerly. An HTTP body is lazy and
+    // may be dropped before its first poll; leaving worker startup inside the
+    // SSE generator would strand the already-persisted response in_progress.
+    trace!("Phase 4: Creating dual streams and spawning storage task");
+    let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
+    let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
+
+    // These pairs are already durable. Queue them before the orchestrator can
+    // enqueue assistant output so client order matches persistence order.
+    for pair in image_descriptions_for_stream.iter() {
+        for message in pair.client_messages() {
+            let _ = tx_client.send(message).await;
+        }
+    }
+
+    let (tx_tool_ack, rx_tool_ack) = mpsc::channel::<Result<(), String>>(8);
+    let mut storage_handle = Some({
+        let db = state.db.clone();
+
+        tokio::spawn(async move {
+            let _storage_execution_guard = storage_execution_guard;
+            storage_task(
+                rx_storage,
+                Some(tx_tool_ack),
+                db,
+                response_id,
+                response_uuid,
+                first_response_item_created_at,
+                conversation_id,
+                user_id,
+                user_key,
+            )
+            .await
+        })
+    });
+
+    trace!("Spawning background orchestrator for phases 5-6");
+    let orchestrator_tx_client = tx_client.clone();
+    let orchestrator_tx_storage = tx_storage.clone();
+    let orchestrator_state = state.clone();
+    let orchestrator_user = user.clone();
+    let orchestrator_body = model_turn_body.clone();
+    let orchestrator_headers = headers.clone();
+    let orchestrator_response = response_for_stream.clone();
+    let orchestrator_metadata = decrypted_metadata.clone();
+    let orchestrator_last_item_created_at = persisted.last_item_created_at;
+    let orchestrator_conversation = conversation_for_stream.clone();
+    let orchestrator_prompt_messages = prompt_messages.clone();
+    let orchestrator_execution = response_execution.clone();
+
+    tokio::spawn(async move {
+        let _orchestrator_execution_guard = orchestrator_execution_guard;
+        trace!("Orchestrator: Starting phases 5-6 in background");
+
+        let cancelled = tokio::select! {
+            biased;
+            _ = orchestrator_execution.cancelled() => true,
+            _ = async {
+                trace!("Orchestrator: Setting up assistant/tool loop");
+
+                let context_for_completion = BuiltContext {
+                    conversation: orchestrator_conversation,
+                    prompt_messages: orchestrator_prompt_messages,
+                    total_prompt_tokens,
+                    web_search_enabled,
+                };
+
+                let persisted_for_completion = PersistedData {
+                    response: orchestrator_response.clone(),
+                    decrypted_metadata: orchestrator_metadata.clone(),
+                    last_item_created_at: orchestrator_last_item_created_at,
+                };
+
+                match setup_completion_processor(
+                    &orchestrator_state,
+                    &orchestrator_user,
+                    &orchestrator_body,
+                    model_plan,
+                    &context_for_completion,
+                    &user_key,
+                    assistant_message_id,
+                    &persisted_for_completion,
+                    &orchestrator_headers,
+                    orchestrator_tx_client.clone(),
+                    orchestrator_tx_storage.clone(),
+                    rx_tool_ack,
+                    orchestrator_execution.clone(),
+                )
+                .await
+                {
+                    Ok(_) => trace!("Orchestrator: Assistant/tool loop completed"),
+                    Err(e) => error!("Orchestrator: Assistant/tool loop failed: {:?}", e),
+                }
+            } => {
+                trace!("Orchestrator: Phases 5-6 completed normally");
+                false
+            }
+        };
+
+        if cancelled {
+            debug!(
+                "Orchestrator: stopping response {} before ordered storage cancellation",
+                response_uuid
+            );
+            // The non-selected completion future has been dropped, so no
+            // producer can enqueue more transcript messages. Storage drains
+            // every prior message before publishing durable cancellation.
+            let _ = orchestrator_tx_storage
+                .send(StorageMessage::Cancelled)
+                .await;
+        }
+    });
+
+    // All root lineages have been spawned. From this point quiescence means
+    // both owner setup and every response-owned child have finished.
+    drop(response_execution_registration);
+    drop(response_setup_guard);
+    let mut client_execution_guard = Some(client_execution_guard);
+
     trace!("Creating SSE event stream for client");
     let event_stream = async_stream::stream! {
         trace!("=== STARTING SSE STREAM ===");
@@ -4014,8 +4690,6 @@ async fn create_response_stream(
             sequence_number: emitter.sequence_number(),
         };
 
-        yield Ok(ResponseEvent::Created(created_event).to_sse_event(&mut emitter).await);
-
         // Event 2: response.in_progress
         let in_progress_event = ResponseInProgressEvent {
             event_type: EVENT_RESPONSE_IN_PROGRESS,
@@ -4023,126 +4697,30 @@ async fn create_response_stream(
             sequence_number: emitter.sequence_number(),
         };
 
+        yield Ok(ResponseEvent::Created(created_event).to_sse_event(&mut emitter).await);
         yield Ok(ResponseEvent::InProgress(in_progress_event).to_sse_event(&mut emitter).await);
-
-        // Phase 4: Create dual streams and spawn storage task
-        trace!("Phase 4: Creating dual streams and spawning storage task");
-        let (tx_storage, rx_storage) = mpsc::channel::<StorageMessage>(STORAGE_CHANNEL_BUFFER);
-        let (tx_client, mut rx_client) = mpsc::channel::<StorageMessage>(CLIENT_CHANNEL_BUFFER);
-
-        // These pairs are already durable. Queue them only for client emission,
-        // before the orchestrator can enqueue any assistant output.
-        for pair in image_descriptions_for_stream.iter() {
-            for message in pair.client_messages() {
-                let _ = tx_client.send(message).await;
-            }
-        }
-
-        // Create channel for tool persistence acknowledgments (supports multiple tool loops)
-        let (tx_tool_ack, rx_tool_ack) = mpsc::channel::<Result<(), String>>(8);
-
-        let _storage_handle = {
-            let db = state.db.clone();
-
-            tokio::spawn(async move {
-                storage_task(
-                    rx_storage,
-                    Some(tx_tool_ack),
-                    db,
-                    response_id,
-                    response_uuid,
-                    first_response_item_created_at,
-                    conversation_id,
-                    user_id,
-                    user_key,
-                )
-                .await;
-            })
-        };
-
-        // Spawn orchestrator task for phases 5-6 (runs in background, sends events to tx_client)
-        trace!("Spawning background orchestrator for phases 5-6");
-        let orchestrator_tx_client = tx_client.clone();
-        let orchestrator_tx_storage = tx_storage.clone();
-        let orchestrator_state = state.clone();
-        let orchestrator_user = user.clone();
-        let orchestrator_body = model_turn_body.clone();
-        let orchestrator_headers = headers.clone();
-        let orchestrator_response = response_for_stream.clone();
-        let orchestrator_metadata = decrypted_metadata.clone();
-        let orchestrator_last_item_created_at = persisted.last_item_created_at;
-        let orchestrator_conversation = conversation_for_stream.clone();
-        let orchestrator_prompt_messages = prompt_messages.clone();
-
-        tokio::spawn(async move {
-            trace!("Orchestrator: Starting phases 5-6 in background");
-
-            // Subscribe to cancellation broadcast. The endpoint lives on a separate
-            // request task, so each stream listens for its own response UUID.
-            let cancel_rx = orchestrator_state.cancellation_broadcast.subscribe();
-            let cancellation_listener = wait_for_response_cancellation(
-                response_uuid,
-                cancel_rx,
-                orchestrator_tx_storage.clone(),
-                orchestrator_tx_client.clone(),
-            );
-
-            // Run phases 5-6 with cancellation support
-            tokio::select! {
-                _ = async {
-                    // Phase 5-6: Run the normal assistant/tool loop
-                    trace!("Orchestrator: Setting up assistant/tool loop");
-
-                    let context_for_completion = BuiltContext {
-                        conversation: orchestrator_conversation,
-                        prompt_messages: orchestrator_prompt_messages,
-                        total_prompt_tokens,
-                        web_search_enabled,
-                    };
-
-                    let persisted_for_completion = PersistedData {
-                        response: orchestrator_response.clone(),
-                        decrypted_metadata: orchestrator_metadata.clone(),
-                        last_item_created_at: orchestrator_last_item_created_at,
-                    };
-
-                    match setup_completion_processor(
-                        &orchestrator_state,
-                        &orchestrator_user,
-                        &orchestrator_body,
-                        model_plan,
-                        &context_for_completion,
-                        &user_key,
-                        assistant_message_id,
-                        &persisted_for_completion,
-                        &orchestrator_headers,
-                        orchestrator_tx_client.clone(),
-                        orchestrator_tx_storage.clone(),
-                        rx_tool_ack,
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            trace!("Orchestrator: Assistant/tool loop completed");
-                        }
-                        Err(e) => {
-                            error!("Orchestrator: Assistant/tool loop failed: {:?}", e);
-                        }
-                    }
-                } => {
-                    trace!("Orchestrator: Phases 5-6 completed normally");
-                }
-
-                _ = cancellation_listener => {}
-            }
-        });
 
         // NOW immediately start the event loop - it will receive events from orchestrator as they happen
         trace!("Starting event loop to receive messages from background tasks");
         let mut client_state = ClientResponseState::default();
         let mut total_prompt_tokens_used = 0i32;
         let mut total_completion_tokens = 0i32;
-        while let Some(msg) = rx_client.recv().await {
+        let mut durable_completion_pending = false;
+        loop {
+            let msg = if durable_completion_pending {
+                next_client_message_after_durable_completion(&mut rx_client)
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = response_execution.cancelled() => StorageMessage::Cancelled,
+                    message = rx_client.recv() => {
+                        let Some(message) = message else {
+                            break;
+                        };
+                        message
+                    }
+                }
+            };
             trace!("Client stream received message from upstream processor");
             match msg {
                 StorageMessage::MessageStarted { item_id } => {
@@ -4304,6 +4882,58 @@ async fn create_response_stream(
                     yield Ok(ResponseEvent::OutputItemDone(reasoning_item_done).to_sse_event(&mut emitter).await);
                 }
                 StorageMessage::ResponseDone { finish_reason: _finish_reason } => {
+                    let storage_completion = if durable_completion_pending {
+                        StorageCompletionDecision::Completed
+                    } else {
+                        await_storage_completion(&mut storage_handle).await
+                    };
+                    match storage_completion {
+                        StorageCompletionDecision::Completed => {}
+                        StorageCompletionDecision::Cancelled => {
+                            debug!(
+                                "Storage completed response {} as cancelled before the client terminal event",
+                                response_uuid
+                            );
+                            let cancelled_event = ResponseCancelledEvent {
+                                id: Uuid::new_v4().to_string(),
+                                event_type: EVENT_RESPONSE_CANCELLED,
+                                created_at: Utc::now().timestamp(),
+                                data: ResponseCancelledData {
+                                    id: response_uuid,
+                                },
+                            };
+                            // A terminal SSE event is also the client-visible
+                            // release point for response lifecycle fences. Do
+                            // not emit it until every process-local task owned
+                            // by the main response has exited.
+                            drop(client_execution_guard.take());
+                            response_execution.wait_for_quiescence().await;
+                            yield Ok(ResponseEvent::Cancelled(cancelled_event).to_sse_event(&mut emitter).await);
+                            break;
+                        }
+                        StorageCompletionDecision::Error => {
+                            error!(
+                                "Storage did not acknowledge durable completion for response {}",
+                                response_uuid
+                            );
+                            best_effort_fail_response_after_storage_error(
+                                &state,
+                                response_id,
+                                response_uuid,
+                            );
+                            let error_event = ResponseErrorEvent {
+                                event_type: EVENT_RESPONSE_ERROR,
+                                error: ResponseError {
+                                    error_type: "stream_error".to_string(),
+                                    message: "Internal storage failure - response was not completed".to_string(),
+                                },
+                            };
+                            drop(client_execution_guard.take());
+                            yield Ok(ResponseEvent::Error(error_event).to_sse_event(&mut emitter).await);
+                            break;
+                        }
+                    }
+
                     let usage = build_usage(
                         if total_prompt_tokens_used > 0 {
                             total_prompt_tokens_used
@@ -4326,6 +4956,8 @@ async fn create_response_stream(
                         sequence_number: emitter.sequence_number(),
                     };
 
+                    drop(client_execution_guard.take());
+                    response_execution.wait_for_quiescence().await;
                     yield Ok(ResponseEvent::Completed(completed_event).to_sse_event(&mut emitter).await);
                     break;
                 }
@@ -4336,6 +4968,41 @@ async fn create_response_stream(
                 }
                 StorageMessage::Cancelled => {
                     debug!("Client stream received cancellation signal");
+                    match client_cancellation_terminal_decision(
+                        await_storage_completion(&mut storage_handle).await,
+                    ) {
+                        ClientCancellationTerminalDecision::EmitCancelled => {}
+                        ClientCancellationTerminalDecision::ReplayCompleted => {
+                            debug!(
+                                "Cancellation for response {} lost to durable completion; draining the client projection before emitting response.completed",
+                                response_uuid
+                            );
+                            durable_completion_pending = true;
+                            continue;
+                        }
+                        ClientCancellationTerminalDecision::EmitError => {
+                            error!(
+                                "Storage did not acknowledge durable cancellation for response {}",
+                                response_uuid
+                            );
+                            best_effort_fail_response_after_storage_error(
+                                &state,
+                                response_id,
+                                response_uuid,
+                            );
+                            let error_event = ResponseErrorEvent {
+                                event_type: EVENT_RESPONSE_ERROR,
+                                error: ResponseError {
+                                    error_type: "stream_error".to_string(),
+                                    message: "Internal storage failure - response cancellation was not finalized".to_string(),
+                                },
+                            };
+                            drop(client_execution_guard.take());
+                            yield Ok(ResponseEvent::Error(error_event).to_sse_event(&mut emitter).await);
+                            break;
+                        }
+                    }
+
                     // Send response.cancelled event
                     let cancelled_event = ResponseCancelledEvent {
                         id: Uuid::new_v4().to_string(),
@@ -4346,11 +5013,36 @@ async fn create_response_stream(
                         },
                     };
 
+                    drop(client_execution_guard.take());
+                    response_execution.wait_for_quiescence().await;
                     yield Ok(ResponseEvent::Cancelled(cancelled_event).to_sse_event(&mut emitter).await);
                     break;
                 }
                 StorageMessage::Error(error_msg) => {
                     error!("Client stream received error: {}", error_msg);
+                    let storage_decision = await_storage_completion(&mut storage_handle).await;
+                    if matches!(storage_decision, StorageCompletionDecision::Cancelled) {
+                        let cancelled_event = ResponseCancelledEvent {
+                            id: Uuid::new_v4().to_string(),
+                            event_type: EVENT_RESPONSE_CANCELLED,
+                            created_at: Utc::now().timestamp(),
+                            data: ResponseCancelledData {
+                                id: response_uuid,
+                            },
+                        };
+                        drop(client_execution_guard.take());
+                        response_execution.wait_for_quiescence().await;
+                        yield Ok(ResponseEvent::Cancelled(cancelled_event).to_sse_event(&mut emitter).await);
+                        break;
+                    }
+                    if matches!(storage_decision, StorageCompletionDecision::Error) {
+                        best_effort_fail_response_after_storage_error(
+                            &state,
+                            response_id,
+                            response_uuid,
+                        );
+                    }
+
                     // Send error event to client
                     let error_event = ResponseErrorEvent {
                         event_type: EVENT_RESPONSE_ERROR,
@@ -4360,6 +5052,7 @@ async fn create_response_stream(
                         },
                     };
 
+                    drop(client_execution_guard.take());
                     yield Ok(ResponseEvent::Error(error_event).to_sse_event(&mut emitter).await);
                     break;
                 }
@@ -4724,11 +5417,25 @@ async fn cancel_response(
             }
         })?;
 
-    // Only allow cancelling responses that have not reached a terminal state.
+    let local_execution =
+        response_execution_for_status(&state.response_executions, id, user.uuid, response.status)?;
+
+    // A terminal-status rejection is client-visible as an already-finished
+    // acknowledgement. If process-local work for that response is still
+    // draining, do not return that acknowledgement early.
     if !matches!(
         response.status,
         ResponseStatus::Queued | ResponseStatus::InProgress
     ) {
+        if !wait_for_local_response_execution_quiescence(
+            local_execution,
+            RESPONSE_CANCEL_ACK_TIMEOUT,
+        )
+        .await
+        {
+            warn!("Timed out waiting for terminal response {} to quiesce", id);
+            return Err(ApiError::ServiceUnavailable);
+        }
         debug!(
             "Cannot cancel response {} with status {:?}",
             id, response.status
@@ -4736,25 +5443,66 @@ async fn cancel_response(
         return Err(ApiError::BadRequest);
     }
 
-    // Update the response status in the database
-    let response = state.db.cancel_response(id, user.uuid).map_err(|e| {
-        debug!(
-            "Response {} not found for user {} during cancel: {:?}",
-            id, user.uuid, e
-        );
-        match e {
-            DBError::ResponsesError(ResponsesError::ResponseNotFound) => ApiError::NotFound,
-            DBError::ResponsesError(ResponsesError::Unauthorized) => ApiError::Unauthorized,
-            DBError::ResponsesError(ResponsesError::ValidationError) => ApiError::BadRequest,
-            _ => ApiError::InternalServerError,
-        }
-    })?;
+    let execution = local_execution.ok_or(ApiError::ServiceUnavailable)?;
 
-    // Broadcast cancellation signal to stream listeners after the DB transition
-    // succeeds so storage cannot race the endpoint and turn a valid cancel into
-    // a bad request.
-    debug!("Broadcasting cancellation signal for response {}", id);
-    let _ = state.cancellation_broadcast.send(id);
+    debug!("Signalling cancellation for response {}", id);
+    execution.cancel();
+
+    // Storage owns the terminal status transition. A cancelled row certifies
+    // pending transcript cleanup; the execution barrier below additionally
+    // certifies that storage, orchestrator, main-provider, and client-finalizer
+    // tasks owned by this response have exited. Usage publication and
+    // best-effort conversation-title work have independent lifecycles.
+    let wait_started = Instant::now();
+    let terminal_response = async {
+        loop {
+            let observed = state
+                .db
+                .get_response_by_uuid_and_user(id, user.uuid)
+                .map_err(|e| {
+                    error!(
+                        "Failed to observe cancellation acknowledgement for response {}: {:?}",
+                        id, e
+                    );
+                    ApiError::InternalServerError
+                })?;
+
+            match response_cancellation_ack_decision(observed.status) {
+                ResponseCancellationAckDecision::Cancelled => break Ok(observed),
+                ResponseCancellationAckDecision::LostTerminalRace => {
+                    debug!(
+                        "Cancellation for response {} lost to terminal status {:?}",
+                        id, observed.status
+                    );
+                    break Err(ApiError::BadRequest);
+                }
+                ResponseCancellationAckDecision::Wait => {}
+            }
+
+            if wait_started.elapsed() >= RESPONSE_CANCEL_ACK_TIMEOUT {
+                warn!(
+                    "Timed out waiting for durable cancellation acknowledgement for response {}",
+                    id
+                );
+                break Err(ApiError::ServiceUnavailable);
+            }
+            tokio::time::sleep(RESPONSE_CANCEL_ACK_POLL_INTERVAL).await;
+        }
+    }
+    .await;
+
+    let remaining = RESPONSE_CANCEL_ACK_TIMEOUT.saturating_sub(wait_started.elapsed());
+    if tokio::time::timeout(remaining, execution.wait_for_quiescence())
+        .await
+        .is_err()
+    {
+        warn!(
+            "Timed out waiting for execution quiescence for response {}",
+            id
+        );
+        return Err(ApiError::ServiceUnavailable);
+    }
+    let response = terminal_response?;
 
     // No usage or output for cancelled responses
     let retrieve_response = ResponsesRetrieveResponse {
@@ -4778,6 +5526,38 @@ async fn delete_response(
     Extension(session_id): Extension<Uuid>,
 ) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
     debug!("Deleting response {} for user {}", id, user.uuid);
+
+    let existing = state
+        .db
+        .get_response_by_uuid_and_user(id, user.uuid)
+        .map_err(|e| {
+            debug!(
+                "Response {} not found for user {} before delete: {:?}",
+                id, user.uuid, e
+            );
+            match e {
+                DBError::ResponsesError(ResponsesError::ResponseNotFound) => ApiError::NotFound,
+                DBError::ResponsesError(ResponsesError::Unauthorized) => ApiError::Unauthorized,
+                _ => ApiError::InternalServerError,
+            }
+        })?;
+
+    let local_execution =
+        response_execution_for_status(&state.response_executions, id, user.uuid, existing.status)?;
+
+    if let Some(execution) = local_execution {
+        execution.cancel();
+        if tokio::time::timeout(RESPONSE_CANCEL_ACK_TIMEOUT, execution.wait_for_quiescence())
+            .await
+            .is_err()
+        {
+            warn!(
+                "Refusing to delete response {} before its execution quiesced",
+                id
+            );
+            return Err(ApiError::ServiceUnavailable);
+        }
+    }
 
     // Delete the response (cascade will handle related records)
     state.db.delete_response(id, user.uuid).map_err(|e| {

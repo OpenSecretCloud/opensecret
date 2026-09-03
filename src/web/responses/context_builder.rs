@@ -1911,6 +1911,7 @@ mod tests {
             message_type: message_type.to_string(),
             id,
             uuid: uuid::Uuid::new_v4(),
+            response_uuid: None,
             content_enc: None,
             status: Some("completed".to_string()),
             created_at: chrono::Utc::now(),

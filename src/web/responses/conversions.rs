@@ -303,6 +303,9 @@ pub enum ConversationItem {
     #[serde(rename = "message")]
     Message {
         id: Uuid,
+        /// Response that created this item, if it was created through the Responses API.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response_id: Option<Uuid>,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
         role: String,
@@ -313,6 +316,9 @@ pub enum ConversationItem {
     #[serde(rename = "function_call")]
     FunctionToolCall {
         id: Uuid,
+        /// Response that created this item, if it was created through the Responses API.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response_id: Option<Uuid>,
         call_id: Uuid,
         name: String,
         arguments: String,
@@ -324,6 +330,9 @@ pub enum ConversationItem {
     #[serde(rename = "function_call_output")]
     FunctionToolCallOutput {
         id: Uuid,
+        /// Response that created this item, if it was created through the Responses API.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response_id: Option<Uuid>,
         call_id: Uuid,
         output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -335,6 +344,9 @@ pub enum ConversationItem {
     #[serde(rename = "reasoning")]
     Reasoning {
         id: Uuid,
+        /// Response that created this item, if it was created through the Responses API.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response_id: Option<Uuid>,
         /// Reasoning text content
         content: Vec<ReasoningContentItem>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -407,6 +419,7 @@ impl ConversationItemConverter {
 
         Ok(ConversationItem::Message {
             id: msg.uuid,
+            response_id: msg.response_uuid,
             status: msg.status.clone(),
             role: ROLE_USER.to_string(),
             content: Vec::<ConversationContent>::from(message_content),
@@ -429,6 +442,7 @@ impl ConversationItemConverter {
 
         Ok(ConversationItem::Message {
             id: msg.uuid,
+            response_id: msg.response_uuid,
             status: msg.status.clone(),
             role: ROLE_ASSISTANT.to_string(),
             content: content_parts,
@@ -443,6 +457,7 @@ impl ConversationItemConverter {
     ) -> Result<ConversationItem, ApiError> {
         Ok(ConversationItem::FunctionToolCall {
             id: msg.uuid,
+            response_id: msg.response_uuid,
             call_id: msg.tool_call_id.ok_or_else(|| {
                 error!("tool_call_id missing for tool call");
                 ApiError::InternalServerError
@@ -464,6 +479,7 @@ impl ConversationItemConverter {
     ) -> Result<ConversationItem, ApiError> {
         Ok(ConversationItem::FunctionToolCallOutput {
             id: msg.uuid,
+            response_id: msg.response_uuid,
             call_id: msg.tool_call_id.ok_or_else(|| {
                 error!("tool_call_id missing for tool output");
                 ApiError::InternalServerError
@@ -488,6 +504,7 @@ impl ConversationItemConverter {
 
         Ok(ConversationItem::Reasoning {
             id: msg.uuid,
+            response_id: msg.response_uuid,
             content: content_items,
             status: msg.status.clone(),
             created_at: Some(msg.created_at.timestamp()),
@@ -528,12 +545,83 @@ impl ConversationItemConverter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encrypt::encrypt_with_key;
+
+    async fn serialized_conversation_items(response_uuid: Option<Uuid>) -> Vec<Value> {
+        let user_key = SecretKey::from_slice(&[0x42; 32]).expect("valid test key");
+        let tool_call_id = Uuid::new_v4();
+        let cases = [
+            (
+                "user",
+                serde_json::to_string(&MessageContent::Text("hello".to_string()))
+                    .expect("serialize user content"),
+                None,
+                None,
+            ),
+            ("assistant", "hello back".to_string(), None, None),
+            (
+                "tool_call",
+                r#"{"query":"hello"}"#.to_string(),
+                Some(tool_call_id),
+                Some("search".to_string()),
+            ),
+            (
+                "tool_output",
+                "result".to_string(),
+                Some(tool_call_id),
+                Some("search".to_string()),
+            ),
+            ("reasoning", "thinking".to_string(), None, None),
+        ];
+
+        let mut values = Vec::with_capacity(cases.len());
+        for (message_type, content, item_tool_call_id, tool_name) in cases {
+            let raw_message = RawThreadMessage {
+                message_type: message_type.to_string(),
+                id: 1,
+                uuid: Uuid::new_v4(),
+                response_uuid,
+                content_enc: Some(encrypt_with_key(&user_key, content.as_bytes()).await),
+                status: Some("completed".to_string()),
+                created_at: chrono::Utc::now(),
+                model: None,
+                token_count: Some(1),
+                tool_call_id: item_tool_call_id,
+                finish_reason: None,
+                tool_name,
+            };
+            let item = ConversationItemConverter::message_to_item(&raw_message, &user_key)
+                .expect("convert conversation item");
+            values.push(serde_json::to_value(item).expect("serialize conversation item"));
+        }
+
+        values
+    }
 
     fn input_image(image_url: Option<&str>) -> MessageContentPart {
         MessageContentPart::InputImage {
             image_url: image_url.map(str::to_string),
             file_id: None,
             detail: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn response_id_is_serialized_for_every_response_backed_conversation_item() {
+        let response_uuid = Uuid::new_v4();
+
+        for item in serialized_conversation_items(Some(response_uuid)).await {
+            assert_eq!(item.get("response_id"), Some(&json!(response_uuid)));
+        }
+    }
+
+    #[tokio::test]
+    async fn response_id_is_omitted_for_standalone_conversation_items() {
+        for item in serialized_conversation_items(None).await {
+            assert!(!item
+                .as_object()
+                .expect("conversation item object")
+                .contains_key("response_id"));
         }
     }
 

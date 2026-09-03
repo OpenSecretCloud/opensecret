@@ -1,6 +1,6 @@
 use crate::{
     db::{setup_db, DBError},
-    encrypt::encrypt_with_key,
+    encrypt::{decrypt_with_key, encrypt_with_key},
     generate_reset_hash,
     login_routes::RegisterCredentials,
     models::{
@@ -24,6 +24,7 @@ use crate::{
     },
     private_key::generate_twelve_word_seed,
     seed_wrapping::{password_reset_code_mac, CredentialKind},
+    web::responses::{handlers::StorageMessage, storage_task, StorageTaskOutcome},
     AppMode, AppState, AppStateBuilder, Error,
 };
 use chrono::Utc;
@@ -31,7 +32,7 @@ use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
 use password_auth::generate_hash;
 use secp256k1::SecretKey;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
 fn test_credential(label: &str) -> &'static str {
@@ -1395,6 +1396,257 @@ async fn db_atomic_response_tool_items_roll_back_on_mid_batch_constraint_failure
     );
 
     let _ = app_state.db.delete_user(&owner);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_response_storage_completion_acknowledges_durable_assistant() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let user =
+        create_response_transaction_test_user(&app_state, project.id, marker, "storage-completion");
+    let conversation_id = insert_response_transaction_test_conversation(&app_state, user.uuid);
+    let response_uuid = Uuid::new_v4();
+    let response = app_state
+        .db
+        .create_response(response_transaction_test_response(
+            response_uuid,
+            user.uuid,
+            conversation_id,
+        ))
+        .expect("response should insert");
+    let assistant_item_id = Uuid::new_v4();
+    let assistant_text = "durable assistant before completion";
+    let user_key = SecretKey::from_slice(&[7u8; 32]).expect("test key should be valid");
+    let decryption_key = user_key;
+    let (storage_tx, storage_rx) = mpsc::channel(8);
+    let storage_handle = tokio::spawn(storage_task(
+        storage_rx,
+        None,
+        app_state.db.clone(),
+        response.id,
+        response_uuid,
+        Utc::now(),
+        conversation_id,
+        user.uuid,
+        user_key,
+    ));
+
+    storage_tx
+        .send(StorageMessage::MessageStarted {
+            item_id: assistant_item_id,
+        })
+        .await
+        .expect("queue assistant start");
+    storage_tx
+        .send(StorageMessage::ContentDelta {
+            item_id: assistant_item_id,
+            delta: assistant_text.to_string(),
+        })
+        .await
+        .expect("queue assistant content");
+    storage_tx
+        .send(StorageMessage::MessageDone {
+            item_id: assistant_item_id,
+            finish_reason: "stop".to_string(),
+        })
+        .await
+        .expect("queue assistant completion");
+    storage_tx
+        .send(StorageMessage::ResponseDone {
+            finish_reason: "stop".to_string(),
+        })
+        .await
+        .expect("queue response completion");
+
+    assert_eq!(
+        storage_handle.await.expect("join storage task"),
+        StorageTaskOutcome::Completed
+    );
+    let persisted_response = app_state
+        .db
+        .get_response_by_uuid_and_user(response_uuid, user.uuid)
+        .expect("completed response should be readable");
+    assert_eq!(persisted_response.status, ResponseStatus::Completed);
+    let assistant = app_state
+        .db
+        .get_assistant_message_by_uuid(assistant_item_id)
+        .expect("assistant lookup should succeed")
+        .expect("assistant should exist before completion acknowledgement");
+    assert_eq!(assistant.response_id, Some(response.id));
+    assert_eq!(assistant.status, "completed");
+    assert_eq!(assistant.finish_reason.as_deref(), Some("stop"));
+    let plaintext = decrypt_with_key(
+        &decryption_key,
+        assistant
+            .content_enc
+            .as_deref()
+            .expect("completed assistant should have ciphertext"),
+    )
+    .expect("assistant ciphertext should decrypt");
+    assert_eq!(plaintext, assistant_text.as_bytes());
+
+    let _ = app_state.db.delete_user(&user);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_response_storage_completion_yields_to_committed_cancellation() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let user = create_response_transaction_test_user(
+        &app_state,
+        project.id,
+        marker,
+        "storage-cancellation-race",
+    );
+    let conversation_id = insert_response_transaction_test_conversation(&app_state, user.uuid);
+    let response_uuid = Uuid::new_v4();
+    let response = app_state
+        .db
+        .create_response(response_transaction_test_response(
+            response_uuid,
+            user.uuid,
+            conversation_id,
+        ))
+        .expect("response should insert");
+    app_state
+        .db
+        .cancel_response(response_uuid, user.uuid)
+        .expect("cancellation should commit before its broadcast");
+    let user_key = SecretKey::from_slice(&[8u8; 32]).expect("test key should be valid");
+    let (storage_tx, storage_rx) = mpsc::channel(2);
+    let storage_handle = tokio::spawn(storage_task(
+        storage_rx,
+        None,
+        app_state.db.clone(),
+        response.id,
+        response_uuid,
+        Utc::now(),
+        conversation_id,
+        user.uuid,
+        user_key,
+    ));
+    storage_tx
+        .send(StorageMessage::ResponseDone {
+            finish_reason: "stop".to_string(),
+        })
+        .await
+        .expect("queue racing response completion");
+
+    assert_eq!(
+        storage_handle.await.expect("join storage task"),
+        StorageTaskOutcome::Cancelled
+    );
+    let persisted_response = app_state
+        .db
+        .get_response_by_uuid_and_user(response_uuid, user.uuid)
+        .expect("cancelled response should be readable");
+    assert_eq!(persisted_response.status, ResponseStatus::Cancelled);
+
+    let _ = app_state.db.delete_user(&user);
+}
+
+#[tokio::test]
+#[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
+async fn db_response_storage_write_failure_never_acknowledges_completion() {
+    let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
+        return;
+    };
+
+    let app_state = build_local_test_app_state(database_url).await;
+    let project = first_active_project(&app_state);
+    let marker = Uuid::new_v4();
+    let user = create_response_transaction_test_user(
+        &app_state,
+        project.id,
+        marker,
+        "storage-write-failure",
+    );
+    let conversation_id = insert_response_transaction_test_conversation(&app_state, user.uuid);
+    let response_uuid = Uuid::new_v4();
+    let response = app_state
+        .db
+        .create_response(response_transaction_test_response(
+            response_uuid,
+            user.uuid,
+            conversation_id,
+        ))
+        .expect("response should insert");
+    let missing_conversation_id = i64::MAX;
+    let assistant_item_id = Uuid::new_v4();
+    let user_key = SecretKey::from_slice(&[9u8; 32]).expect("test key should be valid");
+    let (storage_tx, storage_rx) = mpsc::channel(8);
+    let storage_handle = tokio::spawn(storage_task(
+        storage_rx,
+        None,
+        app_state.db.clone(),
+        response.id,
+        response_uuid,
+        Utc::now(),
+        missing_conversation_id,
+        user.uuid,
+        user_key,
+    ));
+    storage_tx
+        .send(StorageMessage::MessageStarted {
+            item_id: assistant_item_id,
+        })
+        .await
+        .expect("queue assistant start");
+    storage_tx
+        .send(StorageMessage::ContentDelta {
+            item_id: assistant_item_id,
+            delta: "must not be acknowledged".to_string(),
+        })
+        .await
+        .expect("queue assistant content");
+    storage_tx
+        .send(StorageMessage::MessageDone {
+            item_id: assistant_item_id,
+            finish_reason: "stop".to_string(),
+        })
+        .await
+        .expect("queue assistant completion");
+    storage_tx
+        .send(StorageMessage::ResponseDone {
+            finish_reason: "stop".to_string(),
+        })
+        .await
+        .expect("queue response completion");
+
+    assert_eq!(
+        storage_handle.await.expect("join storage task"),
+        StorageTaskOutcome::Failed
+    );
+    let persisted_response = app_state
+        .db
+        .get_response_by_uuid_and_user(response_uuid, user.uuid)
+        .expect("failed response should be readable");
+    assert_eq!(persisted_response.status, ResponseStatus::Failed);
+    assert!(
+        app_state
+            .db
+            .get_assistant_message_by_uuid(assistant_item_id)
+            .expect("assistant lookup should succeed")
+            .is_none(),
+        "failed assistant write must not produce a false durable item"
+    );
+
+    let _ = app_state.db.delete_user(&user);
 }
 
 fn create_response_transaction_test_user(

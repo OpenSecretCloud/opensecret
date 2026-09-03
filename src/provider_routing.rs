@@ -804,7 +804,7 @@ mod tests {
         let router = ProviderRouter::default();
         let proxy_router = proxy_router_with_both_providers();
 
-        for model_id in ["kimi-k3", "deepseek-v4-flash"] {
+        for model_id in ["kimi-k3", "deepseek-v4-flash", "glm-5-3-flash"] {
             let selected = router
                 .select_completion_route(&proxy_router, uuid_for_bucket(50), model_id)
                 .expect("canonical Tinfoil model should route");
@@ -827,6 +827,8 @@ mod tests {
             "kimi-k3-latest",
             "deepseek-v4-flash-0731",
             "deepseek-v4flash",
+            "glm-5.3-flash",
+            "glm-5-3-flash-latest",
         ] {
             let error = router
                 .select_completion_route(&proxy_router, uuid_for_bucket(50), model_id)

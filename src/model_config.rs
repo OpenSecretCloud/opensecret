@@ -116,6 +116,7 @@ pub const AUTO_POWERFUL_MODEL_ID: &str = "auto:powerful";
 pub const QUICK_MODEL_ID: &str = "gpt-oss-120b";
 pub const GLM_5_2_MODEL_ID: &str = "glm-5-2";
 pub const GLM_5_3_MODEL_ID: &str = "glm-5-3";
+pub const GLM_5_3_FLASH_MODEL_ID: &str = "glm-5-3-flash";
 pub const POWERFUL_MODEL_ID: &str = GLM_5_2_MODEL_ID;
 pub const KIMI_K3_MODEL_ID: &str = "kimi-k3";
 pub const DEEPSEEK_V4_FLASH_MODEL_ID: &str = "deepseek-v4-flash";
@@ -537,6 +538,26 @@ const MODEL_CONFIGS: &[ModelConfigEntry] = &[
         GEMMA4_RESPONSES_MODEL_CONFIG,
     ),
     ModelConfigEntry::new(
+        GLM_5_3_FLASH_MODEL_ID,
+        "GLM-5.3 Flash",
+        "GLM-5.3 Flash",
+        "Fast multimodal reasoning and tool-use model with a 1M-token context window.",
+        ModelAccessTier::Pro,
+        ModelCapabilities::chat(true, true),
+        &["New", "Reasoning"],
+        true,
+        true,
+        false,
+        25,
+        1_048_576,
+    )
+    .with_catalog_metadata(ModelCatalogMetadata::new(
+        &["text", "image"],
+        &["text"],
+        None,
+        None,
+    )),
+    ModelConfigEntry::new(
         KIMI_K3_MODEL_ID,
         "Kimi K3",
         "Kimi K3",
@@ -727,7 +748,7 @@ pub fn model_reasoning_history_strategy(model: &str) -> Option<ReasoningHistoryS
         "kimi-k2-6" | "kimi-k2.6" | "kimi-k3" => {
             Some(ReasoningHistoryStrategy::KimiPreserveThinking)
         }
-        "glm-5-2" | "glm-5.2" | "glm-5-3" | "glm-5.3" => {
+        "glm-5-2" | "glm-5.2" | "glm-5-3" | "glm-5.3" | "glm-5-3-flash" | "glm-5.3-flash" => {
             Some(ReasoningHistoryStrategy::GlmClearThinking)
         }
         _ => None,
@@ -870,6 +891,7 @@ mod tests {
         assert_eq!(model_context_window("gemma4-31b"), 256_000);
         assert_eq!(model_context_window("glm-5-2"), 256_000);
         assert_eq!(model_context_window("glm-5-3"), 256_000);
+        assert_eq!(model_context_window("glm-5-3-flash"), 1_048_576);
         assert_eq!(model_context_window("kimi-k3"), 256_000);
         assert_eq!(model_context_window("deepseek-v4-flash"), 800_000);
         assert_eq!(model_context_window(AUTO_QUICK_MODEL_ID), 128_000);
@@ -886,6 +908,7 @@ mod tests {
             "gemma4-31b",
             "glm-5-2",
             "glm-5-3",
+            "glm-5-3-flash",
             "kimi-k3",
             "deepseek-v4-flash",
         ] {
@@ -913,6 +936,8 @@ mod tests {
         assert!(model_supports_reasoning_history("glm-5.2"));
         assert!(model_supports_reasoning_history("glm-5-3"));
         assert!(model_supports_reasoning_history("glm-5.3"));
+        assert!(model_supports_reasoning_history("glm-5-3-flash"));
+        assert!(model_supports_reasoning_history("glm-5.3-flash"));
         assert!(model_supports_reasoning_history(AUTO_POWERFUL_MODEL_ID));
 
         assert!(!model_supports_reasoning_history("gpt-oss-120b"));
@@ -945,6 +970,10 @@ mod tests {
         );
         assert_eq!(
             model_reasoning_history_strategy("glm-5.3"),
+            Some(ReasoningHistoryStrategy::GlmClearThinking)
+        );
+        assert_eq!(
+            model_reasoning_history_strategy("glm-5-3-flash"),
             Some(ReasoningHistoryStrategy::GlmClearThinking)
         );
         assert_eq!(
@@ -1002,6 +1031,10 @@ mod tests {
         assert_eq!(resolve_completion_model_id("kimi-k3"), Some("kimi-k3"));
         assert_eq!(resolve_completion_model_id("glm-5-3"), Some("glm-5-3"));
         assert_eq!(
+            resolve_completion_model_id("glm-5-3-flash"),
+            Some("glm-5-3-flash")
+        );
+        assert_eq!(
             resolve_completion_model_id("deepseek-v4-flash"),
             Some("deepseek-v4-flash")
         );
@@ -1025,6 +1058,10 @@ mod tests {
         assert_eq!(resolve_public_model_id("kimi-k2-5"), None);
         assert_eq!(resolve_public_model_id("kimi-k3"), Some("kimi-k3"));
         assert_eq!(resolve_public_model_id("glm-5-3"), Some("glm-5-3"));
+        assert_eq!(
+            resolve_public_model_id("glm-5-3-flash"),
+            Some("glm-5-3-flash")
+        );
         assert_eq!(
             resolve_public_model_id("deepseek-v4-flash"),
             Some("deepseek-v4-flash")
@@ -1156,6 +1193,7 @@ mod tests {
             "kimi-k2-6",
             "glm-5-2",
             "glm-5-3",
+            "glm-5-3-flash",
             "deepseek-v4-flash",
             AUTO_POWERFUL_MODEL_ID,
         ] {
@@ -1268,11 +1306,38 @@ mod tests {
     }
 
     #[test]
-    fn test_kimi_k3_and_deepseek_are_generally_listed() {
+    fn test_catalog_adds_glm_5_3_flash_through_tinfoil_with_image_and_1m_context() {
+        let catalog = model_catalog_response(ModelAliasTargets::for_plan(ModelPlan::Paid));
+        let glm = catalog_model(&catalog, GLM_5_3_FLASH_MODEL_ID);
+
+        assert_eq!(glm["provider"], "tinfoil");
+        assert_eq!(glm["provider_id"], GLM_5_3_FLASH_MODEL_ID);
+        assert_eq!(glm["display_name"], "GLM-5.3 Flash");
+        assert_eq!(glm["access"], "pro");
+        assert_eq!(glm["context_window"], 1_048_576);
+        assert_eq!(glm["input_modalities"], json!(["text", "image"]));
+        assert_eq!(glm["output_modalities"], json!(["text"]));
+        assert_eq!(glm["capabilities"]["vision"], true);
+        assert_eq!(glm["capabilities"]["reasoning"], true);
+        assert_eq!(glm["capabilities"]["tool_use"], true);
+        assert_eq!(glm["tasks"], json!(["generate", "vision"]));
+        assert_eq!(
+            resolve_completion_model_id(GLM_5_3_FLASH_MODEL_ID),
+            Some(GLM_5_3_FLASH_MODEL_ID)
+        );
+    }
+
+    #[test]
+    fn test_new_tinfoil_models_are_generally_listed() {
         let catalog = model_catalog_response(ModelAliasTargets::default());
         let openai_models = openai_models_response();
 
-        for model in ["kimi-k3", "deepseek-v4-flash", QUICK_MODEL_ID] {
+        for model in [
+            "kimi-k3",
+            "deepseek-v4-flash",
+            GLM_5_3_FLASH_MODEL_ID,
+            QUICK_MODEL_ID,
+        ] {
             assert!(has_model(&catalog, model));
             assert!(has_model(&openai_models, model));
         }
@@ -1283,6 +1348,7 @@ mod tests {
         let expected = vec![
             DEEPSEEK_V4_FLASH_MODEL_ID.to_string(),
             GLM_5_3_MODEL_ID.to_string(),
+            GLM_5_3_FLASH_MODEL_ID.to_string(),
             KIMI_K3_MODEL_ID.to_string(),
         ];
 

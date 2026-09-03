@@ -2710,6 +2710,11 @@ mod tests {
         ));
         assert!(ensure_completion_model_access("glm-5-3", ModelPlan::Paid).is_ok());
         assert!(matches!(
+            ensure_completion_model_access("glm-5-3-flash", ModelPlan::Free),
+            Err(ApiError::ModelNotAvailableOnPlan)
+        ));
+        assert!(ensure_completion_model_access("glm-5-3-flash", ModelPlan::Paid).is_ok());
+        assert!(matches!(
             ensure_completion_model_access(
                 crate::model_config::AUTO_POWERFUL_MODEL_ID,
                 ModelPlan::Free

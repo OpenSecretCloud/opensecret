@@ -899,6 +899,14 @@ mod tests {
             "glm-5-3"
         );
         assert!(matches!(
+            resolve_responses_model("glm-5-3-flash", "tinfoil", ModelPlan::Free),
+            Err(ApiError::ModelNotAvailableOnPlan)
+        ));
+        assert_eq!(
+            resolve_responses_model("glm-5-3-flash", "tinfoil", ModelPlan::Paid).unwrap(),
+            "glm-5-3-flash"
+        );
+        assert!(matches!(
             resolve_responses_model("deepseek-v4-flash", "tinfoil", ModelPlan::Free),
             Err(ApiError::ModelNotAvailableOnPlan)
         ));
@@ -964,6 +972,18 @@ mod tests {
         assert_eq!(glm_5_3_request["model"], "glm-5-3");
         assert_eq!(
             glm_5_3_request["chat_template_kwargs"]["clear_thinking"],
+            false
+        );
+
+        let glm_5_3_flash = responses_request_for_model("glm-5-3-flash");
+        let glm_5_3_flash_request = build_model_turn_request(
+            &glm_5_3_flash,
+            &[json!({"role": "user", "content": "hello"})],
+            false,
+        );
+        assert_eq!(glm_5_3_flash_request["model"], "glm-5-3-flash");
+        assert_eq!(
+            glm_5_3_flash_request["chat_template_kwargs"]["clear_thinking"],
             false
         );
 

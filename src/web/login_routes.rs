@@ -1,3 +1,4 @@
+use crate::transport_v2::envelope::{Credential, CredentialKind};
 use crate::User;
 use crate::{
     db::DBError,
@@ -12,8 +13,10 @@ use crate::{
 };
 use crate::{ApiError, AppState};
 use axum::{
+    body::{Body, HttpBody},
     extract::{Path, State},
-    middleware::from_fn_with_state,
+    http::Request,
+    middleware::{from_fn_with_state, Next},
     response::Response,
     routing::{get, post},
     Extension, Router,
@@ -84,7 +87,7 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
             "/refresh",
             post(refresh_token).layer(from_fn_with_state(
                 app_state.clone(),
-                decrypt_request::<RefreshRequest>,
+                prepare_refresh_request,
             )),
         )
         .route(
@@ -127,6 +130,35 @@ pub struct RefreshResponse {
     refresh_token: String,
 }
 
+async fn prepare_refresh_request(
+    State(state): State<Arc<AppState>>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let is_transport_v2 = request
+        .extensions()
+        .get::<TransportSession>()
+        .is_some_and(TransportSession::is_v2);
+    if is_transport_v2 {
+        if request.body().size_hint().exact() != Some(0) {
+            return Err(ApiError::BadRequest);
+        }
+        let refresh_token = request
+            .extensions()
+            .get::<Credential>()
+            .filter(|credential| credential.kind() == CredentialKind::Resumption)
+            .map(|credential| credential.value().to_string())
+            .ok_or(ApiError::InvalidJwt)?;
+        request
+            .extensions_mut()
+            .insert(RefreshRequest { refresh_token });
+        return Ok(next.run(request).await);
+    }
+
+    let headers = request.headers().clone();
+    decrypt_request::<RefreshRequest>(State(state), headers, request, next).await
+}
+
 #[derive(Deserialize, Clone)]
 pub struct LogoutRequest {
     refresh_token: String,
@@ -139,12 +171,16 @@ pub async fn login(
 ) -> Result<Response, ApiError> {
     tracing::trace!("call login");
 
-    let auth_response = login_internal(data.clone(), creds).await?;
+    let auth_response = login_internal(data.clone(), creds, session_id.is_v2()).await?;
     let result = encrypt_response(&data, &session_id, &auth_response).await;
     result
 }
 
-async fn login_internal(data: Arc<AppState>, creds: Credentials) -> Result<AuthResponse, ApiError> {
+async fn login_internal(
+    data: Arc<AppState>,
+    creds: Credentials,
+    is_transport_v2: bool,
+) -> Result<AuthResponse, ApiError> {
     // First get the project by client_id and verify it's active
     let project = data
         .db
@@ -212,13 +248,13 @@ async fn login_internal(data: Arc<AppState>, creds: Credentials) -> Result<AuthR
         Ok(Some(authenticated_user)) => {
             let access_token = NewToken::new_with_auth_context(
                 &authenticated_user.user,
-                TokenType::Access,
+                TokenType::access_for_transport(is_transport_v2),
                 &data,
                 &authenticated_user.auth_context,
             )?;
             let refresh_token = NewToken::new_with_auth_context(
                 &authenticated_user.user,
-                TokenType::Refresh,
+                TokenType::refresh_for_transport(is_transport_v2),
                 &data,
                 &authenticated_user.auth_context,
             )?;
@@ -285,6 +321,7 @@ pub async fn register(
             password: creds.password,
             client_id: creds.client_id,
         },
+        session_id.is_v2(),
     )
     .await?;
 
@@ -347,7 +384,12 @@ pub async fn refresh_token(
 ) -> Result<Response, ApiError> {
     info!("Refresh token request received");
 
-    let claims = validate_token(&refresh_request.refresh_token, &data, USER_REFRESH)?;
+    let refresh_audience = if session_id.is_v2() {
+        crate::jwt::TRANSPORT_V2_USER_REFRESH
+    } else {
+        USER_REFRESH
+    };
+    let claims = validate_token(&refresh_request.refresh_token, &data, refresh_audience)?;
 
     // Audience check is now handled by validate_token
     let user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::InvalidJwt)?;
@@ -361,10 +403,18 @@ pub async fn refresh_token(
     data.verify_seed_wrap_for_auth_context(&user, &auth_context)
         .map_err(|_| ApiError::InvalidJwt)?;
 
-    let new_access_token =
-        NewToken::new_with_auth_context(&user, TokenType::Access, &data, &auth_context)?;
-    let new_refresh_token =
-        NewToken::new_with_auth_context(&user, TokenType::Refresh, &data, &auth_context)?;
+    let new_access_token = NewToken::new_with_auth_context(
+        &user,
+        TokenType::access_for_transport(session_id.is_v2()),
+        &data,
+        &auth_context,
+    )?;
+    let new_refresh_token = NewToken::new_with_auth_context(
+        &user,
+        TokenType::refresh_for_transport(session_id.is_v2()),
+        &data,
+        &auth_context,
+    )?;
 
     let response = RefreshResponse {
         access_token: new_access_token.token,

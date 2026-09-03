@@ -2,17 +2,23 @@ use crate::db::DBConnection;
 use crate::models::oauth::NewOAuthProvider;
 use crate::Error;
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use oauth2::{
     basic::BasicClient as OAuthBasicClient, AuthUrl, ClientId, ClientSecret, CsrfToken,
-    EndpointNotSet, EndpointSet, RedirectUrl, Scope, TokenUrl,
+    EndpointNotSet, EndpointSet, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 use uuid::Uuid;
+use zeroize::Zeroizing;
+
+use crate::transport_v2::crypto::SessionId;
 
 // OAuth redirects normally complete within seconds. Ten minutes leaves room for a user to
 // authenticate without retaining abandoned CSRF state for the encrypted session lifetime.
@@ -44,7 +50,60 @@ struct OAuthStateStoreInner {
 #[derive(Debug)]
 struct StoredOAuthState {
     state: OAuthState,
+    binding: OAuthStateBinding,
     expires_at: Instant,
+}
+
+/// Server-only binding for an OAuth authorization round trip.
+///
+/// V1 preserves its existing state semantics. V2 binds the one-time callback
+/// state to the attested transport session that initiated the redirect, so
+/// copied provider callback parameters cannot authenticate another session.
+#[derive(Debug)]
+enum OAuthStateBinding {
+    LegacyV1,
+    TransportV2 {
+        session_id: SessionId,
+        code_binding: OAuthCodeBinding,
+    },
+}
+
+/// Provider-verifiable binding between one V2 authorization response and the
+/// enclave session that initiated it.
+///
+/// GitHub and Google bind the authorization code to a one-time PKCE verifier.
+/// Apple does not advertise PKCE, so its signed ID token carries a nonce
+/// generated independently and stored alongside the state and V2 session.
+pub(crate) enum OAuthCodeBinding {
+    Pkce(PkceCodeVerifier),
+    AppleNonce(Zeroizing<String>),
+}
+
+fn new_pkce_binding() -> (PkceCodeChallenge, OAuthCodeBinding) {
+    let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
+    (challenge, OAuthCodeBinding::Pkce(verifier))
+}
+
+fn new_apple_nonce() -> (String, OAuthCodeBinding) {
+    let raw_nonce = Zeroizing::new(URL_SAFE_NO_PAD.encode(crate::encrypt::generate_random::<32>()));
+    let public_nonce = hex::encode(Sha256::digest(raw_nonce.as_bytes()));
+    (public_nonce, OAuthCodeBinding::AppleNonce(raw_nonce))
+}
+
+impl fmt::Debug for OAuthCodeBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pkce(_) => formatter.write_str("Pkce([redacted])"),
+            Self::AppleNonce(_) => formatter.write_str("AppleNonce([redacted])"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BoundOAuthAuthorization {
+    pub(crate) auth_url: String,
+    pub(crate) csrf_token: CsrfToken,
+    pub(crate) code_binding: OAuthCodeBinding,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -70,13 +129,50 @@ impl OAuthStateStore {
         csrf_token: &str,
         state: OAuthState,
     ) -> Result<(), OAuthStateCapacityError> {
-        self.store_at(csrf_token, state, Instant::now()).await
+        self.store_with_binding(
+            csrf_token,
+            state,
+            OAuthStateBinding::LegacyV1,
+            Instant::now(),
+        )
+        .await
     }
 
+    async fn store_for_session(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        session_id: SessionId,
+        code_binding: OAuthCodeBinding,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.store_with_binding(
+            csrf_token,
+            state,
+            OAuthStateBinding::TransportV2 {
+                session_id,
+                code_binding,
+            },
+            Instant::now(),
+        )
+        .await
+    }
+
+    #[cfg(test)]
     async fn store_at(
         &self,
         csrf_token: &str,
         state: OAuthState,
+        now: Instant,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.store_with_binding(csrf_token, state, OAuthStateBinding::LegacyV1, now)
+            .await
+    }
+
+    async fn store_with_binding(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        binding: OAuthStateBinding,
         now: Instant,
     ) -> Result<(), OAuthStateCapacityError> {
         let mut inner = self.inner.lock().await;
@@ -92,6 +188,7 @@ impl OAuthStateStore {
             csrf_token.to_string(),
             StoredOAuthState {
                 state,
+                binding,
                 expires_at: now
                     .checked_add(self.ttl)
                     .expect("OAuth state TTL must fit in Instant"),
@@ -101,23 +198,58 @@ impl OAuthStateStore {
     }
 
     async fn consume(&self, state: &OAuthState) -> bool {
-        self.consume_at(state, Instant::now()).await
+        self.take_with_binding(state, None, Instant::now())
+            .await
+            .is_some()
     }
 
+    async fn consume_for_session(
+        &self,
+        state: &OAuthState,
+        session_id: SessionId,
+    ) -> Option<OAuthCodeBinding> {
+        let stored_state = self
+            .take_with_binding(state, Some(session_id), Instant::now())
+            .await?;
+        match stored_state.binding {
+            OAuthStateBinding::TransportV2 { code_binding, .. } => Some(code_binding),
+            OAuthStateBinding::LegacyV1 => None,
+        }
+    }
+
+    #[cfg(test)]
     async fn consume_at(&self, state: &OAuthState, now: Instant) -> bool {
+        self.take_with_binding(state, None, now).await.is_some()
+    }
+
+    async fn take_with_binding(
+        &self,
+        state: &OAuthState,
+        session_id: Option<SessionId>,
+        now: Instant,
+    ) -> Option<StoredOAuthState> {
         let mut inner = self.inner.lock().await;
         inner
             .entries
             .retain(|_, stored_state| stored_state.expires_at > now);
 
-        let matches = inner
-            .entries
-            .get(&state.csrf_token)
-            .is_some_and(|stored_state| stored_state.state == *state);
-        if matches {
-            inner.entries.remove(&state.csrf_token);
-        }
+        let matches = inner.entries.get(&state.csrf_token).is_some_and(|stored| {
+            stored.state == *state
+                && match (&stored.binding, session_id) {
+                    (OAuthStateBinding::LegacyV1, None) => true,
+                    (
+                        OAuthStateBinding::TransportV2 {
+                            session_id: stored_session,
+                            ..
+                        },
+                        Some(expected_session),
+                    ) => *stored_session == expected_session,
+                    _ => false,
+                }
+        });
         matches
+            .then(|| inner.entries.remove(&state.csrf_token))
+            .flatten()
     }
 
     #[cfg(test)]
@@ -188,16 +320,22 @@ impl GithubProvider {
         (auth_url.to_string(), csrf_token)
     }
 
-    pub async fn store_state(
+    pub(crate) async fn generate_bound_authorize_url(
         &self,
-        csrf_token: &str,
-        state: OAuthState,
-    ) -> Result<(), OAuthStateCapacityError> {
-        self.state_store.store(csrf_token, state).await
-    }
+        client: &BasicClient,
+    ) -> BoundOAuthAuthorization {
+        let (challenge, binding) = new_pkce_binding();
+        let (auth_url, csrf_token) = client
+            .authorize_url(CsrfToken::new_random)
+            .add_scope(Scope::new("user:email".to_string()))
+            .set_pkce_challenge(challenge)
+            .url();
 
-    pub async fn consume_state(&self, state: &OAuthState) -> bool {
-        self.state_store.consume(state).await
+        BoundOAuthAuthorization {
+            auth_url: auth_url.to_string(),
+            csrf_token,
+            code_binding: binding,
+        }
     }
 
     async fn ensure_provider_exists(
@@ -293,16 +431,23 @@ impl GoogleProvider {
         (auth_url.to_string(), csrf_token)
     }
 
-    pub async fn store_state(
+    pub(crate) async fn generate_bound_authorize_url(
         &self,
-        csrf_token: &str,
-        state: OAuthState,
-    ) -> Result<(), OAuthStateCapacityError> {
-        self.state_store.store(csrf_token, state).await
-    }
+        client: &BasicClient,
+    ) -> BoundOAuthAuthorization {
+        let (challenge, binding) = new_pkce_binding();
+        let (auth_url, csrf_token) = client
+            .authorize_url(CsrfToken::new_random)
+            .add_scope(Scope::new("email".to_string()))
+            .add_scope(Scope::new("profile".to_string()))
+            .set_pkce_challenge(challenge)
+            .url();
 
-    pub async fn consume_state(&self, state: &OAuthState) -> bool {
-        self.state_store.consume(state).await
+        BoundOAuthAuthorization {
+            auth_url: auth_url.to_string(),
+            csrf_token,
+            code_binding: binding,
+        }
     }
 
     async fn ensure_provider_exists(
@@ -403,16 +548,25 @@ impl AppleProvider {
         (auth_url.to_string(), csrf_token)
     }
 
-    pub async fn store_state(
+    pub(crate) async fn generate_bound_authorize_url(
         &self,
-        csrf_token: &str,
-        state: OAuthState,
-    ) -> Result<(), OAuthStateCapacityError> {
-        self.state_store.store(csrf_token, state).await
-    }
+        client: &BasicClient,
+    ) -> BoundOAuthAuthorization {
+        let (nonce, binding) = new_apple_nonce();
+        let (auth_url, csrf_token) = client
+            .authorize_url(CsrfToken::new_random)
+            .add_scope(Scope::new("name".to_string()))
+            .add_scope(Scope::new("email".to_string()))
+            .add_extra_param("response_type", "code id_token")
+            .add_extra_param("response_mode", "form_post")
+            .add_extra_param("nonce", nonce)
+            .url();
 
-    pub async fn consume_state(&self, state: &OAuthState) -> bool {
-        self.state_store.consume(state).await
+        BoundOAuthAuthorization {
+            auth_url: auth_url.to_string(),
+            csrf_token,
+            code_binding: binding,
+        }
     }
 
     async fn ensure_provider_exists(
@@ -467,7 +621,19 @@ pub trait OAuthProvider: Send + Sync + 'static {
         csrf_token: &str,
         state: OAuthState,
     ) -> Result<(), OAuthStateCapacityError>;
+    async fn store_state_for_session(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        session_id: SessionId,
+        code_binding: OAuthCodeBinding,
+    ) -> Result<(), OAuthStateCapacityError>;
     async fn consume_state(&self, state: &OAuthState) -> bool;
+    async fn consume_state_for_session(
+        &self,
+        state: &OAuthState,
+        session_id: SessionId,
+    ) -> Option<OAuthCodeBinding>;
     async fn build_client(
         &self,
         client_id: String,
@@ -511,11 +677,33 @@ impl OAuthProvider for GithubProvider {
         csrf_token: &str,
         state: OAuthState,
     ) -> Result<(), OAuthStateCapacityError> {
-        self.store_state(csrf_token, state).await
+        self.state_store.store(csrf_token, state).await
+    }
+
+    async fn store_state_for_session(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        session_id: SessionId,
+        code_binding: OAuthCodeBinding,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.state_store
+            .store_for_session(csrf_token, state, session_id, code_binding)
+            .await
     }
 
     async fn consume_state(&self, state: &OAuthState) -> bool {
-        self.consume_state(state).await
+        self.state_store.consume(state).await
+    }
+
+    async fn consume_state_for_session(
+        &self,
+        state: &OAuthState,
+        session_id: SessionId,
+    ) -> Option<OAuthCodeBinding> {
+        self.state_store
+            .consume_for_session(state, session_id)
+            .await
     }
 
     async fn build_client(
@@ -544,11 +732,33 @@ impl OAuthProvider for GoogleProvider {
         csrf_token: &str,
         state: OAuthState,
     ) -> Result<(), OAuthStateCapacityError> {
-        self.store_state(csrf_token, state).await
+        self.state_store.store(csrf_token, state).await
+    }
+
+    async fn store_state_for_session(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        session_id: SessionId,
+        code_binding: OAuthCodeBinding,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.state_store
+            .store_for_session(csrf_token, state, session_id, code_binding)
+            .await
     }
 
     async fn consume_state(&self, state: &OAuthState) -> bool {
-        self.consume_state(state).await
+        self.state_store.consume(state).await
+    }
+
+    async fn consume_state_for_session(
+        &self,
+        state: &OAuthState,
+        session_id: SessionId,
+    ) -> Option<OAuthCodeBinding> {
+        self.state_store
+            .consume_for_session(state, session_id)
+            .await
     }
 
     async fn build_client(
@@ -577,11 +787,33 @@ impl OAuthProvider for AppleProvider {
         csrf_token: &str,
         state: OAuthState,
     ) -> Result<(), OAuthStateCapacityError> {
-        self.store_state(csrf_token, state).await
+        self.state_store.store(csrf_token, state).await
+    }
+
+    async fn store_state_for_session(
+        &self,
+        csrf_token: &str,
+        state: OAuthState,
+        session_id: SessionId,
+        code_binding: OAuthCodeBinding,
+    ) -> Result<(), OAuthStateCapacityError> {
+        self.state_store
+            .store_for_session(csrf_token, state, session_id, code_binding)
+            .await
     }
 
     async fn consume_state(&self, state: &OAuthState) -> bool {
-        self.consume_state(state).await
+        self.state_store.consume(state).await
+    }
+
+    async fn consume_state_for_session(
+        &self,
+        state: &OAuthState,
+        session_id: SessionId,
+    ) -> Option<OAuthCodeBinding> {
+        self.state_store
+            .consume_for_session(state, session_id)
+            .await
     }
 
     async fn build_client(
@@ -605,6 +837,25 @@ mod tests {
             csrf_token: csrf_token.to_string(),
             client_id: Uuid::from_u128(client_id),
         }
+    }
+
+    fn assert_pkce_authorization(authorization: &BoundOAuthAuthorization) {
+        let parameters: HashMap<_, _> = url::Url::parse(&authorization.auth_url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert_eq!(
+            parameters.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        let OAuthCodeBinding::Pkce(verifier) = &authorization.code_binding else {
+            panic!("V2 authorization must retain a PKCE verifier");
+        };
+        assert_eq!(
+            parameters.get("code_challenge").map(String::as_str),
+            Some(PkceCodeChallenge::from_code_verifier_sha256(verifier).as_str())
+        );
     }
 
     #[tokio::test]
@@ -714,6 +965,143 @@ mod tests {
 
         assert!(!store.consume_at(&mismatched, now).await);
         assert!(store.consume_at(&valid, now).await);
+    }
+
+    #[tokio::test]
+    async fn oauth_state_protocol_and_v2_session_binding_are_non_consuming_on_mismatch() {
+        let store = OAuthStateStore::with_limits(Duration::from_secs(60), 2);
+        let now = Instant::now();
+        let v2_state = state("v2-state", 1);
+        let initiating_session = SessionId::from_bytes([10; 16]);
+        let other_session = SessionId::from_bytes([11; 16]);
+
+        store
+            .store_with_binding(
+                &v2_state.csrf_token,
+                v2_state.clone(),
+                OAuthStateBinding::TransportV2 {
+                    session_id: initiating_session,
+                    code_binding: OAuthCodeBinding::AppleNonce(Zeroizing::new(
+                        "raw-nonce".to_string(),
+                    )),
+                },
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert!(!store.consume_at(&v2_state, now).await);
+        assert!(store
+            .take_with_binding(&v2_state, Some(other_session), now)
+            .await
+            .is_none());
+        let consumed = store
+            .take_with_binding(&v2_state, Some(initiating_session), now)
+            .await
+            .unwrap();
+        let OAuthStateBinding::TransportV2 {
+            code_binding: OAuthCodeBinding::AppleNonce(raw_nonce),
+            ..
+        } = consumed.binding
+        else {
+            panic!("expected an Apple nonce binding");
+        };
+        assert_eq!(raw_nonce.as_str(), "raw-nonce");
+
+        let v1_state = state("v1-state", 2);
+        store
+            .store_at(&v1_state.csrf_token, v1_state.clone(), now)
+            .await
+            .unwrap();
+        assert!(store
+            .take_with_binding(&v1_state, Some(initiating_session), now)
+            .await
+            .is_none());
+        assert!(store.consume_at(&v1_state, now).await);
+    }
+
+    #[tokio::test]
+    async fn v2_authorization_urls_bind_codes_without_changing_v1_urls() {
+        let github = GithubProvider {
+            auth_url: "https://github.example/authorize".to_string(),
+            token_url: "https://github.example/token".to_string(),
+            user_info_url: "https://github.example/user".to_string(),
+            state_store: OAuthStateStore::new(),
+        };
+        let github_client = github
+            .build_client(
+                "github-client".to_string(),
+                "github-secret".to_string(),
+                "https://maple.example/callback".to_string(),
+            )
+            .await
+            .unwrap();
+
+        let legacy_url = github.generate_authorize_url(&github_client).await.0;
+        let legacy_parameters: HashMap<_, _> = url::Url::parse(&legacy_url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert!(!legacy_parameters.contains_key("code_challenge"));
+        assert!(!legacy_parameters.contains_key("code_challenge_method"));
+
+        let bound = github.generate_bound_authorize_url(&github_client).await;
+        assert_pkce_authorization(&bound);
+
+        let google = GoogleProvider {
+            auth_url: "https://google.example/authorize".to_string(),
+            token_url: "https://google.example/token".to_string(),
+            user_info_url: "https://google.example/user".to_string(),
+            state_store: OAuthStateStore::new(),
+        };
+        let google_client = google
+            .build_client(
+                "google-client".to_string(),
+                "google-secret".to_string(),
+                "https://maple.example/callback".to_string(),
+            )
+            .await
+            .unwrap();
+        let bound = google.generate_bound_authorize_url(&google_client).await;
+        assert_pkce_authorization(&bound);
+
+        let apple = AppleProvider {
+            auth_url: "https://apple.example/authorize".to_string(),
+            token_url: "https://apple.example/token".to_string(),
+            jwks_url: "https://apple.example/keys".to_string(),
+            state_store: OAuthStateStore::new(),
+        };
+        let apple_client = apple
+            .build_client(
+                "apple-client".to_string(),
+                "apple-secret".to_string(),
+                "https://maple.example/callback".to_string(),
+            )
+            .await
+            .unwrap();
+        let legacy_url = apple.generate_authorize_url(&apple_client).await.0;
+        let legacy_parameters: HashMap<_, _> = url::Url::parse(&legacy_url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert!(!legacy_parameters.contains_key("nonce"));
+
+        let bound = apple.generate_bound_authorize_url(&apple_client).await;
+        let parameters: HashMap<_, _> = url::Url::parse(&bound.auth_url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        let OAuthCodeBinding::AppleNonce(raw_nonce) = &bound.code_binding else {
+            panic!("Apple V2 authorization must retain the raw nonce");
+        };
+        let expected_nonce = hex::encode(Sha256::digest(raw_nonce.as_bytes()));
+        assert_eq!(
+            parameters.get("nonce").map(String::as_str),
+            Some(expected_nonce.as_str())
+        );
     }
 
     #[tokio::test]

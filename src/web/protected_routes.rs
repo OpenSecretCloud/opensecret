@@ -808,13 +808,13 @@ pub async fn change_password(
                 Ok(new_auth_context) => {
                     let access_token = NewToken::new_with_auth_context(
                         &user,
-                        TokenType::Access,
+                        TokenType::access_for_transport(session_id.is_v2()),
                         &data,
                         &new_auth_context,
                     )?;
                     let refresh_token = NewToken::new_with_auth_context(
                         &user,
-                        TokenType::Refresh,
+                        TokenType::refresh_for_transport(session_id.is_v2()),
                         &data,
                         &new_auth_context,
                     )?;

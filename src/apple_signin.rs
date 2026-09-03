@@ -181,7 +181,9 @@ impl AppleJwtVerifier {
         if let Some(expected) = expected_nonce {
             match &token_data.claims.nonce {
                 Some(token_nonce) => {
-                    // Apple stores SHA256 hash of the nonce in the token
+                    // OpenSecret retains the raw nonce while the client sends
+                    // SHA256(raw nonce) to Apple. Apple returns that supplied
+                    // value in the signed token.
                     use sha2::{Digest, Sha256};
                     let mut hasher = Sha256::new();
                     hasher.update(expected.as_bytes());

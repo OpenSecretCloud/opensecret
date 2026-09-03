@@ -15,14 +15,15 @@ use crate::{
         NewToolCall, NewToolOutput, NewUserMessage, ResponseStatus, ResponsesError,
     },
     models::users::User,
+    provider_cache::CacheNamespaceRoot,
     tokens::count_tokens,
     web::{
         encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
         openai::{
             ensure_completion_model_access, get_chat_completion_response,
             get_chat_completion_response_for_execution,
-            get_chat_completion_response_for_expected_route, BillingContext, CompletionChunk,
-            ServerSelectedCompletionRoute,
+            get_chat_completion_response_for_expected_route, BillingContext, CompletionCachePolicy,
+            CompletionChunk, CompletionExecutionContext, ServerSelectedCompletionRoute,
         },
         openai_auth::AuthMethod,
         responses::{
@@ -2828,6 +2829,7 @@ fn clamp_image_description_tokens(text: &str) -> i32 {
 struct ResponsesImageDescriptionExecutor<'a> {
     state: &'a Arc<AppState>,
     user: &'a User,
+    cache_policy: &'a CompletionCachePolicy,
     _access: PaidImageDescriptionAccess,
 }
 
@@ -2865,8 +2867,7 @@ impl ImageDescriptionAttemptExecutor for ResponsesImageDescriptionExecutor<'_> {
             self.user,
             request,
             &headers,
-            billing_context,
-            ModelPlan::Paid,
+            CompletionExecutionContext::new(billing_context, ModelPlan::Paid, self.cache_policy),
             ServerSelectedCompletionRoute {
                 provider_name: candidate.provider.as_str(),
                 provider_model_id: candidate.provider_model_id,
@@ -2912,12 +2913,14 @@ impl ImageDescriptionAttemptExecutor for ResponsesImageDescriptionExecutor<'_> {
 async fn describe_images(
     state: &Arc<AppState>,
     user: &User,
+    cache_policy: &CompletionCachePolicy,
     access: PaidImageDescriptionAccess,
     images: &[ImageAttachment],
 ) -> Result<Vec<ImageDescriptionToolPair>, ApiError> {
     let executor = ResponsesImageDescriptionExecutor {
         state,
         user,
+        cache_policy,
         _access: access,
     };
     let fallback_policy = RetryNonTerminalImageDescriptionFallbackPolicy;
@@ -3034,6 +3037,7 @@ fn spawn_title_generation_task(
     user: User,
     user_key: SecretKey,
     user_content: String,
+    cache_policy: CompletionCachePolicy,
 ) {
     tokio::spawn(async move {
         debug!(
@@ -3075,9 +3079,7 @@ fn spawn_title_generation_task(
             &user,
             title_request,
             &headers,
-            billing_context,
-            ModelPlan::Free,
-            false,
+            CompletionExecutionContext::new(billing_context, ModelPlan::Free, &cache_policy),
         )
         .await
         {
@@ -3936,7 +3938,7 @@ async fn stream_one_assistant_turn(
     tool_turn_count: usize,
     prompt_token_estimate: usize,
     response_execution: ResponseExecution,
-    require_provider_done: bool,
+    cache_policy: &CompletionCachePolicy,
 ) -> Result<AssistantTurnOutcome, ApiError> {
     let mut chat_request = build_model_turn_request(body, prompt_messages, tools_enabled);
 
@@ -3967,10 +3969,8 @@ async fn stream_one_assistant_turn(
         user,
         chat_request.take(),
         headers,
-        billing_context,
-        model_plan,
+        CompletionExecutionContext::new(billing_context, model_plan, cache_policy),
         response_execution,
-        require_provider_done,
     )
     .await?;
 
@@ -4233,7 +4233,7 @@ async fn setup_completion_processor(
     tx_storage: mpsc::Sender<StorageMessage>,
     mut rx_tool_ack: mpsc::Receiver<Result<(), String>>,
     response_execution: ResponseExecution,
-    require_provider_done: bool,
+    cache_policy: &CompletionCachePolicy,
 ) -> Result<crate::models::responses::Response, ApiError> {
     let tools_enabled = context.web_search_enabled;
     let mut prompt_messages = Arc::as_ref(&context.prompt_messages).clone();
@@ -4260,7 +4260,7 @@ async fn setup_completion_processor(
                 tool_turn_count,
                 prompt_token_estimate,
                 response_execution.clone(),
-                require_provider_done,
+                cache_policy,
             )
             .await?
             {
@@ -4320,10 +4320,16 @@ async fn create_response_stream(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
+    cache_namespace_root: Option<Extension<CacheNamespaceRoot>>,
     Extension(mut body): Extension<ResponsesCreateRequest>,
 ) -> Result<Response, ApiError> {
     trace!("=== ENTERING create_response_stream ===");
     let require_explicit_terminal = session_id.is_v2();
+    let cache_policy = CompletionCachePolicy::for_request(
+        &session_id,
+        cache_namespace_root.map(|Extension(root)| root),
+        user.uuid,
+    )?;
     trace!("User: {}", user.uuid);
     let requested_model = body.model.clone();
     let billing_access = state.chat_billing_access(user.uuid, false).await;
@@ -4404,7 +4410,16 @@ async fn create_response_stream(
     // Phase 2b: Describe all current-turn images before any database write or
     // SSE response. A complete cascade failure therefore leaves no partial chat.
     let image_descriptions = match image_access {
-        Some(access) => describe_images(&state, &user, access, &prepared.image_attachments).await?,
+        Some(access) => {
+            describe_images(
+                &state,
+                &user,
+                &cache_policy,
+                access,
+                &prepared.image_attachments,
+            )
+            .await?
+        }
         None => Vec::new(),
     };
 
@@ -4535,6 +4550,7 @@ async fn create_response_stream(
             user.clone(),
             prepared.user_key,
             user_content,
+            cache_policy.clone(),
         );
     }
 
@@ -4605,6 +4621,7 @@ async fn create_response_stream(
     let orchestrator_conversation = conversation_for_stream.clone();
     let orchestrator_prompt_messages = prompt_messages.clone();
     let orchestrator_execution = response_execution.clone();
+    let orchestrator_cache_policy = cache_policy.clone();
 
     tokio::spawn(async move {
         let _orchestrator_execution_guard = orchestrator_execution_guard;
@@ -4643,7 +4660,7 @@ async fn create_response_stream(
                     orchestrator_tx_storage.clone(),
                     rx_tool_ack,
                     orchestrator_execution.clone(),
-                    require_explicit_terminal,
+                    &orchestrator_cache_policy,
                 )
                 .await
                 {

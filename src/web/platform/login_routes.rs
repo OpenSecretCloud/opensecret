@@ -5,12 +5,15 @@ use crate::{
         org_memberships::OrgRole, platform_email_verification::NewPlatformEmailVerification,
         platform_users::NewPlatformUser,
     },
+    transport_v2::envelope::{Credential, CredentialKind},
     web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
     ApiError, AppState, Error,
 };
 use axum::{
+    body::{Body, HttpBody},
     extract::{Path, State},
-    middleware::from_fn_with_state,
+    http::Request,
+    middleware::{from_fn_with_state, Next},
     response::Response,
     routing::{get, post},
     Extension, Router,
@@ -159,7 +162,7 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
             "/platform/refresh",
             post(refresh_platform_token).layer(from_fn_with_state(
                 app_state.clone(),
-                decrypt_request::<PlatformRefreshRequest>,
+                prepare_platform_refresh_request,
             )),
         )
         .route(
@@ -191,6 +194,35 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
         .with_state(app_state)
 }
 
+async fn prepare_platform_refresh_request(
+    State(state): State<Arc<AppState>>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let is_transport_v2 = request
+        .extensions()
+        .get::<TransportSession>()
+        .is_some_and(TransportSession::is_v2);
+    if is_transport_v2 {
+        if request.body().size_hint().exact() != Some(0) {
+            return Err(ApiError::BadRequest);
+        }
+        let refresh_token = request
+            .extensions()
+            .get::<Credential>()
+            .filter(|credential| credential.kind() == CredentialKind::Resumption)
+            .map(|credential| credential.value().to_string())
+            .ok_or(ApiError::InvalidJwt)?;
+        request
+            .extensions_mut()
+            .insert(PlatformRefreshRequest { refresh_token });
+        return Ok(next.run(request).await);
+    }
+
+    let headers = request.headers().clone();
+    decrypt_request::<PlatformRefreshRequest>(State(state), headers, request, next).await
+}
+
 pub async fn login_platform_user(
     State(data): State<Arc<AppState>>,
     Extension(login_request): Extension<PlatformLoginRequest>,
@@ -202,7 +234,8 @@ pub async fn login_platform_user(
         return Err(ApiError::BadRequest);
     }
 
-    let auth_response = login_internal_platform(data.clone(), login_request).await?;
+    let auth_response =
+        login_internal_platform(data.clone(), login_request, session_id.is_v2()).await?;
     let result = encrypt_response(&data, &session_id, &auth_response).await;
     result
 }
@@ -210,6 +243,7 @@ pub async fn login_platform_user(
 async fn login_internal_platform(
     data: Arc<AppState>,
     login_request: PlatformLoginRequest,
+    is_transport_v2: bool,
 ) -> Result<PlatformAuthResponse, ApiError> {
     // Authenticate the platform user
     match data
@@ -218,10 +252,16 @@ async fn login_internal_platform(
     {
         Ok(Some(platform_user)) => {
             // Generate tokens
-            let access_token =
-                NewToken::new_for_platform_user(&platform_user, TokenType::Access, &data)?;
-            let refresh_token =
-                NewToken::new_for_platform_user(&platform_user, TokenType::Refresh, &data)?;
+            let access_token = NewToken::new_for_platform_user(
+                &platform_user,
+                TokenType::access_for_transport(is_transport_v2),
+                &data,
+            )?;
+            let refresh_token = NewToken::new_for_platform_user(
+                &platform_user,
+                TokenType::refresh_for_transport(is_transport_v2),
+                &data,
+            )?;
 
             let auth_response = PlatformAuthResponse {
                 id: platform_user.uuid,
@@ -333,8 +373,16 @@ pub async fn register_platform_user(
     });
 
     // Generate tokens
-    let access_token = NewToken::new_for_platform_user(&platform_user, TokenType::Access, &data)?;
-    let refresh_token = NewToken::new_for_platform_user(&platform_user, TokenType::Refresh, &data)?;
+    let access_token = NewToken::new_for_platform_user(
+        &platform_user,
+        TokenType::access_for_transport(session_id.is_v2()),
+        &data,
+    )?;
+    let refresh_token = NewToken::new_for_platform_user(
+        &platform_user,
+        TokenType::refresh_for_transport(session_id.is_v2()),
+        &data,
+    )?;
 
     let response = PlatformAuthResponse {
         id: platform_user.uuid,
@@ -359,18 +407,29 @@ pub async fn refresh_platform_token(
         return Err(ApiError::BadRequest);
     }
 
+    let refresh_audience = if session_id.is_v2() {
+        crate::jwt::TRANSPORT_V2_PLATFORM_REFRESH
+    } else {
+        PLATFORM_REFRESH
+    };
     let claims =
-        crate::jwt::validate_token(&refresh_request.refresh_token, &data, PLATFORM_REFRESH)?;
+        crate::jwt::validate_token(&refresh_request.refresh_token, &data, refresh_audience)?;
     let platform_user_id = Uuid::parse_str(&claims.sub).map_err(|_| ApiError::InvalidJwt)?;
 
     // Verify platform user still exists
     let platform_user = data.db.get_platform_user_by_uuid(platform_user_id)?;
 
     // Generate new tokens
-    let new_access_token =
-        NewToken::new_for_platform_user(&platform_user, TokenType::Access, &data)?;
-    let new_refresh_token =
-        NewToken::new_for_platform_user(&platform_user, TokenType::Refresh, &data)?;
+    let new_access_token = NewToken::new_for_platform_user(
+        &platform_user,
+        TokenType::access_for_transport(session_id.is_v2()),
+        &data,
+    )?;
+    let new_refresh_token = NewToken::new_for_platform_user(
+        &platform_user,
+        TokenType::refresh_for_transport(session_id.is_v2()),
+        &data,
+    )?;
 
     let response = PlatformRefreshResponse {
         access_token: new_access_token.token,

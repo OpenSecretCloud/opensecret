@@ -1,4 +1,8 @@
-use crate::jwt::{validate_access_token_for_auth, AuthContext, USER_ACCESS};
+use crate::jwt::{
+    validate_access_token_for_auth, AuthContext, TRANSPORT_V2_USER_ACCESS, USER_ACCESS,
+};
+use crate::transport_v2::envelope::{Credential, CredentialKind};
+use crate::web::encryption_middleware::TransportSession;
 use crate::ApiError;
 use axum::{
     body::Body,
@@ -17,31 +21,54 @@ pub enum AuthMethod {
     ApiKey,
 }
 
+#[derive(Clone, Copy)]
+enum PresentedCredential<'a> {
+    ApiKey(&'a str),
+    Bearer(&'a str),
+}
+
 pub async fn validate_openai_auth(
     State(data): State<Arc<crate::AppState>>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    // Extract Authorization header
-    if let Some(auth_header) = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-    {
-        // Check if it's a UUID (API key) or JWT (contains dots)
-        if !auth_header.contains('.') {
-            // Try to parse as UUID (API key)
-            if let Ok(api_key_uuid) = Uuid::parse_str(auth_header) {
-                // Hash the API key (UUID string with dashes)
+    let is_transport_v2 = req
+        .extensions()
+        .get::<TransportSession>()
+        .is_some_and(TransportSession::is_v2);
+    let presented = if is_transport_v2 {
+        match req.extensions().get::<Credential>() {
+            Some(credential) if credential.kind() == CredentialKind::ApiKey => {
+                PresentedCredential::ApiKey(credential.value())
+            }
+            Some(credential) if credential.kind() == CredentialKind::Bearer => {
+                PresentedCredential::Bearer(credential.value())
+            }
+            _ => return ApiError::InvalidJwt.into_response(),
+        }
+    } else {
+        let Some(value) = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+        else {
+            return ApiError::InvalidJwt.into_response();
+        };
+        if value.contains('.') {
+            PresentedCredential::Bearer(value)
+        } else {
+            PresentedCredential::ApiKey(value)
+        }
+    };
+
+    let token = match presented {
+        PresentedCredential::ApiKey(api_key) => match Uuid::parse_str(api_key) {
+            Ok(api_key_uuid) => {
                 let mut hasher = Sha256::new();
-                hasher.update(api_key_uuid.to_string().as_bytes()); // to_string() includes dashes
+                hasher.update(api_key_uuid.to_string().as_bytes());
                 let key_hash = format!("{:x}", hasher.finalize());
-
-                // Look up the API key in database
-                let db_result = data.db.get_user_by_api_key_hash(&key_hash);
-
-                match db_result {
+                match data.db.get_user_by_api_key_hash(&key_hash) {
                     Ok(Some(user)) => {
                         req.extensions_mut().insert(user);
                         req.extensions_mut().insert(AuthMethod::ApiKey);
@@ -57,26 +84,26 @@ pub async fn validate_openai_auth(
                     }
                 }
             }
-        }
-    }
-
-    // Fall back to JWT validation
-    // Try to validate as JWT
-    let token = match req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|auth_header| auth_header.to_str().ok())
-        .and_then(|auth_value| auth_value.strip_prefix("Bearer ").map(ToString::to_string))
-    {
-        Some(token) => token,
-        None => return ApiError::InvalidJwt.into_response(),
+            Err(_) if is_transport_v2 => return ApiError::Unauthorized.into_response(),
+            // Preserve V1's legacy behavior: a non-UUID bearer without dots
+            // falls through to JWT validation and returns InvalidJwt.
+            Err(_) => api_key,
+        },
+        PresentedCredential::Bearer(token) => token,
     };
 
-    let (claims, access_token_expired) =
-        match validate_access_token_for_auth(&token, &data, USER_ACCESS) {
-            Ok(validation) => validation,
-            Err(_) => return ApiError::InvalidJwt.into_response(),
-        };
+    let (claims, access_token_expired) = match validate_access_token_for_auth(
+        token,
+        &data,
+        if is_transport_v2 {
+            TRANSPORT_V2_USER_ACCESS
+        } else {
+            USER_ACCESS
+        },
+    ) {
+        Ok(validation) => validation,
+        Err(_) => return ApiError::InvalidJwt.into_response(),
+    };
 
     let auth_context = match AuthContext::from_claims(&claims) {
         Ok(auth_context) => auth_context,
@@ -130,7 +157,16 @@ pub async fn validate_optional_openai_auth(
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    if !req.headers().contains_key(header::AUTHORIZATION) {
+    let is_transport_v2 = req
+        .extensions()
+        .get::<TransportSession>()
+        .is_some_and(TransportSession::is_v2);
+    let has_credential = if is_transport_v2 {
+        req.extensions().get::<Credential>().is_some()
+    } else {
+        req.headers().contains_key(header::AUTHORIZATION)
+    };
+    if !has_credential {
         return next.run(req).await;
     }
 

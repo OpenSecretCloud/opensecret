@@ -11,6 +11,7 @@ pub mod conversations;
 pub mod conversions;
 pub mod errors;
 pub mod events;
+mod execution;
 pub mod handlers;
 pub(crate) mod image_describer;
 pub mod instructions;
@@ -28,8 +29,11 @@ pub use context_builder::{build_prompt, build_prompt_with_token_reserve};
 pub use conversions::{ConversationItem, ConversationItemConverter, MessageContentConverter};
 pub use errors::error_mapping;
 pub use events::{ResponseEvent, SseEventEmitter};
+pub(crate) use execution::{
+    ResponseExecution, ResponseExecutionRegistry, ResponseExecutionTaskGuard,
+};
 pub use pagination::Paginator;
-pub use storage::storage_task;
+pub use storage::{storage_task, StorageTaskOutcome};
 // REMOVED: UpstreamStreamProcessor - no longer used with centralized billing architecture
 pub use types::{DeletedObjectResponse, MessageContent, MessageContentPart, NullableField};
 

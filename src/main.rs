@@ -789,7 +789,7 @@ pub struct AppState {
     billing_client: Option<BillingClient>,
     os_flags_client: Option<os_flags::OsFlagsClient>,
     apple_jwt_verifier: Arc<AppleJwtVerifier>,
-    cancellation_broadcast: tokio::sync::broadcast::Sender<Uuid>,
+    response_executions: web::responses::ResponseExecutionRegistry,
     kagi_client: Option<Arc<crate::kagi::KagiClient>>,
 }
 
@@ -1085,8 +1085,6 @@ impl AppStateBuilder {
         ));
         let provider_router = Arc::new(ProviderRouter::default());
 
-        let (cancellation_tx, _) = tokio::sync::broadcast::channel(1024);
-
         let kagi_client = if let Some(ref api_key) = self.kagi_api_key {
             tracing::info!("Initializing Kagi client");
             match crate::kagi::KagiClient::new(api_key.clone()) {
@@ -1132,7 +1130,7 @@ impl AppStateBuilder {
             billing_client,
             os_flags_client,
             apple_jwt_verifier,
-            cancellation_broadcast: cancellation_tx,
+            response_executions: web::responses::ResponseExecutionRegistry::default(),
             kagi_client,
         })
     }

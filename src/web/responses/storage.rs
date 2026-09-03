@@ -20,6 +20,26 @@ use uuid::Uuid;
 
 use super::handlers::StorageMessage;
 
+/// Terminal result of the per-response storage worker.
+///
+/// A `Completed` result is an acknowledgement that every queued response item
+/// was persisted successfully and the response status was durably advanced to
+/// `completed`. The streaming task must not emit `response.completed` for any
+/// other outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageTaskOutcome {
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalStatusUpdate {
+    Updated,
+    AlreadyTerminal,
+    Failed,
+}
+
 #[derive(Default)]
 struct PendingAssistantMessage {
     content: String,
@@ -86,26 +106,65 @@ fn update_terminal_response_status(
     response_uuid: Uuid,
     status: ResponseStatus,
     reason: &str,
-) {
+) -> TerminalStatusUpdate {
     match db.update_response_status_if_current(
         response_id,
         ResponseStatus::InProgress,
         status,
         Some(Utc::now()),
     ) {
-        Ok(true) => {}
+        Ok(true) => TerminalStatusUpdate::Updated,
         Ok(false) => {
             debug!(
                 "Storage: skipped setting response {} ({}) to {:?} after {}; response was no longer in_progress",
                 response_id, response_uuid, status, reason
             );
+            TerminalStatusUpdate::AlreadyTerminal
         }
         Err(e) => {
             error!(
                 "Failed to update response {} ({}) status to {:?} after {}: {:?}",
                 response_id, response_uuid, status, reason, e
             );
+            TerminalStatusUpdate::Failed
         }
+    }
+}
+
+fn terminal_outcome_after_status_update<F, E>(
+    response_uuid: Uuid,
+    status_update: TerminalStatusUpdate,
+    updated_outcome: StorageTaskOutcome,
+    get_persisted_status: F,
+) -> StorageTaskOutcome
+where
+    F: FnOnce() -> Result<ResponseStatus, E>,
+    E: std::fmt::Debug,
+{
+    match status_update {
+        TerminalStatusUpdate::Updated => updated_outcome,
+        TerminalStatusUpdate::Failed => StorageTaskOutcome::Failed,
+        TerminalStatusUpdate::AlreadyTerminal => match get_persisted_status() {
+            Ok(ResponseStatus::Cancelled) => {
+                // A competing cancellation worker already completed the same
+                // durable terminal transition, so its result is authoritative.
+                StorageTaskOutcome::Cancelled
+            }
+            Ok(status) => {
+                error!(
+                    "Storage: response {} was {:?} after a terminal status update lost its in_progress compare-and-set",
+                    response_uuid, status
+                );
+                StorageTaskOutcome::Failed
+            }
+            Err(e) => {
+                error!(
+                    "Storage: failed to read response {} after a terminal status update lost its in_progress compare-and-set: {:?}",
+                    response_uuid, e
+                );
+                StorageTaskOutcome::Failed
+            }
+        },
     }
 }
 
@@ -252,7 +311,8 @@ async fn mark_pending_items_incomplete(
     pending_messages: &mut HashMap<Uuid, PendingAssistantMessage>,
     pending_reasoning: &mut HashMap<Uuid, PendingReasoningItem>,
     message_finish_reason: Option<String>,
-) {
+) -> bool {
+    let mut succeeded = true;
     for (item_id, pending) in pending_messages.drain() {
         if let Err(e) = finalize_assistant_message(
             db,
@@ -268,6 +328,7 @@ async fn mark_pending_items_incomplete(
                 "Failed to finalize pending assistant message {}: {}",
                 item_id, e
             );
+            succeeded = false;
         }
     }
 
@@ -279,8 +340,11 @@ async fn mark_pending_items_incomplete(
                 "Failed to finalize pending reasoning item {}: {}",
                 item_id, e
             );
+            succeeded = false;
         }
     }
+
+    succeeded
 }
 
 /// Main storage task that orchestrates per-item persistence.
@@ -295,11 +359,12 @@ pub async fn storage_task(
     conversation_id: i64,
     user_id: Uuid,
     user_key: SecretKey,
-) {
+) -> StorageTaskOutcome {
     let tool_ack = tool_persist_ack;
     let mut pending_messages: HashMap<Uuid, PendingAssistantMessage> = HashMap::new();
     let mut pending_reasoning: HashMap<Uuid, PendingReasoningItem> = HashMap::new();
     let mut next_item_created_at = first_item_created_at;
+    let mut persistence_failed = false;
 
     while let Some(msg) = rx.recv().await {
         match msg {
@@ -354,6 +419,7 @@ pub async fn storage_task(
                     created_at,
                 ) {
                     error!("{}", e);
+                    persistence_failed = true;
                 }
                 if let Err(e) = finalize_assistant_message(
                     &db,
@@ -366,6 +432,7 @@ pub async fn storage_task(
                 .await
                 {
                     error!("{}", e);
+                    persistence_failed = true;
                 }
             }
             StorageMessage::ReasoningStarted { item_id } => {
@@ -381,6 +448,7 @@ pub async fn storage_task(
                     created_at,
                 ) {
                     error!("{}", e);
+                    persistence_failed = true;
                 }
             }
             StorageMessage::ReasoningDelta { item_id, delta } => {
@@ -418,6 +486,7 @@ pub async fn storage_task(
                         reasoning_finalize_started.elapsed().as_millis(),
                         e
                     );
+                    persistence_failed = true;
                 } else {
                     debug!(
                         "Storage: finalized reasoning item {} for response {} in {} ms",
@@ -453,29 +522,50 @@ pub async fn storage_task(
                         None,
                     )
                     .await;
+                    persistence_failed = true;
                 }
-                update_terminal_response_status(
+                if persistence_failed {
+                    let status_update = update_terminal_response_status(
+                        &db,
+                        response_id,
+                        response_uuid,
+                        ResponseStatus::Failed,
+                        "response item persistence failure",
+                    );
+                    return terminal_outcome_after_status_update(
+                        response_uuid,
+                        status_update,
+                        StorageTaskOutcome::Failed,
+                        || {
+                            db.get_response_by_uuid_and_user(response_uuid, user_id)
+                                .map(|response| response.status)
+                        },
+                    );
+                }
+
+                let status_update = update_terminal_response_status(
                     &db,
                     response_id,
                     response_uuid,
                     ResponseStatus::Completed,
                     "ResponseDone",
                 );
-                return;
+                return terminal_outcome_after_status_update(
+                    response_uuid,
+                    status_update,
+                    StorageTaskOutcome::Completed,
+                    || {
+                        db.get_response_by_uuid_and_user(response_uuid, user_id)
+                            .map(|response| response.status)
+                    },
+                );
             }
             StorageMessage::Cancelled => {
                 debug!(
                     "Storage: cancellation received for response {} ({})",
                     response_id, response_uuid
                 );
-                update_terminal_response_status(
-                    &db,
-                    response_id,
-                    response_uuid,
-                    ResponseStatus::Cancelled,
-                    "cancellation",
-                );
-                mark_pending_items_incomplete(
+                let cleanup_succeeded = mark_pending_items_incomplete(
                     &db,
                     &user_key,
                     &mut pending_messages,
@@ -483,21 +573,52 @@ pub async fn storage_task(
                     Some(FINISH_REASON_CANCELLED.to_string()),
                 )
                 .await;
-                return;
+                // The cancelled database state is the endpoint's durability
+                // certificate. Publish it only after every pending item has
+                // been finalized, never before cleanup.
+                let (status, outcome, reason) = if cleanup_succeeded {
+                    (
+                        ResponseStatus::Cancelled,
+                        StorageTaskOutcome::Cancelled,
+                        "cancellation cleanup",
+                    )
+                } else {
+                    (
+                        ResponseStatus::Failed,
+                        StorageTaskOutcome::Failed,
+                        "cancellation cleanup failure",
+                    )
+                };
+                let status_update = update_terminal_response_status(
+                    &db,
+                    response_id,
+                    response_uuid,
+                    status,
+                    reason,
+                );
+                return terminal_outcome_after_status_update(
+                    response_uuid,
+                    status_update,
+                    outcome,
+                    || {
+                        db.get_response_by_uuid_and_user(response_uuid, user_id)
+                            .map(|response| response.status)
+                    },
+                );
             }
             StorageMessage::Error(error_msg) => {
                 error!(
                     "Storage: received error for response {} ({}): {}",
                     response_id, response_uuid, error_msg
                 );
-                update_terminal_response_status(
+                let status_update = update_terminal_response_status(
                     &db,
                     response_id,
                     response_uuid,
                     ResponseStatus::Failed,
                     "streaming error",
                 );
-                mark_pending_items_incomplete(
+                let cleanup_succeeded = mark_pending_items_incomplete(
                     &db,
                     &user_key,
                     &mut pending_messages,
@@ -505,7 +626,20 @@ pub async fn storage_task(
                     None,
                 )
                 .await;
-                return;
+                let outcome = terminal_outcome_after_status_update(
+                    response_uuid,
+                    status_update,
+                    StorageTaskOutcome::Failed,
+                    || {
+                        db.get_response_by_uuid_and_user(response_uuid, user_id)
+                            .map(|response| response.status)
+                    },
+                );
+                return if cleanup_succeeded {
+                    outcome
+                } else {
+                    StorageTaskOutcome::Failed
+                };
             }
             StorageMessage::ToolCall {
                 tool_call_id,
@@ -548,6 +682,7 @@ pub async fn storage_task(
                             tool_call_persist_started.elapsed().as_millis(),
                             e
                         );
+                        persistence_failed = true;
                         if let Some(ack) = &tool_ack {
                             let _ = ack.send(Err(e)).await;
                         }
@@ -599,6 +734,7 @@ pub async fn storage_task(
                             tool_output_persist_started.elapsed().as_millis(),
                             e
                         );
+                        persistence_failed = true;
                         if let Some(ack) = &tool_ack {
                             let _ = ack.send(Err(e)).await;
                         }
@@ -627,4 +763,89 @@ pub async fn storage_task(
         None,
     )
     .await;
+    StorageTaskOutcome::Failed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn successful_terminal_status_update_uses_requested_outcome() {
+        let outcome = terminal_outcome_after_status_update(
+            Uuid::new_v4(),
+            TerminalStatusUpdate::Updated,
+            StorageTaskOutcome::Completed,
+            || -> Result<ResponseStatus, &'static str> {
+                panic!("a successful compare-and-set must not reread response status")
+            },
+        );
+
+        assert_eq!(outcome, StorageTaskOutcome::Completed);
+
+        let failed_outcome = terminal_outcome_after_status_update(
+            Uuid::new_v4(),
+            TerminalStatusUpdate::Updated,
+            StorageTaskOutcome::Failed,
+            || -> Result<ResponseStatus, &'static str> {
+                panic!("a successful compare-and-set must not reread response status")
+            },
+        );
+        assert_eq!(failed_outcome, StorageTaskOutcome::Failed);
+    }
+
+    #[test]
+    fn cancelled_database_state_wins_completion_race() {
+        for updated_outcome in [StorageTaskOutcome::Completed, StorageTaskOutcome::Failed] {
+            let outcome = terminal_outcome_after_status_update(
+                Uuid::new_v4(),
+                TerminalStatusUpdate::AlreadyTerminal,
+                updated_outcome,
+                || Ok::<ResponseStatus, &'static str>(ResponseStatus::Cancelled),
+            );
+
+            assert_eq!(outcome, StorageTaskOutcome::Cancelled);
+        }
+    }
+
+    #[test]
+    fn completion_fails_closed_for_other_terminal_state_or_read_error() {
+        for status in [
+            ResponseStatus::Queued,
+            ResponseStatus::InProgress,
+            ResponseStatus::Completed,
+            ResponseStatus::Failed,
+        ] {
+            assert_eq!(
+                terminal_outcome_after_status_update(
+                    Uuid::new_v4(),
+                    TerminalStatusUpdate::AlreadyTerminal,
+                    StorageTaskOutcome::Completed,
+                    || Ok::<ResponseStatus, &'static str>(status),
+                ),
+                StorageTaskOutcome::Failed
+            );
+        }
+
+        assert_eq!(
+            terminal_outcome_after_status_update(
+                Uuid::new_v4(),
+                TerminalStatusUpdate::AlreadyTerminal,
+                StorageTaskOutcome::Completed,
+                || Err::<ResponseStatus, &'static str>("read failed"),
+            ),
+            StorageTaskOutcome::Failed
+        );
+        assert_eq!(
+            terminal_outcome_after_status_update(
+                Uuid::new_v4(),
+                TerminalStatusUpdate::Failed,
+                StorageTaskOutcome::Completed,
+                || -> Result<ResponseStatus, &'static str> {
+                    panic!("a failed compare-and-set must not be reread")
+                },
+            ),
+            StorageTaskOutcome::Failed
+        );
+    }
 }

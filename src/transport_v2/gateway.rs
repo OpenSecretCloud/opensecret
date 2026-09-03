@@ -41,8 +41,8 @@ use super::{
         X25519_PUBLIC_KEY_BYTES,
     },
     envelope::{
-        EnvelopeError, LogicalHeader, RequestEnvelope, MAX_ENCODED_REQUEST_BYTES, REQUEST_ID_BYTES,
-        VERSION,
+        EnvelopeError, LogicalHeader, RequestEnvelope, RequestId, MAX_ENCODED_REQUEST_BYTES,
+        REQUEST_ID_BYTES, VERSION,
     },
     framing::{
         frame_ciphertext, FramingError, ResponseRecord, ResponseStart, MAX_RESPONSE_CHUNK_BYTES,
@@ -265,10 +265,11 @@ async fn dispatch_request(
         Ok(envelope) => envelope,
         Err(_) => return encrypted_response(admitted, ApiError::BadRequest.into_response()),
     };
-    let request = match build_application_request(envelope, admitted.session_id()) {
-        Ok(request) => request,
-        Err(_) => return encrypted_response(admitted, ApiError::BadRequest.into_response()),
-    };
+    let request =
+        match build_application_request(envelope, admitted.session_id(), admitted.request_id()) {
+            Ok(request) => request,
+            Err(_) => return encrypted_response(admitted, ApiError::BadRequest.into_response()),
+        };
 
     let response = state
         .application
@@ -282,6 +283,7 @@ async fn dispatch_request(
 fn build_application_request(
     envelope: RequestEnvelope,
     session_id: SessionId,
+    request_id: RequestId,
 ) -> Result<Request<Body>, EnvelopeError> {
     let parts = envelope.into_parts();
     let method =
@@ -302,6 +304,7 @@ fn build_application_request(
     request
         .extensions_mut()
         .insert(TransportSession::v2(session_id));
+    request.extensions_mut().insert(request_id);
     if let Some(credential) = parts.credential {
         request.extensions_mut().insert(credential);
     }
@@ -555,7 +558,7 @@ mod tests {
     use crate::provider_cache::CacheNamespaceRoot;
     use crate::transport_v2::{
         crypto::{derive_client_session, SessionSecrets},
-        envelope::{Credential, CredentialKind, RequestId},
+        envelope::{Credential, CredentialKind},
     };
 
     struct TestSession {
@@ -705,6 +708,10 @@ mod tests {
                     .extensions()
                     .get::<TransportSession>()
                     .is_some_and(TransportSession::is_v2));
+                assert_eq!(
+                    request.extensions().get::<RequestId>(),
+                    Some(&RequestId::from_bytes([0x11; 16]))
+                );
                 assert_eq!(
                     request.extensions().get::<Credential>().unwrap().value(),
                     "v2-token"

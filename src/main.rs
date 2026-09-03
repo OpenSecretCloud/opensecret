@@ -23,8 +23,8 @@ use crate::web::openai_auth::{validate_openai_auth, validate_optional_openai_aut
 use crate::web::platform_login_routes;
 use crate::web::{
     conversation_projects_routes, conversations_routes, health_routes_with_state,
-    instructions_routes, login_routes, oauth_routes, openai_models_routes, openai_routes,
-    protected_routes, responses_routes, web_routes,
+    instructions_routes, login_routes, native_handoff_routes, oauth_routes, openai_models_routes,
+    openai_routes, protected_routes, responses_routes, web_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 use bounded_ttl_cache::BoundedTtlCache;
@@ -3913,6 +3913,7 @@ async fn main() -> Result<(), Error> {
     let v2_application = application
         .clone()
         .merge(health_routes_with_state(app_state.clone()))
+        .merge(native_handoff_routes(app_state.clone()))
         .layer(from_fn(add_error_contract_header));
     let transport_v2_gateway =
         transport_v2::gateway::TransportV2Gateway::new(app_state.clone(), v2_application);

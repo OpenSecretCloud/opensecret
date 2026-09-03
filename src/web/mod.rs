@@ -3,6 +3,7 @@ pub mod audio_utils;
 pub mod encryption_middleware;
 mod health_routes;
 pub mod login_routes;
+mod native_handoff_routes;
 mod oauth_routes;
 mod openai;
 pub mod openai_auth;
@@ -14,6 +15,7 @@ pub(crate) mod web_safety;
 
 pub use health_routes::router_with_state as health_routes_with_state;
 pub use login_routes::router as login_routes;
+pub(crate) use native_handoff_routes::router as native_handoff_routes;
 pub use oauth_routes::router as oauth_routes;
 pub use openai::models_router as openai_models_routes;
 pub use openai::router as openai_routes;

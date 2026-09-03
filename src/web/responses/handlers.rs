@@ -74,8 +74,7 @@ use uuid::Uuid;
 const RESPONSES_SSE_KEEPALIVE_INTERVAL_SECS: u64 = 1;
 const RESPONSE_CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(4);
 const RESPONSE_CANCEL_ACK_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const RESPONSE_STORAGE_JOIN_TIMEOUT: Duration = Duration::from_secs(4);
-const RESPONSE_STORAGE_ABORT_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
+const RESPONSE_STORAGE_JOIN_WARNING_AFTER: Duration = Duration::from_secs(4);
 const MAX_WEB_SEARCH_TOOL_TURNS_FREE: usize = 5;
 const MAX_WEB_SEARCH_TOOL_TURNS_PAID: usize = 30;
 
@@ -457,21 +456,22 @@ mod tests {
     use super::{
         append_streamed_tool_calls, apply_responses_model_defaults,
         assistant_turn_finished_with_tool_call, await_storage_completion,
-        await_storage_completion_with_timeout, build_internal_system_prompt_for_now,
-        build_model_turn_request, build_provider_tools, final_assistant_finish_reason,
-        finalize_first_model_tool_call, has_streamed_tool_call_entries, image_attachments,
-        image_description_access, image_description_api_error, maple_kagi_web_search_prompt,
-        model_turn_request_without_user_payload, resolve_responses_model,
-        resolve_responses_sampling, response_cancellation_ack_decision,
+        await_storage_completion_with_warning_after, build_internal_system_prompt_for_now,
+        build_model_turn_request, build_provider_tools, client_cancellation_terminal_decision,
+        final_assistant_finish_reason, finalize_first_model_tool_call,
+        has_streamed_tool_call_entries, image_attachments, image_description_access,
+        image_description_api_error, maple_kagi_web_search_prompt,
+        model_turn_request_without_user_payload, next_client_message_after_durable_completion,
+        resolve_responses_model, resolve_responses_sampling, response_cancellation_ack_decision,
         response_execution_for_status, send_storage_message,
         wait_for_local_response_execution_quiescence, web_search_is_selected,
         web_search_tool_turn_limit, web_search_tool_turn_limit_error,
-        web_search_tool_turn_limit_reached, ClientResponseState, ConversationParam,
-        ImageAttachment, ImageDescriptionFailureClass, ImageDescriptionInput,
-        ImageDescriptionToolPair, InputMessage, MessageContent, MessageContentPart, MessageInput,
-        ResponseCancellationAckDecision, ResponsesCreateRequest, StorageCompletionDecision,
-        StorageMessage, StreamedToolCall, MAX_WEB_SEARCH_TOOL_TURNS_FREE,
-        MAX_WEB_SEARCH_TOOL_TURNS_PAID, READ_IMAGE_TOOL_NAME,
+        web_search_tool_turn_limit_reached, ClientCancellationTerminalDecision,
+        ClientResponseState, ConversationParam, ImageAttachment, ImageDescriptionFailureClass,
+        ImageDescriptionInput, ImageDescriptionToolPair, InputMessage, MessageContent,
+        MessageContentPart, MessageInput, ResponseCancellationAckDecision, ResponsesCreateRequest,
+        StorageCompletionDecision, StorageMessage, StreamedToolCall,
+        MAX_WEB_SEARCH_TOOL_TURNS_FREE, MAX_WEB_SEARCH_TOOL_TURNS_PAID, READ_IMAGE_TOOL_NAME,
     };
     use crate::web::responses::{tools, StorageTaskOutcome};
     use crate::{
@@ -1036,6 +1036,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_completion_replays_buffered_output_when_client_terminal_send_is_interrupted() {
+        let (storage_tx, mut storage_rx) = mpsc::channel(1);
+        let (client_tx, mut client_rx) = mpsc::channel(3);
+        let item_id = Uuid::new_v4();
+        client_tx
+            .send(StorageMessage::MessageStarted { item_id })
+            .await
+            .expect("queue message start");
+        client_tx
+            .send(StorageMessage::ContentDelta {
+                item_id,
+                delta: "buffered output".to_string(),
+            })
+            .await
+            .expect("queue message content");
+        client_tx
+            .send(StorageMessage::MessageDone {
+                item_id,
+                finish_reason: "stop".to_string(),
+            })
+            .await
+            .expect("fill client channel");
+
+        let terminal_sender = tokio::spawn(async move {
+            send_storage_message(
+                &storage_tx,
+                &client_tx,
+                StorageMessage::ResponseDone {
+                    finish_reason: "stop".to_string(),
+                },
+            )
+            .await
+        });
+
+        assert!(matches!(
+            storage_rx.recv().await,
+            Some(StorageMessage::ResponseDone { .. })
+        ));
+        tokio::task::yield_now().await;
+        assert!(
+            !terminal_sender.is_finished(),
+            "terminal sender must be blocked behind buffered client output"
+        );
+        terminal_sender.abort();
+        assert!(terminal_sender
+            .await
+            .expect_err("terminal sender should be cancelled")
+            .is_cancelled());
+
+        assert!(matches!(
+            next_client_message_after_durable_completion(&mut client_rx),
+            StorageMessage::MessageStarted { item_id: replayed_id } if replayed_id == item_id
+        ));
+
+        assert!(matches!(
+            next_client_message_after_durable_completion(&mut client_rx),
+            StorageMessage::ContentDelta { item_id: replayed_id, delta }
+                if replayed_id == item_id && delta == "buffered output"
+        ));
+        assert!(matches!(
+            next_client_message_after_durable_completion(&mut client_rx),
+            StorageMessage::MessageDone { item_id: replayed_id, finish_reason }
+                if replayed_id == item_id && finish_reason == "stop"
+        ));
+        assert!(matches!(
+            next_client_message_after_durable_completion(&mut client_rx),
+            StorageMessage::ResponseDone { .. }
+        ));
+    }
+
+    #[test]
+    fn durable_storage_outcome_controls_the_client_cancellation_terminal() {
+        assert_eq!(
+            client_cancellation_terminal_decision(StorageCompletionDecision::Completed),
+            ClientCancellationTerminalDecision::ReplayCompleted
+        );
+        assert_eq!(
+            client_cancellation_terminal_decision(StorageCompletionDecision::Cancelled),
+            ClientCancellationTerminalDecision::EmitCancelled
+        );
+        assert_eq!(
+            client_cancellation_terminal_decision(StorageCompletionDecision::Error),
+            ClientCancellationTerminalDecision::EmitError
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_completion_uses_an_already_queued_client_terminal_message() {
+        let (client_tx, mut client_rx) = mpsc::channel(2);
+        client_tx
+            .send(StorageMessage::Usage {
+                prompt_tokens: 3,
+                completion_tokens: 5,
+            })
+            .await
+            .expect("queue usage");
+        client_tx
+            .send(StorageMessage::ResponseDone {
+                finish_reason: "length".to_string(),
+            })
+            .await
+            .expect("queue terminal message");
+
+        assert!(matches!(
+            next_client_message_after_durable_completion(&mut client_rx),
+            StorageMessage::Usage {
+                prompt_tokens: 3,
+                completion_tokens: 5
+            }
+        ));
+        assert!(matches!(
+            next_client_message_after_durable_completion(&mut client_rx),
+            StorageMessage::ResponseDone { finish_reason } if finish_reason == "length"
+        ));
+    }
+
+    #[tokio::test]
     async fn transcript_delta_waits_for_saturated_client_channel() {
         let (storage_tx, mut storage_rx) = mpsc::channel(2);
         let (client_tx, mut client_rx) = mpsc::channel(1);
@@ -1124,20 +1241,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_completion_aborts_a_stalled_storage_worker_after_timeout() {
-        let handle = tokio::spawn(async {
-            std::future::pending::<()>().await;
+    async fn response_completion_keeps_waiting_after_storage_join_warning() {
+        let (release_storage, storage_released) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            storage_released.await.expect("release storage worker");
             StorageTaskOutcome::Completed
         });
         let abort_handle = handle.abort_handle();
         let mut storage_handle = Some(handle);
+        let mut waiter = tokio::spawn(async move {
+            let decision = await_storage_completion_with_warning_after(
+                &mut storage_handle,
+                Duration::from_millis(20),
+            )
+            .await;
+            (decision, storage_handle.is_none())
+        });
 
-        assert_eq!(
-            await_storage_completion_with_timeout(&mut storage_handle, Duration::from_millis(20),)
-                .await,
-            StorageCompletionDecision::Error
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), &mut waiter)
+                .await
+                .is_err(),
+            "storage waiter must remain pending after the warning threshold"
         );
-        assert!(storage_handle.is_none());
+        assert!(!abort_handle.is_finished());
+
+        release_storage.send(()).expect("release storage worker");
+        let (decision, handle_consumed) = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("storage waiter should resume after release")
+            .expect("join storage waiter");
+        assert_eq!(decision, StorageCompletionDecision::Completed);
+        assert!(handle_consumed);
         assert!(abort_handle.is_finished());
     }
 
@@ -3612,6 +3747,23 @@ enum StorageCompletionDecision {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientCancellationTerminalDecision {
+    EmitCancelled,
+    ReplayCompleted,
+    EmitError,
+}
+
+fn client_cancellation_terminal_decision(
+    storage_completion: StorageCompletionDecision,
+) -> ClientCancellationTerminalDecision {
+    match storage_completion {
+        StorageCompletionDecision::Cancelled => ClientCancellationTerminalDecision::EmitCancelled,
+        StorageCompletionDecision::Completed => ClientCancellationTerminalDecision::ReplayCompleted,
+        StorageCompletionDecision::Error => ClientCancellationTerminalDecision::EmitError,
+    }
+}
+
 /// Wait for the storage worker to acknowledge the terminal response state.
 ///
 /// `ResponseDone` reaches the client and storage channels independently. The
@@ -3621,30 +3773,53 @@ enum StorageCompletionDecision {
 async fn await_storage_completion(
     storage_handle: &mut Option<tokio::task::JoinHandle<StorageTaskOutcome>>,
 ) -> StorageCompletionDecision {
-    await_storage_completion_with_timeout(storage_handle, RESPONSE_STORAGE_JOIN_TIMEOUT).await
+    await_storage_completion_with_warning_after(storage_handle, RESPONSE_STORAGE_JOIN_WARNING_AFTER)
+        .await
 }
 
-async fn await_storage_completion_with_timeout(
+async fn await_storage_completion_with_warning_after(
     storage_handle: &mut Option<tokio::task::JoinHandle<StorageTaskOutcome>>,
-    join_timeout: Duration,
+    warning_after: Duration,
 ) -> StorageCompletionDecision {
     let Some(mut handle) = storage_handle.take() else {
         return StorageCompletionDecision::Error;
     };
 
-    match tokio::time::timeout(join_timeout, &mut handle).await {
-        Ok(Ok(StorageTaskOutcome::Completed)) => StorageCompletionDecision::Completed,
-        Ok(Ok(StorageTaskOutcome::Cancelled)) => StorageCompletionDecision::Cancelled,
-        Ok(Ok(StorageTaskOutcome::Failed)) | Ok(Err(_)) => StorageCompletionDecision::Error,
+    let storage_outcome = match tokio::time::timeout(warning_after, &mut handle).await {
+        Ok(outcome) => outcome,
         Err(_) => {
-            error!("Timed out joining the Responses storage worker");
-            handle.abort();
-            // Diesel calls inside the task are synchronous, so Tokio abort is
-            // cooperative. Keep the failure path bounded rather than awaiting
-            // an indefinitely blocked database call after abort.
-            let _ = tokio::time::timeout(RESPONSE_STORAGE_ABORT_JOIN_TIMEOUT, handle).await;
-            StorageCompletionDecision::Error
+            warn!(
+                "Responses storage worker is still running after {} ms; continuing to wait for its authoritative terminal state",
+                warning_after.as_millis()
+            );
+            handle.await
         }
+    };
+
+    match storage_outcome {
+        Ok(StorageTaskOutcome::Completed) => StorageCompletionDecision::Completed,
+        Ok(StorageTaskOutcome::Cancelled) => StorageCompletionDecision::Cancelled,
+        Ok(StorageTaskOutcome::Failed) | Err(_) => StorageCompletionDecision::Error,
+    }
+}
+
+/// Once storage has durably completed, every nonterminal client projection is
+/// already buffered or consumed because producers await each client send before
+/// enqueueing `ResponseDone` for storage. Cancellation can interrupt the
+/// redundant client-side `ResponseDone` send after storage received its copy,
+/// so synthesize only that terminal marker after the buffered projection drains.
+fn next_client_message_after_durable_completion(
+    rx_client: &mut mpsc::Receiver<StorageMessage>,
+) -> StorageMessage {
+    match rx_client.try_recv() {
+        Ok(message @ StorageMessage::ResponseDone { .. }) => message,
+        Ok(StorageMessage::Cancelled | StorageMessage::Error(_))
+        | Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+            StorageMessage::ResponseDone {
+                finish_reason: "stop".to_string(),
+            }
+        }
+        Ok(message) => message,
     }
 }
 
@@ -4530,15 +4705,20 @@ async fn create_response_stream(
         let mut client_state = ClientResponseState::default();
         let mut total_prompt_tokens_used = 0i32;
         let mut total_completion_tokens = 0i32;
+        let mut durable_completion_pending = false;
         loop {
-            let msg = tokio::select! {
-                biased;
-                _ = response_execution.cancelled() => StorageMessage::Cancelled,
-                message = rx_client.recv() => {
-                    let Some(message) = message else {
-                        break;
-                    };
-                    message
+            let msg = if durable_completion_pending {
+                next_client_message_after_durable_completion(&mut rx_client)
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = response_execution.cancelled() => StorageMessage::Cancelled,
+                    message = rx_client.recv() => {
+                        let Some(message) = message else {
+                            break;
+                        };
+                        message
+                    }
                 }
             };
             trace!("Client stream received message from upstream processor");
@@ -4702,7 +4882,12 @@ async fn create_response_stream(
                     yield Ok(ResponseEvent::OutputItemDone(reasoning_item_done).to_sse_event(&mut emitter).await);
                 }
                 StorageMessage::ResponseDone { finish_reason: _finish_reason } => {
-                    match await_storage_completion(&mut storage_handle).await {
+                    let storage_completion = if durable_completion_pending {
+                        StorageCompletionDecision::Completed
+                    } else {
+                        await_storage_completion(&mut storage_handle).await
+                    };
+                    match storage_completion {
                         StorageCompletionDecision::Completed => {}
                         StorageCompletionDecision::Cancelled => {
                             debug!(
@@ -4783,25 +4968,19 @@ async fn create_response_stream(
                 }
                 StorageMessage::Cancelled => {
                     debug!("Client stream received cancellation signal");
-                    match await_storage_completion(&mut storage_handle).await {
-                        StorageCompletionDecision::Cancelled => {}
-                        StorageCompletionDecision::Completed => {
-                            error!(
-                                "Storage completed response {} despite a client cancellation signal",
+                    match client_cancellation_terminal_decision(
+                        await_storage_completion(&mut storage_handle).await,
+                    ) {
+                        ClientCancellationTerminalDecision::EmitCancelled => {}
+                        ClientCancellationTerminalDecision::ReplayCompleted => {
+                            debug!(
+                                "Cancellation for response {} lost to durable completion; draining the client projection before emitting response.completed",
                                 response_uuid
                             );
-                            let error_event = ResponseErrorEvent {
-                                event_type: EVENT_RESPONSE_ERROR,
-                                error: ResponseError {
-                                    error_type: "stream_error".to_string(),
-                                    message: "Internal storage failure - response cancellation was not finalized".to_string(),
-                                },
-                            };
-                            drop(client_execution_guard.take());
-                            yield Ok(ResponseEvent::Error(error_event).to_sse_event(&mut emitter).await);
-                            break;
+                            durable_completion_pending = true;
+                            continue;
                         }
-                        StorageCompletionDecision::Error => {
+                        ClientCancellationTerminalDecision::EmitError => {
                             error!(
                                 "Storage did not acknowledge durable cancellation for response {}",
                                 response_uuid

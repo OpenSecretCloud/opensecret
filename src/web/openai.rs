@@ -14,7 +14,9 @@ use crate::provider_routing::{ProviderName, ProviderRoutingError};
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
-use crate::web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession};
+use crate::web::encryption_middleware::{
+    decrypt_request, encrypt_response, Decrypted, TransportSession,
+};
 use crate::web::openai_auth::AuthMethod;
 use crate::web::responses::{ResponseExecution, ResponseExecutionTaskGuard};
 use crate::{ApiError, AppState};
@@ -836,7 +838,7 @@ async fn proxy_openai(
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(auth_method): axum::Extension<AuthMethod>,
     cache_namespace_root: Option<axum::Extension<CacheNamespaceRoot>>,
-    axum::Extension(mut body): axum::Extension<Value>,
+    Decrypted(mut body): Decrypted<Value>,
 ) -> Result<Response, ApiError> {
     let cache_policy = CompletionCachePolicy::for_request(
         &session_id,
@@ -1931,13 +1933,9 @@ async fn fetch_provider_models(
 
     if !res.is_success() {
         let status = res.status_code();
-        let body_bytes = res.bytes().await.ok();
-        let error_msg = body_bytes
-            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-            .unwrap_or_else(|| status.to_string());
         error!(
-            "Provider {} returned non-success status for models: {} - {}",
-            proxy_config.provider_name, status, error_msg
+            "Provider {} returned non-success status for models: {}",
+            proxy_config.provider_name, status
         );
         return Err(ApiError::InternalServerError);
     }
@@ -2074,7 +2072,7 @@ async fn proxy_transcription(
     axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
-    axum::Extension(transcription_request): axum::Extension<TranscriptionRequest>,
+    Decrypted(transcription_request): Decrypted<TranscriptionRequest>,
 ) -> Result<Response, ApiError> {
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
@@ -2392,14 +2390,9 @@ async fn send_transcription_request(
                 Ok(response_json)
             } else {
                 let status = res.status_code();
-                let body_bytes = res.bytes().await.ok();
-                let error_msg = body_bytes
-                    .map(|b| String::from_utf8_lossy(&b).to_string())
-                    .unwrap_or_else(|| status.to_string());
-
                 error!(
-                    "Provider {} returned transcription error: {} - {}",
-                    provider.provider_name, status, error_msg
+                    "Provider {} returned non-success status for transcription: {}",
+                    provider.provider_name, status
                 );
                 Err(ApiError::InternalServerError)
             }
@@ -2479,7 +2472,7 @@ async fn proxy_tts(
     axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
-    axum::Extension(tts_request): axum::Extension<TTSRequest>,
+    Decrypted(tts_request): Decrypted<TTSRequest>,
 ) -> Result<Response, ApiError> {
     let prepared = prepare_tts_request(tts_request).map_err(|validation_error| {
         warn!(
@@ -2581,7 +2574,7 @@ async fn proxy_embeddings(
     axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
-    axum::Extension(embedding_request): axum::Extension<EmbeddingRequest>,
+    Decrypted(embedding_request): Decrypted<EmbeddingRequest>,
 ) -> Result<Response, ApiError> {
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
@@ -2650,13 +2643,9 @@ async fn proxy_embeddings(
 
     if !res.is_success() {
         let status = res.status_code();
-        let body_bytes = res.bytes().await.ok();
-        let error_msg = body_bytes
-            .map(|b| String::from_utf8_lossy(&b).to_string())
-            .unwrap_or_else(|| status.to_string());
         error!(
-            "Embeddings proxy returned non-success status: {} - {}",
-            status, error_msg
+            "Provider {} returned non-success status for embeddings: {}",
+            proxy_config.provider_name, status
         );
         return Err(ApiError::InternalServerError);
     }

@@ -1,6 +1,6 @@
 use crate::{
     models::{org_memberships::OrgRole, orgs::NewOrg, platform_users::PlatformUser},
-    web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
+    web::encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
     ApiError, AppState,
 };
 use axum::{
@@ -41,14 +41,14 @@ pub fn router(app_state: Arc<AppState>) -> Router {
 async fn create_org(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
-    Extension(create_request): Extension<CreateOrgRequest>,
+    Decrypted(create_request): Decrypted<CreateOrgRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     debug!("Creating new organization");
 
     // Validate request
-    if let Err(errors) = create_request.validate() {
-        error!("Validation error: {:?}", errors);
+    if create_request.validate().is_err() {
+        error!("Organization creation request validation failed");
         return Err(ApiError::BadRequest);
     }
 

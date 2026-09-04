@@ -6,7 +6,7 @@ use crate::{
         platform_users::NewPlatformUser,
     },
     transport_v2::envelope::{Credential, CredentialKind},
-    web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
+    web::encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
     ApiError, AppState, Error,
 };
 use axum::{
@@ -225,12 +225,12 @@ async fn prepare_platform_refresh_request(
 
 pub async fn login_platform_user(
     State(data): State<Arc<AppState>>,
-    Extension(login_request): Extension<PlatformLoginRequest>,
+    Decrypted(login_request): Decrypted<PlatformLoginRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     // Validate request
-    if let Err(errors) = login_request.validate() {
-        error!("Validation error: {:?}", errors);
+    if login_request.validate().is_err() {
+        error!("Platform login request validation failed");
         return Err(ApiError::BadRequest);
     }
 
@@ -285,12 +285,12 @@ async fn login_internal_platform(
 
 pub async fn register_platform_user(
     State(data): State<Arc<AppState>>,
-    Extension(register_request): Extension<PlatformRegisterRequest>,
+    Decrypted(register_request): Decrypted<PlatformRegisterRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     // Validate request
-    if let Err(errors) = register_request.validate() {
-        error!("Validation error: {:?}", errors);
+    if register_request.validate().is_err() {
+        error!("Platform registration request validation failed");
         return Err(ApiError::BadRequest);
     }
 
@@ -398,12 +398,12 @@ pub async fn register_platform_user(
 
 pub async fn refresh_platform_token(
     State(data): State<Arc<AppState>>,
-    Extension(refresh_request): Extension<PlatformRefreshRequest>,
+    Decrypted(refresh_request): Decrypted<PlatformRefreshRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     // Validate request
-    if let Err(errors) = refresh_request.validate() {
-        error!("Validation error: {:?}", errors);
+    if refresh_request.validate().is_err() {
+        error!("Platform token refresh request validation failed");
         return Err(ApiError::BadRequest);
     }
 
@@ -492,7 +492,7 @@ pub async fn verify_platform_email(
 
 pub async fn logout_platform_user(
     State(data): State<Arc<AppState>>,
-    Extension(logout_request): Extension<PlatformLogoutRequest>,
+    Decrypted(logout_request): Decrypted<PlatformLogoutRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     info!("Platform logout request received");
@@ -506,12 +506,12 @@ pub async fn logout_platform_user(
 
 pub async fn platform_password_reset_request(
     State(data): State<Arc<AppState>>,
-    Extension(payload): Extension<PlatformPasswordResetRequestPayload>,
+    Decrypted(payload): Decrypted<PlatformPasswordResetRequestPayload>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     // Validate request
-    if let Err(errors) = payload.validate() {
-        error!("Validation error: {:?}", errors);
+    if payload.validate().is_err() {
+        error!("Platform password reset request validation failed");
         return Err(ApiError::BadRequest);
     }
 
@@ -558,12 +558,12 @@ pub async fn platform_password_reset_request(
 
 pub async fn platform_password_reset_confirm(
     State(data): State<Arc<AppState>>,
-    Extension(payload): Extension<PlatformPasswordResetConfirmPayload>,
+    Decrypted(payload): Decrypted<PlatformPasswordResetConfirmPayload>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     // Validate request
-    if let Err(errors) = payload.validate() {
-        error!("Validation error: {:?}", errors);
+    if payload.validate().is_err() {
+        error!("Platform password reset confirmation validation failed");
         return Err(ApiError::BadRequest);
     }
 

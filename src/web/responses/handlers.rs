@@ -18,7 +18,7 @@ use crate::{
     provider_cache::CacheNamespaceRoot,
     tokens::count_tokens,
     web::{
-        encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
+        encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
         openai::{
             ensure_completion_model_access, get_chat_completion_response,
             get_chat_completion_response_for_execution,
@@ -4321,7 +4321,7 @@ async fn create_response_stream(
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
     cache_namespace_root: Option<Extension<CacheNamespaceRoot>>,
-    Extension(mut body): Extension<ResponsesCreateRequest>,
+    Decrypted(mut body): Decrypted<ResponsesCreateRequest>,
 ) -> Result<Response, ApiError> {
     trace!("=== ENTERING create_response_stream ===");
     let require_explicit_terminal = session_id.is_v2();

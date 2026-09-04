@@ -8,7 +8,7 @@ use crate::{
     models::users::User,
     tokens::count_tokens,
     web::{
-        encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
+        encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
         responses::{
             constants::{
                 DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT,
@@ -251,7 +251,7 @@ async fn create_instruction(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(body): Extension<CreateInstructionRequest>,
+    Decrypted(body): Decrypted<CreateInstructionRequest>,
 ) -> Result<Response, ApiError> {
     debug!("Creating new instruction for user: {}", user.uuid);
 
@@ -346,7 +346,7 @@ async fn update_instruction(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(body): Extension<UpdateInstructionRequest>,
+    Decrypted(body): Decrypted<UpdateInstructionRequest>,
 ) -> Result<Response, ApiError> {
     debug!(
         "Updating instruction {} for user {}",

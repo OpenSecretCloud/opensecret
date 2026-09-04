@@ -66,6 +66,7 @@ pair, then sends:
 ```http
 POST /v2/session
 Content-Type: application/json
+X-OpenSecret-Routing-Key: <canonical padded Base64 challenge>
 
 {
   "version": 2,
@@ -88,7 +89,7 @@ JSON:
   "version": 2,
   "session_id": "<32 lowercase hex characters>",
   "attestation_document": "<Base64 Nitro attestation document>",
-  "expires_in_seconds": 3900
+  "expires_in_seconds": 3600
 }
 ```
 
@@ -137,9 +138,18 @@ The client compares lowercase-hex `session_id` with the response and rejects a
 mismatch. It then erases the ephemeral private key, shared secret, transcript
 scratch values, and any unneeded derived-key copies.
 
-The server session has a fixed 3,900-second lifetime from creation. Activity
+The server session has a fixed 3,600-second lifetime from creation. Activity
 does not extend it. Clients should retire it slightly early to account for
 establishment time and clock or network skew.
+
+`X-OpenSecret-Routing-Key` is the exact canonical Base64 encoding of the
+32-byte client challenge. It is public, random per session, and carries no
+credential, identity, or authority. The enclave requires it to match the
+challenge during session creation and the stored session on later requests.
+The challenge is already authenticated by Nitro attestation and included in
+the session key transcript, so no separate routing-key cryptography exists.
+Its purpose is to let a stateful load balancer select the same enclave for the
+initial handshake and every request that follows.
 
 ## 2. Send a whole logical request
 
@@ -149,12 +159,14 @@ All application operations use one outer endpoint:
 POST /v2/request
 Content-Type: application/octet-stream
 X-Session-Id: <32 lowercase hex session ID>
+X-OpenSecret-Routing-Key: <canonical padded Base64 session routing key>
 
 <request record bytes>
 ```
 
 `Content-Type` must be exactly `application/octet-stream` without parameters,
-and there must be exactly one `X-Session-Id`. The outer URI has no query string.
+and there must be exactly one `X-Session-Id` and one
+`X-OpenSecret-Routing-Key`. The outer URI has no query string.
 Credentials, cookies, and content encoding are forbidden outside the
 ciphertext. Transfer framing such as an absent `Content-Length` or HTTP
 chunking is valid; the gateway always enforces the actual-body limit while
@@ -208,7 +220,8 @@ authorization  proxy-authorization  cookie  set-cookie  host
 content-length transfer-encoding
 connection     keep-alive           te      trailer      upgrade
 forwarded      via                  x-forwarded-for
-x-forwarded-host x-forwarded-proto  x-session-id
+x-forwarded-host x-forwarded-proto  x-opensecret-routing-key
+x-session-id
 ```
 
 `content-encoding` is also rejected on the outer request. It is not in the
@@ -441,7 +454,7 @@ These are byte and retained-state caps, not reservations:
 | Encrypted response record | 65,553 bytes |
 | Logical response headers | 32 entries |
 | Error code | 64 bytes |
-| Session lifetime | 3,900 seconds, absolute |
+| Session lifetime | 3,600 seconds, absolute |
 | Live sessions per enclave process | 2,097,152 |
 | Replay IDs per session | 1,048,576 |
 | Replay IDs per enclave process | 16,777,216 |
@@ -584,9 +597,22 @@ Before enabling V2 clients in production:
 2. Build and verify the production EIF, publish the reviewed PCR evidence, and
    confirm each client enforces the intended PCR policy before key derivation.
 3. Ensure `/v2/request` always reaches the enclave process that created its
-   session. The same constraint covers an OAuth callback because pending OAuth
-   state is also process-local. Enclave restart or loss requires a fresh
-   attestation and session, followed by an encrypted resumption request.
+   session. Preserve the load balancer's existing cookie affinity as the
+   default for released V1 clients. Add a [custom load-balancing
+   rule](https://developers.cloudflare.com/load-balancing/additional-options/load-balancing-rules/)
+   matching `starts_with(http.request.uri.path, "/v2/")` that overrides only
+   those requests to [HTTP-header session
+   affinity](https://developers.cloudflare.com/load-balancing/understand-basics/session-affinity/)
+   on `x-opensecret-routing-key`, requires that header, and uses the maximum
+   3,600-second idle TTL. Canonical clients retire the absolute 3,600-second
+   enclave session 30 seconds early, before an otherwise-idle affinity entry
+   can expire. Global replacement of cookie affinity would break released V1
+   clients, while cookie affinity alone is insufficient for V2 because V2
+   deliberately omits credentials and rejects outer cookies. Header affinity
+   also cannot use Cloudflare's sticky zero-downtime failover; an origin loss
+   therefore requires a fresh attestation and session, followed by an
+   encrypted resumption request. The same affinity constraint covers an OAuth
+   callback because pending OAuth state is also process-local.
 4. Configure ingress to pass `application/octet-stream` bodies byte-for-byte,
    permit at least 52,559,908 bytes if the full logical body limit is supported,
    accept ordinary HTTP transfer framing, and stream responses without
@@ -599,9 +625,11 @@ Before enabling V2 clients in production:
    from local mock/unit tests. Before Apple redirect OAuth is enabled, a real
    provider smoke must confirm that the signed token-endpoint ID token carries
    the requested nonce.
-7. Rate-limit public session creation and other unauthenticated admission at a
-   boundary that cannot be bypassed. The process-wide state counts are final
-   safety caps, not the primary abuse-control policy.
+7. Restrict direct origin ingress to Cloudflare, or enforce equivalent
+   connection, upload-time, and request-rate controls at every origin-local
+   boundary. Rate-limit public session creation and other unauthenticated
+   admission where those controls cannot be bypassed. The process-wide state
+   counts are final safety caps, not the primary abuse-control policy.
 8. Load-test concurrent large requests against the production enclave memory
    profile and set operational admission and headroom accordingly. The
    protocol intentionally has no custom aggregate memory reservation layer.

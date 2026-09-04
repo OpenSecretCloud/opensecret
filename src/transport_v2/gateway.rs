@@ -50,7 +50,7 @@ use super::{
     session::{ReplayBudget, ReplayError, Session, SessionError, SessionStore, SessionStoreError},
 };
 
-const SESSION_LIFETIME: Duration = Duration::from_secs(65 * 60);
+const SESSION_LIFETIME: Duration = Duration::from_secs(60 * 60);
 const SESSION_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_SESSION_REQUEST_BYTES: usize = 4 * 1024;
 const MAX_SESSIONS: usize = 2_097_152;
@@ -60,6 +60,7 @@ const MAX_REQUEST_RECORD_BYTES: usize =
     REQUEST_ID_BYTES + MAX_ENCODED_REQUEST_BYTES + RECORD_TAG_BYTES;
 
 const SESSION_ID_HEADER: HeaderName = HeaderName::from_static("x-session-id");
+const ROUTING_KEY_HEADER: HeaderName = HeaderName::from_static("x-opensecret-routing-key");
 const OUTER_CONTENT_TYPE: HeaderValue = HeaderValue::from_static("application/octet-stream");
 
 #[derive(Clone)]
@@ -181,6 +182,7 @@ async fn create_session(
     if request.uri().query().is_some() {
         return Err(OuterError::BadRequest);
     }
+    let routing_key = parse_outer_routing_key(request.headers())?;
     reject_declared_oversize(request.headers(), MAX_SESSION_REQUEST_BYTES)?;
     let body = read_bounded_body(request.into_body(), MAX_SESSION_REQUEST_BYTES).await?;
     let payload: CreateSessionRequest =
@@ -190,6 +192,9 @@ async fn create_session(
     }
 
     let challenge = decode_canonical_fixed::<HANDSHAKE_CHALLENGE_BYTES>(&payload.challenge)?;
+    if challenge != routing_key {
+        return Err(OuterError::BadRequest);
+    }
     let client_public_key =
         decode_canonical_fixed::<X25519_PUBLIC_KEY_BYTES>(&payload.client_public_key)?;
 
@@ -214,6 +219,7 @@ async fn create_session(
     let session = Arc::new(
         Session::new(
             secrets,
+            challenge,
             SESSION_LIFETIME,
             NonZeroUsize::new(MAX_REPLAY_IDS_PER_SESSION)
                 .expect("transport-v2 per-session replay capacity must be non-zero"),
@@ -244,7 +250,19 @@ async fn dispatch_request(
         return Err(OuterError::BadRequest);
     }
     let session_id = parse_outer_session_id(request.headers())?;
+    let routing_key = parse_outer_routing_key(request.headers())?;
     reject_declared_oversize(request.headers(), MAX_REQUEST_RECORD_BYTES)?;
+
+    // Reject arbitrary session IDs before accepting a potentially large upload.
+    // Drop this short-lived reference immediately so a slow or abandoned body
+    // cannot pin the session. Admission still performs an authoritative lookup
+    // after the body is collected, since the session may expire or disappear in
+    // the meantime.
+    drop(get_routed_session(
+        &state.sessions,
+        session_id,
+        &routing_key,
+    )?);
     let record = read_bounded_body(request.into_body(), MAX_REQUEST_RECORD_BYTES).await?;
     if record.len() < MIN_REQUEST_RECORD_BYTES {
         return Err(OuterError::BadRequest);
@@ -252,10 +270,7 @@ async fn dispatch_request(
 
     // The body arrives before the session is retained. A slow or abandoned
     // upload therefore cannot pin session state.
-    let session = state
-        .sessions
-        .get(session_id)
-        .map_err(map_session_lookup_error)?;
+    let session = get_routed_session(&state.sessions, session_id, &routing_key)?;
     let (admitted, plaintext) = session
         .open_and_admit(&record)
         .map_err(map_admission_error)?;
@@ -502,6 +517,31 @@ fn parse_outer_session_id(headers: &HeaderMap) -> Result<SessionId, OuterError> 
         .ok_or(OuterError::BadRequest)
 }
 
+fn parse_outer_routing_key(
+    headers: &HeaderMap,
+) -> Result<[u8; HANDSHAKE_CHALLENGE_BYTES], OuterError> {
+    let values = headers.get_all(&ROUTING_KEY_HEADER);
+    let mut values = values.iter();
+    let value = values.next().ok_or(OuterError::BadRequest)?;
+    if values.next().is_some() {
+        return Err(OuterError::BadRequest);
+    }
+    let value = value.to_str().map_err(|_| OuterError::BadRequest)?;
+    decode_canonical_fixed(value)
+}
+
+fn get_routed_session(
+    sessions: &SessionStore,
+    session_id: SessionId,
+    routing_key: &[u8; HANDSHAKE_CHALLENGE_BYTES],
+) -> Result<Arc<Session>, OuterError> {
+    let session = sessions.get(session_id).map_err(map_session_lookup_error)?;
+    if !session.matches_routing_key(routing_key) {
+        return Err(OuterError::BadRequest);
+    }
+    Ok(session)
+}
+
 fn decode_canonical_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], OuterError> {
     let decoded = STANDARD
         .decode(encoded.as_bytes())
@@ -564,6 +604,7 @@ mod tests {
     struct TestSession {
         client: SessionSecrets,
         server: Arc<Session>,
+        routing_key: [u8; HANDSHAKE_CHALLENGE_BYTES],
     }
 
     fn test_session(marker: u8) -> TestSession {
@@ -576,16 +617,22 @@ mod tests {
         let client = derive_client_session(client_secret, &transcript).unwrap();
         let server_secrets = derive_server_session(server_secret, &transcript).unwrap();
         let replay_budget = Arc::new(ReplayBudget::new(NonZeroUsize::new(128).unwrap()));
+        let routing_key = [marker; HANDSHAKE_CHALLENGE_BYTES];
         let server = Arc::new(
             Session::new(
                 server_secrets,
+                routing_key,
                 Duration::from_secs(60),
                 NonZeroUsize::new(64).unwrap(),
                 replay_budget,
             )
             .unwrap(),
         );
-        TestSession { client, server }
+        TestSession {
+            client,
+            server,
+            routing_key,
+        }
     }
 
     fn request_router(application: Router<()>, sessions: Arc<SessionStore>) -> Router<()> {
@@ -618,13 +665,26 @@ mod tests {
             .unwrap()
     }
 
-    fn outer_request(session_id: SessionId, record: Vec<u8>) -> Request<Body> {
+    fn outer_request(
+        session_id: SessionId,
+        routing_key: &[u8; HANDSHAKE_CHALLENGE_BYTES],
+        record: Vec<u8>,
+    ) -> Request<Body> {
+        outer_request_with_body(session_id, routing_key, Body::from(record))
+    }
+
+    fn outer_request_with_body(
+        session_id: SessionId,
+        routing_key: &[u8; HANDSHAKE_CHALLENGE_BYTES],
+        body: Body,
+    ) -> Request<Body> {
         Request::builder()
             .method(Method::POST)
             .uri("/v2/request")
             .header(header::CONTENT_TYPE, "application/octet-stream")
             .header(&SESSION_ID_HEADER, session_id.to_string())
-            .body(Body::from(record))
+            .header(&ROUTING_KEY_HEADER, STANDARD.encode(routing_key))
+            .body(body)
             .unwrap()
     }
 
@@ -729,6 +789,7 @@ mod tests {
         let request_id = RequestId::from_bytes([0x11; 16]);
         let request = outer_request(
             test.server.id(),
+            &test.routing_key,
             seal_request(
                 &test.client,
                 request_id,
@@ -777,7 +838,7 @@ mod tests {
         let request_id = RequestId::from_bytes([0x22; 16]);
         let record = seal_request(&test.client, request_id, "/count", None);
 
-        let mut forbidden = outer_request(test.server.id(), record.clone());
+        let mut forbidden = outer_request(test.server.id(), &test.routing_key, record.clone());
         forbidden.headers_mut().insert(
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer stolen"),
@@ -787,12 +848,41 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
+        let mut missing_routing_key =
+            outer_request(test.server.id(), &test.routing_key, record.clone());
+        missing_routing_key
+            .headers_mut()
+            .remove(&ROUTING_KEY_HEADER);
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(missing_routing_key)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(outer_request(
+                    test.server.id(),
+                    &[0x93; HANDSHAKE_CHALLENGE_BYTES],
+                    record.clone(),
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
         let mut tampered = record.clone();
         *tampered.last_mut().unwrap() ^= 1;
         assert_eq!(
             router
                 .clone()
-                .oneshot(outer_request(test.server.id(), tampered))
+                .oneshot(outer_request(test.server.id(), &test.routing_key, tampered))
                 .await
                 .unwrap()
                 .status(),
@@ -801,7 +891,11 @@ mod tests {
 
         let response = router
             .clone()
-            .oneshot(outer_request(test.server.id(), record.clone()))
+            .oneshot(outer_request(
+                test.server.id(),
+                &test.routing_key,
+                record.clone(),
+            ))
             .await
             .unwrap();
         let records = decrypt_records(&test.client, request_id, response).await;
@@ -810,13 +904,57 @@ mod tests {
 
         assert_eq!(
             router
-                .oneshot(outer_request(test.server.id(), record))
+                .oneshot(outer_request(test.server.id(), &test.routing_key, record))
                 .await
                 .unwrap()
                 .status(),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unknown_session_is_rejected_without_reading_the_body() {
+        let sessions = Arc::new(SessionStore::new(NonZeroUsize::new(2).unwrap()));
+        let router = request_router(Router::new(), sessions);
+        let body = Body::from_stream(stream::once(async {
+            panic!("an unknown session body must not be polled");
+            #[allow(unreachable_code)]
+            Ok::<_, io::Error>(Bytes::new())
+        }));
+        let response = router
+            .oneshot(outer_request_with_body(
+                SessionId::from_bytes([0x91; 16]),
+                &[0x91; HANDSHAKE_CHALLENGE_BYTES],
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn session_lookup_after_upload_remains_authoritative() {
+        let test = test_session(9);
+        let sessions = Arc::new(SessionStore::new(NonZeroUsize::new(2).unwrap()));
+        sessions.insert(Arc::clone(&test.server)).unwrap();
+        let request_id = RequestId::from_bytes([0x92; 16]);
+        let record = seal_request(&test.client, request_id, "/unused", None);
+        let session_id = test.server.id();
+        let body = Body::from_stream(stream::once({
+            let sessions = Arc::clone(&sessions);
+            async move {
+                sessions.remove(session_id).unwrap();
+                Ok::<_, io::Error>(Bytes::from(record))
+            }
+        }));
+        let router = request_router(Router::new(), sessions);
+
+        let response = router
+            .oneshot(outer_request_with_body(session_id, &test.routing_key, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -835,7 +973,7 @@ mod tests {
             &test.client,
             request_id,
             router
-                .oneshot(outer_request(test.server.id(), record))
+                .oneshot(outer_request(test.server.id(), &test.routing_key, record))
                 .await
                 .unwrap(),
         )
@@ -859,6 +997,7 @@ mod tests {
         let response = router
             .oneshot(outer_request(
                 first.server.id(),
+                &first.routing_key,
                 seal_request(&first.client, request_id, "/ok", None),
             ))
             .await
@@ -915,6 +1054,7 @@ mod tests {
                 .clone()
                 .oneshot(outer_request(
                     test.server.id(),
+                    &test.routing_key,
                     seal_request(&test.client, success_id, "/stream", None),
                 ))
                 .await
@@ -933,6 +1073,7 @@ mod tests {
             router
                 .oneshot(outer_request(
                     test.server.id(),
+                    &test.routing_key,
                     seal_request(&test.client, error_id, "/stream-error", None),
                 ))
                 .await
@@ -986,6 +1127,7 @@ mod tests {
             router
                 .oneshot(outer_request(
                     test.server.id(),
+                    &test.routing_key,
                     seal_request(&test.client, request_id, "/too-many-headers", None),
                 ))
                 .await

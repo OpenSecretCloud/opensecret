@@ -8,7 +8,7 @@ use crate::{
 };
 use crate::{jwt::USER_REFRESH, web::encryption_middleware::TransportSession};
 use crate::{
-    web::encryption_middleware::{decrypt_request, encrypt_response},
+    web::encryption_middleware::{decrypt_request, encrypt_response, Decrypted},
     Error,
 };
 use crate::{ApiError, AppState};
@@ -166,7 +166,7 @@ pub struct LogoutRequest {
 
 pub async fn login(
     State(data): State<Arc<AppState>>,
-    Extension(creds): Extension<Credentials>,
+    Decrypted(creds): Decrypted<Credentials>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     tracing::trace!("call login");
@@ -194,7 +194,7 @@ async fn login_internal(
             match data.db.get_user_by_email(email.clone(), project.id) {
                 Ok(user) => user,
                 Err(DBError::UserNotFound) => {
-                    error!("User not found by email: {email}");
+                    error!("User not found by provided login identifier");
                     return Err(ApiError::InvalidUsernameOrPassword);
                 }
                 Err(e) => {
@@ -279,7 +279,7 @@ async fn login_internal(
 
 pub async fn logout(
     State(data): State<Arc<AppState>>,
-    Extension(logout_request): Extension<LogoutRequest>,
+    Decrypted(logout_request): Decrypted<LogoutRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     info!("Logout request received");
@@ -292,7 +292,7 @@ pub async fn logout(
 
 pub async fn register(
     State(data): State<Arc<AppState>>,
-    Extension(creds): Extension<RegisterCredentials>,
+    Decrypted(creds): Decrypted<RegisterCredentials>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     tracing::trace!("call register");
@@ -379,7 +379,7 @@ pub async fn handle_new_user_registration(
 
 pub async fn refresh_token(
     State(data): State<Arc<AppState>>,
-    Extension(refresh_request): Extension<RefreshRequest>,
+    Decrypted(refresh_request): Decrypted<RefreshRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     info!("Refresh token request received");
@@ -460,7 +460,7 @@ pub async fn verify_email(
 
 pub async fn password_reset_request(
     State(data): State<Arc<AppState>>,
-    Extension(payload): Extension<PasswordResetRequestPayload>,
+    Decrypted(payload): Decrypted<PasswordResetRequestPayload>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     // Get project by client_id
@@ -512,7 +512,7 @@ pub async fn password_reset_request(
 
 pub async fn password_reset_confirm(
     State(data): State<Arc<AppState>>,
-    Extension(payload): Extension<PasswordResetConfirmPayload>,
+    Decrypted(payload): Decrypted<PasswordResetConfirmPayload>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     // Get project by client_id

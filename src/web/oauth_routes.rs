@@ -3,7 +3,9 @@ use crate::apple_signin::{generate_apple_client_secret, validate_apple_native_to
 use crate::models::oauth::NewUserOAuthConnection;
 use crate::models::oauth::UserOAuthConnection;
 use crate::oauth::{BasicClient, OAuthCodeBinding, OAuthState};
-use crate::web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession};
+use crate::web::encryption_middleware::{
+    decrypt_request, encrypt_response, Decrypted, TransportSession,
+};
 use crate::web::login_routes::handle_new_user_registration;
 use crate::web::platform::common::{
     PROJECT_APPLE_OAUTH_SECRET, PROJECT_GITHUB_OAUTH_SECRET, PROJECT_GOOGLE_OAUTH_SECRET,
@@ -421,7 +423,7 @@ async fn get_project_oauth_client(
 
 pub async fn initiate_oauth(
     State(app_state): State<Arc<AppState>>,
-    Extension(auth_request): Extension<OAuthAuthRequest>,
+    Decrypted(auth_request): Decrypted<OAuthAuthRequest>,
     Extension(session_id): Extension<TransportSession>,
     provider_name: &str,
 ) -> Result<Response, ApiError> {
@@ -523,7 +525,7 @@ pub async fn initiate_oauth(
 
 pub async fn oauth_callback(
     State(app_state): State<Arc<AppState>>,
-    Extension(callback_request): Extension<OAuthCallbackRequest>,
+    Decrypted(callback_request): Decrypted<OAuthCallbackRequest>,
     Extension(session_id): Extension<TransportSession>,
     provider_name: &str,
 ) -> Result<Response, ApiError> {
@@ -531,7 +533,10 @@ pub async fn oauth_callback(
         "Received code (redacted, len={})",
         callback_request.code.len()
     );
-    debug!("Received state: {}", callback_request.state);
+    debug!(
+        "Received OAuth state (redacted, len={})",
+        callback_request.state.len()
+    );
 
     // Decode and parse the state
     let state_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -753,28 +758,10 @@ pub async fn oauth_callback(
 
         // Check if successful
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            error!("Error response from Apple: {}", error_text);
-
-            // Try to parse the error as JSON for more details
-            if let Ok(error_json) = serde_json::from_str::<serde_json::Value>(&error_text) {
-                if let Some(error_obj) = error_json.get("error") {
-                    error!("Error type: {}", error_obj);
-
-                    // If it's an invalid_client error, log diagnostic info
-                    if error_obj.as_str() == Some("invalid_client") {
-                        error!("invalid_client error detected - this typically means the client_secret JWT is invalid");
-                        error!("JWT verification failed - check Team ID, Key ID, and private key configuration");
-                    }
-                }
-            }
-
-            error!("Apple OAuth token exchange failed. Possible issues:");
-            error!("1. Client ID might be wrong (check if it needs .services suffix)");
-            error!("2. Team ID or Key ID might not match the private key");
-            error!("3. Private key might be invalid or in wrong format");
-            error!("4. The authorization code might be invalid or expired");
-            error!("5. Redirect URI might not match the one used in the authorization request");
+            error!(
+                "Apple OAuth token exchange returned non-success status: {}",
+                status
+            );
 
             return Err(ApiError::InternalServerError);
         }
@@ -1010,16 +997,11 @@ async fn fetch_github_user(
     trace!("GitHub API response headers: {:?}", headers);
 
     if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unable to read error body".to_string());
         error!(
             "GitHub API returned non-success status: {} {}",
             status,
             status.canonical_reason().unwrap_or("")
         );
-        error!("Error response body: {}", error_body);
         return Err(ApiError::InternalServerError);
     }
 
@@ -1031,8 +1013,11 @@ async fn fetch_github_user(
     trace!("GitHub user response body: {}", user_body);
 
     let mut github_user: GithubUser = serde_json::from_str(&user_body).map_err(|e| {
-        error!("Failed to parse GitHub user JSON: {:?}", e);
-        error!("GitHub user response body: {}", user_body);
+        error!(
+            "Failed to parse GitHub user JSON: {} (response_bytes={})",
+            e,
+            user_body.len()
+        );
         ApiError::InternalServerError
     })?;
 
@@ -1057,16 +1042,11 @@ async fn fetch_github_user(
         trace!("GitHub emails API response headers: {:?}", emails_headers);
 
         if !emails_status.is_success() {
-            let error_body = emails_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unable to read error body".to_string());
             error!(
                 "GitHub API returned non-success status for emails: {} {}",
                 emails_status,
                 emails_status.canonical_reason().unwrap_or("")
             );
-            error!("Error response body for emails: {}", error_body);
             return Err(ApiError::InternalServerError);
         }
 
@@ -1078,8 +1058,11 @@ async fn fetch_github_user(
         trace!("GitHub emails response body: {}", emails_body);
 
         let emails: Vec<GithubEmail> = serde_json::from_str(&emails_body).map_err(|e| {
-            error!("Failed to parse GitHub emails JSON: {:?}", e);
-            error!("GitHub emails response body: {}", emails_body);
+            error!(
+                "Failed to parse GitHub emails JSON: {} (response_bytes={})",
+                e,
+                emails_body.len()
+            );
             ApiError::InternalServerError
         })?;
 
@@ -1118,14 +1101,7 @@ async fn fetch_google_user(
 
     let status = response.status();
     if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unable to read error body".to_string());
-        error!(
-            "Google API returned non-success status: {} {}",
-            status, error_body
-        );
+        error!("Google API returned non-success status: {}", status);
         return Err(ApiError::InternalServerError);
     }
 
@@ -1363,7 +1339,7 @@ async fn find_or_create_user_from_oauth(
 /// Handler for Apple native sign-in (iOS Sign in with Apple)
 pub async fn handle_apple_native_signin(
     State(app_state): State<Arc<AppState>>,
-    Extension(request): Extension<AppleNativeSignInRequest>,
+    Decrypted(request): Decrypted<AppleNativeSignInRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     debug!("Handling Apple native sign-in");
@@ -1451,10 +1427,7 @@ pub async fn handle_apple_native_signin(
             ApiError::InternalServerError
         })?
     {
-        debug!(
-            "Found existing connection for Apple ID: {}",
-            verified_user_id
-        );
+        debug!("Found existing Apple OAuth connection");
 
         let user = app_state.db.get_user_by_uuid(connection.user_id)?;
         if user.project_id != project.id {
@@ -1474,10 +1447,7 @@ pub async fn handle_apple_native_signin(
     }
 
     // If we get here, user doesn't exist - need to create new user
-    debug!(
-        "No existing user found with Apple ID: {}, creating new user",
-        verified_user_id
-    );
+    debug!("No existing Apple OAuth connection; creating new user");
 
     // For new users, we absolutely need an email
     // Determine the email to use - prioritize the one from the token if available

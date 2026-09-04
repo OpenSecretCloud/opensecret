@@ -5,7 +5,7 @@ use crate::{
         org_memberships::{NewOrgMembership, OrgRole},
         platform_users::PlatformUser,
     },
-    web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
+    web::encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
     ApiError, AppState, DBError,
 };
 use axum::{
@@ -55,7 +55,7 @@ async fn create_invite(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path(org_id): Path<Uuid>,
-    Extension(create_request): Extension<CreateInviteRequest>,
+    Decrypted(create_request): Decrypted<CreateInviteRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     debug!("Creating invite");

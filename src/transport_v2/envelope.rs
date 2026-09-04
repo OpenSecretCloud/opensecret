@@ -537,6 +537,7 @@ fn is_gateway_controlled_header(name: &str) -> bool {
             | "x-forwarded-for"
             | "x-forwarded-host"
             | "x-forwarded-proto"
+            | "x-opensecret-routing-key"
             | "x-session-id"
     )
 }
@@ -682,6 +683,7 @@ mod tests {
             "host",
             "transfer-encoding",
             "x-forwarded-for",
+            "x-opensecret-routing-key",
             "x-session-id",
         ] {
             assert!(matches!(

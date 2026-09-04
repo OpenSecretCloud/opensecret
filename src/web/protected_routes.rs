@@ -4,7 +4,9 @@ use crate::message_signing::SigningAlgorithm;
 use crate::private_key::{
     derive_bip85_mnemonic_from_root, plaintext_user_seed_to_mnemonic, VALID_BIP39_WORD_COUNTS,
 };
-use crate::web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession};
+use crate::web::encryption_middleware::{
+    decrypt_request, encrypt_response, Decrypted, TransportSession,
+};
 use crate::Error;
 use crate::{
     db::DBError, email::send_verification_email, models::email_verification::NewEmailVerification,
@@ -641,7 +643,7 @@ pub async fn put_kv(
     Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<TransportSession>,
     Path(key): Path<String>,
-    Extension(value): Extension<String>,
+    Decrypted(value): Decrypted<String>,
 ) -> Result<Response, ApiError> {
     match data.put(&user, &auth_context, key, value.clone()).await {
         Ok(kv) => kv,
@@ -774,7 +776,7 @@ pub async fn change_password(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(change_request): Extension<ChangePasswordRequest>,
+    Decrypted(change_request): Decrypted<ChangePasswordRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     // Check if user is an OAuth-only user
@@ -932,7 +934,7 @@ pub async fn sign_message(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(sign_request): Extension<SignMessageRequest>,
+    Decrypted(sign_request): Decrypted<SignMessageRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     // Validate key_options
@@ -1036,7 +1038,7 @@ pub async fn get_public_key(
 pub async fn generate_third_party_token(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
-    Extension(request): Extension<ThirdPartyTokenRequest>,
+    Decrypted(request): Decrypted<ThirdPartyTokenRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     // Validate the audience
@@ -1072,7 +1074,7 @@ pub async fn encrypt_data(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(request): Extension<EncryptDataRequest>,
+    Decrypted(request): Decrypted<EncryptDataRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     // Validate key_options
@@ -1126,7 +1128,7 @@ pub async fn decrypt_data(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(request): Extension<DecryptDataRequest>,
+    Decrypted(request): Decrypted<DecryptDataRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     // Validate key_options
@@ -1195,7 +1197,7 @@ pub async fn decrypt_data(
 pub async fn initiate_account_deletion(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
-    Extension(delete_request): Extension<InitiateAccountDeletionRequest>,
+    Decrypted(delete_request): Decrypted<InitiateAccountDeletionRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     info!("User {} is initiating account deletion request", user.uuid);
@@ -1229,7 +1231,7 @@ pub async fn initiate_account_deletion(
 pub async fn confirm_account_deletion(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
-    Extension(confirm_request): Extension<ConfirmAccountDeletionRequest>,
+    Decrypted(confirm_request): Decrypted<ConfirmAccountDeletionRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     info!("User {} is confirming account deletion", user.uuid);
@@ -1277,14 +1279,14 @@ pub async fn confirm_account_deletion(
 pub async fn create_api_key(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
-    Extension(request): Extension<CreateApiKeyRequest>,
+    Decrypted(request): Decrypted<CreateApiKeyRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     debug!("Creating new API key for user: {}", user.uuid);
 
     // Validate the request
-    if let Err(e) = request.validate() {
-        error!("API key request validation failed: {:?}", e);
+    if request.validate().is_err() {
+        error!("API key request validation failed");
         return Err(ApiError::BadRequest);
     }
 

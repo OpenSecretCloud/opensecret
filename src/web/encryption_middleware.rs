@@ -1,15 +1,16 @@
 use axum::{
     body::{Body, Bytes, HttpBody},
-    extract::State,
-    http::{HeaderMap, Method, Request},
+    extract::{FromRequestParts, State},
+    http::{request::Parts, HeaderMap, Method, Request},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use base64::Engine;
 use http_body::{Frame, SizeHint};
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,6 +20,175 @@ use uuid::Uuid;
 use crate::{transport_v2::crypto::SessionId, ApiError, AppState};
 
 const MAX_ENCRYPTED_BODY_BYTES: usize = 50 * 1024 * 1024; // 50MB
+
+// Containers and scalar values each count as one node; object member names do
+// not count separately. String bytes are already covered by the body-size
+// limit and do not increase this count.
+const MAX_V2_JSON_NODES: usize = 1_048_576;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonComplexityError {
+    Invalid,
+    TooManyNodes,
+}
+
+struct JsonNodeBudget {
+    remaining: usize,
+    exceeded: bool,
+}
+
+impl JsonNodeBudget {
+    fn claim<E: serde::de::Error>(&mut self) -> Result<(), E> {
+        match self.remaining.checked_sub(1) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                Ok(())
+            }
+            None => {
+                self.exceeded = true;
+                Err(E::custom("JSON node limit exceeded"))
+            }
+        }
+    }
+}
+
+struct JsonNode<'a> {
+    budget: &'a mut JsonNodeBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for JsonNode<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.budget.claim::<D::Error>()?;
+        deserializer.deserialize_any(JsonNodeVisitor {
+            budget: self.budget,
+        })
+    }
+}
+
+struct JsonNodeVisitor<'a> {
+    budget: &'a mut JsonNodeBudget,
+}
+
+impl<'de> Visitor<'de> for JsonNodeVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence
+            .next_element_seed(JsonNode {
+                budget: &mut *self.budget,
+            })?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_key::<IgnoredAny>()?.is_some() {
+            map.next_value_seed(JsonNode {
+                budget: &mut *self.budget,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_json_complexity(input: &[u8], max_nodes: usize) -> Result<(), JsonComplexityError> {
+    let mut budget = JsonNodeBudget {
+        remaining: max_nodes,
+        exceeded: false,
+    };
+    let mut deserializer = serde_json::Deserializer::from_slice(input);
+    let parsed = JsonNode {
+        budget: &mut budget,
+    }
+    .deserialize(&mut deserializer);
+
+    if budget.exceeded {
+        return Err(JsonComplexityError::TooManyNodes);
+    }
+    parsed.map_err(|_| JsonComplexityError::Invalid)?;
+    deserializer.end().map_err(|_| JsonComplexityError::Invalid)
+}
+
+fn validate_v2_json_body(input: &[u8], max_nodes: usize) -> Result<(), ApiError> {
+    match validate_json_complexity(input, max_nodes) {
+        Ok(()) => Ok(()),
+        Err(JsonComplexityError::Invalid) => Err(ApiError::BadRequest),
+        Err(JsonComplexityError::TooManyNodes) => Err(ApiError::PayloadTooLarge),
+    }
+}
+
+/// A decrypted request body transferred exactly once from middleware to its
+/// handler.
+///
+/// Axum's [`axum::Extension`] extractor clones the stored value. That is fine
+/// for small request metadata, but can duplicate a large deserialized request
+/// body. This extractor removes the value from the request extensions instead,
+/// preserving ordinary handler ownership without a second allocation.
+pub struct Decrypted<T>(pub T);
+
+#[axum::async_trait]
+impl<S, T> FromRequestParts<S> for Decrypted<T>
+where
+    S: Send + Sync,
+    T: Clone + Send + Sync + 'static,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .remove::<T>()
+            .map(Self)
+            .ok_or(ApiError::InternalServerError)
+    }
+}
+
+fn store_decrypted<T>(request: &mut Request<Body>, decrypted: T)
+where
+    T: Clone + Send + Sync + 'static,
+{
+    request.extensions_mut().insert(decrypted);
+}
 
 /// Identifies the transport context that must encrypt a handler response.
 ///
@@ -186,9 +356,10 @@ where
             let body_bytes = axum::body::to_bytes(body, MAX_ENCRYPTED_BODY_BYTES)
                 .await
                 .map_err(|_| ApiError::PayloadTooLarge)?;
+            validate_v2_json_body(&body_bytes, MAX_V2_JSON_NODES)?;
             let decoded =
                 serde_json::from_slice::<T>(&body_bytes).map_err(|_| ApiError::BadRequest)?;
-            request.extensions_mut().insert(decoded);
+            store_decrypted(&mut request, decoded);
         }
 
         return Ok(next.run(request).await);
@@ -234,7 +405,7 @@ where
         ApiError::BadRequest
     })?;
 
-    request.extensions_mut().insert(decrypted);
+    store_decrypted(&mut request, decrypted);
     request
         .extensions_mut()
         .insert(TransportSession::v1(session_id));
@@ -320,6 +491,82 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[derive(Debug)]
+    struct CloneSpy {
+        clone_count: Arc<AtomicUsize>,
+        value: String,
+    }
+
+    impl Clone for CloneSpy {
+        fn clone(&self) -> Self {
+            self.clone_count.fetch_add(1, Ordering::SeqCst);
+            Self {
+                clone_count: self.clone_count.clone(),
+                value: self.value.clone(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decrypted_body_is_moved_to_the_handler_without_cloning() {
+        let clone_count = Arc::new(AtomicUsize::new(0));
+        let mut request = Request::new(Body::empty());
+        store_decrypted(
+            &mut request,
+            CloneSpy {
+                clone_count: clone_count.clone(),
+                value: "request body".to_string(),
+            },
+        );
+        let (mut parts, _) = request.into_parts();
+
+        let Decrypted(body) = Decrypted::<CloneSpy>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+
+        assert_eq!(body.value, "request body");
+        assert_eq!(clone_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decrypted_body_can_only_be_extracted_once() {
+        let mut request = Request::new(Body::empty());
+        store_decrypted(&mut request, "request body".to_string());
+        let (mut parts, _) = request.into_parts();
+
+        let first = Decrypted::<String>::from_request_parts(&mut parts, &()).await;
+        let second = Decrypted::<String>::from_request_parts(&mut parts, &()).await;
+
+        assert!(matches!(first, Ok(Decrypted(body)) if body == "request body"));
+        assert!(matches!(second, Err(ApiError::InternalServerError)));
+    }
+
+    #[test]
+    fn json_complexity_counts_structure_without_counting_string_bytes() {
+        let large_string = format!(r#""{}""#, "x".repeat(128 * 1024));
+        assert_eq!(validate_json_complexity(large_string.as_bytes(), 1), Ok(()));
+
+        let structured = br#"[true,{"payload":"aGVsbG8="},[-1,1.5,null]]"#;
+        assert_eq!(validate_json_complexity(structured, 8), Ok(()));
+        assert_eq!(
+            validate_json_complexity(structured, 7),
+            Err(JsonComplexityError::TooManyNodes)
+        );
+    }
+
+    #[test]
+    fn v2_json_preflight_distinguishes_invalid_json_from_excess_structure() {
+        assert!(matches!(
+            validate_v2_json_body(br#"[1,]"#, 16),
+            Err(ApiError::BadRequest)
+        ));
+        assert!(matches!(
+            validate_v2_json_body(br#"[1,2]"#, 2),
+            Err(ApiError::PayloadTooLarge)
+        ));
+        assert!(validate_v2_json_body(br#"[1,2]"#, 3).is_ok());
+    }
 
     #[test]
     fn classifies_every_bodyless_disjunct() {

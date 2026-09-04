@@ -2,7 +2,7 @@ use crate::{
     email::send_platform_verification_email,
     models::platform_email_verification::NewPlatformEmailVerification,
     models::platform_users::PlatformUser,
-    web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
+    web::encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
     ApiError, AppState,
 };
 use axum::{
@@ -199,12 +199,12 @@ async fn request_platform_verification(
 pub async fn platform_change_password(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
-    Extension(change_request): Extension<PlatformChangePasswordRequest>,
+    Decrypted(change_request): Decrypted<PlatformChangePasswordRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     // Validate request
-    if let Err(errors) = change_request.validate() {
-        error!("Validation error: {:?}", errors);
+    if change_request.validate().is_err() {
+        error!("Platform password change request validation failed");
         return Err(ApiError::BadRequest);
     }
 

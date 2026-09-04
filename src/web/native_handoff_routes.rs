@@ -20,7 +20,7 @@ use crate::{
         envelope::{Credential, RequestId},
     },
     web::{
-        encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
+        encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
         login_routes::AuthResponse,
     },
     ApiError, AppState,
@@ -70,7 +70,7 @@ async fn create_native_handoff_grant(
     Extension(session): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(request): Extension<NativeHandoffGrantRequest>,
+    Decrypted(request): Decrypted<NativeHandoffGrantRequest>,
 ) -> Result<Response, ApiError> {
     if !session.is_v2() {
         return Err(ApiError::BadRequest);
@@ -105,7 +105,7 @@ async fn redeem_native_handoff(
     Extension(request_id): Extension<RequestId>,
     credential: Option<Extension<Credential>>,
     cache_root: Option<Extension<CacheNamespaceRoot>>,
-    Extension(request): Extension<NativeHandoffRedeemRequest>,
+    Decrypted(request): Decrypted<NativeHandoffRedeemRequest>,
 ) -> Result<Response, ApiError> {
     let session_id = session.v2_session_id().ok_or(ApiError::BadRequest)?;
     if credential.is_some() || cache_root.is_some() {

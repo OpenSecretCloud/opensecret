@@ -3,7 +3,7 @@ use crate::{
         org_memberships::{OrgMembershipError, OrgRole},
         platform_users::PlatformUser,
     },
-    web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
+    web::encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
     ApiError, AppState, DBError,
 };
 use axum::{
@@ -87,7 +87,7 @@ async fn update_membership(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, user_id)): Path<(Uuid, Uuid)>,
-    Extension(update_request): Extension<UpdateMembershipRequest>,
+    Decrypted(update_request): Decrypted<UpdateMembershipRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     debug!(

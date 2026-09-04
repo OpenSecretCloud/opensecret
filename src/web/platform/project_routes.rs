@@ -6,7 +6,7 @@ use crate::{
         platform_users::PlatformUser,
         project_settings::{EmailSettings, OAuthSettings},
     },
-    web::encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
+    web::encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
     ApiError, AppState,
 };
 use axum::routing::put;
@@ -108,14 +108,14 @@ async fn create_project(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path(org_id): Path<Uuid>,
-    Extension(create_request): Extension<CreateProjectRequest>,
+    Decrypted(create_request): Decrypted<CreateProjectRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     debug!("Creating new project");
 
     // Validate request
-    if let Err(errors) = create_request.validate() {
-        error!("Validation error: {:?}", errors);
+    if create_request.validate().is_err() {
+        error!("Project creation request validation failed");
         return Err(ApiError::BadRequest);
     }
 
@@ -223,7 +223,7 @@ async fn update_project(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, project_id)): Path<(Uuid, Uuid)>,
-    Extension(update_request): Extension<UpdateProjectRequest>,
+    Decrypted(update_request): Decrypted<UpdateProjectRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     debug!("Updating project");
@@ -398,14 +398,14 @@ async fn create_secret(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, project_id)): Path<(Uuid, Uuid)>,
-    Extension(create_request): Extension<CreateSecretRequest>,
+    Decrypted(create_request): Decrypted<CreateSecretRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     debug!("Creating project secret");
 
     // Validate request
-    if let Err(errors) = create_request.validate() {
-        error!("Validation error: {:?}", errors);
+    if create_request.validate().is_err() {
+        error!("Project secret creation request validation failed");
         return Err(ApiError::BadRequest);
     }
 
@@ -634,14 +634,14 @@ async fn update_email_settings(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, project_id)): Path<(Uuid, Uuid)>,
-    Extension(update_request): Extension<UpdateEmailSettingsRequest>,
+    Decrypted(update_request): Decrypted<UpdateEmailSettingsRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     debug!("Updating project email settings");
 
     // Validate request
-    if let Err(errors) = update_request.validate() {
-        error!("Validation error: {:?}", errors);
+    if update_request.validate().is_err() {
+        error!("Project email settings request validation failed");
         return Err(ApiError::BadRequest);
     }
 
@@ -738,14 +738,14 @@ async fn update_oauth_settings(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, project_id)): Path<(Uuid, Uuid)>,
-    Extension(update_request): Extension<UpdateOAuthSettingsRequest>,
+    Decrypted(update_request): Decrypted<UpdateOAuthSettingsRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
     debug!("Updating project OAuth settings");
 
     // Validate request using validator
-    if let Err(errors) = update_request.validate() {
-        error!("Validation error: {:?}", errors);
+    if update_request.validate().is_err() {
+        error!("Project OAuth settings request validation failed");
         return Err(ApiError::BadRequest);
     }
 

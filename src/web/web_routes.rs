@@ -30,7 +30,7 @@ use crate::{
     },
     models::users::User,
     web::{
-        encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
+        encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
         web_safety::{compact_untrusted_markdown, normalize_public_https_url, strip_image_embeds},
     },
     ApiError, AppMode, AppState,
@@ -273,7 +273,7 @@ async fn search_web(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
-    Extension(body): Extension<Value>,
+    Decrypted(body): Decrypted<Value>,
 ) -> Result<Response, WebRouteError> {
     let request = serde_json::from_value::<WebSearchRequest>(body)
         .map_err(|_| WebRouteError::InvalidRequest)?;
@@ -293,7 +293,7 @@ async fn extract_web(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
-    Extension(body): Extension<Value>,
+    Decrypted(body): Decrypted<Value>,
 ) -> Result<Response, WebRouteError> {
     let request = serde_json::from_value::<WebExtractRequest>(body)
         .map_err(|_| WebRouteError::InvalidRequest)?;

@@ -7,7 +7,7 @@ use crate::{
     models::users::User,
     tokens::count_tokens,
     web::{
-        encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
+        encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
         responses::{
             constants::{
                 DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT,
@@ -161,7 +161,7 @@ async fn create_conversation_project(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(body): Extension<CreateConversationProjectRequest>,
+    Decrypted(body): Decrypted<CreateConversationProjectRequest>,
 ) -> Result<Response, ApiError> {
     let name = validate_project_name(&body.name)?;
     let user_key = state
@@ -267,7 +267,7 @@ async fn update_conversation_project(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(body): Extension<UpdateConversationProjectRequest>,
+    Decrypted(body): Decrypted<UpdateConversationProjectRequest>,
 ) -> Result<Response, ApiError> {
     if body.name.is_none() && body.instructions.is_missing() {
         return Err(ApiError::BadRequest);

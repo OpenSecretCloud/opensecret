@@ -7,7 +7,7 @@ use crate::{
     models::responses::{ConversationProjectFilter, NewConversation},
     models::users::User,
     web::{
-        encryption_middleware::{decrypt_request, encrypt_response, TransportSession},
+        encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
         responses::{
             constants::{
                 self, DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT,
@@ -386,7 +386,7 @@ async fn create_conversation(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(body): Extension<CreateConversationRequest>,
+    Decrypted(body): Decrypted<CreateConversationRequest>,
 ) -> Result<Response, ApiError> {
     // Reject initial items - not supported in our simplified flow
     // Users must use POST /v1/responses to add messages to conversations
@@ -493,7 +493,7 @@ async fn update_conversation(
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(body): Extension<UpdateConversationRequest>,
+    Decrypted(body): Decrypted<UpdateConversationRequest>,
 ) -> Result<Response, ApiError> {
     if body.metadata.is_none() && body.project_id.is_missing() && body.pinned.is_none() {
         return Err(ApiError::BadRequest);
@@ -775,7 +775,7 @@ async fn batch_delete_conversations(
     State(state): State<Arc<AppState>>,
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
-    Extension(body): Extension<BatchDeleteConversationsRequest>,
+    Decrypted(body): Decrypted<BatchDeleteConversationsRequest>,
 ) -> Result<Response, ApiError> {
     // Validate batch size
     if body.ids.is_empty() || body.ids.len() > MAX_CONVERSATION_BATCH_SIZE {
@@ -836,7 +836,7 @@ async fn batch_update_conversation_project(
     State(state): State<Arc<AppState>>,
     Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
-    Extension(body): Extension<BatchUpdateConversationProjectRequest>,
+    Decrypted(body): Decrypted<BatchUpdateConversationProjectRequest>,
 ) -> Result<Response, ApiError> {
     if body.ids.is_empty() || body.ids.len() > MAX_CONVERSATION_BATCH_SIZE {
         return Err(ApiError::BadRequest);

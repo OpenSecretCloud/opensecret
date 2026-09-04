@@ -10,7 +10,7 @@ use std::{
 };
 
 use super::{
-    crypto::{CryptoError, ResponseSealer, SessionId, SessionSecrets},
+    crypto::{CryptoError, ResponseSealer, SessionId, SessionSecrets, HANDSHAKE_CHALLENGE_BYTES},
     envelope::RequestId,
 };
 
@@ -163,6 +163,7 @@ pub(crate) enum SessionError {
 /// here; credentials are authenticated independently on every request.
 pub(crate) struct Session {
     secrets: SessionSecrets,
+    routing_key: [u8; HANDSHAKE_CHALLENGE_BYTES],
     expires_at: Instant,
     replay: ReplayRegistry,
 }
@@ -241,12 +242,14 @@ impl fmt::Debug for Session {
 impl Session {
     pub(crate) fn new(
         secrets: SessionSecrets,
+        routing_key: [u8; HANDSHAKE_CHALLENGE_BYTES],
         lifetime: Duration,
         replay_capacity: NonZeroUsize,
         replay_budget: Arc<ReplayBudget>,
     ) -> Result<Self, SessionError> {
         Self::new_at(
             secrets,
+            routing_key,
             Instant::now(),
             lifetime,
             replay_capacity,
@@ -256,6 +259,7 @@ impl Session {
 
     fn new_at(
         secrets: SessionSecrets,
+        routing_key: [u8; HANDSHAKE_CHALLENGE_BYTES],
         now: Instant,
         lifetime: Duration,
         replay_capacity: NonZeroUsize,
@@ -269,6 +273,7 @@ impl Session {
             .ok_or(SessionError::InvalidLifetime)?;
         Ok(Self {
             secrets,
+            routing_key,
             expires_at,
             replay: ReplayRegistry::new(replay_capacity, replay_budget),
         })
@@ -280,6 +285,16 @@ impl Session {
 
     pub(crate) const fn expires_at(&self) -> Instant {
         self.expires_at
+    }
+
+    /// Confirms that the public load-balancer routing key belongs to this
+    /// attested session. The key is the client challenge already bound into
+    /// the handshake transcript; it conveys no identity or authorization.
+    pub(crate) fn matches_routing_key(
+        &self,
+        routing_key: &[u8; HANDSHAKE_CHALLENGE_BYTES],
+    ) -> bool {
+        &self.routing_key == routing_key
     }
 
     pub(crate) fn is_expired(&self, now: Instant) -> bool {
@@ -474,7 +489,15 @@ mod tests {
         let transcript = HandshakeTranscript::new([marker; 32], client_public, server_public);
         let secrets = derive_server_session(server_secret, &transcript).unwrap();
         Arc::new(
-            Session::new_at(secrets, now, lifetime, REPLAY_CAPACITY, replay_budget(128)).unwrap(),
+            Session::new_at(
+                secrets,
+                [marker; HANDSHAKE_CHALLENGE_BYTES],
+                now,
+                lifetime,
+                REPLAY_CAPACITY,
+                replay_budget(128),
+            )
+            .unwrap(),
         )
     }
 
@@ -584,6 +607,7 @@ mod tests {
         let session = Arc::new(
             Session::new_at(
                 derive_server_session(server_secret, &transcript).unwrap(),
+                [7; HANDSHAKE_CHALLENGE_BYTES],
                 start,
                 Duration::from_secs(60),
                 REPLAY_CAPACITY,
@@ -706,6 +730,7 @@ mod tests {
         assert_eq!(
             Session::new_at(
                 secrets,
+                [3; HANDSHAKE_CHALLENGE_BYTES],
                 now,
                 Duration::ZERO,
                 REPLAY_CAPACITY,

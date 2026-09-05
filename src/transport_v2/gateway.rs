@@ -100,6 +100,8 @@ struct CreateSessionResponse {
 #[derive(Clone, Copy, Debug)]
 enum OuterError {
     BadRequest,
+    SessionNotFound,
+    RequestDecryptionFailed,
     PayloadTooLarge,
     UnsupportedMediaType,
     Unavailable,
@@ -108,12 +110,29 @@ enum OuterError {
 impl IntoResponse for OuterError {
     fn into_response(self) -> Response {
         let status = match self {
-            Self::BadRequest => StatusCode::BAD_REQUEST,
+            Self::BadRequest | Self::SessionNotFound | Self::RequestDecryptionFailed => {
+                StatusCode::BAD_REQUEST
+            }
             Self::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         };
-        (status, "transport request rejected").into_response()
+        let mut response = (status, "transport request rejected").into_response();
+        let recovery_code = match self {
+            Self::SessionNotFound => Some(crate::SESSION_NOT_FOUND_ERROR_CODE),
+            Self::RequestDecryptionFailed => Some("request_decryption_failed"),
+            _ => None,
+        };
+        if let Some(code) = recovery_code {
+            response.headers_mut().insert(
+                crate::ERROR_CONTRACT_HEADER,
+                HeaderValue::from_static(crate::ERROR_CONTRACT_VERSION),
+            );
+            response
+                .headers_mut()
+                .insert(crate::ERROR_CODE_HEADER, HeaderValue::from_static(code));
+        }
+        response
     }
 }
 
@@ -565,7 +584,7 @@ fn map_session_insert_error(error: SessionStoreError) -> OuterError {
 
 fn map_session_lookup_error(error: SessionStoreError) -> OuterError {
     match error {
-        SessionStoreError::Missing | SessionStoreError::Expired => OuterError::BadRequest,
+        SessionStoreError::Missing | SessionStoreError::Expired => OuterError::SessionNotFound,
         SessionStoreError::Collision | SessionStoreError::Full | SessionStoreError::Unavailable => {
             OuterError::Unavailable
         }
@@ -574,11 +593,14 @@ fn map_session_lookup_error(error: SessionStoreError) -> OuterError {
 
 fn map_admission_error(error: SessionError) -> OuterError {
     match error {
+        SessionError::Expired => OuterError::SessionNotFound,
+        // open_and_admit authenticates the incoming record before claiming its
+        // replay ID. No application work has run when this rejection occurs.
+        SessionError::Crypto(CryptoError::Authentication) => OuterError::RequestDecryptionFailed,
         SessionError::Replay(ReplayError::GlobalCapacity | ReplayError::Unavailable) => {
             OuterError::Unavailable
         }
         SessionError::Replay(ReplayError::Duplicate | ReplayError::SessionCapacity)
-        | SessionError::Expired
         | SessionError::Crypto(_) => OuterError::BadRequest,
         SessionError::InvalidLifetime => OuterError::Unavailable,
     }
@@ -608,6 +630,15 @@ mod tests {
     }
 
     fn test_session(marker: u8) -> TestSession {
+        test_session_with_limits(marker, Duration::from_secs(60), 64, 128)
+    }
+
+    fn test_session_with_limits(
+        marker: u8,
+        lifetime: Duration,
+        replay_capacity: usize,
+        process_capacity: usize,
+    ) -> TestSession {
         let client_secret = EphemeralSecret::random_from_rng(OsRng);
         let client_public_key = PublicKey::from(&client_secret).to_bytes();
         let server_secret = EphemeralSecret::random_from_rng(OsRng);
@@ -616,14 +647,16 @@ mod tests {
             HandshakeTranscript::new([marker; 32], client_public_key, server_public_key);
         let client = derive_client_session(client_secret, &transcript).unwrap();
         let server_secrets = derive_server_session(server_secret, &transcript).unwrap();
-        let replay_budget = Arc::new(ReplayBudget::new(NonZeroUsize::new(128).unwrap()));
+        let replay_budget = Arc::new(ReplayBudget::new(
+            NonZeroUsize::new(process_capacity).unwrap(),
+        ));
         let routing_key = [marker; HANDSHAKE_CHALLENGE_BYTES];
         let server = Arc::new(
             Session::new(
                 server_secrets,
                 routing_key,
-                Duration::from_secs(60),
-                NonZeroUsize::new(64).unwrap(),
+                lifetime,
+                NonZeroUsize::new(replay_capacity).unwrap(),
                 replay_budget,
             )
             .unwrap(),
@@ -642,6 +675,100 @@ mod tests {
                 application,
                 sessions,
             }))
+    }
+
+    fn counting_application(dispatches: &Arc<AtomicUsize>) -> Router<()> {
+        Router::new().route(
+            "/count",
+            any({
+                let dispatches = Arc::clone(dispatches);
+                move || {
+                    let dispatches = Arc::clone(&dispatches);
+                    async move {
+                        dispatches.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        )
+    }
+
+    fn assert_outer_rejection(response: Response, status: StatusCode, recovery_code: Option<&str>) {
+        assert_eq!(response.status(), status);
+        assert_eq!(
+            response
+                .headers()
+                .get(crate::ERROR_CODE_HEADER)
+                .map(|value| value.to_str().unwrap()),
+            recovery_code,
+        );
+        if recovery_code.is_some() {
+            assert_eq!(
+                response
+                    .headers()
+                    .get(crate::ERROR_CONTRACT_HEADER)
+                    .unwrap(),
+                "1"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_codes_are_limited_to_missing_expired_and_incoming_authentication_errors() {
+        for error in [
+            map_session_lookup_error(SessionStoreError::Missing),
+            map_session_lookup_error(SessionStoreError::Expired),
+            map_admission_error(SessionError::Expired),
+        ] {
+            assert_outer_rejection(
+                error.into_response(),
+                StatusCode::BAD_REQUEST,
+                Some("session_not_found"),
+            );
+        }
+        assert_outer_rejection(
+            map_admission_error(SessionError::Crypto(CryptoError::Authentication)).into_response(),
+            StatusCode::BAD_REQUEST,
+            Some("request_decryption_failed"),
+        );
+
+        for error in [
+            OuterError::BadRequest,
+            map_admission_error(SessionError::Replay(ReplayError::Duplicate)),
+            map_admission_error(SessionError::Replay(ReplayError::SessionCapacity)),
+            map_admission_error(SessionError::Crypto(CryptoError::NonContributoryKey)),
+            map_admission_error(SessionError::Crypto(CryptoError::KeyDerivation)),
+            map_admission_error(SessionError::Crypto(CryptoError::TruncatedRecord)),
+            map_admission_error(SessionError::Crypto(CryptoError::Encryption)),
+            map_admission_error(SessionError::Crypto(CryptoError::SequenceExhausted)),
+        ] {
+            assert_outer_rejection(error.into_response(), StatusCode::BAD_REQUEST, None);
+        }
+        for error in [
+            map_session_insert_error(SessionStoreError::Collision),
+            map_session_insert_error(SessionStoreError::Full),
+            map_session_insert_error(SessionStoreError::Unavailable),
+            map_session_insert_error(SessionStoreError::Expired),
+            map_session_insert_error(SessionStoreError::Missing),
+            map_session_lookup_error(SessionStoreError::Collision),
+            map_session_lookup_error(SessionStoreError::Full),
+            map_session_lookup_error(SessionStoreError::Unavailable),
+            map_admission_error(SessionError::Replay(ReplayError::GlobalCapacity)),
+            map_admission_error(SessionError::Replay(ReplayError::Unavailable)),
+            map_admission_error(SessionError::InvalidLifetime),
+        ] {
+            assert_outer_rejection(error.into_response(), StatusCode::SERVICE_UNAVAILABLE, None);
+        }
+        assert_outer_rejection(
+            OuterError::PayloadTooLarge.into_response(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            None,
+        );
+        assert_outer_rejection(
+            OuterError::UnsupportedMediaType.into_response(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            None,
+        );
     }
 
     fn seal_request(
@@ -694,6 +821,7 @@ mod tests {
         response: Response,
     ) -> Vec<ResponseRecord> {
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response.headers().contains_key(crate::ERROR_CODE_HEADER));
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE),
             Some(&OUTER_CONTENT_TYPE)
@@ -821,19 +949,7 @@ mod tests {
         let sessions = Arc::new(SessionStore::new(NonZeroUsize::new(2).unwrap()));
         sessions.insert(Arc::clone(&test.server)).unwrap();
         let dispatches = Arc::new(AtomicUsize::new(0));
-        let application = Router::new().route(
-            "/count",
-            any({
-                let dispatches = Arc::clone(&dispatches);
-                move || {
-                    let dispatches = Arc::clone(&dispatches);
-                    async move {
-                        dispatches.fetch_add(1, Ordering::SeqCst);
-                        StatusCode::NO_CONTENT
-                    }
-                }
-            }),
-        );
+        let application = counting_application(&dispatches);
         let router = request_router(application, sessions);
         let request_id = RequestId::from_bytes([0x22; 16]);
         let record = seal_request(&test.client, request_id, "/count", None);
@@ -843,9 +959,10 @@ mod tests {
             header::AUTHORIZATION,
             HeaderValue::from_static("Bearer stolen"),
         );
-        assert_eq!(
-            router.clone().oneshot(forbidden).await.unwrap().status(),
-            StatusCode::BAD_REQUEST
+        assert_outer_rejection(
+            router.clone().oneshot(forbidden).await.unwrap(),
+            StatusCode::BAD_REQUEST,
+            None,
         );
 
         let mut missing_routing_key =
@@ -853,17 +970,13 @@ mod tests {
         missing_routing_key
             .headers_mut()
             .remove(&ROUTING_KEY_HEADER);
-        assert_eq!(
-            router
-                .clone()
-                .oneshot(missing_routing_key)
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::BAD_REQUEST
+        assert_outer_rejection(
+            router.clone().oneshot(missing_routing_key).await.unwrap(),
+            StatusCode::BAD_REQUEST,
+            None,
         );
 
-        assert_eq!(
+        assert_outer_rejection(
             router
                 .clone()
                 .oneshot(outer_request(
@@ -872,22 +985,37 @@ mod tests {
                     record.clone(),
                 ))
                 .await
-                .unwrap()
-                .status(),
-            StatusCode::BAD_REQUEST
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            None,
+        );
+
+        assert_outer_rejection(
+            router
+                .clone()
+                .oneshot(outer_request(
+                    test.server.id(),
+                    &test.routing_key,
+                    vec![0; MIN_REQUEST_RECORD_BYTES - 1],
+                ))
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            None,
         );
 
         let mut tampered = record.clone();
         *tampered.last_mut().unwrap() ^= 1;
-        assert_eq!(
+        assert_outer_rejection(
             router
                 .clone()
                 .oneshot(outer_request(test.server.id(), &test.routing_key, tampered))
                 .await
-                .unwrap()
-                .status(),
-            StatusCode::BAD_REQUEST
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            Some("request_decryption_failed"),
         );
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
 
         let response = router
             .clone()
@@ -902,13 +1030,13 @@ mod tests {
         assert!(matches!(&records[0], ResponseRecord::Start(start) if start.status() == 204));
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
 
-        assert_eq!(
+        assert_outer_rejection(
             router
                 .oneshot(outer_request(test.server.id(), &test.routing_key, record))
                 .await
-                .unwrap()
-                .status(),
-            StatusCode::BAD_REQUEST
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            None,
         );
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
     }
@@ -916,7 +1044,8 @@ mod tests {
     #[tokio::test]
     async fn unknown_session_is_rejected_without_reading_the_body() {
         let sessions = Arc::new(SessionStore::new(NonZeroUsize::new(2).unwrap()));
-        let router = request_router(Router::new(), sessions);
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let router = request_router(counting_application(&dispatches), sessions);
         let body = Body::from_stream(stream::once(async {
             panic!("an unknown session body must not be polled");
             #[allow(unreachable_code)]
@@ -930,7 +1059,8 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_outer_rejection(response, StatusCode::BAD_REQUEST, Some("session_not_found"));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -939,7 +1069,7 @@ mod tests {
         let sessions = Arc::new(SessionStore::new(NonZeroUsize::new(2).unwrap()));
         sessions.insert(Arc::clone(&test.server)).unwrap();
         let request_id = RequestId::from_bytes([0x92; 16]);
-        let record = seal_request(&test.client, request_id, "/unused", None);
+        let record = seal_request(&test.client, request_id, "/count", None);
         let session_id = test.server.id();
         let body = Body::from_stream(stream::once({
             let sessions = Arc::clone(&sessions);
@@ -948,13 +1078,125 @@ mod tests {
                 Ok::<_, io::Error>(Bytes::from(record))
             }
         }));
-        let router = request_router(Router::new(), sessions);
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let router = request_router(counting_application(&dispatches), sessions);
 
         let response = router
             .oneshot(outer_request_with_body(session_id, &test.routing_key, body))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_outer_rejection(response, StatusCode::BAD_REQUEST, Some("session_not_found"));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn expired_session_is_rejected_before_reading_the_body() {
+        let test = test_session_with_limits(10, Duration::from_secs(1), 64, 128);
+        let sessions = Arc::new(SessionStore::new(NonZeroUsize::new(2).unwrap()));
+        sessions.insert(Arc::clone(&test.server)).unwrap();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let router = request_router(counting_application(&dispatches), sessions);
+        tokio::time::sleep_until(test.server.expires_at().into()).await;
+        assert!(test.server.is_expired(Instant::now()));
+        let body = Body::from_stream(stream::once(async {
+            panic!("an expired session body must not be polled");
+            #[allow(unreachable_code)]
+            Ok::<_, io::Error>(Bytes::new())
+        }));
+        let response = router
+            .oneshot(outer_request_with_body(
+                test.server.id(),
+                &test.routing_key,
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_outer_rejection(response, StatusCode::BAD_REQUEST, Some("session_not_found"));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn expiry_during_upload_is_rejected_before_dispatch() {
+        let test = test_session_with_limits(11, Duration::from_secs(1), 64, 128);
+        let sessions = Arc::new(SessionStore::new(NonZeroUsize::new(2).unwrap()));
+        sessions.insert(Arc::clone(&test.server)).unwrap();
+        let record = seal_request(
+            &test.client,
+            RequestId::from_bytes([0x93; 16]),
+            "/count",
+            None,
+        );
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let body = Body::from_stream(stream::once({
+            let session = Arc::clone(&test.server);
+            let uploads = Arc::clone(&uploads);
+            async move {
+                uploads.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep_until(session.expires_at().into()).await;
+                assert!(session.is_expired(Instant::now()));
+                Ok::<_, io::Error>(Bytes::from(record))
+            }
+        }));
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let router = request_router(counting_application(&dispatches), sessions);
+        let response = router
+            .oneshot(outer_request_with_body(
+                test.server.id(),
+                &test.routing_key,
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_outer_rejection(response, StatusCode::BAD_REQUEST, Some("session_not_found"));
+        assert_eq!(uploads.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn replay_capacity_rejections_are_unmarked_and_do_not_dispatch() {
+        for (session_capacity, process_capacity, rejection_status) in [
+            (1, 2, StatusCode::BAD_REQUEST),
+            (2, 1, StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let test = test_session_with_limits(
+                12,
+                Duration::from_secs(60),
+                session_capacity,
+                process_capacity,
+            );
+            let sessions = Arc::new(SessionStore::new(NonZeroUsize::new(2).unwrap()));
+            sessions.insert(Arc::clone(&test.server)).unwrap();
+            let dispatches = Arc::new(AtomicUsize::new(0));
+            let router = request_router(counting_application(&dispatches), sessions);
+            let first_id = RequestId::from_bytes([0x94; 16]);
+            let response = router
+                .clone()
+                .oneshot(outer_request(
+                    test.server.id(),
+                    &test.routing_key,
+                    seal_request(&test.client, first_id, "/count", None),
+                ))
+                .await
+                .unwrap();
+            let records = decrypt_records(&test.client, first_id, response).await;
+            assert!(matches!(&records[0], ResponseRecord::Start(start) if start.status() == 204));
+            assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+            let response = router
+                .oneshot(outer_request(
+                    test.server.id(),
+                    &test.routing_key,
+                    seal_request(
+                        &test.client,
+                        RequestId::from_bytes([0x95; 16]),
+                        "/count",
+                        None,
+                    ),
+                ))
+                .await
+                .unwrap();
+            assert_outer_rejection(response, rejection_status, None);
+            assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[tokio::test]
@@ -980,6 +1222,50 @@ mod tests {
         .await;
         assert!(matches!(&records[0], ResponseRecord::Start(start) if start.status() == 400));
         assert!(matches!(records.last(), Some(ResponseRecord::End)));
+    }
+
+    #[tokio::test]
+    async fn application_recovery_headers_stay_inside_the_encrypted_response() {
+        let test = test_session(13);
+        let sessions = Arc::new(SessionStore::new(NonZeroUsize::new(2).unwrap()));
+        sessions.insert(Arc::clone(&test.server)).unwrap();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let application = Router::new().route(
+            "/count",
+            any({
+                let dispatches = Arc::clone(&dispatches);
+                move || {
+                    let dispatches = Arc::clone(&dispatches);
+                    async move {
+                        dispatches.fetch_add(1, Ordering::SeqCst);
+                        ApiError::SessionNotFound.into_response()
+                    }
+                }
+            }),
+        );
+        let router = request_router(application, sessions);
+        let request_id = RequestId::from_bytes([0x96; 16]);
+        let record = seal_request(&test.client, request_id, "/count", None);
+        let response = router
+            .clone()
+            .oneshot(outer_request(
+                test.server.id(),
+                &test.routing_key,
+                record.clone(),
+            ))
+            .await
+            .unwrap();
+        let records = decrypt_records(&test.client, request_id, response).await;
+        assert!(matches!(&records[0], ResponseRecord::Start(start)
+            if start.status() == 400 && start.headers().iter().any(|header|
+                header.name() == crate::ERROR_CODE_HEADER && header.value() == "session_not_found")));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        let response = router
+            .oneshot(outer_request(test.server.id(), &test.routing_key, record))
+            .await
+            .unwrap();
+        assert_outer_rejection(response, StatusCode::BAD_REQUEST, None);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

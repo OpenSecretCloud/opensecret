@@ -149,7 +149,9 @@ challenge during session creation and the stored session on later requests.
 The challenge is already authenticated by Nitro attestation and included in
 the session key transcript, so no separate routing-key cryptography exists.
 Its purpose is to let a stateful load balancer select the same enclave for the
-initial handshake and every request that follows.
+initial handshake and every request that follows when using HTTP-header
+affinity. The wire header remains required with a single origin or DNS-only
+routing, even when that routing layer does not inspect HTTP headers.
 
 ## 2. Send a whole logical request
 
@@ -395,10 +397,12 @@ an expired access credential—is instead a logical HTTP status, headers, and
 body beginning in the authenticated Start record. In particular, clients
 recognize `access_token_expired` only from the decrypted
 `x-opensecret-error-contract` and `x-opensecret-error-code` logical headers;
-matching outer headers are unauthenticated and must be ignored. EOF without a
+matching outer headers cannot trigger access-token refresh. EOF without a
 terminal record, a second Start, a record after the terminal, a sequence or
 AEAD failure, an invalid frame length, a redirect, a non-200 outer status, or a
-wrong outer content type is a transport failure and must fail closed.
+wrong outer content type is a transport failure. Clients fail closed except
+for the narrowly marked session-recovery response described below; response
+AEAD or framing failures never qualify for automatic recovery.
 
 Before a request is authenticated and replay-admitted, the gateway can return a
 generic plaintext outer `400`, `413`, `415`, or `503`. Once admitted, ordinary
@@ -407,6 +411,22 @@ Start record. A replay rejection is deliberately an outer generic error: the
 server does not encrypt a second response under a reused request subkey and
 sequence. A generic outer `503` is only a capacity signal; it is not proof that
 the request was safe to resend automatically.
+
+Two pre-dispatch failures use outer HTTP `400` with the existing
+`x-opensecret-error-contract: 1` header and one exact
+`x-opensecret-error-code` value:
+
+| Code | Server condition |
+| --- | --- |
+| `session_not_found` | The requested session is actually missing or expired |
+| `request_decryption_failed` | AEAD authentication of the incoming request fails |
+
+The gateway emits these codes only before application dispatch. A routing-key
+mismatch for an existing session, record length/encoding errors, malformed
+envelopes, replay rejection, capacity failures, and ordinary application errors
+do not receive these recovery markers. These
+outer headers are unauthenticated hints, not evidence the original request
+never executed; see the retry rules below.
 
 ### Cryptographic interoperability fixture
 
@@ -460,10 +480,11 @@ These are byte and retained-state caps, not reservations:
 | Replay IDs per enclave process | 16,777,216 |
 | Pending OAuth states | 4,096 per provider for 10 minutes |
 
-The gateway allocates for bytes and state that actually arrive. It does not
-pre-reserve a maximum request, translate byte ceilings into concurrent-request
-permits, or hold a provider/storage permit for a stream. The session and replay
-limits allocate no entries up front.
+These body, session, and replay caps are active defaults, not optional
+deployment settings. The gateway allocates for bytes and state that actually
+arrive. It does not pre-reserve a maximum request, translate byte ceilings into
+concurrent-request permits, or hold a provider/storage permit for a stream. The
+session and replay limits allocate no entries up front.
 
 The request carrier is intentionally buffered once before decryption. During
 admission, a maximum request can briefly coexist as about 50.1 MiB of
@@ -533,17 +554,34 @@ seconds and coalesce concurrent refresh work for the same authentication
 revision. Authentication remains a server decision. If preflight refresh fails
 transiently, credentials are preserved and the original operation is not sent.
 
-No client layer automatically resends a logical request after its ciphertext
-may have left the client. A lost response is an ambiguous outcome: the
-operation may have completed and the request ID is already claimed. An
-authenticated `access_token_expired` response may trigger refresh for future
-operations, but the original operation is still returned as failed. Operations
-that need user-visible retry require their own application-level idempotency
-contract.
+Managed SDK requests allow one automatic resend of the original logical
+operation after a fresh, verified attestation handshake, and only when the
+first attempt returns outer HTTP `400`, exactly
+`x-opensecret-error-contract: 1`, and exactly one of the two recovery codes
+above. The resend uses the new session and a fresh request ID; a second failure
+is returned to the caller. This applies to ordinary managed requests including
+mutations and inference, not just reads.
+
+This deliberately matches V1's best-effort session recovery behavior. An
+untrusted intermediary can let the original request execute, replace its
+response with a forged recovery hint, and cause the client to submit the
+operation again under a new session. The per-session replay set cannot prevent
+that second execution: cross-session at-most-once execution is not guaranteed.
+Operations needing that guarantee require application-level idempotency.
+
+There is no automatic resend for client-side response AEAD or framing failures,
+network failures or timeouts, partial streams, redirects, generic outer `400`
+or `503`, or ordinary application errors. An authenticated
+`access_token_expired` response may trigger refresh for future operations, but
+the original operation is still returned as failed. A lost response remains an
+ambiguous outcome. Prepared native-handoff redemption and session-bound OAuth
+callbacks cannot move to a fresh session; their flows must restart instead.
 
 V2 clients do not fall back to V1 when session establishment or a request
-fails. They reject redirects and unauthenticated outer responses. V1 and V2 use
-separate session stores, record formats, and internal token audiences. Existing
+fails. The narrow recovery hints never authenticate response content or permit
+plaintext credentials; logical credentials remain inside the encrypted resend.
+V1 and V2 use separate session stores, record formats, and internal token
+audiences. Existing
 raw API keys remain the same inference-only application capability across both
 transports; the transport does not rotate them.
 
@@ -570,6 +608,8 @@ tokens in a deep link:
 
 A copied grant cannot be redeemed from a different session or request. The
 session replay set prevents duplicate redemption within the live session.
+Prepared redemption does not use managed session-recovery retries: losing its
+bound session requires a new handoff and grant.
 
 ## V1 compatibility
 
@@ -587,6 +627,8 @@ migration; login, registration, OAuth, and native handoff are valid V2 entry
 paths, while existing raw inference-only API keys remain usable. V1 cache
 entries do not share the new V2 namespace, and V1 traffic does not gain V2's
 credential confidentiality, whole-request binding, or replay guarantees.
+This transport change adds no database migration, schema backfill, runtime
+environment variable, deployed secret, or additional service.
 
 ## Rollout gates
 
@@ -596,9 +638,14 @@ Before enabling V2 clients in production:
    their unchanged paths.
 2. Build and verify the production EIF, publish the reviewed PCR evidence, and
    confirm each client enforces the intended PCR policy before key derivation.
-3. Ensure `/v2/request` always reaches the enclave process that created its
-   session. Preserve the load balancer's existing cookie affinity as the
-   default for released V1 clients. Add a [custom load-balancing
+3. Keep each V2 session's normal traffic on the enclave process that created
+   it. A single origin or stable [DNS-only
+   persistence](https://developers.cloudflare.com/load-balancing/additional-options/dns-persistence/)
+   can meet this requirement; HTTP-header affinity does not apply in DNS-only
+   mode. Verify the actual topology and persistence rather than inferring it
+   from a hostname. For a proxied HTTP deployment whose multiple origins rely
+   on cookie affinity, preserve the existing cookie policy for V1 and add a
+   [custom load-balancing
    rule](https://developers.cloudflare.com/load-balancing/additional-options/load-balancing-rules/)
    matching `starts_with(http.request.uri.path, "/v2/")` that overrides only
    those requests to [HTTP-header session
@@ -610,9 +657,10 @@ Before enabling V2 clients in production:
    clients, while cookie affinity alone is insufficient for V2 because V2
    deliberately omits credentials and rejects outer cookies. Header affinity
    also cannot use Cloudflare's sticky zero-downtime failover; an origin loss
-   therefore requires a fresh attestation and session, followed by an
-   encrypted resumption request. The same affinity constraint covers an OAuth
-   callback because pending OAuth state is also process-local.
+   therefore requires a fresh attestation and session. Only the marked outer
+   `400` recovery cases permit one automatic resend; network failure alone
+   does not. Session-bound OAuth callbacks and prepared native handoffs must
+   restart because their state cannot move to the replacement session.
 4. Configure ingress to pass `application/octet-stream` bodies byte-for-byte,
    permit at least 52,559,908 bytes if the full logical body limit is supported,
    accept ordinary HTTP transfer framing, and stream responses without

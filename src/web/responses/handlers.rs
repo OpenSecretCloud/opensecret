@@ -5908,6 +5908,18 @@ where
         .into_response()
 }
 
+// Test-only seam for checking that the real Responses SSE carrier preserves
+// an application-body failure for the Transport V2 gateway to authenticate.
+#[cfg(test)]
+pub(crate) fn responses_sse_body_failure_for_test() -> Response {
+    responses_sse_response(futures::stream::iter([
+        Ok(Event::default()
+            .event("response.created")
+            .data(r#"{"type":"response.created"}"#)),
+        Err(ApiError::InternalServerError),
+    ]))
+}
+
 /// Helper to create encrypted SSE event
 pub async fn encrypt_event(
     state: &AppState,

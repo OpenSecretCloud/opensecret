@@ -19,8 +19,9 @@ jobs:
     # Custom runner required: ARM64 architecture needed for AWS Nitro Enclaves
     # 4 cores needed for efficient builds and PCR verification
     runs-on: ubuntu-22.04-arm64-4core
+    # This job executes pull-request code. Keep it outside the authenticated
+    # FlakeHub/OIDC trust boundary while retaining PR-scoped GitHub caching.
     permissions:
-      id-token: write
       contents: read
     steps:
       - name: Check out repository
@@ -34,8 +35,11 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@bafaa638b9d5ec0e7e3ac1a7fc80453ef1fd265f # v3
       
-      - name: Enable FlakeHub Cache
-        uses: DeterminateSystems/flakehub-cache-action@1f9a51a2959d3e26c7838c6f3bf9f48acae525ea # v3
+      - name: Enable PR-scoped Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@3c034b51a9deec0a09ef1df8b436ac5db50fae94
+        with:
+          use-flakehub: disabled
+          use-gha-cache: enabled
 
       - name: Check flake.lock health
         uses: DeterminateSystems/flake-checker-action@0af51e37404acfb298f7e2eec77470be27eb57c5 # v10

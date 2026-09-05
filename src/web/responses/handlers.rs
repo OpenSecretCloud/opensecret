@@ -5176,14 +5176,16 @@ async fn create_response_stream(
         );
         return Err(ApiError::Unauthorized);
     }
+    let routing =
+        InferenceRoutingContext::new(model_plan, state.inference_routing_mode(user.uuid).await);
     let alias_targets = if model_alias_requires_flag_lookup(&requested_model) {
-        state.model_alias_targets(user.uuid, model_plan).await
+        state
+            .model_alias_targets(user.uuid, model_plan, routing.mode())
+            .await
     } else {
         ModelAliasTargets::for_plan(model_plan)
     };
     let selected_model = alias_targets.resolve(&requested_model).to_string();
-    let routing =
-        InferenceRoutingContext::new(model_plan, state.inference_routing_mode(user.uuid).await);
     let completion_provider = state.proxy_router.get_completion_proxy();
     let resolved_model = resolve_responses_model(
         &selected_model,

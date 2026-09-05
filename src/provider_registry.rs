@@ -1,15 +1,16 @@
 //! Credential-free provider topology for completion routing.
 //!
 //! This registry is intentionally independent from executable credentials.
-//! Stack 3 introduced it in shadow mode; Stack 6 consumes it for the explicit
-//! GLM same-model provider canary while other active routes remain unchanged.
+//! Router v2 consumes its route eligibility and weights for every completion
+//! model. Legacy feature flags and default-provider preferences stay in the
+//! separate Router v1 configuration.
 
 use crate::model_config::{
     DEEPSEEK_V4_FLASH_MODEL_ID, GLM_5_2_MODEL_ID, GLM_5_3_FLASH_MODEL_ID, GLM_5_3_MODEL_ID,
     KIMI_K2_6_MODEL_ID, KIMI_K3_MODEL_ID, QUICK_MODEL_ID,
 };
 
-pub(crate) const SHADOW_ROUTING_POLICY_VERSION: &str = "routing-v2-shadow-v1";
+pub(crate) const SHADOW_ROUTING_POLICY_VERSION: &str = "routing-v2-weighted-v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ProviderId {
@@ -67,7 +68,6 @@ pub(crate) struct ModelRouteSpec {
 pub(crate) struct CompletionModelSpec {
     pub(crate) public_model_id: &'static str,
     pub(crate) routes: &'static [ModelRouteSpec],
-    pub(crate) default_provider: Option<ProviderId>,
 }
 
 #[derive(Debug)]
@@ -213,52 +213,42 @@ const COMPLETION_MODELS: &[CompletionModelSpec] = &[
     CompletionModelSpec {
         public_model_id: QUICK_MODEL_ID,
         routes: GPT_OSS_120B_ROUTES,
-        default_provider: None,
     },
     CompletionModelSpec {
         public_model_id: "gemma4-31b",
         routes: GEMMA4_31B_ROUTES,
-        default_provider: None,
     },
     CompletionModelSpec {
         public_model_id: KIMI_K3_MODEL_ID,
         routes: KIMI_K3_ROUTES,
-        default_provider: None,
     },
     CompletionModelSpec {
         public_model_id: KIMI_K2_6_MODEL_ID,
         routes: KIMI_K2_6_ROUTES,
-        default_provider: Some(ProviderId::Continuum),
     },
     CompletionModelSpec {
         public_model_id: GLM_5_2_MODEL_ID,
         routes: GLM_5_2_ROUTES,
-        default_provider: Some(ProviderId::Tinfoil),
     },
     CompletionModelSpec {
         public_model_id: GLM_5_3_MODEL_ID,
         routes: GLM_5_3_ROUTES,
-        default_provider: Some(ProviderId::Continuum),
     },
     CompletionModelSpec {
         public_model_id: GLM_5_3_FLASH_MODEL_ID,
         routes: GLM_5_3_FLASH_ROUTES,
-        default_provider: None,
     },
     CompletionModelSpec {
         public_model_id: DEEPSEEK_V4_FLASH_MODEL_ID,
         routes: DEEPSEEK_V4_FLASH_ROUTES,
-        default_provider: None,
     },
     CompletionModelSpec {
         public_model_id: "llama3-3-70b",
         routes: LLAMA3_3_70B_ROUTES,
-        default_provider: None,
     },
     CompletionModelSpec {
         public_model_id: "gpt-oss-safeguard-120b",
         routes: GPT_OSS_SAFEGUARD_120B_ROUTES,
-        default_provider: None,
     },
 ];
 
@@ -305,13 +295,6 @@ mod tests {
                 assert!(!route.provider_model_id.trim().is_empty());
                 assert!(!route.response_model_id.trim().is_empty());
                 assert_eq!(route.response_model_id, model.public_model_id);
-            }
-
-            if let Some(default_provider) = model.default_provider {
-                assert!(model
-                    .routes
-                    .iter()
-                    .any(|route| route.provider == default_provider));
             }
         }
 

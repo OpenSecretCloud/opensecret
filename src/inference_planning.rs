@@ -1,15 +1,16 @@
 //! Deterministic, credential-free completion route planning.
 //!
 //! The plan describes route identity and ordered same-model candidates without
-//! naming or invoking an executable endpoint. It remains the baseline shadow
-//! planner for every model and is also reused by Stack 6 after GLM's active
-//! canary has filtered its configured providers through one health snapshot.
+//! naming or invoking an executable endpoint. Router v2 applies the configured
+//! weights after filtering providers through one health snapshot. Legacy
+//! provider flags and default-provider preferences are not planner inputs.
 
 use crate::inference::{InferenceIntent, RouteIdentity};
 use crate::provider_registry::{
     ProviderId, ProviderRegistry, RouteSelectionSource, SHADOW_ROUTING_POLICY_VERSION,
 };
 
+/// Router v1 preference, deliberately absent from Router v2 planning inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProviderPreference {
     provider: ProviderId,
@@ -82,7 +83,6 @@ impl ConfiguredProviders {
 pub(crate) struct RoutePlanningInput<'a> {
     pub(crate) intent: &'a InferenceIntent,
     pub(crate) configured_providers: ConfiguredProviders,
-    pub(crate) provider_preference: Option<ProviderPreference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,10 +98,6 @@ pub(crate) struct RouteCandidate {
 pub(crate) enum PlanDecision {
     FixedRoute,
     StaticBucket,
-    DefaultProvider,
-    FeatureFlagPreference,
-    PreferredProviderUnavailable,
-    DefaultProviderUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,62 +167,32 @@ pub(crate) fn plan_completion_route(
         ));
     }
 
-    if let Some(preference) = input.provider_preference {
-        if let Some(route) = eligible_routes
-            .iter()
-            .find(|route| route.candidate.provider == preference.provider())
-        {
-            return Ok(build_plan(
-                route,
-                &eligible_routes,
-                preference.source(),
-                None,
-                PlanDecision::FeatureFlagPreference,
-            ));
-        }
-    }
-
-    if let Some(default_provider) = model.default_provider {
-        if let Some(route) = eligible_routes
-            .iter()
-            .find(|route| route.candidate.provider == default_provider)
-        {
-            let (source, decision) = if input.provider_preference.is_some() {
-                (
-                    RouteSelectionSource::Fallback,
-                    PlanDecision::PreferredProviderUnavailable,
-                )
-            } else {
-                (
-                    RouteSelectionSource::DefaultProvider,
-                    PlanDecision::DefaultProvider,
-                )
-            };
-            return Ok(build_plan(route, &eligible_routes, source, None, decision));
-        }
-    }
-
-    let fallback_source = if input.provider_preference.is_some() || model.default_provider.is_some()
-    {
+    // Report fallback when a configured route is unavailable, without turning
+    // a legacy default or feature flag into a preferred Router v2 provider.
+    let enabled_route_count = model
+        .routes
+        .iter()
+        .filter(|route| {
+            route.enabled
+                && route.weight > 0
+                && registry
+                    .provider(route.provider)
+                    .is_some_and(|provider| provider.enabled && provider.weight > 0)
+        })
+        .count();
+    let selection_source = if eligible_routes.len() < enabled_route_count {
         RouteSelectionSource::Fallback
     } else {
         RouteSelectionSource::StaticSplit
-    };
-    let missing_preference_decision = if input.provider_preference.is_some() {
-        Some(PlanDecision::PreferredProviderUnavailable)
-    } else if model.default_provider.is_some() {
-        Some(PlanDecision::DefaultProviderUnavailable)
-    } else {
-        None
     };
 
     if eligible_routes.len() == 1 {
         return Ok(build_plan(
             &eligible_routes[0],
             &eligible_routes,
-            fallback_source,
+            selection_source,
             None,
-            missing_preference_decision.unwrap_or(PlanDecision::FixedRoute),
+            PlanDecision::FixedRoute,
         ));
     }
 
@@ -236,9 +202,9 @@ pub(crate) fn plan_completion_route(
     Ok(build_plan(
         selected,
         &eligible_routes,
-        fallback_source,
+        selection_source,
         Some(bucket),
-        missing_preference_decision.unwrap_or(PlanDecision::StaticBucket),
+        PlanDecision::StaticBucket,
     ))
 }
 
@@ -327,7 +293,6 @@ mod tests {
             RoutePlanningInput {
                 intent: &intent,
                 configured_providers: ConfiguredProviders::all(),
-                provider_preference: None,
             },
         )
         .expect("shadow route");
@@ -337,18 +302,17 @@ mod tests {
         assert_eq!(plan.selected.provider_model_id, GLM_5_2_MODEL_ID);
         assert_eq!(plan.selected.provider, ProviderId::Tinfoil);
         assert_eq!(plan.selected.bucket, None);
-        assert_eq!(plan.decision, PlanDecision::DefaultProvider);
+        assert_eq!(plan.decision, PlanDecision::FixedRoute);
     }
 
     #[test]
-    fn alias_resolved_glm_5_3_honors_the_tinfoil_provider_preference() {
+    fn alias_resolved_glm_5_3_uses_weighted_provider_selection() {
         let intent = intent(AUTO_POWERFUL_MODEL_ID, GLM_5_3_MODEL_ID);
         let plan = plan_completion_route(
             &PROVIDER_REGISTRY,
             RoutePlanningInput {
                 intent: &intent,
                 configured_providers: ConfiguredProviders::all(),
-                provider_preference: Some(ProviderPreference::feature_flag(ProviderId::Tinfoil)),
             },
         )
         .expect("GLM 5.3 Tinfoil plan");
@@ -357,6 +321,12 @@ mod tests {
         assert_eq!(intent.public_model_id, GLM_5_3_MODEL_ID);
         assert_eq!(plan.selected.provider, ProviderId::Tinfoil);
         assert_eq!(plan.selected.provider_model_id, GLM_5_3_MODEL_ID);
+        assert_eq!(plan.selected.bucket, Some(73));
+        assert_eq!(
+            plan.selected.selection_source,
+            RouteSelectionSource::StaticSplit
+        );
+        assert_eq!(plan.decision, PlanDecision::StaticBucket);
         assert_eq!(plan.eligible_routes.len(), 2);
         assert!(plan
             .eligible_routes
@@ -370,7 +340,6 @@ mod tests {
         let input = RoutePlanningInput {
             intent: &intent,
             configured_providers: ConfiguredProviders::all(),
-            provider_preference: Some(ProviderPreference::feature_flag(ProviderId::Continuum)),
         };
 
         let first = plan_completion_route(&PROVIDER_REGISTRY, input).expect("first plan");
@@ -395,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_preference_falls_back_without_authorizing_another_model() {
+    fn unavailable_provider_falls_back_without_authorizing_another_model() {
         let intent = intent(GLM_5_3_MODEL_ID, GLM_5_3_MODEL_ID);
         let configured = ConfiguredProviders::none().with_provider(ProviderId::Tinfoil);
         let plan = plan_completion_route(
@@ -403,7 +372,6 @@ mod tests {
             RoutePlanningInput {
                 intent: &intent,
                 configured_providers: configured,
-                provider_preference: Some(ProviderPreference::feature_flag(ProviderId::Continuum)),
             },
         )
         .expect("Tinfoil fallback plan");
@@ -414,7 +382,7 @@ mod tests {
             plan.selected.selection_source,
             RouteSelectionSource::Fallback
         );
-        assert_eq!(plan.decision, PlanDecision::PreferredProviderUnavailable);
+        assert_eq!(plan.decision, PlanDecision::FixedRoute);
         assert_eq!(plan.eligible_routes.len(), 1);
     }
 
@@ -426,7 +394,6 @@ mod tests {
             RoutePlanningInput {
                 intent: &intent,
                 configured_providers: ConfiguredProviders::all(),
-                provider_preference: None,
             },
         )
         .expect("Flash route");
@@ -450,7 +417,6 @@ mod tests {
                 RoutePlanningInput {
                     intent: &unknown,
                     configured_providers: ConfiguredProviders::all(),
-                    provider_preference: None,
                 },
             ),
             Err(RoutePlanningError::UnsupportedModel(
@@ -466,7 +432,6 @@ mod tests {
                 RoutePlanningInput {
                     intent: &kimi,
                     configured_providers: tinfoil_only,
-                    provider_preference: None,
                 },
             ),
             Err(RoutePlanningError::NoEligibleRoute("kimi-k2-6".to_string()))

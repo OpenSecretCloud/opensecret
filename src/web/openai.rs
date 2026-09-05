@@ -4,7 +4,7 @@ use crate::inference::{
     CompletionEvidence, InferenceAttempt, InferenceExecution, InferenceIntent, InferenceSurface,
     ReplaySafety, WorkloadClass,
 };
-use crate::inference_planning::{ProviderPreference, RoutePlan, RoutePlanningError};
+use crate::inference_planning::{RoutePlan, RoutePlanningError};
 use crate::model_config::{
     model_alias_requires_flag_lookup, model_catalog_response, openai_models_response,
     ModelAliasTargets, ModelPlan,
@@ -822,7 +822,6 @@ pub(crate) struct PinnedCompletionRequest {
     /// until the first provider turn atomically claims any half-open gates.
     route: SelectedProviderRoute,
     routing_mode: InferenceRoutingMode,
-    provider_preference: Option<ProviderPreference>,
     finalized_route: Arc<OnceLock<SelectedProviderRoute>>,
 }
 
@@ -830,14 +829,12 @@ impl PinnedCompletionRequest {
     fn new(
         intent: InferenceIntent,
         route: SelectedProviderRoute,
-        provider_preference: Option<ProviderPreference>,
         routing_mode: InferenceRoutingMode,
     ) -> Self {
         Self {
             intent,
             route,
             routing_mode,
-            provider_preference,
             finalized_route: Arc::new(OnceLock::new()),
         }
     }
@@ -1605,8 +1602,12 @@ async fn proxy_openai(
         })?
         .to_string();
 
+    let routing =
+        InferenceRoutingContext::new(model_plan, state.inference_routing_mode(user.uuid).await);
     let alias_targets = if model_alias_requires_flag_lookup(&requested_model_name) {
-        state.model_alias_targets(user.uuid, model_plan).await
+        state
+            .model_alias_targets(user.uuid, model_plan, routing.mode())
+            .await
     } else {
         ModelAliasTargets::for_plan(model_plan)
     };
@@ -1619,8 +1620,6 @@ async fn proxy_openai(
         InferenceSurface::ChatCompletions,
         WorkloadClass::Interactive,
     );
-    let routing =
-        InferenceRoutingContext::new(model_plan, state.inference_routing_mode(user.uuid).await);
     let pinned_completion = prepare_completion_request(&state, &user, intent, routing).await?;
     if requested_model_name != model_name {
         debug!(
@@ -1844,11 +1843,9 @@ fn select_prepared_completion_route(
     provider_router: &ProviderRouter,
     proxy_router: &ProxyRouter,
     intent: &InferenceIntent,
-    provider_preference: Option<crate::inference_planning::ProviderPreference>,
     baseline_plan: Result<RoutePlan, RoutePlanningError>,
 ) -> Result<SelectedProviderRoute, ApiError> {
-    let active =
-        provider_router.select_active_completion_route(proxy_router, intent, provider_preference);
+    let active = provider_router.select_active_completion_route(proxy_router, intent);
     retain_active_route_after_shadow_observation(intent, active, baseline_plan)
         .map_err(provider_routing_api_error)
 }
@@ -1869,25 +1866,25 @@ pub(crate) async fn prepare_completion_request(
     }
 
     ensure_completion_model_access(&intent.public_model_id, intent.model_plan)?;
-    let provider_preference = state
-        .provider_routing_preference(user.uuid, &intent.public_model_id)
-        .await;
     let route = match routing.mode() {
-        InferenceRoutingMode::Legacy => state
-            .provider_router
-            .select_completion_route_for_mode(
-                &state.proxy_router,
-                &intent,
-                provider_preference,
-                InferenceRoutingMode::Legacy,
-            )
-            .map_err(provider_routing_api_error)?,
+        InferenceRoutingMode::Legacy => {
+            let provider_preference = state
+                .provider_routing_preference(user.uuid, &intent.public_model_id)
+                .await;
+            state
+                .provider_router
+                .select_completion_route_for_mode(
+                    &state.proxy_router,
+                    &intent,
+                    provider_preference,
+                    InferenceRoutingMode::Legacy,
+                )
+                .map_err(provider_routing_api_error)?
+        }
         InferenceRoutingMode::V2 => {
-            let shadow = state.provider_router.shadow_completion_plan(
-                &state.proxy_router,
-                &intent,
-                provider_preference,
-            );
+            let shadow = state
+                .provider_router
+                .shadow_completion_plan(&state.proxy_router, &intent);
             if let Ok(plan) = &shadow {
                 let candidate_health = plan
                     .eligible_routes
@@ -1916,7 +1913,6 @@ pub(crate) async fn prepare_completion_request(
                 &state.provider_router,
                 &state.proxy_router,
                 &intent,
-                provider_preference,
                 shadow,
             )?
         }
@@ -1938,12 +1934,7 @@ pub(crate) async fn prepare_completion_request(
         route.selection_source
     );
 
-    Ok(PinnedCompletionRequest::new(
-        intent,
-        route,
-        provider_preference,
-        routing.mode(),
-    ))
+    Ok(PinnedCompletionRequest::new(intent, route, routing.mode()))
 }
 
 fn probe_api_error(retry_after: Duration) -> ApiError {
@@ -1964,12 +1955,7 @@ fn replan_completion_route_excluding(
 ) -> Result<SelectedProviderRoute, ApiError> {
     loop {
         let route = provider_router
-            .select_active_completion_route_excluding(
-                proxy_router,
-                &pinned.intent,
-                pinned.provider_preference,
-                excluded_routes,
-            )
+            .select_active_completion_route_excluding(proxy_router, &pinned.intent, excluded_routes)
             .map_err(provider_routing_api_error)?;
 
         // Auto model selection is finalized during request preparation, before
@@ -3222,7 +3208,10 @@ async fn proxy_model_catalog(
     let model_plan = ModelPlan::from_is_paid(
         billing_access.is_some_and(crate::billing::ChatBillingAccess::is_paid),
     );
-    let alias_targets = state.model_alias_targets(user.uuid, model_plan).await;
+    let routing_mode = state.inference_routing_mode(user.uuid).await;
+    let alias_targets = state
+        .model_alias_targets(user.uuid, model_plan, routing_mode)
+        .await;
     let catalog_response = model_catalog_response(alias_targets);
     encrypt_response(&state, &session_id, &catalog_response).await
 }
@@ -4223,7 +4212,6 @@ mod tests {
                 bucket: None,
                 selection_source: crate::provider_registry::RouteSelectionSource::DefaultProvider,
             },
-            None,
             InferenceRoutingMode::V2,
         )
     }
@@ -4280,10 +4268,10 @@ mod tests {
             WorkloadClass::Interactive,
         );
         let route = provider_router
-            .select_active_completion_route(proxy_router, &intent, None)
+            .select_active_completion_route(proxy_router, &intent)
             .expect("initial GLM 5.3 route");
         assert_eq!(route.provider, ProviderId::Continuum);
-        PinnedCompletionRequest::new(intent, route, None, InferenceRoutingMode::V2)
+        PinnedCompletionRequest::new(intent, route, InferenceRoutingMode::V2)
     }
 
     fn open_and_claim_probe_at_boundary(
@@ -4334,7 +4322,6 @@ mod tests {
         let pinned = PinnedCompletionRequest::new(
             intent.clone(),
             route.clone(),
-            None,
             InferenceRoutingMode::Legacy,
         );
         let winning_probe = open_and_claim_probe_at_boundary(&provider_router, &intent, &route);
@@ -4361,15 +4348,11 @@ mod tests {
             WorkloadClass::Interactive,
         );
         let route = provider_router
-            .select_active_completion_route(&proxy_router, &intent, None)
+            .select_active_completion_route(&proxy_router, &intent)
             .expect("initial GLM route");
         assert_eq!(route.provider, ProviderId::Continuum);
-        let pinned = PinnedCompletionRequest::new(
-            intent.clone(),
-            route.clone(),
-            None,
-            InferenceRoutingMode::V2,
-        );
+        let pinned =
+            PinnedCompletionRequest::new(intent.clone(), route.clone(), InferenceRoutingMode::V2);
         let winning_probe = open_and_claim_probe_at_boundary(&provider_router, &intent, &route);
 
         let claimed = claim_completion_turn(&provider_router, &proxy_router, &pinned, true)
@@ -4399,14 +4382,10 @@ mod tests {
             WorkloadClass::Interactive,
         );
         let route = provider_router
-            .select_active_completion_route(&proxy_router, &intent, None)
+            .select_active_completion_route(&proxy_router, &intent)
             .expect("initial K3 route");
-        let pinned = PinnedCompletionRequest::new(
-            intent.clone(),
-            route.clone(),
-            None,
-            InferenceRoutingMode::V2,
-        );
+        let pinned =
+            PinnedCompletionRequest::new(intent.clone(), route.clone(), InferenceRoutingMode::V2);
         let winning_probe = open_and_claim_probe_at_boundary(&provider_router, &intent, &route);
 
         let error = claim_completion_turn(&provider_router, &proxy_router, &pinned, true)
@@ -4426,7 +4405,7 @@ mod tests {
         let winning_probe =
             open_and_claim_probe_at_boundary(&provider_router, pinned.intent(), &route);
         let alternate = provider_router
-            .select_active_completion_route(&proxy_router, pinned.intent(), None)
+            .select_active_completion_route(&proxy_router, pinned.intent())
             .expect("same-model alternate remains eligible");
         assert_eq!(alternate.provider, ProviderId::Tinfoil);
 
@@ -4451,7 +4430,7 @@ mod tests {
             WorkloadClass::Interactive,
         );
         let route = provider_router
-            .select_active_completion_route(&proxy_router, &intent, None)
+            .select_active_completion_route(&proxy_router, &intent)
             .expect("initial K3 route");
         let probe = open_and_claim_probe_at_boundary(&provider_router, &intent, &route);
         let attempt = intent.begin_execution().begin_attempt(route.identity());
@@ -4490,7 +4469,7 @@ mod tests {
         let _external_probe =
             open_and_claim_probe_at_boundary(&provider_router, pinned.intent(), &route);
         let alternate = provider_router
-            .select_active_completion_route(&proxy_router, pinned.intent(), None)
+            .select_active_completion_route(&proxy_router, pinned.intent())
             .expect("same-model alternate remains eligible");
         assert_eq!(alternate.provider, ProviderId::Tinfoil);
         let error = claim_completion_turn(&provider_router, &proxy_router, &pinned, true)
@@ -4833,12 +4812,11 @@ mod tests {
             WorkloadClass::Interactive,
         );
 
-        let first_baseline = provider_router.shadow_completion_plan(&proxy_router, &intent, None);
+        let first_baseline = provider_router.shadow_completion_plan(&proxy_router, &intent);
         let first_route = select_prepared_completion_route(
             &provider_router,
             &proxy_router,
             &intent,
-            None,
             first_baseline,
         )
         .expect("initial GLM route");
@@ -4881,13 +4859,11 @@ mod tests {
             WorkloadClass::Interactive,
         );
         assert_ne!(second_intent.request_id, intent.request_id);
-        let second_baseline =
-            provider_router.shadow_completion_plan(&proxy_router, &second_intent, None);
+        let second_baseline = provider_router.shadow_completion_plan(&proxy_router, &second_intent);
         let second_route = select_prepared_completion_route(
             &provider_router,
             &proxy_router,
             &second_intent,
-            None,
             second_baseline,
         )
         .expect("next request uses Tinfoil GLM");
@@ -4996,16 +4972,11 @@ mod tests {
             InferenceSurface::Responses,
             WorkloadClass::Interactive,
         );
-        let baseline = provider_router.shadow_completion_plan(&proxy_router, &intent, None);
-        let route = select_prepared_completion_route(
-            &provider_router,
-            &proxy_router,
-            &intent,
-            None,
-            baseline,
-        )
-        .expect("initial GLM route");
-        let pinned = PinnedCompletionRequest::new(intent, route, None, InferenceRoutingMode::V2);
+        let baseline = provider_router.shadow_completion_plan(&proxy_router, &intent);
+        let route =
+            select_prepared_completion_route(&provider_router, &proxy_router, &intent, baseline)
+                .expect("initial GLM route");
+        let pinned = PinnedCompletionRequest::new(intent, route, InferenceRoutingMode::V2);
         let provider_router_ref = &provider_router;
         let proxy_router_ref = &proxy_router;
 
@@ -5086,13 +5057,11 @@ mod tests {
             InferenceSurface::Responses,
             WorkloadClass::Interactive,
         );
-        let next_baseline =
-            provider_router.shadow_completion_plan(&proxy_router, &next_intent, None);
+        let next_baseline = provider_router.shadow_completion_plan(&proxy_router, &next_intent);
         let next_route = select_prepared_completion_route(
             &provider_router,
             &proxy_router,
             &next_intent,
-            None,
             next_baseline,
         )
         .expect("next logical request switches providers");
@@ -5286,13 +5255,11 @@ mod tests {
             )
         };
         let first_intent = new_intent();
-        let first_baseline =
-            provider_router.shadow_completion_plan(&proxy_router, &first_intent, None);
+        let first_baseline = provider_router.shadow_completion_plan(&proxy_router, &first_intent);
         let first_route = select_prepared_completion_route(
             &provider_router,
             &proxy_router,
             &first_intent,
-            None,
             first_baseline,
         )
         .expect("initial Continuum GLM route");
@@ -5313,13 +5280,11 @@ mod tests {
         );
 
         let second_intent = new_intent();
-        let second_baseline =
-            provider_router.shadow_completion_plan(&proxy_router, &second_intent, None);
+        let second_baseline = provider_router.shadow_completion_plan(&proxy_router, &second_intent);
         let second_route = select_prepared_completion_route(
             &provider_router,
             &proxy_router,
             &second_intent,
-            None,
             second_baseline,
         )
         .expect("Tinfoil GLM route while Continuum is open");
@@ -5340,13 +5305,11 @@ mod tests {
         );
 
         let third_intent = new_intent();
-        let third_baseline =
-            provider_router.shadow_completion_plan(&proxy_router, &third_intent, None);
+        let third_baseline = provider_router.shadow_completion_plan(&proxy_router, &third_intent);
         let error = select_prepared_completion_route(
             &provider_router,
             &proxy_router,
             &third_intent,
-            None,
             third_baseline,
         )
         .expect_err("both GLM routes are open");
@@ -5829,7 +5792,7 @@ mod tests {
                 Some(73),
             ),
             eligible_routes: Vec::new(),
-            decision: PlanDecision::PreferredProviderUnavailable,
+            decision: PlanDecision::FixedRoute,
             candidate_scope: CandidateScope::SamePublicModelOnly,
             policy_version: SHADOW_ROUTING_POLICY_VERSION,
         };

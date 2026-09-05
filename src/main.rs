@@ -1404,14 +1404,18 @@ impl AppState {
         }
     }
 
-    /// Resolve automatic model aliases for this user's plan. Paid overrides
-    /// default off on missing configuration, a missing flag, service failure,
-    /// or timeout. Free plans never apply paid alias overrides.
+    /// Resolve automatic aliases under the request's router policy. Router v2
+    /// uses fixed aliases without consulting legacy selector flags. Legacy paid
+    /// overrides default off on missing configuration, failure, or timeout.
     pub(crate) async fn model_alias_targets(
         &self,
         user_uuid: Uuid,
         model_plan: ModelPlan,
+        routing_mode: InferenceRoutingMode,
     ) -> ModelAliasTargets {
+        if routing_mode == InferenceRoutingMode::V2 {
+            return ModelAliasTargets::for_router_v2(model_plan);
+        }
         if !model_plan.is_paid() {
             return ModelAliasTargets::for_plan(model_plan);
         }

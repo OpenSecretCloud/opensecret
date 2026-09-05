@@ -402,6 +402,15 @@ impl ModelAliasTargets {
         }
     }
 
+    /// Router v2 uses fixed alias policy rather than legacy model-selector flags.
+    /// Resolving an alias does not grant access to its target model.
+    pub(crate) const fn for_router_v2(plan: ModelPlan) -> Self {
+        Self {
+            powerful: GLM_5_3_MODEL_ID,
+            ..Self::for_plan(plan)
+        }
+    }
+
     pub(crate) const fn for_plan_with_overrides(
         plan: ModelPlan,
         overrides: PaidModelAliasOverrides,
@@ -1094,6 +1103,82 @@ mod tests {
         );
         assert_eq!(paid.resolve(AUTO_POWERFUL_MODEL_ID), GLM_5_2_MODEL_ID);
         assert_eq!(paid.resolve(KIMI_K3_MODEL_ID), KIMI_K3_MODEL_ID);
+    }
+
+    #[test]
+    fn test_router_v2_auto_targets_use_glm_5_3_and_preserve_plan_specific_quick() {
+        for (plan, expected_quick) in [
+            (ModelPlan::Free, QUICK_MODEL_ID),
+            (ModelPlan::Paid, DEEPSEEK_V4_FLASH_MODEL_ID),
+        ] {
+            let targets = ModelAliasTargets::for_router_v2(plan);
+            assert_eq!(targets.resolve(AUTO_QUICK_MODEL_ID), expected_quick);
+            assert_eq!(targets.resolve(AUTO_POWERFUL_MODEL_ID), GLM_5_3_MODEL_ID);
+            assert_eq!(
+                resolve_public_model_id(targets.resolve(AUTO_POWERFUL_MODEL_ID)),
+                Some(GLM_5_3_MODEL_ID)
+            );
+            assert_eq!(
+                model_context_window(targets.resolve(AUTO_POWERFUL_MODEL_ID)),
+                model_context_window(GLM_5_3_MODEL_ID)
+            );
+        }
+    }
+
+    #[test]
+    fn test_router_v2_alias_policy_preserves_explicit_model_identities() {
+        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+            let targets = ModelAliasTargets::for_router_v2(plan);
+            for model in enabled_api_completion_model_ids() {
+                assert_eq!(targets.resolve(model), model, "plan={plan:?}");
+                assert_eq!(resolve_public_model_id(targets.resolve(model)), Some(model));
+            }
+            assert_eq!(targets.resolve(GLM_5_2_MODEL_ID), GLM_5_2_MODEL_ID);
+            assert_eq!(
+                resolve_completion_model_id(targets.resolve(GLM_5_2_MODEL_ID)),
+                Some(GLM_5_2_MODEL_ID)
+            );
+            assert_eq!(targets.resolve("unknown-model"), "unknown-model");
+            assert_eq!(
+                resolve_public_model_id(targets.resolve("unknown-model")),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn test_router_v2_catalog_alias_metadata_matches_resolved_models() {
+        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+            let targets = ModelAliasTargets::for_router_v2(plan);
+            let catalog = model_catalog_response(targets);
+            for alias in catalog["aliases"].as_array().expect("aliases") {
+                let selector = alias["id"].as_str().expect("alias ID");
+                let target = targets.resolve(selector);
+                let model = catalog_model(&catalog, target);
+                assert_eq!(alias["target_model"], target);
+                assert_eq!(alias["access"], model["access"]);
+                assert_eq!(alias["capabilities"], model["capabilities"]);
+            }
+            assert_eq!(catalog["defaults"]["quick"], AUTO_QUICK_MODEL_ID);
+            assert_eq!(catalog["defaults"]["powerful"], AUTO_POWERFUL_MODEL_ID);
+            assert!(has_model(&catalog, GLM_5_2_MODEL_ID));
+            assert!(has_model(&catalog, GLM_5_3_MODEL_ID));
+        }
+    }
+
+    #[test]
+    fn test_router_v2_auto_targets_preserve_model_entitlements() {
+        for plan in [ModelPlan::Free, ModelPlan::Paid] {
+            let targets = ModelAliasTargets::for_router_v2(plan);
+            assert!(plan.allows_model(targets.resolve(AUTO_QUICK_MODEL_ID)));
+            assert_eq!(
+                plan.allows_model(targets.resolve(AUTO_POWERFUL_MODEL_ID)),
+                plan.is_paid()
+            );
+            for model in [GLM_5_2_MODEL_ID, GLM_5_3_MODEL_ID] {
+                assert_eq!(plan.allows_model(targets.resolve(model)), plan.is_paid());
+            }
+        }
     }
 
     #[test]

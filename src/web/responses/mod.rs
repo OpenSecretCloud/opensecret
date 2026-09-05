@@ -33,7 +33,7 @@ pub(crate) use execution::{
     ResponseExecution, ResponseExecutionRegistry, ResponseExecutionTaskGuard,
 };
 pub use pagination::Paginator;
-pub use storage::{storage_task, StorageTaskOutcome};
+pub use storage::storage_task;
 // REMOVED: UpstreamStreamProcessor - no longer used with centralized billing architecture
 pub use types::{DeletedObjectResponse, MessageContent, MessageContentPart, NullableField};
 

@@ -1194,6 +1194,8 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            assert!(!response.headers().contains_key(crate::CLIENT_REPLAY_HEADER));
+            assert!(!response.headers().contains_key(header::RETRY_AFTER));
             assert_outer_rejection(response, rejection_status, None);
             assert_eq!(dispatches.load(Ordering::SeqCst), 1);
         }
@@ -1266,6 +1268,175 @@ mod tests {
             .unwrap();
         assert_outer_rejection(response, StatusCode::BAD_REQUEST, None);
         assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn responses_sse_body_failure_is_an_authenticated_transport_error() {
+        let test = test_session(15);
+        let sessions = Arc::new(SessionStore::new(NonZeroUsize::new(2).unwrap()));
+        sessions.insert(Arc::clone(&test.server)).unwrap();
+        let application = Router::new().route(
+            "/v1/responses",
+            any(|| async {
+                crate::web::responses::handlers::responses_sse_body_failure_for_test()
+            }),
+        );
+        let router = request_router(application, sessions);
+        let request_id = RequestId::from_bytes([0xa3; 16]);
+        let response = router
+            .oneshot(outer_request(
+                test.server.id(),
+                &test.routing_key,
+                seal_request(&test.client, request_id, "/v1/responses", None),
+            ))
+            .await
+            .unwrap();
+        let records = decrypt_records(&test.client, request_id, response).await;
+        assert!(matches!(&records[0], ResponseRecord::Start(start)
+            if start.status() == 200
+                && start.headers().iter().any(|header|
+                    header.name() == "content-type" && header.value() == "text/event-stream")));
+
+        let mut body = Vec::new();
+        for record in &records {
+            if let ResponseRecord::Chunk(bytes) = record {
+                body.extend_from_slice(bytes);
+            }
+        }
+        let logical_sse = std::str::from_utf8(&body).unwrap();
+        assert!(logical_sse.contains(r#"{"type":"response.created"}"#));
+        // A carrier failure must not invent a storage-authoritative terminal.
+        assert!(!logical_sse.contains("response.failed"));
+        assert!(!logical_sse.contains("response.completed"));
+        assert!(
+            matches!(records.last(), Some(ResponseRecord::Error { code })
+            if code == "application_body_failed")
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, ResponseRecord::Error { .. }))
+                .count(),
+            1,
+        );
+        assert!(!records
+            .iter()
+            .any(|record| matches!(record, ResponseRecord::End)));
+    }
+
+    #[tokio::test]
+    async fn inference_capacity_metadata_is_authenticated_and_does_not_allow_record_replay() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            for client_replay_safe in [false, true] {
+                let test = test_session(14);
+                let sessions = Arc::new(SessionStore::new(NonZeroUsize::new(2).unwrap()));
+                sessions.insert(Arc::clone(&test.server)).unwrap();
+                let dispatches = Arc::new(AtomicUsize::new(0));
+                let application = Router::new().route(
+                    "/capacity",
+                    any({
+                        let dispatches = Arc::clone(&dispatches);
+                        move || {
+                            let dispatches = Arc::clone(&dispatches);
+                            async move {
+                                dispatches.fetch_add(1, Ordering::SeqCst);
+                                ApiError::InferenceCapacity {
+                                    status,
+                                    retry_after: Some(Duration::from_secs(7)),
+                                    client_replay_safe,
+                                }
+                                .into_response()
+                            }
+                        }
+                    }),
+                );
+                let router = request_router(application, sessions);
+                let request_id = RequestId::from_bytes([0xa1; 16]);
+                let record = seal_request(&test.client, request_id, "/capacity", None);
+                let response = router
+                    .clone()
+                    .oneshot(outer_request(
+                        test.server.id(),
+                        &test.routing_key,
+                        record.clone(),
+                    ))
+                    .await
+                    .unwrap();
+
+                // Application retry instructions are authenticated inner metadata.
+                assert!(!response.headers().contains_key(crate::CLIENT_REPLAY_HEADER));
+                assert!(!response.headers().contains_key(header::RETRY_AFTER));
+                let records = decrypt_records(&test.client, request_id, response).await;
+                let ResponseRecord::Start(start) = &records[0] else {
+                    panic!("capacity response must begin with an authenticated response start");
+                };
+                assert_eq!(start.status(), status.as_u16());
+                let logical_header = |name: &str| {
+                    start
+                        .headers()
+                        .iter()
+                        .find(|header| header.name() == name)
+                        .map(|header| header.value())
+                };
+                assert_eq!(logical_header(crate::ERROR_CONTRACT_HEADER), Some("1"));
+                assert_eq!(
+                    logical_header(crate::ERROR_CODE_HEADER),
+                    Some("inference_capacity")
+                );
+                assert_eq!(logical_header("retry-after"), Some("7"));
+                assert_eq!(
+                    logical_header(crate::CLIENT_REPLAY_HEADER),
+                    client_replay_safe.then_some("safe"),
+                );
+                let mut body = Vec::new();
+                for record in &records {
+                    if let ResponseRecord::Chunk(bytes) = record {
+                        body.extend_from_slice(bytes);
+                    }
+                }
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                    serde_json::json!({
+                        "status": status.as_u16(),
+                        "message": "Inference capacity is temporarily unavailable",
+                    }),
+                );
+                assert!(matches!(records.last(), Some(ResponseRecord::End)));
+                assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+
+                // Even an authenticated safe marker never permits ciphertext replay.
+                let response = router
+                    .clone()
+                    .oneshot(outer_request(test.server.id(), &test.routing_key, record))
+                    .await
+                    .unwrap();
+                assert!(!response.headers().contains_key(crate::CLIENT_REPLAY_HEADER));
+                assert!(!response.headers().contains_key(header::RETRY_AFTER));
+                assert_outer_rejection(response, StatusCode::BAD_REQUEST, None);
+                assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+
+                if client_replay_safe {
+                    // A permitted logical retry must use a fresh transport request ID.
+                    let retry_id = RequestId::from_bytes([0xa2; 16]);
+                    let response = router
+                        .oneshot(outer_request(
+                            test.server.id(),
+                            &test.routing_key,
+                            seal_request(&test.client, retry_id, "/capacity", None),
+                        ))
+                        .await
+                        .unwrap();
+                    let records = decrypt_records(&test.client, retry_id, response).await;
+                    assert!(matches!(&records[0], ResponseRecord::Start(start)
+                        if start.status() == status.as_u16()));
+                    assert!(matches!(records.last(), Some(ResponseRecord::End)));
+                    assert_eq!(dispatches.load(Ordering::SeqCst), 2);
+                }
+            }
+        }
     }
 
     #[tokio::test]

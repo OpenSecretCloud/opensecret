@@ -24,7 +24,11 @@ use crate::{
     },
     private_key::generate_twelve_word_seed,
     seed_wrapping::{password_reset_code_mac, CredentialKind},
-    web::responses::{handlers::StorageMessage, storage_task, StorageTaskOutcome},
+    web::responses::{
+        handlers::{ResponseTerminal, StorageMessage},
+        storage::StorageTaskOutcome,
+        storage_task,
+    },
     AppMode, AppState, AppStateBuilder, Error,
 };
 use chrono::Utc;
@@ -32,7 +36,7 @@ use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
 use password_auth::generate_hash;
 use secp256k1::SecretKey;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
 
 fn test_credential(label: &str) -> &'static str {
@@ -1426,9 +1430,11 @@ async fn db_response_storage_completion_acknowledges_durable_assistant() {
     let user_key = SecretKey::from_slice(&[7u8; 32]).expect("test key should be valid");
     let decryption_key = user_key;
     let (storage_tx, storage_rx) = mpsc::channel(8);
+    let (terminal_tx, mut terminal_rx) = oneshot::channel();
     let storage_handle = tokio::spawn(storage_task(
         storage_rx,
         None,
+        Some(terminal_tx),
         app_state.db.clone(),
         response.id,
         response_uuid,
@@ -1459,16 +1465,18 @@ async fn db_response_storage_completion_acknowledges_durable_assistant() {
         .await
         .expect("queue assistant completion");
     storage_tx
-        .send(StorageMessage::ResponseDone {
+        .send(StorageMessage::Terminal(ResponseTerminal::Completed {
             finish_reason: "stop".to_string(),
-        })
+        }))
         .await
         .expect("queue response completion");
 
-    assert_eq!(
-        storage_handle.await.expect("join storage task"),
-        StorageTaskOutcome::Completed
-    );
+    let terminal = (&mut terminal_rx)
+        .await
+        .expect("terminal sender should finish")
+        .expect("terminal persistence should succeed")
+        .expect("response still exists");
+    assert_eq!(terminal.status(), ResponseStatus::Completed);
     let persisted_response = app_state
         .db
         .get_response_by_uuid_and_user(response_uuid, user.uuid)
@@ -1492,71 +1500,101 @@ async fn db_response_storage_completion_acknowledges_durable_assistant() {
     .expect("assistant ciphertext should decrypt");
     assert_eq!(plaintext, assistant_text.as_bytes());
 
+    assert_eq!(
+        storage_handle.await.expect("join storage task"),
+        StorageTaskOutcome::Completed
+    );
     let _ = app_state.db.delete_user(&user);
 }
 
 #[tokio::test]
 #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]
-async fn db_response_storage_completion_yields_to_committed_cancellation() {
+async fn db_response_storage_terminal_yields_to_committed_authoritative_status() {
     let Some(database_url) = std::env::var("AEAD_TAMPER_TEST_DATABASE_URL").ok() else {
         eprintln!("skipping: AEAD_TAMPER_TEST_DATABASE_URL is not set");
         return;
     };
 
     let app_state = build_local_test_app_state(database_url).await;
-    let project = first_active_project(&app_state);
-    let marker = Uuid::new_v4();
-    let user = create_response_transaction_test_user(
-        &app_state,
-        project.id,
-        marker,
-        "storage-cancellation-race",
-    );
-    let conversation_id = insert_response_transaction_test_conversation(&app_state, user.uuid);
-    let response_uuid = Uuid::new_v4();
-    let response = app_state
-        .db
-        .create_response(response_transaction_test_response(
+    for (persisted_status, requested, expected_outcome) in [
+        (
+            ResponseStatus::Cancelled,
+            ResponseTerminal::Completed {
+                finish_reason: "stop".to_string(),
+            },
+            StorageTaskOutcome::Cancelled,
+        ),
+        (
+            ResponseStatus::Completed,
+            ResponseTerminal::Cancelled,
+            StorageTaskOutcome::Completed,
+        ),
+    ] {
+        let project = first_active_project(&app_state);
+        let marker = Uuid::new_v4();
+        let user = create_response_transaction_test_user(
+            &app_state,
+            project.id,
+            marker,
+            "storage-cancellation-race",
+        );
+        let conversation_id = insert_response_transaction_test_conversation(&app_state, user.uuid);
+        let response_uuid = Uuid::new_v4();
+        let response = app_state
+            .db
+            .create_response(response_transaction_test_response(
+                response_uuid,
+                user.uuid,
+                conversation_id,
+            ))
+            .expect("response should insert");
+        app_state
+            .db
+            .update_response_status_if_current(
+                response.id,
+                ResponseStatus::InProgress,
+                persisted_status,
+                Some(Utc::now()),
+            )
+            .expect("competing terminal should commit");
+        let user_key = SecretKey::from_slice(&[8u8; 32]).expect("test key should be valid");
+        let (storage_tx, storage_rx) = mpsc::channel(2);
+        let (terminal_tx, mut terminal_rx) = oneshot::channel();
+        let storage_handle = tokio::spawn(storage_task(
+            storage_rx,
+            None,
+            Some(terminal_tx),
+            app_state.db.clone(),
+            response.id,
             response_uuid,
-            user.uuid,
+            Utc::now(),
             conversation_id,
-        ))
-        .expect("response should insert");
-    app_state
-        .db
-        .cancel_response(response_uuid, user.uuid)
-        .expect("cancellation should commit before its broadcast");
-    let user_key = SecretKey::from_slice(&[8u8; 32]).expect("test key should be valid");
-    let (storage_tx, storage_rx) = mpsc::channel(2);
-    let storage_handle = tokio::spawn(storage_task(
-        storage_rx,
-        None,
-        app_state.db.clone(),
-        response.id,
-        response_uuid,
-        Utc::now(),
-        conversation_id,
-        user.uuid,
-        user_key,
-    ));
-    storage_tx
-        .send(StorageMessage::ResponseDone {
-            finish_reason: "stop".to_string(),
-        })
-        .await
-        .expect("queue racing response completion");
+            user.uuid,
+            user_key,
+        ));
+        storage_tx
+            .send(StorageMessage::Terminal(requested))
+            .await
+            .expect("queue racing response completion");
 
-    assert_eq!(
-        storage_handle.await.expect("join storage task"),
-        StorageTaskOutcome::Cancelled
-    );
-    let persisted_response = app_state
-        .db
-        .get_response_by_uuid_and_user(response_uuid, user.uuid)
-        .expect("cancelled response should be readable");
-    assert_eq!(persisted_response.status, ResponseStatus::Cancelled);
+        let terminal = (&mut terminal_rx)
+            .await
+            .expect("terminal sender should finish")
+            .expect("terminal persistence should succeed")
+            .expect("response still exists");
+        assert_eq!(terminal.status(), persisted_status);
+        let persisted_response = app_state
+            .db
+            .get_response_by_uuid_and_user(response_uuid, user.uuid)
+            .expect("cancelled response should be readable");
+        assert_eq!(persisted_response.status, persisted_status);
 
-    let _ = app_state.db.delete_user(&user);
+        assert_eq!(
+            storage_handle.await.expect("join storage task"),
+            expected_outcome
+        );
+        let _ = app_state.db.delete_user(&user);
+    }
 }
 
 #[tokio::test]
@@ -1590,9 +1628,11 @@ async fn db_response_storage_write_failure_never_acknowledges_completion() {
     let assistant_item_id = Uuid::new_v4();
     let user_key = SecretKey::from_slice(&[9u8; 32]).expect("test key should be valid");
     let (storage_tx, storage_rx) = mpsc::channel(8);
+    let (terminal_tx, mut terminal_rx) = oneshot::channel();
     let storage_handle = tokio::spawn(storage_task(
         storage_rx,
         None,
+        Some(terminal_tx),
         app_state.db.clone(),
         response.id,
         response_uuid,
@@ -1622,21 +1662,27 @@ async fn db_response_storage_write_failure_never_acknowledges_completion() {
         .await
         .expect("queue assistant completion");
     storage_tx
-        .send(StorageMessage::ResponseDone {
+        .send(StorageMessage::Terminal(ResponseTerminal::Completed {
             finish_reason: "stop".to_string(),
-        })
+        }))
         .await
         .expect("queue response completion");
 
-    assert_eq!(
-        storage_handle.await.expect("join storage task"),
-        StorageTaskOutcome::Failed
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut terminal_rx)
+            .await
+            .is_err(),
+        "failed item persistence must not acknowledge a terminal"
+    );
+    assert!(
+        !storage_handle.is_finished(),
+        "storage must retain ownership while cleanup retries"
     );
     let persisted_response = app_state
         .db
         .get_response_by_uuid_and_user(response_uuid, user.uuid)
-        .expect("failed response should be readable");
-    assert_eq!(persisted_response.status, ResponseStatus::Failed);
+        .expect("unfinished response should be readable");
+    assert_eq!(persisted_response.status, ResponseStatus::InProgress);
     assert!(
         app_state
             .db
@@ -1646,6 +1692,24 @@ async fn db_response_storage_write_failure_never_acknowledges_completion() {
         "failed assistant write must not produce a false durable item"
     );
 
+    // Deleting this disposable row lets the retrying worker establish that no
+    // terminal can be published, without pretending the failed write succeeded.
+    app_state
+        .db
+        .delete_response(response_uuid, user.uuid)
+        .expect("delete test response");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), terminal_rx)
+            .await
+            .expect("storage should notice deletion")
+            .expect("terminal sender")
+            .expect("deletion is authoritative")
+            .is_none()
+    );
+    assert_eq!(
+        storage_handle.await.expect("join storage task"),
+        StorageTaskOutcome::Failed
+    );
     let _ = app_state.db.delete_user(&user);
 }
 

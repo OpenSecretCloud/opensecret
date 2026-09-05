@@ -46,18 +46,18 @@ mod tests {
 
     #[test]
     fn test_model_max_ctx_known_models() {
-        assert_eq!(model_max_ctx("llama3-3-70b"), 128_000);
-        assert_eq!(model_max_ctx("gpt-oss-120b"), 128_000);
-        assert_eq!(model_max_ctx("gpt-oss-safeguard-120b"), 131_000);
-        assert_eq!(model_max_ctx("kimi-k2-6"), 256_000);
-        assert_eq!(model_max_ctx("gemma4-31b"), 256_000);
-        assert_eq!(model_max_ctx("glm-5-2"), 256_000);
-        assert_eq!(model_max_ctx("glm-5-3"), 256_000);
+        assert_eq!(model_max_ctx("llama3-3-70b"), 131_072);
+        assert_eq!(model_max_ctx("gpt-oss-120b"), 131_072);
+        assert_eq!(model_max_ctx("gpt-oss-safeguard-120b"), 131_072);
+        assert_eq!(model_max_ctx("kimi-k2-6"), 262_144);
+        assert_eq!(model_max_ctx("gemma4-31b"), 262_144);
+        assert_eq!(model_max_ctx("glm-5-2"), 393_216);
+        assert_eq!(model_max_ctx("glm-5-3"), 262_144);
         assert_eq!(model_max_ctx("glm-5-3-flash"), 1_048_576);
-        assert_eq!(model_max_ctx("kimi-k3"), 256_000);
-        assert_eq!(model_max_ctx("deepseek-v4-flash"), 800_000);
-        assert_eq!(model_max_ctx("auto:quick"), 128_000);
-        assert_eq!(model_max_ctx("auto:powerful"), 256_000);
+        assert_eq!(model_max_ctx("kimi-k3"), 262_144);
+        assert_eq!(model_max_ctx("deepseek-v4-flash"), 1_048_576);
+        assert_eq!(model_max_ctx("auto:quick"), 131_072);
+        assert_eq!(model_max_ctx("auto:powerful"), 393_216);
     }
 
     #[test]
@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn test_model_max_ctx_prefix_matching() {
-        assert_eq!(model_max_ctx("llama3-3-70b-instruct"), 128_000);
+        assert_eq!(model_max_ctx("llama3-3-70b-instruct"), 131_072);
         assert_eq!(model_max_ctx("unknown-r1-70b-instruct"), 64_000);
     }
 }

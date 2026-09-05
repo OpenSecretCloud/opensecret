@@ -8,7 +8,7 @@ use crate::{
         conversations::ConversationResponse,
         handlers::{
             ContentPart, InputTokenDetails, OutputItem, OutputTokenDetails, ReasoningInfo,
-            ResponseUsage, ResponsesCreateResponse, TextFormat, TextFormatSpec,
+            ResponseError, ResponseUsage, ResponsesCreateResponse, TextFormat, TextFormatSpec,
         },
     },
 };
@@ -121,6 +121,11 @@ impl ResponseBuilder {
     /// * `metadata` - Optional JSON metadata
     pub fn metadata(mut self, metadata: Option<Value>) -> Self {
         self.response.metadata = metadata;
+        self
+    }
+
+    pub fn error(mut self, error: ResponseError) -> Self {
+        self.response.error = Some(error);
         self
     }
 

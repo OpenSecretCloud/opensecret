@@ -78,10 +78,7 @@ fn decrypt_instruction(
 }
 
 pub(crate) fn prompt_token_budget(model: &str) -> usize {
-    let max_ctx = model_max_ctx(model);
-    let response_reserve = 4096usize;
-    let safety = 500usize;
-    max_ctx.saturating_sub(response_reserve + safety)
+    model_max_ctx(model)
 }
 
 /// Return (messages, total_prompt_tokens)
@@ -1003,8 +1000,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_glm_5_2_prompt_budget_reserves_response_and_safety_tokens() {
-        assert_eq!(prompt_token_budget("glm-5-2"), 256_000 - 4096 - 500);
+    fn test_prompt_budget_uses_model_context_window() {
+        assert_eq!(prompt_token_budget("llama3-3-70b"), 131_072);
+        assert_eq!(prompt_token_budget("glm-5-2"), 393_216);
+        assert_eq!(prompt_token_budget("glm-5-3-flash"), 1_048_576);
     }
 
     // Helper to create a ChatMsg
@@ -1231,6 +1230,40 @@ mod tests {
     }
 
     #[test]
+    fn test_full_context_window_preserves_history_and_incoming_reservation() {
+        let incoming_tokens = 2_000;
+        let metadata = vec![
+            context_metadata("user", 1, 1_000),
+            context_metadata("assistant", 2, 389_216),
+            context_metadata("user", 3, 1_000),
+        ];
+        let (needed_ids, did_truncate) =
+            determine_needed_message_ids(&metadata, "glm-5-2", 0, incoming_tokens)
+                .expect("select history within the full context window");
+        assert!(!did_truncate);
+        assert_eq!(
+            needed_ids,
+            vec![
+                ("user".to_string(), 1),
+                ("assistant".to_string(), 2),
+                ("user".to_string(), 3),
+            ]
+        );
+
+        let history = vec![
+            create_chat_msg("user", "First question", Some(1_000)),
+            create_chat_msg("assistant", "Full answer", Some(389_216)),
+            create_chat_msg("user", "Follow-up", Some(1_000)),
+        ];
+        let (messages, history_tokens) =
+            build_prompt_from_chat_messages_with_token_reserve(history, "glm-5-2", incoming_tokens)
+                .expect("build history with room reserved for the incoming message");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["content"], "Full answer");
+        assert_eq!(history_tokens + incoming_tokens, 393_216);
+    }
+
+    #[test]
     fn test_truncation_preserves_first_and_last() {
         // Create many messages that will exceed token limit
         let mut msgs = vec![];
@@ -1244,7 +1277,7 @@ mod tests {
         ));
 
         // Many middle messages (each with high token count to trigger truncation)
-        // We need to exceed 59,404 token budget
+        // We need to exceed the 64,000-token model context window.
         for i in 0..35 {
             msgs.push(create_chat_msg(
                 "user",
@@ -1349,7 +1382,7 @@ mod tests {
         }
 
         // Total tokens should be within budget
-        let budget = 64_000 - 4096 - 500; // max - response_reserve - safety
+        let budget = 64_000;
         assert!(total_tokens <= budget);
     }
 
@@ -1358,10 +1391,10 @@ mod tests {
         // Force truncation with a system message at the start
         let msgs = vec![
             create_chat_msg("system", "You are a helpful assistant", Some(10)),
-            create_chat_msg("user", "First", Some(20000)),
-            create_chat_msg("assistant", "First reply", Some(20000)),
-            create_chat_msg("user", "Second", Some(20000)),
-            create_chat_msg("assistant", "Second reply", Some(20000)),
+            create_chat_msg("user", "First", Some(25000)),
+            create_chat_msg("assistant", "First reply", Some(25000)),
+            create_chat_msg("user", "Second", Some(25000)),
+            create_chat_msg("assistant", "Second reply", Some(25000)),
             create_chat_msg("user", "New message", Some(5)),
         ];
 
@@ -1458,7 +1491,7 @@ mod tests {
             ),
             create_chat_msg("user", "First", Some(20_000)),
             create_chat_msg("assistant", "First reply", Some(20_000)),
-            create_chat_msg("user", "Oversized current image context", Some(59_000)),
+            create_chat_msg("user", "Oversized current image context", Some(64_000)),
         ];
 
         let result = build_prompt_from_chat_messages(msgs, "test-model");
@@ -1476,7 +1509,7 @@ mod tests {
         //
         // Scenario:
         // - First user message: 100 tokens (kept in head)
-        // - Middle messages: 50,000 tokens total (will be truncated)
+        // - Middle messages: 60,000 tokens total (will be truncated)
         // - Recent user message: 10,000 tokens (HUGE - exceeds available tail budget)
         //
         // The recent message must survive even though it's larger than available_for_tail
@@ -1487,7 +1520,7 @@ mod tests {
         msgs.push(create_chat_msg("user", "First message", Some(100)));
 
         // Many middle messages to consume most of the budget
-        for i in 0..25 {
+        for i in 0..30 {
             msgs.push(create_chat_msg(
                 "user",
                 &format!("Middle user {}", i),
@@ -2102,7 +2135,7 @@ mod tests {
         let mut msgs = vec![create_chat_msg("user", "First question", Some(5))];
 
         // Bloat the middle with many old tool turns
-        for i in 0..20 {
+        for i in 0..22 {
             let id = uuid::Uuid::new_v4();
             msgs.push(create_tool_call_chat_msg(
                 id,
@@ -2158,7 +2191,7 @@ mod tests {
             .any(|m| m["content"].as_str().unwrap_or("").contains("truncated")));
 
         // Must stay inside the budget
-        let budget = 64_000 - 4096 - 500;
+        let budget = 64_000;
         assert!(
             total_tokens <= budget,
             "prompt tokens {} exceed budget {}",

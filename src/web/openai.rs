@@ -1977,6 +1977,11 @@ async fn send_transcription_with_retries(
     Err(last_error.unwrap_or(ApiError::InternalServerError))
 }
 
+fn map_audio_split_error(error: String) -> ApiError {
+    warn!("Rejected invalid transcription audio: {error}");
+    ApiError::BadRequest
+}
+
 async fn proxy_transcription(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
@@ -2047,10 +2052,7 @@ async fn proxy_transcription(
     // Always split the audio (returns single chunk if no splitting needed)
     let chunks = splitter
         .split_audio(&file_bytes, &transcription_request.content_type)
-        .map_err(|e| {
-            error!("Failed to split audio: {}", e);
-            ApiError::InternalServerError
-        })?;
+        .map_err(map_audio_split_error)?;
 
     info!("Processing {} chunk(s)", chunks.len());
 
@@ -2788,6 +2790,13 @@ mod tests {
 
     fn tts_request(payload: Value) -> TTSRequest {
         serde_json::from_value(payload).unwrap()
+    }
+
+    #[test]
+    fn audio_split_errors_map_to_bad_request() {
+        let response = map_audio_split_error("invalid WAV".to_string()).into_response();
+
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[test]

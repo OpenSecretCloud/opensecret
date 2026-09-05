@@ -438,10 +438,17 @@
           ];
         };
 
-        # Preserve the currently deployed Nitro boot behavior explicitly. A
-        # trust-policy experiment belongs in its own held draft PR.
+        # Held trust-policy experiment: do not credit CPU RNG input toward
+        # kernel RNG initialization; preserve the bootloader trust default.
+        unverifiedEnclaveKernelCmdline =
+          "reboot=k panic=30 pci=off nomodules console=ttyS0 random.trust_cpu=off root=/dev/ram0";
         enclaveKernelCmdline =
-          "reboot=k panic=30 pci=off nomodules console=ttyS0 random.trust_cpu=on root=/dev/ram0";
+          assert pkgs.lib.assertMsg (
+            pkgs.lib.hasInfix "random.trust_cpu=off" unverifiedEnclaveKernelCmdline
+            && !(pkgs.lib.hasInfix "random.trust_cpu=on" unverifiedEnclaveKernelCmdline)
+            && !(pkgs.lib.hasInfix "random.trust_bootloader=" unverifiedEnclaveKernelCmdline)
+          ) "The held CPU trust experiment must disable only CPU entropy trust";
+          unverifiedEnclaveKernelCmdline;
 
         # Function to create EIF with specific APP_MODE
         mkEif = { appMode, opensecretPkg ? opensecret, nameSuffix ? "" }: nitro.buildEif {

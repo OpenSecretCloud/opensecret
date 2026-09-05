@@ -1,0 +1,71 @@
+name: Attestation Publisher Checks
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/attestations-ci.yml"
+      - ".github/workflows/release-nitro-eif.yml"
+      - ".github/workflows/promote-nitro-attestation.yml"
+      - "attestations/**"
+      - "scripts/generate_nitro_release_manifest.py"
+      - "scripts/manage_tuf_repository.py"
+      - "scripts/tests/test_generate_nitro_release_manifest.py"
+      - "scripts/tests/test_manage_tuf_repository.py"
+      - "flake.nix"
+      - "flake.lock"
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/attestations-ci.yml"
+      - ".github/workflows/release-nitro-eif.yml"
+      - ".github/workflows/promote-nitro-attestation.yml"
+      - "attestations/**"
+      - "scripts/generate_nitro_release_manifest.py"
+      - "scripts/manage_tuf_repository.py"
+      - "scripts/tests/test_generate_nitro_release_manifest.py"
+      - "scripts/tests/test_manage_tuf_repository.py"
+      - "flake.nix"
+      - "flake.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: TUF manager and Worker
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@bafaa638b9d5ec0e7e3ac1a7fc80453ef1fd265f # v3
+
+      - name: Enable FlakeHub Cache
+        uses: DeterminateSystems/flakehub-cache-action@1f9a51a2959d3e26c7838c6f3bf9f48acae525ea # v3
+
+      - name: Run Python publisher tests
+        run: |
+          nix develop --no-update-lock-file --command \
+            python -m unittest \
+              scripts.tests.test_generate_nitro_release_manifest \
+              scripts.tests.test_manage_tuf_repository \
+              --verbose
+
+      - name: Install locked Worker dependencies
+        run: |
+          nix develop --no-update-lock-file --command bash -lc \
+            'cd attestations && bun install --frozen-lockfile --ignore-scripts'
+
+      - name: Check Worker formatting, types, tests, and dry-run bundle
+        run: |
+          nix develop --no-update-lock-file --command bash -lc \
+            'cd attestations && bun run check'

@@ -228,7 +228,19 @@ just verify-pcr-prod   # For production
 just verify-pcr-preview # For preview
 ```
 
-This ensures the build is reproducible and matches the expected configuration.
+This compares the local build with the checked-in reference. Release provenance
+and client authorization are separate: follow
+[Nitro EIF Attestation Trust](PCR_VERIFICATION.md) for the manual tagged
+Sigstore candidate and protected TUF promotion. During migration, use this
+race-free order for a changed PCR tuple: protected TUF `rollout`; append and
+locally verify the signed legacy JSON; review and merge that JSON; fetch the
+merged `raw.githubusercontent.com/OpenSecretCloud/opensecret/master/` URL and
+byte-compare it with the merged file before verifying its signatures again;
+deploy and verify the enclave; then protected TUF `finalize`. Never deploy
+between editing the legacy file and verifying its merged raw URL. If rollout
+reports the complete tuple is already active, follow its direction to
+`finalize` instead of creating a redundant overlap. The legacy commands and
+file format remain unchanged.
 
 ## Setup SSL
 

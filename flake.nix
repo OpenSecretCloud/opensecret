@@ -82,7 +82,10 @@
           pkgs.python3
           (pkgs.python3.withPackages (ps: with ps; [
             cryptography
+            securesystemslib
+            tuf
           ]))
+          pkgs.bun
           pkgs.go
         ];
         linuxOnlyInputs = [

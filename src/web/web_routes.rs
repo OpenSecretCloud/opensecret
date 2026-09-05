@@ -22,7 +22,6 @@ use std::{
     time::Duration,
 };
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use crate::{
     kagi::{
@@ -31,7 +30,7 @@ use crate::{
     },
     models::users::User,
     web::{
-        encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+        encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
         web_safety::{compact_untrusted_markdown, normalize_public_https_url, strip_image_embeds},
     },
     ApiError, AppMode, AppState,
@@ -272,10 +271,10 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
 
 async fn search_web(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
-    Extension(body): Extension<Value>,
-) -> Result<Json<EncryptedResponse<WebSearchResponse>>, WebRouteError> {
+    Decrypted(body): Decrypted<Value>,
+) -> Result<Response, WebRouteError> {
     let request = serde_json::from_value::<WebSearchRequest>(body)
         .map_err(|_| WebRouteError::InvalidRequest)?;
     let options = validate_search_request(request)?;
@@ -292,10 +291,10 @@ async fn search_web(
 
 async fn extract_web(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
-    Extension(body): Extension<Value>,
-) -> Result<Json<EncryptedResponse<WebExtractResponse>>, WebRouteError> {
+    Decrypted(body): Decrypted<Value>,
+) -> Result<Response, WebRouteError> {
     let request = serde_json::from_value::<WebExtractRequest>(body)
         .map_err(|_| WebRouteError::InvalidRequest)?;
     let (urls, timeout) = validate_extract_request(request)?;

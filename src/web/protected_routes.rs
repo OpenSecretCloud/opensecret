@@ -4,9 +4,10 @@ use crate::message_signing::SigningAlgorithm;
 use crate::private_key::{
     derive_bip85_mnemonic_from_root, plaintext_user_seed_to_mnemonic, VALID_BIP39_WORD_COUNTS,
 };
-use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
+use crate::web::encryption_middleware::{
+    decrypt_request, encrypt_response, Decrypted, TransportSession,
+};
 use crate::Error;
-use crate::KVPair;
 use crate::{
     db::DBError, email::send_verification_email, models::email_verification::NewEmailVerification,
     models::users::User, ApiError, AppState,
@@ -16,12 +17,13 @@ use crate::{
 const BIP85_PURPOSE: u32 = 83696968; // BIP-85 purpose value
 const BIP85_APPLICATION_BIP39: u32 = 39; // Application number for BIP-39 mnemonics
 use axum::middleware::from_fn_with_state;
+use axum::Extension;
 use axum::{
     extract::{Path, Query, State},
+    response::Response,
     routing::{delete, get, post, put},
     Router,
 };
-use axum::{Extension, Json};
 use base64::{engine::general_purpose, Engine as _};
 use bitcoin::bip32::DerivationPath;
 use chrono::{DateTime, Utc};
@@ -554,8 +556,8 @@ pub fn router(app_state: Arc<AppState>) -> Router<()> {
 pub async fn user_protected(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<ProtectedUserData>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     let mut app_user: AppUser = AppUser::from(&user);
 
     // Set email verification status - only if not a guest user
@@ -622,9 +624,9 @@ pub async fn get_kv(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Path(key): Path<String>,
-) -> Result<Json<EncryptedResponse<Option<String>>>, ApiError> {
+) -> Result<Response, ApiError> {
     let value = match data.get(&user, &auth_context, key).await {
         Ok(kv) => kv,
         Err(e) => {
@@ -639,10 +641,10 @@ pub async fn put_kv(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Path(key): Path<String>,
-    Extension(value): Extension<String>,
-) -> Result<Json<EncryptedResponse<String>>, ApiError> {
+    Decrypted(value): Decrypted<String>,
+) -> Result<Response, ApiError> {
     match data.put(&user, &auth_context, key, value.clone()).await {
         Ok(kv) => kv,
         Err(e) => {
@@ -657,9 +659,9 @@ pub async fn delete_kv(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Path(key): Path<String>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     match data.delete(&user, &auth_context, key).await {
         Ok(_) => {
             let response = json!({ "message": "Resource deleted successfully" });
@@ -675,8 +677,8 @@ pub async fn delete_kv(
 pub async fn delete_all_kv(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     match data.delete_all(user.uuid).await {
         Ok(_) => {
             let response = json!({
@@ -695,8 +697,8 @@ pub async fn list_kv(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<Vec<KVPair>>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     let kvs = match data.list(&user, &auth_context).await {
         Ok(kvs) => kvs,
         Err(e) => {
@@ -710,8 +712,8 @@ pub async fn list_kv(
 pub async fn request_new_verification_code(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     // First check if user has an email
     let email = match user.get_email() {
         Some(email) => email.to_string(),
@@ -774,9 +776,9 @@ pub async fn change_password(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(change_request): Extension<ChangePasswordRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    Decrypted(change_request): Decrypted<ChangePasswordRequest>,
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     // Check if user is an OAuth-only user
     if user.password_enc.is_none() {
         error!("OAuth-only user attempted to change password");
@@ -808,13 +810,13 @@ pub async fn change_password(
                 Ok(new_auth_context) => {
                     let access_token = NewToken::new_with_auth_context(
                         &user,
-                        TokenType::Access,
+                        TokenType::access_for_transport(session_id.is_v2()),
                         &data,
                         &new_auth_context,
                     )?;
                     let refresh_token = NewToken::new_with_auth_context(
                         &user,
-                        TokenType::Refresh,
+                        TokenType::refresh_for_transport(session_id.is_v2()),
                         &data,
                         &new_auth_context,
                     )?;
@@ -845,9 +847,9 @@ pub async fn get_private_key(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Query(query): Query<DerivationPathQuery>,
-) -> Result<Json<EncryptedResponse<PrivateKeyResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Validate paths if present
     query.validate()?;
 
@@ -890,9 +892,9 @@ pub async fn get_private_key_bytes(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Query(query): Query<DerivationPathQuery>,
-) -> Result<Json<EncryptedResponse<PrivateKeyBytesResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Validate derivation path if present
     query.validate()?;
 
@@ -932,9 +934,9 @@ pub async fn sign_message(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(sign_request): Extension<SignMessageRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<SignMessageResponseJson>>, ApiError> {
+    Decrypted(sign_request): Decrypted<SignMessageRequest>,
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     // Validate key_options
     let validation_query = DerivationPathQuery {
         key_options: sign_request.key_options.clone(),
@@ -985,9 +987,9 @@ pub async fn get_public_key(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Query(query): Query<PublicKeyQuery>,
-) -> Result<Json<EncryptedResponse<PublicKeyResponseJson>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Validate the key_options
     let validation_query = DerivationPathQuery {
         key_options: query.key_options.clone(),
@@ -1036,9 +1038,9 @@ pub async fn get_public_key(
 pub async fn generate_third_party_token(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
-    Extension(request): Extension<ThirdPartyTokenRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<ThirdPartyTokenResponse>>, ApiError> {
+    Decrypted(request): Decrypted<ThirdPartyTokenRequest>,
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     // Validate the audience
     if let Some(audience) = request.audience.as_ref() {
         if audience.is_empty() || (audience.contains(':') && url::Url::parse(audience).is_err()) {
@@ -1072,9 +1074,9 @@ pub async fn encrypt_data(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(request): Extension<EncryptDataRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<EncryptDataResponse>>, ApiError> {
+    Decrypted(request): Decrypted<EncryptDataRequest>,
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     // Validate key_options
     let validation_query = DerivationPathQuery {
         key_options: request.key_options.clone(),
@@ -1126,9 +1128,9 @@ pub async fn decrypt_data(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(request): Extension<DecryptDataRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<String>>, ApiError> {
+    Decrypted(request): Decrypted<DecryptDataRequest>,
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     // Validate key_options
     let validation_query = DerivationPathQuery {
         key_options: request.key_options.clone(),
@@ -1195,9 +1197,9 @@ pub async fn decrypt_data(
 pub async fn initiate_account_deletion(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
-    Extension(delete_request): Extension<InitiateAccountDeletionRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    Decrypted(delete_request): Decrypted<InitiateAccountDeletionRequest>,
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     info!("User {} is initiating account deletion request", user.uuid);
 
     // Create the account deletion request
@@ -1229,9 +1231,9 @@ pub async fn initiate_account_deletion(
 pub async fn confirm_account_deletion(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
-    Extension(confirm_request): Extension<ConfirmAccountDeletionRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    Decrypted(confirm_request): Decrypted<ConfirmAccountDeletionRequest>,
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     info!("User {} is confirming account deletion", user.uuid);
 
     // Confirm the account deletion
@@ -1277,14 +1279,14 @@ pub async fn confirm_account_deletion(
 pub async fn create_api_key(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
-    Extension(request): Extension<CreateApiKeyRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<CreateApiKeyResponse>>, ApiError> {
+    Decrypted(request): Decrypted<CreateApiKeyRequest>,
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Creating new API key for user: {}", user.uuid);
 
     // Validate the request
-    if let Err(e) = request.validate() {
-        error!("API key request validation failed: {:?}", e);
+    if request.validate().is_err() {
+        error!("API key request validation failed");
         return Err(ApiError::BadRequest);
     }
 
@@ -1334,8 +1336,8 @@ pub async fn create_api_key(
 pub async fn list_api_keys(
     State(data): State<Arc<AppState>>,
     Extension(user): Extension<User>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<ListApiKeysResponse>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Listing API keys for user: {}", user.uuid);
 
     let api_keys = data
@@ -1363,8 +1365,8 @@ pub async fn delete_api_key(
     State(data): State<Arc<AppState>>,
     Path(name): Path<String>,
     Extension(user): Extension<User>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Deleting API key '{}' for user: {}", name, user.uuid);
 
     data.db

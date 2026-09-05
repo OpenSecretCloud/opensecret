@@ -5,14 +5,15 @@ use crate::{
         org_memberships::{NewOrgMembership, OrgRole},
         platform_users::PlatformUser,
     },
-    web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+    web::encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
     ApiError, AppState, DBError,
 };
 use axum::{
     extract::{Path, State},
     middleware::from_fn_with_state,
+    response::Response,
     routing::{delete, get, post},
-    Extension, Json, Router,
+    Extension, Router,
 };
 use std::sync::Arc;
 use tokio::spawn;
@@ -54,9 +55,9 @@ async fn create_invite(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path(org_id): Path<Uuid>,
-    Extension(create_request): Extension<CreateInviteRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<InviteResponse>>, ApiError> {
+    Decrypted(create_request): Decrypted<CreateInviteRequest>,
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Creating invite");
 
     // Get the org by UUID
@@ -133,8 +134,8 @@ async fn list_invites(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path(org_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<Vec<InviteResponse>>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Listing organization invites");
 
     // Get the org by UUID
@@ -167,7 +168,7 @@ async fn list_invites(
         .filter(|invite| !invite.used && invite.expires_at > now)
         .collect::<Vec<_>>();
 
-    let response = active_invites
+    let response: Vec<InviteResponse> = active_invites
         .into_iter()
         .map(|invite| InviteResponse {
             code: invite.code,
@@ -187,8 +188,8 @@ async fn get_invite(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, invite_code)): Path<(Uuid, Uuid)>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<DetailedInviteResponse>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Getting invite by code");
 
     // Get the org by UUID
@@ -247,8 +248,8 @@ async fn delete_invite(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, invite_code)): Path<(Uuid, Uuid)>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Deleting invite");
 
     // Get the org by UUID
@@ -299,8 +300,8 @@ async fn accept_invite(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path(code): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Accepting invite");
 
     // Get and validate the invite code

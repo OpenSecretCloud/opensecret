@@ -200,7 +200,7 @@ fn models_route_allows_optional_identity_but_requires_session_e2ee() {
     let handler_body = extract_function_body(&openai_source, "async fn proxy_models");
     assert!(
         openai_source.contains(
-            "async fn proxy_models(\n    State(state): State<Arc<AppState>>,\n    axum::Extension(session_id): axum::Extension<Uuid>,\n    user: Option<axum::Extension<User>>"
+            "async fn proxy_models(\n    State(state): State<Arc<AppState>>,\n    axum::Extension(session_id): axum::Extension<TransportSession>,\n    user: Option<axum::Extension<User>>"
         )
             && handler_body.contains("encrypt_response(&state, &session_id, &models_response)"),
         "the models handler must require session E2EE while allowing optional identity"
@@ -362,8 +362,8 @@ fn refresh_route_preserves_signed_auth_context_without_recomputing_binding() {
     for required_pattern in [
         "AuthContext::from_claims(&claims)",
         "verify_seed_wrap_for_auth_context(&user, &auth_context)",
-        "NewToken::new_with_auth_context(&user, TokenType::Access, &data, &auth_context)",
-        "NewToken::new_with_auth_context(&user, TokenType::Refresh, &data, &auth_context)",
+        "TokenType::access_for_transport(session_id.is_v2())",
+        "TokenType::refresh_for_transport(session_id.is_v2())",
     ] {
         assert!(
             refresh_body.contains(required_pattern),
@@ -714,8 +714,8 @@ fn password_credential_lifecycle_rewraps_seed_and_reissues_tokens() {
         ".update_user_password_and_seed_wrap(",
         "&auth_context",
         "NewToken::new_with_auth_context(",
-        "TokenType::Access",
-        "TokenType::Refresh",
+        "TokenType::access_for_transport(session_id.is_v2())",
+        "TokenType::refresh_for_transport(session_id.is_v2())",
         "&new_auth_context",
     ] {
         assert!(
@@ -911,8 +911,8 @@ fn password_registration_and_login_issue_tokens_only_after_seed_wrap_verificatio
     for required_pattern in [
         ".authenticate_user(",
         "NewToken::new_with_auth_context(",
-        "TokenType::Access",
-        "TokenType::Refresh",
+        "TokenType::access_for_transport(is_transport_v2)",
+        "TokenType::refresh_for_transport(is_transport_v2)",
         "&authenticated_user.auth_context",
     ] {
         assert!(

@@ -93,17 +93,34 @@ async fn get_attestation(
     };
 
     trace!("Generating attestation based on app mode");
-    let result = match data.app_mode {
-        AppMode::Local => generate_mock_attestation(data.clone(), request).await,
-        _ => generate_real_attestation(data, request).await,
-    };
-    result
+    let document = generate_attestation_document(data, request).await?;
+    Ok(attestation_response(document))
 }
 
-async fn generate_mock_attestation(
+pub(crate) async fn generate_attestation_document(
     data: Arc<AppState>,
     request: Request,
-) -> Result<(StatusCode, Json<AttestationResponse>), ApiError> {
+) -> Result<Vec<u8>, ApiError> {
+    match data.app_mode {
+        AppMode::Local => generate_mock_attestation_document(data, request).await,
+        _ => generate_real_attestation_document(request),
+    }
+}
+
+fn attestation_response(document: Vec<u8>) -> (StatusCode, Json<AttestationResponse>) {
+    let attestation_document = general_purpose::STANDARD.encode(document);
+    (
+        StatusCode::OK,
+        Json(AttestationResponse {
+            attestation_document,
+        }),
+    )
+}
+
+async fn generate_mock_attestation_document(
+    data: Arc<AppState>,
+    request: Request,
+) -> Result<Vec<u8>, ApiError> {
     let (user_data, nonce, public_key) = match request {
         Request::Attestation {
             user_data,
@@ -148,16 +165,7 @@ async fn generate_mock_attestation(
     })?;
     trace!("COSE_Sign1 structure encoded");
 
-    // Convert to base64
-    trace!("Converting to base64");
-    let attestation_doc_base64 = general_purpose::STANDARD.encode(&final_document);
-    trace!("Converted to base64");
-    Ok((
-        StatusCode::OK,
-        Json(AttestationResponse {
-            attestation_document: attestation_doc_base64,
-        }),
-    ))
+    Ok(final_document)
 }
 
 async fn create_mock_attestation_document(
@@ -340,10 +348,7 @@ fn create_cose_sign1(payload: Vec<u8>, signature: Vec<u8>) -> Value {
     ])
 }
 
-async fn generate_real_attestation(
-    _data: Arc<AppState>,
-    request: Request,
-) -> Result<(StatusCode, Json<AttestationResponse>), ApiError> {
+fn generate_real_attestation_document(request: Request) -> Result<Vec<u8>, ApiError> {
     // Initialize the Nitro Secure Module (NSM) driver
     let nsm_fd = nsm_init();
     if nsm_fd < 0 {
@@ -358,17 +363,7 @@ async fn generate_real_attestation(
 
     // Handle the response
     match response {
-        Response::Attestation { document } => {
-            // Convert the attestation document to a base64 encoded string
-            let attestation_doc_base64 = general_purpose::STANDARD.encode(&document);
-
-            Ok((
-                StatusCode::OK,
-                Json(AttestationResponse {
-                    attestation_document: attestation_doc_base64,
-                }),
-            ))
-        }
+        Response::Attestation { document } => Ok(document),
         Response::Error(_) => {
             error!("NSM returned an error response");
             Err(ApiError::InternalServerError)

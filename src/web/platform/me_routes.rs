@@ -2,21 +2,21 @@ use crate::{
     email::send_platform_verification_email,
     models::platform_email_verification::NewPlatformEmailVerification,
     models::platform_users::PlatformUser,
-    web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+    web::encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
     ApiError, AppState,
 };
 use axum::{
     extract::State,
     middleware::from_fn_with_state,
+    response::Response,
     routing::{get, post},
-    Extension, Json, Router,
+    Extension, Router,
 };
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::spawn;
 use tracing::error;
-use uuid::Uuid;
 use validator::Validate;
 
 use super::common::{MeResponse, OrgResponse, PlatformUserResponse};
@@ -63,8 +63,8 @@ pub fn router(app_state: Arc<AppState>) -> Router {
 async fn get_platform_user(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<MeResponse>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     // Check if email is verified
     let email_verified = match data
         .db
@@ -130,8 +130,8 @@ async fn get_platform_user(
 async fn request_platform_verification(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     // Check if the user is already verified
     match data
         .db
@@ -199,12 +199,12 @@ async fn request_platform_verification(
 pub async fn platform_change_password(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
-    Extension(change_request): Extension<PlatformChangePasswordRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    Decrypted(change_request): Decrypted<PlatformChangePasswordRequest>,
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     // Validate request
-    if let Err(errors) = change_request.validate() {
-        error!("Validation error: {:?}", errors);
+    if change_request.validate().is_err() {
+        error!("Platform password change request validation failed");
         return Err(ApiError::BadRequest);
     }
 

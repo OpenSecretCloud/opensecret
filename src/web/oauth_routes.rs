@@ -2,8 +2,10 @@ use crate::apple_signin::{generate_apple_client_secret, validate_apple_native_to
 #[cfg(test)]
 use crate::models::oauth::NewUserOAuthConnection;
 use crate::models::oauth::UserOAuthConnection;
-use crate::oauth::{BasicClient, OAuthState};
-use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
+use crate::oauth::{BasicClient, OAuthCodeBinding, OAuthState};
+use crate::web::encryption_middleware::{
+    decrypt_request, encrypt_response, Decrypted, TransportSession,
+};
 use crate::web::login_routes::handle_new_user_registration;
 use crate::web::platform::common::{
     PROJECT_APPLE_OAUTH_SECRET, PROJECT_GITHUB_OAUTH_SECRET, PROJECT_GOOGLE_OAUTH_SECRET,
@@ -22,8 +24,9 @@ use crate::{
 };
 use axum::{
     extract::{Extension, State},
+    response::Response,
     routing::post,
-    Json, Router,
+    Router,
 };
 use base64::Engine as _;
 use oauth2::TokenResponse;
@@ -420,10 +423,10 @@ async fn get_project_oauth_client(
 
 pub async fn initiate_oauth(
     State(app_state): State<Arc<AppState>>,
-    Extension(auth_request): Extension<OAuthAuthRequest>,
-    Extension(session_id): Extension<Uuid>,
+    Decrypted(auth_request): Decrypted<OAuthAuthRequest>,
+    Extension(session_id): Extension<TransportSession>,
     provider_name: &str,
-) -> Result<Json<EncryptedResponse<OAuthOAuthCallbackResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     // Get project
     let project = app_state
         .db
@@ -442,8 +445,43 @@ pub async fn initiate_oauth(
             ApiError::InternalServerError
         })?;
 
-    // Generate initial authorization URL to get the CSRF token
-    let (initial_url, csrf_token) = oauth_provider.generate_authorize_url(&oauth_client).await;
+    // V2 adds a provider-verified authorization-code binding. V1 deliberately
+    // retains its existing authorization URL and state behavior.
+    let v2_session_id = session_id.v2_session_id();
+    let (initial_url, csrf_token, code_binding) = if v2_session_id.is_some() {
+        let authorization = match provider_name {
+            "github" => {
+                oauth_provider
+                    .as_github()
+                    .ok_or(ApiError::InternalServerError)?
+                    .generate_bound_authorize_url(&oauth_client)
+                    .await
+            }
+            "google" => {
+                oauth_provider
+                    .as_google()
+                    .ok_or(ApiError::InternalServerError)?
+                    .generate_bound_authorize_url(&oauth_client)
+                    .await
+            }
+            "apple" => {
+                oauth_provider
+                    .as_apple()
+                    .ok_or(ApiError::InternalServerError)?
+                    .generate_bound_authorize_url(&oauth_client)
+                    .await
+            }
+            _ => return Err(ApiError::InternalServerError),
+        };
+        (
+            authorization.auth_url,
+            authorization.csrf_token,
+            Some(authorization.code_binding),
+        )
+    } else {
+        let (auth_url, csrf_token) = oauth_provider.generate_authorize_url(&oauth_client).await;
+        (auth_url, csrf_token, None)
+    };
 
     // Create our state that includes both CSRF token and client_id
     let state = OAuthState {
@@ -452,10 +490,25 @@ pub async fn initiate_oauth(
     };
 
     // Store the complete state in the provider
-    oauth_provider
-        .store_state(csrf_token.secret(), state.clone())
-        .await
-        .map_err(|_| ApiError::TooManyRequests)?;
+    match (v2_session_id, code_binding) {
+        (Some(session_id), Some(code_binding)) => {
+            oauth_provider
+                .store_state_for_session(
+                    csrf_token.secret(),
+                    state.clone(),
+                    session_id,
+                    code_binding,
+                )
+                .await
+        }
+        (None, None) => {
+            oauth_provider
+                .store_state(csrf_token.secret(), state.clone())
+                .await
+        }
+        _ => return Err(ApiError::InternalServerError),
+    }
+    .map_err(|_| ApiError::TooManyRequests)?;
 
     let state_json = serde_json::to_string(&state).map_err(|_| ApiError::InternalServerError)?;
     let state_base64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(state_json);
@@ -472,15 +525,18 @@ pub async fn initiate_oauth(
 
 pub async fn oauth_callback(
     State(app_state): State<Arc<AppState>>,
-    Extension(callback_request): Extension<OAuthCallbackRequest>,
-    Extension(session_id): Extension<Uuid>,
+    Decrypted(callback_request): Decrypted<OAuthCallbackRequest>,
+    Extension(session_id): Extension<TransportSession>,
     provider_name: &str,
-) -> Result<Json<EncryptedResponse<OAuthCallbackResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!(
         "Received code (redacted, len={})",
         callback_request.code.len()
     );
-    debug!("Received state: {}", callback_request.state);
+    debug!(
+        "Received OAuth state (redacted, len={})",
+        callback_request.state.len()
+    );
 
     // Decode and parse the state
     let state_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -507,12 +563,28 @@ pub async fn oauth_callback(
 
     // Validate and atomically consume the complete state so a successful match is one-time.
     // A mismatched state is left in the store for the legitimate callback.
-    let is_valid = oauth_provider.consume_state(&state).await;
+    let is_transport_v2 = session_id.is_v2();
+    let code_binding = match session_id.v2_session_id() {
+        Some(session_id) => oauth_provider
+            .consume_state_for_session(&state, session_id)
+            .await
+            .map(Some),
+        None => oauth_provider.consume_state(&state).await.then_some(None),
+    };
 
-    if !is_valid {
+    let Some(code_binding) = code_binding else {
         error!("Invalid state in {} callback", provider_name);
         return Err(ApiError::BadRequest);
-    }
+    };
+
+    let (pkce_verifier, apple_nonce) = match (is_transport_v2, provider_name, code_binding) {
+        (false, _, None) => (None, None),
+        (true, "github" | "google", Some(OAuthCodeBinding::Pkce(verifier))) => {
+            (Some(verifier), None)
+        }
+        (true, "apple", Some(OAuthCodeBinding::AppleNonce(nonce))) => (None, Some(nonce)),
+        _ => return Err(ApiError::InternalServerError),
+    };
 
     // Get project (we can trust the client_id now since we validated it against our stored state)
     debug!("Getting project from client_id: {:?}", state.client_id);
@@ -686,28 +758,10 @@ pub async fn oauth_callback(
 
         // Check if successful
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            error!("Error response from Apple: {}", error_text);
-
-            // Try to parse the error as JSON for more details
-            if let Ok(error_json) = serde_json::from_str::<serde_json::Value>(&error_text) {
-                if let Some(error_obj) = error_json.get("error") {
-                    error!("Error type: {}", error_obj);
-
-                    // If it's an invalid_client error, log diagnostic info
-                    if error_obj.as_str() == Some("invalid_client") {
-                        error!("invalid_client error detected - this typically means the client_secret JWT is invalid");
-                        error!("JWT verification failed - check Team ID, Key ID, and private key configuration");
-                    }
-                }
-            }
-
-            error!("Apple OAuth token exchange failed. Possible issues:");
-            error!("1. Client ID might be wrong (check if it needs .services suffix)");
-            error!("2. Team ID or Key ID might not match the private key");
-            error!("3. Private key might be invalid or in wrong format");
-            error!("4. The authorization code might be invalid or expired");
-            error!("5. Redirect URI might not match the one used in the authorization request");
+            error!(
+                "Apple OAuth token exchange returned non-success status: {}",
+                status
+            );
 
             return Err(ApiError::InternalServerError);
         }
@@ -745,14 +799,17 @@ pub async fn oauth_callback(
                 error!("Failed to build OAuth HTTP client: {:?}", e);
                 ApiError::InternalServerError
             })?;
-        let token = oauth_client
-            .exchange_code(AuthorizationCode::new(callback_request.code.clone()))
-            .request_async(&http_client)
-            .await
-            .map_err(|e| {
-                error!("Failed to exchange code for access token: {:?}", e);
-                ApiError::InternalServerError
-            })?;
+        let exchange =
+            oauth_client.exchange_code(AuthorizationCode::new(callback_request.code.clone()));
+        let exchange = if let Some(verifier) = pkce_verifier {
+            exchange.set_pkce_verifier(verifier)
+        } else {
+            exchange
+        };
+        let token = exchange.request_async(&http_client).await.map_err(|e| {
+            error!("Failed to exchange code for access token: {:?}", e);
+            ApiError::InternalServerError
+        })?;
 
         // No ID token for non-Apple providers
         (token, None)
@@ -867,7 +924,14 @@ pub async fn oauth_callback(
             })?;
 
             // Verify the token just like we do for native sign-in
-            let apple_user = match fetch_apple_user(&app_state, &id_token, &client_id).await {
+            let apple_user = match fetch_apple_user(
+                &app_state,
+                &id_token,
+                &client_id,
+                apple_nonce.as_ref().map(|nonce| nonce.as_str()),
+            )
+            .await
+            {
                 Ok(user) => {
                     debug!("Successfully verified Apple ID token");
                     user
@@ -902,7 +966,8 @@ pub async fn oauth_callback(
         }
     };
 
-    let auth_response = oauth_callback_response(&app_state, &authenticated_user)?;
+    let auth_response =
+        oauth_callback_response(&app_state, &authenticated_user, session_id.is_v2())?;
     encrypt_response(&app_state, &session_id, &auth_response).await
 }
 
@@ -932,16 +997,11 @@ async fn fetch_github_user(
     trace!("GitHub API response headers: {:?}", headers);
 
     if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unable to read error body".to_string());
         error!(
             "GitHub API returned non-success status: {} {}",
             status,
             status.canonical_reason().unwrap_or("")
         );
-        error!("Error response body: {}", error_body);
         return Err(ApiError::InternalServerError);
     }
 
@@ -953,8 +1013,11 @@ async fn fetch_github_user(
     trace!("GitHub user response body: {}", user_body);
 
     let mut github_user: GithubUser = serde_json::from_str(&user_body).map_err(|e| {
-        error!("Failed to parse GitHub user JSON: {:?}", e);
-        error!("GitHub user response body: {}", user_body);
+        error!(
+            "Failed to parse GitHub user JSON: {} (response_bytes={})",
+            e,
+            user_body.len()
+        );
         ApiError::InternalServerError
     })?;
 
@@ -979,16 +1042,11 @@ async fn fetch_github_user(
         trace!("GitHub emails API response headers: {:?}", emails_headers);
 
         if !emails_status.is_success() {
-            let error_body = emails_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unable to read error body".to_string());
             error!(
                 "GitHub API returned non-success status for emails: {} {}",
                 emails_status,
                 emails_status.canonical_reason().unwrap_or("")
             );
-            error!("Error response body for emails: {}", error_body);
             return Err(ApiError::InternalServerError);
         }
 
@@ -1000,8 +1058,11 @@ async fn fetch_github_user(
         trace!("GitHub emails response body: {}", emails_body);
 
         let emails: Vec<GithubEmail> = serde_json::from_str(&emails_body).map_err(|e| {
-            error!("Failed to parse GitHub emails JSON: {:?}", e);
-            error!("GitHub emails response body: {}", emails_body);
+            error!(
+                "Failed to parse GitHub emails JSON: {} (response_bytes={})",
+                e,
+                emails_body.len()
+            );
             ApiError::InternalServerError
         })?;
 
@@ -1040,14 +1101,7 @@ async fn fetch_google_user(
 
     let status = response.status();
     if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unable to read error body".to_string());
-        error!(
-            "Google API returned non-success status: {} {}",
-            status, error_body
-        );
+        error!("Google API returned non-success status: {}", status);
         return Err(ApiError::InternalServerError);
     }
 
@@ -1069,13 +1123,19 @@ async fn fetch_apple_user(
     app_state: &AppState,
     id_token: &str,
     client_id: &str,
+    expected_nonce: Option<&str>,
 ) -> Result<AppleUser, ApiError> {
     debug!("Parsing and validating Apple ID token");
 
-    // Validate the token using the shared verifier (no nonce validation for now in web flow)
-    let claims =
-        validate_apple_native_token(&app_state.apple_jwt_verifier, id_token, client_id, None)
-            .await?;
+    // V2 requires the provider-signed ID token to carry the nonce generated
+    // for this exact state and session. V1 continues without nonce validation.
+    let claims = validate_apple_native_token(
+        &app_state.apple_jwt_verifier,
+        id_token,
+        client_id,
+        expected_nonce,
+    )
+    .await?;
 
     // Create an AppleUser from the claims
     let apple_user = AppleUser {
@@ -1123,10 +1183,11 @@ fn authenticated_oauth_user(
 fn oauth_callback_response(
     app_state: &AppState,
     authenticated_user: &AuthenticatedOAuthUser,
+    is_transport_v2: bool,
 ) -> Result<OAuthCallbackResponse, ApiError> {
     let access_token = NewToken::new_with_auth_context(
         &authenticated_user.user,
-        TokenType::Access,
+        TokenType::access_for_transport(is_transport_v2),
         app_state,
         &authenticated_user.auth_context,
     )
@@ -1136,7 +1197,7 @@ fn oauth_callback_response(
     })?;
     let refresh_token = NewToken::new_with_auth_context(
         &authenticated_user.user,
-        TokenType::Refresh,
+        TokenType::refresh_for_transport(is_transport_v2),
         app_state,
         &authenticated_user.auth_context,
     )
@@ -1278,9 +1339,9 @@ async fn find_or_create_user_from_oauth(
 /// Handler for Apple native sign-in (iOS Sign in with Apple)
 pub async fn handle_apple_native_signin(
     State(app_state): State<Arc<AppState>>,
-    Extension(request): Extension<AppleNativeSignInRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<OAuthCallbackResponse>>, ApiError> {
+    Decrypted(request): Decrypted<AppleNativeSignInRequest>,
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Handling Apple native sign-in");
 
     // Get project
@@ -1366,10 +1427,7 @@ pub async fn handle_apple_native_signin(
             ApiError::InternalServerError
         })?
     {
-        debug!(
-            "Found existing connection for Apple ID: {}",
-            verified_user_id
-        );
+        debug!("Found existing Apple OAuth connection");
 
         let user = app_state.db.get_user_by_uuid(connection.user_id)?;
         if user.project_id != project.id {
@@ -1381,17 +1439,15 @@ pub async fn handle_apple_native_signin(
 
         let authenticated_user =
             authenticated_oauth_user(&app_state, user, "apple", &verified_user_id)?;
-        let auth_response = oauth_callback_response(&app_state, &authenticated_user)?;
+        let auth_response =
+            oauth_callback_response(&app_state, &authenticated_user, session_id.is_v2())?;
 
         debug!("Apple sign-in successful for existing user");
         return encrypt_response(&app_state, &session_id, &auth_response).await;
     }
 
     // If we get here, user doesn't exist - need to create new user
-    debug!(
-        "No existing user found with Apple ID: {}, creating new user",
-        verified_user_id
-    );
+    debug!("No existing Apple OAuth connection; creating new user");
 
     // For new users, we absolutely need an email
     // Determine the email to use - prioritize the one from the token if available
@@ -1449,7 +1505,8 @@ pub async fn handle_apple_native_signin(
     )
     .await?;
 
-    let auth_response = oauth_callback_response(&app_state, &authenticated_user)?;
+    let auth_response =
+        oauth_callback_response(&app_state, &authenticated_user, session_id.is_v2())?;
 
     debug!("Apple native sign-in successful for new user");
     encrypt_response(&app_state, &session_id, &auth_response).await

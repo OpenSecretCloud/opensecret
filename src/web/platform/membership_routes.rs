@@ -3,14 +3,15 @@ use crate::{
         org_memberships::{OrgMembershipError, OrgRole},
         platform_users::PlatformUser,
     },
-    web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+    web::encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
     ApiError, AppState, DBError,
 };
 use axum::{
     extract::{Path, State},
     middleware::from_fn_with_state,
+    response::Response,
     routing::{delete, get, patch},
-    Extension, Json, Router,
+    Extension, Router,
 };
 use std::sync::Arc;
 use tracing::{debug, error};
@@ -44,8 +45,8 @@ async fn list_memberships(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path(org_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<Vec<MembershipResponse>>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Listing memberships");
 
     // Get the org by UUID
@@ -70,7 +71,7 @@ async fn list_memberships(
         })?;
 
     // Create response directly from the joined results
-    let response = memberships_with_users
+    let response: Vec<MembershipResponse> = memberships_with_users
         .into_iter()
         .map(|m| MembershipResponse {
             user_id: m.platform_user_id,
@@ -86,9 +87,9 @@ async fn update_membership(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, user_id)): Path<(Uuid, Uuid)>,
-    Extension(update_request): Extension<UpdateMembershipRequest>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<MembershipResponse>>, ApiError> {
+    Decrypted(update_request): Decrypted<UpdateMembershipRequest>,
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!(
         "Updating membership for user {} in org {} to role {:?}",
         user_id, org_id, update_request.role
@@ -193,8 +194,8 @@ async fn delete_membership(
     State(data): State<Arc<AppState>>,
     Extension(platform_user): Extension<PlatformUser>,
     Path((org_id, user_id)): Path<(Uuid, Uuid)>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<serde_json::Value>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Deleting membership");
 
     // Get the org by UUID

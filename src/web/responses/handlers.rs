@@ -15,14 +15,15 @@ use crate::{
         NewToolCall, NewToolOutput, NewUserMessage, ResponseStatus, ResponsesError,
     },
     models::users::User,
+    provider_cache::CacheNamespaceRoot,
     tokens::count_tokens,
     web::{
-        encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+        encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
         openai::{
             ensure_completion_model_access, get_chat_completion_response,
             get_chat_completion_response_for_execution,
-            get_chat_completion_response_for_expected_route, BillingContext, CompletionChunk,
-            ServerSelectedCompletionRoute,
+            get_chat_completion_response_for_expected_route, BillingContext, CompletionCachePolicy,
+            CompletionChunk, CompletionExecutionContext, ServerSelectedCompletionRoute,
         },
         openai_auth::AuthMethod,
         responses::{
@@ -53,9 +54,8 @@ use axum::{
         IntoResponse, Response,
     },
     routing::{delete, get, post},
-    Extension, Json, Router,
+    Extension, Router,
 };
-use base64::Engine;
 use chrono::Utc;
 use futures::Stream;
 use secp256k1::SecretKey;
@@ -2829,6 +2829,7 @@ fn clamp_image_description_tokens(text: &str) -> i32 {
 struct ResponsesImageDescriptionExecutor<'a> {
     state: &'a Arc<AppState>,
     user: &'a User,
+    cache_policy: &'a CompletionCachePolicy,
     _access: PaidImageDescriptionAccess,
 }
 
@@ -2866,8 +2867,7 @@ impl ImageDescriptionAttemptExecutor for ResponsesImageDescriptionExecutor<'_> {
             self.user,
             request,
             &headers,
-            billing_context,
-            ModelPlan::Paid,
+            CompletionExecutionContext::new(billing_context, ModelPlan::Paid, self.cache_policy),
             ServerSelectedCompletionRoute {
                 provider_name: candidate.provider.as_str(),
                 provider_model_id: candidate.provider_model_id,
@@ -2913,12 +2913,14 @@ impl ImageDescriptionAttemptExecutor for ResponsesImageDescriptionExecutor<'_> {
 async fn describe_images(
     state: &Arc<AppState>,
     user: &User,
+    cache_policy: &CompletionCachePolicy,
     access: PaidImageDescriptionAccess,
     images: &[ImageAttachment],
 ) -> Result<Vec<ImageDescriptionToolPair>, ApiError> {
     let executor = ResponsesImageDescriptionExecutor {
         state,
         user,
+        cache_policy,
         _access: access,
     };
     let fallback_policy = RetryNonTerminalImageDescriptionFallbackPolicy;
@@ -3035,6 +3037,7 @@ fn spawn_title_generation_task(
     user: User,
     user_key: SecretKey,
     user_content: String,
+    cache_policy: CompletionCachePolicy,
 ) {
     tokio::spawn(async move {
         debug!(
@@ -3076,8 +3079,7 @@ fn spawn_title_generation_task(
             &user,
             title_request,
             &headers,
-            billing_context,
-            ModelPlan::Free,
+            CompletionExecutionContext::new(billing_context, ModelPlan::Free, &cache_policy),
         )
         .await
         {
@@ -3936,6 +3938,7 @@ async fn stream_one_assistant_turn(
     tool_turn_count: usize,
     prompt_token_estimate: usize,
     response_execution: ResponseExecution,
+    cache_policy: &CompletionCachePolicy,
 ) -> Result<AssistantTurnOutcome, ApiError> {
     let mut chat_request = build_model_turn_request(body, prompt_messages, tools_enabled);
 
@@ -3966,8 +3969,7 @@ async fn stream_one_assistant_turn(
         user,
         chat_request.take(),
         headers,
-        billing_context,
-        model_plan,
+        CompletionExecutionContext::new(billing_context, model_plan, cache_policy),
         response_execution,
     )
     .await?;
@@ -4231,6 +4233,7 @@ async fn setup_completion_processor(
     tx_storage: mpsc::Sender<StorageMessage>,
     mut rx_tool_ack: mpsc::Receiver<Result<(), String>>,
     response_execution: ResponseExecution,
+    cache_policy: &CompletionCachePolicy,
 ) -> Result<crate::models::responses::Response, ApiError> {
     let tools_enabled = context.web_search_enabled;
     let mut prompt_messages = Arc::as_ref(&context.prompt_messages).clone();
@@ -4257,6 +4260,7 @@ async fn setup_completion_processor(
                 tool_turn_count,
                 prompt_token_estimate,
                 response_execution.clone(),
+                cache_policy,
             )
             .await?
             {
@@ -4313,12 +4317,19 @@ async fn setup_completion_processor(
 async fn create_response_stream(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(mut body): Extension<ResponsesCreateRequest>,
+    cache_namespace_root: Option<Extension<CacheNamespaceRoot>>,
+    Decrypted(mut body): Decrypted<ResponsesCreateRequest>,
 ) -> Result<Response, ApiError> {
     trace!("=== ENTERING create_response_stream ===");
+    let require_explicit_terminal = session_id.is_v2();
+    let cache_policy = CompletionCachePolicy::for_request(
+        &session_id,
+        cache_namespace_root.map(|Extension(root)| root),
+        user.uuid,
+    )?;
     trace!("User: {}", user.uuid);
     let requested_model = body.model.clone();
     let billing_access = state.chat_billing_access(user.uuid, false).await;
@@ -4399,7 +4410,16 @@ async fn create_response_stream(
     // Phase 2b: Describe all current-turn images before any database write or
     // SSE response. A complete cascade failure therefore leaves no partial chat.
     let image_descriptions = match image_access {
-        Some(access) => describe_images(&state, &user, access, &prepared.image_attachments).await?,
+        Some(access) => {
+            describe_images(
+                &state,
+                &user,
+                &cache_policy,
+                access,
+                &prepared.image_attachments,
+            )
+            .await?
+        }
         None => Vec::new(),
     };
 
@@ -4530,6 +4550,7 @@ async fn create_response_stream(
             user.clone(),
             prepared.user_key,
             user_content,
+            cache_policy.clone(),
         );
     }
 
@@ -4600,6 +4621,7 @@ async fn create_response_stream(
     let orchestrator_conversation = conversation_for_stream.clone();
     let orchestrator_prompt_messages = prompt_messages.clone();
     let orchestrator_execution = response_execution.clone();
+    let orchestrator_cache_policy = cache_policy.clone();
 
     tokio::spawn(async move {
         let _orchestrator_execution_guard = orchestrator_execution_guard;
@@ -4638,6 +4660,7 @@ async fn create_response_stream(
                     orchestrator_tx_storage.clone(),
                     rx_tool_ack,
                     orchestrator_execution.clone(),
+                    &orchestrator_cache_policy,
                 )
                 .await
                 {
@@ -4706,6 +4729,7 @@ async fn create_response_stream(
         let mut total_prompt_tokens_used = 0i32;
         let mut total_completion_tokens = 0i32;
         let mut durable_completion_pending = false;
+        let mut saw_terminal = false;
         loop {
             let msg = if durable_completion_pending {
                 next_client_message_after_durable_completion(&mut rx_client)
@@ -4908,6 +4932,7 @@ async fn create_response_stream(
                             // by the main response has exited.
                             drop(client_execution_guard.take());
                             response_execution.wait_for_quiescence().await;
+                            saw_terminal = true;
                             yield Ok(ResponseEvent::Cancelled(cancelled_event).to_sse_event(&mut emitter).await);
                             break;
                         }
@@ -4929,6 +4954,7 @@ async fn create_response_stream(
                                 },
                             };
                             drop(client_execution_guard.take());
+                            saw_terminal = true;
                             yield Ok(ResponseEvent::Error(error_event).to_sse_event(&mut emitter).await);
                             break;
                         }
@@ -4958,6 +4984,7 @@ async fn create_response_stream(
 
                     drop(client_execution_guard.take());
                     response_execution.wait_for_quiescence().await;
+                    saw_terminal = true;
                     yield Ok(ResponseEvent::Completed(completed_event).to_sse_event(&mut emitter).await);
                     break;
                 }
@@ -4998,6 +5025,7 @@ async fn create_response_stream(
                                 },
                             };
                             drop(client_execution_guard.take());
+                            saw_terminal = true;
                             yield Ok(ResponseEvent::Error(error_event).to_sse_event(&mut emitter).await);
                             break;
                         }
@@ -5015,6 +5043,7 @@ async fn create_response_stream(
 
                     drop(client_execution_guard.take());
                     response_execution.wait_for_quiescence().await;
+                    saw_terminal = true;
                     yield Ok(ResponseEvent::Cancelled(cancelled_event).to_sse_event(&mut emitter).await);
                     break;
                 }
@@ -5032,6 +5061,7 @@ async fn create_response_stream(
                         };
                         drop(client_execution_guard.take());
                         response_execution.wait_for_quiescence().await;
+                        saw_terminal = true;
                         yield Ok(ResponseEvent::Cancelled(cancelled_event).to_sse_event(&mut emitter).await);
                         break;
                     }
@@ -5053,6 +5083,7 @@ async fn create_response_stream(
                     };
 
                     drop(client_execution_guard.take());
+                    saw_terminal = true;
                     yield Ok(ResponseEvent::Error(error_event).to_sse_event(&mut emitter).await);
                     break;
                 }
@@ -5180,6 +5211,18 @@ async fn create_response_stream(
             }
         }
 
+        if require_explicit_terminal && !saw_terminal {
+            error!("Responses client stream closed without a terminal event");
+            let error_event = ResponseErrorEvent {
+                event_type: EVENT_RESPONSE_ERROR,
+                error: ResponseError {
+                    error_type: "stream_error".to_string(),
+                    message: "Response stream ended unexpectedly".to_string(),
+                },
+            };
+            yield Ok(ResponseEvent::Error(error_event).to_sse_event(&mut emitter).await);
+        }
+
         // Client stream is done, but storage and upstream tasks continue independently
         trace!("Client SSE stream ending");
     };
@@ -5214,22 +5257,20 @@ where
 /// Helper to create encrypted SSE event
 pub async fn encrypt_event(
     state: &AppState,
-    session_id: &Uuid,
+    transport_session: &TransportSession,
     event_type: &str,
     payload: &Value,
 ) -> Result<Event, ApiError> {
     trace!("encrypt_event called for event type: {}", event_type);
     let payload_str = payload.to_string();
-    let encrypted = state
-        .encrypt_session_data(session_id, payload_str.as_bytes())
+    let event_data = transport_session
+        .encode_sse_data(state, &payload_str)
         .await
         .map_err(|e| {
-            error!("Failed to encrypt event data: {:?}", e);
+            error!("Failed to encode event data: {:?}", e);
             ApiError::InternalServerError
         })?;
-
-    let base64_encrypted = base64::engine::general_purpose::STANDARD.encode(&encrypted);
-    Ok(Event::default().event(event_type).data(base64_encrypted))
+    Ok(Event::default().event(event_type).data(event_data))
 }
 
 /// GET /v1/responses/{id} - Retrieve a single response
@@ -5238,8 +5279,8 @@ async fn get_response(
     Path(id): Path<Uuid>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<ResponsesRetrieveResponse>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Getting response {} for user {}", id, user.uuid);
 
     // Get the response
@@ -5400,8 +5441,8 @@ async fn cancel_response(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     Extension(user): Extension<User>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<ResponsesRetrieveResponse>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Cancelling response {} for user {}", id, user.uuid);
 
     // Verify the response exists and belongs to the user, and is in_progress
@@ -5523,8 +5564,8 @@ async fn delete_response(
     State(state): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
     Extension(user): Extension<User>,
-    Extension(session_id): Extension<Uuid>,
-) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
+    Extension(session_id): Extension<TransportSession>,
+) -> Result<Response, ApiError> {
     debug!("Deleting response {} for user {}", id, user.uuid);
 
     let existing = state

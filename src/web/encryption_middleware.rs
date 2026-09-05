@@ -1,24 +1,279 @@
 use axum::{
     body::{Body, Bytes, HttpBody},
-    extract::State,
-    http::{HeaderMap, Method, Request},
+    extract::{FromRequestParts, State},
+    http::{request::Parts, HeaderMap, Method, Request},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
     Json,
 };
 use base64::Engine;
 use http_body::{Frame, SizeHint};
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use uuid::Uuid;
 
-use crate::{ApiError, AppState};
+use crate::{transport_v2::crypto::SessionId, ApiError, AppState};
 
 const MAX_ENCRYPTED_BODY_BYTES: usize = 50 * 1024 * 1024; // 50MB
+
+// Containers and scalar values each count as one node; object member names do
+// not count separately. String bytes are already covered by the body-size
+// limit and do not increase this count.
+const MAX_V2_JSON_NODES: usize = 1_048_576;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonComplexityError {
+    Invalid,
+    TooManyNodes,
+}
+
+struct JsonNodeBudget {
+    remaining: usize,
+    exceeded: bool,
+}
+
+impl JsonNodeBudget {
+    fn claim<E: serde::de::Error>(&mut self) -> Result<(), E> {
+        match self.remaining.checked_sub(1) {
+            Some(remaining) => {
+                self.remaining = remaining;
+                Ok(())
+            }
+            None => {
+                self.exceeded = true;
+                Err(E::custom("JSON node limit exceeded"))
+            }
+        }
+    }
+}
+
+struct JsonNode<'a> {
+    budget: &'a mut JsonNodeBudget,
+}
+
+impl<'de> DeserializeSeed<'de> for JsonNode<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        self.budget.claim::<D::Error>()?;
+        deserializer.deserialize_any(JsonNodeVisitor {
+            budget: self.budget,
+        })
+    }
+}
+
+struct JsonNodeVisitor<'a> {
+    budget: &'a mut JsonNodeBudget,
+}
+
+impl<'de> Visitor<'de> for JsonNodeVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence
+            .next_element_seed(JsonNode {
+                budget: &mut *self.budget,
+            })?
+            .is_some()
+        {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while map.next_key::<IgnoredAny>()?.is_some() {
+            map.next_value_seed(JsonNode {
+                budget: &mut *self.budget,
+            })?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_json_complexity(input: &[u8], max_nodes: usize) -> Result<(), JsonComplexityError> {
+    let mut budget = JsonNodeBudget {
+        remaining: max_nodes,
+        exceeded: false,
+    };
+    let mut deserializer = serde_json::Deserializer::from_slice(input);
+    let parsed = JsonNode {
+        budget: &mut budget,
+    }
+    .deserialize(&mut deserializer);
+
+    if budget.exceeded {
+        return Err(JsonComplexityError::TooManyNodes);
+    }
+    parsed.map_err(|_| JsonComplexityError::Invalid)?;
+    deserializer.end().map_err(|_| JsonComplexityError::Invalid)
+}
+
+fn validate_v2_json_body(input: &[u8], max_nodes: usize) -> Result<(), ApiError> {
+    match validate_json_complexity(input, max_nodes) {
+        Ok(()) => Ok(()),
+        Err(JsonComplexityError::Invalid) => Err(ApiError::BadRequest),
+        Err(JsonComplexityError::TooManyNodes) => Err(ApiError::PayloadTooLarge),
+    }
+}
+
+/// A decrypted request body transferred exactly once from middleware to its
+/// handler.
+///
+/// Axum's [`axum::Extension`] extractor clones the stored value. That is fine
+/// for small request metadata, but can duplicate a large deserialized request
+/// body. This extractor removes the value from the request extensions instead,
+/// preserving ordinary handler ownership without a second allocation.
+pub struct Decrypted<T>(pub T);
+
+#[axum::async_trait]
+impl<S, T> FromRequestParts<S> for Decrypted<T>
+where
+    S: Send + Sync,
+    T: Clone + Send + Sync + 'static,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .remove::<T>()
+            .map(Self)
+            .ok_or(ApiError::InternalServerError)
+    }
+}
+
+fn store_decrypted<T>(request: &mut Request<Body>, decrypted: T)
+where
+    T: Clone + Send + Sync + 'static,
+{
+    request.extensions_mut().insert(decrypted);
+}
+
+/// Identifies the transport context that must encrypt a handler response.
+///
+/// Keeping this distinct from the application's authenticated principal makes
+/// the response transport explicit at the handler boundary. V1 contains only
+/// the legacy session identifier; future protocol versions can carry their
+/// exact response-encryption context without changing every handler again.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransportSession {
+    kind: TransportSessionKind,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TransportSessionKind {
+    V1 {
+        session_id: Uuid,
+    },
+    #[allow(dead_code)] // Constructed by the stacked V2 gateway.
+    V2 {
+        session_id: SessionId,
+    },
+}
+
+impl TransportSession {
+    fn v1(session_id: Uuid) -> Self {
+        Self {
+            kind: TransportSessionKind::V1 { session_id },
+        }
+    }
+
+    /// Marks a request that has already been authenticated and decrypted by
+    /// the private Transport V2 gateway. This is an in-process capability: an
+    /// HTTP caller cannot create request extensions.
+    #[allow(dead_code)] // Constructed by the stacked V2 gateway.
+    pub(crate) fn v2(session_id: SessionId) -> Self {
+        Self {
+            kind: TransportSessionKind::V2 { session_id },
+        }
+    }
+
+    pub(crate) fn is_v2(&self) -> bool {
+        matches!(&self.kind, TransportSessionKind::V2 { .. })
+    }
+
+    #[allow(dead_code)] // Used by OAuth and native handoff in the gateway layer.
+    pub(crate) fn v2_session_id(&self) -> Option<SessionId> {
+        match &self.kind {
+            TransportSessionKind::V1 { .. } => None,
+            TransportSessionKind::V2 { session_id } => Some(*session_id),
+        }
+    }
+
+    pub(crate) async fn encrypt_response_bytes(
+        &self,
+        state: &AppState,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ApiError> {
+        match &self.kind {
+            TransportSessionKind::V1 { session_id } => {
+                state.encrypt_session_data(session_id, plaintext).await
+            }
+            TransportSessionKind::V2 { .. } => Ok(plaintext.to_vec()),
+        }
+    }
+
+    /// Returns the exact `data:` payload expected by the logical SSE stream.
+    /// V1 keeps its per-event encryption and base64 wrapper; V2 leaves the
+    /// inner stream as ordinary UTF-8 because the gateway encrypts the entire
+    /// response carrier record-by-record.
+    pub(crate) async fn encode_sse_data(
+        &self,
+        state: &AppState,
+        plaintext: &str,
+    ) -> Result<String, ApiError> {
+        match &self.kind {
+            TransportSessionKind::V1 { .. } => {
+                let encrypted = self
+                    .encrypt_response_bytes(state, plaintext.as_bytes())
+                    .await?;
+                Ok(base64::engine::general_purpose::STANDARD.encode(encrypted))
+            }
+            TransportSessionKind::V2 { .. } => Ok(plaintext.to_string()),
+        }
+    }
+}
 
 #[derive(Deserialize)]
 pub struct EncryptedRequest {
@@ -73,7 +328,9 @@ where
     if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>() {
         request.extensions_mut().insert(());
     }
-    request.extensions_mut().insert(session_id);
+    request
+        .extensions_mut()
+        .insert(TransportSession::v1(session_id));
     let response = run_next(request).await;
     Ok(hold_resource_through_response_body(response, resource))
 }
@@ -87,6 +344,27 @@ pub async fn decrypt_request<T>(
 where
     T: DeserializeOwned + Send + Sync + Clone + 'static,
 {
+    if request
+        .extensions()
+        .get::<TransportSession>()
+        .is_some_and(TransportSession::is_v2)
+    {
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>() {
+            request.extensions_mut().insert(());
+        } else {
+            let body = std::mem::replace(request.body_mut(), Body::empty());
+            let body_bytes = axum::body::to_bytes(body, MAX_ENCRYPTED_BODY_BYTES)
+                .await
+                .map_err(|_| ApiError::PayloadTooLarge)?;
+            validate_v2_json_body(&body_bytes, MAX_V2_JSON_NODES)?;
+            let decoded =
+                serde_json::from_slice::<T>(&body_bytes).map_err(|_| ApiError::BadRequest)?;
+            store_decrypted(&mut request, decoded);
+        }
+
+        return Ok(next.run(request).await);
+    }
+
     let session_id = parse_session_id(&headers)?;
 
     // Skip body processing for GET, DELETE, or when T is ().
@@ -127,8 +405,10 @@ where
         ApiError::BadRequest
     })?;
 
-    request.extensions_mut().insert(decrypted);
-    request.extensions_mut().insert(session_id);
+    store_decrypted(&mut request, decrypted);
+    request
+        .extensions_mut()
+        .insert(TransportSession::v1(session_id));
     let response = next.run(request).await;
     Ok(hold_resource_through_response_body(response, session_lease))
 }
@@ -175,16 +455,26 @@ where
 
 pub async fn encrypt_response<T: Serialize>(
     state: &AppState,
-    session_id: &Uuid,
+    transport_session: &TransportSession,
     response: &T,
-) -> Result<Json<EncryptedResponse<T>>, ApiError> {
+) -> Result<Response, ApiError> {
     let response_json = serde_json::to_vec(response).map_err(|_| ApiError::InternalServerError)?;
-    let encrypted_response = state
-        .encrypt_session_data(session_id, &response_json)
+
+    if transport_session.is_v2() {
+        return Ok((
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            response_json,
+        )
+            .into_response());
+    }
+
+    let encrypted_response = transport_session
+        .encrypt_response_bytes(state, &response_json)
         .await?;
-    Ok(Json(EncryptedResponse::new(
+    Ok(Json(EncryptedResponse::<T>::new(
         base64::engine::general_purpose::STANDARD.encode(encrypted_response),
-    )))
+    ))
+    .into_response())
 }
 
 #[cfg(test)]
@@ -201,6 +491,82 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[derive(Debug)]
+    struct CloneSpy {
+        clone_count: Arc<AtomicUsize>,
+        value: String,
+    }
+
+    impl Clone for CloneSpy {
+        fn clone(&self) -> Self {
+            self.clone_count.fetch_add(1, Ordering::SeqCst);
+            Self {
+                clone_count: self.clone_count.clone(),
+                value: self.value.clone(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decrypted_body_is_moved_to_the_handler_without_cloning() {
+        let clone_count = Arc::new(AtomicUsize::new(0));
+        let mut request = Request::new(Body::empty());
+        store_decrypted(
+            &mut request,
+            CloneSpy {
+                clone_count: clone_count.clone(),
+                value: "request body".to_string(),
+            },
+        );
+        let (mut parts, _) = request.into_parts();
+
+        let Decrypted(body) = Decrypted::<CloneSpy>::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+
+        assert_eq!(body.value, "request body");
+        assert_eq!(clone_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn decrypted_body_can_only_be_extracted_once() {
+        let mut request = Request::new(Body::empty());
+        store_decrypted(&mut request, "request body".to_string());
+        let (mut parts, _) = request.into_parts();
+
+        let first = Decrypted::<String>::from_request_parts(&mut parts, &()).await;
+        let second = Decrypted::<String>::from_request_parts(&mut parts, &()).await;
+
+        assert!(matches!(first, Ok(Decrypted(body)) if body == "request body"));
+        assert!(matches!(second, Err(ApiError::InternalServerError)));
+    }
+
+    #[test]
+    fn json_complexity_counts_structure_without_counting_string_bytes() {
+        let large_string = format!(r#""{}""#, "x".repeat(128 * 1024));
+        assert_eq!(validate_json_complexity(large_string.as_bytes(), 1), Ok(()));
+
+        let structured = br#"[true,{"payload":"aGVsbG8="},[-1,1.5,null]]"#;
+        assert_eq!(validate_json_complexity(structured, 8), Ok(()));
+        assert_eq!(
+            validate_json_complexity(structured, 7),
+            Err(JsonComplexityError::TooManyNodes)
+        );
+    }
+
+    #[test]
+    fn v2_json_preflight_distinguishes_invalid_json_from_excess_structure() {
+        assert!(matches!(
+            validate_v2_json_body(br#"[1,]"#, 16),
+            Err(ApiError::BadRequest)
+        ));
+        assert!(matches!(
+            validate_v2_json_body(br#"[1,2]"#, 2),
+            Err(ApiError::PayloadTooLarge)
+        ));
+        assert!(validate_v2_json_body(br#"[1,2]"#, 3).is_ok());
+    }
 
     #[test]
     fn classifies_every_bodyless_disjunct() {
@@ -274,7 +640,10 @@ mod tests {
                 .body(Body::empty())
                 .unwrap(),
             move |request| {
-                assert_eq!(request.extensions().get::<Uuid>(), Some(&session_id));
+                assert_eq!(
+                    request.extensions().get::<TransportSession>(),
+                    Some(&TransportSession::v1(session_id))
+                );
                 assert!(request.extensions().get::<()>().is_some());
                 observed_calls.fetch_add(1, Ordering::SeqCst);
                 async { Response::new(Body::empty()) }

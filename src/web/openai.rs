@@ -4,6 +4,9 @@ use crate::model_config::{
 };
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
+use crate::provider_cache::{
+    derive_tinfoil_cache_namespace, CacheNamespaceRoot, DerivedCacheNamespace,
+};
 use crate::provider_client::{
     ProviderClient, ProviderRequest, ProviderRequestError, ProviderResponse,
 };
@@ -11,17 +14,20 @@ use crate::provider_routing::{ProviderName, ProviderRoutingError};
 use crate::proxy_config::ProxyConfig;
 use crate::sqs::UsageEvent;
 use crate::web::audio_utils::{merge_transcriptions, AudioSplitter, TINFOIL_MAX_SIZE};
-use crate::web::encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse};
+use crate::web::encryption_middleware::{
+    decrypt_request, encrypt_response, Decrypted, TransportSession,
+};
 use crate::web::openai_auth::AuthMethod;
 use crate::web::responses::{ResponseExecution, ResponseExecutionTaskGuard};
 use crate::{ApiError, AppState};
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap};
 use axum::{
+    body::Body,
     extract::State,
     response::sse::{Event, Sse},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use base64::{engine::general_purpose, Engine as _};
 use bigdecimal::BigDecimal;
@@ -52,6 +58,37 @@ const MAX_BOUNDED_PROVIDER_RESPONSE_BYTES: usize = 256 * 1024;
 
 const PROVIDER_MANAGED_CACHE_SALT_FIELD: &str = "cache_salt";
 const PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD: &str = "user_cache_secret";
+
+/// The provider cache namespace is an explicit input to every completion.
+/// This prevents a V2 request from silently falling back to the legacy,
+/// operator-computable SHA256(user UUID) namespace.
+#[derive(Clone)]
+pub(crate) enum CompletionCachePolicy {
+    LegacyV1,
+    BoundV2(DerivedCacheNamespace),
+}
+
+impl CompletionCachePolicy {
+    pub(crate) fn for_request(
+        transport: &TransportSession,
+        cache_namespace_root: Option<CacheNamespaceRoot>,
+        verified_user_id: Uuid,
+    ) -> Result<Self, ApiError> {
+        if transport.is_v2() {
+            let root = cache_namespace_root.ok_or(ApiError::BadRequest)?;
+            Ok(Self::BoundV2(derive_tinfoil_cache_namespace(
+                &root,
+                verified_user_id,
+            )))
+        } else {
+            Ok(Self::LegacyV1)
+        }
+    }
+
+    pub(crate) const fn requires_provider_done(&self) -> bool {
+        matches!(self, Self::BoundV2(_))
+    }
+}
 
 #[derive(Clone, Default)]
 struct CompletionRequestLogMetadata {
@@ -519,6 +556,48 @@ pub struct BillingContext {
     pub model_name: String,
 }
 
+/// Application policy carried with an internal completion request.
+///
+/// Keeping these values together makes it difficult for nested inference paths
+/// to forget the transport-specific cache boundary while retaining the shared
+/// completion implementation used by Chat and Responses.
+pub(crate) struct CompletionExecutionContext<'a> {
+    billing: BillingContext,
+    model_plan: ModelPlan,
+    cache: &'a CompletionCachePolicy,
+    response_execution: Option<ResponseExecution>,
+    response_execution_guard: Option<ResponseExecutionTaskGuard>,
+}
+
+impl<'a> CompletionExecutionContext<'a> {
+    pub(crate) const fn new(
+        billing: BillingContext,
+        model_plan: ModelPlan,
+        cache: &'a CompletionCachePolicy,
+    ) -> Self {
+        Self {
+            billing,
+            model_plan,
+            cache,
+            response_execution: None,
+            response_execution_guard: None,
+        }
+    }
+
+    fn with_response_execution(
+        mut self,
+        response_execution: ResponseExecution,
+    ) -> Result<Self, ApiError> {
+        let response_execution_guard = response_execution.begin_task().map_err(|_| {
+            debug!("Response execution was cancelled before a provider turn could start");
+            ApiError::ServiceUnavailable
+        })?;
+        self.response_execution = Some(response_execution);
+        self.response_execution_guard = Some(response_execution_guard);
+        Ok(self)
+    }
+}
+
 impl BillingContext {
     pub fn new(auth_method: AuthMethod, model_name: String) -> Self {
         Self {
@@ -755,11 +834,17 @@ pub fn models_router(app_state: Arc<AppState>) -> Router<()> {
 async fn proxy_openai(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(auth_method): axum::Extension<AuthMethod>,
-    axum::Extension(mut body): axum::Extension<Value>,
+    cache_namespace_root: Option<axum::Extension<CacheNamespaceRoot>>,
+    Decrypted(mut body): Decrypted<Value>,
 ) -> Result<Response, ApiError> {
+    let cache_policy = CompletionCachePolicy::for_request(
+        &session_id,
+        cache_namespace_root.map(|axum::Extension(root)| root),
+        user.uuid,
+    )?;
     let billing_access = state
         .chat_billing_access(user.uuid, auth_method == AuthMethod::ApiKey)
         .await;
@@ -811,9 +896,14 @@ async fn proxy_openai(
     let billing_context = BillingContext::new(auth_method, requested_model_name);
 
     // Get the completion stream - billing happens automatically inside!
-    let completion =
-        get_chat_completion_response(&state, &user, body, &headers, billing_context, model_plan)
-            .await?;
+    let completion = get_chat_completion_response(
+        &state,
+        &user,
+        body,
+        &headers,
+        CompletionExecutionContext::new(billing_context, model_plan, &cache_policy),
+    )
+    .await?;
 
     debug!(
         "Received completion from provider: {} (streaming: {})",
@@ -842,7 +932,9 @@ async fn proxy_openai(
     debug!("Handling streaming response");
     let mut rx = completion.stream;
 
+    let require_explicit_terminal = session_id.is_v2();
     let stream = async_stream::stream! {
+        let mut saw_terminal = false;
         while let Some(chunk) = rx.recv().await {
             match chunk {
                 CompletionChunk::StreamChunk(json) => {
@@ -865,10 +957,12 @@ async fn proxy_openai(
                     trace!("Received usage chunk (billing already processed)");
                 }
                 CompletionChunk::Done => {
+                    saw_terminal = true;
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
                 CompletionChunk::Error(error_msg) => {
+                    saw_terminal = true;
                     error!("Stream error from completion API: {}", error_msg);
                     match encrypt_sse_event(&state, &session_id, &stream_error_payload(&error_msg)).await {
                         Ok(event) => yield Ok(event),
@@ -881,6 +975,7 @@ async fn proxy_openai(
                     break;
                 }
                 CompletionChunk::FullResponse(_) => {
+                    saw_terminal = true;
                     // Shouldn't happen in streaming mode
                     error!("Received FullResponse in streaming mode");
                     match encrypt_sse_event(&state, &session_id, &stream_error_payload("Invalid event format")).await {
@@ -892,6 +987,22 @@ async fn proxy_openai(
                         }
                     }
                     break;
+                }
+            }
+        }
+
+        if require_explicit_terminal && !saw_terminal {
+            error!("Completion stream closed without a terminal event");
+            match encrypt_sse_event(
+                &state,
+                &session_id,
+                &stream_error_payload("Completion stream ended unexpectedly"),
+            )
+            .await
+            {
+                Ok(event) => yield Ok(event),
+                Err(error) => {
+                    error!("Failed to encode terminal stream error: {:?}", error);
                 }
             }
         }
@@ -923,21 +1034,10 @@ pub async fn get_chat_completion_response(
     user: &User,
     body: Value,
     headers: &HeaderMap,
-    billing_context: BillingContext,
-    model_plan: ModelPlan,
+    execution: CompletionExecutionContext<'_>,
 ) -> Result<CompletionStream, ApiError> {
-    get_chat_completion_response_with_expected_route(
-        state,
-        user,
-        body,
-        headers,
-        billing_context,
-        model_plan,
-        None,
-        None,
-        None,
-    )
-    .await
+    get_chat_completion_response_with_expected_route(state, user, body, headers, execution, None)
+        .await
 }
 
 /// Responses-only completion entry point with process-local task ownership.
@@ -947,26 +1047,12 @@ pub(crate) async fn get_chat_completion_response_for_execution(
     user: &User,
     body: Value,
     headers: &HeaderMap,
-    billing_context: BillingContext,
-    model_plan: ModelPlan,
+    execution: CompletionExecutionContext<'_>,
     response_execution: ResponseExecution,
 ) -> Result<CompletionStream, ApiError> {
-    let response_execution_guard = response_execution.begin_task().map_err(|_| {
-        debug!("Response execution was cancelled before a provider turn could start");
-        ApiError::ServiceUnavailable
-    })?;
-    get_chat_completion_response_with_expected_route(
-        state,
-        user,
-        body,
-        headers,
-        billing_context,
-        model_plan,
-        None,
-        Some(response_execution),
-        Some(response_execution_guard),
-    )
-    .await
+    let execution = execution.with_response_execution(response_execution)?;
+    get_chat_completion_response_with_expected_route(state, user, body, headers, execution, None)
+        .await
 }
 
 /// Run an entitled completion only if routing resolves to the server-selected
@@ -978,8 +1064,7 @@ pub(crate) async fn get_chat_completion_response_for_expected_route(
     user: &User,
     body: Value,
     headers: &HeaderMap,
-    billing_context: BillingContext,
-    model_plan: ModelPlan,
+    execution: CompletionExecutionContext<'_>,
     route: ServerSelectedCompletionRoute<'_>,
 ) -> Result<CompletionStream, ApiError> {
     let continuum_cache_salt = (route.provider_name == ProviderName::Continuum.as_str())
@@ -989,15 +1074,12 @@ pub(crate) async fn get_chat_completion_response_for_expected_route(
         user,
         body,
         headers,
-        billing_context,
-        model_plan,
+        execution,
         Some(ExpectedCompletionRoute {
             provider_name: route.provider_name,
             provider_model_id: route.provider_model_id,
             continuum_cache_salt,
         }),
-        None,
-        None,
     )
     .await
 }
@@ -1014,18 +1096,24 @@ struct ExpectedCompletionRoute<'a> {
     continuum_cache_salt: Option<String>,
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn get_chat_completion_response_with_expected_route(
     state: &Arc<AppState>,
     user: &User,
     body: Value,
     headers: &HeaderMap,
-    mut billing_context: BillingContext,
-    model_plan: ModelPlan,
+    execution: CompletionExecutionContext<'_>,
     expected_route: Option<ExpectedCompletionRoute<'_>>,
-    response_execution: Option<ResponseExecution>,
-    response_execution_guard: Option<ResponseExecutionTaskGuard>,
 ) -> Result<CompletionStream, ApiError> {
+    let CompletionExecutionContext {
+        mut billing,
+        model_plan,
+        cache,
+        response_execution,
+        response_execution_guard,
+    } = execution;
+    let billing_context = &mut billing;
+    let cache_policy = cache;
+    let require_provider_done = cache_policy.requires_provider_done();
     if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
         error!("Request body is empty or invalid");
         return Err(ApiError::BadRequest);
@@ -1133,6 +1221,7 @@ async fn get_chat_completion_response_with_expected_route(
         &mut modified_body,
         &selected_route.proxy.provider_name,
         user.uuid,
+        cache_policy,
     );
     if let Some(expected_route) = &expected_route {
         apply_server_selected_cache_isolation(
@@ -1247,14 +1336,8 @@ async fn get_chat_completion_response_with_expected_route(
 
         // ✅ Handle billing HERE, inside completions API
         if let Some(usage) = extract_usage(&response_json) {
-            publish_usage_event_internal(
-                state,
-                user,
-                &billing_context,
-                usage,
-                &successful_provider,
-            )
-            .await;
+            publish_usage_event_internal(state, user, billing_context, usage, &successful_provider)
+                .await;
         }
 
         // Return the full response as a single chunk
@@ -1422,7 +1505,14 @@ async fn get_chat_completion_response_with_expected_route(
                         &tx_consumer,
                     )
                     .await;
-                    let _ = tx_consumer.send(CompletionChunk::Done).await;
+                    let terminal = if require_provider_done {
+                        CompletionChunk::Error(
+                            "Provider stream ended before its completion marker".to_string(),
+                        )
+                    } else {
+                        CompletionChunk::Done
+                    };
+                    let _ = tx_consumer.send(terminal).await;
                     return;
                 }
                 Err(_) => {
@@ -1546,6 +1636,7 @@ fn apply_provider_managed_request_fields(
     body: &mut serde_json::Map<String, Value>,
     provider_name: &str,
     user_uuid: Uuid,
+    cache_policy: &CompletionCachePolicy,
 ) {
     if body.remove(PROVIDER_MANAGED_CACHE_SALT_FIELD).is_some() {
         debug!("Stripped provider-managed completion request field: cache_salt");
@@ -1556,9 +1647,13 @@ fn apply_provider_managed_request_fields(
         .is_some();
 
     if provider_name == ProviderName::Tinfoil.as_str() {
+        let user_cache_secret = match cache_policy {
+            CompletionCachePolicy::LegacyV1 => tinfoil_user_cache_secret(user_uuid),
+            CompletionCachePolicy::BoundV2(namespace) => namespace.tinfoil_user_cache_secret(),
+        };
         body.insert(
             PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD.to_string(),
-            json!(tinfoil_user_cache_secret(user_uuid)),
+            json!(user_cache_secret),
         );
         if replaced_user_cache_secret {
             debug!("Replaced provider-managed completion request field: user_cache_secret");
@@ -1785,27 +1880,25 @@ fn build_usage_event(
 /// Helper to encrypt an SSE event
 async fn encrypt_sse_event(
     state: &AppState,
-    session_id: &Uuid,
+    transport_session: &TransportSession,
     json: &Value,
 ) -> Result<Event, ApiError> {
     let json_str = json.to_string();
-    let encrypted_data = state
-        .encrypt_session_data(session_id, json_str.as_bytes())
+    let event_data = transport_session
+        .encode_sse_data(state, &json_str)
         .await
         .map_err(|e| {
-            error!("Failed to encrypt SSE event data: {:?}", e);
+            error!("Failed to encode SSE event data: {:?}", e);
             ApiError::InternalServerError
         })?;
-
-    let base64_encrypted = general_purpose::STANDARD.encode(&encrypted_data);
-    Ok(Event::default().data(base64_encrypted))
+    Ok(Event::default().data(event_data))
 }
 
 async fn proxy_models(
     State(state): State<Arc<AppState>>,
-    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(session_id): axum::Extension<TransportSession>,
     user: Option<axum::Extension<User>>,
-) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     let _ = user;
     let proxy_config = state.proxy_router.get_completion_proxy();
     let models_response = if proxy_config.provider_name == "tinfoil" {
@@ -1840,13 +1933,9 @@ async fn fetch_provider_models(
 
     if !res.is_success() {
         let status = res.status_code();
-        let body_bytes = res.bytes().await.ok();
-        let error_msg = body_bytes
-            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-            .unwrap_or_else(|| status.to_string());
         error!(
-            "Provider {} returned non-success status for models: {} - {}",
-            proxy_config.provider_name, status, error_msg
+            "Provider {} returned non-success status for models: {}",
+            proxy_config.provider_name, status
         );
         return Err(ApiError::InternalServerError);
     }
@@ -1865,11 +1954,11 @@ async fn fetch_provider_models(
 async fn proxy_model_catalog(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
-    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
     axum::Extension(_body): axum::Extension<()>,
-) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+) -> Result<Response, ApiError> {
     let billing_access = state.chat_billing_access(user.uuid, false).await;
     let model_plan = ModelPlan::from_is_paid(
         billing_access.is_some_and(crate::billing::ChatBillingAccess::is_paid),
@@ -1980,11 +2069,11 @@ async fn send_transcription_with_retries(
 async fn proxy_transcription(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
-    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
-    axum::Extension(transcription_request): axum::Extension<TranscriptionRequest>,
-) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+    Decrypted(transcription_request): Decrypted<TranscriptionRequest>,
+) -> Result<Response, ApiError> {
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
         if let Some(billing_client) = &state.billing_client {
@@ -2301,14 +2390,9 @@ async fn send_transcription_request(
                 Ok(response_json)
             } else {
                 let status = res.status_code();
-                let body_bytes = res.bytes().await.ok();
-                let error_msg = body_bytes
-                    .map(|b| String::from_utf8_lossy(&b).to_string())
-                    .unwrap_or_else(|| status.to_string());
-
                 error!(
-                    "Provider {} returned transcription error: {} - {}",
-                    provider.provider_name, status, error_msg
+                    "Provider {} returned non-success status for transcription: {}",
+                    provider.provider_name, status
                 );
                 Err(ApiError::InternalServerError)
             }
@@ -2385,11 +2469,11 @@ async fn ensure_paid_tts_access(state: &AppState, user: &User) -> Result<(), Api
 
 async fn proxy_tts(
     State(state): State<Arc<AppState>>,
-    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
-    axum::Extension(tts_request): axum::Extension<TTSRequest>,
-) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+    Decrypted(tts_request): Decrypted<TTSRequest>,
+) -> Result<Response, ApiError> {
     let prepared = prepare_tts_request(tts_request).map_err(|validation_error| {
         warn!(
             error = %validation_error,
@@ -2452,8 +2536,7 @@ async fn proxy_tts(
         ApiError::InternalServerError
     })??;
 
-    let (response_payload, is_json_response) =
-        build_tts_response_payload(&body_bytes, &response_content_type);
+    let is_json_response = serde_json::from_slice::<Value>(&body_bytes).is_ok();
     if is_json_response {
         warn!(
             model = %prepared.model,
@@ -2471,18 +2554,28 @@ async fn proxy_tts(
         );
     }
 
-    // Encrypt and return the response
+    // Transport V2 encrypts the complete logical HTTP response in the gateway,
+    // so it can preserve the provider's native audio or JSON bytes. V1 keeps
+    // its established JSON/base64 response contract unchanged.
+    if session_id.is_v2() {
+        return Response::builder()
+            .header(header::CONTENT_TYPE, response_content_type)
+            .body(Body::from(body_bytes))
+            .map_err(|_| ApiError::InternalServerError);
+    }
+
+    let (response_payload, _) = build_tts_response_payload(&body_bytes, &response_content_type);
     encrypt_response(&state, &session_id, &response_payload).await
 }
 
 async fn proxy_embeddings(
     State(state): State<Arc<AppState>>,
     _headers: HeaderMap,
-    axum::Extension(session_id): axum::Extension<Uuid>,
+    axum::Extension(session_id): axum::Extension<TransportSession>,
     axum::Extension(user): axum::Extension<User>,
     axum::Extension(_auth_method): axum::Extension<AuthMethod>,
-    axum::Extension(embedding_request): axum::Extension<EmbeddingRequest>,
-) -> Result<Json<EncryptedResponse<Value>>, ApiError> {
+    Decrypted(embedding_request): Decrypted<EmbeddingRequest>,
+) -> Result<Response, ApiError> {
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() {
         if let Some(billing_client) = &state.billing_client {
@@ -2550,13 +2643,9 @@ async fn proxy_embeddings(
 
     if !res.is_success() {
         let status = res.status_code();
-        let body_bytes = res.bytes().await.ok();
-        let error_msg = body_bytes
-            .map(|b| String::from_utf8_lossy(&b).to_string())
-            .unwrap_or_else(|| status.to_string());
         error!(
-            "Embeddings proxy returned non-success status: {} - {}",
-            status, error_msg
+            "Provider {} returned non-success status for embeddings: {}",
+            proxy_config.provider_name, status
         );
         return Err(ApiError::InternalServerError);
     }
@@ -3101,12 +3190,46 @@ mod tests {
             ("messages".to_string(), json!([])),
         ]);
 
-        apply_provider_managed_request_fields(&mut body, ProviderName::Tinfoil.as_str(), user_uuid);
+        apply_provider_managed_request_fields(
+            &mut body,
+            ProviderName::Tinfoil.as_str(),
+            user_uuid,
+            &CompletionCachePolicy::LegacyV1,
+        );
 
         assert_eq!(body.get("model"), Some(&json!("kimi-k2-6")));
         assert_eq!(body.get("messages"), Some(&json!([])));
         assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
         assert_eq!(
+            body.get(PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD),
+            Some(&json!(tinfoil_user_cache_secret(user_uuid)))
+        );
+    }
+
+    #[test]
+    fn bound_v2_cache_namespace_replaces_legacy_and_client_values() {
+        let user_uuid = Uuid::from_u128(42);
+        let root = CacheNamespaceRoot::from_bytes([0x55; 32]);
+        let namespace = derive_tinfoil_cache_namespace(&root, user_uuid);
+        let expected = namespace.tinfoil_user_cache_secret();
+        let mut body = serde_json::Map::from_iter([
+            ("cache_salt".to_string(), json!("user-supplied")),
+            ("user_cache_secret".to_string(), json!("client-controlled")),
+        ]);
+
+        apply_provider_managed_request_fields(
+            &mut body,
+            ProviderName::Tinfoil.as_str(),
+            user_uuid,
+            &CompletionCachePolicy::BoundV2(namespace),
+        );
+
+        assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
+        assert_eq!(
+            body.get(PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD),
+            Some(&json!(expected))
+        );
+        assert_ne!(
             body.get(PROVIDER_MANAGED_USER_CACHE_SECRET_FIELD),
             Some(&json!(tinfoil_user_cache_secret(user_uuid)))
         );
@@ -3123,6 +3246,7 @@ mod tests {
             &mut body,
             ProviderName::Continuum.as_str(),
             Uuid::from_u128(42),
+            &CompletionCachePolicy::LegacyV1,
         );
 
         assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
@@ -3141,6 +3265,7 @@ mod tests {
             &mut body,
             ProviderName::Continuum.as_str(),
             user_uuid,
+            &CompletionCachePolicy::LegacyV1,
         );
         assert!(!body.contains_key(PROVIDER_MANAGED_CACHE_SALT_FIELD));
 

@@ -23,8 +23,8 @@ use crate::web::openai_auth::{validate_openai_auth, validate_optional_openai_aut
 use crate::web::platform_login_routes;
 use crate::web::{
     conversation_projects_routes, conversations_routes, health_routes_with_state,
-    instructions_routes, login_routes, oauth_routes, openai_models_routes, openai_routes,
-    protected_routes, responses_routes, web_routes,
+    instructions_routes, login_routes, native_handoff_routes, oauth_routes, openai_models_routes,
+    openai_routes, protected_routes, responses_routes, web_routes,
 };
 use crate::{attestation_routes::SessionState, web::platform_routes};
 use bounded_ttl_cache::BoundedTtlCache;
@@ -57,7 +57,7 @@ use axum::{
     http::{HeaderName, HeaderValue, StatusCode},
     middleware::{from_fn, from_fn_with_state, Next},
     response::{IntoResponse, Response},
-    Json,
+    Json, Router,
 };
 use base64::engine::general_purpose;
 use base64::Engine as _;
@@ -113,6 +113,8 @@ mod models;
 mod oauth;
 mod os_flags;
 mod private_key;
+#[allow(dead_code)] // Used by the dormant Transport V2 core in this stack layer.
+mod provider_cache;
 mod provider_client;
 mod provider_routing;
 mod proxy_config;
@@ -122,6 +124,8 @@ mod security_invariants;
 mod seed_wrapping;
 mod sqs;
 mod tokens;
+#[allow(dead_code)] // Includes client-side vector helpers shared with the SDK implementation.
+mod transport_v2;
 mod web;
 
 #[cfg(test)]
@@ -1711,7 +1715,7 @@ impl AppState {
 
         let encrypted_pw = encrypt_with_key(&secret_key, password_hash.as_bytes()).await;
 
-        tracing::debug!("registering new user: {:?}", creds.email);
+        tracing::debug!("Registering new user");
 
         // Generate private key for new user
         let user_seed_words = generate_twelve_word_seed(self.aws_credential_manager.clone())
@@ -1727,7 +1731,7 @@ impl AppState {
             user_seed_words.as_bytes(),
         )?;
 
-        tracing::info!("registered new user: {:?} {:?}", user.email, user.uuid);
+        tracing::info!("Registered new user: {}", user.uuid);
 
         Ok(user)
     }
@@ -2122,7 +2126,7 @@ impl AppState {
             Err(DBError::UserNotFound) => {
                 // User doesn't exist, but we don't want to reveal this information
                 // So we'll just log it and return as if everything was successful
-                debug!("Password reset requested for non-existent email: {}", email);
+                debug!("Password reset requested for nonexistent user");
             }
             Err(e) => {
                 // For other errors, we should still log them but not expose them to the user
@@ -2295,10 +2299,7 @@ impl AppState {
             Ok(None) => {
                 // User doesn't exist, but we don't want to reveal this information
                 // So we'll just log it and return as if everything was successful
-                debug!(
-                    "Password reset requested for non-existent platform email: {}",
-                    email
-                );
+                debug!("Password reset requested for nonexistent platform user");
             }
             Err(e) => {
                 // For other errors, we should still log them but not expose them to the user
@@ -2627,7 +2628,7 @@ impl AppState {
         let platform_user = match self.db.get_platform_user_by_email(email)? {
             Some(user) => user,
             None => {
-                warn!("Could not find platform user by email: {email}");
+                warn!("Could not find platform user by provided login identifier");
                 return Ok(None);
             }
         };
@@ -3510,6 +3511,48 @@ async fn retrieve_kagi_api_key(
     }
 }
 
+fn application_routes(app_state: Arc<AppState>) -> Router<()> {
+    protected_routes(app_state.clone())
+        .route_layer(from_fn_with_state(app_state.clone(), validate_jwt))
+        .merge(login_routes(app_state.clone()))
+        .merge(
+            openai_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_openai_auth)),
+        )
+        .merge(
+            openai_models_routes(app_state.clone()).route_layer(from_fn_with_state(
+                app_state.clone(),
+                validate_optional_openai_auth,
+            )),
+        )
+        .merge(
+            responses_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            web_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            conversations_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            conversation_projects_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(
+            instructions_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
+        )
+        .merge(oauth_routes(app_state.clone()))
+        .merge(platform_login_routes(app_state.clone()))
+        .merge(
+            platform_routes(app_state.clone())
+                .route_layer(from_fn_with_state(app_state.clone(), validate_platform_jwt)),
+        )
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     dotenv::dotenv().ok();
@@ -3863,47 +3906,19 @@ async fn main() -> Result<(), Error> {
         // allow requests from any origin
         .allow_origin(Any);
 
-    let app = protected_routes(app_state.clone())
-        .route_layer(from_fn_with_state(app_state.clone(), validate_jwt))
+    let application = application_routes(app_state.clone());
+    let v2_application = application
+        .clone()
         .merge(health_routes_with_state(app_state.clone()))
-        .merge(login_routes(app_state.clone()))
-        .merge(
-            openai_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_openai_auth)),
-        )
-        .merge(
-            openai_models_routes(app_state.clone()).route_layer(from_fn_with_state(
-                app_state.clone(),
-                validate_optional_openai_auth,
-            )),
-        )
-        .merge(
-            responses_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
-        )
-        .merge(
-            web_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
-        )
-        .merge(
-            conversations_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
-        )
-        .merge(
-            conversation_projects_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
-        )
-        .merge(
-            instructions_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_jwt)),
-        )
+        .merge(native_handoff_routes(app_state.clone()))
+        .layer(from_fn(add_error_contract_header));
+    let transport_v2_gateway =
+        transport_v2::gateway::TransportV2Gateway::new(app_state.clone(), v2_application);
+
+    let app = application
+        .merge(health_routes_with_state(app_state.clone()))
         .merge(attestation_routes::router(app_state.clone()))
-        .merge(oauth_routes(app_state.clone()))
-        .merge(platform_login_routes(app_state.clone()))
-        .merge(
-            platform_routes(app_state.clone())
-                .route_layer(from_fn_with_state(app_state.clone(), validate_platform_jwt)),
-        )
+        .merge(transport_v2_gateway.router())
         .layer(cors)
         .layer(from_fn(add_error_contract_header));
 
@@ -3917,6 +3932,9 @@ async fn main() -> Result<(), Error> {
         result = axum::serve(listener, app.into_make_service()) => Ok(result?),
         _ = secret_cache_maintenance::run(app_state) => {
             unreachable!("secret cache maintenance runs until the server stops")
+        }
+        _ = transport_v2_gateway.run_maintenance() => {
+            unreachable!("transport-v2 session maintenance runs until the server stops")
         }
     }
 }

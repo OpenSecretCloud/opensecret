@@ -7,7 +7,7 @@ use crate::{
     models::users::User,
     tokens::count_tokens,
     web::{
-        encryption_middleware::{decrypt_request, encrypt_response, EncryptedResponse},
+        encryption_middleware::{decrypt_request, encrypt_response, Decrypted, TransportSession},
         responses::{
             constants::{
                 DEFAULT_PAGINATION_LIMIT, DEFAULT_PAGINATION_ORDER, MAX_PAGINATION_LIMIT,
@@ -21,8 +21,9 @@ use crate::{
 use axum::{
     extract::{Path, Query, State},
     middleware::from_fn_with_state,
+    response::Response,
     routing::{delete, get, post},
-    Extension, Json, Router,
+    Extension, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -157,11 +158,11 @@ fn build_project_response(
 
 async fn create_conversation_project(
     State(state): State<Arc<AppState>>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(body): Extension<CreateConversationProjectRequest>,
-) -> Result<Json<EncryptedResponse<ConversationProjectResponse>>, ApiError> {
+    Decrypted(body): Decrypted<CreateConversationProjectRequest>,
+) -> Result<Response, ApiError> {
     let name = validate_project_name(&body.name)?;
     let user_key = state
         .get_user_key(&user, &auth_context, None, None)
@@ -184,10 +185,10 @@ async fn create_conversation_project(
 async fn list_conversation_projects(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListConversationProjectsParams>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-) -> Result<Json<EncryptedResponse<ConversationProjectListResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     let limit = if params.limit <= 0 {
         DEFAULT_PAGINATION_LIMIT
     } else {
@@ -241,10 +242,10 @@ async fn list_conversation_projects(
 async fn get_conversation_project(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-) -> Result<Json<EncryptedResponse<ConversationProjectResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     let ctx = ConversationProjectContext::load(&state, project_id, &user, &auth_context).await?;
     let instructions = state
         .db
@@ -263,11 +264,11 @@ async fn get_conversation_project(
 async fn update_conversation_project(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
     Extension(auth_context): Extension<AuthContext>,
-    Extension(body): Extension<UpdateConversationProjectRequest>,
-) -> Result<Json<EncryptedResponse<ConversationProjectResponse>>, ApiError> {
+    Decrypted(body): Decrypted<UpdateConversationProjectRequest>,
+) -> Result<Response, ApiError> {
     if body.name.is_none() && body.instructions.is_missing() {
         return Err(ApiError::BadRequest);
     }
@@ -321,9 +322,9 @@ async fn update_conversation_project(
 async fn delete_conversation_project(
     State(state): State<Arc<AppState>>,
     Path(project_id): Path<Uuid>,
-    Extension(session_id): Extension<Uuid>,
+    Extension(session_id): Extension<TransportSession>,
     Extension(user): Extension<User>,
-) -> Result<Json<EncryptedResponse<DeletedObjectResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     debug!(
         "Deleting conversation project {} for user {}",
         project_id, user.uuid

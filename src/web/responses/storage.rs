@@ -197,19 +197,13 @@ fn update_terminal_response_status(
                     Ok(None)
                 }
                 Err(e) => {
-                    error!(
-                        "Failed to read authoritative response {} ({}) status after {}: {:?}",
-                        response_id, response_uuid, reason, e
-                    );
+                    error!(response_uuid = %response_uuid, stage = "terminal_read", error_kind = crate::observability::error_kind(&e), "Storage terminal persistence failed");
                     Err("Failed to read authoritative terminal response status".to_string())
                 }
             }
         }
         Err(e) => {
-            error!(
-                "Failed to update response {} ({}) status to {:?} after {}: {:?}",
-                response_id, response_uuid, status, reason, e
-            );
+            error!(response_uuid = %response_uuid, status = ?status, stage = "terminal_update", error_kind = crate::observability::error_kind(&e), "Storage terminal persistence failed");
             Err("Failed to persist terminal response status".to_string())
         }
     }
@@ -476,10 +470,7 @@ async fn finalize_pending_items_for_terminal(
                 pending_messages.remove(&item_id);
             }
             Err(e) => {
-                error!(
-                    "Failed to finalize pending assistant message {}: {}",
-                    item_id, e
-                );
+                error!(item_id = %item_id, stage = "message_cleanup", "Storage operation failed");
                 failures.push(e);
             }
         }
@@ -516,10 +507,7 @@ async fn finalize_pending_items_for_terminal(
                 pending_reasoning.remove(&item_id);
             }
             Err(e) => {
-                error!(
-                    "Failed to finalize pending reasoning item {}: {}",
-                    item_id, e
-                );
+                error!(item_id = %item_id, stage = "reasoning_cleanup", "Storage operation failed");
                 failures.push(e);
             }
         }
@@ -597,10 +585,7 @@ async fn finalize_pending_tool_calls_for_terminal(
                 pending_tool_calls.remove(&tool_call_id);
             }
             Err(e) => {
-                error!(
-                    "Failed to terminalize pending tool_call {}: {}",
-                    tool_call_id, e
-                );
+                error!(tool_call_id = %tool_call_id, stage = "tool_cleanup", "Storage operation failed");
                 failures.push(e);
             }
         }
@@ -685,10 +670,7 @@ async fn persist_terminal_until_authoritative(
                 }
                 Ok(_) => Err(cleanup_error),
                 Err(e) => {
-                    warn!(
-                        "Failed to verify response existence after cleanup error: response_uuid={}, error={:?}",
-                        response_uuid, e
-                    );
+                    warn!(response_uuid = %response_uuid, stage = "cleanup_response_lookup", error_kind = crate::observability::error_kind(&e), "Storage cleanup lookup failed");
                     Err(cleanup_error)
                 }
             },
@@ -696,14 +678,8 @@ async fn persist_terminal_until_authoritative(
 
         match terminal_result {
             Ok(authoritative) => return authoritative,
-            Err(e) => {
-                warn!(
-                    "Storage terminal persistence will retry: response_uuid={}, reason={}, retry_delay_ms={}, error={}",
-                    response_uuid,
-                    reason,
-                    retry_delay.as_millis(),
-                    e
-                );
+            Err(_e) => {
+                warn!(response_uuid = %response_uuid, stage = "terminal_persistence", retry_delay_ms = retry_delay.as_millis(), "Storage terminal persistence will retry");
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = retry_delay.saturating_mul(2).min(TERMINAL_RETRY_MAX_DELAY);
             }
@@ -742,7 +718,7 @@ pub async fn storage_task(
                     .created_at
                     .get_or_insert_with(|| allocate_created_at(&mut next_item_created_at))
                     .to_owned();
-                if let Err(e) = create_assistant_message_if_missing(
+                if let Err(_e) = create_assistant_message_if_missing(
                     &db,
                     conversation_id,
                     response_id,
@@ -750,7 +726,7 @@ pub async fn storage_task(
                     item_id,
                     created_at,
                 ) {
-                    error!("{}", e);
+                    error!(stage = "message_start", "Storage operation failed");
                     storage_failed = true;
                 }
             }
@@ -770,10 +746,7 @@ pub async fn storage_task(
                 item_id,
                 finish_reason,
             } => {
-                debug!(
-                    "Storage: message done {} with finish_reason={}",
-                    item_id, finish_reason
-                );
+                debug!(item_id = %item_id, "Storage: message done");
                 let (created_at, content) = {
                     let pending = pending_messages.entry(item_id).or_default();
                     pending.completed_finish_reason = Some(finish_reason.clone());
@@ -791,8 +764,8 @@ pub async fn storage_task(
                     item_id,
                     created_at,
                 );
-                if let Err(e) = &create_result {
-                    error!("{}", e);
+                if let Err(_e) = &create_result {
+                    error!(stage = "message_create", "Storage operation failed");
                     storage_failed = true;
                 }
                 if create_result.is_ok() {
@@ -809,8 +782,8 @@ pub async fn storage_task(
                         Ok(()) => {
                             pending_messages.remove(&item_id);
                         }
-                        Err(e) => {
-                            error!("{}", e);
+                        Err(_e) => {
+                            error!(stage = "message_finalize", "Storage operation failed");
                             storage_failed = true;
                         }
                     }
@@ -823,7 +796,7 @@ pub async fn storage_task(
                     .created_at
                     .get_or_insert_with(|| allocate_created_at(&mut next_item_created_at))
                     .to_owned();
-                if let Err(e) = create_reasoning_item_if_missing(
+                if let Err(_e) = create_reasoning_item_if_missing(
                     &db,
                     conversation_id,
                     response_id,
@@ -831,7 +804,7 @@ pub async fn storage_task(
                     item_id,
                     created_at,
                 ) {
-                    error!("{}", e);
+                    error!(stage = "reasoning_start", "Storage operation failed");
                     storage_failed = true;
                 }
             }
@@ -858,17 +831,11 @@ pub async fn storage_task(
                     pending.completed = true;
                     pending.content.clone()
                 };
-                if let Err(e) =
+                if let Err(_e) =
                     finalize_reasoning_item(&db, &user_key, item_id, content, STATUS_COMPLETED)
                         .await
                 {
-                    error!(
-                        "Failed to finalize reasoning item {} for response {} after {} ms: {}",
-                        item_id,
-                        response_id,
-                        reasoning_finalize_started.elapsed().as_millis(),
-                        e
-                    );
+                    error!(item_id = %item_id, response_id, stage = "reasoning_finalize", elapsed_ms = reasoning_finalize_started.elapsed().as_millis(), "Storage operation failed");
                     storage_failed = true;
                 } else {
                     pending_reasoning.remove(&item_id);
@@ -932,12 +899,8 @@ pub async fn storage_task(
                 name,
                 arguments,
             } => {
-                let tool_name = name.clone();
                 let tool_call_persist_started = Instant::now();
-                debug!(
-                    "Storage: persisting tool_call {} ({}) for response {}",
-                    tool_call_id, tool_name, response_id
-                );
+                debug!(tool_call_id = %tool_call_id, response_id, "Storage: persisting tool call");
                 let created_at = allocate_created_at(&mut next_item_created_at);
                 pending_tool_calls.insert(
                     tool_call_id,
@@ -963,22 +926,11 @@ pub async fn storage_task(
                 )
                 .await
                 {
-                    Ok(()) => debug!(
-                        "Storage: persisted tool_call {} ({}) for response {} in {} ms",
-                        tool_call_id,
-                        tool_name,
-                        response_id,
-                        tool_call_persist_started.elapsed().as_millis()
-                    ),
+                    Ok(()) => {
+                        debug!(tool_call_id = %tool_call_id, response_id, elapsed_ms = tool_call_persist_started.elapsed().as_millis(), "Storage: persisted tool call")
+                    }
                     Err(e) => {
-                        error!(
-                            "Failed to persist tool_call {} ({}) for response {} after {} ms: {}",
-                            tool_call_id,
-                            tool_name,
-                            response_id,
-                            tool_call_persist_started.elapsed().as_millis(),
-                            e
-                        );
+                        error!(tool_call_id = %tool_call_id, response_id, stage = "tool_call_persist", elapsed_ms = tool_call_persist_started.elapsed().as_millis(), "Storage operation failed");
                         storage_failed = true;
                         if let Some(ack) = &tool_ack {
                             let _ = ack.send(Err(e)).await;
@@ -1029,14 +981,7 @@ pub async fn storage_task(
                         }
                     }
                     Err(e) => {
-                        error!(
-                            "Failed to persist tool_output {} for tool_call {} on response {} after {} ms: {}",
-                            tool_output_id,
-                            tool_call_id,
-                            response_id,
-                            tool_output_persist_started.elapsed().as_millis(),
-                            e
-                        );
+                        error!(tool_call_id = %tool_call_id, tool_output_id = %tool_output_id, response_id, stage = "tool_output_persist", elapsed_ms = tool_output_persist_started.elapsed().as_millis(), "Storage operation failed");
                         storage_failed = true;
                         if let Some(ack) = &tool_ack {
                             let _ = ack.send(Err(e)).await;

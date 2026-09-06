@@ -7,6 +7,20 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
+# jq errors can include the input being parsed, including credentials and
+# decrypted values. Keep stdout and exit status for the caller, but report only
+# the fixed stage name and status when parsing fails.
+secret_jq() {
+    local stage="$1"
+    shift
+    local status=0
+    jq "$@" 2>/dev/null || status=$?
+    if [ "$status" -ne 0 ]; then
+        log "Error: startup_stage=$stage exit_code=$status" >&2
+    fi
+    return "$status"
+}
+
 # BEGIN ENCLAVE_ENTROPY_PREFLIGHT
 # Fail closed before any application or KMS work if the enclave entropy path is
 # not the one we expect. Positional overrides exist only so this function can
@@ -187,12 +201,16 @@ vsock_request() {
     local port=$2
     local request=$3
 
-    response=$(python3 /app/vsock_helper.py "$cid" "$port" "$request")
+    # The helper can dump raw response bytes on decoding failures.
+    response=$(python3 /app/vsock_helper.py "$cid" "$port" "$request" 2>/dev/null)
+    local status=$?
+    if [ "$status" -ne 0 ]; then
+        log "Error: startup_stage=fetch_parent_response exit_code=$status" >&2
+    fi
     
     # Check if the response contains an error
-    if echo "$response" | jq -e 'has("error")' > /dev/null; then
-        error_message=$(echo "$response" | jq -r '.error')
-        log "VSOCK request failed: $error_message"
+    if echo "$response" | jq -e 'has("error")' > /dev/null 2>&1; then
+        log "Error: startup_stage=fetch_parent_response status=parent_error" >&2
         return 1
     fi
 
@@ -295,20 +313,19 @@ if [ -z "$aws_creds" ]; then
 fi
 
 # Add error checking for jq parsing
-if ! access_key_id=$(echo "$aws_creds" | jq -r '.response_value.AccessKeyId'); then
+if ! access_key_id=$(echo "$aws_creds" | secret_jq parse_aws_access_key_id -r '.response_value.AccessKeyId'); then
     log "Error: Failed to parse AccessKeyId from AWS credentials"
-    log "AWS credentials response: $aws_creds"
     exit 1
 fi
-if ! secret_access_key=$(echo "$aws_creds" | jq -r '.response_value.SecretAccessKey'); then
+if ! secret_access_key=$(echo "$aws_creds" | secret_jq parse_aws_secret_access_key -r '.response_value.SecretAccessKey'); then
     log "Error: Failed to parse SecretAccessKey from AWS credentials"
     exit 1
 fi
-if ! session_token=$(echo "$aws_creds" | jq -r '.response_value.Token'); then
+if ! session_token=$(echo "$aws_creds" | secret_jq parse_aws_session_token -r '.response_value.Token'); then
     log "Error: Failed to parse Token from AWS credentials"
     exit 1
 fi
-if ! region=$(echo "$aws_creds" | jq -r '.response_value.Region'); then
+if ! region=$(echo "$aws_creds" | secret_jq parse_aws_region -r '.response_value.Region'); then
     log "Error: Failed to parse Region from AWS credentials"
     exit 1
 fi
@@ -318,13 +335,12 @@ log "AWS credentials retrieved and parsed successfully"
 # Get encrypted database URL from Secrets Manager
 log "Fetching encrypted database URL"
 secret_response=$(get_database_url_secret)
-log "Retrieved raw secret response"
+log "Received database secret response"
 
 # Extract the database_url value from the JSON structure
-encrypted_db_url=$(echo "$secret_response" | jq -r '.response_value | fromjson | .database_url')
+encrypted_db_url=$(echo "$secret_response" | secret_jq parse_database_secret -r '.response_value | fromjson | .database_url')
 if [ -z "$encrypted_db_url" ]; then
     log "Error: Failed to get encrypted database URL"
-    log "Secret response: $secret_response"
     exit 1
 fi
 
@@ -338,7 +354,11 @@ decryption_output=$(kmstool_enclave_cli decrypt \
     --aws-access-key-id "$access_key_id" \
     --aws-secret-access-key "$secret_access_key" \
     --aws-session-token "$session_token" \
-    --ciphertext "$encrypted_db_url" 2>&1)
+    --ciphertext "$encrypted_db_url" 2>&1) || {
+        status=$?
+        log "Error: startup_stage=decrypt_database_url exit_code=$status"
+        exit "$status"
+    }
 
 log "Got decryption output, parsing URL"
 
@@ -346,7 +366,6 @@ decrypted_db_url=$(echo "$decryption_output" | sed -n 's/PLAINTEXT: //p')
 
 if [ -z "$decrypted_db_url" ]; then
     log "Error: Failed to decrypt database URL"
-    log "Decryption output: $decryption_output"
     exit 1
 fi
 
@@ -368,7 +387,7 @@ if [ -z "$DB_HOSTNAME" ]; then
 fi
 
 echo "127.0.0.1 $DB_HOSTNAME" >> /etc/hosts
-log "Added $DB_HOSTNAME to /etc/hosts"
+log "Added database host mapping to /etc/hosts"
 
 # Add OpenAI API hostname to /etc/hosts
 echo "127.0.0.1 api.openai.com" >> /etc/hosts
@@ -459,7 +478,7 @@ log "Created /app/libnsm.so"
 log "Network configuration:"
 ip addr show
 ip route
-cat /etc/hosts
+# Do not dump /etc/hosts: the database hostname comes from a decrypted secret.
 
 # Start the traffic forwarder for the database in the background
 log "Starting database traffic forwarder"
@@ -868,20 +887,18 @@ if [ "$APP_MODE" != "local" ]; then
     # Get Continuum Proxy API key from Secrets Manager
     log "Fetching Continuum Proxy API key"
     continuum_proxy_api_key_response=$(get_continuum_proxy_api_key_secret)
-    log "Retrieved raw Continuum Proxy API key response"
+    log "Received Continuum Proxy API key response"
 
     # Check if the response is an error
-    if echo "$continuum_proxy_api_key_response" | jq -e '.response_type == "error"' > /dev/null; then
-        error_message=$(echo "$continuum_proxy_api_key_response" | jq -r '.response_value')
-        log "Error: Failed to get Continuum Proxy API key. Error message: $error_message"
+    if echo "$continuum_proxy_api_key_response" | jq -e '.response_type == "error"' > /dev/null 2>&1; then
+        log "Error: startup_stage=fetch_continuum_proxy_key status=parent_error"
         exit 1
     fi
 
     # Extract the encrypted API key value from the JSON structure
-    continuum_proxy_api_key_encrypted=$(echo "$continuum_proxy_api_key_response" | jq -r '.response_value | fromjson | .api_key')
+    continuum_proxy_api_key_encrypted=$(echo "$continuum_proxy_api_key_response" | secret_jq parse_continuum_proxy_key -r '.response_value | fromjson | .api_key')
     if [ -z "$continuum_proxy_api_key_encrypted" ]; then
         log "Error: Failed to extract Continuum Proxy API key from the response"
-        log "Secret response: $continuum_proxy_api_key_response"
         exit 1
     fi
 
@@ -893,13 +910,16 @@ if [ "$APP_MODE" != "local" ]; then
         --aws-access-key-id "$access_key_id" \
         --aws-secret-access-key "$secret_access_key" \
         --aws-session-token "$session_token" \
-        --ciphertext "$continuum_proxy_api_key_encrypted" 2>&1)
+        --ciphertext "$continuum_proxy_api_key_encrypted" 2>&1) || {
+            status=$?
+            log "Error: startup_stage=decrypt_continuum_proxy_key exit_code=$status"
+            exit "$status"
+        }
 
     decrypted_api_key=$(echo "$decryption_output" | sed -n 's/PLAINTEXT: //p')
 
     if [ -z "$decrypted_api_key" ]; then
         log "Error: Failed to decrypt Continuum Proxy API key"
-        log "Decryption output: $decryption_output"
         exit 1
     fi
 
@@ -925,20 +945,18 @@ if [ "$APP_MODE" != "local" ]; then
     # Get Tinfoil Proxy API key from Secrets Manager
     log "Fetching Tinfoil Proxy API key"
     tinfoil_proxy_api_key_response=$(get_tinfoil_proxy_api_key_secret)
-    log "Retrieved raw Tinfoil Proxy API key response"
+    log "Received Tinfoil Proxy API key response"
 
     # Check if the response is an error
-    if echo "$tinfoil_proxy_api_key_response" | jq -e '.response_type == "error"' > /dev/null; then
-        error_message=$(echo "$tinfoil_proxy_api_key_response" | jq -r '.response_value')
-        log "Error: Failed to get Tinfoil Proxy API key. Error message: $error_message"
+    if echo "$tinfoil_proxy_api_key_response" | jq -e '.response_type == "error"' > /dev/null 2>&1; then
+        log "Error: startup_stage=fetch_tinfoil_proxy_key status=parent_error"
         exit 1
     fi
 
     # Extract the encrypted API key value from the JSON structure
-    tinfoil_proxy_api_key_encrypted=$(echo "$tinfoil_proxy_api_key_response" | jq -r '.response_value | fromjson | .api_key')
+    tinfoil_proxy_api_key_encrypted=$(echo "$tinfoil_proxy_api_key_response" | secret_jq parse_tinfoil_proxy_key -r '.response_value | fromjson | .api_key')
     if [ -z "$tinfoil_proxy_api_key_encrypted" ]; then
         log "Error: Failed to extract Tinfoil Proxy API key from the response"
-        log "Secret response: $tinfoil_proxy_api_key_response"
         exit 1
     fi
 
@@ -950,13 +968,16 @@ if [ "$APP_MODE" != "local" ]; then
         --aws-access-key-id "$access_key_id" \
         --aws-secret-access-key "$secret_access_key" \
         --aws-session-token "$session_token" \
-        --ciphertext "$tinfoil_proxy_api_key_encrypted" 2>&1)
+        --ciphertext "$tinfoil_proxy_api_key_encrypted" 2>&1) || {
+            status=$?
+            log "Error: startup_stage=decrypt_tinfoil_proxy_key exit_code=$status"
+            exit "$status"
+        }
 
     decrypted_api_key=$(echo "$decryption_output" | sed -n 's/PLAINTEXT: //p')
 
     if [ -z "$decrypted_api_key" ]; then
         log "Error: Failed to decrypt Tinfoil Proxy API key"
-        log "Decryption output: $decryption_output"
         exit 1
     fi
 
@@ -978,7 +999,9 @@ fi
 
 # Start the opensecret
 log "Starting opensecret..."
-RUST_LOG_STYLE=never RUST_LOG="${RUST_LOG:-debug,hyper=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,aws_sdk_sqs=info,aws_config=info}" APP_MODE="$APP_MODE" OPENAI_API_BASE="$OPENAI_API_BASE" TINFOIL_API_KEY="$tinfoil_proxy_api_key" /app/opensecret &
+# Application milestones remain visible; dependencies do not inherit debug.
+# An explicit RUST_LOG still selects a more detailed operator-requested filter.
+RUST_LOG_STYLE=never RUST_LOG="${RUST_LOG:-warn,opensecret=info}" APP_MODE="$APP_MODE" OPENAI_API_BASE="$OPENAI_API_BASE" TINFOIL_API_KEY="$tinfoil_proxy_api_key" /app/opensecret &
 
 # Wait for the opensecret to start
 log "Waiting for opensecret to start"

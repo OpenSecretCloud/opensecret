@@ -40,6 +40,26 @@ use std::sync::Arc;
 use tracing::{debug, error, trace};
 use uuid::Uuid;
 
+fn oauth_token_error_kind<E: std::error::Error + 'static>(
+    error: &oauth2::basic::BasicRequestTokenError<E>,
+) -> &'static str {
+    use oauth2::basic::BasicErrorResponseType;
+    match error {
+        oauth2::RequestTokenError::ServerResponse(response) => match response.error() {
+            BasicErrorResponseType::InvalidClient => "invalid_client",
+            BasicErrorResponseType::InvalidGrant => "invalid_grant",
+            BasicErrorResponseType::InvalidRequest => "invalid_request",
+            BasicErrorResponseType::InvalidScope => "invalid_scope",
+            BasicErrorResponseType::UnauthorizedClient => "unauthorized_client",
+            BasicErrorResponseType::UnsupportedGrantType => "unsupported_grant_type",
+            BasicErrorResponseType::Extension(_) => "other_server_response",
+        },
+        oauth2::RequestTokenError::Request(_) => "request",
+        oauth2::RequestTokenError::Parse(_, _) => "response_parse",
+        oauth2::RequestTokenError::Other(_) => "other",
+    }
+}
+
 pub fn router(app_state: Arc<AppState>) -> Router {
     Router::new()
         .route(
@@ -258,10 +278,7 @@ async fn get_project_oauth_client(
             if let Some(ref mut settings) = apple_settings {
                 if !settings.client_id.ends_with(".services") {
                     settings.client_id = format!("{}.services", settings.client_id);
-                    debug!(
-                        "Modified Apple client ID for OAuth client: {}",
-                        settings.client_id
-                    );
+                    debug!("Using Apple Services ID for OAuth client");
                 }
             }
 
@@ -281,7 +298,7 @@ async fn get_project_oauth_client(
             (enabled, standard_settings, secret)
         }
         _ => {
-            error!("Unsupported OAuth provider: {}", provider_name);
+            error!("Unsupported OAuth provider");
             return Err(ApiError::BadRequest);
         }
     };
@@ -386,11 +403,7 @@ async fn get_project_oauth_client(
             ApiError::InternalServerError
         })?;
 
-        // Log the OAuth URL and redirect URL being used
-        debug!(
-            "Building Apple OAuth client with Client ID: {}, Redirect URL: {}",
-            client_id_with_services, apple_settings.redirect_url
-        );
+        debug!("Building Apple OAuth client");
 
         // Use the same client ID for the OAuth client as in the JWT's sub claim
         let client_id_for_client = client_id_with_services.clone();
@@ -404,8 +417,8 @@ async fn get_project_oauth_client(
                 apple_settings.redirect_url.clone(),
             )
             .await
-            .map_err(|e| {
-                error!("Failed to build Apple OAuth client: {:?}", e);
+            .map_err(|_| {
+                error!("Failed to build Apple OAuth client");
                 ApiError::InternalServerError
             })
     } else {
@@ -541,13 +554,13 @@ pub async fn oauth_callback(
     // Decode and parse the state
     let state_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&callback_request.state)
-        .map_err(|e| {
-            error!("Could not parse state: {:?}", e);
+        .map_err(|_| {
+            error!("Could not parse state");
             ApiError::BadRequest
         })?;
     debug!("Parsed state from request");
     let state: OAuthState = serde_json::from_slice(&state_json).map_err(|e| {
-        error!("Could not parse OAuthState: {:?}", e);
+        error!(error_kind = ?e.classify(), "Could not parse OAuthState");
         ApiError::BadRequest
     })?;
     debug!("Converted state to OAuthState");
@@ -587,15 +600,12 @@ pub async fn oauth_callback(
     };
 
     // Get project (we can trust the client_id now since we validated it against our stored state)
-    debug!("Getting project from client_id: {:?}", state.client_id);
+    debug!("Getting project for verified OAuth state");
     let project = app_state
         .db
         .get_org_project_by_client_id(state.client_id)
-        .map_err(|e| {
-            error!(
-                "Could not get project by client {:?} id: {:?}",
-                state.client_id, e
-            );
+        .map_err(|_| {
+            error!("Could not get project for verified OAuth state");
             ApiError::BadRequest
         })?;
 
@@ -749,7 +759,12 @@ pub async fn oauth_callback(
 
         // Send the request
         let response = request.send().await.map_err(|e| {
-            error!("HTTP request failed: {:?}", e);
+            error!(
+                timeout = e.is_timeout(),
+                connect = e.is_connect(),
+                decode = e.is_decode(),
+                "HTTP request failed"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -768,13 +783,18 @@ pub async fn oauth_callback(
 
         // Parse the successful response
         let token_json = response.text().await.map_err(|e| {
-            error!("Failed to read response body: {:?}", e);
+            error!(
+                timeout = e.is_timeout(),
+                connect = e.is_connect(),
+                decode = e.is_decode(),
+                "Failed to read response body"
+            );
             ApiError::InternalServerError
         })?;
 
         // Parse the JSON using our custom AppleTokenResponse struct
         let apple_token: AppleTokenResponse = serde_json::from_str(&token_json).map_err(|e| {
-            error!("Failed to parse Apple token response: {:?}", e);
+            error!(error_kind = ?e.classify(), "Failed to parse Apple token response");
             ApiError::InternalServerError
         })?;
 
@@ -796,7 +816,12 @@ pub async fn oauth_callback(
             .redirect(oauth2::reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| {
-                error!("Failed to build OAuth HTTP client: {:?}", e);
+                error!(
+                    timeout = e.is_timeout(),
+                    connect = e.is_connect(),
+                    decode = e.is_decode(),
+                    "Failed to build OAuth HTTP client"
+                );
                 ApiError::InternalServerError
             })?;
         let exchange =
@@ -807,7 +832,10 @@ pub async fn oauth_callback(
             exchange
         };
         let token = exchange.request_async(&http_client).await.map_err(|e| {
-            error!("Failed to exchange code for access token: {:?}", e);
+            error!(
+                error_kind = oauth_token_error_kind(&e),
+                "Failed to exchange code for access token"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -834,7 +862,7 @@ pub async fn oauth_callback(
                     user
                 }
                 Err(e) => {
-                    error!("Failed to fetch GitHub user: {:?}", e);
+                    error!("Failed to fetch GitHub user");
                     return Err(e);
                 }
             };
@@ -863,7 +891,7 @@ pub async fn oauth_callback(
                     user
                 }
                 Err(e) => {
-                    error!("Failed to fetch Google user: {:?}", e);
+                    error!("Failed to fetch Google user");
                     return Err(e);
                 }
             };
@@ -910,7 +938,7 @@ pub async fn oauth_callback(
             // This is because Apple requires Services ID for web flow, not App ID
             if !client_id.ends_with(".services") {
                 client_id = format!("{}.services", client_id);
-                debug!("Modified Apple client ID for web flow: {}", client_id);
+                debug!("Using Apple Services ID for web flow");
             }
 
             // For Apple, we need to extract the ID token from the token exchange response
@@ -937,7 +965,7 @@ pub async fn oauth_callback(
                     user
                 }
                 Err(e) => {
-                    error!("Failed to verify Apple ID token: {:?}", e);
+                    error!("Failed to verify Apple ID token");
                     return Err(e);
                 }
             };
@@ -961,7 +989,7 @@ pub async fn oauth_callback(
             .await?
         }
         _ => {
-            error!("Unsupported provider: {}", provider_name);
+            error!("Unsupported OAuth provider");
             return Err(ApiError::InternalServerError);
         }
     };
@@ -978,7 +1006,7 @@ async fn fetch_github_user(
     let client = crate::http_client::client();
     let user_url = &github_provider.user_info_url;
 
-    debug!("Sending request to GitHub API: {}", user_url);
+    debug!("Sending request to GitHub user API");
     let response = client
         .get(user_url)
         .header("Authorization", format!("token {}", access_token))
@@ -986,15 +1014,20 @@ async fn fetch_github_user(
         .send()
         .await
         .map_err(|e| {
-            error!("Failed to send request to GitHub API: {:?}", e);
+            error!(
+                timeout = e.is_timeout(),
+                connect = e.is_connect(),
+                decode = e.is_decode(),
+                "Failed to send request to GitHub API"
+            );
             ApiError::InternalServerError
         })?;
 
-    // Get status and headers before consuming the response
     let status = response.status();
-    let headers = response.headers().clone();
-    debug!("GitHub API response status: {}", status);
-    trace!("GitHub API response headers: {:?}", headers);
+    debug!(
+        status = status.as_u16(),
+        "GitHub user API response received"
+    );
 
     if !status.is_success() {
         error!(
@@ -1006,17 +1039,25 @@ async fn fetch_github_user(
     }
 
     let user_body = response.text().await.map_err(|e| {
-        error!("Failed to read GitHub user response body: {:?}", e);
+        error!(
+            timeout = e.is_timeout(),
+            connect = e.is_connect(),
+            decode = e.is_decode(),
+            "Failed to read GitHub user response body"
+        );
         ApiError::InternalServerError
     })?;
 
-    trace!("GitHub user response body: {}", user_body);
+    debug!(
+        response_bytes = user_body.len(),
+        "GitHub user response received"
+    );
 
     let mut github_user: GithubUser = serde_json::from_str(&user_body).map_err(|e| {
         error!(
-            "Failed to parse GitHub user JSON: {} (response_bytes={})",
-            e,
-            user_body.len()
+            error_kind = ?e.classify(),
+            response_bytes = user_body.len(),
+            "Failed to parse GitHub user JSON"
         );
         ApiError::InternalServerError
     })?;
@@ -1024,7 +1065,7 @@ async fn fetch_github_user(
     // If the email is not public, fetch the email separately
     if github_user.email.is_none() {
         let emails_url = "https://api.github.com/user/emails";
-        debug!("Fetching GitHub user emails: {}", emails_url);
+        debug!("Fetching GitHub user emails");
         let emails_response = client
             .get(emails_url)
             .header("Authorization", format!("token {}", access_token))
@@ -1032,14 +1073,20 @@ async fn fetch_github_user(
             .send()
             .await
             .map_err(|e| {
-                error!("Failed to send request for GitHub user emails: {:?}", e);
+                error!(
+                    timeout = e.is_timeout(),
+                    connect = e.is_connect(),
+                    decode = e.is_decode(),
+                    "Failed to send request for GitHub user emails"
+                );
                 ApiError::InternalServerError
             })?;
 
         let emails_status = emails_response.status();
-        let emails_headers = emails_response.headers().clone();
-        trace!("GitHub emails API response status: {}", emails_status);
-        trace!("GitHub emails API response headers: {:?}", emails_headers);
+        trace!(
+            status = emails_status.as_u16(),
+            "GitHub emails API response received"
+        );
 
         if !emails_status.is_success() {
             error!(
@@ -1051,17 +1098,25 @@ async fn fetch_github_user(
         }
 
         let emails_body = emails_response.text().await.map_err(|e| {
-            error!("Failed to read GitHub emails response body: {:?}", e);
+            error!(
+                timeout = e.is_timeout(),
+                connect = e.is_connect(),
+                decode = e.is_decode(),
+                "Failed to read GitHub emails response body"
+            );
             ApiError::InternalServerError
         })?;
 
-        trace!("GitHub emails response body: {}", emails_body);
+        trace!(
+            response_bytes = emails_body.len(),
+            "GitHub emails response received"
+        );
 
         let emails: Vec<GithubEmail> = serde_json::from_str(&emails_body).map_err(|e| {
             error!(
-                "Failed to parse GitHub emails JSON: {} (response_bytes={})",
-                e,
-                emails_body.len()
+                error_kind = ?e.classify(),
+                response_bytes = emails_body.len(),
+                "Failed to parse GitHub emails JSON"
             );
             ApiError::InternalServerError
         })?;
@@ -1088,14 +1143,19 @@ async fn fetch_google_user(
     let client = crate::http_client::client();
     let user_url = &google_provider.user_info_url;
 
-    debug!("Sending request to Google API: {}", user_url);
+    debug!("Sending request to Google user API");
     let response = client
         .get(user_url)
         .header(AUTHORIZATION, format!("Bearer {}", access_token))
         .send()
         .await
         .map_err(|e| {
-            error!("Failed to send request to Google API: {:?}", e);
+            error!(
+                timeout = e.is_timeout(),
+                connect = e.is_connect(),
+                decode = e.is_decode(),
+                "Failed to send request to Google API"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -1106,7 +1166,12 @@ async fn fetch_google_user(
     }
 
     let google_user: GoogleUser = response.json().await.map_err(|e| {
-        error!("Failed to parse Google user JSON: {:?}", e);
+        error!(
+            timeout = e.is_timeout(),
+            connect = e.is_connect(),
+            decode = e.is_decode(),
+            "Failed to parse Google user JSON"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -1165,15 +1230,15 @@ fn authenticated_oauth_user(
 ) -> Result<AuthenticatedOAuthUser, ApiError> {
     let auth_context = app_state
         .oauth_auth_context_for_user(&user, provider_name, provider_user_id)
-        .map_err(|e| {
-            error!("Failed to compute OAuth auth context: {:?}", e);
+        .map_err(|_| {
+            error!("Failed to compute OAuth auth context");
             ApiError::InternalServerError
         })?;
 
     app_state
         .verify_seed_wrap_for_auth_context(&user, &auth_context)
-        .map_err(|e| {
-            error!("OAuth seed wrap verification failed: {:?}", e);
+        .map_err(|_| {
+            error!("OAuth seed wrap verification failed");
             ApiError::Unauthorized
         })?;
 
@@ -1191,8 +1256,8 @@ fn oauth_callback_response(
         app_state,
         &authenticated_user.auth_context,
     )
-    .map_err(|e| {
-        error!("Failed to generate access token: {:?}", e);
+    .map_err(|_| {
+        error!("Failed to generate access token");
         ApiError::InternalServerError
     })?;
     let refresh_token = NewToken::new_with_auth_context(
@@ -1201,8 +1266,8 @@ fn oauth_callback_response(
         app_state,
         &authenticated_user.auth_context,
     )
-    .map_err(|e| {
-        error!("Failed to generate refresh token: {:?}", e);
+    .map_err(|_| {
+        error!("Failed to generate refresh token");
         ApiError::InternalServerError
     })?;
 
@@ -1230,8 +1295,8 @@ async fn find_or_create_user_from_oauth(
     let provider = app_state
         .db
         .get_oauth_provider_by_name(provider_name)
-        .map_err(|e| {
-            error!("Failed to get {} OAuth provider: {:?}", provider_name, e);
+        .map_err(|_| {
+            error!("Failed to get {} OAuth provider", provider_name);
             ApiError::InternalServerError
         })?
         .ok_or_else(|| {
@@ -1246,11 +1311,8 @@ async fn find_or_create_user_from_oauth(
             &provider_user_id,
             project_id,
         )
-        .map_err(|e| {
-            error!(
-                "Failed to get OAuth connection for verified provider subject: {:?}",
-                e
-            );
+        .map_err(|_| {
+            error!("Failed to get OAuth connection for verified provider subject");
             ApiError::InternalServerError
         })?
     {
@@ -1276,8 +1338,8 @@ async fn find_or_create_user_from_oauth(
             let existing_connection = app_state
                 .db
                 .get_user_oauth_connection_by_user_and_provider(existing_user.uuid, provider.id)
-                .map_err(|e| {
-                    error!("Failed to get existing OAuth connection: {:?}", e);
+                .map_err(|_| {
+                    error!("Failed to get existing OAuth connection");
                     ApiError::InternalServerError
                 })?;
 
@@ -1319,8 +1381,8 @@ async fn find_or_create_user_from_oauth(
                     encrypted_access_token,
                     user_seed_words.as_bytes(),
                 )
-                .map_err(|e| {
-                    error!("Failed to create new OAuth user and seed wrap: {:?}", e);
+                .map_err(|_| {
+                    error!("Failed to create new OAuth user and seed wrap");
                     ApiError::InternalServerError
                 })?;
 
@@ -1329,8 +1391,8 @@ async fn find_or_create_user_from_oauth(
 
             authenticated_oauth_user(app_state, user, provider_name, &provider_user_id)
         }
-        Err(e) => {
-            error!("Database error when fetching user: {:?}", e);
+        Err(_) => {
+            error!("Database error when fetching OAuth user");
             Err(ApiError::InternalServerError)
         }
     }
@@ -1399,8 +1461,8 @@ pub async fn handle_apple_native_signin(
     let apple_provider = app_state
         .db
         .get_oauth_provider_by_name("apple")
-        .map_err(|e| {
-            error!("Failed to get Apple OAuth provider: {:?}", e);
+        .map_err(|_| {
+            error!("Failed to get Apple OAuth provider");
             ApiError::InternalServerError
         })?
         .ok_or_else(|| {
@@ -1419,11 +1481,8 @@ pub async fn handle_apple_native_signin(
             &verified_user_id,
             project.id,
         )
-        .map_err(|e| {
-            error!(
-                "Failed to get Apple OAuth connection for verified subject: {:?}",
-                e
-            );
+        .map_err(|_| {
+            error!("Failed to get Apple OAuth connection for verified subject");
             ApiError::InternalServerError
         })?
     {
@@ -1528,8 +1587,8 @@ async fn update_provider_connection(
     app_state
         .db
         .update_user_oauth_connection(&connection)
-        .map_err(|e| {
-            error!("Failed to update OAuth connection: {:?}", e);
+        .map_err(|_| {
+            error!("Failed to update OAuth connection");
             ApiError::InternalServerError
         })?;
 
@@ -1563,8 +1622,8 @@ async fn create_provider_connection(
     app_state
         .db
         .create_user_oauth_connection(new_connection)
-        .map_err(|e| {
-            error!("Failed to create new OAuth connection: {:?}", e);
+        .map_err(|_| {
+            error!("Failed to create new OAuth connection");
             ApiError::InternalServerError
         })?;
 
@@ -1575,8 +1634,8 @@ async fn encrypt_access_token(
     app_state: &AppState,
     access_token: &str,
 ) -> Result<Vec<u8>, ApiError> {
-    let secret_key = SecretKey::from_slice(&app_state.enclave_key).map_err(|e| {
-        error!("Failed to create SecretKey from enclave key: {:?}", e);
+    let secret_key = SecretKey::from_slice(&app_state.enclave_key).map_err(|_| {
+        error!("Failed to create SecretKey from enclave key");
         ApiError::InternalServerError
     })?;
     Ok(encrypt::encrypt_with_key(&secret_key, access_token.as_bytes()).await)
@@ -1593,6 +1652,45 @@ mod tests {
     };
     use diesel::{ExpressionMethods, QueryDsl, RunQueryDsl};
     use tokio::sync::RwLock;
+
+    #[test]
+    fn oauth_token_error_category_omits_malformed_token_response_and_description() {
+        use oauth2::basic::{BasicClient, BasicErrorResponse, BasicErrorResponseType};
+        use oauth2::{ClientId, HttpRequest, HttpResponse, RequestTokenError, TokenUrl};
+
+        const RESPONSE: &str = r#"{"access_token":"PRIVATE_ACCESS_SENTINEL","refresh_token":"PRIVATE_REFRESH_SENTINEL","token_type":"bearer","expires_in":{"private":"PRIVATE_CLAIMS_SENTINEL"}}"#;
+        let client = BasicClient::new(ClientId::new("test-client".to_string()))
+            .set_token_uri(TokenUrl::new("https://oauth.invalid/token".to_string()).unwrap());
+        let error = client
+            .exchange_code(AuthorizationCode::new("test-code".to_string()))
+            .request(&|_: HttpRequest| {
+                Ok::<HttpResponse, std::io::Error>(
+                    oauth2::http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(RESPONSE.as_bytes().to_vec())
+                        .unwrap(),
+                )
+            })
+            .unwrap_err();
+        let RequestTokenError::Parse(_, body) = &error else {
+            panic!("malformed token response must produce a parse error");
+        };
+        assert_eq!(body.as_slice(), RESPONSE.as_bytes());
+        let category = oauth_token_error_kind(&error);
+        assert_eq!(category, "response_parse");
+        assert!(!category.contains("PRIVATE_"));
+
+        let error: oauth2::basic::BasicRequestTokenError<std::io::Error> =
+            RequestTokenError::ServerResponse(BasicErrorResponse::new(
+                BasicErrorResponseType::Extension("PRIVATE_ERROR_SENTINEL".to_string()),
+                Some("PRIVATE_DESCRIPTION_SENTINEL".to_string()),
+                Some("https://oauth.invalid/PRIVATE_URI_SENTINEL".to_string()),
+            ));
+        let category = oauth_token_error_kind(&error);
+        assert_eq!(category, "other_server_response");
+        assert!(!category.contains("PRIVATE_"));
+    }
 
     #[tokio::test]
     #[ignore = "requires AEAD_TAMPER_TEST_DATABASE_URL pointing at disposable migrated local Postgres"]

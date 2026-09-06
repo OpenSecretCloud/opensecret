@@ -429,7 +429,10 @@ async fn create_conversation(
 
     // Encrypt the entire metadata object
     let metadata_json = serde_json::to_string(&metadata).map_err(|e| {
-        error!("Failed to serialize metadata: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to serialize metadata"
+        );
         ApiError::InternalServerError
     })?;
     let metadata_enc = Some(encrypt_with_key(&user_key, metadata_json.as_bytes()).await);
@@ -504,7 +507,10 @@ async fn update_conversation(
     let metadata_enc = if let Some(metadata) = body.metadata.as_ref() {
         validate_metadata(metadata)?;
         let metadata_json = serde_json::to_string(metadata).map_err(|e| {
-            error!("Failed to serialize metadata: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to serialize metadata"
+            );
             ApiError::InternalServerError
         })?;
         Some(encrypt_with_key(&ctx.user_key, metadata_json.as_bytes()).await)
@@ -802,7 +808,7 @@ async fn batch_delete_conversations(
                         });
                     }
                     Err(e) => {
-                        error!("Failed to delete conversation {}: {:?}", conversation_id, e);
+                        error!(%conversation_id, error_kind = crate::observability::error_kind(&e), "Failed to delete conversation");
                         results.push(BatchDeleteItemResult {
                             id: conversation_id,
                             object: constants::OBJECT_TYPE_CONVERSATION_DELETED,

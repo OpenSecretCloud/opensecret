@@ -66,7 +66,10 @@ async fn list_memberships(
         .db
         .get_all_org_memberships_with_users_for_org(org.id)
         .map_err(|e| {
-            error!("Failed to get memberships with users: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to get memberships with users"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -99,7 +102,11 @@ async fn update_membership(
     let org = match data.db.get_org_by_uuid(org_id) {
         Ok(org) => org,
         Err(e) => {
-            error!("Organization not found: {} - Error: {:?}", org_id, e);
+            error!(
+                %org_id,
+                error_kind = crate::observability::error_kind(&e),
+                "Organization lookup failed"
+            );
             return Err(ApiError::NotFound);
         }
     };
@@ -172,7 +179,10 @@ async fn update_membership(
         .db
         .get_org_membership_by_platform_user_and_org_with_user(user_id, org.id)
         .map_err(|e| {
-            error!("Failed to get membership with user after update: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to get membership with user after update"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -232,7 +242,10 @@ async fn delete_membership(
                 ApiError::BadRequest
             }
             _ => {
-                error!("Failed to delete membership: {:?}", e);
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to delete membership"
+                );
                 ApiError::InternalServerError
             }
         })?;

@@ -21,19 +21,22 @@ impl From<PlatformUserError> for ApiError {
     fn from(err: PlatformUserError) -> Self {
         match err {
             PlatformUserError::DatabaseError(e) => {
-                tracing::error!("Database error: {:?}", e);
+                tracing::error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Platform user database error"
+                );
                 ApiError::InternalServerError
             }
-            PlatformUserError::InvalidEmail(msg) => {
-                tracing::error!("Invalid email error: {}", msg);
+            PlatformUserError::InvalidEmail(_) => {
+                tracing::debug!(reason = "invalid_email", "Platform user input rejected");
                 ApiError::BadRequest
             }
-            PlatformUserError::DuplicateEmail(email) => {
-                tracing::error!("Duplicate email error: {}", email);
+            PlatformUserError::DuplicateEmail(_) => {
+                tracing::debug!(reason = "duplicate_email", "Platform user input rejected");
                 ApiError::EmailAlreadyExists
             }
-            PlatformUserError::InvalidPassword(msg) => {
-                tracing::error!("Invalid password error: {}", msg);
+            PlatformUserError::InvalidPassword(_) => {
+                tracing::debug!(reason = "invalid_password", "Platform user input rejected");
                 ApiError::BadRequest
             }
         }

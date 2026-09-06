@@ -399,8 +399,12 @@ impl ConversationItemConverter {
             "tool_call" => Self::tool_call_to_item(msg, content),
             "tool_output" => Self::tool_output_to_item(msg, content),
             "reasoning" => Self::reasoning_to_item(msg, content),
-            unknown => {
-                error!("Unknown message type: {}", unknown);
+            _ => {
+                error!(
+                    stage = "message_conversion",
+                    error_kind = "unknown_message_type",
+                    "Unknown message type"
+                );
                 Err(ApiError::InternalServerError)
             }
         }
@@ -413,7 +417,7 @@ impl ConversationItemConverter {
     ) -> Result<ConversationItem, ApiError> {
         // User messages MUST be stored as MessageContent
         let message_content: MessageContent = serde_json::from_str(&content).map_err(|e| {
-            error!("Failed to deserialize message content: {:?}", e);
+            error!(stage = "message_conversion", error_kind = ?e.classify(), "Failed to deserialize message content");
             ApiError::InternalServerError
         })?;
 

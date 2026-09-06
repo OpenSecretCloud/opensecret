@@ -117,6 +117,10 @@ transport; protected routes are not ordinary plaintext `fetch`, `curl`, or
 - Treat billing and feature flags only as configurable external HTTP APIs.
   Their server credentials remain backend-only, and each changed call site
   must define its own unavailable, timeout, denial, and success behavior.
+- Follow `docs/logging.md` for request correlation and safe diagnostics. Retain
+  spans across spawned work and streaming bodies; skip arguments by default in
+  instrumentation and explicitly allowlist fields. Error Display/Debug can
+  contain user data: use bounded typed categories, including at debug/trace.
 - Separate source-confirmed, test-confirmed, build-confirmed, live-confirmed,
   inferred, and unverified claims. Source and local tests do not prove deployed
   PCRs, KMS/IAM policy, artifact identity, network placement, or log retention.

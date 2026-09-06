@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tracing::Instrument;
 
 type StandardHttpClient = reqwest::Client;
 type TinfoilRefreshTask = JoinHandle<Result<SecureClientSnapshot, ProviderRequestError>>;
@@ -295,7 +296,7 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::spawn(recovery)
+    tokio::spawn(recovery.in_current_span())
 }
 
 fn spawn_tinfoil_refresh_after_connect_failure(
@@ -382,10 +383,10 @@ impl SecureTinfoilTransport {
                     tracing::info!("Tinfoil router discovery and attestation succeeded");
                     return;
                 }
-                Ok(Err(error)) => {
+                Ok(Err(_error)) => {
                     tracing::warn!(
                         retry_delay_seconds = retry_delay.as_secs(),
-                        error = %error,
+                        error_kind = "discovery_or_attestation",
                         "Tinfoil router discovery or attestation failed; retrying in background"
                     );
                 }
@@ -459,9 +460,9 @@ impl SecureTinfoilTransport {
                     refresh_attempt: slot.refresh_attempt,
                 })
             }
-            Ok(Err(error)) => {
+            Ok(Err(_error)) => {
                 tracing::warn!(
-                    error = %error,
+                    error_kind = "discovery_or_attestation",
                     "Tinfoil router refresh failed; transitioning unavailable"
                 );
                 slot.client = None;

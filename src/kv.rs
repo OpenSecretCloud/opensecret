@@ -43,26 +43,43 @@ pub fn get(
     user_secret_key: &SecretKey,
 ) -> StoreResult<Option<String>> {
     debug!("Getting KV pair");
-    let mut conn = pool.get().map_err(|e| {
-        error!("Failed to get database connection: {:?}", e);
+    let mut conn = pool.get().map_err(|_| {
+        error!(
+            stage = "kv_get",
+            error_kind = "database_connection",
+            "Failed to get database connection"
+        );
         StoreError::DatabaseError(UserKVError::DatabaseError(diesel::result::Error::NotFound))
     })?;
 
     let encrypted_key = encrypt_key_deterministic(user_secret_key, key.as_bytes());
 
-    let user_kv = UserKV::get_by_user_and_key(&mut conn, user_id, &encrypted_key).map_err(|e| {
-        error!("Failed to get KV pair: {:?}", e);
-        e
-    })?;
+    let user_kv =
+        UserKV::get_by_user_and_key(&mut conn, user_id, &encrypted_key).inspect_err(|_| {
+            error!(
+                stage = "kv_get",
+                error_kind = "database",
+                "Failed to get KV pair"
+            );
+        })?;
 
     if let Some(user_kv) = user_kv {
         let decrypted_value =
-            decrypt_with_key(user_secret_key, &user_kv.value_enc).map_err(|e| {
-                error!("Failed to decrypt value: {:?}", e);
+            decrypt_with_key(user_secret_key, &user_kv.value_enc).map_err(|_| {
+                error!(
+                    stage = "kv_get",
+                    error_kind = "decryption",
+                    "Failed to decrypt value"
+                );
                 StoreError::DecryptionError
             })?;
-        let value_str = String::from_utf8(decrypted_value).map_err(|e| {
-            error!("Failed to convert decrypted value to string: {:?}", e);
+        let value_str = String::from_utf8(decrypted_value).map_err(|_| {
+            // FromUtf8Error's Debug includes the decrypted byte buffer.
+            error!(
+                stage = "kv_get",
+                error_kind = "invalid_utf8",
+                "Failed to convert decrypted value to string"
+            );
             StoreError::DecryptionError
         })?;
         Ok(Some(value_str))

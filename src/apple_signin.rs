@@ -68,6 +68,36 @@ where
 const APPLE_JWKS_URL: &str = "https://appleid.apple.com/auth/keys";
 const APPLE_ISSUER: &str = "https://appleid.apple.com";
 
+// Error payloads may include decoded claims or key material. Only emit an
+// allowlisted category, including an explicit fallback for unfamiliar errors.
+fn jwt_error_kind(error: &jsonwebtoken::errors::Error) -> &'static str {
+    use jsonwebtoken::errors::ErrorKind;
+    match error.kind() {
+        ErrorKind::InvalidToken => "invalid_token",
+        ErrorKind::InvalidSignature => "invalid_signature",
+        ErrorKind::ExpiredSignature => "expired",
+        ErrorKind::ImmatureSignature => "not_yet_valid",
+        ErrorKind::InvalidIssuer => "invalid_issuer",
+        ErrorKind::InvalidAudience => "invalid_audience",
+        ErrorKind::InvalidSubject => "invalid_subject",
+        ErrorKind::MissingRequiredClaim(_) => "missing_claim",
+        ErrorKind::InvalidClaimFormat(_) => "invalid_claim_format",
+        ErrorKind::InvalidAlgorithm
+        | ErrorKind::InvalidAlgorithmName
+        | ErrorKind::MissingAlgorithm => "invalid_algorithm",
+        ErrorKind::InvalidKeyFormat
+        | ErrorKind::InvalidRsaKey(_)
+        | ErrorKind::InvalidEcdsaKey
+        | ErrorKind::InvalidEddsaKey => "invalid_key",
+        ErrorKind::Json(_) => "json",
+        ErrorKind::Base64(_) => "base64",
+        ErrorKind::Utf8(_) => "utf8",
+        ErrorKind::Signing(_) | ErrorKind::RsaFailedSigning => "signing",
+        ErrorKind::Provider(_) => "crypto_provider",
+        _ => "other",
+    }
+}
+
 // Cache of Apple's public keys, with timestamp for refresh logic
 pub struct AppleJwksCache {
     keys: HashMap<String, AppleKey>,
@@ -87,7 +117,10 @@ pub struct AppleKey {
 impl AppleKey {
     pub fn to_decoding_key(&self) -> Result<DecodingKey, ApiError> {
         DecodingKey::from_rsa_components(&self.n, &self.e).map_err(|e| {
-            error!("Failed to create decoding key from RSA components: {:?}", e);
+            error!(
+                error_kind = jwt_error_kind(&e),
+                "Failed to create decoding key from RSA components"
+            );
             ApiError::InternalServerError
         })
     }
@@ -142,7 +175,10 @@ impl AppleJwtVerifier {
     ) -> Result<AppleIdTokenClaims, ApiError> {
         // Get the kid from the token header
         let header = decode_header(token).map_err(|e| {
-            error!("Failed to decode JWT header: {:?}", e);
+            error!(
+                error_kind = jwt_error_kind(&e),
+                "Failed to decode JWT header"
+            );
             ApiError::InvalidJwt
         })?;
 
@@ -151,7 +187,7 @@ impl AppleJwtVerifier {
             ApiError::InvalidJwt
         })?;
 
-        debug!("Validating Apple JWT with kid: {}", kid);
+        debug!("Validating Apple JWT");
 
         // Get the matching public key
         let decoding_key = self.get_key_for_kid(&kid).await?;
@@ -172,7 +208,10 @@ impl AppleJwtVerifier {
         let token_data =
             jsonwebtoken::decode::<AppleIdTokenClaims>(token, &decoding_key, &validation).map_err(
                 |e| {
-                    error!("JWT verification failed: {:?}", e);
+                    error!(
+                        error_kind = jwt_error_kind(&e),
+                        "Apple JWT verification failed"
+                    );
                     ApiError::InvalidJwt
                 },
             )?;
@@ -227,7 +266,7 @@ impl AppleJwtVerifier {
         // Now try to get the key with a fresh cache
         let cache = self.jwks_cache.read().await;
         let key = cache.keys.get(kid).ok_or_else(|| {
-            error!("Key ID {} not found in Apple JWKS even after refresh", kid);
+            error!("Token key ID not found in Apple JWKS even after refresh");
             ApiError::InvalidJwt
         })?;
 
@@ -259,7 +298,11 @@ impl AppleJwtVerifier {
             .send()
             .await
             .map_err(|e| {
-                error!("Failed to fetch Apple JWKS: {:?}", e);
+                error!(
+                    timeout = e.is_timeout(),
+                    connect = e.is_connect(),
+                    "Failed to fetch Apple JWKS"
+                );
                 ApiError::InternalServerError
             })?;
 
@@ -269,7 +312,11 @@ impl AppleJwtVerifier {
         }
 
         let jwks: JwksResponse = response.json().await.map_err(|e| {
-            error!("Failed to parse Apple JWKS response: {:?}", e);
+            error!(
+                timeout = e.is_timeout(),
+                decode = e.is_decode(),
+                "Failed to parse Apple JWKS response"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -386,6 +433,33 @@ pub fn generate_apple_client_secret(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apple_jwt_error_category_omits_custom_provider_and_claim_descriptions() {
+        use jsonwebtoken::errors::{Error, ErrorKind};
+        const PRIVATE: &str = "PRIVATE_APPLE_CLAIM_AND_KEY_SENTINEL";
+        let errors = [
+            (
+                Error::from(ErrorKind::Provider(PRIVATE.to_string())),
+                "crypto_provider",
+            ),
+            (
+                Error::from(ErrorKind::InvalidClaimFormat(PRIVATE.to_string())),
+                "invalid_claim_format",
+            ),
+            (
+                Error::from(ErrorKind::InvalidRsaKey(PRIVATE.to_string())),
+                "invalid_key",
+            ),
+        ];
+        for (error, expected) in errors {
+            assert!(error.to_string().contains(PRIVATE));
+            let category = jwt_error_kind(&error);
+            assert_eq!(category, expected);
+            assert!(!category.contains(PRIVATE));
+        }
+    }
+
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use openssl::{
         ec::{EcGroup, EcKey},

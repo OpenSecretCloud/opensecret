@@ -298,14 +298,14 @@ async fn create_instruction(
         is_default: body.is_default,
     };
 
-    trace!("Creating instruction with: {:?}", new_instruction);
+    trace!(stage = "instruction_create", "Creating instruction");
 
     let instruction = state
         .db
         .create_user_instruction(new_instruction)
         .map_err(error_mapping::map_generic_db_error)?;
 
-    trace!("Created instruction: {:?}", instruction);
+    trace!(stage = "instruction_create", "Created instruction");
 
     let response = InstructionResponseBuilder::new(instruction)
         .name(body.name.clone())

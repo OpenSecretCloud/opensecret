@@ -33,6 +33,7 @@ belongs to the current checkout.
 
 `APP_MODE=local` writes line-buffered tracing to stdout so redirected `cargo run`
 logs appear immediately. When `RUST_LOG` is unset the default is
-`opensecret=debug` plus `axum_login`, `tower_sessions`, `sqlx=warn`, and
-`tower_http`. Override `RUST_LOG` to quiet or expand that set. Do not log
-secrets, tokens, decrypted bodies, or raw provider payloads.
+`warn,opensecret=info`. Add a focused module override such as
+`opensecret::web::responses=debug` when investigating. Keep the application
+root at info to retain request spans. See [logging and request correlation](logging.md)
+for trace IDs, body outcomes, privacy rules, and the parent logger's framing limits.

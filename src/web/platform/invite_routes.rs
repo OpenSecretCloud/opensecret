@@ -17,6 +17,7 @@ use axum::{
 };
 use std::sync::Arc;
 use tokio::spawn;
+use tracing::Instrument;
 use tracing::{debug, error};
 use uuid::Uuid;
 
@@ -92,7 +93,10 @@ async fn create_invite(
     );
 
     let invite = data.db.create_invite_code(new_invite).map_err(|e| {
-        error!("Failed to create invite code: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to create invite code"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -102,20 +106,26 @@ async fn create_invite(
     let app_mode = data.app_mode.clone();
     let resend_api_key = data.resend_api_key.clone();
     let org_uuid = org.uuid;
-    spawn(async move {
-        if let Err(e) = send_platform_invite_email(
-            app_mode,
-            resend_api_key,
-            email,
-            org.name,
-            invite_code,
-            org_uuid,
-        )
-        .await
-        {
-            error!("Failed to send invite email: {:?}", e);
+    spawn(
+        async move {
+            if let Err(e) = send_platform_invite_email(
+                app_mode,
+                resend_api_key,
+                email,
+                org.name,
+                invite_code,
+                org_uuid,
+            )
+            .await
+            {
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to send invite email"
+                );
+            }
         }
-    });
+        .in_current_span(),
+    );
 
     let response = InviteResponse {
         code: invite.code,
@@ -157,7 +167,10 @@ async fn list_invites(
 
     // Get all invite codes for the org
     let all_invites = data.db.get_all_invite_codes_for_org(org.id).map_err(|e| {
-        error!("Failed to get invite codes: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to get invite codes"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -200,7 +213,10 @@ async fn get_invite(
 
     // Get invite by code
     let invite = data.db.get_invite_code_by_code(invite_code).map_err(|e| {
-        error!("Failed to get invite code: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to get invite code"
+        );
         match e {
             DBError::InviteCodeNotFound => ApiError::NotFound,
             _ => ApiError::InternalServerError,
@@ -271,7 +287,10 @@ async fn delete_invite(
 
     // Get invite by code
     let invite = data.db.get_invite_code_by_code(invite_code).map_err(|e| {
-        error!("Failed to get invite code: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to get invite code"
+        );
         match e {
             DBError::InviteCodeNotFound => ApiError::NotFound,
             _ => ApiError::InternalServerError,
@@ -285,7 +304,10 @@ async fn delete_invite(
 
     // Delete the invite
     data.db.delete_invite_code(&invite).map_err(|e| {
-        error!("Failed to delete invite code: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to delete invite code"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -331,7 +353,10 @@ async fn accept_invite(
     data.db
         .accept_invite_transaction(&invite, new_membership)
         .map_err(|e| {
-            error!("Failed to accept invite: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to accept invite"
+            );
             match e {
                 DBError::InviteCodeError(InviteCodeError::AlreadyUsed) => ApiError::BadRequest,
                 DBError::InviteCodeError(InviteCodeError::Expired) => ApiError::BadRequest,

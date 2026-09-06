@@ -146,7 +146,10 @@ impl AwsCredentialManager {
                         );
                         panic!("Could not obtain AWS credentials after maximum retries");
                     }
-                    tracing::error!("Failed to refresh AWS credentials: {:?}", e);
+                    tracing::error!(
+                        error_kind = crate::observability::error_kind(&e),
+                        "Failed to refresh AWS credentials"
+                    );
                     tracing::info!(
                         "Retrying in 5 seconds... (attempt {}/{})",
                         attempts,

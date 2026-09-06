@@ -357,10 +357,7 @@ impl GithubProvider {
             match db.create_oauth_provider(new_provider) {
                 Ok(_) => info!("GitHub OAuth provider successfully added to database"),
                 Err(e) => {
-                    error!(
-                        "Failed to create GitHub OAuth provider in database: {:?}",
-                        e
-                    );
+                    error!("Failed to create GitHub OAuth provider in database");
                     return Err(e.into());
                 }
             }
@@ -469,10 +466,7 @@ impl GoogleProvider {
             match db.create_oauth_provider(new_provider) {
                 Ok(_) => info!("Google OAuth provider successfully added to database"),
                 Err(e) => {
-                    error!(
-                        "Failed to create Google OAuth provider in database: {:?}",
-                        e
-                    );
+                    error!("Failed to create Google OAuth provider in database");
                     return Err(e.into());
                 }
             }
@@ -589,7 +583,7 @@ impl AppleProvider {
             match db.create_oauth_provider(new_provider) {
                 Ok(_) => info!("Apple OAuth provider successfully added to database"),
                 Err(e) => {
-                    error!("Failed to create Apple OAuth provider in database: {:?}", e);
+                    error!("Failed to create Apple OAuth provider in database");
                     return Err(e.into());
                 }
             }

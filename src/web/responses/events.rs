@@ -77,7 +77,11 @@ impl<'a> SseEventEmitter<'a> {
                         event
                     }
                     Err(e) => {
-                        error!("Failed to encrypt {} event: {:?}", event_type, e);
+                        error!(
+                            event_type,
+                            error_kind = crate::observability::error_kind(&e),
+                            "Failed to encrypt event"
+                        );
                         Event::default()
                             .event("error")
                             .data(ERROR_DATA_ENCRYPTION_FAILED)
@@ -85,7 +89,11 @@ impl<'a> SseEventEmitter<'a> {
                 }
             }
             Err(e) => {
-                error!("Failed to serialize {}: {:?}", event_type, e);
+                error!(
+                    event_type,
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to serialize event"
+                );
                 Event::default()
                     .event("error")
                     .data(ERROR_DATA_SERIALIZATION_FAILED)
@@ -103,7 +111,11 @@ impl<'a> SseEventEmitter<'a> {
                 match encrypt_event(self.state, &self.transport_session, event_type, &json).await {
                     Ok(event) => event,
                     Err(e) => {
-                        error!("Failed to encrypt {} event: {:?}", event_type, e);
+                        error!(
+                            event_type,
+                            error_kind = crate::observability::error_kind(&e),
+                            "Failed to encrypt event"
+                        );
                         Event::default()
                             .event("error")
                             .data(ERROR_DATA_ENCRYPTION_FAILED)
@@ -111,7 +123,11 @@ impl<'a> SseEventEmitter<'a> {
                 }
             }
             Err(e) => {
-                error!("Failed to serialize {}: {:?}", event_type, e);
+                error!(
+                    event_type,
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to serialize event"
+                );
                 Event::default()
                     .event("error")
                     .data(ERROR_DATA_SERIALIZATION_FAILED)

@@ -58,7 +58,10 @@ async fn create_org(
         .db
         .create_org_with_owner(new_org, platform_user.uuid)
         .map_err(|e| {
-            error!("Failed to create organization with owner: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to create organization with owner"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -82,7 +85,10 @@ async fn list_orgs(
         .db
         .get_all_org_memberships_for_platform_user(platform_user.uuid)
         .map_err(|e| {
-            error!("Failed to get org memberships: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to get org memberships"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -136,7 +142,10 @@ async fn delete_org(
 
     // Delete the org
     data.db.delete_org(&org).map_err(|e| {
-        error!("Failed to delete organization: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to delete organization"
+        );
         ApiError::InternalServerError
     })?;
 

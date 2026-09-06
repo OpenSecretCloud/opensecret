@@ -201,9 +201,8 @@ impl SqsEventPublisher {
 
     pub async fn publish_event(&self, event: UsageEvent) -> Result<(), SqsError> {
         let event_id = event.event_id;
-        let user_id = event.user_id;
 
-        info!("Publishing event {} for user {}", event_id, user_id);
+        debug!(%event_id, "Publishing usage event to SQS");
 
         let backoff = ExponentialBackoff::<SystemClock> {
             initial_interval: Duration::from_millis(INITIAL_INTERVAL_MS),
@@ -222,7 +221,7 @@ impl SqsEventPublisher {
             let message_body = serde_json::to_string(&event)
                 .map_err(|e| BackoffError::permanent(SqsError::Serialization(e)))?;
 
-            debug!("sending message to SQS: {:?}", event);
+            debug!(%event_id, "Sending usage event to SQS");
 
             match client
                 .send_message()
@@ -239,17 +238,16 @@ impl SqsEventPublisher {
 
         match result {
             Ok(_) => {
-                info!(
-                    "Successfully published event {} for user {} to SQS",
-                    event_id, user_id
-                );
+                info!(%event_id, "Successfully published usage event to SQS");
                 Ok(())
             }
-            Err(_) => {
-                error!(
-                    "Failed to publish event after retries. Event data: {:?}",
-                    event
-                );
+            Err(error) => {
+                let error_kind = match error {
+                    SqsError::AwsSdk(_) => "aws_sdk",
+                    SqsError::Serialization(_) => "serialization",
+                    SqsError::NoCredentials => "credentials_unavailable",
+                };
+                error!(%event_id, error_kind, "Failed to publish usage event after retries");
                 Err(SqsError::AwsSdk(
                     "Failed to publish after retries".to_string(),
                 ))

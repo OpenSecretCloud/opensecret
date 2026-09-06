@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::spawn;
-use tracing::{error, info};
+use tracing::Instrument;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 #[derive(Deserialize, Clone)]
@@ -194,11 +195,14 @@ async fn login_internal(
             match data.db.get_user_by_email(email.clone(), project.id) {
                 Ok(user) => user,
                 Err(DBError::UserNotFound) => {
-                    error!("User not found by provided login identifier");
+                    debug!(reason = "unknown_login", "Authentication request rejected");
                     return Err(ApiError::InvalidUsernameOrPassword);
                 }
                 Err(e) => {
-                    error!("Error fetching user by email: {:?}", e);
+                    error!(
+                        error_kind = crate::observability::error_kind(&e),
+                        "Error fetching user by email"
+                    );
                     return Err(ApiError::InternalServerError);
                 }
             }
@@ -208,35 +212,50 @@ async fn login_internal(
             match data.db.get_user_by_uuid(*id) {
                 Ok(user) => {
                     if !user.is_guest() {
-                        error!("ID-based login not allowed for users with email addresses");
+                        debug!(
+                            reason = "id_login_not_allowed",
+                            "Authentication request rejected"
+                        );
                         return Err(ApiError::InvalidUsernameOrPassword);
                     }
                     // Verify user belongs to the specified project
                     if user.project_id != project.id {
-                        error!("User does not belong to specified project");
+                        debug!(
+                            reason = "project_mismatch",
+                            "Authentication request rejected"
+                        );
                         return Err(ApiError::InvalidUsernameOrPassword);
                     }
                     user
                 }
                 Err(DBError::UserNotFound) => {
-                    error!("User not found by ID: {id}");
+                    debug!(reason = "unknown_login", "Authentication request rejected");
                     return Err(ApiError::InvalidUsernameOrPassword);
                 }
                 Err(e) => {
-                    error!("Error fetching user by ID: {:?}", e);
+                    error!(
+                        error_kind = crate::observability::error_kind(&e),
+                        "Error fetching user by ID"
+                    );
                     return Err(ApiError::InternalServerError);
                 }
             }
         }
         (None, None) => {
-            error!("Neither email nor ID provided for login");
+            debug!(
+                reason = "missing_login_identifier",
+                "Authentication request rejected"
+            );
             return Err(ApiError::InvalidUsernameOrPassword);
         }
     };
 
     // Check if the user is an OAuth-only user
     if user.password_enc.is_none() {
-        error!("Attempted password login for OAuth-only user");
+        debug!(
+            reason = "password_login_not_available",
+            "Authentication request rejected"
+        );
         return Err(ApiError::InvalidUsernameOrPassword);
     }
 
@@ -267,11 +286,17 @@ async fn login_internal(
             Ok(auth_response)
         }
         Ok(None) => {
-            error!("Invalid password attempt");
+            debug!(
+                reason = "invalid_credentials",
+                "Authentication request rejected"
+            );
             Err(ApiError::InvalidUsernameOrPassword)
         }
         Err(e) => {
-            error!("Error authenticating user: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Error authenticating user"
+            );
             Err(ApiError::InternalServerError)
         }
     }
@@ -282,7 +307,7 @@ pub async fn logout(
     Decrypted(logout_request): Decrypted<LogoutRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
-    info!("Logout request received");
+    debug!("Logout request received");
     // TODO actually delete the refresh token
     drop(logout_request.refresh_token);
     let response = json!({ "message": "Logged out successfully" });
@@ -300,11 +325,17 @@ pub async fn register(
     let user = match data.register_user(creds.clone()).await {
         Ok(user) => user,
         Err(Error::UserAlreadyExists) => {
-            tracing::warn!("Cannot register user that already exists");
+            debug!(
+                reason = "already_registered",
+                "Registration request rejected"
+            );
             return Err(ApiError::EmailAlreadyExists);
         }
         Err(e) => {
-            tracing::error!("Error registering user: {:?}", e);
+            tracing::error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Error registering user"
+            );
             return Err(ApiError::InternalServerError);
         }
     };
@@ -341,7 +372,10 @@ pub async fn handle_new_user_registration(
         let verification = match data.db.create_email_verification(new_verification) {
             Ok(v) => v,
             Err(e) => {
-                tracing::error!("Error creating email verification: {:?}", e);
+                tracing::error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Error creating email verification"
+                );
                 return Err(ApiError::InternalServerError);
             }
         };
@@ -352,13 +386,19 @@ pub async fn handle_new_user_registration(
             let verification_code = verification.verification_code;
             let data = data.clone();
             let project_id = user.project_id;
-            spawn(async move {
-                if let Err(e) =
-                    send_verification_email(&data, project_id, email, verification_code).await
-                {
-                    tracing::error!("Could not send verification email: {e}");
+            spawn(
+                async move {
+                    if let Err(e) =
+                        send_verification_email(&data, project_id, email, verification_code).await
+                    {
+                        tracing::error!(
+                            error_kind = crate::observability::error_kind(&e),
+                            "Could not send verification email"
+                        );
+                    }
                 }
-            });
+                .in_current_span(),
+            );
         }
     }
 
@@ -367,11 +407,17 @@ pub async fn handle_new_user_registration(
         let welcome_email = user.get_email().unwrap().to_string(); // Safe to unwrap since we checked is_guest()
         let data = data.clone();
         let project_id = user.project_id;
-        spawn(async move {
-            if let Err(e) = send_hello_email(&data, project_id, welcome_email).await {
-                tracing::error!("Could not schedule welcome email: {e}");
+        spawn(
+            async move {
+                if let Err(e) = send_hello_email(&data, project_id, welcome_email).await {
+                    tracing::error!(
+                        error_kind = crate::observability::error_kind(&e),
+                        "Could not schedule welcome email"
+                    );
+                }
             }
-        });
+            .in_current_span(),
+        );
     }
 
     Ok(())
@@ -382,7 +428,7 @@ pub async fn refresh_token(
     Decrypted(refresh_request): Decrypted<RefreshRequest>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
-    info!("Refresh token request received");
+    debug!("Refresh token request received");
 
     let refresh_audience = if session_id.is_v2() {
         crate::jwt::TRANSPORT_V2_USER_REFRESH
@@ -473,7 +519,10 @@ pub async fn password_reset_request(
     match data.db.get_user_by_email(payload.email.clone(), project.id) {
         Ok(user) => {
             if user.password_enc.is_none() {
-                error!("OAuth-only user attempted to reset password");
+                debug!(
+                    reason = "password_reset_not_available",
+                    "Authentication request rejected"
+                );
                 // Still return success to not leak information about the account
                 let response = json!({
                     "message": "If an account with that email exists, we have sent a password reset link."
@@ -489,7 +538,10 @@ pub async fn password_reset_request(
             return encrypt_response(&data, &session_id, &response).await;
         }
         Err(e) => {
-            error!("Error in password reset request: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Error in password reset request"
+            );
             return Err(ApiError::InternalServerError);
         }
     }
@@ -499,7 +551,10 @@ pub async fn password_reset_request(
         .create_password_reset_request(payload.email.clone(), payload.hashed_secret, project.id)
         .await
         .map_err(|e| {
-            error!("Error in create_password_reset_request: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Error in create_password_reset_request"
+            );
             // We don't expose this error to the user
         });
 
@@ -525,16 +580,22 @@ pub async fn password_reset_confirm(
     match data.db.get_user_by_email(payload.email.clone(), project.id) {
         Ok(user) => {
             if user.password_enc.is_none() {
-                error!("OAuth-only user attempted to reset password");
+                debug!(
+                    reason = "password_reset_not_available",
+                    "Authentication request rejected"
+                );
                 return Err(ApiError::InvalidUsernameOrPassword);
             }
         }
         Err(DBError::UserNotFound) => {
-            error!("User not found in password reset confirm");
+            debug!(reason = "unknown_login", "Authentication request rejected");
             return Err(ApiError::InvalidUsernameOrPassword);
         }
         Err(e) => {
-            error!("Error in password reset confirm: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Error in password reset confirm"
+            );
             return Err(ApiError::InternalServerError);
         }
     }

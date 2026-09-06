@@ -165,9 +165,10 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
     // Path must have exactly 6 segments: m/PURPOSE'/APP'/LANGUAGE'/WORDS'/INDEX'
     if segments.len() != 6 {
         error!(
-            "BIP-85 path must have exactly 6 segments, found {}: {}",
-            segments.len(),
-            path
+            stage = "bip85_path_validation",
+            error_kind = "segment_count",
+            segment_count = segments.len(),
+            "BIP-85 path must have exactly 6 segments"
         );
         return Err(ApiError::BadRequest);
     }
@@ -175,35 +176,39 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
     // First segment should be "m" (master key)
     if segments[0] != "m" {
         error!(
-            "BIP-85 path must start with 'm', found '{}': {}",
-            segments[0], path
+            stage = "bip85_path_validation",
+            error_kind = "master_segment",
+            "BIP-85 path must start with 'm'"
         );
         return Err(ApiError::BadRequest);
     }
 
-    let purpose = parse_hardened_bip85_segment(segments[1], "purpose", path)?;
+    let purpose = parse_hardened_bip85_segment(segments[1], "purpose")?;
     if purpose != BIP85_PURPOSE {
         error!(
-            "BIP-85 path purpose must be {}' or {}h, found '{}': {}",
-            BIP85_PURPOSE, BIP85_PURPOSE, segments[1], path
+            stage = "bip85_path_validation",
+            error_kind = "purpose",
+            "BIP-85 path has an unsupported purpose"
         );
         return Err(ApiError::BadRequest);
     }
 
-    let application = parse_hardened_bip85_segment(segments[2], "application", path)?;
+    let application = parse_hardened_bip85_segment(segments[2], "application")?;
     if application != BIP85_APPLICATION_BIP39 {
         error!(
-            "BIP-85 path application must be {}' or {}h for BIP-39 mnemonics, found '{}': {}",
-            BIP85_APPLICATION_BIP39, BIP85_APPLICATION_BIP39, segments[2], path
+            stage = "bip85_path_validation",
+            error_kind = "application",
+            "BIP-85 path has an unsupported application"
         );
         return Err(ApiError::BadRequest);
     }
 
-    let language = parse_hardened_bip85_segment(segments[3], "language", path)?;
+    let language = parse_hardened_bip85_segment(segments[3], "language")?;
     if language != 0 {
         error!(
-            "BIP-85 path language must be 0' or 0h for English, found '{}': {}",
-            segments[3], path
+            stage = "bip85_path_validation",
+            error_kind = "language",
+            "BIP-85 path has an unsupported language"
         );
         return Err(ApiError::BadRequest);
     }
@@ -214,8 +219,9 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
         Ok(value) => value,
         Err(_) => {
             error!(
-                "BIP-85 path word count must be a number, found '{}': {}",
-                word_count, path
+                stage = "bip85_path_validation",
+                error_kind = "word_count_number",
+                "BIP-85 path word count must be a number"
             );
             return Err(ApiError::BadRequest);
         }
@@ -224,8 +230,9 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
     // Validate word count is one of the valid options
     if !VALID_BIP39_WORD_COUNTS.contains(&word_count_value) {
         error!(
-            "BIP-85 path word count must be one of {:?}, found {}: {}",
-            VALID_BIP39_WORD_COUNTS, word_count_value, path
+            stage = "bip85_path_validation",
+            error_kind = "word_count_range",
+            "BIP-85 path word count is unsupported"
         );
         return Err(ApiError::BadRequest);
     }
@@ -233,8 +240,9 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
     // Check word count is hardened
     if !(word_count.ends_with('\'') || word_count.ends_with('h')) {
         error!(
-            "BIP-85 path word count must be hardened, found '{}': {}",
-            word_count, path
+            stage = "bip85_path_validation",
+            error_kind = "word_count_hardening",
+            "BIP-85 path word count must be hardened"
         );
         return Err(ApiError::BadRequest);
     }
@@ -243,8 +251,9 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
     let index = segments[5];
     if !(index.ends_with('\'') || index.ends_with('h')) {
         error!(
-            "BIP-85 path index must be hardened, found '{}': {}",
-            index, path
+            stage = "bip85_path_validation",
+            error_kind = "index_hardening",
+            "BIP-85 path index must be hardened"
         );
         return Err(ApiError::BadRequest);
     }
@@ -254,8 +263,9 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
         Ok(value) => value,
         Err(_) => {
             error!(
-                "BIP-85 path index must be a valid number, found '{}': {}",
-                index, path
+                stage = "bip85_path_validation",
+                error_kind = "index_number",
+                "BIP-85 path index must be a valid number"
             );
             return Err(ApiError::BadRequest);
         }
@@ -264,11 +274,13 @@ pub fn validate_bip85_path(path: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn parse_hardened_bip85_segment(segment: &str, name: &str, path: &str) -> Result<u32, ApiError> {
+fn parse_hardened_bip85_segment(segment: &str, name: &'static str) -> Result<u32, ApiError> {
     if !(segment.ends_with('\'') || segment.ends_with('h')) {
         error!(
-            "BIP-85 path {} must be hardened, found '{}': {}",
-            name, segment, path
+            stage = "bip85_path_validation",
+            error_kind = "segment_hardening",
+            segment = name,
+            "BIP-85 path segment must be hardened"
         );
         return Err(ApiError::BadRequest);
     }
@@ -278,8 +290,10 @@ fn parse_hardened_bip85_segment(segment: &str, name: &str, path: &str) -> Result
         .parse::<u32>()
         .map_err(|_| {
             error!(
-                "BIP-85 path {} must be a valid number, found '{}': {}",
-                name, segment, path
+                stage = "bip85_path_validation",
+                error_kind = "segment_number",
+                segment = name,
+                "BIP-85 path segment must be a valid number"
             );
             ApiError::BadRequest
         })
@@ -309,8 +323,12 @@ fn validate_path(path: &str) -> Result<(), ApiError> {
     }
 
     // For non-empty paths, validate using bitcoin library's DerivationPath
-    DerivationPath::from_str(path).map_err(|e| {
-        error!("Invalid derivation path format: {}", e);
+    DerivationPath::from_str(path).map_err(|_| {
+        error!(
+            stage = "bip32_path_validation",
+            error_kind = "invalid_path",
+            "Invalid derivation path format"
+        );
         ApiError::BadRequest
     })?;
 
@@ -568,7 +586,11 @@ pub async fn user_protected(
             Ok(verification) => verification.is_verified,
             Err(DBError::EmailVerificationNotFound) => false,
             Err(e) => {
-                tracing::error!("Error checking email verification: {:?}", e);
+                tracing::error!(
+                    stage = "user_protected",
+                    error_kind = crate::observability::error_kind(&e),
+                    "Error checking email verification"
+                );
                 return Err(ApiError::InternalServerError);
             }
         }
@@ -590,7 +612,11 @@ pub async fn user_protected(
                                 "apple" => LoginMethod::Apple,
                                 // Add other providers here as they're supported
                                 _ => {
-                                    tracing::error!("Unknown OAuth provider: {}", provider.name);
+                                    tracing::error!(
+                                        stage = "user_protected",
+                                        error_kind = "unknown_oauth_provider",
+                                        "Unknown OAuth provider"
+                                    );
                                     return Err(ApiError::InternalServerError);
                                 }
                             };
@@ -603,14 +629,22 @@ pub async fn user_protected(
                             return Err(ApiError::InternalServerError);
                         }
                         Err(e) => {
-                            tracing::error!("Error fetching OAuth provider: {:?}", e);
+                            tracing::error!(
+                                stage = "user_protected",
+                                error_kind = crate::observability::error_kind(&e),
+                                "Error fetching OAuth provider"
+                            );
                             return Err(ApiError::InternalServerError);
                         }
                     }
                 }
             }
             Err(e) => {
-                tracing::error!("Error fetching OAuth connections: {:?}", e);
+                tracing::error!(
+                    stage = "user_protected",
+                    error_kind = crate::observability::error_kind(&e),
+                    "Error fetching OAuth connections"
+                );
                 return Err(ApiError::InternalServerError);
             }
         }
@@ -630,7 +664,11 @@ pub async fn get_kv(
     let value = match data.get(&user, &auth_context, key).await {
         Ok(kv) => kv,
         Err(e) => {
-            tracing::error!("Error getting key-value pair: {:?}", e);
+            tracing::error!(
+                stage = "get_kv",
+                error_kind = crate::observability::error_kind(&e),
+                "Error getting key-value pair"
+            );
             return Err(ApiError::InternalServerError);
         }
     };
@@ -648,7 +686,11 @@ pub async fn put_kv(
     match data.put(&user, &auth_context, key, value.clone()).await {
         Ok(kv) => kv,
         Err(e) => {
-            tracing::error!("Error putting key-value pair: {:?}", e);
+            tracing::error!(
+                stage = "put_kv",
+                error_kind = crate::observability::error_kind(&e),
+                "Error putting key-value pair"
+            );
             return Err(ApiError::InternalServerError);
         }
     };
@@ -668,7 +710,11 @@ pub async fn delete_kv(
             encrypt_response(&data, &session_id, &response).await
         }
         Err(e) => {
-            tracing::error!("Error deleting key-value pair: {:?}", e);
+            tracing::error!(
+                stage = "delete_kv",
+                error_kind = crate::observability::error_kind(&e),
+                "Error deleting key-value pair"
+            );
             Err(ApiError::InternalServerError)
         }
     }
@@ -687,7 +733,11 @@ pub async fn delete_all_kv(
             encrypt_response(&data, &session_id, &response).await
         }
         Err(e) => {
-            tracing::error!("Error deleting all key-value pairs: {:?}", e);
+            tracing::error!(
+                stage = "delete_all_kv",
+                error_kind = crate::observability::error_kind(&e),
+                "Error deleting all key-value pairs"
+            );
             Err(ApiError::InternalServerError)
         }
     }
@@ -702,7 +752,11 @@ pub async fn list_kv(
     let kvs = match data.list(&user, &auth_context).await {
         Ok(kvs) => kvs,
         Err(e) => {
-            tracing::error!("Error listing key-value pairs: {:?}", e);
+            tracing::error!(
+                stage = "list_kv",
+                error_kind = crate::observability::error_kind(&e),
+                "Error listing key-value pairs"
+            );
             return Err(ApiError::InternalServerError);
         }
     };
@@ -732,7 +786,11 @@ pub async fn request_new_verification_code(
             }
             // Delete the old verification
             if let Err(e) = data.db.delete_email_verification(&verification) {
-                tracing::error!("Error deleting old verification: {:?}", e);
+                tracing::error!(
+                    stage = "request_new_verification_code",
+                    error_kind = crate::observability::error_kind(&e),
+                    "Error deleting old verification"
+                );
                 return Err(ApiError::InternalServerError);
             }
         }
@@ -740,7 +798,11 @@ pub async fn request_new_verification_code(
             // This is fine, we'll create a new verification
         }
         Err(e) => {
-            tracing::error!("Error checking email verification: {:?}", e);
+            tracing::error!(
+                stage = "request_new_verification_code",
+                error_kind = crate::observability::error_kind(&e),
+                "Error checking email verification"
+            );
             return Err(ApiError::InternalServerError);
         }
     }
@@ -750,7 +812,11 @@ pub async fn request_new_verification_code(
     let verification = match data.db.create_email_verification(new_verification) {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!("Error creating email verification: {:?}", e);
+            tracing::error!(
+                stage = "request_new_verification_code",
+                error_kind = crate::observability::error_kind(&e),
+                "Error creating email verification"
+            );
             return Err(ApiError::InternalServerError);
         }
     };
@@ -764,7 +830,11 @@ pub async fn request_new_verification_code(
     )
     .await
     {
-        tracing::error!("Error sending verification email: {:?}", e);
+        tracing::error!(
+            stage = "request_new_verification_code",
+            error_kind = crate::observability::error_kind(&e),
+            "Error sending verification email"
+        );
         return Err(ApiError::InternalServerError);
     }
 
@@ -828,7 +898,11 @@ pub async fn change_password(
                     encrypt_response(&data, &session_id, &response).await
                 }
                 Err(e) => {
-                    error!("Error changing password: {:?}", e);
+                    error!(
+                        stage = "change_password",
+                        error_kind = crate::observability::error_kind(&e),
+                        "Error changing password"
+                    );
                     match e {
                         Error::AuthenticationError => Err(ApiError::InvalidUsernameOrPassword),
                         _ => Err(ApiError::InternalServerError),
@@ -856,11 +930,19 @@ pub async fn get_private_key(
     let plaintext_seed = data
         .decrypt_seed_for_auth_context(&user, &auth_context)
         .map_err(|e| {
-            error!("Failed to decrypt authenticated seed wrap: {:?}", e);
+            error!(
+                stage = "get_private_key",
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to decrypt authenticated seed wrap"
+            );
             ApiError::Unauthorized
         })?;
     let root_mnemonic = plaintext_user_seed_to_mnemonic(&plaintext_seed).map_err(|e| {
-        error!("Failed to parse user seed mnemonic: {:?}", e);
+        error!(
+            stage = "get_private_key",
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to parse user seed mnemonic"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -869,7 +951,11 @@ pub async fn get_private_key(
         // Derive a child mnemonic
         let child_mnemonic =
             derive_bip85_mnemonic_from_root(root_mnemonic, bip85_path).map_err(|e| {
-                error!("BIP-85 derivation error: {:?}", e);
+                error!(
+                    stage = "get_private_key",
+                    error_kind = crate::observability::error_kind(&e),
+                    "BIP-85 derivation error"
+                );
                 ApiError::BadRequest
             })?;
 
@@ -908,16 +994,28 @@ pub async fn get_private_key_bytes(
         )
         .await
         .map_err(|e| match e {
-            Error::InvalidDerivationPath(msg) => {
-                error!("Invalid derivation path: {}", msg);
+            Error::InvalidDerivationPath(_) => {
+                error!(
+                    stage = "user_key_derivation",
+                    error_kind = "invalid_path",
+                    "Invalid derivation path"
+                );
                 ApiError::BadRequest
             }
-            Error::KeyDerivationError(msg) => {
-                error!("Failed to derive key: {}", msg);
+            Error::KeyDerivationError(_) => {
+                error!(
+                    stage = "user_key_derivation",
+                    error_kind = "key_derivation",
+                    "Failed to derive key"
+                );
                 ApiError::BadRequest
             }
             _ => {
-                error!("Failed to get user key: {:?}", e);
+                error!(
+                    stage = "get_private_key_bytes",
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to get user key"
+                );
                 ApiError::InternalServerError
             }
         })?;
@@ -956,7 +1054,11 @@ pub async fn sign_message(
     let message_bytes = general_purpose::STANDARD
         .decode(&sign_request.message_base64)
         .map_err(|e| {
-            error!("Failed to decode base64 message: {:?}", e);
+            error!(
+                stage = "sign_message",
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to decode base64 message"
+            );
             ApiError::BadRequest
         })?;
 
@@ -971,7 +1073,11 @@ pub async fn sign_message(
         )
         .await
         .map_err(|e| {
-            error!("Error signing message: {:?}", e);
+            error!(
+                stage = "sign_message",
+                error_kind = crate::observability::error_kind(&e),
+                "Error signing message"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -1009,7 +1115,11 @@ pub async fn get_public_key(
         )
         .await
         .map_err(|e| {
-            error!("Error getting user key: {:?}", e);
+            error!(
+                stage = "get_public_key",
+                error_kind = crate::observability::error_kind(&e),
+                "Error getting user key"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -1044,7 +1154,11 @@ pub async fn generate_third_party_token(
     // Validate the audience
     if let Some(audience) = request.audience.as_ref() {
         if audience.is_empty() || (audience.contains(':') && url::Url::parse(audience).is_err()) {
-            error!("Invalid audience provided: {}", audience);
+            error!(
+                stage = "third_party_token",
+                error_kind = "invalid_audience",
+                "Invalid audience provided"
+            );
             return Err(ApiError::BadRequest);
         }
     }
@@ -1061,7 +1175,11 @@ pub async fn generate_third_party_token(
     ) {
         Ok(token) => token,
         Err(e) => {
-            error!("Failed to generate third party token: {:?}", e);
+            error!(
+                stage = "generate_third_party_token",
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to generate third party token"
+            );
             return Err(e);
         }
     };
@@ -1097,16 +1215,28 @@ pub async fn encrypt_data(
         )
         .await
         .map_err(|e| match e {
-            Error::InvalidDerivationPath(msg) => {
-                error!("Invalid derivation path: {}", msg);
+            Error::InvalidDerivationPath(_) => {
+                error!(
+                    stage = "user_key_derivation",
+                    error_kind = "invalid_path",
+                    "Invalid derivation path"
+                );
                 ApiError::BadRequest
             }
-            Error::KeyDerivationError(msg) => {
-                error!("Failed to derive key: {}", msg);
+            Error::KeyDerivationError(_) => {
+                error!(
+                    stage = "user_key_derivation",
+                    error_kind = "key_derivation",
+                    "Failed to derive key"
+                );
                 ApiError::BadRequest
             }
             _ => {
-                error!("Failed to get user key: {:?}", e);
+                error!(
+                    stage = "encrypt_data",
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to get user key"
+                );
                 ApiError::InternalServerError
             }
         })?;
@@ -1151,16 +1281,28 @@ pub async fn decrypt_data(
         )
         .await
         .map_err(|e| match e {
-            Error::InvalidDerivationPath(msg) => {
-                error!("Invalid derivation path: {}", msg);
+            Error::InvalidDerivationPath(_) => {
+                error!(
+                    stage = "user_key_derivation",
+                    error_kind = "invalid_path",
+                    "Invalid derivation path"
+                );
                 ApiError::BadRequest
             }
-            Error::KeyDerivationError(msg) => {
-                error!("Failed to derive key: {}", msg);
+            Error::KeyDerivationError(_) => {
+                error!(
+                    stage = "user_key_derivation",
+                    error_kind = "key_derivation",
+                    "Failed to derive key"
+                );
                 ApiError::BadRequest
             }
             _ => {
-                error!("Failed to get user key: {e}");
+                error!(
+                    stage = "decrypt_data",
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to get user key"
+                );
                 ApiError::InternalServerError
             }
         })?;
@@ -1169,7 +1311,11 @@ pub async fn decrypt_data(
     let encrypted_data = match general_purpose::STANDARD.decode(&request.encrypted_data) {
         Ok(data) => data,
         Err(e) => {
-            error!("Failed to decode base64 data: {e}");
+            error!(
+                stage = "decrypt_data",
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to decode base64 data"
+            );
             return Err(ApiError::BadRequest);
         }
     };
@@ -1178,7 +1324,11 @@ pub async fn decrypt_data(
     let decrypted_data = match encrypt::decrypt_with_key(&user_key, &encrypted_data) {
         Ok(data) => data,
         Err(e) => {
-            error!("Decryption failed: {e}");
+            error!(
+                stage = "decrypt_data",
+                error_kind = crate::observability::error_kind(&e),
+                "Decryption failed"
+            );
             return Err(ApiError::BadRequest);
         }
     };
@@ -1187,7 +1337,11 @@ pub async fn decrypt_data(
     let decrypted_string = match String::from_utf8(decrypted_data) {
         Ok(s) => s,
         Err(e) => {
-            error!("Failed to convert decrypted data to string: {e}");
+            error!(
+                stage = "decrypt_data",
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to convert decrypted data to string"
+            );
             return Err(ApiError::BadRequest);
         }
     };
@@ -1222,7 +1376,11 @@ pub async fn initiate_account_deletion(
             result
         }
         Err(e) => {
-            error!("Error in initiating account deletion: {:?}", e);
+            error!(
+                stage = "initiate_account_deletion",
+                error_kind = crate::observability::error_kind(&e),
+                "Error in initiating account deletion"
+            );
             Err(ApiError::InternalServerError)
         }
     }
@@ -1255,19 +1413,35 @@ pub async fn confirm_account_deletion(
         }
         Err(e) => match e {
             Error::AccountDeletionExpired => {
-                warn!("Account deletion confirmation has expired: {:?}", e);
+                warn!(
+                    stage = "confirm_account_deletion",
+                    error_kind = crate::observability::error_kind(&e),
+                    "Account deletion confirmation has expired"
+                );
                 Err(ApiError::BadRequest)
             }
             Error::InvalidAccountDeletionSecret => {
-                warn!("Invalid account deletion secret: {:?}", e);
+                warn!(
+                    stage = "confirm_account_deletion",
+                    error_kind = crate::observability::error_kind(&e),
+                    "Invalid account deletion secret"
+                );
                 Err(ApiError::BadRequest)
             }
             Error::InvalidAccountDeletionRequest => {
-                warn!("Invalid account deletion request: {:?}", e);
+                warn!(
+                    stage = "confirm_account_deletion",
+                    error_kind = crate::observability::error_kind(&e),
+                    "Invalid account deletion request"
+                );
                 Err(ApiError::BadRequest)
             }
             _ => {
-                error!("Error in confirming account deletion: {:?}", e);
+                error!(
+                    stage = "confirm_account_deletion",
+                    error_kind = crate::observability::error_kind(&e),
+                    "Error in confirming account deletion"
+                );
                 Err(ApiError::InternalServerError)
             }
         },
@@ -1313,11 +1487,19 @@ pub async fn create_api_key(
             DBError::UserApiKeyError(
                 crate::models::user_api_keys::UserApiKeyError::DuplicateName,
             ) => {
-                error!("API key with name '{}' already exists for user", name);
+                error!(
+                    stage = "create_api_key",
+                    error_kind = "duplicate_name",
+                    "API key name already exists for user"
+                );
                 ApiError::Conflict // 409 - name already in use
             }
             _ => {
-                error!("Failed to create API key: {:?}", e);
+                error!(
+                    stage = "create_api_key",
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to create API key"
+                );
                 ApiError::InternalServerError
             }
         }
@@ -1329,7 +1511,7 @@ pub async fn create_api_key(
         created_at: api_key_record.created_at,
     };
 
-    info!("Created API key '{}' for user {}", response.name, user.uuid);
+    info!(stage = "create_api_key", "Created API key");
     encrypt_response(&data, &session_id, &response).await
 }
 
@@ -1344,7 +1526,11 @@ pub async fn list_api_keys(
         .db
         .get_all_user_api_keys_for_user(user.uuid)
         .map_err(|e| {
-            error!("Failed to list API keys: {:?}", e);
+            error!(
+                stage = "list_api_keys",
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to list API keys"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -1367,12 +1553,16 @@ pub async fn delete_api_key(
     Extension(user): Extension<User>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
-    debug!("Deleting API key '{}' for user: {}", name, user.uuid);
+    debug!(stage = "delete_api_key", "Deleting API key");
 
     data.db
         .delete_user_api_key_by_name(&name, user.uuid)
         .map_err(|e| {
-            error!("Failed to delete API key: {:?}", e);
+            error!(
+                stage = "delete_api_key",
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to delete API key"
+            );
             match e {
                 DBError::UserApiKeyError(
                     crate::models::user_api_keys::UserApiKeyError::NotFound,
@@ -1381,7 +1571,7 @@ pub async fn delete_api_key(
             }
         })?;
 
-    info!("Deleted API key '{}' for user {}", name, user.uuid);
+    info!(stage = "delete_api_key", "Deleted API key");
 
     let response = json!({ "success": true });
     encrypt_response(&data, &session_id, &response).await
@@ -1392,6 +1582,53 @@ mod tests {
     use super::*;
     use crate::encrypt::{decrypt_with_key, encrypt_with_key};
     use secp256k1::SecretKey;
+
+    #[test]
+    fn invalid_derivation_paths_are_diagnosed_without_logging_input() {
+        #[derive(Clone)]
+        struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for LogCapture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = LogCapture(captured.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+
+        for path in [
+            "private-path\nforged-log-line",
+            "private-path/83696968'/39'/0'/12'/0'",
+            "m/private-path'/39'/0'/12'/0'",
+            "m/83696968'/private-path'/0'/12'/0'",
+            "m/83696968'/39'/private-path'/12'/0'",
+            "m/83696968'/39'/0'/private-path'/0'",
+            "m/83696968'/39'/0'/12'/private-path'",
+        ] {
+            assert!(validate_bip85_path(path).is_err());
+        }
+        assert!(validate_path("m/private-path\nforged-log-line").is_err());
+
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("bip85_path_validation"), "{logs}");
+        assert!(logs.contains("bip32_path_validation"), "{logs}");
+        assert!(logs.contains("error_kind="), "{logs}");
+        assert!(!logs.contains("private-path"), "{logs}");
+        assert!(!logs.contains("forged-log-line"), "{logs}");
+    }
 
     #[test]
     fn test_derivation_path_validation() {

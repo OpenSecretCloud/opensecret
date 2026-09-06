@@ -26,7 +26,10 @@ pub mod error_mapping {
             }
             DBError::ResponsesError(ResponsesError::ValidationError) => ApiError::BadRequest,
             _ => {
-                error!("Conversation database error: {:?}", e);
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Conversation database error"
+                );
                 ApiError::InternalServerError
             }
         }
@@ -41,7 +44,10 @@ pub mod error_mapping {
             }
             DBError::ResponsesError(ResponsesError::ValidationError) => ApiError::BadRequest,
             _ => {
-                error!("Batch conversation project database error: {:?}", e);
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Batch conversation project database error"
+                );
                 ApiError::InternalServerError
             }
         }
@@ -55,7 +61,10 @@ pub mod error_mapping {
             }
             DBError::ResponsesError(ResponsesError::ValidationError) => ApiError::BadRequest,
             _ => {
-                error!("Conversation project database error: {:?}", e);
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Conversation project database error"
+                );
                 ApiError::InternalServerError
             }
         }
@@ -75,7 +84,10 @@ pub mod error_mapping {
                 ApiError::NotFound
             }
             _ => {
-                error!("Instruction database error: {:?}", e);
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Instruction database error"
+                );
                 ApiError::InternalServerError
             }
         }
@@ -94,7 +106,10 @@ pub mod error_mapping {
             DBError::ResponsesError(ResponsesError::Unauthorized) => ApiError::Unauthorized,
             DBError::ResponsesError(ResponsesError::ValidationError) => ApiError::BadRequest,
             _ => {
-                error!("Response database error: {:?}", e);
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Response database error"
+                );
                 ApiError::InternalServerError
             }
         }
@@ -108,7 +123,10 @@ pub mod error_mapping {
     /// # Returns
     /// ApiError with logging
     pub fn map_message_error(e: DBError) -> ApiError {
-        error!("Message database error: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Message database error"
+        );
         ApiError::InternalServerError
     }
 
@@ -122,7 +140,10 @@ pub mod error_mapping {
     /// # Returns
     /// ApiError with logging
     pub fn map_generic_db_error(e: DBError) -> ApiError {
-        error!("Database error: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Database error"
+        );
         ApiError::InternalServerError
     }
 

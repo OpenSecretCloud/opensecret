@@ -111,16 +111,13 @@ impl BillingClient {
         let response = request.send().await?;
 
         if response.status().is_success() {
-            response
-                .json::<UsageResponse>()
-                .await
-                .map_err(|e| BillingError::ParseError(e.to_string()))
+            response.json::<UsageResponse>().await.map_err(|e| {
+                BillingError::ParseError(crate::observability::error_kind(&e).to_owned())
+            })
         } else {
-            let error = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            Err(BillingError::ServiceError(error))
+            let status = response.status().as_u16();
+            // Never retain an external body in an error later formatted by callers.
+            Err(BillingError::ServiceError(format!("HTTP {status}")))
         }
     }
 
@@ -169,8 +166,8 @@ impl BillingClient {
         }
         let plan_usage = plan_usage.unwrap_or_else(|error| {
             warn!(
-                "Billing plan lookup failed for API request (user_id={}): {}; using free model access",
-                user_id, error
+                error_kind = crate::observability::error_kind(&error),
+                "Billing plan lookup failed for API request; using free model access"
             );
             UsageResponse {
                 can_use: false,

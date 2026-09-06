@@ -3099,10 +3099,35 @@ async fn get_secret(key_name: &str) -> Result<String, Error> {
         crate::aws_credentials::MAX_VSOCK_RESPONSE_BYTES,
     )?;
 
-    let parent_response: ParentResponse = serde_json::from_str(&response)?;
+    parse_parent_secret_response(&response)
+}
+
+// Startup's Result error and expect/unwrap failures are printed with Debug by
+// the runtime. Erase payload-bearing parse errors before they reach that sink.
+fn parse_parent_secret_response(response: &str) -> Result<String, Error> {
+    let parent_response: ParentResponse = serde_json::from_str(response).map_err(|error| {
+        error!(
+            stage = "parent_secret_response",
+            error_kind = observability::error_kind(&error),
+            "Failed to parse secret response"
+        );
+        Error::SecretParsingError
+    })?;
     if parent_response.response_type == "secret" {
-        let secret_json: Value =
-            serde_json::from_str(parent_response.response_value.as_str().unwrap())?;
+        let secret_json: Value = serde_json::from_str(
+            parent_response
+                .response_value
+                .as_str()
+                .ok_or(Error::SecretParsingError)?,
+        )
+        .map_err(|error| {
+            error!(
+                stage = "secret_json",
+                error_kind = observability::error_kind(&error),
+                "Failed to parse secret value"
+            );
+            Error::SecretParsingError
+        })?;
 
         // Assuming the secret is always a JSON object with a single key-value pair
         if let Some((_, value)) = secret_json.as_object().and_then(|obj| obj.iter().next()) {
@@ -3112,6 +3137,79 @@ async fn get_secret(key_name: &str) -> Result<String, Error> {
         }
     } else {
         Err(Error::AuthenticationError)
+    }
+}
+
+fn decode_startup_secret(bytes: Vec<u8>) -> Result<String, Error> {
+    String::from_utf8(bytes).map_err(|_| Error::SecretParsingError)
+}
+
+fn decode_local_enclave_key(value: &str) -> Result<[u8; 32], Error> {
+    hex::decode(value)
+        .map_err(|_| Error::SecretParsingError)?
+        .try_into()
+        .map_err(|_| Error::SecretParsingError)
+}
+
+fn required_secret_env(name: &'static str) -> String {
+    // VarError::NotUnicode retains the actual environment value in Debug.
+    env::var(name).unwrap_or_else(|_| panic!("{name} must be set to valid UTF-8"))
+}
+
+#[cfg(test)]
+mod startup_secret_log_tests {
+    use super::*;
+
+    #[test]
+    fn startup_secret_decode_errors_do_not_retain_bytes() {
+        let mut private = b"PRIVATE_STARTUP_SECRET_SENTINEL".to_vec();
+        private.push(0xff);
+        let original = String::from_utf8(private.clone()).unwrap_err();
+        assert!(format!("{original:?}").contains(&format!("{private:?}")));
+        let error = decode_startup_secret(private.clone()).unwrap_err();
+        assert_eq!(format!("{error:?}"), "SecretParsingError");
+        assert!(!format!("{error:?}").contains(&format!("{private:?}")));
+
+        let wrong_length_key = hex::encode(&private[..31]);
+        let error = decode_local_enclave_key(&wrong_length_key).unwrap_err();
+        assert_eq!(format!("{error:?}"), "SecretParsingError");
+        assert!(decode_local_enclave_key("not-hex").is_err());
+    }
+
+    #[test]
+    fn parent_secret_parse_errors_do_not_retain_content() {
+        let payload = serde_json::json!("PRIVATE_PARENT_SECRET_SENTINEL").to_string();
+        let original = serde_json::from_str::<ParentResponse>(&payload).unwrap_err();
+        assert!(format!("{original:?}").contains("PRIVATE_PARENT_SECRET_SENTINEL"));
+        assert_eq!(
+            format!("{:?}", parse_parent_secret_response(&payload).unwrap_err()),
+            "SecretParsingError"
+        );
+        let malformed_inner = serde_json::json!({"response_type":"secret", "response_value":"{PRIVATE_PARENT_SECRET_SENTINEL"});
+        assert_eq!(
+            format!(
+                "{:?}",
+                parse_parent_secret_response(&malformed_inner.to_string()).unwrap_err()
+            ),
+            "SecretParsingError"
+        );
+    }
+
+    #[test]
+    fn startup_secret_success_values_are_preserved() {
+        assert_eq!(
+            decode_startup_secret(b"synthetic-secret".to_vec()).unwrap(),
+            "synthetic-secret"
+        );
+        assert_eq!(
+            decode_local_enclave_key(&hex::encode([7u8; 32])).unwrap(),
+            [7u8; 32]
+        );
+        let response = serde_json::json!({"response_type":"secret", "response_value":serde_json::json!({"database_url":"synthetic-ciphertext"}).to_string()});
+        assert_eq!(
+            parse_parent_secret_response(&response.to_string()).unwrap(),
+            "synthetic-ciphertext"
+        );
     }
 }
 
@@ -3397,9 +3495,7 @@ async fn get_or_create_jwt_secret(
     match app_mode {
         AppMode::Local => {
             // For local mode, use environment variable
-            Ok(std::env::var("JWT_SECRET")
-                .expect("JWT_SECRET must be set in local mode")
-                .into_bytes())
+            Ok(required_secret_env("JWT_SECRET").into_bytes())
         }
         _ => {
             // Check if JWT secret exists in enclave_secrets
@@ -4053,7 +4149,7 @@ async fn main() -> Result<(), Error> {
                     Error::EncryptionError(e.to_string())
                 })?;
 
-                String::from_utf8(url_vec).expect("should parse url")
+                decode_startup_secret(url_vec).expect("database URL must be valid UTF-8")
             }
             Err(e) => {
                 tracing::error!(
@@ -4064,7 +4160,7 @@ async fn main() -> Result<(), Error> {
             }
         }
     } else {
-        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set")
+        required_secret_env("DATABASE_URL")
     };
 
     let db = setup_db(pg_url);
@@ -4076,12 +4172,9 @@ async fn main() -> Result<(), Error> {
                 .await?;
         enclave_key.key
     } else {
-        let enclave_key =
-            std::env::var("ENCLAVE_SECRET_MOCK").expect("needs ENCLAVE_SECRET_MOCK in local mode");
-        let enclave_key: [u8; 32] = hex::decode(enclave_key)
-            .unwrap()
-            .try_into()
-            .expect("ENCLAVE_SECRET_MOCK must be 32 bytes");
+        let enclave_key = required_secret_env("ENCLAVE_SECRET_MOCK");
+        let enclave_key = decode_local_enclave_key(&enclave_key)
+            .expect("ENCLAVE_SECRET_MOCK must encode 32 bytes");
         enclave_key.to_vec()
     };
 
@@ -4096,10 +4189,7 @@ async fn main() -> Result<(), Error> {
                     .expect("OpenAI API key should be retrieved correctly"),
             )
         } else {
-            Some(
-                std::env::var("OPENAI_API_KEY")
-                    .expect("OPENAI_API_KEY must be set for OpenAI domain"),
-            )
+            Some(required_secret_env("OPENAI_API_KEY"))
         }
     } else {
         None // No API key needed if not using OpenAI's domain
@@ -4198,7 +4288,7 @@ async fn main() -> Result<(), Error> {
                 Error::EncryptionError(e.to_string())
             })?;
 
-            Some(String::from_utf8(url_vec).expect("should parse url"))
+            Some(decode_startup_secret(url_vec).expect("SQS URL must be valid UTF-8"))
         } else {
             // URL not found in database - this is optional so we'll return None
             None

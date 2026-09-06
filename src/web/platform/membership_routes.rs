@@ -119,8 +119,10 @@ async fn update_membership(
         Ok(m) => m,
         Err(e) => {
             error!(
-                "Current user {} not in org {} - Error: {:?}",
-                platform_user.uuid, org_id, e
+                user_id = %platform_user.uuid,
+                %org_id,
+                error_kind = crate::observability::error_kind(&e),
+                "Current user membership lookup failed"
             );
             return Err(ApiError::Unauthorized);
         }
@@ -143,8 +145,10 @@ async fn update_membership(
         Ok(m) => m,
         Err(e) => {
             error!(
-                "Target user {} not found in org {} - Error: {:?}",
-                user_id, org_id, e
+                %user_id,
+                %org_id,
+                error_kind = crate::observability::error_kind(&e),
+                "Target user membership lookup failed"
             );
             return Err(ApiError::NotFound);
         }
@@ -167,8 +171,12 @@ async fn update_membership(
             }
             _ => {
                 error!(
-                    "Failed to update membership for user {} from '{}' to '{:?}': {:?}",
-                    user_id, target_membership.role, update_request.role, e
+                    %user_id,
+                    %org_id,
+                    previous_role = %target_membership.role,
+                    requested_role = ?update_request.role,
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to update membership"
                 );
                 ApiError::InternalServerError
             }

@@ -3917,6 +3917,7 @@ async fn validate_and_normalize_input(
 
     if user_message_tokens as usize >= ctx_budget {
         debug!(
+            user_uuid = %user.uuid,
             input_tokens = user_message_tokens,
             token_budget = ctx_budget,
             reason = "input_too_large",
@@ -4021,6 +4022,7 @@ async fn build_context_and_check_billing(
 
     if total_prompt_tokens >= prompt_token_budget(&body.model) {
         debug!(
+            user_uuid = %user.uuid,
             input_tokens = total_prompt_tokens,
             token_budget = prompt_token_budget(&body.model),
             reason = "prompt_too_large",
@@ -4038,6 +4040,7 @@ async fn build_context_and_check_billing(
     // Check billing with token validation (BEFORE any persistence).
     if let Some(billing_access) = billing_access {
         debug!(
+            user_uuid = %user.uuid,
             input_tokens = total_prompt_tokens,
             "Checking Responses billing"
         );
@@ -4045,12 +4048,13 @@ async fn build_context_and_check_billing(
         if let Err(e) = billing_access.check_with_tokens(total_prompt_tokens as i32) {
             match e {
                 BillingError::UsageLimitExceeded => {
-                    debug!(reason = "usage_limit", "Responses request rejected");
+                    debug!(user_uuid = %user.uuid, reason = "usage_limit", "Responses request rejected");
                     return Err(ApiError::UsageLimitReached);
                 }
                 BillingError::FreeTokenLimitExceeded => {
                     // This error is only returned for free users
                     debug!(
+                        user_uuid = %user.uuid,
                         input_tokens = total_prompt_tokens,
                         reason = "free_tier_token_limit",
                         "Responses request rejected"
@@ -4060,13 +4064,14 @@ async fn build_context_and_check_billing(
                 _ => {
                     // Log the error but allow the request for other billing service errors
                     error!(
+                        user_uuid = %user.uuid,
                         error_kind = crate::observability::error_kind(&e),
                         "Billing service error, allowing request"
                     );
                 }
             }
         }
-        debug!("Responses billing check passed");
+        debug!(user_uuid = %user.uuid, "Responses billing check passed");
     }
 
     Ok(BuiltContext {
@@ -4185,7 +4190,7 @@ async fn persist_request_data(
         .map_err(error_mapping::map_generic_db_error)?;
     let response = persisted.response;
 
-    debug!(response_uuid = %response.uuid, conversation_uuid = %conversation.uuid, "Created response");
+    debug!(user_uuid = %user.uuid, response_uuid = %response.uuid, conversation_uuid = %conversation.uuid, "Created response");
 
     Ok(PersistedData {
         response,
@@ -4780,7 +4785,15 @@ async fn consume_assistant_turn(
                     finish_reason.as_deref(),
                 ) {
                     debug!(
-                        finish_reason_present = finish_reason.is_some(),
+                        finish_reason = match finish_reason.as_deref() {
+                            Some("stop") => "stop",
+                            Some("length") => "length",
+                            Some("tool_calls") => "tool_calls",
+                            Some("function_call") => "function_call",
+                            Some("content_filter") => "content_filter",
+                            Some(_) => "other",
+                            None => "unspecified",
+                        },
                         "Assistant turn finalized tool call"
                     );
                     let tool_call = finalize_first_model_tool_call(&streamed_tool_calls)
@@ -5142,6 +5155,7 @@ async fn create_response_stream(
         ModelPlan::from_is_paid(billing_access.is_some_and(ChatBillingAccess::is_paid));
     if user.is_guest() && !model_plan.is_paid() {
         debug!(
+            user_uuid = %user.uuid,
             reason = "guest_requires_paid_plan",
             "Responses request rejected"
         );
@@ -5924,7 +5938,7 @@ async fn get_response(
     Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
-    debug!("Retrieving response");
+    debug!(user_uuid = %user.uuid, response_uuid = %id, "Retrieving response");
 
     // Get the response
     let response = state
@@ -6095,7 +6109,7 @@ async fn cancel_response(
     Extension(user): Extension<User>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
-    debug!("Cancelling response");
+    debug!(user_uuid = %user.uuid, response_uuid = %id, "Cancelling response");
 
     // Verify the response exists and belongs to the user, and is in_progress
     let response = state
@@ -6103,6 +6117,8 @@ async fn cancel_response(
         .get_response_by_uuid_and_user(id, user.uuid)
         .map_err(|e| {
             debug!(
+                user_uuid = %user.uuid,
+                response_uuid = %id,
                 error_kind = crate::observability::error_kind(&e),
                 "Response lookup failed"
             );
@@ -6156,7 +6172,7 @@ async fn cancel_response(
                 .db
                 .get_response_by_uuid_and_user(id, user.uuid)
                 .map_err(|e| {
-                    error!(response_uuid = %id, error_kind = crate::observability::error_kind(&e), "Failed to observe cancellation acknowledgement");
+                    error!(user_uuid = %user.uuid, response_uuid = %id, error_kind = crate::observability::error_kind(&e), "Failed to observe cancellation acknowledgement");
                     ApiError::InternalServerError
                 })?;
 
@@ -6218,13 +6234,15 @@ async fn delete_response(
     Extension(user): Extension<User>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
-    debug!("Deleting response");
+    debug!(user_uuid = %user.uuid, response_uuid = %id, "Deleting response");
 
     let existing = state
         .db
         .get_response_by_uuid_and_user(id, user.uuid)
         .map_err(|e| {
             debug!(
+                user_uuid = %user.uuid,
+                response_uuid = %id,
                 error_kind = crate::observability::error_kind(&e),
                 "Response lookup failed"
             );
@@ -6255,6 +6273,8 @@ async fn delete_response(
     // Delete the response (cascade will handle related records)
     state.db.delete_response(id, user.uuid).map_err(|e| {
         debug!(
+            user_uuid = %user.uuid,
+            response_uuid = %id,
             error_kind = crate::observability::error_kind(&e),
             "Response lookup failed"
         );

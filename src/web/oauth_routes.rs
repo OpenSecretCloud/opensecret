@@ -600,7 +600,7 @@ pub async fn oauth_callback(
     };
 
     // Get project (we can trust the client_id now since we validated it against our stored state)
-    debug!("Getting project for verified OAuth state");
+    debug!(client_id = %state.client_id, "Getting project for verified OAuth state");
     let project = app_state
         .db
         .get_org_project_by_client_id(state.client_id)

@@ -1545,12 +1545,12 @@ async fn proxy_openai(
 
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() && !model_plan.is_paid() {
-        debug!(reason = "guest_requires_paid_plan", "Chat request rejected");
+        debug!(user_uuid = %user.uuid, reason = "guest_requires_paid_plan", "Chat request rejected");
         return Err(ApiError::Unauthorized);
     }
 
     if billing_access.is_some_and(|access| !access.can_use()) {
-        debug!(reason = "usage_limit", "Chat request rejected");
+        debug!(user_uuid = %user.uuid, reason = "usage_limit", "Chat request rejected");
         return Err(ApiError::UsageLimitReached);
     }
 
@@ -2965,7 +2965,7 @@ async fn publish_usage_event_internal(
         BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(usage.completion_tokens);
     let total_cost = input_cost + output_cost;
 
-    debug!(model = resolve_public_model_id(&billing_context.model_name).unwrap_or("custom"), provider = provider_name, prompt_tokens = usage.prompt_tokens, cached_prompt_tokens = usage.cached_prompt_tokens.unwrap_or(0), completion_tokens = usage.completion_tokens, estimated_cost = %total_cost, "Chat completion usage");
+    debug!(user_uuid = %user.uuid, model = resolve_public_model_id(&billing_context.model_name).unwrap_or("custom"), provider = provider_name, prompt_tokens = usage.prompt_tokens, cached_prompt_tokens = usage.cached_prompt_tokens.unwrap_or(0), completion_tokens = usage.completion_tokens, estimated_cost = %total_cost, "Chat completion usage");
 
     // Spawn background task for DB + SQS
     let state_clone = state.clone();
@@ -2984,7 +2984,7 @@ async fn publish_usage_event_internal(
         );
 
         if let Err(e) = state_clone.db.create_token_usage(new_usage) {
-            error!(error_kind = crate::observability::error_kind(&e), "Failed to save token usage");
+            error!(user_uuid = %user_id, error_kind = crate::observability::error_kind(&e), "Failed to save token usage");
         }
 
         let cached_input_tokens = usage.cached_prompt_tokens;
@@ -3000,7 +3000,7 @@ async fn publish_usage_event_internal(
                 model_name,
             );
 
-            debug!(provider = %event.provider_name, model = resolve_public_model_id(&event.model_name).unwrap_or("custom"), input_tokens = event.input_tokens, output_tokens = event.output_tokens, cached_input_tokens = ?event.cached_input_tokens, "Prepared SQS usage event");
+            debug!(user_uuid = %event.user_id, provider = %event.provider_name, model = resolve_public_model_id(&event.model_name).unwrap_or("custom"), input_tokens = event.input_tokens, output_tokens = event.output_tokens, cached_input_tokens = ?event.cached_input_tokens, "Prepared SQS usage event");
 
             match publisher.publish_event(event).await {
                 Ok(_) => debug!("published usage event successfully"),
@@ -3251,14 +3251,15 @@ async fn proxy_transcription(
         if let Some(billing_client) = &state.billing_client {
             match billing_client.is_user_paid(user.uuid).await {
                 Ok(true) => {
-                    debug!("Paid guest request allowed");
+                    debug!(user_uuid = %user.uuid, "Paid guest request allowed");
                 }
                 Ok(false) => {
-                    debug!(reason = "guest_requires_paid_plan", "Request rejected");
+                    debug!(user_uuid = %user.uuid, reason = "guest_requires_paid_plan", "Request rejected");
                     return Err(ApiError::Unauthorized);
                 }
                 Err(e) => {
                     warn!(
+                        user_uuid = %user.uuid,
                         error_kind = crate::observability::error_kind(&e),
                         "Guest billing check failed"
                     );
@@ -3266,7 +3267,7 @@ async fn proxy_transcription(
                 }
             }
         } else {
-            warn!(reason = "billing_unavailable", "Guest request rejected");
+            warn!(user_uuid = %user.uuid, reason = "billing_unavailable", "Guest request rejected");
             return Err(ApiError::Unauthorized);
         }
     }
@@ -3612,11 +3613,12 @@ async fn ensure_paid_tts_access(state: &AppState, user: &User) -> Result<(), Api
             Ok(Ok(true)) => TTSBillingAccess::Allowed,
             Ok(Ok(false)) => TTSBillingAccess::FreeOrExhausted,
             Ok(Err(_)) => {
-                warn!("TTS billing entitlement check failed");
+                warn!(user_uuid = %user.uuid, "TTS billing entitlement check failed");
                 TTSBillingAccess::Unavailable
             }
             Err(_) => {
                 warn!(
+                    user_uuid = %user.uuid,
                     timeout_seconds = TTS_BILLING_CHECK_TIMEOUT.as_secs(),
                     "TTS billing entitlement check timed out"
                 );
@@ -3624,14 +3626,14 @@ async fn ensure_paid_tts_access(state: &AppState, user: &User) -> Result<(), Api
             }
         }
     } else {
-        warn!("TTS requested while the billing client is unavailable");
+        warn!(user_uuid = %user.uuid, "TTS requested while the billing client is unavailable");
         TTSBillingAccess::Unavailable
     };
 
     let result = tts_billing_access_decision(access);
     if result.is_err() {
         debug!(
-
+            user_uuid = %user.uuid,
             access = ?access,
             "Denied paid TTS access"
         );
@@ -3756,14 +3758,15 @@ async fn proxy_embeddings(
         if let Some(billing_client) = &state.billing_client {
             match billing_client.is_user_paid(user.uuid).await {
                 Ok(true) => {
-                    debug!("Paid guest request allowed");
+                    debug!(user_uuid = %user.uuid, "Paid guest request allowed");
                 }
                 Ok(false) => {
-                    debug!(reason = "guest_requires_paid_plan", "Request rejected");
+                    debug!(user_uuid = %user.uuid, reason = "guest_requires_paid_plan", "Request rejected");
                     return Err(ApiError::Unauthorized);
                 }
                 Err(e) => {
                     warn!(
+                        user_uuid = %user.uuid,
                         error_kind = crate::observability::error_kind(&e),
                         "Guest billing check failed"
                     );
@@ -3771,7 +3774,7 @@ async fn proxy_embeddings(
                 }
             }
         } else {
-            warn!(reason = "billing_unavailable", "Guest request rejected");
+            warn!(user_uuid = %user.uuid, reason = "billing_unavailable", "Guest request rejected");
             return Err(ApiError::Unauthorized);
         }
     }

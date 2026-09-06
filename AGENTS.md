@@ -111,6 +111,11 @@ transport; protected routes are not ordinary plaintext `fetch`, `curl`, or
   prompts, reasoning, decrypted bodies, response deltas, provider bodies, or
   other sensitive user content. Safe metadata must be bounded and allowlisted;
   `trace` is not a private channel.
+- PII is not categorically excluded: relevant IDs, email addresses, API-key
+  display names, model/provider names, and non-content request parameters are
+  valid diagnostics. The protected boundary is keys/credentials and plaintext
+  that belongs encrypted at rest, including messages, titles, instructions,
+  KV keys/values, and tool/media content. Select metadata fields explicitly.
 - Preserve capacity, expiry, one-use/lease, cleanup, cancellation, and failure
   behavior at unauthenticated, cryptographic, streaming, and external-service
   boundaries.

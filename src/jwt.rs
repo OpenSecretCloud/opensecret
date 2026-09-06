@@ -378,7 +378,11 @@ impl NewToken {
             .db
             .get_org_project_by_client_id(project_client_id)
             .map_err(|e| {
-                tracing::error!("Error looking up JWT project");
+                tracing::error!(
+                    %project_client_id,
+                    error_kind = crate::observability::error_kind(&e),
+                    "Error looking up JWT project"
+                );
                 match e {
                     DBError::OrgProjectNotFound => ApiError::BadRequest,
                     _ => ApiError::InternalServerError,
@@ -394,21 +398,22 @@ impl NewToken {
                 // Decrypt the custom JWT secret using the enclave key
                 let secret_key =
                     secp256k1::SecretKey::from_slice(&app_state.enclave_key).map_err(|_| {
-                        tracing::error!("Failed to create secret key from enclave key");
+                        tracing::error!(%project_client_id, "Failed to create secret key from enclave key");
                         ApiError::InternalServerError
                     })?;
 
-                let decrypted_key =
-                    crate::encrypt::decrypt_with_key(&secret_key, &secret.secret_enc).map_err(
-                        |_| {
-                            tracing::error!("Failed to decrypt custom JWT secret");
-                            ApiError::InternalServerError
-                        },
-                    )?;
+                let decrypted_key = crate::encrypt::decrypt_with_key(
+                    &secret_key,
+                    &secret.secret_enc,
+                )
+                .map_err(|_| {
+                    tracing::error!(%project_client_id, "Failed to decrypt custom JWT secret");
+                    ApiError::InternalServerError
+                })?;
 
                 // For custom secrets, use HS256 algorithm (HMAC with shared secret)
                 // This is what third-party services like Supabase expect
-                tracing::debug!("Using custom JWT secret with HS256");
+                tracing::debug!(%project_client_id, "Using custom JWT secret with HS256");
 
                 // Create HS256 header
                 let jwt_header = JwtHeader::new(JwtAlgorithm::HS256);
@@ -423,28 +428,33 @@ impl NewToken {
                         jsonwebtoken::errors::ErrorKind::Signing(_) => "signing",
                         _ => "other",
                     };
-                    tracing::error!(error_kind, "Error creating HS256 token with custom secret");
+                    tracing::error!(%project_client_id, error_kind, "Error creating HS256 token with custom secret");
                     ApiError::InternalServerError
                 })
             }
             Ok(None) => {
                 // No custom secret found, use the default key
-                tracing::debug!("No custom JWT secret found, using default");
+                tracing::debug!(%project_client_id, "No custom JWT secret found, using default");
                 let es256k = Es256k::<Sha256>::new(app_state.config.jwt_keys.secp.clone());
 
                 es256k
                     .token(header, claims, &app_state.config.jwt_keys.signing_key)
                     .map_err(|e| {
                         tracing::error!(
+                            %project_client_id,
                             error_kind = token_creation_error_kind(&e),
                             "Error creating token"
                         );
                         ApiError::InternalServerError
                     })
             }
-            Err(_) => {
+            Err(error) => {
                 // Database error looking up the secret
-                tracing::error!("Database error looking up custom JWT secret");
+                tracing::error!(
+                    %project_client_id,
+                    error_kind = crate::observability::error_kind(&error),
+                    "Database error looking up custom JWT secret"
+                );
                 Err(ApiError::InternalServerError)
             }
         }
@@ -469,7 +479,7 @@ impl NewToken {
             | TokenType::Refresh
             | TokenType::TransportV2Access
             | TokenType::TransportV2Refresh => {
-                tracing::error!("User access/refresh tokens require AuthContext");
+                tracing::error!(user_id = %user.uuid, project_id = user.project_id, "User access/refresh tokens require AuthContext");
                 return Err(ApiError::BadRequest);
             }
         };
@@ -485,7 +495,7 @@ impl NewToken {
             auth_binding: None,
         };
 
-        tracing::debug!("Creating new third-party token");
+        tracing::debug!(user_id = %user.uuid, project_id = user.project_id, "Creating new third-party token");
 
         // Account for clock drift by setting issued_at 1 minute in the past
         let now = Utc::now();
@@ -512,6 +522,8 @@ impl NewToken {
                 .token(&header, &claims, &app_state.config.jwt_keys.signing_key)
                 .map_err(|e| {
                     tracing::error!(
+                        user_id = %user.uuid,
+                        project_id = user.project_id,
                         error_kind = token_creation_error_kind(&e),
                         "Error creating token"
                     );
@@ -519,7 +531,7 @@ impl NewToken {
                 })?
         };
 
-        tracing::debug!("Successfully created token");
+        tracing::debug!(user_id = %user.uuid, project_id = user.project_id, "Successfully created token");
 
         Ok(Self {
             token: token_string,
@@ -533,7 +545,12 @@ impl NewToken {
         auth_context: &AuthContext,
     ) -> Result<Self, ApiError> {
         if user.project_id != auth_context.project_id {
-            tracing::error!("User token auth context project does not match user project");
+            tracing::error!(
+                user_id = %user.uuid,
+                project_id = user.project_id,
+                auth_project_id = auth_context.project_id,
+                "User token auth context project does not match user project"
+            );
             return Err(ApiError::BadRequest);
         }
 
@@ -571,7 +588,7 @@ impl NewToken {
         };
         auth_context.apply_to_claims(&mut custom_claims);
 
-        tracing::debug!("Creating new user token with auth context");
+        tracing::debug!(user_id = %user.uuid, project_id = user.project_id, "Creating new user token with auth context");
 
         let now = Utc::now();
         let iat = now - Duration::minutes(1);
@@ -589,6 +606,8 @@ impl NewToken {
             .token(&header, &claims, &app_state.config.jwt_keys.signing_key)
             .map_err(|e| {
                 tracing::error!(
+                    user_id = %user.uuid,
+                    project_id = user.project_id,
                     error_kind = token_creation_error_kind(&e),
                     "Error creating v2 user token"
                 );
@@ -643,7 +662,7 @@ impl NewToken {
             auth_binding: None,
         };
 
-        tracing::debug!("Creating new platform token");
+        tracing::debug!(platform_user_id = %user.uuid, "Creating new platform token");
 
         // Account for clock drift by setting issued_at 1 minute in the past
         let now = Utc::now();
@@ -662,13 +681,14 @@ impl NewToken {
             .token(&header, &claims, &app_state.config.jwt_keys.signing_key)
             .map_err(|e| {
                 tracing::error!(
+                    platform_user_id = %user.uuid,
                     error_kind = token_creation_error_kind(&e),
                     "Error creating token"
                 );
                 ApiError::InternalServerError
             })?;
 
-        tracing::debug!("Successfully created platform token");
+        tracing::debug!(platform_user_id = %user.uuid, "Successfully created platform token");
 
         Ok(Self {
             token: token_string,
@@ -731,13 +751,15 @@ fn issue_native_handoff_grant_with_keys(
         )
         .map_err(|error| {
             tracing::error!(
+                %user_id,
+                project_id = auth_context.project_id,
                 error_kind = token_creation_error_kind(&error),
                 "failed to create transport-v2 native handoff grant"
             );
             ApiError::InternalServerError
         })?;
     if !is_canonical_compact_jwt(&grant) {
-        tracing::error!("issued transport-v2 native handoff grant exceeded its wire contract");
+        tracing::error!(%user_id, project_id = auth_context.project_id, "issued transport-v2 native handoff grant exceeded its wire contract");
         return Err(ApiError::InternalServerError);
     }
 
@@ -935,14 +957,24 @@ pub async fn validate_jwt(
 
     let user = match data.get_user(user_uuid).await {
         Ok(user) => user,
-        Err(_) => {
-            tracing::error!("Error getting JWT user");
+        Err(error) => {
+            tracing::error!(
+                user_id = %user_uuid,
+                project_id = auth_context.project_id,
+                error_kind = crate::observability::error_kind(&error),
+                "Error getting JWT user"
+            );
             return ApiError::InternalServerError.into_response();
         }
     };
 
     if user.project_id != auth_context.project_id {
-        tracing::error!("JWT auth context project does not match user project");
+        tracing::error!(
+            user_id = %user_uuid,
+            project_id = user.project_id,
+            auth_project_id = auth_context.project_id,
+            "JWT auth context project does not match user project"
+        );
         return ApiError::InvalidJwt.into_response();
     }
 
@@ -950,7 +982,7 @@ pub async fn validate_jwt(
         .verify_seed_wrap_for_auth_context(&user, &auth_context)
         .is_err()
     {
-        tracing::error!("JWT auth context no longer unwraps an active seed wrap");
+        tracing::error!(user_id = %user_uuid, project_id = user.project_id, "JWT auth context no longer unwraps an active seed wrap");
         return ApiError::InvalidJwt.into_response();
     }
 
@@ -1012,8 +1044,12 @@ pub async fn validate_platform_jwt(
 
     let platform_user = match data.db.get_platform_user_by_uuid(platform_user_id) {
         Ok(user) => user,
-        Err(_) => {
-            tracing::error!("Error getting platform JWT user");
+        Err(error) => {
+            tracing::error!(
+                %platform_user_id,
+                error_kind = crate::observability::error_kind(&error),
+                "Error getting platform JWT user"
+            );
             return ApiError::Unauthorized.into_response();
         }
     };

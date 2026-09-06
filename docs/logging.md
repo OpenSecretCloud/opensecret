@@ -58,14 +58,26 @@ response, distinguishable by span context.
 
 ## Add or change logging
 
-- Prefer fixed operation/reason fields and allowlisted provider/model/status
-  metadata. Treat unknown client/provider strings as content even when they
-  appear in an error. Do not log whole errors, records, claims, headers, OAuth
-  responses, prompts, deltas, KMS output, or credential-bearing URLs.
+- The confidentiality boundary is content and secret material, not PII in
+  general. User/project/client/response IDs, email addresses, API-key display
+  names (never the actual key), model/provider names, status, counts, timings,
+  and other non-content request parameters are useful diagnostic metadata.
+  Retain them when relevant, with bounded/escaped string fields.
+- Never log user/enclave/session keys, mnemonics, passwords, tokens, credentials,
+  or plaintext that belongs encrypted at rest: prompts, completions, assistant
+  messages/reasoning, conversation titles, instructions, KV keys/values,
+  tool arguments/results, or media content. Being encrypted during transport
+  does not make the decrypted value safe to log.
+- Select metadata fields explicitly. Whole records, claims, headers, OAuth
+  documents, provider bodies, KMS output, and arbitrary error text may mix
+  allowed metadata with prohibited content. Avoid dumping those containers;
+  keep the useful fields without retaining their payloads.
 - Use `observability::error_kind` for supported Rust error chains, or a narrow
   typed classifier for a particular boundary. It deliberately returns a fixed
   fallback for unknown types. Add a typed category when more detail is needed;
   do not fall back to `Display`/`Debug` or parse arbitrary error messages.
+  `Result::expect`/`unwrap` and a failed `main -> Result` also print error
+  `Debug`; erase retained secret buffers and parse text before those paths.
 - Use `#[tracing::instrument(skip_all)]` with explicit safe fields for operation
   spans. Normal awaited calls inherit context. Detached futures need
   `.in_current_span()`; blocking closures need a captured span and `in_scope`.

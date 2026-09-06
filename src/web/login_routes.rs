@@ -229,7 +229,11 @@ async fn login_internal(
                     user
                 }
                 Err(DBError::UserNotFound) => {
-                    debug!(reason = "unknown_login", "Authentication request rejected");
+                    debug!(
+                        reason = "unknown_login",
+                        user_id = %id,
+                        "Authentication request rejected"
+                    );
                     return Err(ApiError::InvalidUsernameOrPassword);
                 }
                 Err(e) => {

@@ -104,8 +104,9 @@ async fn list_orgs(
             }
             Err(e) => {
                 error!(
-                    "Failed to get org details for org_id {}: {:?}",
-                    membership.org_id, e
+                    org_id = membership.org_id,
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to get organization details"
                 );
                 // Continue with the next membership
             }

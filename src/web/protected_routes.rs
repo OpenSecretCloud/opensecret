@@ -1511,7 +1511,12 @@ pub async fn create_api_key(
         created_at: api_key_record.created_at,
     };
 
-    info!(stage = "create_api_key", "Created API key");
+    info!(
+        stage = "create_api_key",
+        user_id = %user.uuid,
+        api_key_name = ?response.name,
+        "Created API key"
+    );
     encrypt_response(&data, &session_id, &response).await
 }
 
@@ -1553,7 +1558,12 @@ pub async fn delete_api_key(
     Extension(user): Extension<User>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
-    debug!(stage = "delete_api_key", "Deleting API key");
+    debug!(
+        stage = "delete_api_key",
+        user_id = %user.uuid,
+        api_key_name = ?name,
+        "Deleting API key"
+    );
 
     data.db
         .delete_user_api_key_by_name(&name, user.uuid)
@@ -1571,7 +1581,12 @@ pub async fn delete_api_key(
             }
         })?;
 
-    info!(stage = "delete_api_key", "Deleted API key");
+    info!(
+        stage = "delete_api_key",
+        user_id = %user.uuid,
+        api_key_name = ?name,
+        "Deleted API key"
+    );
 
     let response = json!({ "success": true });
     encrypt_response(&data, &session_id, &response).await

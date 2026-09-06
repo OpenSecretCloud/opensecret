@@ -79,7 +79,10 @@ pub async fn validate_openai_auth(
                         return ApiError::Unauthorized.into_response();
                     }
                     Err(e) => {
-                        tracing::error!("Database error during API key lookup: {:?}", e);
+                        tracing::error!(
+                            error_kind = crate::observability::error_kind(&e),
+                            "Database error during API key lookup"
+                        );
                         return ApiError::InternalServerError.into_response();
                     }
                 }
@@ -113,7 +116,10 @@ pub async fn validate_openai_auth(
     let user_uuid: Uuid = match Uuid::parse_str(&claims.sub) {
         Ok(uuid) => uuid,
         Err(e) => {
-            tracing::error!("Error parsing user uuid: {:?}", e);
+            tracing::error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Error parsing user uuid"
+            );
             return ApiError::InvalidJwt.into_response();
         }
     };
@@ -121,7 +127,10 @@ pub async fn validate_openai_auth(
     let user = match data.get_user(user_uuid).await {
         Ok(user) => user,
         Err(e) => {
-            tracing::error!("Error getting user: {:?}", e);
+            tracing::error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Error getting user"
+            );
             return ApiError::InternalServerError.into_response();
         }
     };
@@ -133,8 +142,8 @@ pub async fn validate_openai_auth(
 
     if let Err(e) = data.verify_seed_wrap_for_auth_context(&user, &auth_context) {
         tracing::error!(
-            "OpenAI JWT auth context no longer unwraps an active seed wrap: {:?}",
-            e
+            error_kind = crate::observability::error_kind(&e),
+            "OpenAI JWT auth context no longer unwraps an active seed wrap"
         );
         return ApiError::InvalidJwt.into_response();
     }

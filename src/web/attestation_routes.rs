@@ -37,9 +37,11 @@ impl SessionState {
     }
 
     pub fn decrypt(&self, encrypted_data: &[u8], nonce: &[u8; 12]) -> Result<Vec<u8>, ApiError> {
-        tracing::trace!("decrypting encrypted data");
-        tracing::trace!("nonce: {:?}", nonce);
-        tracing::trace!("encrypted data length: {}", encrypted_data.len());
+        tracing::trace!(
+            stage = "session_decrypt",
+            encrypted_bytes = encrypted_data.len(),
+            "Decrypting encrypted data"
+        );
 
         let key = Key::from_slice(self.session_key.as_ref());
         let cipher = ChaCha20Poly1305::new(key);

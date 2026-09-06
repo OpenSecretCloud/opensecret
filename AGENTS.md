@@ -111,12 +111,21 @@ transport; protected routes are not ordinary plaintext `fetch`, `curl`, or
   prompts, reasoning, decrypted bodies, response deltas, provider bodies, or
   other sensitive user content. Safe metadata must be bounded and allowlisted;
   `trace` is not a private channel.
+- PII is not categorically excluded: relevant IDs, email addresses, API-key
+  display names, model/provider names, and non-content request parameters are
+  valid diagnostics. The protected boundary is keys/credentials and plaintext
+  that belongs encrypted at rest, including messages, titles, instructions,
+  KV keys/values, and tool/media content. Select metadata fields explicitly.
 - Preserve capacity, expiry, one-use/lease, cleanup, cancellation, and failure
   behavior at unauthenticated, cryptographic, streaming, and external-service
   boundaries.
 - Treat billing and feature flags only as configurable external HTTP APIs.
   Their server credentials remain backend-only, and each changed call site
   must define its own unavailable, timeout, denial, and success behavior.
+- Follow `docs/logging.md` for request correlation and safe diagnostics. Retain
+  spans across spawned work and streaming bodies; skip arguments by default in
+  instrumentation and explicitly allowlist fields. Error Display/Debug can
+  contain user data: use bounded typed categories, including at debug/trace.
 - Separate source-confirmed, test-confirmed, build-confirmed, live-confirmed,
   inferred, and unverified claims. Source and local tests do not prove deployed
   PCRs, KMS/IAM policy, artifact identity, network placement, or log retention.

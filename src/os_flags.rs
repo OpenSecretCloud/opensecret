@@ -178,17 +178,11 @@ impl OsFlagsClient {
             self.cache.insert(cache_key, response.clone()).await;
             Ok(response)
         } else {
-            let text = resp.text().await.unwrap_or_default();
-            let message = serde_json::from_str::<serde_json::Value>(&text)
-                .ok()
-                .and_then(|v| {
-                    v.get("error")
-                        .and_then(|e| e.as_str())
-                        .map(ToOwned::to_owned)
-                })
-                .unwrap_or(text);
-
-            Err(OsFlagsError::Service { status, message })
+            // The service body can contain user data or proxy diagnostics.
+            Err(OsFlagsError::Service {
+                status,
+                message: "flag service rejected request".to_owned(),
+            })
         }
     }
 

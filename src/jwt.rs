@@ -60,6 +60,42 @@ pub(crate) const TRANSPORT_V2_NATIVE_HANDOFF_MAX_BYTES: usize = 4 * 1024;
 
 pub const USER_TOKEN_FORMAT_V2: u8 = 2;
 
+// JWT errors can carry untrusted headers, claims, or serializer messages. Keep
+// diagnostics useful without formatting any of those payloads into logs.
+fn token_creation_error_kind(error: &jwt_compact::CreationError) -> &'static str {
+    match error {
+        jwt_compact::CreationError::Header(_) => "header_serialization",
+        jwt_compact::CreationError::Claims(_) => "claims_serialization",
+        jwt_compact::CreationError::CborClaims(_) => "cbor_claims_serialization",
+        _ => "other",
+    }
+}
+
+fn token_parse_error_kind(error: &jwt_compact::ParseError) -> &'static str {
+    match error {
+        jwt_compact::ParseError::InvalidTokenStructure => "invalid_structure",
+        jwt_compact::ParseError::InvalidBase64Encoding => "invalid_base64",
+        jwt_compact::ParseError::MalformedHeader(_) => "malformed_header",
+        jwt_compact::ParseError::UnsupportedContentType(_) => "unsupported_content_type",
+        _ => "other",
+    }
+}
+
+fn token_validation_error_kind(error: &jwt_compact::ValidationError) -> &'static str {
+    match error {
+        jwt_compact::ValidationError::AlgorithmMismatch { .. } => "algorithm_mismatch",
+        jwt_compact::ValidationError::InvalidSignatureLen { .. } => "invalid_signature_length",
+        jwt_compact::ValidationError::MalformedSignature(_) => "malformed_signature",
+        jwt_compact::ValidationError::InvalidSignature => "invalid_signature",
+        jwt_compact::ValidationError::MalformedClaims(_) => "malformed_claims",
+        jwt_compact::ValidationError::MalformedCborClaims(_) => "malformed_cbor_claims",
+        jwt_compact::ValidationError::NoClaim(_) => "missing_claim",
+        jwt_compact::ValidationError::Expired => "expired",
+        jwt_compact::ValidationError::NotMature => "not_yet_valid",
+        _ => "other",
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TokenType {
     Access,
@@ -260,10 +296,7 @@ impl TokenType {
 
         // 1. Check for reserved audiences
         if RESERVED_AUDIENCES.contains(&aud) {
-            tracing::error!(
-                "Third-party tokens cannot use internal audience types: {}",
-                aud
-            );
+            tracing::error!("Third-party tokens cannot use internal audience types");
             return Err(ApiError::BadRequest);
         }
 
@@ -271,10 +304,9 @@ impl TokenType {
         const MAX_AUDIENCE_LENGTH: usize = 50;
         if aud.len() > MAX_AUDIENCE_LENGTH {
             tracing::error!(
-                "Audience value exceeds maximum length of {}: {} (length: {})",
-                MAX_AUDIENCE_LENGTH,
-                aud,
-                aud.len()
+                max_length = MAX_AUDIENCE_LENGTH,
+                audience_bytes = aud.len(),
+                "Audience value exceeds maximum length"
             );
             return Err(ApiError::BadRequest);
         }
@@ -302,7 +334,7 @@ impl TokenType {
                 || c == '%'
                 || c == '#'
         }) {
-            tracing::error!("Audience contains disallowed characters: {}", aud);
+            tracing::error!("Audience contains disallowed characters");
             return Err(ApiError::BadRequest);
         }
 
@@ -314,8 +346,8 @@ impl TokenType {
 
         // 6. Parse as URI to ensure it's valid if it contains ':'
         if aud.contains(':') {
-            Url::parse(aud).map_err(|e| {
-                tracing::error!("Invalid audience URI format: {}, error: {:?}", aud, e);
+            Url::parse(aud).map_err(|_| {
+                tracing::error!("Invalid audience URI format");
                 ApiError::BadRequest
             })?;
         }
@@ -336,12 +368,8 @@ impl NewToken {
         use crate::web::platform::common::THIRD_PARTY_JWT_SECRET;
 
         // Parse the "azp" value which should be the project client_id
-        let project_client_id = Uuid::parse_str(azp).map_err(|e| {
-            tracing::error!(
-                "Invalid project client_id format in azp: {}, error: {:?}",
-                azp,
-                e
-            );
+        let project_client_id = Uuid::parse_str(azp).map_err(|_| {
+            tracing::error!("Invalid project client_id format in azp");
             ApiError::BadRequest
         })?;
 
@@ -351,9 +379,9 @@ impl NewToken {
             .get_org_project_by_client_id(project_client_id)
             .map_err(|e| {
                 tracing::error!(
-                    "Error looking up project with client_id {}: {:?}",
-                    project_client_id,
-                    e
+                    %project_client_id,
+                    error_kind = crate::observability::error_kind(&e),
+                    "Error looking up JWT project"
                 );
                 match e {
                     DBError::OrgProjectNotFound => ApiError::BadRequest,
@@ -369,29 +397,23 @@ impl NewToken {
             Ok(Some(secret)) => {
                 // Decrypt the custom JWT secret using the enclave key
                 let secret_key =
-                    secp256k1::SecretKey::from_slice(&app_state.enclave_key).map_err(|e| {
-                        tracing::error!("Failed to create secret key from enclave key: {:?}", e);
+                    secp256k1::SecretKey::from_slice(&app_state.enclave_key).map_err(|_| {
+                        tracing::error!(%project_client_id, "Failed to create secret key from enclave key");
                         ApiError::InternalServerError
                     })?;
 
-                let decrypted_key =
-                    crate::encrypt::decrypt_with_key(&secret_key, &secret.secret_enc).map_err(
-                        |e| {
-                            tracing::error!(
-                                "Failed to decrypt custom JWT secret for project {}: {:?}",
-                                project_client_id,
-                                e
-                            );
-                            ApiError::InternalServerError
-                        },
-                    )?;
+                let decrypted_key = crate::encrypt::decrypt_with_key(
+                    &secret_key,
+                    &secret.secret_enc,
+                )
+                .map_err(|_| {
+                    tracing::error!(%project_client_id, "Failed to decrypt custom JWT secret");
+                    ApiError::InternalServerError
+                })?;
 
                 // For custom secrets, use HS256 algorithm (HMAC with shared secret)
                 // This is what third-party services like Supabase expect
-                tracing::debug!(
-                    "Using custom JWT secret with HS256 for project {}",
-                    project_client_id
-                );
+                tracing::debug!(%project_client_id, "Using custom JWT secret with HS256");
 
                 // Create HS256 header
                 let jwt_header = JwtHeader::new(JwtAlgorithm::HS256);
@@ -400,32 +422,38 @@ impl NewToken {
                 let encoding_key = EncodingKey::from_secret(&decrypted_key);
 
                 // Encode the token using HS256
-                jwt_encode(&jwt_header, claims, &encoding_key).map_err(|e| {
-                    tracing::error!("Error creating HS256 token with custom secret: {:?}", e);
+                jwt_encode(&jwt_header, claims, &encoding_key).map_err(|error| {
+                    let error_kind = match error.kind() {
+                        jsonwebtoken::errors::ErrorKind::Json(_) => "serialization",
+                        jsonwebtoken::errors::ErrorKind::Signing(_) => "signing",
+                        _ => "other",
+                    };
+                    tracing::error!(%project_client_id, error_kind, "Error creating HS256 token with custom secret");
                     ApiError::InternalServerError
                 })
             }
             Ok(None) => {
                 // No custom secret found, use the default key
-                tracing::debug!(
-                    "No custom JWT secret found for project {}, using default",
-                    project_client_id
-                );
+                tracing::debug!(%project_client_id, "No custom JWT secret found, using default");
                 let es256k = Es256k::<Sha256>::new(app_state.config.jwt_keys.secp.clone());
 
                 es256k
                     .token(header, claims, &app_state.config.jwt_keys.signing_key)
                     .map_err(|e| {
-                        tracing::error!("Error creating token: {:?}", e);
+                        tracing::error!(
+                            %project_client_id,
+                            error_kind = token_creation_error_kind(&e),
+                            "Error creating token"
+                        );
                         ApiError::InternalServerError
                     })
             }
-            Err(e) => {
+            Err(error) => {
                 // Database error looking up the secret
                 tracing::error!(
-                    "Database error looking up custom JWT secret for project {}: {:?}",
-                    project_client_id,
-                    e
+                    %project_client_id,
+                    error_kind = crate::observability::error_kind(&error),
+                    "Database error looking up custom JWT secret"
                 );
                 Err(ApiError::InternalServerError)
             }
@@ -451,7 +479,7 @@ impl NewToken {
             | TokenType::Refresh
             | TokenType::TransportV2Access
             | TokenType::TransportV2Refresh => {
-                tracing::error!("User access/refresh tokens require AuthContext");
+                tracing::error!(user_id = %user.uuid, project_id = user.project_id, "User access/refresh tokens require AuthContext");
                 return Err(ApiError::BadRequest);
             }
         };
@@ -467,7 +495,7 @@ impl NewToken {
             auth_binding: None,
         };
 
-        tracing::debug!("Creating new token with claims: {:?}", custom_claims);
+        tracing::debug!(user_id = %user.uuid, project_id = user.project_id, "Creating new third-party token");
 
         // Account for clock drift by setting issued_at 1 minute in the past
         let now = Utc::now();
@@ -493,12 +521,17 @@ impl NewToken {
             es256k
                 .token(&header, &claims, &app_state.config.jwt_keys.signing_key)
                 .map_err(|e| {
-                    tracing::error!("Error creating token: {:?}", e);
+                    tracing::error!(
+                        user_id = %user.uuid,
+                        project_id = user.project_id,
+                        error_kind = token_creation_error_kind(&e),
+                        "Error creating token"
+                    );
                     ApiError::InternalServerError
                 })?
         };
 
-        tracing::debug!("Successfully created token");
+        tracing::debug!(user_id = %user.uuid, project_id = user.project_id, "Successfully created token");
 
         Ok(Self {
             token: token_string,
@@ -512,7 +545,12 @@ impl NewToken {
         auth_context: &AuthContext,
     ) -> Result<Self, ApiError> {
         if user.project_id != auth_context.project_id {
-            tracing::error!("User token auth context project does not match user project");
+            tracing::error!(
+                user_id = %user.uuid,
+                project_id = user.project_id,
+                auth_project_id = auth_context.project_id,
+                "User token auth context project does not match user project"
+            );
             return Err(ApiError::BadRequest);
         }
 
@@ -550,11 +588,7 @@ impl NewToken {
         };
         auth_context.apply_to_claims(&mut custom_claims);
 
-        tracing::debug!(
-            "Creating new v2 user token for user {} with audience {:?}",
-            user.get_id(),
-            custom_claims.aud
-        );
+        tracing::debug!(user_id = %user.uuid, project_id = user.project_id, "Creating new user token with auth context");
 
         let now = Utc::now();
         let iat = now - Duration::minutes(1);
@@ -571,7 +605,12 @@ impl NewToken {
         let token_string = es256k
             .token(&header, &claims, &app_state.config.jwt_keys.signing_key)
             .map_err(|e| {
-                tracing::error!("Error creating v2 user token: {:?}", e);
+                tracing::error!(
+                    user_id = %user.uuid,
+                    project_id = user.project_id,
+                    error_kind = token_creation_error_kind(&e),
+                    "Error creating v2 user token"
+                );
                 ApiError::InternalServerError
             })?;
 
@@ -623,10 +662,7 @@ impl NewToken {
             auth_binding: None,
         };
 
-        tracing::debug!(
-            "Creating new platform token with claims: {:?}",
-            custom_claims
-        );
+        tracing::debug!(platform_user_id = %user.uuid, "Creating new platform token");
 
         // Account for clock drift by setting issued_at 1 minute in the past
         let now = Utc::now();
@@ -644,11 +680,15 @@ impl NewToken {
         let token_string = es256k
             .token(&header, &claims, &app_state.config.jwt_keys.signing_key)
             .map_err(|e| {
-                tracing::error!("Error creating token: {:?}", e);
+                tracing::error!(
+                    platform_user_id = %user.uuid,
+                    error_kind = token_creation_error_kind(&e),
+                    "Error creating token"
+                );
                 ApiError::InternalServerError
             })?;
 
-        tracing::debug!("Successfully created platform token");
+        tracing::debug!(platform_user_id = %user.uuid, "Successfully created platform token");
 
         Ok(Self {
             token: token_string,
@@ -710,11 +750,16 @@ fn issue_native_handoff_grant_with_keys(
             &jwt_keys.signing_key,
         )
         .map_err(|error| {
-            tracing::error!(?error, "failed to create transport-v2 native handoff grant");
+            tracing::error!(
+                %user_id,
+                project_id = auth_context.project_id,
+                error_kind = token_creation_error_kind(&error),
+                "failed to create transport-v2 native handoff grant"
+            );
             ApiError::InternalServerError
         })?;
     if !is_canonical_compact_jwt(&grant) {
-        tracing::error!("issued transport-v2 native handoff grant exceeded its wire contract");
+        tracing::error!(%user_id, project_id = auth_context.project_id, "issued transport-v2 native handoff grant exceeded its wire contract");
         return Err(ApiError::InternalServerError);
     }
 
@@ -904,30 +949,40 @@ pub async fn validate_jwt(
 
     let user_uuid: Uuid = match Uuid::parse_str(&claims.sub) {
         Ok(uuid) => uuid,
-        Err(e) => {
-            tracing::error!("Error parsing user uuid: {:?}", e);
+        Err(_) => {
+            tracing::error!("Error parsing user uuid in JWT");
             return ApiError::InvalidJwt.into_response();
         }
     };
 
     let user = match data.get_user(user_uuid).await {
         Ok(user) => user,
-        Err(e) => {
-            tracing::error!("Error getting user: {:?}", e);
+        Err(error) => {
+            tracing::error!(
+                user_id = %user_uuid,
+                project_id = auth_context.project_id,
+                error_kind = crate::observability::error_kind(&error),
+                "Error getting JWT user"
+            );
             return ApiError::InternalServerError.into_response();
         }
     };
 
     if user.project_id != auth_context.project_id {
-        tracing::error!("JWT auth context project does not match user project");
+        tracing::error!(
+            user_id = %user_uuid,
+            project_id = user.project_id,
+            auth_project_id = auth_context.project_id,
+            "JWT auth context project does not match user project"
+        );
         return ApiError::InvalidJwt.into_response();
     }
 
-    if let Err(e) = data.verify_seed_wrap_for_auth_context(&user, &auth_context) {
-        tracing::error!(
-            "JWT auth context no longer unwraps an active seed wrap: {:?}",
-            e
-        );
+    if data
+        .verify_seed_wrap_for_auth_context(&user, &auth_context)
+        .is_err()
+    {
+        tracing::error!(user_id = %user_uuid, project_id = user.project_id, "JWT auth context no longer unwraps an active seed wrap");
         return ApiError::InvalidJwt.into_response();
     }
 
@@ -981,16 +1036,20 @@ pub async fn validate_platform_jwt(
 
     let platform_user_id: Uuid = match Uuid::parse_str(&claims.sub) {
         Ok(uuid) => uuid,
-        Err(e) => {
-            tracing::error!("Error parsing platform user uuid: {:?}", e);
+        Err(_) => {
+            tracing::error!("Error parsing platform user uuid in JWT");
             return ApiError::InvalidJwt.into_response();
         }
     };
 
     let platform_user = match data.db.get_platform_user_by_uuid(platform_user_id) {
         Ok(user) => user,
-        Err(e) => {
-            tracing::error!("Error getting platform user: {:?}", e);
+        Err(error) => {
+            tracing::error!(
+                %platform_user_id,
+                error_kind = crate::observability::error_kind(&error),
+                "Error getting platform JWT user"
+            );
             return ApiError::Unauthorized.into_response();
         }
     };
@@ -1058,7 +1117,10 @@ fn validate_token_with_keys_for_auth(
     let parsed_token = match UntrustedToken::new(original_token) {
         Ok(token) => token,
         Err(e) => {
-            tracing::error!("Failed to parse token: {:?}", e);
+            tracing::error!(
+                error_kind = token_parse_error_kind(&e),
+                "Failed to parse token"
+            );
             return Err(ApiError::InvalidJwt);
         }
     };
@@ -1074,15 +1136,11 @@ fn validate_token_with_keys_for_auth(
                 let claims: &Claims<CustomClaims> = token.claims();
                 if let Some(audience) = &claims.custom.aud {
                     if audience != expected_audience {
-                        tracing::error!(
-                            "Invalid audience: got {}, expected {}",
-                            audience,
-                            expected_audience
-                        );
+                        tracing::error!("JWT audience does not match the required token type");
                         return Err(ApiError::InvalidJwt);
                     }
                 } else {
-                    tracing::error!("Missing audience in token, expected {}", expected_audience);
+                    tracing::error!("Missing audience in token");
                     return Err(ApiError::InvalidJwt);
                 }
 
@@ -1098,7 +1156,10 @@ fn validate_token_with_keys_for_auth(
                         true
                     }
                     Err(e) => {
-                        tracing::error!("Token expiration validation failed: {:?}", e);
+                        tracing::error!(
+                            error_kind = token_validation_error_kind(&e),
+                            "Token expiration validation failed"
+                        );
                         return Err(ApiError::InvalidJwt);
                     }
                 };
@@ -1106,7 +1167,10 @@ fn validate_token_with_keys_for_auth(
                 (token, access_token_expired)
             }
             Err(e) => {
-                tracing::debug!("ES256K validation failed: {:?}", e);
+                tracing::debug!(
+                    error_kind = token_validation_error_kind(&e),
+                    "ES256K validation failed"
+                );
                 return Err(ApiError::InvalidJwt);
             }
         };
@@ -1118,6 +1182,39 @@ fn validate_token_with_keys_for_auth(
 mod tests {
     use super::*;
     use jsonwebtoken::{decode as jwt_decode, DecodingKey, Validation};
+
+    #[test]
+    fn jwt_error_categories_omit_untrusted_claims_and_header_values() {
+        const PRIVATE: &str = "PRIVATE_JWT_DESCRIPTION_AND_CLAIMS_SENTINEL";
+        let claims_error = || <serde_json::Error as serde::de::Error>::custom(PRIVATE);
+        let categories = [
+            token_creation_error_kind(&jwt_compact::CreationError::Claims(claims_error())),
+            token_parse_error_kind(&jwt_compact::ParseError::UnsupportedContentType(
+                PRIVATE.to_string(),
+            )),
+            token_parse_error_kind(&jwt_compact::ParseError::MalformedHeader(claims_error())),
+            token_validation_error_kind(&jwt_compact::ValidationError::MalformedClaims(
+                claims_error(),
+            )),
+            token_validation_error_kind(&jwt_compact::ValidationError::AlgorithmMismatch {
+                expected: "ES256K".to_string(),
+                actual: PRIVATE.to_string(),
+            }),
+        ];
+        assert_eq!(
+            categories,
+            [
+                "claims_serialization",
+                "unsupported_content_type",
+                "malformed_header",
+                "malformed_claims",
+                "algorithm_mismatch",
+            ]
+        );
+        assert!(categories
+            .iter()
+            .all(|category| !category.contains(PRIVATE)));
+    }
 
     fn test_keys(byte: u8) -> JwtKeys {
         JwtKeys::new(vec![byte; 32]).unwrap()

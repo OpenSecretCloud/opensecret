@@ -75,7 +75,8 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant as TokioInstant;
-use tracing::{debug, error, info, trace, warn};
+use tracing::Instrument;
+use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
 const RESPONSES_SSE_KEEPALIVE_INTERVAL_SECS: u64 = 1;
@@ -225,7 +226,7 @@ fn resolve_responses_model(
         Some(model) => Ok(model.to_string()),
         None if completion_provider_name != "tinfoil" => Ok(requested_model.to_string()),
         None => {
-            error!("Unsupported responses model requested: {}", requested_model);
+            debug!(reason = "unsupported_model", "Responses request rejected");
             Err(ApiError::BadRequest)
         }
     }
@@ -399,19 +400,13 @@ fn web_search_is_selected(
     is_tool_choice_allowed(tool_choice) && is_web_search_enabled(tools) && kagi_available
 }
 
-fn select_web_search(state: &AppState, user_uuid: Uuid, body: &ResponsesCreateRequest) -> bool {
+fn select_web_search(state: &AppState, _user_uuid: Uuid, body: &ResponsesCreateRequest) -> bool {
     let kagi_available = state.kagi_client.is_some();
     let selected = web_search_is_selected(&body.tool_choice, &body.tools, kagi_available);
     if selected {
-        info!(
-            user_uuid = %user_uuid,
-            "Selected Kagi as the Responses web-search provider"
-        );
+        debug!("Selected Kagi as the Responses web-search provider");
     } else if is_tool_choice_allowed(&body.tool_choice) && is_web_search_enabled(&body.tools) {
-        debug!(
-            user_uuid = %user_uuid,
-            "Kagi web-search client is unavailable"
-        );
+        debug!("Kagi web-search client is unavailable");
     }
     selected
 }
@@ -549,13 +544,21 @@ fn has_streamed_tool_call_entries(tool_call_delta: &Value) -> bool {
         .is_some_and(|entries| !entries.is_empty())
 }
 
+fn tool_kind_for_log(name: &str) -> &'static str {
+    match name {
+        "web_search" => "web_search",
+        "open_urls" => "open_urls",
+        _ => "unknown",
+    }
+}
+
 fn finalize_first_model_tool_call(tool_calls: &[StreamedToolCall]) -> Option<ModelToolCall> {
     let tool_call = tool_calls.first()?;
     let name = tool_call.name.clone()?;
     let arguments = serde_json::from_str(&tool_call.arguments).unwrap_or_else(|e| {
         warn!(
-            "Failed to parse tool arguments for {} as JSON: {:?}. Using empty object.",
-            name, e
+            error_kind = crate::observability::error_kind(&e),
+            "Invalid tool arguments; using empty object"
         );
         json!({})
     });
@@ -3606,23 +3609,17 @@ async fn describe_images(
     for (image_index, content_index, result) in outcomes {
         let outcome = match result {
             Ok(outcome) => outcome,
-            Err(ImageDescriptionError::InvalidRequest(error)) => {
-                warn!(
+            Err(ImageDescriptionError::InvalidRequest(_error)) => {
+                debug!(
                     image_index,
-                    "Rejected invalid Responses image description input: {}", error
+                    reason = "invalid_image_input",
+                    "Responses image description rejected"
                 );
                 return Err(ApiError::BadRequest);
             }
             Err(error @ ImageDescriptionError::AttemptsFailed { .. }) => {
                 for failure in error.attempts() {
-                    warn!(
-                        image_index,
-                        provider = failure.candidate.provider.as_str(),
-                        model = failure.candidate.public_model_id,
-                        failure_class = ?failure.error.class,
-                        "Responses image description attempt failed: {}",
-                        failure.error.summary
-                    );
+                    warn!(image_index, provider = failure.candidate.provider.as_str(), model = failure.candidate.public_model_id, failure_class = ?failure.error.class, "Responses image description attempt failed");
                 }
                 return Err(ApiError::ImageDescriptionUnavailable);
             }
@@ -3743,10 +3740,7 @@ fn spawn_title_generation_task(
             match prepare_completion_request(&state, &user, title_intent, routing).await {
                 Ok(pinned) => pinned,
                 Err(error) => {
-                    error!(
-                        "Title generation: failed to prepare inference route: {:?}",
-                        error
-                    );
+                    error!(error_kind = crate::observability::error_kind(&error), "Title generation: failed to prepare inference route");
                     return;
                 }
             };
@@ -3814,7 +3808,7 @@ fn spawn_title_generation_task(
                                                         metadata_enc,
                                                     )
                                                 {
-                                                    error!("Failed to update conversation metadata with generated title: {:?}", e);
+                                                    error!(error_kind = crate::observability::error_kind(&e), "Failed to update conversation metadata with generated title");
                                                 } else {
                                                     debug!("Successfully updated conversation {} with generated title", conversation_uuid);
                                                 }
@@ -3823,15 +3817,12 @@ fn spawn_title_generation_task(
                                             }
                                         }
                                         Err(e) => {
-                                            error!(
-                                                "Failed to decrypt conversation metadata: {:?}",
-                                                e
-                                            );
+                                            error!(error_kind = crate::observability::error_kind(&e), "Failed to decrypt conversation metadata");
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    error!("Failed to get conversation for title update: {:?}", e);
+                                    error!(error_kind = crate::observability::error_kind(&e), "Failed to get conversation for title update");
                                 }
                             }
                         } else {
@@ -3849,10 +3840,10 @@ fn spawn_title_generation_task(
                 }
             }
             Err(e) => {
-                error!("Failed to generate conversation title: {:?}", e);
+                error!(has_terminal = e.terminal().is_some(), "Failed to generate conversation title");
             }
         }
-    });
+    }.in_current_span());
 }
 
 /// Phase 1: Validate and normalize input
@@ -3886,9 +3877,9 @@ async fn validate_and_normalize_input(
         if let MessageContent::Parts(parts) = &msg.content {
             for part in parts {
                 if matches!(part, MessageContentPart::InputFile { .. }) {
-                    error!(
-                        "User {} attempted to use unsupported file upload feature",
-                        user.uuid
+                    debug!(
+                        reason = "unsupported_file_upload",
+                        "Responses request rejected"
                     );
                     return Err(ApiError::BadRequest);
                 }
@@ -3925,16 +3916,22 @@ async fn validate_and_normalize_input(
     let ctx_budget = prompt_token_budget(&body.model);
 
     if user_message_tokens as usize >= ctx_budget {
-        error!(
-            "User message too large for user {}: {} tokens exceeds budget {} for model {}",
-            user.uuid, user_message_tokens, ctx_budget, body.model
+        debug!(
+            user_uuid = %user.uuid,
+            input_tokens = user_message_tokens,
+            token_budget = ctx_budget,
+            reason = "input_too_large",
+            "Responses request rejected"
         );
         return Err(ApiError::MessageExceedsContextLimit);
     }
 
     // Serialize the MessageContent for storage
     let content_for_storage = serde_json::to_string(&message_content).map_err(|e| {
-        error!("Failed to serialize message content: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to serialize message content"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -4024,12 +4021,12 @@ async fn build_context_and_check_billing(
     normalize_tool_call_ids_for_model(&mut prompt_messages, &body.model);
 
     if total_prompt_tokens >= prompt_token_budget(&body.model) {
-        error!(
-            "Responses prompt too large for user {}: {} tokens exceeds budget {} for model {}",
-            user.uuid,
-            total_prompt_tokens,
-            prompt_token_budget(&body.model),
-            body.model
+        debug!(
+            user_uuid = %user.uuid,
+            input_tokens = total_prompt_tokens,
+            token_budget = prompt_token_budget(&body.model),
+            reason = "prompt_too_large",
+            "Responses request rejected"
         );
         return Err(ApiError::MessageExceedsContextLimit);
     }
@@ -4043,31 +4040,38 @@ async fn build_context_and_check_billing(
     // Check billing with token validation (BEFORE any persistence).
     if let Some(billing_access) = billing_access {
         debug!(
-            "Checking billing for user {} with {} input tokens",
-            user.uuid, total_prompt_tokens
+            user_uuid = %user.uuid,
+            input_tokens = total_prompt_tokens,
+            "Checking Responses billing"
         );
 
         if let Err(e) = billing_access.check_with_tokens(total_prompt_tokens as i32) {
             match e {
                 BillingError::UsageLimitExceeded => {
-                    error!("Usage limit exceeded for user: {}", user.uuid);
+                    debug!(user_uuid = %user.uuid, reason = "usage_limit", "Responses request rejected");
                     return Err(ApiError::UsageLimitReached);
                 }
                 BillingError::FreeTokenLimitExceeded => {
                     // This error is only returned for free users
-                    error!(
-                        "Free tier token limit exceeded for user {} with {} tokens",
-                        user.uuid, total_prompt_tokens
+                    debug!(
+                        user_uuid = %user.uuid,
+                        input_tokens = total_prompt_tokens,
+                        reason = "free_tier_token_limit",
+                        "Responses request rejected"
                     );
                     return Err(ApiError::FreeTokenLimitExceeded);
                 }
                 _ => {
                     // Log the error but allow the request for other billing service errors
-                    error!("Billing service error, allowing request: {}", e);
+                    error!(
+                        user_uuid = %user.uuid,
+                        error_kind = crate::observability::error_kind(&e),
+                        "Billing service error, allowing request"
+                    );
                 }
             }
         }
-        debug!("Billing check passed for user {}", user.uuid);
+        debug!(user_uuid = %user.uuid, "Responses billing check passed");
     }
 
     Ok(BuiltContext {
@@ -4102,7 +4106,10 @@ async fn persist_request_data(
     // Encrypt metadata if provided
     let metadata_enc = if let Some(metadata) = &body.metadata {
         let metadata_json = serde_json::to_string(metadata).map_err(|e| {
-            error!("Failed to serialize metadata: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to serialize metadata"
+            );
             ApiError::InternalServerError
         })?;
         Some(encrypt_with_key(&prepared.user_key, metadata_json.as_bytes()).await)
@@ -4140,8 +4147,8 @@ async fn persist_request_data(
     for pair in image_descriptions {
         let arguments_json = serde_json::to_string(&pair.arguments).map_err(|e| {
             error!(
-                "Failed to serialize automatic read_image arguments: {:?}",
-                e
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to serialize automatic read_image arguments"
             );
             ApiError::InternalServerError
         })?;
@@ -4183,10 +4190,7 @@ async fn persist_request_data(
         .map_err(error_mapping::map_generic_db_error)?;
     let response = persisted.response;
 
-    info!(
-        "Created response {} for user {} in conversation {}",
-        response.uuid, user.uuid, conversation.uuid
-    );
+    debug!(user_uuid = %user.uuid, response_uuid = %response.uuid, conversation_uuid = %conversation.uuid, "Created response");
 
     Ok(PersistedData {
         response,
@@ -4296,10 +4300,7 @@ async fn execute_tool_call_and_wait(
     let tool_output_id = Uuid::new_v4();
     let tool_call_enqueue_started = std::time::Instant::now();
 
-    debug!(
-        "Tool loop: enqueueing tool_call {} ({}) for response {}",
-        tool_call_id, tool_call.name, persisted.response.uuid
-    );
+    debug!(tool_call_id = %tool_call_id, tool_kind = tool_kind_for_log(&tool_call.name), response_uuid = %persisted.response.uuid, "Enqueueing tool call");
 
     let tool_call_msg = StorageMessage::ToolCall {
         tool_call_id,
@@ -4316,26 +4317,14 @@ async fn execute_tool_call_and_wait(
                 persisted.response.uuid
             );
         })?;
-    debug!(
-        "Tool loop: enqueued tool_call {} ({}) for response {} in {} ms",
-        tool_call_id,
-        tool_call.name,
-        persisted.response.uuid,
-        tool_call_enqueue_started.elapsed().as_millis()
-    );
+    debug!(tool_call_id = %tool_call_id, tool_kind = tool_kind_for_log(&tool_call.name), response_uuid = %persisted.response.uuid, elapsed_ms = tool_call_enqueue_started.elapsed().as_millis(), "Enqueued tool call");
 
     let tool_execution_started = std::time::Instant::now();
-    debug!(
-        "Tool loop: starting execution for tool_call {} ({}) on response {}",
-        tool_call_id, tool_call.name, persisted.response.uuid
-    );
+    debug!(tool_call_id = %tool_call_id, tool_kind = tool_kind_for_log(&tool_call.name), response_uuid = %persisted.response.uuid, "Starting tool execution");
 
     let tool_result = if web_search_tool_turn_limit_reached(tool_turn_count, model_plan) {
         let max_tool_turns = web_search_tool_turn_limit(model_plan);
-        info!(
-            "Reached max web_search tool turns ({}) for response {}; returning limit error without executing {}",
-            max_tool_turns, persisted.response.uuid, tool_call.name
-        );
+        debug!(max_tool_turns, response_uuid = %persisted.response.uuid, tool_kind = tool_kind_for_log(&tool_call.name), "Tool execution limit reached");
         Err(web_search_tool_turn_limit_error(model_plan))
     } else {
         let result = tools::execute_tool(
@@ -4346,21 +4335,12 @@ async fn execute_tool_call_and_wait(
         )
         .await;
         if result.is_err() {
-            warn!(
-                "Tool execution failed for tool_call {} ({}) on response {}",
-                tool_call_id, tool_call.name, persisted.response.uuid
-            );
+            warn!(tool_call_id = %tool_call_id, tool_kind = tool_kind_for_log(&tool_call.name), response_uuid = %persisted.response.uuid, "Tool execution failed");
         }
         result
     };
     let tool_output = tools::format_tool_result(tool_result);
-    debug!(
-        "Tool loop: finished execution for tool_call {} ({}) on response {} in {} ms",
-        tool_call_id,
-        tool_call.name,
-        persisted.response.uuid,
-        tool_execution_started.elapsed().as_millis()
-    );
+    debug!(tool_call_id = %tool_call_id, tool_kind = tool_kind_for_log(&tool_call.name), response_uuid = %persisted.response.uuid, elapsed_ms = tool_execution_started.elapsed().as_millis(), "Finished tool execution");
 
     let tool_output_enqueue_started = std::time::Instant::now();
     debug!(
@@ -4390,7 +4370,7 @@ async fn execute_tool_call_and_wait(
         tool_output_enqueue_started.elapsed().as_millis()
     );
 
-    info!(
+    debug!(
         "Successfully sent tool_call {} and tool_output {} to streams for conversation {}",
         tool_call_id, tool_output_id, persisted.response.conversation_id
     );
@@ -4407,8 +4387,11 @@ async fn execute_tool_call_and_wait(
             );
             Ok(())
         }
-        Ok(Some(Err(e))) => {
-            error!("Failed to persist tools to database: {}", e);
+        Ok(Some(Err(_e))) => {
+            error!(
+                stage = "tool_persistence",
+                "Failed to persist tools to database"
+            );
             Err(ApiError::InternalServerError)
         }
         Ok(None) => {
@@ -4464,10 +4447,9 @@ fn best_effort_fail_response_after_storage_error(
             "Response {} was already terminal after storage worker error",
             response_uuid
         ),
-        Err(e) => error!(
-            "Failed to mark response {} failed after storage worker error: {:?}",
-            response_uuid, e
-        ),
+        Err(e) => {
+            error!(response_uuid = %response_uuid, error_kind = crate::observability::error_kind(&e), "Failed to mark response failed after storage worker error")
+        }
     }
 }
 
@@ -4567,7 +4549,7 @@ async fn start_responses_assistant_turn(
         pinned_completion.intent().request_id,
         conversation_uuid,
         response_uuid,
-        body.model,
+        resolve_public_model_id(&body.model).unwrap_or("custom"),
         tool_turn_count,
         prompt_token_estimate,
         prompt_messages.len(),
@@ -4803,8 +4785,16 @@ async fn consume_assistant_turn(
                     finish_reason.as_deref(),
                 ) {
                     debug!(
-                        "Assistant turn finalized tool_call after model stream completion (finish_reason={})",
-                        finish_reason.as_deref().unwrap_or("unknown")
+                        finish_reason = match finish_reason.as_deref() {
+                            Some("stop") => "stop",
+                            Some("length") => "length",
+                            Some("tool_calls") => "tool_calls",
+                            Some("function_call") => "function_call",
+                            Some("content_filter") => "content_filter",
+                            Some(_) => "other",
+                            None => "unspecified",
+                        },
+                        "Assistant turn finalized tool call"
                     );
                     let tool_call = finalize_first_model_tool_call(&streamed_tool_calls)
                         .ok_or(ApiError::InternalServerError)?;
@@ -4968,10 +4958,7 @@ async fn setup_completion_processor(
 
         match turn {
             AssistantTurnOutcome::ToolCall(tool_call) => {
-                debug!(
-                    "Tool loop: assistant turn requested tool {} for response {}",
-                    tool_call.name, persisted.response.uuid
-                );
+                debug!(tool_kind = tool_kind_for_log(&tool_call.name), response_uuid = %persisted.response.uuid, "Assistant turn requested tool");
                 tool_turn_count += 1;
                 if execute_tool_call_and_wait(
                     state,
@@ -5126,11 +5113,8 @@ async fn forward_authoritative_response_terminal(
             );
             return;
         }
-        Ok(Err(e)) => {
-            error!(
-                "Storage task could not verify terminal persistence: response_uuid={}, error={}",
-                response_uuid, e
-            );
+        Ok(Err(_e)) => {
+            error!(response_uuid = %response_uuid, stage = "terminal_persistence", "Storage task could not verify terminal persistence");
             return;
         }
         Err(_) => {
@@ -5170,9 +5154,10 @@ async fn create_response_stream(
     let model_plan =
         ModelPlan::from_is_paid(billing_access.is_some_and(ChatBillingAccess::is_paid));
     if user.is_guest() && !model_plan.is_paid() {
-        error!(
-            "Guest user without a paid plan attempted to use Responses API: {}",
-            user.uuid
+        debug!(
+            user_uuid = %user.uuid,
+            reason = "guest_requires_paid_plan",
+            "Responses request rejected"
         );
         return Err(ApiError::Unauthorized);
     }
@@ -5194,8 +5179,8 @@ async fn create_response_stream(
     )?;
     if requested_model != resolved_model {
         debug!(
-            "Resolved responses model {} to {}",
-            requested_model, resolved_model
+            public_model = resolve_public_model_id(&resolved_model).unwrap_or("custom"),
+            "Resolved Responses model alias"
         );
     }
     body.model = resolved_model;
@@ -5213,7 +5198,7 @@ async fn create_response_stream(
         .unwrap_or_default();
     trace!(
         "Request body metadata: model={}, stream={}, input_kind={}, input_message_count={}, instructions_present={}, tools_count={}, tool_choice_present={}, metadata_present={}, max_output_tokens_present={}, temperature_present={}, top_p_present={}, parallel_tool_calls={}, store={}",
-        body.model,
+        resolve_public_model_id(&body.model).unwrap_or("custom"),
         body.stream,
         input_kind,
         input_message_count,
@@ -5423,44 +5408,50 @@ async fn create_response_stream(
     }
 
     let storage_db = state.db.clone();
-    tokio::spawn(async move {
-        let _storage_execution_guard = storage_execution_guard;
-        storage_task(
-            rx_storage,
-            Some(tx_tool_ack),
-            Some(tx_terminal_ack),
-            storage_db,
-            response_id,
-            response_uuid,
-            first_response_item_created_at,
-            conversation_id,
-            user_id,
-            user_key,
-        )
-        .await;
-    });
+    tokio::spawn(
+        async move {
+            let _storage_execution_guard = storage_execution_guard;
+            storage_task(
+                rx_storage,
+                Some(tx_tool_ack),
+                Some(tx_terminal_ack),
+                storage_db,
+                response_id,
+                response_uuid,
+                first_response_item_created_at,
+                conversation_id,
+                user_id,
+                user_key,
+            )
+            .await;
+        }
+        .in_current_span(),
+    );
 
-    tokio::spawn(supervise_response_execution(
-        state.clone(),
-        user.clone(),
-        model_turn_body,
-        pinned_completion,
-        model_plan,
-        context,
-        user_key,
-        assistant_message_id,
-        persisted,
-        headers,
-        tx_client,
-        tx_storage,
-        rx_tool_ack,
-        rx_terminal_ack,
-        response_execution.clone(),
-        first_started,
-        execution_policy,
-        supervisor_execution_guard,
-        cache_policy.clone(),
-    ));
+    tokio::spawn(
+        supervise_response_execution(
+            state.clone(),
+            user.clone(),
+            model_turn_body,
+            pinned_completion,
+            model_plan,
+            context,
+            user_key,
+            assistant_message_id,
+            persisted,
+            headers,
+            tx_client,
+            tx_storage,
+            rx_tool_ack,
+            rx_terminal_ack,
+            response_execution.clone(),
+            first_started,
+            execution_policy,
+            supervisor_execution_guard,
+            cache_policy.clone(),
+        )
+        .in_current_span(),
+    );
 
     drop(response_execution_registration);
     drop(response_setup_guard);
@@ -5746,10 +5737,7 @@ async fn create_response_stream(
                     name,
                     arguments,
                 } => {
-                    debug!(
-                        "Client stream received tool_call {} ({}) for response {}",
-                        tool_call_id, name, response_uuid
-                    );
+                    debug!(tool_call_id = %tool_call_id, tool_kind = tool_kind_for_log(&name), response_uuid = %response_uuid, "Client stream received tool call");
                     let tool_name = name.clone();
                     let arguments_json =
                         serde_json::to_string(&arguments).unwrap_or_else(|_| "{}".to_string());
@@ -5933,7 +5921,10 @@ pub async fn encrypt_event(
         .encode_sse_data(state, &payload_str)
         .await
         .map_err(|e| {
-            error!("Failed to encode event data: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to encode event data"
+            );
             ApiError::InternalServerError
         })?;
     Ok(Event::default().event(event_type).data(event_data))
@@ -5947,7 +5938,7 @@ async fn get_response(
     Extension(auth_context): Extension<AuthContext>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
-    debug!("Getting response {} for user {}", id, user.uuid);
+    debug!(user_uuid = %user.uuid, response_uuid = %id, "Retrieving response");
 
     // Get the response
     let response = state
@@ -5978,7 +5969,10 @@ async fn get_response(
         match msg.message_type.as_str() {
             "assistant" => {
                 let text = decrypt_string(&user_key, msg.content_enc.as_ref()).map_err(|e| {
-                    error!("Failed to decrypt assistant message content: {:?}", e);
+                    error!(
+                        error_kind = crate::observability::error_kind(&e),
+                        "Failed to decrypt assistant message content"
+                    );
                     error_mapping::map_decryption_error("assistant message content")
                 })?;
 
@@ -5997,7 +5991,10 @@ async fn get_response(
             "tool_call" => {
                 let arguments =
                     decrypt_string(&user_key, msg.content_enc.as_ref()).map_err(|e| {
-                        error!("Failed to decrypt tool call arguments: {:?}", e);
+                        error!(
+                            error_kind = crate::observability::error_kind(&e),
+                            "Failed to decrypt tool call arguments"
+                        );
                         error_mapping::map_decryption_error("tool call arguments")
                     })?;
 
@@ -6019,7 +6016,10 @@ async fn get_response(
             }
             "tool_output" => {
                 let output = decrypt_string(&user_key, msg.content_enc.as_ref()).map_err(|e| {
-                    error!("Failed to decrypt tool output: {:?}", e);
+                    error!(
+                        error_kind = crate::observability::error_kind(&e),
+                        "Failed to decrypt tool output"
+                    );
                     error_mapping::map_decryption_error("tool output")
                 })?;
 
@@ -6109,14 +6109,19 @@ async fn cancel_response(
     Extension(user): Extension<User>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
-    debug!("Cancelling response {} for user {}", id, user.uuid);
+    debug!(user_uuid = %user.uuid, response_uuid = %id, "Cancelling response");
 
     // Verify the response exists and belongs to the user, and is in_progress
     let response = state
         .db
         .get_response_by_uuid_and_user(id, user.uuid)
         .map_err(|e| {
-            debug!("Response {} not found for user {}: {:?}", id, user.uuid, e);
+            debug!(
+                user_uuid = %user.uuid,
+                response_uuid = %id,
+                error_kind = crate::observability::error_kind(&e),
+                "Response lookup failed"
+            );
             match e {
                 DBError::ResponsesError(ResponsesError::ResponseNotFound) => ApiError::NotFound,
                 DBError::ResponsesError(ResponsesError::Unauthorized) => ApiError::Unauthorized,
@@ -6167,10 +6172,7 @@ async fn cancel_response(
                 .db
                 .get_response_by_uuid_and_user(id, user.uuid)
                 .map_err(|e| {
-                    error!(
-                        "Failed to observe cancellation acknowledgement for response {}: {:?}",
-                        id, e
-                    );
+                    error!(user_uuid = %user.uuid, response_uuid = %id, error_kind = crate::observability::error_kind(&e), "Failed to observe cancellation acknowledgement");
                     ApiError::InternalServerError
                 })?;
 
@@ -6232,15 +6234,17 @@ async fn delete_response(
     Extension(user): Extension<User>,
     Extension(session_id): Extension<TransportSession>,
 ) -> Result<Response, ApiError> {
-    debug!("Deleting response {} for user {}", id, user.uuid);
+    debug!(user_uuid = %user.uuid, response_uuid = %id, "Deleting response");
 
     let existing = state
         .db
         .get_response_by_uuid_and_user(id, user.uuid)
         .map_err(|e| {
             debug!(
-                "Response {} not found for user {} before delete: {:?}",
-                id, user.uuid, e
+                user_uuid = %user.uuid,
+                response_uuid = %id,
+                error_kind = crate::observability::error_kind(&e),
+                "Response lookup failed"
             );
             match e {
                 DBError::ResponsesError(ResponsesError::ResponseNotFound) => ApiError::NotFound,
@@ -6269,8 +6273,10 @@ async fn delete_response(
     // Delete the response (cascade will handle related records)
     state.db.delete_response(id, user.uuid).map_err(|e| {
         debug!(
-            "Response {} not found for user {} during delete: {:?}",
-            id, user.uuid, e
+            user_uuid = %user.uuid,
+            response_uuid = %id,
+            error_kind = crate::observability::error_kind(&e),
+            "Response lookup failed"
         );
         match e {
             DBError::ResponsesError(ResponsesError::ResponseNotFound) => ApiError::NotFound,

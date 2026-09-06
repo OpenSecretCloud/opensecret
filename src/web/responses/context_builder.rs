@@ -152,16 +152,18 @@ pub fn build_prompt_with_token_reserve<D: DBConnection + ?Sized>(
                 Ok(None) => None,
                 Err(e) => {
                     error!(
-                        "Failed to load default instruction for user {}: {:?}",
-                        user_id, e
+                        stage = "context_default_instruction",
+                        error_kind = crate::observability::error_kind(&e),
+                        "Failed to load default instruction"
                     );
                     return Err(crate::ApiError::InternalServerError);
                 }
             },
             Err(e) => {
                 error!(
-                    "Failed to load project instruction for conversation {}: {:?}",
-                    conversation_id, e
+                    stage = "context_project_instruction",
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to load project instruction"
                 );
                 return Err(crate::ApiError::InternalServerError);
             }
@@ -287,7 +289,7 @@ pub fn build_prompt_with_token_reserve<D: DBConnection + ?Sized>(
                 // Parse arguments as JSON - if malformed, use empty object but continue safely
                 let arguments: serde_json::Value =
                     serde_json::from_str(&arguments_str).unwrap_or_else(|e| {
-                        error!("Failed to parse tool call arguments as JSON: {:?}. Using empty object.", e);
+                        error!(stage = "context_tool_arguments", error_kind = ?e.classify(), "Failed to parse tool call arguments as JSON; using empty object");
                         serde_json::json!({})
                     });
 
@@ -298,8 +300,8 @@ pub fn build_prompt_with_token_reserve<D: DBConnection + ?Sized>(
                 // OpenAI expects arguments as a JSON string, not a JSON object
                 let arguments_string = serde_json::to_string(&arguments).unwrap_or_else(|e| {
                     error!(
-                        "Failed to serialize tool arguments: {:?}. Using empty object string.",
-                        e
+                        stage = "context_tool_arguments", error_kind = ?e.classify(),
+                        "Failed to serialize tool arguments; using empty object string"
                     );
                     "{}".to_string()
                 });
@@ -323,8 +325,8 @@ pub fn build_prompt_with_token_reserve<D: DBConnection + ?Sized>(
                     Ok(s) => s,
                     Err(e) => {
                         error!(
-                            "Failed to serialize tool_call message: {:?}. Skipping this tool call.",
-                            e
+                            stage = "context_tool_call", error_kind = ?e.classify(),
+                            "Failed to serialize tool_call message; skipping this tool call"
                         );
                         // If this fails, skip this message entirely rather than corrupting the conversation
                         continue;
@@ -878,7 +880,7 @@ pub fn build_prompt_from_chat_messages_with_token_reserve(
                 // User messages are stored as MessageContent - convert to OpenAI format
                 use crate::web::responses::{MessageContent, MessageContentConverter};
                 let mc: MessageContent = serde_json::from_str(&m.content).map_err(|e| {
-                    error!("Failed to deserialize user message content: {:?}", e);
+                    error!(stage = "context_user_message", error_kind = ?e.classify(), "Failed to deserialize user message content");
                     crate::ApiError::InternalServerError
                 })?;
                 MessageContentConverter::to_model_format(&mc)
@@ -985,8 +987,9 @@ fn normalize_tool_call_ids_for_kimi(messages: &mut [Value]) {
                     }
                 } else {
                     warn!(
-                        "Leaving unmatched tool_call_id {} unchanged during Kimi ID normalization",
-                        original_id
+                        stage = "kimi_tool_id_normalization",
+                        error_kind = "unmatched_tool_call",
+                        "Leaving unmatched tool_call_id unchanged during Kimi ID normalization"
                     );
                 }
             }

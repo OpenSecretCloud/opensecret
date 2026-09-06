@@ -99,7 +99,7 @@ async fn execute_kagi_search(
 
     debug!(
         elapsed_ms = started.elapsed().as_millis(),
-        trace_id = response.meta.trace.as_deref().unwrap_or("unavailable"),
+        upstream_trace_id = %sanitize_trace_id(response.meta.trace.as_deref().unwrap_or("unavailable")),
         "Finished Kagi search request"
     );
 
@@ -263,7 +263,7 @@ async fn execute_kagi_open_urls(
     debug!(
         elapsed_ms = started.elapsed().as_millis(),
         url_count = urls.len(),
-        trace_id = response.meta.trace.as_deref().unwrap_or("unavailable"),
+        upstream_trace_id = %sanitize_trace_id(response.meta.trace.as_deref().unwrap_or("unavailable")),
         "Finished Kagi extract request"
     );
 
@@ -675,7 +675,12 @@ pub async fn execute_tool(
     kagi_client: Option<&Arc<KagiClient>>,
     kagi_allowed_urls: &mut HashSet<String>,
 ) -> Result<String, String> {
-    debug!(tool_name, "Executing tool");
+    let tool_kind = match tool_name {
+        "web_search" => "web_search",
+        "open_urls" => "open_urls",
+        _ => "unknown",
+    };
+    debug!(tool_kind, "Executing tool");
 
     match tool_name {
         "web_search" => {
@@ -693,7 +698,7 @@ pub async fn execute_tool(
             execute_kagi_open_urls(arguments, client, kagi_allowed_urls).await
         }
         _ => {
-            error!(tool_name, "Unknown tool requested");
+            error!(tool_kind, "Unknown tool requested");
             Err(format!("Tool '{tool_name}' is unavailable"))
         }
     }

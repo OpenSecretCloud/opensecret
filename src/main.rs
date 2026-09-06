@@ -85,6 +85,7 @@ use tokio::spawn;
 use tokio::sync::RwLock;
 use tokio::task::{self};
 use tower_http::cors::{Any, CorsLayer};
+use tracing::Instrument;
 use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use url::Url;
@@ -114,6 +115,7 @@ mod migrations;
 mod model_config;
 mod models;
 mod oauth;
+mod observability;
 mod os_flags;
 mod private_key;
 #[allow(dead_code)] // Used by the dormant Transport V2 core in this stack layer.
@@ -564,7 +566,10 @@ impl From<ProviderRequestError> for ApiError {
 
 impl From<DBError> for ApiError {
     fn from(err: DBError) -> Self {
-        error!("Database error: {:?}", err);
+        error!(
+            error_kind = crate::observability::error_kind(&err),
+            "Database error"
+        );
         match err {
             DBError::PlatformUserNotFound => ApiError::UserNotFound,
             DBError::PlatformUserError(_) => ApiError::InternalServerError,
@@ -796,9 +801,9 @@ fn optional_env(name: &str) -> Option<String> {
 }
 
 /// Default `RUST_LOG` when unset. The binary crate is `opensecret`; the old
-/// `sg_backend` default matched no events, so local `cargo run` was silent.
-const DEFAULT_RUST_LOG_FILTER: &str =
-    "opensecret=debug,axum_login=debug,tower_sessions=debug,sqlx=warn,tower_http=debug";
+/// `sg_backend` default matched no events. Dependencies remain at warn unless
+/// explicitly selected; application diagnostics can be enabled per module.
+const DEFAULT_RUST_LOG_FILTER: &str = "warn,opensecret=info";
 
 fn init_tracing(app_mode: &AppMode) -> Result<(), Error> {
     let filter = EnvFilter::new(
@@ -850,8 +855,8 @@ mod default_log_filter_tests {
         assert!(
             DEFAULT_RUST_LOG_FILTER
                 .split(',')
-                .any(|directive| directive == "opensecret=debug"),
-            "local default must enable opensecret=debug: {DEFAULT_RUST_LOG_FILTER}"
+                .any(|directive| directive == "opensecret=info"),
+            "default must enable opensecret=info: {DEFAULT_RUST_LOG_FILTER}"
         );
         assert!(
             !DEFAULT_RUST_LOG_FILTER.contains("sg_backend"),
@@ -1256,21 +1261,30 @@ impl AppStateBuilder {
 
         // Initialize GitHub provider
         let github_provider = GithubProvider::new(db.clone()).await.map_err(|e| {
-            error!("Failed to initialize GitHub OAuth provider: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to initialize GitHub OAuth provider"
+            );
             Error::BuilderError("Failed to initialize GitHub OAuth provider".to_string())
         })?;
         oauth_manager.add_provider("github".to_string(), Box::new(github_provider));
 
         // Initialize Google provider
         let google_provider = GoogleProvider::new(db.clone()).await.map_err(|e| {
-            error!("Failed to initialize Google OAuth provider: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to initialize Google OAuth provider"
+            );
             Error::BuilderError("Failed to initialize Google OAuth provider".to_string())
         })?;
         oauth_manager.add_provider("google".to_string(), Box::new(google_provider));
 
         // Initialize Apple provider
         let apple_provider = AppleProvider::new(db.clone()).await.map_err(|e| {
-            error!("Failed to initialize Apple OAuth provider: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to initialize Apple OAuth provider"
+            );
             Error::BuilderError("Failed to initialize Apple OAuth provider".to_string())
         })?;
         oauth_manager.add_provider("apple".to_string(), Box::new(apple_provider));
@@ -1338,8 +1352,8 @@ impl AppStateBuilder {
                 }
                 Err(e) => {
                     tracing::error!(
-                        "Failed to initialize Kagi client: {:?}. Web search will be unavailable.",
-                        e
+                        error_kind = observability::error_kind(&e),
+                        "Failed to initialize Kagi client; web search will be unavailable"
                     );
                     None
                 }
@@ -1396,8 +1410,9 @@ impl AppState {
             Ok(enabled) => enabled,
             Err(e) => {
                 warn!(
-                    "os-flags check failed (user_uuid={}, flag_key={}): {}",
-                    user_uuid, flag_key, e
+                    flag_key,
+                    error_kind = observability::error_kind(&e),
+                    "os-flags check failed"
                 );
                 false
             }
@@ -1437,8 +1452,8 @@ impl AppState {
             Ok(Ok(response)) => PaidModelAliasOverrides::from_flag_values(&response.flags),
             Ok(Err(e)) => {
                 warn!(
-                    "os-flags paid model alias check failed (user_uuid={}): {}; using default aliases",
-                    user_uuid, e
+                    error_kind = observability::error_kind(&e),
+                    "os-flags paid model alias check failed; using default aliases"
                 );
                 PaidModelAliasOverrides::default()
             }
@@ -1498,7 +1513,7 @@ impl AppState {
                 warn!(
                     user_uuid = %user_uuid,
                     flag_key,
-                    %error,
+                    error_kind = observability::error_kind(&error),
                     "os-flags inference-router check failed; retaining legacy router"
                 );
                 InferenceRoutingMode::Legacy
@@ -1560,8 +1575,9 @@ impl AppState {
             }
             Ok(Err(e)) => {
                 warn!(
-                    "os-flags provider routing check failed (user_uuid={}, requested_model={}, flag_key={}): {}; using default provider routing",
-                    user_uuid, requested_model, flag_key, e
+                    flag_key,
+                    error_kind = observability::error_kind(&e),
+                    "os-flags provider routing check failed; using default provider routing"
                 );
                 None
             }
@@ -1600,8 +1616,8 @@ impl AppState {
             Ok(Ok(access)) => Some(access),
             Ok(Err(e)) => {
                 warn!(
-                    "billing access check failed (user_uuid={}): {}; using free model access",
-                    user_uuid, e
+                    error_kind = observability::error_kind(&e),
+                    "billing access check failed; using free model access"
                 );
                 None
             }
@@ -1997,8 +2013,8 @@ impl AppState {
             .get_org_project_by_client_id(creds.client_id)
             .map_err(|e| {
                 error!(
-                    "Database error during client_id ({:?}) lookup: {:?}",
-                    creds.client_id, e
+                    error_kind = observability::error_kind(&e),
+                    "Database error during client ID lookup"
                 );
                 DBError::OrgProjectNotFound
             })?;
@@ -2046,7 +2062,7 @@ impl AppState {
             user_seed_words.as_bytes(),
         )?;
 
-        tracing::info!("Registered new user: {}", user.uuid);
+        tracing::debug!("Registered new user");
 
         Ok(user)
     }
@@ -2078,7 +2094,7 @@ impl AppState {
 
         // Check if the user is an OAuth-only user
         if user.password_enc.is_none() {
-            error!("OAuth-only user attempted password login");
+            debug!(reason = "oauth_only", "Password login rejected");
             return Ok(None);
         }
 
@@ -2096,9 +2112,11 @@ impl AppState {
 
         // Verifying the password is blocking and potentially slow, so we'll do so via
         // `spawn_blocking`.
-        let res =
-            task::spawn_blocking(move || verify_password(user_password, &decrypted_password_hash))
-                .await?;
+        let span = tracing::Span::current();
+        let res = task::spawn_blocking(move || {
+            span.in_scope(|| verify_password(user_password, &decrypted_password_hash))
+        })
+        .await?;
 
         match res {
             Ok(_) => {
@@ -2170,7 +2188,7 @@ impl AppState {
         let result = message_signing::sign_message(&user_secret_key, message_bytes, algorithm);
 
         if result.is_err() {
-            error!("Failed to sign message for user: {}", user.uuid);
+            error!("Failed to sign user message");
         }
 
         result
@@ -2321,12 +2339,15 @@ impl AppState {
         session_lease: &SessionLease,
         encrypted_data: &str,
     ) -> Result<Vec<u8>, ApiError> {
-        tracing::trace!("decrypting session data for session_id: {}", session_id);
+        tracing::trace!("Decrypting session data");
 
         let decoded_data = general_purpose::STANDARD
             .decode(encrypted_data)
             .map_err(|e| {
-                tracing::error!("Failed to decode base64 data: {:?}", e);
+                tracing::error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to decode base64 data"
+                );
                 ApiError::BadRequest
             })?;
 
@@ -2339,19 +2360,23 @@ impl AppState {
 
         let (nonce, ciphertext) = decoded_data.split_at(12);
         let nonce_array: [u8; 12] = nonce.try_into().map_err(|e| {
-            tracing::error!("Failed to convert nonce: {:?}", e);
+            tracing::error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to convert nonce"
+            );
             ApiError::BadRequest
         })?;
 
-        tracing::trace!("nonce: {:?}", nonce_array);
         tracing::trace!("ciphertext length: {}", ciphertext.len());
 
         let decrypted = session_lease
             .value()
             .decrypt(ciphertext, &nonce_array)
-            .map_err(|e| {
-                tracing::error!("Decryption failed: {:?}", e);
-                e
+            .inspect_err(|e| {
+                tracing::error!(
+                    error_kind = crate::observability::error_kind(e),
+                    "Decryption failed"
+                );
             })?;
 
         // Invalid ciphertext must not extend an attacker's retained session.
@@ -2428,14 +2453,20 @@ impl AppState {
                     let app_state = self.clone();
                     let user_email = email.clone();
                     let code = alphanumeric_code.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            send_password_reset_email(&app_state, project_id, user_email, code)
-                                .await
-                        {
-                            error!("Failed to send password reset email: {:?}", e);
+                    tokio::spawn(
+                        async move {
+                            if let Err(e) =
+                                send_password_reset_email(&app_state, project_id, user_email, code)
+                                    .await
+                            {
+                                error!(
+                                    error_kind = crate::observability::error_kind(&e),
+                                    "Failed to send password reset email"
+                                );
+                            }
                         }
-                    });
+                        .in_current_span(),
+                    );
                 }
             }
             Err(DBError::UserNotFound) => {
@@ -2445,7 +2476,10 @@ impl AppState {
             }
             Err(e) => {
                 // For other errors, we should still log them but not expose them to the user
-                error!("Error during password reset request: {:?}", e);
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Error during password reset request"
+                );
             }
         }
 
@@ -2520,17 +2554,23 @@ impl AppState {
                 // Send confirmation email in the background
                 let app_state = self.clone();
                 let user_email = user.email.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = send_password_reset_confirmation_email(
-                        &app_state,
-                        project_id,
-                        user_email.expect("We checked email had to exist above"),
-                    )
-                    .await
-                    {
-                        error!("Failed to send password reset confirmation email: {:?}", e);
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = send_password_reset_confirmation_email(
+                            &app_state,
+                            project_id,
+                            user_email.expect("We checked email had to exist above"),
+                        )
+                        .await
+                        {
+                            error!(
+                                error_kind = crate::observability::error_kind(&e),
+                                "Failed to send password reset confirmation email"
+                            );
+                        }
                     }
-                });
+                    .in_current_span(),
+                );
 
                 Ok(())
             } else {
@@ -2597,18 +2637,24 @@ impl AppState {
                     let app_state = self.clone();
                     let user_email = email.clone();
                     let code = alphanumeric_code.clone();
-                    spawn(async move {
-                        if let Err(e) = send_platform_password_reset_email(
-                            &app_state,
-                            app_state.resend_api_key.clone(),
-                            user_email,
-                            code,
-                        )
-                        .await
-                        {
-                            error!("Failed to send platform password reset email: {:?}", e);
+                    spawn(
+                        async move {
+                            if let Err(e) = send_platform_password_reset_email(
+                                &app_state,
+                                app_state.resend_api_key.clone(),
+                                user_email,
+                                code,
+                            )
+                            .await
+                            {
+                                error!(
+                                    error_kind = crate::observability::error_kind(&e),
+                                    "Failed to send platform password reset email"
+                                );
+                            }
                         }
-                    });
+                        .in_current_span(),
+                    );
                 }
             }
             Ok(None) => {
@@ -2618,7 +2664,10 @@ impl AppState {
             }
             Err(e) => {
                 // For other errors, we should still log them but not expose them to the user
-                error!("Error during platform password reset request: {:?}", e);
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Error during platform password reset request"
+                );
             }
         }
 
@@ -2633,7 +2682,7 @@ impl AppState {
         plaintext_secret: String,
         new_password: String,
     ) -> Result<(), Error> {
-        trace!("Confirm platform password reset for {email}");
+        trace!("Confirm platform password reset");
 
         let platform_user = match self.db.get_platform_user_by_email(&email) {
             Ok(Some(user)) => user,
@@ -2690,20 +2739,23 @@ impl AppState {
                 // Send confirmation email in the background
                 let user_email = platform_user.email.clone();
                 let app_state = self.clone();
-                spawn(async move {
-                    if let Err(e) = send_platform_password_reset_confirmation_email(
-                        &app_state,
-                        app_state.resend_api_key.clone(),
-                        user_email,
-                    )
-                    .await
-                    {
-                        error!(
-                            "Failed to send platform password reset confirmation email: {:?}",
-                            e
-                        );
+                spawn(
+                    async move {
+                        if let Err(e) = send_platform_password_reset_confirmation_email(
+                            &app_state,
+                            app_state.resend_api_key.clone(),
+                            user_email,
+                        )
+                        .await
+                        {
+                            error!(
+                                error_kind = crate::observability::error_kind(&e),
+                                "Failed to send platform password reset confirmation email"
+                            );
+                        }
                     }
-                });
+                    .in_current_span(),
+                );
 
                 Ok(())
             } else {
@@ -2829,15 +2881,22 @@ impl AppState {
                 let app_state = self.clone();
                 let user_email = user.email.clone();
                 let code = confirmation_code.to_string();
-                tokio::spawn(async move {
-                    if let Some(email) = user_email {
-                        if let Err(e) =
-                            send_account_deletion_email(&app_state, project_id, email, code).await
-                        {
-                            error!("Failed to send account deletion email: {:?}", e);
+                tokio::spawn(
+                    async move {
+                        if let Some(email) = user_email {
+                            if let Err(e) =
+                                send_account_deletion_email(&app_state, project_id, email, code)
+                                    .await
+                            {
+                                error!(
+                                    error_kind = crate::observability::error_kind(&e),
+                                    "Failed to send account deletion email"
+                                );
+                            }
                         }
                     }
-                });
+                    .in_current_span(),
+                );
             }
             Err(DBError::UserNotFound) => {
                 // User doesn't exist, but we don't want to reveal this information
@@ -2849,7 +2908,10 @@ impl AppState {
             }
             Err(e) => {
                 // For other errors, we should still log them but not expose them to the user
-                error!("Error during account deletion request: {:?}", e);
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Error during account deletion request"
+                );
             }
         }
 
@@ -2908,17 +2970,21 @@ impl AppState {
                 if let Some(email) = user.email.clone() {
                     let app_state = self.clone();
                     let project_id = user.project_id;
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            send_account_deletion_confirmation_email(&app_state, project_id, email)
-                                .await
-                        {
-                            error!(
-                                "Failed to send account deletion confirmation email: {:?}",
-                                e
-                            );
+                    tokio::spawn(
+                        async move {
+                            if let Err(e) = send_account_deletion_confirmation_email(
+                                &app_state, project_id, email,
+                            )
+                            .await
+                            {
+                                error!(
+                                    error_kind = crate::observability::error_kind(&e),
+                                    "Failed to send account deletion confirmation email"
+                                );
+                            }
                         }
-                    });
+                        .in_current_span(),
+                    );
                 }
 
                 Ok(())
@@ -2950,7 +3016,7 @@ impl AppState {
 
         // Check if this is an OAuth-only user (no password)
         if platform_user.password_enc.is_none() {
-            error!("OAuth-only platform user attempted password login");
+            debug!(reason = "oauth_only", "Platform password login rejected");
             return Ok(None);
         }
 
@@ -2966,8 +3032,11 @@ impl AppState {
 
         // Verifying the password is blocking and potentially slow, so we'll do so via
         // `spawn_blocking`.
-        let res = task::spawn_blocking(move || verify_password(password, &decrypted_password_hash))
-            .await?;
+        let span = tracing::Span::current();
+        let res = task::spawn_blocking(move || {
+            span.in_scope(|| verify_password(password, &decrypted_password_hash))
+        })
+        .await?;
 
         match res {
             Ok(_) => Ok(Some(platform_user)),
@@ -3030,10 +3099,35 @@ async fn get_secret(key_name: &str) -> Result<String, Error> {
         crate::aws_credentials::MAX_VSOCK_RESPONSE_BYTES,
     )?;
 
-    let parent_response: ParentResponse = serde_json::from_str(&response)?;
+    parse_parent_secret_response(&response)
+}
+
+// Startup's Result error and expect/unwrap failures are printed with Debug by
+// the runtime. Erase payload-bearing parse errors before they reach that sink.
+fn parse_parent_secret_response(response: &str) -> Result<String, Error> {
+    let parent_response: ParentResponse = serde_json::from_str(response).map_err(|error| {
+        error!(
+            stage = "parent_secret_response",
+            error_kind = observability::error_kind(&error),
+            "Failed to parse secret response"
+        );
+        Error::SecretParsingError
+    })?;
     if parent_response.response_type == "secret" {
-        let secret_json: Value =
-            serde_json::from_str(parent_response.response_value.as_str().unwrap())?;
+        let secret_json: Value = serde_json::from_str(
+            parent_response
+                .response_value
+                .as_str()
+                .ok_or(Error::SecretParsingError)?,
+        )
+        .map_err(|error| {
+            error!(
+                stage = "secret_json",
+                error_kind = observability::error_kind(&error),
+                "Failed to parse secret value"
+            );
+            Error::SecretParsingError
+        })?;
 
         // Assuming the secret is always a JSON object with a single key-value pair
         if let Some((_, value)) = secret_json.as_object().and_then(|obj| obj.iter().next()) {
@@ -3043,6 +3137,79 @@ async fn get_secret(key_name: &str) -> Result<String, Error> {
         }
     } else {
         Err(Error::AuthenticationError)
+    }
+}
+
+fn decode_startup_secret(bytes: Vec<u8>) -> Result<String, Error> {
+    String::from_utf8(bytes).map_err(|_| Error::SecretParsingError)
+}
+
+fn decode_local_enclave_key(value: &str) -> Result<[u8; 32], Error> {
+    hex::decode(value)
+        .map_err(|_| Error::SecretParsingError)?
+        .try_into()
+        .map_err(|_| Error::SecretParsingError)
+}
+
+fn required_secret_env(name: &'static str) -> String {
+    // VarError::NotUnicode retains the actual environment value in Debug.
+    env::var(name).unwrap_or_else(|_| panic!("{name} must be set to valid UTF-8"))
+}
+
+#[cfg(test)]
+mod startup_secret_log_tests {
+    use super::*;
+
+    #[test]
+    fn startup_secret_decode_errors_do_not_retain_bytes() {
+        let mut private = b"PRIVATE_STARTUP_SECRET_SENTINEL".to_vec();
+        private.push(0xff);
+        let original = String::from_utf8(private.clone()).unwrap_err();
+        assert!(format!("{original:?}").contains(&format!("{private:?}")));
+        let error = decode_startup_secret(private.clone()).unwrap_err();
+        assert_eq!(format!("{error:?}"), "SecretParsingError");
+        assert!(!format!("{error:?}").contains(&format!("{private:?}")));
+
+        let wrong_length_key = hex::encode(&private[..31]);
+        let error = decode_local_enclave_key(&wrong_length_key).unwrap_err();
+        assert_eq!(format!("{error:?}"), "SecretParsingError");
+        assert!(decode_local_enclave_key("not-hex").is_err());
+    }
+
+    #[test]
+    fn parent_secret_parse_errors_do_not_retain_content() {
+        let payload = serde_json::json!("PRIVATE_PARENT_SECRET_SENTINEL").to_string();
+        let original = serde_json::from_str::<ParentResponse>(&payload).unwrap_err();
+        assert!(format!("{original:?}").contains("PRIVATE_PARENT_SECRET_SENTINEL"));
+        assert_eq!(
+            format!("{:?}", parse_parent_secret_response(&payload).unwrap_err()),
+            "SecretParsingError"
+        );
+        let malformed_inner = serde_json::json!({"response_type":"secret", "response_value":"{PRIVATE_PARENT_SECRET_SENTINEL"});
+        assert_eq!(
+            format!(
+                "{:?}",
+                parse_parent_secret_response(&malformed_inner.to_string()).unwrap_err()
+            ),
+            "SecretParsingError"
+        );
+    }
+
+    #[test]
+    fn startup_secret_success_values_are_preserved() {
+        assert_eq!(
+            decode_startup_secret(b"synthetic-secret".to_vec()).unwrap(),
+            "synthetic-secret"
+        );
+        assert_eq!(
+            decode_local_enclave_key(&hex::encode([7u8; 32])).unwrap(),
+            [7u8; 32]
+        );
+        let response = serde_json::json!({"response_type":"secret", "response_value":serde_json::json!({"database_url":"synthetic-ciphertext"}).to_string()});
+        assert_eq!(
+            parse_parent_secret_response(&response.to_string()).unwrap(),
+            "synthetic-ciphertext"
+        );
     }
 }
 
@@ -3328,9 +3495,7 @@ async fn get_or_create_jwt_secret(
     match app_mode {
         AppMode::Local => {
             // For local mode, use environment variable
-            Ok(std::env::var("JWT_SECRET")
-                .expect("JWT_SECRET must be set in local mode")
-                .into_bytes())
+            Ok(required_secret_env("JWT_SECRET").into_bytes())
         }
         _ => {
             // Check if JWT secret exists in enclave_secrets
@@ -3933,7 +4098,10 @@ async fn main() -> Result<(), Error> {
                         tokio::time::sleep(refresh_interval).await;
                     }
                     Err(e) => {
-                        tracing::error!("Failed to refresh AWS credentials: {:?}", e);
+                        tracing::error!(
+                            error_kind = crate::observability::error_kind(&e),
+                            "Failed to refresh AWS credentials"
+                        );
                         tracing::info!("Retrying in 5 seconds...");
                         tokio::time::sleep(retry_interval).await;
                     }
@@ -3974,22 +4142,25 @@ async fn main() -> Result<(), Error> {
                     &encrypted_url,
                 )
                 .map_err(|e| {
-                    tracing::error!("Failed to decrypt database URL: {:?}", e);
+                    tracing::error!(
+                        error_kind = crate::observability::error_kind(&e),
+                        "Failed to decrypt database URL"
+                    );
                     Error::EncryptionError(e.to_string())
                 })?;
 
-                String::from_utf8(url_vec).expect("should parse url")
+                decode_startup_secret(url_vec).expect("database URL must be valid UTF-8")
             }
             Err(e) => {
                 tracing::error!(
-                    "Failed to retrieve database URL from Secrets Manager: {:?}",
-                    e
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to retrieve database URL from Secrets Manager"
                 );
                 return Err(e);
             }
         }
     } else {
-        std::env::var("DATABASE_URL").expect("DATABASE_URL must be set")
+        required_secret_env("DATABASE_URL")
     };
 
     let db = setup_db(pg_url);
@@ -4001,12 +4172,9 @@ async fn main() -> Result<(), Error> {
                 .await?;
         enclave_key.key
     } else {
-        let enclave_key =
-            std::env::var("ENCLAVE_SECRET_MOCK").expect("needs ENCLAVE_SECRET_MOCK in local mode");
-        let enclave_key: [u8; 32] = hex::decode(enclave_key)
-            .unwrap()
-            .try_into()
-            .expect("ENCLAVE_SECRET_MOCK must be 32 bytes");
+        let enclave_key = required_secret_env("ENCLAVE_SECRET_MOCK");
+        let enclave_key = decode_local_enclave_key(&enclave_key)
+            .expect("ENCLAVE_SECRET_MOCK must encode 32 bytes");
         enclave_key.to_vec()
     };
 
@@ -4021,10 +4189,7 @@ async fn main() -> Result<(), Error> {
                     .expect("OpenAI API key should be retrieved correctly"),
             )
         } else {
-            Some(
-                std::env::var("OPENAI_API_KEY")
-                    .expect("OPENAI_API_KEY must be set for OpenAI domain"),
-            )
+            Some(required_secret_env("OPENAI_API_KEY"))
         }
     } else {
         None // No API key needed if not using OpenAI's domain
@@ -4116,11 +4281,14 @@ async fn main() -> Result<(), Error> {
                 &general_purpose::STANDARD.encode(&encrypted_url.value),
             )
             .map_err(|e| {
-                tracing::error!("Failed to decrypt SQS queue URL: {:?}", e);
+                tracing::error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to decrypt SQS queue URL"
+                );
                 Error::EncryptionError(e.to_string())
             })?;
 
-            Some(String::from_utf8(url_vec).expect("should parse url"))
+            Some(decode_startup_secret(url_vec).expect("SQS URL must be valid UTF-8"))
         } else {
             // URL not found in database - this is optional so we'll return None
             None
@@ -4228,7 +4396,8 @@ async fn main() -> Result<(), Error> {
         .clone()
         .merge(health_routes_with_state(app_state.clone()))
         .merge(native_handoff_routes(app_state.clone()))
-        .layer(from_fn(add_error_contract_header));
+        .layer(from_fn(add_error_contract_header))
+        .layer(from_fn(observability::trace_logical_request));
     let transport_v2_gateway =
         transport_v2::gateway::TransportV2Gateway::new(app_state.clone(), v2_application);
 
@@ -4237,7 +4406,8 @@ async fn main() -> Result<(), Error> {
         .merge(attestation_routes::router(app_state.clone()))
         .merge(transport_v2_gateway.router())
         .layer(cors)
-        .layer(from_fn(add_error_contract_header));
+        .layer(from_fn(add_error_contract_header))
+        .layer(from_fn(observability::trace_request));
 
     let bind_addr =
         std::env::var("OPENSECRET_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());

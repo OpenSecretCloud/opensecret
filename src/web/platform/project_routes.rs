@@ -141,7 +141,10 @@ async fn create_project(
         .db
         .get_org_project_by_name_and_org(&create_request.name, org.id)
         .map_err(|e| {
-            error!("Failed to check for existing project: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to check for existing project"
+            );
             ApiError::InternalServerError
         })?
         .is_some()
@@ -162,7 +165,10 @@ async fn create_project(
     );
 
     let project = data.db.create_org_project(new_project).map_err(|e| {
-        error!("Failed to create project: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to create project"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -200,7 +206,10 @@ async fn list_projects(
 
     // Get all projects
     let projects = data.db.get_all_org_projects_for_org(org.id).map_err(|e| {
-        error!("Failed to get projects: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to get projects"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -264,7 +273,10 @@ async fn update_project(
                 .db
                 .get_org_project_by_name_and_org(&name, org.id)
                 .map_err(|e| {
-                    error!("Failed to check for existing project: {:?}", e);
+                    error!(
+                        error_kind = crate::observability::error_kind(&e),
+                        "Failed to check for existing project"
+                    );
                     ApiError::InternalServerError
                 })?
                 .is_some()
@@ -286,7 +298,10 @@ async fn update_project(
     }
 
     data.db.update_org_project(&updated_project).map_err(|e| {
-        error!("Failed to update project: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to update project"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -383,7 +398,10 @@ async fn delete_project(
 
     // Delete the project
     data.db.delete_org_project(&project).map_err(|e| {
-        error!("Failed to delete project: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to delete project"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -441,13 +459,19 @@ async fn create_secret(
     let secret_bytes = general_purpose::STANDARD
         .decode(&create_request.secret)
         .map_err(|e| {
-            error!("Invalid base64 encoding: {}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Invalid base64 encoding"
+            );
             ApiError::BadRequest
         })?;
 
     // Encrypt the secret bytes with the enclave key
     let secret_key = SecretKey::from_slice(&data.enclave_key).map_err(|e| {
-        error!("Failed to create secret key: {}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to create secret key"
+        );
         ApiError::InternalServerError
     })?;
     let encrypted_secret = crate::encrypt::encrypt_with_key(&secret_key, &secret_bytes).await;
@@ -460,7 +484,10 @@ async fn create_secret(
     );
 
     let secret = data.db.create_org_project_secret(new_secret).map_err(|e| {
-        error!("Failed to create project secret: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to create project secret"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -509,7 +536,10 @@ async fn list_secrets(
         .db
         .get_all_org_project_secrets_for_project(project.id)
         .map_err(|e| {
-            error!("Failed to get project secrets: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to get project secrets"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -566,7 +596,10 @@ async fn delete_secret(
         .db
         .get_org_project_secret_by_key_name_and_project(&key_name, project.id)
         .map_err(|e| {
-            error!("Failed to get project secret: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to get project secret"
+            );
             ApiError::InternalServerError
         })?
         .ok_or_else(|| {
@@ -576,7 +609,10 @@ async fn delete_secret(
 
     // Delete the secret
     data.db.delete_org_project_secret(&secret).map_err(|e| {
-        error!("Failed to delete project secret: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to delete project secret"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -687,7 +723,10 @@ async fn update_email_settings(
 
     // Get the updated settings from the database to return
     let updated_settings = settings.get_email_settings().map_err(|e| {
-        error!("Failed to parse updated email settings: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to parse updated email settings"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -810,7 +849,10 @@ async fn update_oauth_settings(
 
     // Get the updated settings from the database to return
     let updated_settings = settings.get_oauth_settings().map_err(|e| {
-        error!("Failed to parse updated oauth settings: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to parse updated oauth settings"
+        );
         ApiError::InternalServerError
     })?;
 

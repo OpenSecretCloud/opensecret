@@ -66,7 +66,10 @@ async fn list_memberships(
         .db
         .get_all_org_memberships_with_users_for_org(org.id)
         .map_err(|e| {
-            error!("Failed to get memberships with users: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to get memberships with users"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -99,7 +102,11 @@ async fn update_membership(
     let org = match data.db.get_org_by_uuid(org_id) {
         Ok(org) => org,
         Err(e) => {
-            error!("Organization not found: {} - Error: {:?}", org_id, e);
+            error!(
+                %org_id,
+                error_kind = crate::observability::error_kind(&e),
+                "Organization lookup failed"
+            );
             return Err(ApiError::NotFound);
         }
     };
@@ -112,8 +119,10 @@ async fn update_membership(
         Ok(m) => m,
         Err(e) => {
             error!(
-                "Current user {} not in org {} - Error: {:?}",
-                platform_user.uuid, org_id, e
+                user_id = %platform_user.uuid,
+                %org_id,
+                error_kind = crate::observability::error_kind(&e),
+                "Current user membership lookup failed"
             );
             return Err(ApiError::Unauthorized);
         }
@@ -136,8 +145,10 @@ async fn update_membership(
         Ok(m) => m,
         Err(e) => {
             error!(
-                "Target user {} not found in org {} - Error: {:?}",
-                user_id, org_id, e
+                %user_id,
+                %org_id,
+                error_kind = crate::observability::error_kind(&e),
+                "Target user membership lookup failed"
             );
             return Err(ApiError::NotFound);
         }
@@ -160,8 +171,12 @@ async fn update_membership(
             }
             _ => {
                 error!(
-                    "Failed to update membership for user {} from '{}' to '{:?}': {:?}",
-                    user_id, target_membership.role, update_request.role, e
+                    %user_id,
+                    %org_id,
+                    previous_role = %target_membership.role,
+                    requested_role = ?update_request.role,
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to update membership"
                 );
                 ApiError::InternalServerError
             }
@@ -172,7 +187,10 @@ async fn update_membership(
         .db
         .get_org_membership_by_platform_user_and_org_with_user(user_id, org.id)
         .map_err(|e| {
-            error!("Failed to get membership with user after update: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to get membership with user after update"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -232,7 +250,10 @@ async fn delete_membership(
                 ApiError::BadRequest
             }
             _ => {
-                error!("Failed to delete membership: {:?}", e);
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to delete membership"
+                );
                 ApiError::InternalServerError
             }
         })?;

@@ -752,12 +752,21 @@ pub(crate) struct PostgresConnection {
     db: Pool<ConnectionManager<PgConnection>>,
 }
 
+fn log_db_failure(error: &DBError, operation: &'static str) {
+    let error_kind = crate::observability::error_kind(error);
+    if error_kind == "db_not_found" {
+        debug!(error_kind, operation, "Database lookup did not find a row");
+    } else {
+        error!(error_kind, operation, "Database operation failed");
+    }
+}
+
 impl DBConnection for PostgresConnection {
     fn create_user(&self, new_user: NewUser) -> Result<User, DBError> {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_user.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to create user: {:?}", e);
+            log_db_failure(e, "Failed to create user");
         }
         result
     }
@@ -766,7 +775,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = User::get_by_uuid(conn, uuid)?.ok_or(DBError::UserNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get user by UUID: {:?}", e);
+            log_db_failure(e, "Failed to get user by UUID");
         }
         result
     }
@@ -775,7 +784,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = User::get_by_email(conn, email, project_id)?.ok_or(DBError::UserNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get user by email: {:?}", e);
+            log_db_failure(e, "Failed to get user by email");
         }
         result
     }
@@ -937,7 +946,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = verification.verify(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to verify email: {:?}", e);
+            log_db_failure(e, "Failed to verify email");
         }
         result
     }
@@ -949,7 +958,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_request.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to create password reset request: {:?}", e);
+            log_db_failure(e, "Failed to create password reset request");
         }
         result
     }
@@ -963,7 +972,7 @@ impl DBConnection for PostgresConnection {
         let result = PasswordResetRequest::get_by_user_id_and_code(conn, user_id, &encrypted_code)
             .map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to get password reset request: {:?}", e);
+            log_db_failure(e, "Failed to get password reset request");
         }
         result
     }
@@ -1008,7 +1017,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = request.mark_as_reset(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to mark password reset request as complete: {:?}", e);
+            log_db_failure(e, "Failed to mark password reset request as complete");
         }
         result
     }
@@ -1230,7 +1239,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_org.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to create org: {:?}", e);
+            log_db_failure(e, "Failed to create org");
         }
         result
     }
@@ -1239,7 +1248,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = Org::get_by_id(conn, id)?.ok_or(DBError::OrgNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get org by ID: {:?}", e);
+            log_db_failure(e, "Failed to get org by ID");
         }
         result
     }
@@ -1248,7 +1257,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = Org::get_by_uuid(conn, uuid)?.ok_or(DBError::OrgNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get org by UUID: {:?}", e);
+            log_db_failure(e, "Failed to get org by UUID");
         }
         result
     }
@@ -1257,7 +1266,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = Org::get_by_name(conn, name).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to get org by name: {:?}", e);
+            log_db_failure(e, "Failed to get org by name");
         }
         result
     }
@@ -1266,7 +1275,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = Org::get_all(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to get all orgs: {:?}", e);
+            log_db_failure(e, "Failed to get all orgs");
         }
         result
     }
@@ -1275,7 +1284,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = org.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to update org: {:?}", e);
+            log_db_failure(e, "Failed to update org");
         }
         result
     }
@@ -1284,7 +1293,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = org.delete(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to delete org: {:?}", e);
+            log_db_failure(e, "Failed to delete org");
         }
         result
     }
@@ -1294,7 +1303,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_project.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to create org project: {:?}", e);
+            log_db_failure(e, "Failed to create org project");
         }
         result
     }
@@ -1303,7 +1312,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgProject::get_by_id(conn, id)?.ok_or(DBError::OrgProjectNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get org project by ID: {:?}", e);
+            log_db_failure(e, "Failed to get org project by ID");
         }
         result
     }
@@ -1312,7 +1321,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgProject::get_by_uuid(conn, uuid)?.ok_or(DBError::OrgProjectNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get org project by UUID: {:?}", e);
+            log_db_failure(e, "Failed to get org project by UUID");
         }
         result
     }
@@ -1322,7 +1331,7 @@ impl DBConnection for PostgresConnection {
         let result =
             OrgProject::get_by_client_id(conn, client_id)?.ok_or(DBError::OrgProjectNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get org project by client ID: {:?}", e);
+            log_db_failure(e, "Failed to get org project by client ID");
         }
         result
     }
@@ -1335,7 +1344,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgProject::get_by_name_and_org(conn, name, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to get org project by name and org: {:?}", e);
+            log_db_failure(e, "Failed to get org project by name and org");
         }
         result
     }
@@ -1344,7 +1353,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgProject::get_all_for_org(conn, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to get all org projects for org: {:?}", e);
+            log_db_failure(e, "Failed to get all org projects for org");
         }
         result
     }
@@ -1353,7 +1362,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgProject::get_active_for_org(conn, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to get active org projects for org: {:?}", e);
+            log_db_failure(e, "Failed to get active org projects for org");
         }
         result
     }
@@ -1362,7 +1371,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = project.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to update org project: {:?}", e);
+            log_db_failure(e, "Failed to update org project");
         }
         result
     }
@@ -1371,7 +1380,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = project.delete(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to delete org project: {:?}", e);
+            log_db_failure(e, "Failed to delete org project");
         }
         result
     }
@@ -1384,7 +1393,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_secret.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to create org project secret: {:?}", e);
+            log_db_failure(e, "Failed to create org project secret");
         }
         result
     }
@@ -1394,7 +1403,7 @@ impl DBConnection for PostgresConnection {
         let result =
             OrgProjectSecret::get_by_id(conn, id)?.ok_or(DBError::OrgProjectSecretNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get org project secret by ID: {:?}", e);
+            log_db_failure(e, "Failed to get org project secret by ID");
         }
         result
     }
@@ -1408,9 +1417,9 @@ impl DBConnection for PostgresConnection {
         let result = OrgProjectSecret::get_by_key_name_and_project(conn, key_name, project_id)
             .map_err(DBError::from);
         if let Err(ref e) = result {
-            error!(
-                "Failed to get org project secret by key name and project: {:?}",
-                e
+            log_db_failure(
+                e,
+                "Failed to get org project secret by key name and project",
             );
         }
         result
@@ -1423,7 +1432,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgProjectSecret::get_all_for_project(conn, project_id).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to get all org project secrets for project: {:?}", e);
+            log_db_failure(e, "Failed to get all org project secrets for project");
         }
         result
     }
@@ -1432,7 +1441,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = secret.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to update org project secret: {:?}", e);
+            log_db_failure(e, "Failed to update org project secret");
         }
         result
     }
@@ -1441,7 +1450,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = secret.delete(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to delete org project secret: {:?}", e);
+            log_db_failure(e, "Failed to delete org project secret");
         }
         result
     }
@@ -1451,7 +1460,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_invite.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to create invite code: {:?}", e);
+            log_db_failure(e, "Failed to create invite code");
         }
         result
     }
@@ -1460,7 +1469,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = InviteCode::get_by_id(conn, id)?.ok_or(DBError::InviteCodeNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get invite code by ID: {:?}", e);
+            log_db_failure(e, "Failed to get invite code by ID");
         }
         result
     }
@@ -1469,7 +1478,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = InviteCode::get_by_code(conn, code)?.ok_or(DBError::InviteCodeNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get invite code by code: {:?}", e);
+            log_db_failure(e, "Failed to get invite code by code");
         }
         result
     }
@@ -1482,7 +1491,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = InviteCode::get_by_email_and_org(conn, email, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to get invite code by email and org: {:?}", e);
+            log_db_failure(e, "Failed to get invite code by email and org");
         }
         result
     }
@@ -1491,7 +1500,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = InviteCode::get_all_for_org(conn, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to get all invite codes for org: {:?}", e);
+            log_db_failure(e, "Failed to get all invite codes for org");
         }
         result
     }
@@ -1500,7 +1509,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = invite.mark_as_used(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to mark invite code as used: {:?}", e);
+            log_db_failure(e, "Failed to mark invite code as used");
         }
         result
     }
@@ -1509,7 +1518,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = invite.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to update invite code: {:?}", e);
+            log_db_failure(e, "Failed to update invite code");
         }
         result
     }
@@ -1518,7 +1527,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = invite.delete(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to delete invite code: {:?}", e);
+            log_db_failure(e, "Failed to delete invite code");
         }
         result
     }
@@ -1528,7 +1537,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_user.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to create platform user: {:?}", e);
+            log_db_failure(e, "Failed to create platform user");
         }
         result
     }
@@ -1537,7 +1546,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = PlatformUser::get_by_id(conn, id)?.ok_or(DBError::PlatformUserNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get platform user by ID: {:?}", e);
+            log_db_failure(e, "Failed to get platform user by ID");
         }
         result
     }
@@ -1546,7 +1555,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = PlatformUser::get_by_uuid(conn, uuid)?.ok_or(DBError::PlatformUserNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get platform user by UUID: {:?}", e);
+            log_db_failure(e, "Failed to get platform user by UUID");
         }
         result
     }
@@ -1555,7 +1564,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = PlatformUser::get_by_email(conn, email).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to get platform user by email: {:?}", e);
+            log_db_failure(e, "Failed to get platform user by email");
         }
         result
     }
@@ -1564,7 +1573,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = user.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to update platform user: {:?}", e);
+            log_db_failure(e, "Failed to update platform user");
         }
         result
     }
@@ -1579,7 +1588,7 @@ impl DBConnection for PostgresConnection {
             .update_password(conn, new_password_enc)
             .map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to update platform user password: {:?}", e);
+            log_db_failure(e, "Failed to update platform user password");
         }
         result
     }
@@ -1594,7 +1603,7 @@ impl DBConnection for PostgresConnection {
             .insert(conn)
             .map_err(DBError::OrgMembershipError);
         if let Err(ref e) = result {
-            error!("Failed to create org membership: {:?}", e);
+            log_db_failure(e, "Failed to create org membership");
         }
         result
     }
@@ -1608,10 +1617,7 @@ impl DBConnection for PostgresConnection {
         let result = OrgMembership::get_by_platform_user_and_org(conn, platform_user_id, org_id)
             .map_err(DBError::from);
         if let Err(ref e) = result {
-            error!(
-                "Failed to get org membership by platform user and org: {:?}",
-                e
-            );
+            log_db_failure(e, "Failed to get org membership by platform user and org");
         }
         result
     }
@@ -1626,9 +1632,9 @@ impl DBConnection for PostgresConnection {
             OrgMembership::get_by_platform_user_and_org_with_user(conn, platform_user_id, org_id)
                 .map_err(DBError::from);
         if let Err(ref e) = result {
-            error!(
-                "Failed to get org membership with user info by platform user and org: {:?}",
-                e
+            log_db_failure(
+                e,
+                "Failed to get org membership with user info by platform user and org",
             );
         }
         result
@@ -1642,10 +1648,7 @@ impl DBConnection for PostgresConnection {
         let result =
             OrgMembership::get_all_for_platform_user(conn, platform_user_id).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!(
-                "Failed to get all org memberships for platform user: {:?}",
-                e
-            );
+            log_db_failure(e, "Failed to get all org memberships for platform user");
         }
         result
     }
@@ -1654,7 +1657,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgMembership::get_all_for_org(conn, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to get all org memberships for org: {:?}", e);
+            log_db_failure(e, "Failed to get all org memberships for org");
         }
         result
     }
@@ -1666,10 +1669,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = OrgMembership::get_all_with_users_for_org(conn, org_id).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!(
-                "Failed to get all org memberships with users for org: {:?}",
-                e
-            );
+            log_db_failure(e, "Failed to get all org memberships with users for org");
         }
         result
     }
@@ -1678,7 +1678,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = membership.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to update org membership: {:?}", e);
+            log_db_failure(e, "Failed to update org membership");
         }
         result
     }
@@ -1687,7 +1687,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = membership.delete(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to delete org membership: {:?}", e);
+            log_db_failure(e, "Failed to delete org membership");
         }
         result
     }
@@ -1708,7 +1708,7 @@ impl DBConnection for PostgresConnection {
                 _ => DBError::from(e),
             });
         if let Err(ref e) = result {
-            error!("Failed to update org membership role: {:?}", e);
+            log_db_failure(e, "Failed to update org membership role");
         }
         result
     }
@@ -1728,7 +1728,7 @@ impl DBConnection for PostgresConnection {
                 _ => DBError::from(e),
             });
         if let Err(ref e) = result {
-            error!("Failed to delete org membership: {:?}", e);
+            log_db_failure(e, "Failed to delete org membership");
         }
         result
     }
@@ -1898,7 +1898,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_verification.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to create platform email verification: {:?}", e);
+            log_db_failure(e, "Failed to create platform email verification");
         }
         result
     }
@@ -1911,7 +1911,7 @@ impl DBConnection for PostgresConnection {
         let result = PlatformEmailVerification::get_by_id(conn, id)?
             .ok_or(DBError::PlatformEmailVerificationNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get platform email verification by ID: {:?}", e);
+            log_db_failure(e, "Failed to get platform email verification by ID");
         }
         result
     }
@@ -1924,9 +1924,9 @@ impl DBConnection for PostgresConnection {
         let result = PlatformEmailVerification::get_by_platform_user_id(conn, platform_user_id)?
             .ok_or(DBError::PlatformEmailVerificationNotFound);
         if let Err(ref e) = result {
-            error!(
-                "Failed to get platform email verification by platform user ID: {:?}",
-                e
+            log_db_failure(
+                e,
+                "Failed to get platform email verification by platform user ID",
             );
         }
         result
@@ -1940,7 +1940,7 @@ impl DBConnection for PostgresConnection {
         let result = PlatformEmailVerification::get_by_verification_code(conn, code)?
             .ok_or(DBError::PlatformEmailVerificationNotFound);
         if let Err(ref e) = result {
-            error!("Failed to get platform email verification by code: {:?}", e);
+            log_db_failure(e, "Failed to get platform email verification by code");
         }
         result
     }
@@ -1952,7 +1952,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = verification.update(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to update platform email verification: {:?}", e);
+            log_db_failure(e, "Failed to update platform email verification");
         }
         result
     }
@@ -1964,7 +1964,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = verification.delete(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to delete platform email verification: {:?}", e);
+            log_db_failure(e, "Failed to delete platform email verification");
         }
         result
     }
@@ -1976,7 +1976,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = verification.verify(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to verify platform email: {:?}", e);
+            log_db_failure(e, "Failed to verify platform email");
         }
         result
     }
@@ -1989,7 +1989,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_request.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to create platform password reset request: {:?}", e);
+            log_db_failure(e, "Failed to create platform password reset request");
         }
         result
     }
@@ -2004,7 +2004,7 @@ impl DBConnection for PostgresConnection {
             PlatformPasswordResetRequest::get_by_user_id_and_code(conn, user_id, &encrypted_code)
                 .map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to get platform password reset request: {:?}", e);
+            log_db_failure(e, "Failed to get platform password reset request");
         }
         result
     }
@@ -2016,9 +2016,9 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = request.mark_as_reset(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!(
-                "Failed to mark platform password reset request as complete: {:?}",
-                e
+            log_db_failure(
+                e,
+                "Failed to mark platform password reset request as complete",
             );
         }
         result
@@ -2033,7 +2033,7 @@ impl DBConnection for PostgresConnection {
             _ => DBError::from(e),
         });
         if let Err(ref e) = result {
-            error!("Failed to validate platform invite code: {:?}", e);
+            log_db_failure(e, "Failed to validate platform invite code");
         }
         result
     }
@@ -2105,7 +2105,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = new_request.insert(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to create account deletion request: {:?}", e);
+            log_db_failure(e, "Failed to create account deletion request");
         }
         result
     }
@@ -2120,7 +2120,7 @@ impl DBConnection for PostgresConnection {
             AccountDeletionRequest::get_by_user_id_and_code(conn, user_id, &encrypted_code)
                 .map_err(DBError::from);
         if let Err(ref e) = result {
-            error!("Failed to get account deletion request: {:?}", e);
+            log_db_failure(e, "Failed to get account deletion request");
         }
         result
     }
@@ -2132,10 +2132,7 @@ impl DBConnection for PostgresConnection {
         let conn = &mut self.db.get().map_err(|_| DBError::ConnectionError)?;
         let result = request.mark_as_deleted(conn).map_err(DBError::from);
         if let Err(ref e) = result {
-            error!(
-                "Failed to mark account deletion request as complete: {:?}",
-                e
-            );
+            log_db_failure(e, "Failed to mark account deletion request as complete");
         }
         result
     }
@@ -2986,8 +2983,41 @@ impl DBConnection for PostgresConnection {
     // Maintenance
 }
 
+/// Replace r2d2's default Display-based logging, including worker connection
+/// failures that happen before build() returns a sanitized pool timeout.
+#[derive(Debug)]
+struct PoolErrorHandler;
+
+impl diesel::r2d2::HandleError<diesel::r2d2::Error> for PoolErrorHandler {
+    fn handle_error(&self, error: diesel::r2d2::Error) {
+        use diesel::result::ConnectionError;
+
+        let (stage, error_kind) = match &error {
+            diesel::r2d2::Error::ConnectionError(error) => match error {
+                ConnectionError::InvalidCString(_) | ConnectionError::InvalidConnectionUrl(_) => {
+                    ("connect", "db_connection_url")
+                }
+                ConnectionError::BadConnection(_) => ("connect", "db_connection_failed"),
+                ConnectionError::CouldntSetupConfiguration(error) => {
+                    ("connection_setup", crate::observability::error_kind(error))
+                }
+                _ => ("connect", "db_connection_failed"),
+            },
+            diesel::r2d2::Error::QueryError(error) => {
+                ("connection_check", crate::observability::error_kind(error))
+            }
+        };
+        error!(
+            stage,
+            error_kind, "Database pool connection operation failed"
+        );
+    }
+}
+
+#[tracing::instrument(skip_all, fields(max_connections = 20, min_idle = 5))]
 pub(crate) fn setup_db(url: String) -> Arc<dyn DBConnection + Send + Sync> {
-    info!("Connecting to database...");
+    let started = std::time::Instant::now();
+    info!("Connecting to database");
     let manager = ConnectionManager::<PgConnection>::new(url);
 
     let pool = Pool::builder()
@@ -2997,9 +3027,110 @@ pub(crate) fn setup_db(url: String) -> Arc<dyn DBConnection + Send + Sync> {
         .idle_timeout(Some(std::time::Duration::from_secs(600))) // 10 minutes
         .max_lifetime(Some(std::time::Duration::from_secs(1800))) // 30 minutes
         .test_on_check_out(true)
+        .error_handler(Box::new(PoolErrorHandler))
         .build(manager)
-        .expect("Unable to build DB connection pool");
+        .unwrap_or_else(|error| {
+            error!(
+                error_kind = crate::observability::error_kind(&error),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "Unable to build DB connection pool"
+            );
+            // Preserve the startup failure without formatting a potentially
+            // sensitive PostgreSQL diagnostic into the panic message.
+            panic!("Unable to build DB connection pool");
+        });
 
-    info!("Connected to database with pool size: 20, min idle: 5");
+    let state = pool.state();
+    info!(
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        connections = state.connections,
+        idle_connections = state.idle_connections,
+        "Database pool ready"
+    );
     Arc::new(PostgresConnection { db: pool })
+}
+
+#[cfg(test)]
+mod pool_error_log_tests {
+    use super::*;
+    use diesel::r2d2::HandleError;
+    use diesel::result::{ConnectionError, DatabaseErrorKind, Error as QueryError};
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn pool_error_handler_omits_database_diagnostics_at_default_log_level() {
+        const PRIVATE: &str = "PRIVATE_DATABASE_HOST_USER_AND_QUERY_SENTINEL";
+        let errors = [
+            diesel::r2d2::Error::ConnectionError(ConnectionError::BadConnection(
+                PRIVATE.to_owned(),
+            )),
+            diesel::r2d2::Error::ConnectionError(ConnectionError::InvalidConnectionUrl(
+                PRIVATE.to_owned(),
+            )),
+            diesel::r2d2::Error::ConnectionError(ConnectionError::CouldntSetupConfiguration(
+                QueryError::DatabaseError(
+                    DatabaseErrorKind::ReadOnlyTransaction,
+                    Box::new(PRIVATE.to_owned()),
+                ),
+            )),
+            diesel::r2d2::Error::QueryError(QueryError::DatabaseError(
+                DatabaseErrorKind::ClosedConnection,
+                Box::new(PRIVATE.to_owned()),
+            )),
+        ];
+        for error in &errors {
+            assert!(error.to_string().contains(PRIVATE));
+        }
+
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(crate::DEFAULT_RUST_LOG_FILTER)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for error in errors {
+                PoolErrorHandler.handle_error(error);
+            }
+        });
+
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            output
+                .matches("Database pool connection operation failed")
+                .count(),
+            4
+        );
+        for expected in [
+            "db_connection_failed",
+            "db_connection_url",
+            "connection_setup",
+            "db_read_only_transaction",
+            "connection_check",
+            "db_closed_connection",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing diagnostic category {expected}"
+            );
+        }
+        assert!(!output.contains(PRIVATE));
+    }
 }

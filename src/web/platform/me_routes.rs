@@ -17,6 +17,7 @@ use serde_json::json;
 use std::sync::Arc;
 use tokio::spawn;
 use tracing::error;
+use tracing::Instrument;
 use validator::Validate;
 
 use super::common::{MeResponse, OrgResponse, PlatformUserResponse};
@@ -73,7 +74,10 @@ async fn get_platform_user(
         Ok(verification) => verification.is_verified,
         Err(crate::db::DBError::PlatformEmailVerificationNotFound) => false,
         Err(e) => {
-            error!("Error fetching platform email verification: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Error fetching platform email verification"
+            );
             return Err(ApiError::InternalServerError);
         }
     };
@@ -85,7 +89,10 @@ async fn get_platform_user(
     {
         Ok(memberships) => memberships,
         Err(e) => {
-            error!("Error fetching organization memberships: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Error fetching organization memberships"
+            );
             return Err(ApiError::InternalServerError);
         }
     };
@@ -103,7 +110,11 @@ async fn get_platform_user(
                     name: org.name,
                 }),
                 Err(e) => {
-                    error!("Error fetching organization {}: {:?}", org_id, e);
+                    error!(
+                        org_id,
+                        error_kind = crate::observability::error_kind(&e),
+                        "Error fetching organization"
+                    );
                     None // Skip this organization but continue processing others
                 }
             }
@@ -144,7 +155,10 @@ async fn request_platform_verification(
             }
             // Delete the old verification
             if let Err(e) = data.db.delete_platform_email_verification(&verification) {
-                error!("Error deleting old platform verification: {:?}", e);
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Error deleting old platform verification"
+                );
                 return Err(ApiError::InternalServerError);
             }
         }
@@ -152,7 +166,10 @@ async fn request_platform_verification(
             // This is fine, we'll create a new verification
         }
         Err(e) => {
-            error!("Error checking platform email verification: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Error checking platform email verification"
+            );
             return Err(ApiError::InternalServerError);
         }
     }
@@ -162,14 +179,20 @@ async fn request_platform_verification(
         // 24 hours expiration
         Ok(v) => v,
         Err(e) => {
-            error!("Error creating platform email verification: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Error creating platform email verification"
+            );
             return Err(ApiError::InternalServerError);
         }
     };
     let verification = match data.db.create_platform_email_verification(new_verification) {
         Ok(v) => v,
         Err(e) => {
-            error!("Error creating platform email verification: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Error creating platform email verification"
+            );
             return Err(ApiError::InternalServerError);
         }
     };
@@ -179,18 +202,24 @@ async fn request_platform_verification(
     let verification_code = verification.verification_code;
     let app_state = data.clone();
 
-    spawn(async move {
-        if let Err(e) = send_platform_verification_email(
-            &app_state,
-            app_state.resend_api_key.clone(),
-            email,
-            verification_code,
-        )
-        .await
-        {
-            error!("Could not send platform verification email: {}", e);
+    spawn(
+        async move {
+            if let Err(e) = send_platform_verification_email(
+                &app_state,
+                app_state.resend_api_key.clone(),
+                email,
+                verification_code,
+            )
+            .await
+            {
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Could not send platform verification email"
+                );
+            }
         }
-    });
+        .in_current_span(),
+    );
 
     let response = json!({ "message": "New verification code sent successfully" });
     encrypt_response(&data, &session_id, &response).await
@@ -230,7 +259,10 @@ pub async fn platform_change_password(
                     encrypt_response(&data, &session_id, &response).await
                 }
                 Err(e) => {
-                    error!("Error changing platform user password: {:?}", e);
+                    error!(
+                        error_kind = crate::observability::error_kind(&e),
+                        "Error changing platform user password"
+                    );
                     Err(ApiError::InternalServerError)
                 }
             }

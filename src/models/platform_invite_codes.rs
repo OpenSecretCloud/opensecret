@@ -15,7 +15,10 @@ impl From<PlatformInviteCodeError> for ApiError {
     fn from(err: PlatformInviteCodeError) -> Self {
         match err {
             PlatformInviteCodeError::DatabaseError(e) => {
-                tracing::error!("Database error: {:?}", e);
+                tracing::error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Database error"
+                );
                 ApiError::InternalServerError
             }
             PlatformInviteCodeError::InviteCodeNotFound(_) => {

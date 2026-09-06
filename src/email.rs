@@ -21,6 +21,36 @@ pub enum EmailError {
     DatabaseError(#[from] DBError),
 }
 
+fn log_send_error(email_kind: &'static str, error: &resend_rs::Error) {
+    // Resend's Display/Debug includes provider messages and sometimes the full
+    // response. Those can contain addresses or email content.
+    match error {
+        resend_rs::Error::Http(error) => error!(
+            email_kind,
+            error_kind = "http",
+            timeout = error.is_timeout(),
+            connect = error.is_connect(),
+            "Failed to send email"
+        ),
+        resend_rs::Error::Resend(error) => error!(
+            email_kind,
+            error_kind = ?error.kind(),
+            status = error.status_code,
+            "Failed to send email"
+        ),
+        resend_rs::Error::Parse(_) => error!(
+            email_kind,
+            error_kind = "response_parse",
+            "Failed to send email"
+        ),
+        resend_rs::Error::RateLimit { .. } => error!(
+            email_kind,
+            error_kind = "rate_limit",
+            "Failed to send email"
+        ),
+    }
+}
+
 const WELCOME_EMAIL_HTML: &str = r#"
 <!DOCTYPE html>
 <html lang="en">
@@ -309,7 +339,7 @@ async fn get_project_email_settings(
 
     // Verify provider is resend
     if email_settings.provider != "resend" {
-        error!("Unsupported email provider: {}", email_settings.provider);
+        error!("Unsupported email provider");
         return Err(EmailError::IncompleteSettings);
     }
 
@@ -347,8 +377,8 @@ pub async fn send_hello_email(
     let project = app_state
         .db
         .get_org_project_by_id(project_id)
-        .map_err(|e| {
-            error!("Failed to get project: {}", e);
+        .map_err(|_| {
+            error!("Failed to get email project");
             EmailError::UnknownError
         })?;
 
@@ -375,7 +405,7 @@ pub async fn send_hello_email(
         .with_scheduled_at(&scheduled_at);
 
     let _email = resend.emails.send(email).await.map_err(|e| {
-        tracing::error!("Failed to send email: {}", e);
+        log_send_error("hello", &e);
         EmailError::UnknownError
     });
     Ok(())
@@ -394,14 +424,14 @@ pub async fn send_verification_email(
     let project = app_state
         .db
         .get_org_project_by_id(project_id)
-        .map_err(|e| {
-            error!("Failed to get project: {}", e);
+        .map_err(|_| {
+            error!("Failed to get email project");
             EmailError::UnknownError
         })?;
 
     // Get organization name for the team signature
-    let org = app_state.db.get_org_by_id(project.org_id).map_err(|e| {
-        error!("Failed to get organization: {}", e);
+    let org = app_state.db.get_org_by_id(project.org_id).map_err(|_| {
+        error!("Failed to get email organization");
         EmailError::UnknownError
     })?;
 
@@ -463,7 +493,7 @@ pub async fn send_verification_email(
     let email = CreateEmailBaseOptions::new(from_email, to, subject).with_html(&html_content);
 
     let _email = resend.emails.send(email).await.map_err(|e| {
-        tracing::error!("Failed to send email: {}", e);
+        log_send_error("verification", &e);
         EmailError::UnknownError
     });
     Ok(())
@@ -482,14 +512,14 @@ pub async fn send_password_reset_email(
     let project = app_state
         .db
         .get_org_project_by_id(project_id)
-        .map_err(|e| {
-            error!("Failed to get project: {}", e);
+        .map_err(|_| {
+            error!("Failed to get email project");
             EmailError::UnknownError
         })?;
 
     // Get organization name for the team signature
-    let org = app_state.db.get_org_by_id(project.org_id).map_err(|e| {
-        error!("Failed to get organization: {}", e);
+    let org = app_state.db.get_org_by_id(project.org_id).map_err(|_| {
+        error!("Failed to get email organization");
         EmailError::UnknownError
     })?;
 
@@ -530,7 +560,7 @@ pub async fn send_password_reset_email(
     let email = CreateEmailBaseOptions::new(from_email, to, subject).with_html(&html_content);
 
     let _email = resend.emails.send(email).await.map_err(|e| {
-        tracing::error!("Failed to send email: {}", e);
+        log_send_error("password_reset", &e);
         EmailError::UnknownError
     });
     Ok(())
@@ -548,14 +578,14 @@ pub async fn send_password_reset_confirmation_email(
     let project = app_state
         .db
         .get_org_project_by_id(project_id)
-        .map_err(|e| {
-            error!("Failed to get project: {}", e);
+        .map_err(|_| {
+            error!("Failed to get email project");
             EmailError::UnknownError
         })?;
 
     // Get organization name for the team signature
-    let org = app_state.db.get_org_by_id(project.org_id).map_err(|e| {
-        error!("Failed to get organization: {}", e);
+    let org = app_state.db.get_org_by_id(project.org_id).map_err(|_| {
+        error!("Failed to get email organization");
         EmailError::UnknownError
     })?;
 
@@ -598,7 +628,7 @@ pub async fn send_password_reset_confirmation_email(
     let email = CreateEmailBaseOptions::new(from_email, to, subject).with_html(&html_content);
 
     let _email = resend.emails.send(email).await.map_err(|e| {
-        tracing::error!("Failed to send email: {}", e);
+        log_send_error("password_reset_confirmation", &e);
         EmailError::UnknownError
     });
     Ok(())
@@ -671,7 +701,7 @@ pub async fn send_platform_verification_email(
     let email = CreateEmailBaseOptions::new(from_email, to, subject).with_html(&html_content);
 
     let _email = resend.emails.send(email).await.map_err(|e| {
-        tracing::error!("Failed to send email: {}", e);
+        log_send_error("platform_verification", &e);
         EmailError::UnknownError
     });
     Ok(())
@@ -746,7 +776,7 @@ pub async fn send_platform_invite_email(
     let email = CreateEmailBaseOptions::new(from, to, subject).with_html(&html_content);
 
     let _email = resend.emails.send(email).await.map_err(|e| {
-        tracing::error!("Failed to send email: {}", e);
+        log_send_error("platform_invite", &e);
         EmailError::UnknownError
     });
     Ok(())
@@ -830,7 +860,7 @@ pub async fn send_platform_password_reset_email(
     let email = CreateEmailBaseOptions::new(from_email, to, subject).with_html(&html_content);
 
     let _email = resend.emails.send(email).await.map_err(|e| {
-        tracing::error!("Failed to send email: {}", e);
+        log_send_error("platform_password_reset", &e);
         EmailError::UnknownError
     });
     Ok(())
@@ -885,7 +915,7 @@ pub async fn send_platform_password_reset_confirmation_email(
     let email = CreateEmailBaseOptions::new(from_email, to, subject).with_html(&html_content);
 
     let _email = resend.emails.send(email).await.map_err(|e| {
-        tracing::error!("Failed to send email: {}", e);
+        log_send_error("platform_password_reset_confirmation", &e);
         EmailError::UnknownError
     });
     Ok(())
@@ -904,14 +934,14 @@ pub async fn send_account_deletion_email(
     let project = app_state
         .db
         .get_org_project_by_id(project_id)
-        .map_err(|e| {
-            error!("Failed to get project: {}", e);
+        .map_err(|_| {
+            error!("Failed to get email project");
             EmailError::UnknownError
         })?;
 
     // Get organization name for the team signature
-    let org = app_state.db.get_org_by_id(project.org_id).map_err(|e| {
-        error!("Failed to get organization: {}", e);
+    let org = app_state.db.get_org_by_id(project.org_id).map_err(|_| {
+        error!("Failed to get email organization");
         EmailError::UnknownError
     })?;
 
@@ -953,7 +983,7 @@ pub async fn send_account_deletion_email(
     let email = CreateEmailBaseOptions::new(from_email, to, subject).with_html(&html_content);
 
     let _email = resend.emails.send(email).await.map_err(|e| {
-        tracing::error!("Failed to send email: {}", e);
+        log_send_error("account_deletion", &e);
         EmailError::UnknownError
     });
     Ok(())
@@ -971,14 +1001,14 @@ pub async fn send_account_deletion_confirmation_email(
     let project = app_state
         .db
         .get_org_project_by_id(project_id)
-        .map_err(|e| {
-            error!("Failed to get project: {}", e);
+        .map_err(|_| {
+            error!("Failed to get email project");
             EmailError::UnknownError
         })?;
 
     // Get organization name for the team signature
-    let org = app_state.db.get_org_by_id(project.org_id).map_err(|e| {
-        error!("Failed to get organization: {}", e);
+    let org = app_state.db.get_org_by_id(project.org_id).map_err(|_| {
+        error!("Failed to get email organization");
         EmailError::UnknownError
     })?;
 
@@ -1016,8 +1046,61 @@ pub async fn send_account_deletion_confirmation_email(
     let email = CreateEmailBaseOptions::new(from_email, to, subject).with_html(&html_content);
 
     let _email = resend.emails.send(email).await.map_err(|e| {
-        tracing::error!("Failed to send email: {}", e);
+        log_send_error("account_deletion_confirmation", &e);
         EmailError::UnknownError
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn resend_error_logs_omit_provider_descriptions_and_response_payloads() {
+        const PRIVATE: &str = "PRIVATE_EMAIL_ADDRESS_AND_BODY_SENTINEL";
+        let provider_error = resend_rs::Error::Resend(resend_rs::types::ErrorResponse {
+            status_code: 422,
+            name: PRIVATE.to_string(),
+            message: PRIVATE.to_string(),
+        });
+        let parse_error = resend_rs::Error::Parse(PRIVATE.to_string());
+        assert!(provider_error.to_string().contains(PRIVATE));
+        assert!(parse_error.to_string().contains(PRIVATE));
+
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            log_send_error("verification", &provider_error);
+            log_send_error("password_reset", &parse_error);
+        });
+
+        let output = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.matches("Failed to send email").count(), 2);
+        assert!(output.contains("Unrecognized"));
+        assert!(output.contains("422"));
+        assert!(output.contains("response_parse"));
+        assert!(!output.contains(PRIVATE));
+    }
 }

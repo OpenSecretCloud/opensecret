@@ -12,7 +12,11 @@ use secp256k1::rand::rngs::OsRng;
 use secp256k1::SecretKey;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256, Sha512};
-use std::{process::Command, sync::Arc};
+use std::{
+    io,
+    process::{Command, Output},
+    sync::Arc,
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -245,7 +249,7 @@ impl CanonicalBytes {
 /// ```ignore
 /// let content: Option<MessageContent> = decrypt_content(&user_key, msg.content_enc.as_ref())
 ///     .map_err(|e| {
-///         error!("Failed to decrypt message: {:?}", e);
+///         error!(error_kind = crate::observability::error_kind(&e), "Failed to decrypt message");
 ///         ApiError::InternalServerError
 ///     })?;
 /// ```
@@ -262,8 +266,15 @@ where
 
     let decrypted_bytes = decrypt_with_key(key, encrypted)?;
 
-    let value = serde_json::from_slice(&decrypted_bytes)
-        .map_err(|e| EncryptError::DeserializationFailed(e.to_string()))?;
+    let value = serde_json::from_slice(&decrypted_bytes).map_err(|error| {
+        // Serde's message can quote a decrypted string when its type is wrong.
+        EncryptError::DeserializationFailed(format!(
+            "JSON {:?} at line {} column {}",
+            error.classify(),
+            error.line(),
+            error.column()
+        ))
+    })?;
 
     Ok(Some(value))
 }
@@ -288,7 +299,7 @@ where
 /// ```ignore
 /// let text: Option<String> = decrypt_string(&user_key, msg.content_enc.as_ref())
 ///     .map_err(|e| {
-///         error!("Failed to decrypt message: {:?}", e);
+///         error!(error_kind = crate::observability::error_kind(&e), "Failed to decrypt message");
 ///         ApiError::InternalServerError
 ///     })?;
 /// ```
@@ -353,25 +364,47 @@ pub fn decrypt_with_kms(
         .arg(aws_session_token)
         .arg("--ciphertext")
         .arg(ciphertext)
-        .output()
-        .map_err(|e| {
-            tracing::error!(
-                "Failed to execute kmstool_enclave_cli for decryption: {}",
-                e
-            );
-            EncryptError::KmsError(e.to_string())
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::error!("kmstool_enclave_cli decryption failed: {}", stderr);
-        return Err(EncryptError::KmsError(stderr.to_string()));
-    }
-
-    let output_str =
-        String::from_utf8(output.stdout).map_err(|e| EncryptError::KmsError(e.to_string()))?;
+        .output();
+    let output_str = check_kmstool_output("decrypt", output)?;
 
     parse_kmstool_plaintext(&output_str, "decrypt", None)
+}
+
+/// Subprocess diagnostics may contain credentials or key material. Discard them
+/// at this boundary so neither logs nor callers formatting an error retain them.
+fn check_kmstool_output(
+    operation: &'static str,
+    output: io::Result<Output>,
+) -> Result<String, EncryptError> {
+    let output = output.map_err(|error| {
+        let kind = error.kind();
+        tracing::error!(operation, error_kind = ?kind, "Failed to execute kmstool_enclave_cli");
+        EncryptError::KmsError(format!("kmstool {operation} execution failed: {kind:?}"))
+    })?;
+
+    if !output.status.success() {
+        let exit_code = output.status.code();
+        tracing::error!(
+            operation,
+            error_kind = "process_failed",
+            ?exit_code,
+            "kmstool_enclave_cli failed"
+        );
+        let detail = match exit_code {
+            Some(code) => format!("kmstool {operation} failed (exit code {code})"),
+            None => format!("kmstool {operation} terminated without an exit code"),
+        };
+        return Err(EncryptError::KmsError(detail));
+    }
+
+    String::from_utf8(output.stdout).map_err(|_| {
+        tracing::error!(
+            operation,
+            error_kind = "invalid_utf8",
+            "Invalid kmstool_enclave_cli output"
+        );
+        EncryptError::KmsError(format!("Invalid UTF-8 in kmstool {operation} output"))
+    })
 }
 
 #[derive(Debug)]
@@ -505,20 +538,8 @@ pub fn create_new_encryption_key(
         .arg(aws_kms_key_id)
         .arg("--key-spec")
         .arg("AES-256")
-        .output()
-        .map_err(|e| {
-            tracing::error!("Failed to execute kmstool_enclave_cli: {}", e);
-            EncryptError::KmsError(e.to_string())
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::error!("kmstool_enclave_cli failed: {}", stderr);
-        return Err(EncryptError::KmsError(stderr.to_string()));
-    }
-
-    let output_str =
-        String::from_utf8(output.stdout).map_err(|e| EncryptError::KmsError(e.to_string()))?;
+        .output();
+    let output_str = check_kmstool_output("genkey", output)?;
     parse_kmstool_genkey(&output_str)
 }
 
@@ -577,26 +598,8 @@ pub async fn generate_random_bytes_from_enclave(
         .arg(aws_session_token)
         .arg("--length")
         .arg(length.to_string())
-        .output()
-        .map_err(|e| {
-            tracing::error!(
-                "Failed to execute kmstool_enclave_cli for random byte generation: {}",
-                e
-            );
-            EncryptError::KmsError(e.to_string())
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::error!(
-            "kmstool_enclave_cli random byte generation failed: {}",
-            stderr
-        );
-        return Err(EncryptError::KmsError(stderr.to_string()));
-    }
-
-    let output_str =
-        String::from_utf8(output.stdout).map_err(|e| EncryptError::KmsError(e.to_string()))?;
+        .output();
+    let output_str = check_kmstool_output("genrandom", output)?;
 
     parse_kmstool_plaintext(&output_str, "genrandom", Some(length))
 }
@@ -647,6 +650,126 @@ impl CustomRng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn synthetic_kmstool_output(status: i32, stdout: Vec<u8>, stderr: Vec<u8>) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+
+        Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout,
+            stderr,
+        }
+    }
+
+    #[test]
+    fn kmstool_execution_error_retains_only_operation_and_kind() {
+        let error = check_kmstool_output(
+            "decrypt",
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private subprocess diagnostic",
+            )),
+        )
+        .unwrap_err();
+
+        assert!(matches!(&error, EncryptError::KmsError(_)));
+        assert!(error.to_string().contains("decrypt"));
+        assert!(error.to_string().contains("PermissionDenied"));
+        assert!(!format!("{error:?} {error}").contains("private subprocess diagnostic"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kmstool_process_failure_does_not_retain_output() {
+        for operation in ["decrypt", "genkey", "genrandom"] {
+            for status in [23 << 8, 9] {
+                let error = check_kmstool_output(
+                    operation,
+                    Ok(synthetic_kmstool_output(
+                        status,
+                        b"private stdout payload".to_vec(),
+                        b"private stderr payload".to_vec(),
+                    )),
+                )
+                .unwrap_err();
+
+                assert!(matches!(&error, EncryptError::KmsError(_)));
+                let diagnostic = format!("{error:?} {error}");
+                assert!(!diagnostic.contains("private stdout payload"));
+                assert!(!diagnostic.contains("private stderr payload"));
+                assert!(diagnostic.contains(operation));
+                if status == 23 << 8 {
+                    assert!(diagnostic.contains("exit code 23"));
+                } else {
+                    assert!(diagnostic.contains("without an exit code"));
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kmstool_invalid_utf8_does_not_retain_output() {
+        let mut stdout = b"private stdout payload".to_vec();
+        stdout.push(0xff);
+        let error = check_kmstool_output(
+            "genkey",
+            Ok(synthetic_kmstool_output(
+                0,
+                stdout,
+                b"private stderr payload".to_vec(),
+            )),
+        )
+        .unwrap_err();
+
+        let diagnostic = format!("{error:?} {error}");
+        assert!(matches!(error, EncryptError::KmsError(_)));
+        assert!(diagnostic.contains("Invalid UTF-8"));
+        assert!(!diagnostic.contains("private stdout payload"));
+        assert!(!diagnostic.contains("private stderr payload"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kmstool_success_preserves_stdout_for_exact_parsing() {
+        let stdout = "PLAINTEXT: dGVzdA==\n";
+        let actual = check_kmstool_output(
+            "decrypt",
+            Ok(synthetic_kmstool_output(
+                0,
+                stdout.as_bytes().to_vec(),
+                b"private stderr payload".to_vec(),
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(actual, stdout);
+    }
+
+    #[tokio::test]
+    async fn content_deserialization_error_does_not_retain_decrypted_value() {
+        let key = SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let plaintext = br#""private decrypted value""#;
+        let original_error = serde_json::from_slice::<u32>(plaintext).unwrap_err();
+        assert!(original_error
+            .to_string()
+            .contains("private decrypted value"));
+
+        let encrypted = encrypt_with_key(&key, plaintext).await;
+        let error = decrypt_content::<u32>(&key, Some(&encrypted)).unwrap_err();
+        assert!(matches!(&error, EncryptError::DeserializationFailed(_)));
+        let diagnostic = format!("{error:?} {error}");
+        assert!(diagnostic.contains("JSON Data at line 1 column"));
+        assert!(!diagnostic.contains("private decrypted value"));
+
+        assert_eq!(decrypt_content::<u32>(&key, None).unwrap(), None);
+        let valid = encrypt_with_key(&key, b"123").await;
+        assert_eq!(
+            decrypt_content::<u32>(&key, Some(&valid)).unwrap(),
+            Some(123)
+        );
+    }
 
     fn kmstool_plaintext_output(bytes: &[u8]) -> String {
         format!("{KMSTOOL_PLAINTEXT_PREFIX}{}\n", STANDARD.encode(bytes))

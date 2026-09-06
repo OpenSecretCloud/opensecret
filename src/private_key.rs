@@ -132,7 +132,11 @@ pub fn decrypt_and_derive_bip85_mnemonic(
     // 1. Validate BIP-85 path format
     // Convert ApiError to our Error type
     validate_bip85_path(bip85_path).map_err(|_| {
-        error!("BIP-85 path validation failed: {}", bip85_path);
+        error!(
+            stage = "bip85_derivation",
+            error_kind = "invalid_path",
+            "BIP-85 path validation failed"
+        );
         Error::InvalidDerivationPath(format!("Invalid BIP-85 path format: {}", bip85_path))
     })?;
 
@@ -148,7 +152,11 @@ pub fn derive_bip85_mnemonic_from_root(
     // 1. Validate BIP-85 path format
     // Convert ApiError to our Error type
     validate_bip85_path(bip85_path).map_err(|_| {
-        error!("BIP-85 path validation failed: {}", bip85_path);
+        error!(
+            stage = "bip85_derivation",
+            error_kind = "invalid_path",
+            "BIP-85 path validation failed"
+        );
         Error::InvalidDerivationPath(format!("Invalid BIP-85 path format: {}", bip85_path))
     })?;
 
@@ -157,7 +165,11 @@ pub fn derive_bip85_mnemonic_from_root(
     // 2. Convert root_seed to Xpriv
     let secp = Secp256k1::new();
     let xpriv = Xpriv::new_master(Network::Bitcoin, &root_seed).map_err(|e| {
-        error!("Failed to create master key from seed: {}", e);
+        error!(
+            stage = "bip85_derivation",
+            error_kind = "master_key",
+            "Failed to create master key from seed"
+        );
         Error::EncryptionError(e.to_string())
     })?;
 
@@ -168,15 +180,20 @@ pub fn derive_bip85_mnemonic_from_root(
     // Extract word count (segment 4)
     let word_count_segment = segments[4].trim_end_matches(&['\'', 'h'][..]);
     let word_count = word_count_segment.parse::<u32>().map_err(|_| {
-        error!("Failed to parse word count: {}", word_count_segment);
+        error!(
+            stage = "bip85_derivation",
+            error_kind = "invalid_word_count",
+            "Failed to parse word count"
+        );
         Error::InvalidDerivationPath(format!("Invalid word count: {}", word_count_segment))
     })?;
 
     // Validate word count is one of the allowed values
     if !VALID_BIP39_WORD_COUNTS.contains(&word_count) {
         error!(
-            "Invalid word count: {}, must be one of: {:?}",
-            word_count, VALID_BIP39_WORD_COUNTS
+            stage = "bip85_derivation",
+            error_kind = "unsupported_word_count",
+            "Invalid word count"
         );
         return Err(Error::InvalidDerivationPath(format!(
             "Word count must be one of {:?}, got: {}",
@@ -187,7 +204,11 @@ pub fn derive_bip85_mnemonic_from_root(
     // Extract derivation index (segment 5)
     let index_segment = segments[5].trim_end_matches(&['\'', 'h'][..]);
     let index = index_segment.parse::<u32>().map_err(|_| {
-        error!("Failed to parse index: {}", index_segment);
+        error!(
+            stage = "bip85_derivation",
+            error_kind = "invalid_index",
+            "Failed to parse index"
+        );
         Error::InvalidDerivationPath(format!("Invalid index: {}", index_segment))
     })?;
 
@@ -199,7 +220,11 @@ pub fn derive_bip85_mnemonic_from_root(
     match bip85_mnemonic_result {
         Ok(derived_mnemonic) => Ok(derived_mnemonic),
         Err(e) => {
-            error!("BIP-85 derivation failed: {}, path: {}", e, bip85_path);
+            error!(
+                stage = "bip85_derivation",
+                error_kind = "key_derivation",
+                "BIP-85 derivation failed"
+            );
             Err(Error::KeyDerivationError(format!(
                 "BIP-85 derivation error: {}. Path: {}",
                 e, bip85_path

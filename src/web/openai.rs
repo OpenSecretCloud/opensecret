@@ -7,7 +7,7 @@ use crate::inference::{
 use crate::inference_planning::{RoutePlan, RoutePlanningError};
 use crate::model_config::{
     model_alias_requires_flag_lookup, model_catalog_response, openai_models_response,
-    ModelAliasTargets, ModelPlan,
+    resolve_public_model_id, ModelAliasTargets, ModelPlan,
 };
 use crate::models::token_usage::NewTokenUsage;
 use crate::models::users::User;
@@ -54,7 +54,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
-use tracing::{debug, error, info, trace, warn};
+use tracing::Instrument;
+use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
 // Maximum audio file size (100MB) - sanity check, CF already limits to 50MB
@@ -1114,22 +1115,16 @@ fn log_attempt_terminal(
             attempt.route.provider_model_id,
             evidence
         ),
-        AttemptTerminal::Failed { failure, .. } => warn!(
-            "Inference attempt failed: request_id={}, execution_id={}, attempt_id={}, provider={}, public_model={}, provider_model={}, kind={:?}, stage={:?}, replay_safety={:?}, status={:?}, retry_after_ms={:?}, upstream_request_id={:?}, upstream_code={:?}",
-            attempt.request_id,
-            attempt.execution_id,
-            attempt.attempt_id,
-            attempt.route.provider.as_str(),
-            attempt.route.public_model_id,
-            attempt.route.provider_model_id,
-            failure.kind,
-            failure.stage,
-            failure.replay_safety,
-            failure.status,
-            failure.retry_after.map(|duration| duration.as_millis()),
-            failure.upstream_request_id,
-            failure.upstream_code
-        ),
+        AttemptTerminal::Failed { failure, .. }
+            if failure.kind == AttemptFailureKind::ConsumerDropped => debug!(
+                request_id = %attempt.request_id,
+                execution_id = %attempt.execution_id,
+                attempt_id = %attempt.attempt_id,
+                provider = attempt.route.provider.as_str(),
+                stage = ?failure.stage,
+                "Inference consumer disconnected"
+            ),
+        AttemptTerminal::Failed { failure, .. } => warn!(request_id = %attempt.request_id, execution_id = %attempt.execution_id, attempt_id = %attempt.attempt_id, provider = attempt.route.provider.as_str(), public_model = %attempt.route.public_model_id, provider_model = %attempt.route.provider_model_id, kind = ?failure.kind, stage = ?failure.stage, replay_safety = ?failure.replay_safety, status = ?failure.status, retry_after_ms = ?failure.retry_after.map(|duration| duration.as_millis()), "Inference attempt failed"),
     }
 }
 
@@ -1231,10 +1226,7 @@ async fn read_non_streaming_completion_response(
             collect_bounded_provider_response_body(response.bytes_stream(), limit_bytes)
                 .await
                 .map_err(|error| {
-                    error!(
-                        "Failed to read bounded inference response body: request_id={}, execution_id={}, attempt_id={}, error={}",
-                        attempt.request_id, attempt.execution_id, attempt.attempt_id, error
-                    );
+                    error!(request_id = %attempt.request_id, execution_id = %attempt.execution_id, attempt_id = %attempt.attempt_id, error_kind = crate::observability::error_kind(&error), "Failed to read bounded inference response body");
                     let kind = match error {
                         BoundedProviderResponseBodyError::Read => {
                             AttemptFailureKind::ResponseBody
@@ -1250,11 +1242,8 @@ async fn read_non_streaming_completion_response(
                     )
                 })?,
         ),
-        None => response.bytes().await.map_err(|error| {
-            error!(
-                "Failed to read inference response body: request_id={}, execution_id={}, attempt_id={}, error={}",
-                attempt.request_id, attempt.execution_id, attempt.attempt_id, error
-            );
+        None => response.bytes().await.map_err(|_error| {
+            error!(request_id = %attempt.request_id, execution_id = %attempt.execution_id, attempt_id = %attempt.attempt_id, stage = "response_body", "Failed to read inference response body");
             AttemptFailure::new(
                 AttemptFailureKind::ResponseBody,
                 AttemptStage::ResponseBody,
@@ -1264,10 +1253,7 @@ async fn read_non_streaming_completion_response(
     };
 
     let mut response_json: Value = serde_json::from_slice(&body_bytes).map_err(|error| {
-        error!(
-            "Failed to parse inference response JSON: request_id={}, execution_id={}, attempt_id={}, error={}",
-            attempt.request_id, attempt.execution_id, attempt.attempt_id, error
-        );
+        error!(request_id = %attempt.request_id, execution_id = %attempt.execution_id, attempt_id = %attempt.attempt_id, error_kind = crate::observability::error_kind(&error), "Failed to parse inference response JSON");
         AttemptFailure::new(
             AttemptFailureKind::InvalidResponse,
             AttemptStage::ResponseBody,
@@ -1280,13 +1266,7 @@ async fn read_non_streaming_completion_response(
         AttemptFailureKind::UpstreamResponseError,
         AttemptStage::ResponseBody,
     ) {
-        warn!(
-            "Inference provider emitted a non-streaming error payload: request_id={}, execution_id={}, attempt_id={}, upstream_code={:?}",
-            attempt.request_id,
-            attempt.execution_id,
-            attempt.attempt_id,
-            failure.upstream_code
-        );
+        warn!(request_id = %attempt.request_id, execution_id = %attempt.execution_id, attempt_id = %attempt.attempt_id, kind = ?failure.kind, stage = ?failure.stage, "Inference provider emitted a non-streaming error payload");
         return Err(failure);
     }
 
@@ -1360,13 +1340,7 @@ async fn process_completion_stream(
                     let mut json = match serde_json::from_slice::<Value>(&frame) {
                         Ok(json) => json,
                         Err(error) => {
-                            error!(
-                                "Received invalid inference stream data: request_id={}, execution_id={}, attempt_id={}, error={}",
-                                attempt.request_id,
-                                attempt.execution_id,
-                                attempt.attempt_id,
-                                error
-                            );
+                            error!(request_id = %attempt.request_id, execution_id = %attempt.execution_id, attempt_id = %attempt.attempt_id, error_kind = crate::observability::error_kind(&error), "Received invalid inference stream data");
                             return finish_stream_processing(
                                 &mut usage_accumulator,
                                 StreamUsageFinalization::InvalidData,
@@ -1383,13 +1357,7 @@ async fn process_completion_stream(
                     };
 
                     if let Some(failure) = upstream_stream_failure(&json) {
-                        warn!(
-                            "Inference provider emitted an error stream frame: request_id={}, execution_id={}, attempt_id={}, upstream_code={:?}",
-                            attempt.request_id,
-                            attempt.execution_id,
-                            attempt.attempt_id,
-                            failure.upstream_code
-                        );
+                        warn!(request_id = %attempt.request_id, execution_id = %attempt.execution_id, attempt_id = %attempt.attempt_id, kind = ?failure.kind, stage = ?failure.stage, "Inference provider emitted an error stream frame");
                         return finish_stream_processing(
                             &mut usage_accumulator,
                             StreamUsageFinalization::ProviderError,
@@ -1421,11 +1389,8 @@ async fn process_completion_stream(
                     }
                 }
             }
-            Ok(Some(Err(error))) => {
-                error!(
-                    "Inference stream transport error: request_id={}, execution_id={}, attempt_id={}, error={}",
-                    attempt.request_id, attempt.execution_id, attempt.attempt_id, error
-                );
+            Ok(Some(Err(_error))) => {
+                error!(request_id = %attempt.request_id, execution_id = %attempt.execution_id, attempt_id = %attempt.attempt_id, stage = "stream_transport", "Inference stream transport error");
                 return finish_stream_processing(
                     &mut usage_accumulator,
                     StreamUsageFinalization::TransportError,
@@ -1494,7 +1459,7 @@ async fn publish_stream_usage(
     if !finalization.is_provider_done() {
         warn!(
             "Finalizing streaming usage from terminal fallback: trigger={:?}, provider={}, model={}",
-            finalization, provider, billing_context.model_name
+            finalization, provider, resolve_public_model_id(&billing_context.model_name).unwrap_or("custom")
         );
     }
 
@@ -1580,15 +1545,12 @@ async fn proxy_openai(
 
     // Check if guest user is allowed (paid guests are allowed, free guests are not)
     if user.is_guest() && !model_plan.is_paid() {
-        error!(
-            "Guest user without a paid plan attempted to use chat: {}",
-            user.uuid
-        );
+        debug!(user_uuid = %user.uuid, reason = "guest_requires_paid_plan", "Chat request rejected");
         return Err(ApiError::Unauthorized);
     }
 
     if billing_access.is_some_and(|access| !access.can_use()) {
-        error!("Usage limit reached for user: {}", user.uuid);
+        debug!(user_uuid = %user.uuid, reason = "usage_limit", "Chat request rejected");
         return Err(ApiError::UsageLimitReached);
     }
 
@@ -1597,7 +1559,7 @@ async fn proxy_openai(
         .get("model")
         .and_then(|m| m.as_str())
         .ok_or_else(|| {
-            error!("Model not specified in request");
+            debug!("Model not specified in request");
             ApiError::BadRequest
         })?
         .to_string();
@@ -1623,8 +1585,8 @@ async fn proxy_openai(
     let pinned_completion = prepare_completion_request(&state, &user, intent, routing).await?;
     if requested_model_name != model_name {
         debug!(
-            "Resolved chat model {} to {}",
-            requested_model_name, model_name
+            public_model = resolve_public_model_id(&model_name).unwrap_or("custom"),
+            "Resolved chat model alias"
         );
         body.as_object_mut()
             .expect("model was read from a JSON object")
@@ -1687,7 +1649,7 @@ async fn proxy_openai(
                     match encrypt_sse_event(&state, &session_id, &json).await {
                         Ok(event) => yield Ok::<Event, std::convert::Infallible>(event),
                         Err(e) => {
-                            error!("Failed to encrypt event data: {:?}", e);
+                            error!(error_kind = crate::observability::error_kind(&e), "Failed to encrypt event data");
                             break;
                         }
                     }
@@ -1711,7 +1673,7 @@ async fn proxy_openai(
                             match encrypt_sse_event(&state, &session_id, &error_payload).await {
                                 Ok(event) => yield Ok(event),
                                 Err(error) => {
-                                    error!("Failed to encrypt terminal error event: {error:?}");
+                                    error!(error_kind = crate::observability::error_kind(&error), "Failed to encrypt terminal error event");
                                 }
                             }
                         }
@@ -1726,7 +1688,7 @@ async fn proxy_openai(
                     match encrypt_sse_event(&state, &session_id, &error_payload).await {
                         Ok(event) => yield Ok(event),
                         Err(error) => {
-                            error!("Failed to encrypt invalid-format error event: {error:?}");
+                            error!(error_kind = crate::observability::error_kind(&error), "Failed to encrypt invalid-format error event");
                         }
                     }
                     break;
@@ -1745,7 +1707,7 @@ async fn proxy_openai(
             {
                 Ok(event) => yield Ok(event),
                 Err(error) => {
-                    error!("Failed to encode terminal stream error: {:?}", error);
+                    error!(error_kind = crate::observability::error_kind(&error), "Failed to encode terminal stream error");
                 }
             }
         }
@@ -1816,12 +1778,12 @@ fn retain_active_route_after_shadow_observation(
 
 fn provider_routing_api_error(error: ProviderRoutingError) -> ApiError {
     match error {
-        ProviderRoutingError::UnsupportedModel(model) => {
-            error!("Unsupported completion model requested: {}", model);
+        ProviderRoutingError::UnsupportedModel(_model) => {
+            debug!(reason = "unsupported_model", "Completion request rejected");
             ApiError::BadRequest
         }
-        ProviderRoutingError::NoEligibleRoute(model) => {
-            error!("No eligible provider route for completion model: {}", model);
+        ProviderRoutingError::NoEligibleRoute(_model) => {
+            error!(reason = "no_eligible_route", "Completion routing failed");
             ApiError::InternalServerError
         }
         ProviderRoutingError::CapacityUnavailable { model, retry_after } => {
@@ -1919,14 +1881,13 @@ pub(crate) async fn prepare_completion_request(
     };
 
     debug!(
-        "Pinned inference route: request_id={}, routing_mode={:?}, selection_mode={:?}, auto={}, surface={:?}, workload={:?}, requested_model={}, public_model={}, provider={}, provider_model={}, bucket={:?}, source={:?}",
+        "Pinned inference route: request_id={}, routing_mode={:?}, selection_mode={:?}, auto={}, surface={:?}, workload={:?}, public_model={}, provider={}, provider_model={}, bucket={:?}, source={:?}",
         intent.request_id,
         routing.mode(),
         intent.selection_mode,
         intent.selection_mode.is_auto(),
         intent.surface,
         intent.workload_class,
-        intent.requested_model_id,
         route.public_model_id,
         route.provider.as_str(),
         route.provider_model_id,
@@ -2268,10 +2229,7 @@ pub(crate) async fn get_chat_completion_response_for_expected_route(
     let pinned = prepare_completion_request(state, user, intent, routing)
         .await
         .map_err(|error| {
-            error!(
-                "Failed to prepare server-selected completion route: expected_provider={}, expected_provider_model={}, error={error:?}",
-                route.provider_name, route.provider_model_id
-            );
+            error!(provider = %route.provider_name, provider_model = %route.provider_model_id, error_kind = crate::observability::error_kind(&error), "Failed to prepare server-selected completion route");
             CompletionExecutionError::Request(ApiError::ServiceUnavailable)
         })?;
 
@@ -2348,14 +2306,14 @@ async fn get_chat_completion_response_with_options(
     let cache_policy = cache;
     let require_provider_done = cache_policy.requires_provider_done();
     if body.is_null() || body.as_object().is_none_or(|obj| obj.is_empty()) {
-        error!("Request body is empty or invalid");
+        debug!("Request body is empty or invalid");
         return Err(ApiError::BadRequest.into());
     }
 
     let mut modified_body = body
         .as_object()
         .ok_or_else(|| {
-            error!("Request body is not a JSON object");
+            debug!("Request body is not a JSON object");
             ApiError::BadRequest
         })?
         .clone();
@@ -2370,19 +2328,13 @@ async fn get_chat_completion_response_with_options(
         .get("model")
         .and_then(|m| m.as_str())
         .ok_or_else(|| {
-            error!("Model not specified in request");
+            debug!("Model not specified in request");
             ApiError::BadRequest
         })?
         .to_string();
 
     if body_model_name != pinned.public_model_id() {
-        error!(
-            "Prepared inference model did not match execution body: request_id={}, preferred_model={}, prepared_model={}, body_model={}",
-            pinned.intent.request_id,
-            pinned.intent.public_model_id,
-            pinned.public_model_id(),
-            body_model_name
-        );
+        error!(request_id = %pinned.intent.request_id, prepared_model = pinned.public_model_id(), "Prepared inference model did not match execution body");
         return Err(ApiError::InternalServerError.into());
     }
 
@@ -2504,10 +2456,7 @@ async fn get_chat_completion_response_with_options(
                     AttemptStage::BeforeSend,
                     ReplaySafety::ProvenPreAcceptance,
                 );
-                error!(
-                    "Failed to serialize inference request: request_id={}, execution_id={}, attempt_id={}, error={:?}",
-                    attempt.request_id, attempt.execution_id, attempt.attempt_id, error
-                );
+                error!(request_id = %attempt.request_id, execution_id = %attempt.execution_id, attempt_id = %attempt.attempt_id, error_kind = crate::observability::error_kind(&error), "Failed to serialize inference request");
                 let terminal = AttemptTerminal::Failed { attempt, failure };
                 terminal_guard.record_terminal(&terminal);
                 return Err(CompletionExecutionError::Attempt {
@@ -2564,7 +2513,7 @@ async fn get_chat_completion_response_with_options(
                     },
                     ShadowObservationMode::Update,
                 );
-                info!(
+                debug!(
                     "Inference response started: request_id={}, execution_id={}, attempt_id={}",
                     attempt.request_id, attempt.execution_id, attempt.attempt_id
                 );
@@ -2717,32 +2666,35 @@ pub(crate) async fn finish_started_completion(
     let stream_attempt = attempt.clone();
     terminal_guard.set_stage(AttemptStage::Stream);
 
-    tokio::spawn(async move {
-        let _response_execution_guard = response_execution_guard;
-        let result = process_completion_stream(
-            response,
-            &response_model_id,
-            stream_attempt,
-            &tx_consumer,
-            Duration::from_secs(STREAM_CHUNK_TIMEOUT_SECS),
-            response_execution.as_ref(),
-            require_provider_done,
-        )
-        .await;
-        let terminal = result.terminal.clone();
-        terminal_guard.record_terminal(&terminal);
-        publish_stream_usage(
-            result.usage,
-            result.finalization,
-            &state_clone,
-            &user_clone,
-            &billing_ctx,
-            &provider,
-            &tx_consumer,
-        )
-        .await;
-        let _ = tx_consumer.send(CompletionChunk::Terminal(terminal)).await;
-    });
+    tokio::spawn(
+        async move {
+            let _response_execution_guard = response_execution_guard;
+            let result = process_completion_stream(
+                response,
+                &response_model_id,
+                stream_attempt,
+                &tx_consumer,
+                Duration::from_secs(STREAM_CHUNK_TIMEOUT_SECS),
+                response_execution.as_ref(),
+                require_provider_done,
+            )
+            .await;
+            let terminal = result.terminal.clone();
+            terminal_guard.record_terminal(&terminal);
+            publish_stream_usage(
+                result.usage,
+                result.finalization,
+                &state_clone,
+                &user_clone,
+                &billing_ctx,
+                &provider,
+                &tx_consumer,
+            )
+            .await;
+            let _ = tx_consumer.send(CompletionChunk::Terminal(terminal)).await;
+        }
+        .in_current_span(),
+    );
 
     Ok(CompletionStream {
         stream: rx_consumer,
@@ -2775,9 +2727,9 @@ pub(crate) fn ensure_completion_model_access(
     model_plan: ModelPlan,
 ) -> Result<(), ApiError> {
     if !model_plan.allows_model(model_name) {
-        error!(
-            "Paid completion model requested without entitlement: {}",
-            model_name
+        debug!(
+            reason = "model_requires_paid_plan",
+            "Completion request rejected"
         );
         return Err(ApiError::ModelNotAvailableOnPlan);
     }
@@ -3013,17 +2965,7 @@ async fn publish_usage_event_internal(
         BigDecimal::from_str("0.0000053").unwrap() * BigDecimal::from(usage.completion_tokens);
     let total_cost = input_cost + output_cost;
 
-    info!(
-        "Chat completion usage for user {}: model={}, provider={}, prompt_tokens={}, cached_prompt_tokens={}, completion_tokens={}, total_tokens={}, estimated_cost={}",
-        user.uuid,
-        billing_context.model_name,
-        provider_name,
-        usage.prompt_tokens,
-        usage.cached_prompt_tokens.unwrap_or(0),
-        usage.completion_tokens,
-        usage.prompt_tokens + usage.completion_tokens,
-        total_cost
-    );
+    debug!(user_uuid = %user.uuid, model = resolve_public_model_id(&billing_context.model_name).unwrap_or("custom"), provider = provider_name, prompt_tokens = usage.prompt_tokens, cached_prompt_tokens = usage.cached_prompt_tokens.unwrap_or(0), completion_tokens = usage.completion_tokens, estimated_cost = %total_cost, "Chat completion usage");
 
     // Spawn background task for DB + SQS
     let state_clone = state.clone();
@@ -3042,7 +2984,7 @@ async fn publish_usage_event_internal(
         );
 
         if let Err(e) = state_clone.db.create_token_usage(new_usage) {
-            error!("Failed to save token usage: {:?}", e);
+            error!(user_uuid = %user_id, error_kind = crate::observability::error_kind(&e), "Failed to save token usage");
         }
 
         let cached_input_tokens = usage.cached_prompt_tokens;
@@ -3058,19 +3000,11 @@ async fn publish_usage_event_internal(
                 model_name,
             );
 
-            debug!(
-                "Prepared SQS usage event: user_uuid={}, provider={}, model={}, input_tokens={}, output_tokens={}, cached_input_tokens={:?}",
-                event.user_id,
-                event.provider_name,
-                event.model_name,
-                event.input_tokens,
-                event.output_tokens,
-                event.cached_input_tokens
-            );
+            debug!(user_uuid = %event.user_id, provider = %event.provider_name, model = resolve_public_model_id(&event.model_name).unwrap_or("custom"), input_tokens = event.input_tokens, output_tokens = event.output_tokens, cached_input_tokens = ?event.cached_input_tokens, "Prepared SQS usage event");
 
             match publisher.publish_event(event).await {
                 Ok(_) => debug!("published usage event successfully"),
-                Err(e) => error!("error publishing usage event: {e}"),
+                Err(e) => error!(error_kind = crate::observability::error_kind(&e), "error publishing usage event"),
             }
         } else {
             debug!(
@@ -3078,7 +3012,7 @@ async fn publish_usage_event_internal(
                 cached_input_tokens
             );
         }
-    });
+    }.in_current_span());
 }
 
 fn build_usage_event(
@@ -3114,7 +3048,10 @@ async fn encrypt_sse_event(
         .encode_sse_data(state, &json_str)
         .await
         .map_err(|e| {
-            error!("Failed to encode SSE event data: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to encode SSE event data"
+            );
             ApiError::InternalServerError
         })?;
 
@@ -3169,10 +3106,7 @@ async fn fetch_provider_models(
         )
         .await
         .map_err(|e| {
-            error!(
-                "Failed to fetch models from provider {}: {:?}",
-                proxy_config.provider_name, e
-            );
+            error!(provider = %proxy_config.provider_name, error_kind = crate::observability::error_kind(&e), "Failed to fetch provider models");
             ApiError::from(e)
         })?;
 
@@ -3185,13 +3119,16 @@ async fn fetch_provider_models(
         return Err(ApiError::InternalServerError);
     }
 
-    let body_bytes = res.bytes().await.map_err(|e| {
-        error!("Failed to read models response body: {:?}", e);
+    let body_bytes = res.bytes().await.map_err(|_e| {
+        error!("Failed to read models response body");
         ApiError::InternalServerError
     })?;
 
     serde_json::from_slice(&body_bytes).map_err(|e| {
-        error!("Failed to parse models response: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to parse models response"
+        );
         ApiError::InternalServerError
     })
 }
@@ -3255,7 +3192,7 @@ async fn send_transcription_with_retries(
 
         match send_transcription_request(client, primary_provider, &primary_model, params).await {
             Ok(response) => {
-                info!(
+                debug!(
                     "Successfully got transcription from primary provider {} on cycle {}",
                     primary_provider.provider_name,
                     cycle + 1
@@ -3263,12 +3200,7 @@ async fn send_transcription_with_retries(
                 return Ok(response);
             }
             Err(err) => {
-                error!(
-                    "Cycle {}: Primary provider {} failed: {}",
-                    cycle + 1,
-                    primary_provider.provider_name,
-                    err
-                );
+                warn!(cycle = cycle + 1, provider = %primary_provider.provider_name, error_kind = crate::observability::error_kind(&err), "Primary transcription provider failed");
                 last_error = Some(err);
             }
         }
@@ -3287,7 +3219,7 @@ async fn send_transcription_with_retries(
                 .await
             {
                 Ok(response) => {
-                    info!(
+                    debug!(
                         "Successfully got transcription from fallback provider {} on cycle {}",
                         fallback_provider.provider_name,
                         cycle + 1
@@ -3295,22 +3227,14 @@ async fn send_transcription_with_retries(
                     return Ok(response);
                 }
                 Err(err) => {
-                    error!(
-                        "Cycle {}: Fallback provider {} failed: {}",
-                        cycle + 1,
-                        fallback_provider.provider_name,
-                        err
-                    );
+                    warn!(cycle = cycle + 1, provider = %fallback_provider.provider_name, error_kind = crate::observability::error_kind(&err), "Fallback transcription provider failed");
                     last_error = Some(err);
                 }
             }
         }
     }
 
-    error!(
-        "All transcription providers failed after {} cycles. Last error: {:?}",
-        max_cycles, last_error
-    );
+    error!(cycles = max_cycles, "All transcription providers failed");
     Err(last_error.unwrap_or(ApiError::InternalServerError))
 }
 
@@ -3327,25 +3251,23 @@ async fn proxy_transcription(
         if let Some(billing_client) = &state.billing_client {
             match billing_client.is_user_paid(user.uuid).await {
                 Ok(true) => {
-                    debug!("Paid guest user allowed for transcription: {}", user.uuid);
+                    debug!(user_uuid = %user.uuid, "Paid guest request allowed");
                 }
                 Ok(false) => {
-                    error!(
-                        "Free guest user attempted to use transcription feature: {}",
-                        user.uuid
-                    );
+                    debug!(user_uuid = %user.uuid, reason = "guest_requires_paid_plan", "Request rejected");
                     return Err(ApiError::Unauthorized);
                 }
                 Err(e) => {
-                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
+                    warn!(
+                        user_uuid = %user.uuid,
+                        error_kind = crate::observability::error_kind(&e),
+                        "Guest billing check failed"
+                    );
                     return Err(ApiError::Unauthorized);
                 }
             }
         } else {
-            error!(
-                "Guest user attempted to use transcription without billing client: {}",
-                user.uuid
-            );
+            warn!(user_uuid = %user.uuid, reason = "billing_unavailable", "Guest request rejected");
             return Err(ApiError::Unauthorized);
         }
     }
@@ -3354,14 +3276,17 @@ async fn proxy_transcription(
     let file_bytes = general_purpose::STANDARD
         .decode(&transcription_request.file)
         .map_err(|e| {
-            error!("Failed to decode base64 audio file: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to decode base64 audio file"
+            );
             ApiError::BadRequest
         })?;
 
     // Validate file size (100MB limit as sanity check, CF already limits to 50MB)
     let file_size = file_bytes.len();
     if file_size == 0 {
-        error!("Audio file is empty");
+        debug!("Audio file is empty");
         return Err(ApiError::BadRequest);
     }
     if file_size > MAX_AUDIO_SIZE {
@@ -3371,7 +3296,7 @@ async fn proxy_transcription(
         );
         return Err(ApiError::BadRequest);
     }
-    info!("Audio file size: {} bytes", file_size);
+    debug!("Audio file size: {} bytes", file_size);
 
     // Check if we need to split the audio
     let splitter = AudioSplitter::new();
@@ -3384,12 +3309,12 @@ async fn proxy_transcription(
     // Always split the audio (returns single chunk if no splitting needed)
     let chunks = splitter
         .split_audio(&file_bytes, &transcription_request.content_type)
-        .map_err(|e| {
-            error!("Failed to split audio: {}", e);
+        .map_err(|_e| {
+            error!("Failed to split audio");
             ApiError::InternalServerError
         })?;
 
-    info!("Processing {} chunk(s)", chunks.len());
+    debug!("Processing {} chunk(s)", chunks.len());
 
     // Process chunks in parallel (even if it's just one)
     let mut futures = Vec::new();
@@ -3408,7 +3333,7 @@ async fn proxy_transcription(
 
         let future = async move {
             let chunk_size = chunk.data.len();
-            info!(
+            debug!(
                 "Processing chunk {} (size: {} bytes)",
                 chunk.index, chunk_size
             );
@@ -3417,7 +3342,7 @@ async fn proxy_transcription(
             let mut fallback_provider = Some(default_proxy.clone());
 
             if chunk_size > TINFOIL_MAX_SIZE && primary_provider.provider_name == "tinfoil" {
-                info!(
+                debug!(
                     "Chunk {} size {} bytes exceeds Tinfoil's 0.5MB limit, using fallback only",
                     chunk.index, chunk_size
                 );
@@ -3453,11 +3378,15 @@ async fn proxy_transcription(
             .await
             {
                 Ok(response) => {
-                    info!("Chunk {} transcribed successfully", chunk.index);
+                    debug!("Chunk {} transcribed successfully", chunk.index);
                     Ok((chunk.index, response))
                 }
                 Err(err) => {
-                    error!("Chunk {} failed: {}", chunk.index, err);
+                    error!(
+                        chunk_index = chunk.index,
+                        error_kind = crate::observability::error_kind(&err),
+                        "Transcription chunk failed"
+                    );
                     Err(err)
                 }
             }
@@ -3475,7 +3404,10 @@ async fn proxy_transcription(
         match result {
             Ok(r) => successful_results.push(r),
             Err(e) => {
-                error!("Chunk processing failed: {}", e);
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Chunk processing failed"
+                );
                 return Err(e);
             }
         }
@@ -3497,8 +3429,8 @@ async fn proxy_transcription(
             })?
     } else {
         // Multiple chunks - merge the results
-        let merged = merge_transcriptions(successful_results).map_err(|e| {
-            error!("Failed to merge transcriptions: {}", e);
+        let merged = merge_transcriptions(successful_results).map_err(|_e| {
+            error!("Failed to merge transcriptions");
             ApiError::InternalServerError
         })?;
 
@@ -3625,13 +3557,16 @@ async fn send_transcription_request(
     {
         Ok(res) => {
             if res.is_success() {
-                let body_bytes = res.bytes().await.map_err(|e| {
-                    error!("Failed to read transcription response body: {:?}", e);
+                let body_bytes = res.bytes().await.map_err(|_e| {
+                    error!("Failed to read transcription response body");
                     ApiError::InternalServerError
                 })?;
 
                 let response_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
-                    error!("Failed to parse transcription response: {:?}", e);
+                    error!(
+                        error_kind = crate::observability::error_kind(&e),
+                        "Failed to parse transcription response"
+                    );
                     ApiError::InternalServerError
                 })?;
 
@@ -3646,10 +3581,7 @@ async fn send_transcription_request(
             }
         }
         Err(e) => {
-            error!(
-                "Failed to send transcription request to {}: {:?}",
-                provider.provider_name, e
-            );
+            error!(provider = %provider.provider_name, error_kind = crate::observability::error_kind(&e), "Failed to send transcription request");
             Err(ApiError::from(e))
         }
     }
@@ -3681,10 +3613,7 @@ async fn ensure_paid_tts_access(state: &AppState, user: &User) -> Result<(), Api
             Ok(Ok(true)) => TTSBillingAccess::Allowed,
             Ok(Ok(false)) => TTSBillingAccess::FreeOrExhausted,
             Ok(Err(_)) => {
-                warn!(
-                    user_uuid = %user.uuid,
-                    "TTS billing entitlement check failed"
-                );
+                warn!(user_uuid = %user.uuid, "TTS billing entitlement check failed");
                 TTSBillingAccess::Unavailable
             }
             Err(_) => {
@@ -3697,16 +3626,13 @@ async fn ensure_paid_tts_access(state: &AppState, user: &User) -> Result<(), Api
             }
         }
     } else {
-        warn!(
-            user_uuid = %user.uuid,
-            "TTS requested while the billing client is unavailable"
-        );
+        warn!(user_uuid = %user.uuid, "TTS requested while the billing client is unavailable");
         TTSBillingAccess::Unavailable
     };
 
     let result = tts_billing_access_decision(access);
     if result.is_err() {
-        warn!(
+        debug!(
             user_uuid = %user.uuid,
             access = ?access,
             "Denied paid TTS access"
@@ -3723,10 +3649,7 @@ async fn proxy_tts(
     Decrypted(tts_request): Decrypted<TTSRequest>,
 ) -> Result<Response, ApiError> {
     let prepared = prepare_tts_request(tts_request).map_err(|validation_error| {
-        warn!(
-            error = %validation_error,
-            "Rejected invalid TTS request"
-        );
+        debug!(reason = ?validation_error, "Rejected invalid TTS request");
         match validation_error {
             TTSRequestValidationError::InputTooLong => ApiError::PayloadTooLarge,
             _ => ApiError::BadRequest,
@@ -3736,7 +3659,10 @@ async fn proxy_tts(
 
     let proxy_config = state.proxy_router.get_tinfoil_proxy();
     let request_body = serde_json::to_vec(&prepared.provider_payload).map_err(|e| {
-        error!("Failed to serialize TTS request: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to serialize TTS request"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -3751,7 +3677,10 @@ async fn proxy_tts(
             )
             .await
             .map_err(|e| {
-                error!("Failed to create TTS request: {:?}", e);
+                error!(
+                    error_kind = crate::observability::error_kind(&e),
+                    "Failed to create TTS request"
+                );
                 ApiError::from(e)
             })?;
 
@@ -3768,8 +3697,8 @@ async fn proxy_tts(
             .content_type()
             .unwrap_or("application/octet-stream")
             .to_string();
-        let body_bytes = res.bytes().await.map_err(|e| {
-            error!("Failed to read TTS response body: {:?}", e);
+        let body_bytes = res.bytes().await.map_err(|_e| {
+            error!("Failed to read TTS response body");
             ApiError::InternalServerError
         })?;
         Ok((body_bytes, content_type))
@@ -3788,15 +3717,15 @@ async fn proxy_tts(
     if is_json_response {
         warn!(
             model = %prepared.model,
-            voice = %prepared.voice_for_log,
+            voice_is_default = (prepared.voice_for_log == DEFAULT_VOXTRAL_TTS_VOICE),
             response_bytes = body_bytes.len(),
             "TTS provider returned a successful JSON response"
         );
     } else {
-        info!(
+        debug!(
             model = %prepared.model,
-            voice = %prepared.voice_for_log,
-            content_type = %response_content_type,
+            voice_is_default = (prepared.voice_for_log == DEFAULT_VOXTRAL_TTS_VOICE),
+            content_type_is_audio = response_content_type.starts_with("audio/"),
             audio_bytes = body_bytes.len(),
             "TTS synthesis succeeded"
         );
@@ -3829,25 +3758,23 @@ async fn proxy_embeddings(
         if let Some(billing_client) = &state.billing_client {
             match billing_client.is_user_paid(user.uuid).await {
                 Ok(true) => {
-                    debug!("Paid guest user allowed for embeddings: {}", user.uuid);
+                    debug!(user_uuid = %user.uuid, "Paid guest request allowed");
                 }
                 Ok(false) => {
-                    error!(
-                        "Free guest user attempted to use embeddings feature: {}",
-                        user.uuid
-                    );
+                    debug!(user_uuid = %user.uuid, reason = "guest_requires_paid_plan", "Request rejected");
                     return Err(ApiError::Unauthorized);
                 }
                 Err(e) => {
-                    error!("Billing check failed for guest user {}: {}", user.uuid, e);
+                    warn!(
+                        user_uuid = %user.uuid,
+                        error_kind = crate::observability::error_kind(&e),
+                        "Guest billing check failed"
+                    );
                     return Err(ApiError::Unauthorized);
                 }
             }
         } else {
-            error!(
-                "Guest user attempted to use embeddings without billing client: {}",
-                user.uuid
-            );
+            warn!(user_uuid = %user.uuid, reason = "billing_unavailable", "Guest request rejected");
             return Err(ApiError::Unauthorized);
         }
     }
@@ -3859,7 +3786,7 @@ async fn proxy_embeddings(
         _ => true,
     };
     if is_empty {
-        error!("Input is empty or invalid");
+        debug!("Input is empty or invalid");
         return Err(ApiError::BadRequest);
     }
 
@@ -3867,7 +3794,10 @@ async fn proxy_embeddings(
 
     // Build request body
     let request_body = serde_json::to_string(&embedding_request).map_err(|e| {
-        error!("Failed to serialize embedding request: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to serialize embedding request"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -3885,7 +3815,10 @@ async fn proxy_embeddings(
         )
         .await
         .map_err(|e| {
-            error!("Failed to send embeddings request: {:?}", e);
+            error!(
+                error_kind = crate::observability::error_kind(&e),
+                "Failed to send embeddings request"
+            );
             ApiError::from(e)
         })?;
 
@@ -3899,13 +3832,16 @@ async fn proxy_embeddings(
     }
 
     // Parse response
-    let body_bytes = res.bytes().await.map_err(|e| {
-        error!("Failed to read embeddings response body: {:?}", e);
+    let body_bytes = res.bytes().await.map_err(|_e| {
+        error!("Failed to read embeddings response body");
         ApiError::InternalServerError
     })?;
 
     let response_json: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
-        error!("Failed to parse embeddings response: {:?}", e);
+        error!(
+            error_kind = crate::observability::error_kind(&e),
+            "Failed to parse embeddings response"
+        );
         ApiError::InternalServerError
     })?;
 
@@ -4018,10 +3954,7 @@ async fn try_provider(
             }
         }
         Err(e) => {
-            error!(
-                "Failed to send request to {}: {:?}",
-                proxy_config.provider_name, e
-            );
+            error!(provider = %proxy_config.provider_name, error_kind = crate::observability::error_kind(&e), "Failed to send provider request");
             Err(e)
         }
     };

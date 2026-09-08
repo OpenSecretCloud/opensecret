@@ -137,11 +137,14 @@ or skipped tests, configured external services, and every unverified layer.
 ## Operator authority
 
 EIF/PCR parity is a release and deployment gate, not an ordinary development
-or pull-request gate. GitHub Actions still builds the development EIF on
-pull requests, but skips PCR comparison there. Master pushes and
-`workflow_dispatch` still verify PCR values against the checked-in
-references. Do not update PCR references as part of ordinary pull-request
-work. Treat an EIF build failure separately from PCR mismatch.
+or pull-request gate. GitHub Actions builds the development EIF on source
+pull requests, but skips PCR comparison there. The build workflow excludes
+automatic PCR-only and documentation-only changes using its explicit
+`paths-ignore` list; Rust CI and supply-chain checks remain enabled. Source
+master pushes and `workflow_dispatch` still verify PCR values against the
+checked-in references. Follow `docs/pcr-compatibility.md` for manual
+compatibility publication. Do not update PCR references as part of ordinary
+pull-request work. Treat an EIF build failure separately from PCR mismatch.
 
 Before publishing or deploying an authorized dev or prod EIF, build it on the
 supported Linux/ARM64 release builder, intentionally review its measurements,

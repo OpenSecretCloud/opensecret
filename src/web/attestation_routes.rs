@@ -15,7 +15,8 @@ use serde_bytes::ByteBuf;
 use serde_cbor::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+use tokio::{sync::Semaphore, task};
 use tracing::{error, trace};
 use uuid::Uuid;
 use yasna::models::ObjectIdentifier;
@@ -97,14 +98,62 @@ async fn get_attestation(
     Ok(attestation_response(document))
 }
 
+/// Upper bound on NSM attestation requests in flight at once. The kernel NSM
+/// driver serializes device requests under one mutex, so additional
+/// concurrency only queues inside the kernel; this bound keeps a burst of
+/// unauthenticated handshakes from occupying blocking-pool threads while
+/// they wait for that lock.
+const MAX_CONCURRENT_NSM_REQUESTS: usize = 4;
+static NSM_REQUEST_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_NSM_REQUESTS)));
+
 pub(crate) async fn generate_attestation_document(
     data: Arc<AppState>,
     request: Request,
 ) -> Result<Vec<u8>, ApiError> {
     match data.app_mode {
         AppMode::Local => generate_mock_attestation_document(data, request).await,
-        _ => generate_real_attestation_document(request),
+        _ => run_nsm_blocking(move || generate_real_attestation_document(request)).await?,
     }
+}
+
+/// Runs one synchronous NSM operation on Tokio's blocking pool under the
+/// process-wide permit bound, so the device ioctl never stalls an async
+/// worker thread that is serving other connections.
+async fn run_nsm_blocking<T, F>(operation: F) -> Result<T, ApiError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    run_blocking_with_permit(Arc::clone(&NSM_REQUEST_PERMITS), operation).await
+}
+
+/// The permit is owned by the blocking closure, not by this future. A
+/// cancelled caller (for example a client that disconnects while waiting)
+/// therefore cannot release capacity while its NSM operation is still
+/// running on the blocking pool.
+async fn run_blocking_with_permit<T, F>(
+    permits: Arc<Semaphore>,
+    operation: F,
+) -> Result<T, ApiError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permit = permits.acquire_owned().await.map_err(|_| {
+        error!("NSM request permit semaphore is closed");
+        ApiError::InternalServerError
+    })?;
+    task::spawn_blocking(move || {
+        let result = operation();
+        drop(permit);
+        result
+    })
+    .await
+    .map_err(|join_error| {
+        error!("NSM blocking task did not complete: {join_error}");
+        ApiError::InternalServerError
+    })
 }
 
 fn attestation_response(document: Vec<u8>) -> (StatusCode, Json<AttestationResponse>) {
@@ -468,5 +517,113 @@ mod tests {
         let client_public_key = x25519_dalek::PublicKey::from(&client_secret);
 
         assert!(derive_contributory_shared_secret(ephemeral_secret, &client_public_key).is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn nsm_blocking_operations_respect_the_permit_bound_and_all_complete() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        const BOUND: usize = 2;
+        const OPERATIONS: usize = BOUND * 6;
+        let permits = Arc::new(Semaphore::new(BOUND));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut tasks = Vec::new();
+        for index in 0..OPERATIONS {
+            let permits = Arc::clone(&permits);
+            let in_flight = Arc::clone(&in_flight);
+            let peak = Arc::clone(&peak);
+            tasks.push(tokio::spawn(async move {
+                run_blocking_with_permit(permits, move || {
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(5));
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    index
+                })
+                .await
+            }));
+        }
+
+        let mut completed = Vec::new();
+        for task in tasks {
+            completed.push(task.await.unwrap().unwrap());
+        }
+        completed.sort_unstable();
+        assert_eq!(completed, (0..OPERATIONS).collect::<Vec<_>>());
+        assert!(peak.load(Ordering::SeqCst) >= 1);
+        assert!(peak.load(Ordering::SeqCst) <= BOUND);
+        assert_eq!(permits.available_permits(), BOUND);
+    }
+
+    #[tokio::test]
+    async fn nsm_blocking_panic_is_an_internal_error_and_releases_its_permit() {
+        let permits = Arc::new(Semaphore::new(1));
+        let failed: Result<(), ApiError> =
+            run_blocking_with_permit(Arc::clone(&permits), || panic!("simulated NSM failure"))
+                .await;
+        assert!(matches!(failed, Err(ApiError::InternalServerError)));
+        assert_eq!(permits.available_permits(), 1);
+        assert_eq!(
+            run_blocking_with_permit(Arc::clone(&permits), || 7)
+                .await
+                .unwrap(),
+            7
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_waiter_keeps_its_permit_until_the_operation_finishes() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let permits = Arc::new(Semaphore::new(1));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        // Start one operation and abandon its caller once the blocking
+        // operation is known to be running.
+        let waiter = tokio::spawn({
+            let permits = Arc::clone(&permits);
+            async move {
+                run_blocking_with_permit(permits, move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .await
+            }
+        });
+        task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        // The abandoned operation still holds the only permit, so a second
+        // operation must not start.
+        assert_eq!(permits.available_permits(), 0);
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(200),
+            run_blocking_with_permit(Arc::clone(&permits), || 1),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "second operation started while the abandoned operation held the permit"
+        );
+
+        // Releasing the running operation returns the permit.
+        release_tx.send(()).unwrap();
+        let value = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_blocking_with_permit(Arc::clone(&permits), || 2),
+        )
+        .await
+        .expect("permit was not returned after the abandoned operation finished")
+        .unwrap();
+        assert_eq!(value, 2);
+        assert_eq!(permits.available_permits(), 1);
     }
 }

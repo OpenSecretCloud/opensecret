@@ -563,7 +563,9 @@ pub async fn generate_random_bytes_from_enclave(
     length: usize,
 ) -> Result<Vec<u8>, EncryptError> {
     tracing::debug!("Attempting to run kmstool_enclave_cli for random byte generation");
-    let output = Command::new("/bin/kmstool_enclave_cli")
+    // An abandoned caller must not leave an orphaned helper process running.
+    let output = tokio::process::Command::new("/bin/kmstool_enclave_cli")
+        .kill_on_drop(true)
         .arg("genrandom")
         .arg("--region")
         .arg(aws_region)
@@ -578,6 +580,7 @@ pub async fn generate_random_bytes_from_enclave(
         .arg("--length")
         .arg(length.to_string())
         .output()
+        .await
         .map_err(|e| {
             tracing::error!(
                 "Failed to execute kmstool_enclave_cli for random byte generation: {}",

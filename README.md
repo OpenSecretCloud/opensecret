@@ -1,7 +1,7 @@
 # OpenSecret
 
 OpenSecret is the open-source Rust backend for confidential AI applications
-such as [Maple](https://github.com/OpenSecretCloud/Maple). It owns
+such as [Maple](https://github.com/MaplePrivacyLabs/Maple). It owns
 authentication, encrypted client sessions and persistence, provider routing,
 usage accounting, and OpenAI-shaped/Responses APIs carried inside the
 OpenSecret encrypted transport.
@@ -10,6 +10,21 @@ Production is designed for AWS Nitro Enclaves. A source checkout or local build
 can validate implementation and build invariants, but does not by itself prove
 the artifact, PCR, IAM/KMS policy, logging, or network configuration of a
 deployed environment.
+
+## Maple monorepo transition
+
+The backend is being imported, with its history and existing PCR file layout,
+into `services/opensecret/` in
+[MaplePrivacyLabs/Maple](https://github.com/MaplePrivacyLabs/Maple). Until that
+import is merged and its public files are verified, this repository remains
+the source for the existing backend and SDK PCR URLs.
+
+This repository will remain public, writable, and unarchived for manual
+publication of the same signed PCR files used by older clients. The transition
+does not remove its backend source, change SDK URLs, or introduce GitHub EIF
+publishing or deployment. See
+[`docs/pcr-compatibility.md`](docs/pcr-compatibility.md) for the publication
+contract and cutover prerequisites.
 
 ## Local quick start
 
@@ -86,9 +101,12 @@ with the repository's Nix flake on the appropriate Linux/ARM environment. Build,
 PCR comparison, deployment, and live trust verification are distinct evidence.
 
 Routine pull requests do not require EIF/PCR parity. The Nix Reproducible
-Builds workflow still builds the development EIF on pull requests, but skips
-PCR comparison there. Master pushes and manual `workflow_dispatch` still
-verify PCR values against the checked-in references. Before an authorized
+Builds workflow builds the development EIF on source pull requests, but skips
+PCR comparison there. It skips automatic runs when every changed path is one
+of the four PCR JSON files or the documentation paths listed in
+[`build.yml`](.github/workflows/build.yml). Source master pushes and manual
+`workflow_dispatch` still verify PCR values against the checked-in references.
+Rust CI and supply-chain checks remain enabled. Before an authorized
 dev or prod publish/deployment, use the supported Linux/ARM64 release
 builder to review and deliberately update/verify the target measurements;
 never update checked-in PCRs solely to clear ordinary pull-request CI.

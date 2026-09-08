@@ -6,15 +6,35 @@ on:
   push:
     branches:
       - master
+    # Compatibility publication copies already signed PCR files; it does not
+    # rebuild this repository's retained backend source.
+    paths-ignore:
+      - 'pcrDev.json'
+      - 'pcrDevHistory.json'
+      - 'pcrProd.json'
+      - 'pcrProdHistory.json'
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'docs/**'
+      - '.agents/skills/**/SKILL.md'
   pull_request:
     branches:
       - master
+    paths-ignore:
+      - 'pcrDev.json'
+      - 'pcrDevHistory.json'
+      - 'pcrProd.json'
+      - 'pcrProdHistory.json'
+      - 'README.md'
+      - 'AGENTS.md'
+      - 'docs/**'
+      - '.agents/skills/**/SKILL.md'
   workflow_dispatch:
 
 jobs:
   dev:
     name: "Development Reproducible Build"
-    # Run on all PRs and master pushes
+    # Run on source PRs/master pushes and explicit manual builds.
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event_name == 'push'
     # Custom runner required: ARM64 architecture needed for AWS Nitro Enclaves
     # 4 cores needed for efficient builds and PCR verification

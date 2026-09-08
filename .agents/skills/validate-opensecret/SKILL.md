@@ -167,9 +167,13 @@ nix build --no-link --no-write-lock-file .#default
 
 EIF construction, PCR comparison, and reference/history updates are
 release-only work. The Nix Reproducible Builds workflow builds the
-development EIF on pull requests but skips PCR comparison there. Master
-pushes and `workflow_dispatch` still compare against checked-in
-references. Ordinary pull-request completion does not update PCR
+development EIF on source pull requests but skips PCR comparison there.
+Automatic runs skip changes confined to the four PCR files and documentation
+paths explicitly listed in `.github/workflows/build.yml`. Source master pushes
+and `workflow_dispatch` still compare against checked-in references. Use
+`docs/pcr-compatibility.md` for manual publication validation; rebuilding
+retained legacy source does not verify a PCR file copied from Maple.
+Ordinary pull-request completion does not update PCR
 references. If a master or release build succeeds and then fails only
 PCR comparison, treat that as deferred release work and do not copy or
 sign CI values just to make the job green. Treat an EIF build failure

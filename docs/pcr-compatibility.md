@@ -1,10 +1,11 @@
-# Signed PCR compatibility during the Maple import
+# Signed PCR compatibility after the Maple import
 
-The backend import into `MaplePrivacyLabs/Maple` at `services/opensecret/` is
-being prepared. Do not switch clients or publishing ownership until the import
-is merged, its exact source revision is reviewed, and the new public files on
-Maple's `master` branch are verified. This document prepares the legacy side;
-it does not declare the cutover complete.
+The backend import into
+[MaplePrivacyLabs/Maple at `services/opensecret/`](https://github.com/MaplePrivacyLabs/Maple/tree/master/services/opensecret)
+is complete. Backend source and new signed-PCR changes are maintained there.
+This repository remains the writable compatibility mirror for older clients;
+new Maple SDKs use the canonical monorepo histories. Keep both locations
+available and publish identical reviewed files to each.
 
 ## Keep the installed-client URLs working
 
@@ -23,17 +24,18 @@ repository as part of the import. Retaining its current source is intentional;
 source retirement is a separate decision. Existing clients must continue to
 receive JSON directly at these URLs rather than depending on redirects.
 
-## Manual publication after cutover
+## Manual publication
 
-After Maple's import is merged and verified, make new backend and signed-PCR
-changes in `services/opensecret/`. Preserve the existing signing key, JSON
+Make new backend and signed-PCR changes in the monorepo under
+`services/opensecret/`. Preserve the existing signing key, JSON
 format, filenames, and previously published history entries. Copy the four
 files from one reviewed Maple commit into this repository; do not independently
 sign or regenerate a second set here.
 
-The Maple import includes `services/opensecret/docs/pcr-compatibility.md` and
-`services/opensecret/scripts/pcr_compatibility.py`. Once available on the
-verified Maple revision, use that runbook and helper for the precise commands:
+Use the current monorepo
+[runbook](https://github.com/MaplePrivacyLabs/Maple/blob/master/services/opensecret/docs/pcr-compatibility.md)
+and [helper](https://github.com/MaplePrivacyLabs/Maple/blob/master/services/opensecret/scripts/pcr_compatibility.py)
+from the reviewed Maple revision for the precise commands:
 
 1. Fetch both repositories and identify the full reviewed Maple source commit
    and the current legacy `origin/master` commit. Use a clean legacy checkout
@@ -66,9 +68,10 @@ deploy an EIF, modify KMS/IAM, or prove which measurements a live enclave uses.
 
 Coordinate signed history publication with the backend deployment so old
 clients can recognize the authorized measurement when it starts serving.
-Switch new SDK defaults only after the canonical Maple raw URLs exist and are
-verified. There is no automatic sunset date for this legacy publication path;
-ending it needs a separate client-compatibility decision.
+The new SDK defaults already use the canonical Maple raw URLs. This does not
+upgrade existing clients or end their need for these legacy URLs. There is no
+automatic sunset date for this publication path; ending it needs a separate
+client-compatibility decision.
 
 ## CI behavior while source remains here
 

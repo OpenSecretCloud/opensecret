@@ -1,5 +1,12 @@
 # OpenSecret agent guide
 
+> **Compatibility repository:** active backend work belongs in
+> [MaplePrivacyLabs/Maple's `services/opensecret/`](https://github.com/MaplePrivacyLabs/Maple/tree/master/services/opensecret)
+> and follows its current agent guide. This repository stays public, writable,
+> and unarchived for manual, exact-byte signed-PCR publication. Follow
+> [the compatibility contract](docs/pcr-compatibility.md); do not sign a second
+> history here. The remaining guide describes the retained legacy source.
+
 This file applies to the whole repository. It contains durable project rules;
 task procedures live in `.agents/skills/`. Load the matching skill before doing
 specialized work.

@@ -11,20 +11,32 @@ can validate implementation and build invariants, but does not by itself prove
 the artifact, PCR, IAM/KMS policy, logging, or network configuration of a
 deployed environment.
 
-## Maple monorepo transition
+## Development moved; signed PCR compatibility remains here
 
-The backend is being imported, with its history and existing PCR file layout,
-into `services/opensecret/` in
-[MaplePrivacyLabs/Maple](https://github.com/MaplePrivacyLabs/Maple). Until that
-import is merged and its public files are verified, this repository remains
-the source for the existing backend and SDK PCR URLs.
+**Active backend development now lives in
+[MaplePrivacyLabs/Maple at `services/opensecret/`](https://github.com/MaplePrivacyLabs/Maple/tree/master/services/opensecret).**
+The history-preserving import is complete. Use the
+[current backend guide](https://github.com/MaplePrivacyLabs/Maple/blob/master/services/opensecret/README.md)
+and direct new backend issues and pull requests to the monorepo. OpenSecret
+remains the backend's name.
 
-This repository will remain public, writable, and unarchived for manual
-publication of the same signed PCR files used by older clients. The transition
-does not remove its backend source, change SDK URLs, or introduce GitHub EIF
-publishing or deployment. See
-[`docs/pcr-compatibility.md`](docs/pcr-compatibility.md) for the publication
-contract and cutover prerequisites.
+This repository stays public, writable, and **unarchived** to serve the
+root-level `pcrDev.json`, `pcrProd.json`, `pcrDevHistory.json`, and
+`pcrProdHistory.json` URLs required by older clients. New Maple SDKs use the
+canonical files under `services/opensecret/`; older packages and installed
+clients do not change URLs automatically.
+
+For each authorized PCR update, manually copy all four files byte-for-byte
+from one reviewed monorepo commit and verify both public locations. Do not
+regenerate or sign a second copy here. Follow
+[`docs/pcr-compatibility.md`](docs/pcr-compatibility.md). The existing signing
+scheme and operator authority remain unchanged, and there is no automatic
+sunset date. GitHub does not publish or deploy the active backend's EIFs.
+
+The retained source and instructions below describe this legacy checkout.
+They are historical reference, not the current development or deployment
+entrypoint. Existing issues and pull requests are not closed or ported by this
+notice.
 
 ## Local quick start
 

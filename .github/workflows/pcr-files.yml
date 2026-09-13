@@ -1,0 +1,37 @@
+name: Signed PCR files
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Validate the four signed PCR files
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      # The validator lives beside the canonical files in Maple; pin its revision.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: MaplePrivacyLabs/Maple
+          ref: 54386a038eec8bcb5a35523e688095d03e2703df
+          path: maple
+          sparse-checkout: services/opensecret/scripts/pcr_compatibility.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Install the validator's dependency
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-cryptography
+
+      - name: Validate signatures, history shape and snapshot membership
+        run: python3 maple/services/opensecret/scripts/pcr_compatibility.py check .
